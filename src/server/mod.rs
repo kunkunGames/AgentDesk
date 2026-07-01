@@ -280,17 +280,33 @@ pub(crate) async fn run(
         config.config_hot_reload,
     );
     let pg_pool = match pg_pool {
+        // Callers that provide a runtime pool have already completed the
+        // startup migrate/config-audit/reseed sequence under the startup lock.
         Some(pool) => Some(pool),
-        None => crate::db::postgres::connect_and_migrate(&config)
-            .await
-            .map_err(anyhow::Error::msg)?,
+        None => {
+            let pool = crate::db::postgres::connect(&config)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if let Some(pool_ref) = pool.as_ref() {
+                crate::db::postgres::with_startup_advisory_lock(pool_ref, || async {
+                    crate::db::postgres::migrate(pool_ref).await?;
+                    crate::db::postgres::startup_reseed_with_warmup_pool(pool_ref, &config).await
+                })
+                .await
+                .map_err(anyhow::Error::msg)?;
+            }
+            pool
+        }
     };
+    if pg_pool.is_none() {
+        anyhow::bail!("PostgreSQL is required for AgentDesk server runtime");
+    }
     let startup_pg_pool = if pg_pool.is_some() {
         match crate::db::postgres::connect_for_startup(&config).await {
             Ok(pool) => pool,
             Err(error) => {
                 tracing::warn!(
-                    "[startup] postgres warmup pool unavailable; falling back to runtime pool: {error}"
+                    "[startup] postgres warmup pool unavailable for boot reconcile; falling back to runtime pool: {error}"
                 );
                 None
             }
@@ -298,13 +314,6 @@ pub(crate) async fn run(
     } else {
         None
     };
-    if let Some(pool) = startup_pg_pool.as_ref().or(pg_pool.as_ref()) {
-        crate::db::postgres::startup_reseed(pool, &config)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    } else {
-        anyhow::bail!("PostgreSQL is required for AgentDesk server runtime");
-    }
     if let Some(pool) = pg_pool.as_ref() {
         // #1309: publish the runtime PG pool so cancel-tombstone helpers
         // called from contexts without a SharedData / PgPool argument
@@ -388,6 +397,7 @@ pub(crate) async fn run(
     );
     worker_registry.run_boot_only_steps().await?;
     worker_registry.start_after_boot_reconcile()?;
+    routes::receipt::spawn_token_analytics_cache_prewarm();
 
     // Resolve dashboard dist path relative to runtime root or binary location
     let dashboard_dir = crate::cli::agentdesk_runtime_root()
@@ -475,7 +485,27 @@ pub(crate) async fn run(
     ));
     let app = app.fallback_service(dashboard_service);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
+    // #3870 — fail closed on the dangerous combination of a non-loopback bind
+    // host with no `server.auth_token`. The control-plane auth middleware is
+    // fail-open when no token is set, so exposing it on the LAN would hand the
+    // entire mutating control-plane (deploy gate, agent CRUD, dispatch create)
+    // to any LAN peer. Force the bind to loopback instead of refusing to boot,
+    // so the server still serves locally — graceful degradation, not a brick.
+    let (bind_host, bind_decision) = routes::resolve_secure_bind_host(&config);
+    if let routes::BindSecurityDecision::ForcedLoopback { requested_host } = &bind_decision {
+        tracing::error!(
+            requested_host = %requested_host,
+            forced_host = %bind_host,
+            port = config.server.port,
+            "SECURITY (#3870): server.host={requested_host} is non-loopback and \
+             server.auth_token is unset — the control-plane auth middleware is fail-open, so \
+             this would expose deploy-gate / agent-CRUD / dispatch endpoints to the LAN with no \
+             auth. Force-binding to loopback ({bind_host}) instead. The server still serves \
+             locally. To expose on the LAN intentionally, set server.auth_token (recommended) \
+             or server.allow_insecure_nonloopback_bind=true."
+        );
+    }
+    let addr = format!("{}:{}", bind_host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("HTTP server listening on {addr}");
     routes::audit_explicit_auth_routes_on_boot(&config);

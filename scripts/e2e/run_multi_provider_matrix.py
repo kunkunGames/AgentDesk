@@ -79,6 +79,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("AGENTDESK_E2E_TURN_START_TIMEOUT_S", "180")),
     )
+    parser.add_argument(
+        "--required-agent-mode",
+        choices=cell_driver.AGENT_MODES,
+        default=os.environ.get("AGENTDESK_E2E_REQUIRED_AGENT_MODE"),
+        help="Fail selected scenarios whose declared agent_mode is below this gate.",
+    )
+    parser.add_argument(
+        "--required-coverage-class",
+        choices=cell_driver.COVERAGE_CLASSES,
+        default=os.environ.get("AGENTDESK_E2E_REQUIRED_COVERAGE_CLASS"),
+        help="Fail selected scenarios whose declared coverage_class is below this gate.",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +136,33 @@ def load_cross_channel_scenarios(scenarios_dir: Path) -> list[dict[str, Any]]:
         if not isinstance(data.get("cross_channel"), dict):
             raise ValueError(f"{yaml_path} declares cross_channel without config")
         data["__path__"] = str(yaml_path)
+        cell_driver.validate_scenario_agent_mode(data)
+        cell_driver.validate_scenario_coverage_class(data)
+        scenarios.append(data)
+    return scenarios
+
+
+def load_restart_guard_scenarios(scenarios_dir: Path) -> list[dict[str, Any]]:
+    """Load E-17-style foreign-active restart-guard orchestration scenarios.
+
+    Like cross-channel scenarios these are orchestrator-owned (``cells: []``); the
+    single-cell driver never runs them. The matrix holds a foreign provider turn
+    active and then drives the harness restart-refusal guard for a second cell.
+    """
+
+    scenarios: list[dict[str, Any]] = []
+    for yaml_path in sorted(scenarios_dir.glob("*.yaml")):
+        with yaml_path.open("r", encoding="utf-8") as fp:
+            data = yaml.safe_load(fp)
+        if not isinstance(data, dict):
+            raise ValueError(f"{yaml_path} did not parse to a mapping")
+        if data.get("orchestration") != "foreign_active_restart_guard":
+            continue
+        if not isinstance(data.get("restart_guard"), dict):
+            raise ValueError(f"{yaml_path} declares foreign_active_restart_guard without config")
+        data["__path__"] = str(yaml_path)
+        cell_driver.validate_scenario_agent_mode(data)
+        cell_driver.validate_scenario_coverage_class(data)
         scenarios.append(data)
     return scenarios
 
@@ -183,6 +222,10 @@ def run_cell(
         cmd.extend(["--filter", args.filter])
     if args.dry_run:
         cmd.append("--dry-run")
+    if args.required_agent_mode:
+        cmd.extend(["--required-agent-mode", str(args.required_agent_mode)])
+    if args.required_coverage_class:
+        cmd.extend(["--required-coverage-class", str(args.required_coverage_class)])
     if args.allow_destructive:
         cmd.append("--allow-destructive")
     if not args.reset_before_each:
@@ -201,10 +244,17 @@ def run_cell(
         "kind": "cell",
         "pass_index": pass_index,
         "cell": cell,
+        "provider": cell_driver.cell_provider(cell),
+        "runtime": cell_driver.cell_runtime(cell),
         "channel_id": channel_id,
+        "provider_identity": cell_driver.provider_identity(cell, channel_id),
         "returncode": proc.returncode,
         "report": str(report_path),
         "totals": (report or {}).get("totals"),
+        "agent_mode_totals": (report or {}).get("agent_mode_totals"),
+        "coverage_class_totals": (report or {}).get("coverage_class_totals"),
+        "coverage_class_violations": (report or {}).get("coverage_class_violations"),
+        "real_provider_contacted": bool((report or {}).get("real_provider_contacted")),
         "ok": proc.returncode == 0 and bool(report),
     }
 
@@ -265,12 +315,14 @@ def resolve_cross_channel_participants(
                 "name": str(raw_participant.get("name") or cell),
                 "cell": cell,
                 "provider": cell_driver.cell_provider(cell),
+                "runtime": cell_driver.cell_runtime(cell),
                 "channel_id": str(channel_id),
                 "channel_kind": str(
                     raw_participant.get("channel_kind")
                     or cell_driver.cell_channel_kind(cell)
                 ),
                 "handoff_to_agent": cell_driver.cell_default_agent(cell),
+                "provider_identity": cell_driver.provider_identity(cell, str(channel_id)),
                 "workspace_substring": cell_driver.cell_workspace_substring(cell),
                 "marker": str(marker),
                 "prompt": str(prompt),
@@ -555,27 +607,120 @@ def run_cross_channel_scenario(
     pass_index: int,
 ) -> dict[str, Any]:
     scenario_id = str(scenario.get("id"))
+    declared_agent_mode = cell_driver.scenario_agent_mode(scenario)
+    declared_coverage_class = cell_driver.scenario_coverage_class(scenario)
+    initial_coverage_actual = cell_driver._initial_coverage_class_actual(  # noqa: SLF001
+        scenario,
+        declared=declared_coverage_class,
+        dry_run=bool(args.dry_run),
+    )
     result: dict[str, Any] = {
         "kind": "cross_channel",
         "pass_index": pass_index,
         "id": scenario_id,
         "path": scenario.get("__path__"),
+        "run_id": run_id,
         "status": "skipped",
         "reason": None,
+        "agent_mode": declared_agent_mode,
+        "agent_mode_planned": cell_driver.infer_planned_agent_mode(
+            scenario,
+            declared=declared_agent_mode,
+        ),
+        "agent_mode_actual": "none",
+        "agent_mode_contract": cell_driver._agent_mode_contract(  # noqa: SLF001
+            declared=declared_agent_mode,
+            actual="none",
+            dry_run=bool(args.dry_run),
+            real_provider_contacted=False,
+        ),
+        "coverage_class": declared_coverage_class,
+        "coverage_class_planned": cell_driver.infer_planned_coverage_class(
+            scenario,
+            declared=declared_coverage_class,
+        ),
+        "coverage_class_actual": initial_coverage_actual,
+        "coverage_class_contract": cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual=initial_coverage_actual,
+            dry_run=bool(args.dry_run),
+        ),
+        "real_provider_contacted": False,
+        "failure_attribution": None,
         "participants": [],
         "ok": False,
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
     }
+
+    gate_violation = cell_driver.required_agent_mode_violation(
+        declared=declared_agent_mode,
+        required=getattr(args, "required_agent_mode", None),
+        scenario_id=scenario_id,
+    )
+    if gate_violation:
+        result["status"] = "fail"
+        result["reason"] = gate_violation
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "agent_mode_gate",
+            gate_violation,
+        )
+        return result
+
+    coverage_gate_violation = cell_driver.required_coverage_class_violation(
+        declared=declared_coverage_class,
+        required=getattr(args, "required_coverage_class", None),
+        scenario_id=scenario_id,
+    )
+    if coverage_gate_violation:
+        result["status"] = "fail"
+        result["reason"] = coverage_gate_violation
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "coverage_class_gate",
+            coverage_gate_violation,
+        )
+        return result
 
     try:
         required_cells = _cross_participants_required_cells(scenario)
     except ValueError as error:
         result["status"] = "fail"
         result["reason"] = str(error)
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "config",
+            str(error),
+        )
         return result
     missing_selected = sorted(required_cells.difference(selected_cells))
     if missing_selected:
         result["reason"] = "requires selected cells: " + ", ".join(missing_selected)
+        observed_gate_violation = cell_driver.required_agent_mode_violation(
+            declared=declared_agent_mode,
+            actual=str(result["agent_mode_actual"]),
+            required=getattr(args, "required_agent_mode", None),
+            scenario_id=scenario_id,
+        )
+        if observed_gate_violation and not args.dry_run:
+            result["status"] = "fail"
+            result["reason"] = observed_gate_violation
+            result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+                "agent_mode_gate",
+                observed_gate_violation,
+            )
+            return result
+        observed_coverage_gate_violation = cell_driver.required_coverage_class_violation(
+            declared=declared_coverage_class,
+            actual=str(result["coverage_class_actual"]),
+            required=getattr(args, "required_coverage_class", None),
+            scenario_id=scenario_id,
+        )
+        if observed_coverage_gate_violation and not args.dry_run:
+            result["status"] = "fail"
+            result["reason"] = observed_coverage_gate_violation
+            result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+                "coverage_class_gate",
+                observed_coverage_gate_violation,
+            )
+            return result
         result["ok"] = True
         return result
 
@@ -588,11 +733,19 @@ def run_cross_channel_scenario(
     except ValueError as error:
         result["status"] = "fail"
         result["reason"] = str(error)
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "config",
+            str(error),
+        )
         return result
     result["participants"] = [
         {
             "cell": participant["cell"],
+            "provider": participant["provider"],
+            "runtime": participant["runtime"],
             "channel_id": participant["channel_id"],
+            "worker_agent": participant["handoff_to_agent"],
+            "provider_identity": participant["provider_identity"],
             "marker": participant["marker"],
         }
         for participant in participants
@@ -607,6 +760,12 @@ def run_cross_channel_scenario(
             )
         )
         result["status"] = "pass"
+        result["coverage_class_actual"] = "live"
+        result["coverage_class_contract"] = cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual="live",
+            dry_run=bool(args.dry_run),
+        )
         result["ok"] = True
         result["completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
         return result
@@ -680,6 +839,7 @@ def run_cross_channel_scenario(
                 "message_id": response.get("message_id") or response.get("id"),
             }
 
+        dispatch_errors: list[str] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(participants)) as executor:
             futures = {
                 executor.submit(_dispatch, participant): participant
@@ -689,13 +849,21 @@ def run_cross_channel_scenario(
                 participant = futures[future]
                 try:
                     dispatch_results.append(future.result())
+                    cell_driver._mark_real_provider_contacted(  # noqa: SLF001
+                        result,
+                        declared_agent_mode=declared_agent_mode,
+                        dry_run=False,
+                    )
                 except Exception as error:  # noqa: BLE001
-                    raise assertions.AssertionError(
-                        "cross-channel dispatch failed "
+                    dispatch_errors.append(
                         f"cell={participant['cell']} channel={participant['channel_id']}: "
                         f"{type(error).__name__}: {error}"
-                    ) from error
+                    )
         result["dispatches"] = sorted(dispatch_results, key=lambda item: item["cell"])
+        if dispatch_errors:
+            raise assertions.AssertionError(
+                "cross-channel dispatch failed " + "; ".join(dispatch_errors)
+            )
 
         wait_timeout_s = float(
             (scenario.get("cross_channel") or {}).get("wait_timeout_s", 240)
@@ -781,7 +949,11 @@ def run_cross_channel_scenario(
             )
             channel_record = {
                 "cell": participant["cell"],
+                "provider": participant["provider"],
+                "runtime": participant["runtime"],
                 "channel_id": participant["channel_id"],
+                "provider_identity": participant["provider_identity"],
+                "real_provider_contacted": True,
                 "relay_count": len(window.messages),
                 "raw_count": len(window.raw_messages),
                 "message_updates": len(window.message_updates),
@@ -809,10 +981,20 @@ def run_cross_channel_scenario(
         if teardown_errors:
             result["teardown_errors"] = teardown_errors
         result["status"] = "pass"
+        result["coverage_class_actual"] = "live"
+        result["coverage_class_contract"] = cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual="live",
+            dry_run=False,
+        )
         result["ok"] = True
     except assertions.AssertionError as error:
         result["status"] = "fail"
         result["reason"] = f"assertion: {error}"
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "assertion",
+            str(error),
+        )
         teardown_errors = _send_cross_channel_teardown(
             clients=clients,
             participants=participants,
@@ -824,6 +1006,10 @@ def run_cross_channel_scenario(
     except Exception as error:  # noqa: BLE001
         result["status"] = "fail"
         result["reason"] = f"{type(error).__name__}: {error}"
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "exception",
+            str(result["reason"]),
+        )
         teardown_errors = _send_cross_channel_teardown(
             clients=clients,
             participants=participants,
@@ -837,15 +1023,576 @@ def run_cross_channel_scenario(
     return result
 
 
+def _restart_guard_config(scenario: dict[str, Any]) -> dict[str, Any]:
+    config = scenario.get("restart_guard")
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"{scenario.get('__path__') or scenario.get('id')} restart_guard must be a mapping"
+        )
+    for role in ("foreign_hold", "restart_attempt"):
+        if not isinstance(config.get(role), dict):
+            raise ValueError(
+                f"{scenario.get('id')} restart_guard.{role} must be a mapping"
+            )
+    return config
+
+
+def _restart_guard_required_cells(scenario: dict[str, Any]) -> set[str]:
+    config = _restart_guard_config(scenario)
+    cells: set[str] = set()
+    for role in ("foreign_hold", "restart_attempt"):
+        cell = str(config[role].get("cell") or "")
+        if cell not in DEFAULT_CELLS:
+            raise ValueError(
+                f"{scenario.get('id')} restart_guard.{role} has bad cell {cell!r}"
+            )
+        cells.add(cell)
+    if len(cells) < 2:
+        raise ValueError(
+            f"{scenario.get('id')} restart_guard.foreign_hold and restart_attempt "
+            "must name different cells"
+        )
+    return cells
+
+
+def resolve_restart_guard_roles(
+    scenario: dict[str, Any],
+    *,
+    channel_ids: dict[str, str],
+    selected_cells: list[str],
+) -> dict[str, dict[str, Any]]:
+    config = _restart_guard_config(scenario)
+    required_cells = _restart_guard_required_cells(scenario)
+    missing_selected = sorted(required_cells.difference(selected_cells))
+    if missing_selected:
+        raise ValueError(
+            "restart-guard scenario requires selected cells: "
+            + ", ".join(missing_selected)
+        )
+    roles: dict[str, dict[str, Any]] = {}
+    for role in ("foreign_hold", "restart_attempt"):
+        raw = config[role]
+        cell = str(raw["cell"])
+        channel_id = channel_ids.get(cell)
+        if not channel_id:
+            raise ValueError(f"configured e2e channel id missing for cell {cell!r}")
+        roles[role] = {
+            "role": role,
+            "cell": cell,
+            "provider": cell_driver.cell_provider(cell),
+            "runtime": cell_driver.cell_runtime(cell),
+            "channel_id": str(channel_id),
+            "channel_kind": str(
+                raw.get("channel_kind") or cell_driver.cell_channel_kind(cell)
+            ),
+            "handoff_to_agent": cell_driver.cell_default_agent(cell),
+            "workspace_substring": cell_driver.cell_workspace_substring(cell),
+            "provider_identity": cell_driver.provider_identity(cell, str(channel_id)),
+            "config": raw,
+        }
+    return roles
+
+
+def _wait_for_foreign_mailbox_busy(
+    *,
+    base_url: str,
+    channel_id: str,
+    provider: str,
+    timeout_s: float,
+    poll_interval_s: float,
+) -> dict[str, Any]:
+    """Poll /api/health/detail until the held foreign mailbox reports busy.
+
+    Bridges the durable provider-hold witness (an on-disk inflight row) to the
+    /api/health/detail mailbox evidence the restart guard actually inspects, so
+    the guard check that follows is deterministic rather than racing the snapshot.
+    """
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    last_error: str | None = None
+    last_reasons: list[str] = []
+    while True:
+        try:
+            detail = cell_driver._read_health_detail(base_url)  # noqa: SLF001
+            mailboxes = detail.get("mailboxes")
+            if isinstance(mailboxes, list):
+                for mailbox in mailboxes:
+                    if not isinstance(mailbox, dict):
+                        continue
+                    if cell_driver._mailbox_channel_id(mailbox) != str(channel_id):  # noqa: SLF001
+                        continue
+                    if cell_driver._mailbox_provider(mailbox) != provider:  # noqa: SLF001
+                        continue
+                    reasons = cell_driver._mailbox_busy_reasons(mailbox)  # noqa: SLF001
+                    last_reasons = reasons
+                    if reasons:
+                        return {
+                            "channel_id": str(channel_id),
+                            "provider": provider,
+                            "busy_reasons": reasons,
+                            "mailbox": cell_driver._mailbox_debug_summary(mailbox),  # noqa: SLF001
+                        }
+            last_error = None
+        except Exception as error:  # noqa: BLE001 - poll through transient health errors
+            last_error = f"{type(error).__name__}: {error}"
+        if time.monotonic() >= deadline:
+            raise assertions.AssertionError(
+                f"foreign mailbox provider={provider} channel={channel_id} never reported "
+                f"busy within {timeout_s}s; last_reasons={last_reasons or '<none>'}; "
+                f"last_error={last_error or '<none>'}"
+            )
+        time.sleep(poll_interval_s)
+
+
+def run_foreign_active_restart_guard_scenario(
+    scenario: dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    channel_ids: dict[str, str],
+    selected_cells: list[str],
+    pass_index: int,
+) -> dict[str, Any]:
+    """Hold a foreign provider turn active, then prove the restart guard refuses.
+
+    SAFETY: this orchestration never calls ``restart_dcserver_for_e2e`` and never
+    kickstarts dcserver. It drives only ``_guard_no_foreign_active_turns`` — the
+    "refuses before restart" half of the restart path — so even a regressed guard
+    cannot trigger a real restart that harms unrelated active production work.
+    """
+
+    scenario_id = str(scenario.get("id"))
+    declared_agent_mode = cell_driver.scenario_agent_mode(scenario)
+    declared_coverage_class = cell_driver.scenario_coverage_class(scenario)
+    initial_coverage_actual = cell_driver._initial_coverage_class_actual(  # noqa: SLF001
+        scenario,
+        declared=declared_coverage_class,
+        dry_run=bool(args.dry_run),
+    )
+    result: dict[str, Any] = {
+        "kind": "foreign_active_restart_guard",
+        "pass_index": pass_index,
+        "id": scenario_id,
+        "path": scenario.get("__path__"),
+        "run_id": run_id,
+        "status": "skipped",
+        "reason": None,
+        "agent_mode": declared_agent_mode,
+        "agent_mode_planned": cell_driver.infer_planned_agent_mode(
+            scenario,
+            declared=declared_agent_mode,
+        ),
+        "agent_mode_actual": "none",
+        "agent_mode_contract": cell_driver._agent_mode_contract(  # noqa: SLF001
+            declared=declared_agent_mode,
+            actual="none",
+            dry_run=bool(args.dry_run),
+            real_provider_contacted=False,
+        ),
+        "coverage_class": declared_coverage_class,
+        "coverage_class_planned": cell_driver.infer_planned_coverage_class(
+            scenario,
+            declared=declared_coverage_class,
+        ),
+        "coverage_class_actual": initial_coverage_actual,
+        "coverage_class_contract": cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual=initial_coverage_actual,
+            dry_run=bool(args.dry_run),
+        ),
+        "real_provider_contacted": False,
+        "failure_attribution": None,
+        "roles": [],
+        "destructive": True,
+        "ok": False,
+        "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+
+    gate_violation = cell_driver.required_agent_mode_violation(
+        declared=declared_agent_mode,
+        required=getattr(args, "required_agent_mode", None),
+        scenario_id=scenario_id,
+    )
+    if gate_violation:
+        result["status"] = "fail"
+        result["reason"] = gate_violation
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "agent_mode_gate",
+            gate_violation,
+        )
+        return result
+
+    coverage_gate_violation = cell_driver.required_coverage_class_violation(
+        declared=declared_coverage_class,
+        required=getattr(args, "required_coverage_class", None),
+        scenario_id=scenario_id,
+    )
+    if coverage_gate_violation:
+        result["status"] = "fail"
+        result["reason"] = coverage_gate_violation
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "coverage_class_gate",
+            coverage_gate_violation,
+        )
+        return result
+
+    try:
+        required_cells = _restart_guard_required_cells(scenario)
+    except ValueError as error:
+        result["status"] = "fail"
+        result["reason"] = str(error)
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "config",
+            str(error),
+        )
+        return result
+
+    missing_selected = sorted(required_cells.difference(selected_cells))
+    if missing_selected:
+        result["reason"] = "requires selected cells: " + ", ".join(missing_selected)
+        observed_gate_violation = cell_driver.required_agent_mode_violation(
+            declared=declared_agent_mode,
+            actual=str(result["agent_mode_actual"]),
+            required=getattr(args, "required_agent_mode", None),
+            scenario_id=scenario_id,
+        )
+        if observed_gate_violation and not args.dry_run:
+            result["status"] = "fail"
+            result["reason"] = observed_gate_violation
+            result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+                "agent_mode_gate",
+                observed_gate_violation,
+            )
+            return result
+        observed_coverage_gate_violation = cell_driver.required_coverage_class_violation(
+            declared=declared_coverage_class,
+            actual=str(result["coverage_class_actual"]),
+            required=getattr(args, "required_coverage_class", None),
+            scenario_id=scenario_id,
+        )
+        if observed_coverage_gate_violation and not args.dry_run:
+            result["status"] = "fail"
+            result["reason"] = observed_coverage_gate_violation
+            result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+                "coverage_class_gate",
+                observed_coverage_gate_violation,
+            )
+            return result
+        result["ok"] = True
+        return result
+
+    if bool(scenario.get("destructive")) and not (
+        getattr(args, "allow_destructive", False)
+        and os.environ.get("AGENTDESK_E2E_ALLOW_DESTRUCTIVE") == "1"
+    ):
+        result["status"] = "skipped"
+        result["reason"] = (
+            "destructive: requires --allow-destructive AND AGENTDESK_E2E_ALLOW_DESTRUCTIVE=1"
+        )
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "destructive_gate",
+            str(result["reason"]),
+        )
+        if not args.dry_run:
+            observed_coverage_gate_violation = (
+                cell_driver.required_coverage_class_violation(
+                    declared=declared_coverage_class,
+                    actual=str(result["coverage_class_actual"]),
+                    required=getattr(args, "required_coverage_class", None),
+                    scenario_id=scenario_id,
+                )
+            )
+            if observed_coverage_gate_violation:
+                result["status"] = "fail"
+                result["reason"] = observed_coverage_gate_violation
+                result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+                    "coverage_class_gate",
+                    observed_coverage_gate_violation,
+                )
+                return result
+        result["ok"] = True
+        return result
+
+    try:
+        roles = resolve_restart_guard_roles(
+            scenario,
+            channel_ids=channel_ids,
+            selected_cells=selected_cells,
+        )
+    except ValueError as error:
+        result["status"] = "fail"
+        result["reason"] = str(error)
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "config",
+            str(error),
+        )
+        return result
+
+    foreign = roles["foreign_hold"]
+    attempt = roles["restart_attempt"]
+    result["roles"] = [
+        {
+            "role": role["role"],
+            "cell": role["cell"],
+            "provider": role["provider"],
+            "runtime": role["runtime"],
+            "channel_id": role["channel_id"],
+            "provider_identity": role["provider_identity"],
+        }
+        for role in (foreign, attempt)
+    ]
+
+    if args.dry_run:
+        print(
+            f"[matrix] dry-run restart-guard {scenario_id}: hold "
+            f"{foreign['cell']}->{foreign['channel_id']} active, attempt restart on "
+            f"{attempt['cell']}->{attempt['channel_id']} (guard-only, no restart)"
+        )
+        result["status"] = "pass"
+        result["coverage_class_actual"] = "live"
+        result["coverage_class_contract"] = cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual="live",
+            dry_run=bool(args.dry_run),
+        )
+        result["ok"] = True
+        result["completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        return result
+
+    runtime_root = Path(args.queue_runtime_root)
+    hold_cfg = foreign["config"]
+    ok_marker = str(hold_cfg.get("ok_marker") or "[E2E:E17:HOLD-OK]")
+    late_marker = str(hold_cfg.get("late_marker") or "[E2E:E17:HOLD-LATE]")
+    foreign_label = f"{foreign['provider']}:{foreign['channel_id']}"
+    foreign_client = cell_driver.discord.DiscordClient(
+        base_url=args.base_url,
+        timeout_s=args.turn_start_timeout_s,
+        handoff_to_agent=foreign["handoff_to_agent"],
+        handoff_from_agent="adk-e2e-orchestrator",
+    )
+    hold_released = False
+
+    try:
+        if args.reset_before_each:
+            result["resets"] = [
+                cell_driver.reset_channel_state(
+                    base_url=args.base_url,
+                    channel_id=role["channel_id"],
+                    runtime_root=runtime_root,
+                    provider=role["provider"],
+                )
+                for role in (foreign, attempt)
+            ]
+            time.sleep(2.0)
+
+        hold_prompt = cell_driver.build_provider_hold_prompt(
+            {
+                "ok_marker": ok_marker,
+                "late_marker": late_marker,
+                "hold_seconds": int(
+                    hold_cfg.get("hold_seconds", cell_driver.DEFAULT_PROVIDER_HOLD_SECONDS)
+                ),
+            },
+            scenario_id=scenario_id,
+        )
+        send_response = foreign_client.send_prompt(
+            foreign["channel_id"],
+            hold_prompt,
+            channel_kind=foreign["channel_kind"],
+        )
+        cell_driver._mark_real_provider_contacted(  # noqa: SLF001
+            result,
+            declared_agent_mode=declared_agent_mode,
+            dry_run=False,
+        )
+        turn_identity = cell_driver.turn_identity_from_send_response(
+            send_response,
+            channel_id=foreign["channel_id"],
+        )
+
+        # Deterministic witness that the foreign turn is genuinely held active.
+        result["foreign_hold_state"] = cell_driver.wait_for_provider_hold_state(
+            runtime_root=runtime_root,
+            provider=foreign["provider"],
+            channel_id=foreign["channel_id"],
+            expected_identity=turn_identity,
+            ok_marker=ok_marker,
+            late_marker=late_marker,
+            timeout_s=float(hold_cfg.get("witness_timeout_s", 180)),
+            poll_interval_s=float(hold_cfg.get("witness_poll_interval_s", 1)),
+        )
+
+        # The /api/health/detail excerpt the restart guard will name on refusal.
+        result["foreign_mailbox_evidence"] = _wait_for_foreign_mailbox_busy(
+            base_url=args.base_url,
+            channel_id=foreign["channel_id"],
+            provider=foreign["provider"],
+            timeout_s=float(hold_cfg.get("busy_timeout_s", 45)),
+            poll_interval_s=float(hold_cfg.get("busy_poll_interval_s", 2)),
+        )
+
+        # Attempt the codex-tui destructive restart: drive ONLY the refusal guard.
+        # restart_dcserver_for_e2e is intentionally NOT called — the guard is the
+        # "refuses before restart" gate, and skipping the real kickstart is the
+        # safety boundary that keeps this destructive scenario inert.
+        refusal: str | None = None
+        try:
+            cell_driver._guard_no_foreign_active_turns(  # noqa: SLF001
+                args.base_url,
+                attempt["channel_id"],
+                attempt["cell"],
+            )
+        except assertions.AssertionError as error:
+            refusal = str(error)
+
+        if refusal is None:
+            raise assertions.AssertionError(
+                f"restart guard did NOT refuse while a foreign {foreign['provider']} "
+                f"mailbox (channel={foreign['channel_id']}) was active — #2935 "
+                f"regression; foreign evidence={result.get('foreign_mailbox_evidence')}"
+            )
+        if foreign_label not in refusal:
+            raise assertions.AssertionError(
+                f"restart guard refused but did not name foreign mailbox "
+                f"{foreign_label!r}; refusal={refusal!r}"
+            )
+        result["restart_refusal"] = refusal
+
+        result["foreign_hold_cancel"] = cell_driver.cancel_turn(
+            base_url=args.base_url,
+            channel_id=foreign["channel_id"],
+            force=True,
+        )
+        hold_released = True
+
+        result["idle_checks"] = {
+            "foreign_hold": cell_driver.assert_cell_idle(
+                base_url=args.base_url,
+                channel_id=foreign["channel_id"],
+                cell=foreign["cell"],
+                runtime_root=runtime_root,
+            ),
+            "restart_attempt": cell_driver.assert_cell_idle(
+                base_url=args.base_url,
+                channel_id=attempt["channel_id"],
+                cell=attempt["cell"],
+                runtime_root=runtime_root,
+            ),
+        }
+        result["status"] = "pass"
+        result["coverage_class_actual"] = "live"
+        result["coverage_class_contract"] = cell_driver._coverage_class_contract(  # noqa: SLF001
+            declared=declared_coverage_class,
+            actual="live",
+            dry_run=False,
+        )
+        result["ok"] = True
+    except assertions.AssertionError as error:
+        result["status"] = "fail"
+        result["reason"] = f"assertion: {error}"
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "assertion",
+            str(error),
+        )
+    except Exception as error:  # noqa: BLE001
+        result["status"] = "fail"
+        result["reason"] = f"{type(error).__name__}: {error}"
+        result["failure_attribution"] = cell_driver._failure_attribution(  # noqa: SLF001
+            "exception",
+            str(result["reason"]),
+        )
+    finally:
+        if not hold_released:
+            # Best-effort release so a failed run never strands the foreign turn.
+            try:
+                result.setdefault("teardown", {})["foreign_hold_cancel"] = (
+                    cell_driver.cancel_turn(
+                        base_url=args.base_url,
+                        channel_id=foreign["channel_id"],
+                        force=True,
+                    )
+                )
+            except Exception as cleanup_error:  # noqa: BLE001
+                result.setdefault("teardown_errors", []).append(
+                    "foreign_hold_cancel: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+
+    result["completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    return result
+
+
+def _matrix_agent_mode_totals(results: list[dict[str, Any]]) -> dict[str, int]:
+    totals = {mode: 0 for mode in cell_driver.AGENT_MODES}
+    for result in results:
+        nested = result.get("agent_mode_totals")
+        if isinstance(nested, dict):
+            for mode in totals:
+                totals[mode] += int(nested.get(mode) or 0)
+            continue
+        mode = str(result.get("agent_mode") or "")
+        if mode in totals:
+            totals[mode] += 1
+    return totals
+
+
+def _matrix_coverage_class_totals(results: list[dict[str, Any]]) -> dict[str, int]:
+    totals = {coverage: 0 for coverage in cell_driver.COVERAGE_CLASSES}
+    for result in results:
+        nested = result.get("coverage_class_totals")
+        if isinstance(nested, dict):
+            for coverage in totals:
+                totals[coverage] += int(nested.get(coverage) or 0)
+            continue
+        coverage = str(result.get("coverage_class") or "")
+        if coverage in totals:
+            totals[coverage] += 1
+    return totals
+
+
+def _matrix_coverage_class_violations(
+    results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    for result in results:
+        nested = result.get("coverage_class_violations")
+        if isinstance(nested, list):
+            violations.extend(item for item in nested if isinstance(item, dict))
+        attribution = result.get("failure_attribution")
+        if not isinstance(attribution, dict):
+            continue
+        if attribution.get("source") != "coverage_class_gate":
+            continue
+        violations.append(
+            {
+                "kind": result.get("kind"),
+                "id": result.get("id"),
+                "cell": result.get("cell"),
+                "provider": result.get("provider"),
+                "runtime": result.get("runtime"),
+                "coverage_class": result.get("coverage_class"),
+                "coverage_class_actual": result.get("coverage_class_actual"),
+                "reason": result.get("reason"),
+            }
+        )
+    return violations
+
+
 def main() -> int:
     args = parse_args()
     cells = parse_cells(args.cells)
     channel_ids = load_channel_ids(Path(args.config).expanduser())
     cross_scenarios = load_cross_channel_scenarios(Path(args.scenarios))
+    restart_guard_scenarios = load_restart_guard_scenarios(Path(args.scenarios))
     wanted = parse_filter(args.filter)
     if wanted:
         cross_scenarios = [
             scenario for scenario in cross_scenarios if str(scenario.get("id")) in wanted
+        ]
+        restart_guard_scenarios = [
+            scenario
+            for scenario in restart_guard_scenarios
+            if str(scenario.get("id")) in wanted
         ]
     output_dir = resolve_output_dir(args.output)
     pass_count = 2 if args.twice else 1
@@ -885,12 +1632,40 @@ def main() -> int:
                 f"status={result['status']} ok={result['ok']} "
                 f"reason={result.get('reason') or ''}"
             )
+        for scenario in restart_guard_scenarios:
+            print(
+                f"[matrix] restart-guard pass={pass_index} scenario={scenario.get('id')}"
+            )
+            result = run_foreign_active_restart_guard_scenario(
+                scenario,
+                args=args,
+                run_id=output_dir.name,
+                channel_ids=channel_ids,
+                selected_cells=cells,
+                pass_index=pass_index,
+            )
+            results.append(result)
+            print(
+                "[matrix] restart-guard result "
+                f"pass={pass_index} scenario={scenario.get('id')} "
+                f"status={result['status']} ok={result['ok']} "
+                f"reason={result.get('reason') or ''}"
+            )
 
     summary = {
         "output": str(output_dir),
         "cells": cells,
         "passes": pass_count,
         "cross_channel_scenarios": [str(scenario.get("id")) for scenario in cross_scenarios],
+        "restart_guard_scenarios": [
+            str(scenario.get("id")) for scenario in restart_guard_scenarios
+        ],
+        "agent_mode_totals": _matrix_agent_mode_totals(results),
+        "coverage_class_totals": _matrix_coverage_class_totals(results),
+        "coverage_class_violations": _matrix_coverage_class_violations(results),
+        "real_provider_contacted": any(
+            result.get("real_provider_contacted") is True for result in results
+        ),
         "results": results,
         "ok": all(result["ok"] for result in results),
     }

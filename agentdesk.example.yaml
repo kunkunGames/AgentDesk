@@ -19,6 +19,13 @@ cluster:
   dispatch_routing:
     wait_timeout_secs: 600
     wake_interval_secs: 30
+  # Intake routing is opt-in. Keep disabled until worker nodes advertise
+  # intake_worker capability and the operator is ready to test observe/enforce.
+  intake_routing:
+    enabled: false
+    mode: "observe"
+    forward_pre_claim_timeout_secs: 12
+    stale_claim_recovery_secs: 60
 
 discord:
   guild_id: "YOUR_GUILD_ID"
@@ -122,12 +129,12 @@ voice:
       # edge-tts rate argument, e.g. +0%, -10%, +15%.
       rate: "+0%"
   thresholds:
-    # dBFS threshold that marks the start of speech.
-    speech_start_db: -45.0
-    # dBFS threshold below which speech is considered ended.
-    speech_end_db: -55.0
-    # dBFS threshold used while listening for wake words.
-    wake_word_db: -50.0
+    # Mean-volume floor (dBFS) for the STT speech-vs-silence gate: utterances
+    # whose mean volume is below this (and whose peak is below the internal
+    # -12 dB max floor) are treated as silence and skipped before whisper.
+    # Lower it to transcribe quieter speech; raise it to drop more background
+    # noise. This is the effective gate default.
+    speech_start_db: -35.0
   idle:
     # Silence after a PCM burst before closing the current segment file.
     segment_idle_ms: 2200

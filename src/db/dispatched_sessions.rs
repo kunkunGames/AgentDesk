@@ -5,6 +5,7 @@ use crate::db::agents::resolve_agent_channel_for_provider_pg;
 use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
 };
+use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::session_activity::SessionActivityResolver;
 
 pub(crate) async fn load_dispatch_thread_id_pg(pool: &PgPool, dispatch_id: &str) -> Option<String> {
@@ -789,9 +790,7 @@ pub(crate) async fn list_dispatched_sessions_pg(
 }
 
 fn tmux_session_name_from_session_key(session_key: Option<&str>) -> Option<String> {
-    let (_, tmux_session) = session_key?.split_once(':')?;
-    let tmux_session = tmux_session.trim();
-    (!tmux_session.is_empty()).then(|| tmux_session.to_string())
+    tmux_name_from_session_key(session_key?)
 }
 
 #[cfg(test)]
@@ -1635,11 +1634,18 @@ pub(crate) async fn refresh_session_heartbeat_by_key_to_unix_nanos_pg(
     let Some(activity_at) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos) else {
         return false;
     };
-    match sqlx::query("UPDATE sessions SET last_heartbeat = $2 WHERE session_key = $1")
-        .bind(session_key)
-        .bind(activity_at)
-        .execute(pool)
-        .await
+    match sqlx::query(
+        "UPDATE sessions
+         SET last_heartbeat = GREATEST(
+             COALESCE(last_heartbeat, TIMESTAMPTZ 'epoch'),
+             $2
+         )
+         WHERE session_key = $1",
+    )
+    .bind(session_key)
+    .bind(activity_at)
+    .execute(pool)
+    .await
     {
         Ok(result) => result.rows_affected() > 0,
         Err(error) => {

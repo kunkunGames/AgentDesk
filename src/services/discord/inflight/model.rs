@@ -8,6 +8,7 @@
 //! re-exports every public item so existing `inflight::*` paths still resolve.
 
 use super::*;
+use crate::services::agent_protocol::TaskNotificationKind;
 
 /// Build an optional `serenity::MessageId` from a possibly-zero raw inflight id.
 ///
@@ -77,6 +78,15 @@ pub(in crate::services::discord) struct InflightTurnState {
     pub provider: String,
     pub channel_id: u64,
     pub channel_name: Option<String>,
+    /// Offset-authority channel for tmux watcher delivery records.
+    ///
+    /// This is usually identical to `channel_id`, but a bridge turn can reuse a
+    /// watcher owned by another channel. Durable delivery records are keyed by
+    /// that owner channel, while `channel_id` remains the Discord delivery
+    /// channel. `logical_channel_id` is a thread-parent axis and must not be
+    /// used as a substitute.
+    #[serde(default)]
+    pub watcher_owner_channel_id: Option<u64>,
     #[serde(default)]
     pub logical_channel_id: Option<u64>,
     #[serde(default)]
@@ -165,6 +175,29 @@ pub(in crate::services::discord) struct InflightTurnState {
     /// no `INFLIGHT_STATE_VERSION` bump per the #2235 compat convention.
     #[serde(default)]
     pub recovery_relay_attempts: u32,
+    /// #3918: durable per-turn idempotency marker for the committed-then-gone
+    /// anchor-repost fallback (#3607/#3610). Set to `true` immediately AFTER a
+    /// `Delivered` send-new repost and BEFORE the row is cleared, so that if the
+    /// subsequent `clear_inflight_state` fails (returns `false`) or the process
+    /// crashes after this write, the next boot re-loads this row with the marker
+    /// set and `try_recover_anchor_repost` short-circuits to `None` instead of
+    /// re-posting the same answer a SECOND time. This is the primary
+    /// at-most-once guard for the realistic unbounded loop (a silently failing
+    /// clear). Additive `#[serde(default)]` field — legacy rows deserialize as
+    /// `false`, no `INFLIGHT_STATE_VERSION` bump per the #2235 compat convention.
+    #[serde(default)]
+    pub anchor_reposted: bool,
+    /// #3918: count of committed-then-gone anchor-repost send-new ATTEMPTS for
+    /// this turn, bumped durably BEFORE each send. Hard-bounds the residual
+    /// Discord-accept→marker-write crash window (where `anchor_reposted` was not
+    /// yet recorded) to at most `RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET` posts so
+    /// duplication can never be unbounded. Deliberately DISTINCT from
+    /// `recovery_relay_attempts` (the transient-failure retry budget) so the
+    /// pre-send count never double-counts against the `PreserveAndCount` bump —
+    /// a premature force-clear there would re-introduce the #3607 data loss.
+    /// Additive `#[serde(default)]` field; legacy rows deserialize as `0`.
+    #[serde(default)]
+    pub anchor_repost_attempts: u32,
     /// Whether any tool_use was seen during this turn (persisted for restart recovery).
     #[serde(default)]
     pub any_tool_used: bool,
@@ -312,6 +345,14 @@ pub(in crate::services::discord) struct InflightTurnState {
     /// non-voice turns / legacy rows.
     #[serde(default)]
     pub followup_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
+    /// #3871: Discord message ids of the streamed rollover PREFIXES this turn
+    /// froze (a `>DISCORD_MSG_LIMIT` answer that rolled over mid-stream). Persisted
+    /// alongside `response_sent_offset` so a terminal full-body fallback that runs
+    /// in a LATER `'watcher_loop` iteration or after a watcher restart still deletes
+    /// every accumulated frozen prefix (no residual duplicate). Empty for legacy
+    /// rows / turns that never rolled over.
+    #[serde(default)]
+    pub streaming_rollover_frozen_msg_ids: Vec<u64>,
 }
 
 /// Origin of a turn whose state is captured in [`InflightTurnState`]. Pure
@@ -422,7 +463,7 @@ mod turn_source_tests {
 
     #[test]
     fn missing_field_defaults_to_managed_when_deserialised() {
-        // The full state struct is gated behind `legacy-sqlite-tests`, so we
+        // The full state struct lived behind the removed SQLite-only gate, so we
         // exercise the `#[serde(default)]` contract with a small wrapper
         // that captures the exact attribute combination used on the field.
         #[derive(serde::Deserialize, Debug)]
@@ -569,6 +610,68 @@ mod turn_source_tests {
             RelayOwnerKind::StandbyRelay
         );
     }
+
+    #[test]
+    fn watcher_owner_channel_id_defaults_absent_legacy_rows_to_none() {
+        let state: InflightTurnState = serde_json::from_value(serde_json::json!({
+            "version": 9,
+            "provider": "codex",
+            "channel_id": 42,
+            "channel_name": "adk-cdx",
+            "request_owner_user_id": 7,
+            "user_msg_id": 8,
+            "current_msg_id": 9,
+            "current_msg_len": 0,
+            "user_text": "hello",
+            "source": "text",
+            "session_id": null,
+            "tmux_session_name": "AgentDesk-codex-adk-cdx",
+            "output_path": "/tmp/out.jsonl",
+            "input_fifo_path": null,
+            "last_offset": 0,
+            "full_response": "",
+            "response_sent_offset": 0,
+            "started_at": "2026-06-28 10:00:00",
+            "updated_at": "2026-06-28 10:00:00",
+            "watcher_owns_live_relay": false
+        }))
+        .expect("legacy row without owner channel should deserialize");
+
+        assert_eq!(state.watcher_owner_channel_id, None);
+        assert_eq!(state.delivery_record_owner_channel_id(), 42);
+    }
+
+    #[test]
+    fn watcher_owner_channel_id_round_trips_when_present() {
+        let json = serde_json::json!({
+            "version": 9,
+            "provider": "codex",
+            "channel_id": 42,
+            "channel_name": "adk-cdx",
+            "watcher_owner_channel_id": 99,
+            "request_owner_user_id": 7,
+            "user_msg_id": 8,
+            "current_msg_id": 9,
+            "current_msg_len": 0,
+            "user_text": "hello",
+            "source": "text",
+            "session_id": null,
+            "tmux_session_name": "AgentDesk-codex-adk-cdx",
+            "output_path": "/tmp/out.jsonl",
+            "input_fifo_path": null,
+            "last_offset": 0,
+            "full_response": "",
+            "response_sent_offset": 0,
+            "started_at": "2026-06-28 10:00:00",
+            "updated_at": "2026-06-28 10:00:00",
+            "watcher_owns_live_relay": false
+        });
+        assert_eq!(json["watcher_owner_channel_id"], serde_json::json!(99));
+        let parsed: InflightTurnState =
+            serde_json::from_value(json).expect("deserialize owner channel");
+        assert_eq!(parsed.watcher_owner_channel_id, Some(99));
+        assert_eq!(parsed.delivery_record_owner_channel_id(), 99);
+    }
 }
 
 impl InflightTurnState {
@@ -612,6 +715,7 @@ impl InflightTurnState {
             provider: provider_name,
             channel_id,
             channel_name,
+            watcher_owner_channel_id: Some(channel_id),
             logical_channel_id: Some(channel_id),
             thread_id: None,
             thread_title: None,
@@ -646,6 +750,9 @@ impl InflightTurnState {
             updated_at: now,
             born_generation,
             recovery_relay_attempts: 0,
+            // #3918: never reposted / zero send-new attempts at turn birth.
+            anchor_reposted: false,
+            anchor_repost_attempts: 0,
             any_tool_used: false,
             has_post_tool_text: false,
             session_key: None,
@@ -671,6 +778,7 @@ impl InflightTurnState {
             followup_merge_consecutive: false,
             followup_pending_uploads: Vec::new(),
             followup_voice_announcement: None,
+            streaming_rollover_frozen_msg_ids: Vec::new(),
         }
     }
 
@@ -725,6 +833,36 @@ impl InflightTurnState {
     pub(in crate::services::discord) fn set_relay_owner_kind(&mut self, kind: RelayOwnerKind) {
         self.relay_owner_kind = kind;
         self.watcher_owns_live_relay = matches!(kind, RelayOwnerKind::Watcher);
+    }
+
+    pub(in crate::services::discord) fn set_watcher_owner_channel_id(
+        &mut self,
+        owner_channel_id: u64,
+    ) -> bool {
+        let normalized = (owner_channel_id != 0).then_some(owner_channel_id);
+        let changed = self.watcher_owner_channel_id != normalized;
+        self.watcher_owner_channel_id = normalized;
+        if let (Some(provider), Some(tmux_session_name)) = (
+            ProviderKind::from_str(&self.provider),
+            self.tmux_session_name.as_deref().filter(|name| !name.is_empty()),
+        ) && let Some(owner_channel_id) = normalized
+            && let Err(error) =
+                crate::services::discord::outbound::delivery_record::record_watcher_owner_channel_context(
+                    &provider,
+                    poise::serenity_prelude::ChannelId::new(self.channel_id),
+                    poise::serenity_prelude::ChannelId::new(owner_channel_id),
+                    tmux_session_name,
+                )
+        {
+            tracing::info!("⚠ delivery-record owner-channel save failed: {error}");
+        }
+        changed
+    }
+
+    pub(in crate::services::discord) fn delivery_record_owner_channel_id(&self) -> u64 {
+        self.watcher_owner_channel_id
+            .filter(|id| *id != 0)
+            .unwrap_or(self.channel_id)
     }
 
     pub(in crate::services::discord) fn terminal_delivery_completed(&self) -> bool {

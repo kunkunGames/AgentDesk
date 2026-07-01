@@ -3,9 +3,10 @@ use super::inflight::optional_message_id;
 use super::recovery_paths::restart::dispose_recovery_relay_outcome;
 use super::recovery_paths::shared::RecoveryRelayOutcome;
 use super::settings::{
-    load_last_remote_profile, load_last_session_path, resolve_role_binding,
+    load_last_session_path, resolve_role_binding,
     validate_bot_channel_routing_with_provider_channel,
 };
+use super::single_message_panel as smp;
 use super::turn_bridge::stale_inflight_message;
 use super::*;
 use crate::db::turns::TurnTokenUsage;
@@ -48,6 +49,15 @@ mod analytics_transcript;
 mod rebind_runtime;
 #[path = "recovery_engine/state_extractors.rs"]
 mod state_extractors;
+// #3834: behavior-preserving extraction of the manual-rebind recovery path
+// (`rebind_inflight_for_channel` + its private `codex_tui_*` / `Pending*` support
+// cluster and unit tests) into a leaf module. `RebindOutcome` / `RebindError` stay
+// in this root module (shared with `rebind_runtime` + external callers); the entry
+// point is re-exported below so external call sites stay byte-identical.
+#[path = "recovery_engine/manual_rebind.rs"]
+mod manual_rebind;
+#[path = "recovery_engine/routing_orphan.rs"] // #3869 routing-orphan finalize
+mod routing_orphan;
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::extract_response_from_output;
@@ -83,7 +93,7 @@ use self::terminal_watcher::{
 // members (the worktree path/branch/info/git helpers, `recovery_dispatch_id`,
 // `recovery_requires_worktree_context` and `inflight_ready_for_input_without_tui_pane`)
 // stay private to the submodule.
-use self::rebind_runtime::resolve_rebind_runtime_state;
+use self::rebind_runtime::{resolve_rebind_runtime_state, spawn_codex_tui_rebind_relay_output};
 use self::state_extractors::{
     inflight_or_legacy_tmux_ready_for_input, interrupted_recovery_message, recovery_spawn_adk_cwd,
     recovery_tmux_session_name, restore_recovered_session_worktree,
@@ -92,6 +102,10 @@ use self::state_extractors::{
 // `recovery_engine::save_missing_session_handoff` path stays valid for the
 // `recovery_paths::restart` external caller.
 pub(super) use self::state_extractors::save_missing_session_handoff;
+// #3834: `rebind_inflight_for_channel` is re-exported (not just re-imported) so the
+// `recovery_engine::rebind_inflight_for_channel` path stays valid for its `health`
+// caller. Its private cluster (`codex_tui_*`, `Pending*`) is not re-exported.
+pub(crate) use self::manual_rebind::rebind_inflight_for_channel;
 // #3479: re-import the analytics + transcript helpers so root call sites stay
 // byte-identical. `recovered_transcript_turn_id` is gated on cfg(test) — the root
 // reaches it only from its unit test (prod calls it inside analytics_transcript).
@@ -321,10 +335,6 @@ fn should_advance_recovery_dispatch_after_relay(relay_ok: bool) -> bool {
     relay_ok
 }
 
-fn forget_completion_footer_for_recovery_takeover(channel_id: ChannelId) {
-    super::single_message_panel::completion_footer_forget_registered_target(channel_id);
-}
-
 async fn relay_recovery_terminal_notice(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -357,7 +367,9 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
     placeholder: Option<MessageId>,
     text: &str,
 ) -> RecoveryRelayOutcome {
-    forget_completion_footer_for_recovery_takeover(channel_id);
+    if let Some(placeholder) = placeholder {
+        smp::completion_footer_forget_registered_target_if_message(channel_id, placeholder);
+    }
     let delivery = match placeholder {
         Some(placeholder) => {
             use super::recovery_paths::controller_cutover as cc;
@@ -560,7 +572,7 @@ async fn complete_recovery_visible_turn(
         &mut last_status_panel_text,
         background,
         source,
-        Some(state.user_msg_id),
+        (Some(state.user_msg_id), Some(state)),
     )
     .await;
     RecoveryCompletionOutcome::Emitted
@@ -582,20 +594,28 @@ mod recovery_completion_outcome_tests {
     use poise::serenity_prelude::{ChannelId, MessageId};
 
     fn state_for_recovery(user_msg_id: u64) -> super::inflight::InflightTurnState {
-        super::inflight::InflightTurnState::new(
-            ProviderKind::Claude,
-            4243,
-            Some("adk-cc".to_string()),
-            7,
-            user_msg_id,
-            user_msg_id + 1,
-            "prompt".to_string(),
-            Some("session".to_string()),
-            Some("AgentDesk-claude-adk-cc".to_string()),
-            Some("/tmp/claude-transcript.jsonl".to_string()),
-            None,
-            0,
-        )
+        serde_json::from_value(serde_json::json!({
+            "version": 9,
+            "provider": "claude",
+            "channel_id": 4243,
+            "channel_name": "adk-cc",
+            "request_owner_user_id": 7,
+            "user_msg_id": user_msg_id,
+            "current_msg_id": user_msg_id + 1,
+            "current_msg_len": 0,
+            "user_text": "prompt",
+            "source": "text",
+            "session_id": "session",
+            "tmux_session_name": "AgentDesk-claude-adk-cc",
+            "output_path": "/tmp/claude-transcript.jsonl",
+            "input_fifo_path": null,
+            "last_offset": 0,
+            "full_response": "",
+            "response_sent_offset": 0,
+            "started_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00"
+        }))
+        .expect("recovery test inflight state")
     }
 
     #[test]
@@ -703,7 +723,11 @@ mod recovery_completion_outcome_tests {
             true,
         );
 
-        super::forget_completion_footer_for_recovery_takeover(channel_id);
+        assert!(
+            super::super::single_message_panel::completion_footer_forget_registered_target_if_message(
+            channel_id,
+            MessageId::new(3_089_301),
+        ));
 
         assert_eq!(
             super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
@@ -714,6 +738,39 @@ mod recovery_completion_outcome_tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn recovery_takeover_keeps_different_completion_footer_target() {
+        let channel_id = ChannelId::new(3_089_211);
+        let shared = super::super::make_shared_data_for_tests();
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
+        let _ = super::super::single_message_panel::register_completion_footer_target(
+            channel_id,
+            MessageId::new(3_089_311),
+            &ProviderKind::Claude,
+            1_800_000_000,
+            "Final answer",
+            None,
+            true,
+        );
+
+        assert!(
+            !super::super::single_message_panel::completion_footer_forget_registered_target_if_message(
+            channel_id,
+            MessageId::new(3_089_312),
+        ));
+
+        assert!(
+            super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
+                shared.as_ref(),
+                channel_id,
+                "⠸",
+                1_800_000_005,
+            )
+            .is_some()
+        );
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
     }
 }
 
@@ -1665,13 +1722,17 @@ pub(super) async fn restore_inflight_turns(
                 provider_channel_name.as_deref(),
                 is_dm,
             ) {
-                if !reason.is_expected_cross_bot_skip() {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                        state.channel_id,
-                    );
-                }
+                // #3869: orphan→finalize, else preserve (`false` ⇒ suppress expected-skip logs).
+                routing_orphan::route_recovery_skip(
+                    http,
+                    shared,
+                    provider,
+                    &state,
+                    tmux_name.as_deref(),
+                    reason,
+                    false,
+                )
+                .await;
                 continue;
             }
 
@@ -1707,11 +1768,17 @@ pub(super) async fn restore_inflight_turns(
                     provider_channel_name.as_deref(),
                     is_dm,
                 ) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                        state.channel_id,
-                    );
+                    // #3869: orphan→finalize, else preserve (`true` ⇒ log skips).
+                    routing_orphan::route_recovery_skip(
+                        http,
+                        shared,
+                        provider,
+                        &state,
+                        tmux_name.as_deref(),
+                        reason,
+                        true,
+                    )
+                    .await;
                     continue;
                 }
                 {
@@ -1901,11 +1968,16 @@ pub(super) async fn restore_inflight_turns(
             provider_channel_name.as_deref(),
             is_dm,
         ) {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                state.channel_id,
-            );
+            routing_orphan::route_recovery_skip(
+                http,
+                shared,
+                provider,
+                &state,
+                tmux_session_name.as_deref(),
+                reason,
+                true,
+            )
+            .await;
             continue;
         }
         let (fallback_output, fallback_input) = tmux_session_name
@@ -2719,8 +2791,18 @@ pub(super) async fn restore_inflight_turns(
             // default-OFF flag, probe the recorded anchor and repost (send-new) iff
             // it is permanently gone. Flag OFF → `enabled()` is false so the whole
             // block is skipped and the legacy finish+clear below runs byte-identically.
-            if recovery_paths::shared::recovery_anchor_repost_enabled() {
-                if let Some(outcome) = recovery_paths::restart::try_recover_anchor_repost(
+            // #3918: the committed answer's anchor may have vanished — run the
+            // anchor-repost send-new fallback AND its on-disk row disposition in
+            // `recovery_paths::restart`. `true` ⇒ the row is fully handled
+            // (relayed + disposed, OR the pre-send bump did not durably persist so
+            // the send was REFUSED and the row deliberately PRESERVED for a later
+            // boot) → `continue` WITHOUT the legacy committed clear, which would
+            // otherwise drop an IoError-deferred answer or delete a newer turn's
+            // row. `false` ⇒ no repost needed/possible → fall through to the clear.
+            // Flag OFF short-circuits before the call, so the dark deploy stays a
+            // byte-for-byte no-op.
+            if recovery_paths::shared::recovery_anchor_repost_enabled()
+                && recovery_paths::restart::recover_committed_anchor_repost(
                     http,
                     shared,
                     provider,
@@ -2728,37 +2810,8 @@ pub(super) async fn restore_inflight_turns(
                     &state.full_response,
                 )
                 .await
-                {
-                    // #3610 PR-2 (codex r2 Issue-2, storm guard): pass
-                    // `tmux_alive = false` to the dispose so a repeatedly
-                    // TransientFailure-ing send-new is BUDGET-BOUNDED. This row's
-                    // terminal answer is ALREADY committed — pane liveness is
-                    // irrelevant to whether the *anchor message* can be re-posted,
-                    // so the normal-turn "live pane may still own the answer"
-                    // preservation (`unrecoverable_relay_disposition`'s
-                    // `tmux_alive == true` arm, shared.rs) must NOT apply here.
-                    // Were the real probe passed, a live pane would force
-                    // `PreserveAndCount` every boot and a transient send-new
-                    // failure could loop FOREVER (preserve+retry each restart).
-                    // `tmux_alive` reaches only (a) the disposition's budget gate
-                    // and (b) the `termination_audit` `tmux_alive` column — never a
-                    // kill / extra force-clear path (verified) — so `false` is the
-                    // minimal, side-effect-free way to enforce the bound. The probe
-                    // call is dropped because its result is intentionally unused.
-                    recovery_paths::restart::dispose_recovery_relay_outcome(
-                        shared,
-                        provider,
-                        &state,
-                        outcome,
-                        false,
-                        "recovery_anchor_repost",
-                        "anchor_repost",
-                        &state.full_response,
-                        false,
-                    )
-                    .await;
-                    continue;
-                }
+            {
+                continue;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::warn!(
@@ -2871,11 +2924,6 @@ pub(super) async fn restore_inflight_turns(
                         continue;
                     }
                 };
-                let saved_remote = load_last_remote_profile(
-                    shared.pg_pool.as_ref(),
-                    &shared.token_hash,
-                    channel_id.get(),
-                );
                 let mut data = shared.core.lock().await;
                 let session = data
                     .sessions
@@ -2888,7 +2936,7 @@ pub(super) async fn restore_inflight_turns(
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
                         cleared: false,
-                        remote_profile_name: saved_remote,
+                        remote_profile_name: None,
                         channel_id: Some(channel_id.get()),
                         channel_name: effective_channel_name.clone(),
                         category_name: None,
@@ -3117,12 +3165,6 @@ pub(super) async fn restore_inflight_turns(
                 continue;
             }
         };
-        let saved_remote = load_last_remote_profile(
-            shared.pg_pool.as_ref(),
-            &shared.token_hash,
-            channel_id.get(),
-        );
-
         let cancel_token = Arc::new(CancelToken::new());
         super::turn_bridge::bind_cancel_token_tmux_runtime(
             provider,
@@ -3144,7 +3186,7 @@ pub(super) async fn restore_inflight_turns(
                     history: Vec::new(),
                     pending_uploads: Vec::new(),
                     cleared: false,
-                    remote_profile_name: saved_remote.clone(),
+                    remote_profile_name: None,
                     channel_id: Some(channel_id.get()),
                     channel_name: channel_name.clone(),
                     category_name: None,
@@ -3161,9 +3203,7 @@ pub(super) async fn restore_inflight_turns(
             if session.channel_name.is_none() {
                 session.channel_name = channel_name.clone();
             }
-            if session.remote_profile_name.is_none() {
-                session.remote_profile_name = saved_remote;
-            }
+            session.remote_profile_name = None;
             restore_recovered_session_worktree(session, &state);
         }
 
@@ -3446,529 +3486,6 @@ impl std::fmt::Display for RebindError {
             ),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
         }
-    }
-}
-
-/// #896: Rebind a live tmux session to a freshly-created inflight state and
-/// (re)spawn the output watcher — recovers orphan states whose tmux is alive
-/// but whose inflight JSON was cleared, leaving output with no relay path.
-///
-/// Preconditions (enforced, typed error on violation): tmux session alive
-/// (absent ⇒ force-kill + restart instead); no existing inflight for the
-/// channel (caller clears first); channel role-map-bound to the provider.
-///
-/// Side effects on success: writes the provider/channel inflight JSON with
-/// `last_offset` = current output size (only NEW output is relayed —
-/// retroactive emission is out of scope); registers/refreshes the
-/// `DiscordSession`; spawns a `tmux_output_watcher` via the single-watcher
-/// claim policy (an existing live owner is reused, `watcher_spawned=false`,
-/// and still picks up the new inflight — not an error).
-pub(crate) async fn rebind_inflight_for_channel(
-    http: &Arc<serenity::Http>,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: u64,
-    tmux_session_override: Option<String>,
-) -> Result<RebindOutcome, RebindError> {
-    let discord_channel_id = ChannelId::new(channel_id);
-
-    // Preflight existence check — fast 409 before walking the validation /
-    // tmux-liveness path. Advisory only; the AUTHORITATIVE guard is the atomic
-    // `save_inflight_state_create_new` below (`O_CREAT | O_EXCL`), so a live turn
-    // winning the race between here and the write cannot be clobbered.
-    let existing_inflight = match super::inflight::load_inflight_state(provider, channel_id) {
-        Some(existing) => match recovery_phase_for_existing_inflight_rebind(&existing) {
-            RecoveryPhase::WatcherReattach => {
-                super::inflight::clear_inflight_state(provider, channel_id);
-                None
-            }
-            RecoveryPhase::InflightRestore => Some(existing),
-            RecoveryPhase::Pending | RecoveryPhase::Done => {
-                return Err(RebindError::InflightAlreadyExists);
-            }
-        },
-        None => None,
-    };
-    let resuming_existing_inflight = existing_inflight.is_some();
-
-    if resuming_existing_inflight {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] ♻ rebind resuming existing inflight turn for channel {} without overwriting canonical state",
-            channel_id
-        );
-    }
-
-    let existing_session_id = existing_inflight
-        .as_ref()
-        .and_then(|state| state.session_id.clone());
-    let existing_saved_output_path = existing_inflight
-        .as_ref()
-        .and_then(|state| state.output_path.clone());
-
-    // Resolve tmux session name + channel name from the request, falling back
-    // to the in-memory session map when no override is provided.
-    let (tmux_session_name, channel_name) = match tmux_session_override {
-        Some(name) => {
-            let ch_name =
-                crate::services::provider::parse_provider_and_channel_from_tmux_name(&name)
-                    .map(|(_, ch)| ch);
-            (name, ch_name)
-        }
-        None => {
-            let ch_name = {
-                let data = shared.core.lock().await;
-                data.sessions
-                    .get(&discord_channel_id)
-                    .and_then(|s| s.channel_name.clone())
-            };
-            let ch_name = match ch_name {
-                Some(n) => n,
-                None => return Err(RebindError::ChannelNameMissing),
-            };
-            let tmux = provider.build_tmux_session_name(&ch_name);
-            (tmux, Some(ch_name))
-        }
-    };
-
-    if !tmux_session_alive_with_retry(&tmux_session_name) {
-        return Err(RebindError::TmuxNotAlive {
-            tmux_session: tmux_session_name,
-        });
-    }
-
-    // Validate provider↔channel binding against the settings snapshot,
-    // mirroring what `restore_inflight_turns` requires for watcher revival.
-    let settings_snapshot = shared.settings.read().await.clone();
-    let channel_lookup_timeout = std::time::Duration::from_secs(5);
-    let is_dm = matches!(
-        tokio::time::timeout(channel_lookup_timeout, discord_channel_id.to_channel(http)).await,
-        Ok(Ok(serenity::model::channel::Channel::Private(_)))
-    );
-    let (allowlist_channel_id, provider_channel_name) = match tokio::time::timeout(
-        channel_lookup_timeout,
-        super::resolve_thread_parent(http, discord_channel_id),
-    )
-    .await
-    {
-        Ok(Some((pid, pname))) => (pid, pname.or(channel_name.clone())),
-        Ok(None) => (discord_channel_id, channel_name.clone()),
-        Err(_) => {
-            tracing::warn!(
-                channel_id,
-                provider = provider.as_str(),
-                "rebind channel metadata lookup timed out; falling back to direct channel validation",
-            );
-            (discord_channel_id, channel_name.clone())
-        }
-    };
-    if validate_bot_channel_routing_with_provider_channel(
-        &settings_snapshot,
-        provider,
-        allowlist_channel_id,
-        channel_name.as_deref(),
-        provider_channel_name.as_deref(),
-        is_dm,
-    )
-    .is_err()
-    {
-        return Err(RebindError::ChannelNotBound);
-    }
-
-    let runtime_state = resolve_rebind_runtime_state(
-        provider,
-        &tmux_session_name,
-        existing_saved_output_path.as_deref(),
-        existing_session_id.clone(),
-    )?;
-    let output_path = runtime_state.output_path;
-    let synthetic_initial_offset = runtime_state.synthetic_initial_offset;
-    let input_fifo_for_state = runtime_state.input_fifo_path;
-    let runtime_kind_for_state = runtime_state.runtime_kind;
-    let session_id_for_state = runtime_state.session_id;
-
-    let initial_offset = if let Some(existing) = existing_inflight.as_ref() {
-        let (resume_offset, current_len, truncated) =
-            recovery_watcher_start_offset_for_state(&output_path, existing);
-        if truncated {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ↻ rebind restarting existing inflight watcher from 0 for {} (saved offset {}, file len {})",
-                tmux_session_name,
-                existing.last_offset,
-                current_len
-            );
-        }
-        if existing_saved_output_path.as_deref() != Some(output_path.as_str()) {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ♻ rebind watcher adopted live output path for existing inflight {}: {:?} -> {}",
-                tmux_session_name,
-                existing_saved_output_path,
-                output_path
-            );
-        }
-        resume_offset
-    } else {
-        synthetic_initial_offset
-    };
-
-    let recovered_state_for_session = if let Some(mut existing) = existing_inflight.clone() {
-        let expected = super::inflight::InflightTurnIdentity::from_state(&existing);
-        let expected_turn_start_offset = existing.turn_start_offset;
-        existing.tmux_session_name = Some(tmux_session_name.clone());
-        existing.output_path = Some(output_path.clone());
-        existing.input_fifo_path = input_fifo_for_state.clone();
-        if let Some(runtime_kind) = runtime_kind_for_state {
-            existing.runtime_kind = Some(runtime_kind);
-        }
-        if session_id_for_state.is_some() {
-            existing.session_id = session_id_for_state.clone();
-        }
-        existing.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
-        let save_outcome =
-            super::inflight::save_existing_inflight_rebind_adoption_if_matches_identity(
-                &existing,
-                &expected,
-                expected_turn_start_offset,
-            );
-        if !matches!(save_outcome, super::inflight::GuardedSaveOutcome::Saved) {
-            tracing::warn!(
-                channel_id,
-                tmux_session = %tmux_session_name,
-                ?save_outcome,
-                "rebind could not persist existing inflight watcher adoption",
-            );
-            return Err(RebindError::Internal(format!(
-                "persist existing inflight watcher adoption for channel {channel_id}: {save_outcome:?}"
-            )));
-        }
-        existing
-    } else {
-        // Build and persist the new inflight state. No request_owner / msg_ids
-        // apply because this recovery has no originating Discord message.
-        //
-        // #897 counter-model re-review (round 2): flag this as `rebind_origin`
-        // so routing / persistence code that keys off "is there a live
-        // foreground turn" treats it as absent. This synthetic state exists only
-        // to expose a recovered tmux session through inflight APIs; it must not
-        // masquerade as a user-authored Discord turn.
-        let mut state = super::inflight::InflightTurnState::new(
-            provider.clone(),
-            channel_id,
-            channel_name.clone(),
-            0, // request_owner_user_id — no originating Discord user
-            0, // user_msg_id
-            0, // current_msg_id (placeholder)
-            String::from("/api/inflight/rebind"),
-            None, // session_id
-            Some(tmux_session_name.clone()),
-            Some(output_path.clone()),
-            input_fifo_for_state.clone(),
-            initial_offset,
-        );
-        state.runtime_kind = runtime_kind_for_state;
-        if session_id_for_state.is_some() {
-            state.session_id = session_id_for_state.clone();
-        }
-        state.rebind_origin = true;
-        // #2161 Part 2 / #2285 adoption: this synthetic inflight is born when
-        // `POST /api/inflight/rebind` adopts a tmux session the operator
-        // launched outside AgentDesk (e.g. `tmux new -s <expected>` + run
-        // provider manually). Tag as `ExternalAdopted` so audit logs and
-        // monitoring surfaces can distinguish "AgentDesk-launched" from
-        // "AgentDesk-discovered" sessions. The session-bound relay (epic
-        // #2285 E1–E5) routes both identically — this is pure audit
-        // metadata.
-        state.turn_source = super::inflight::TurnSource::ExternalAdopted;
-        // #3582: bind the relay to the watcher we respawn below. The
-        // STALL-WATCHDOG force-clean -> respawn path reaches this birth site with
-        // `existing_inflight = None` (force-clean deleted the row first); without
-        // this stamp the synthetic row defaults to `relay_owner_kind = None` and
-        // every later idle-tail / panel / routing check runs the degraded
-        // bridge-owned path even though the watcher owns the live tmux relay. The
-        // monitor-auto-turn birth site (`tmux.rs`) already stamps Watcher the same
-        // way; `rebind_origin` and `relay_owner_kind` are independent flags.
-        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
-        // #3581: stamp the bounded-preservation fields so an unadopted,
-        // never-progressed rebind-origin row can be reaped after a deadline (or
-        // a boot-time generation mismatch) instead of becoming a permanent
-        // orphan that wedges turn-start. Only this birth site stamps them; the
-        // reap predicate (`should_reap_abandoned_rebind_origin`) still requires
-        // the row to be owner-less / unadopted / never-progressed, so a row that
-        // goes live before the deadline is never reaped.
-        state.rebind_origin_created_at_unix = Some(super::inflight::now_unix());
-        state.rebind_origin_deadline_secs =
-            Some(super::inflight::rebind_origin_deadline_secs_env());
-        state.rebind_origin_birth_generation = Some(super::runtime_store::load_generation());
-
-        // Atomic create-or-fail: if a legitimate turn created its inflight file
-        // between the preflight check above and this point, the write fails
-        // with `AlreadyExists` and we return 409. Without this guard the
-        // synthetic rebind state (user_msg_id=0, placeholder ids zeroed) would
-        // overwrite the real turn's canonical state and break its completion
-        // path — the exact race the #897 P2 #1 review flagged.
-        match super::inflight::save_inflight_state_create_new(&state) {
-            Ok(()) => {}
-            Err(super::inflight::CreateNewInflightError::AlreadyExists) => {
-                return Err(RebindError::InflightAlreadyExists);
-            }
-            Err(super::inflight::CreateNewInflightError::Internal(msg)) => {
-                return Err(RebindError::Internal(msg));
-            }
-        }
-        state
-    };
-    forget_completion_footer_for_recovery_takeover(discord_channel_id);
-
-    // Register / refresh the in-memory session so downstream handlers can
-    // locate this channel after the rebind.
-    {
-        let mut data = shared.core.lock().await;
-        let session = data
-            .sessions
-            .entry(discord_channel_id)
-            .or_insert_with(|| DiscordSession {
-                session_id: existing_session_id.clone(),
-                memento_context_loaded: false,
-                memento_reflected: false,
-                current_path: None,
-                history: Vec::new(),
-                pending_uploads: Vec::new(),
-                cleared: false,
-                remote_profile_name: None,
-                channel_id: Some(channel_id),
-                channel_name: channel_name.clone(),
-                category_name: None,
-                last_active: tokio::time::Instant::now(),
-                worktree: None,
-                born_generation: super::runtime_store::load_generation(),
-            });
-        session.channel_id = Some(channel_id);
-        session.last_active = tokio::time::Instant::now();
-        if session.channel_name.is_none() {
-            session.channel_name = channel_name.clone();
-        }
-        restore_recovered_session_worktree(session, &recovered_state_for_session);
-    }
-
-    let finish_mailbox_on_completion = if existing_inflight.is_some() {
-        reregister_active_turn_from_inflight(shared, &recovered_state_for_session).await
-    } else {
-        false
-    };
-
-    // #1135: claim with the single-watcher policy. A live watcher for this
-    // same tmux session is reused; a cancelled same-session handle or a
-    // different-session channel incumbent is replaced so recovery is not
-    // blocked by stale registry state.
-    let (watcher_spawned, watcher_replaced) = {
-        #[cfg(unix)]
-        {
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let resume_offset = std::sync::Arc::new(std::sync::Mutex::new(None::<u64>));
-            let pause_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let turn_delivered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let last_heartbeat_ts_ms = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
-                super::tmux_watcher_now_ms(),
-            ));
-            let handle = TmuxWatcherHandle {
-                tmux_session_name: tmux_session_name.clone(),
-                output_path: output_path.clone(),
-                paused: paused.clone(),
-                resume_offset: resume_offset.clone(),
-                cancel: cancel.clone(),
-                pause_epoch: pause_epoch.clone(),
-                turn_delivered: turn_delivered.clone(),
-                last_heartbeat_ts_ms: last_heartbeat_ts_ms.clone(),
-            };
-            // `claim_or_reuse_watcher` reuses a live watcher for the same
-            // tmux session and only spawns when it claimed or replaced a
-            // stale/different-session slot.
-            let claim = super::tmux::claim_or_reuse_watcher(
-                &shared.tmux_watchers,
-                discord_channel_id,
-                handle,
-                provider,
-                "recovery_restore_inflight",
-            );
-            if claim.should_spawn() {
-                shared.record_tmux_watcher_reconnect(discord_channel_id);
-                let restored_turn = super::tmux::restored_watcher_turn_from_inflight(
-                    &recovered_state_for_session,
-                    &tmux_session_name,
-                    finish_mailbox_on_completion,
-                );
-                super::task_supervisor::spawn_observed_tmux_watcher(
-                    "recovery_restore_inflight_tmux_output_watcher",
-                    shared.clone(),
-                    tmux_session_name.clone(),
-                    cancel.clone(),
-                    super::tmux::tmux_output_watcher_with_restore(
-                        discord_channel_id,
-                        http.clone(),
-                        shared.clone(),
-                        output_path.clone(),
-                        tmux_session_name.clone(),
-                        initial_offset,
-                        cancel,
-                        paused,
-                        resume_offset,
-                        pause_epoch,
-                        turn_delivered,
-                        last_heartbeat_ts_ms,
-                        restored_turn,
-                    ),
-                );
-            }
-            (claim.should_spawn(), claim.replaced_existing())
-        }
-        #[cfg(not(unix))]
-        {
-            (false, false)
-        }
-    };
-
-    Ok(RebindOutcome {
-        tmux_session: tmux_session_name,
-        channel_id,
-        initial_offset,
-        watcher_spawned,
-        watcher_replaced,
-    })
-}
-
-#[cfg(test)]
-mod post_work_evidence_tests {
-    use super::*;
-    use crate::services::provider::ProviderKind;
-
-    #[test]
-    fn recovery_input_fifo_requirement_is_runtime_specific() {
-        assert_eq!(
-            recovery_input_fifo_for_runtime(RuntimeHandoffKind::ClaudeTui, None).unwrap(),
-            None
-        );
-        assert_eq!(
-            recovery_input_fifo_for_runtime(RuntimeHandoffKind::CodexTui, None).unwrap(),
-            None
-        );
-        assert!(
-            recovery_input_fifo_for_runtime(RuntimeHandoffKind::LegacyTmuxWrapper, None).is_err()
-        );
-        assert_eq!(
-            recovery_input_fifo_for_runtime(
-                RuntimeHandoffKind::LegacyTmuxWrapper,
-                Some("/tmp/session.input".to_string())
-            )
-            .unwrap(),
-            Some("/tmp/session.input".to_string())
-        );
-    }
-
-    #[test]
-    fn recovery_handoff_preserves_runtime_kind() {
-        let handoff = runtime_handoff_for_recovery(
-            RuntimeHandoffKind::ClaudeTui,
-            "/tmp/claude-transcript.jsonl".to_string(),
-            None,
-            "AgentDesk-claude-adk".to_string(),
-            Some("session-1".to_string()),
-            42,
-        );
-
-        match handoff {
-            RuntimeHandoff::ClaudeTui {
-                transcript_path,
-                tmux_session_name,
-                last_offset,
-            } => {
-                assert_eq!(transcript_path, "/tmp/claude-transcript.jsonl");
-                assert_eq!(tmux_session_name, "AgentDesk-claude-adk");
-                assert_eq!(last_offset, 42);
-            }
-            other => panic!("expected ClaudeTui handoff, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tmux_ready_completion_requires_current_turn_work_evidence() {
-        let mut state = inflight::InflightTurnState::new(
-            ProviderKind::Codex,
-            42,
-            Some("adk-cdx".to_string()),
-            123,
-            456,
-            789,
-            "background notification".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.input".to_string()),
-            64,
-        );
-        state.task_notification_kind =
-            Some(crate::services::agent_protocol::TaskNotificationKind::Background);
-
-        assert!(
-            !recovery_has_post_work_ready_evidence(&state),
-            "task-notification-only inflight must not trust a stale tmux Ready for input footer"
-        );
-
-        state.full_response = "completed".to_string();
-        assert!(recovery_has_post_work_ready_evidence(&state));
-
-        state.full_response.clear();
-        state.any_tool_used = true;
-        assert!(recovery_has_post_work_ready_evidence(&state));
-
-        state.any_tool_used = false;
-        state.last_tool_summary = Some("Bash completed".to_string());
-        assert!(recovery_has_post_work_ready_evidence(&state));
-    }
-
-    /// #3582 regression: the synthetic inflight that `rebind_inflight_for_channel`
-    /// creates when `existing_inflight = None` (the STALL-WATCHDOG force-clean ->
-    /// respawn path, which deletes the row first) must be stamped watcher-owned.
-    /// Before the fix this row defaulted to `relay_owner_kind = None`, so
-    /// `effective_relay_owner_kind()` resolved to `None` and every later idle-tail /
-    /// panel / routing check ran the degraded bridge-owned path even though the
-    /// watcher actually owns the live tmux relay. This mirrors the exact stamps the
-    /// birth site applies; if a refactor drops `set_relay_owner_kind(Watcher)` there
-    /// this assertion fails.
-    #[test]
-    fn synthetic_rebind_origin_row_is_watcher_owned() {
-        let mut state = inflight::InflightTurnState::new(
-            ProviderKind::Claude,
-            1_479_671_298_497_183_835,
-            Some("adk-cc".to_string()),
-            0, // request_owner_user_id — no originating Discord user
-            0, // user_msg_id
-            0, // current_msg_id (placeholder)
-            String::from("/api/inflight/rebind"),
-            None,
-            Some("AgentDesk-claude-adk-cc".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            None,
-            0,
-        );
-        // Birth-site stamps (must stay in sync with `rebind_inflight_for_channel`).
-        state.rebind_origin = true;
-        state.turn_source = inflight::TurnSource::ExternalAdopted;
-        state.set_relay_owner_kind(inflight::RelayOwnerKind::Watcher);
-
-        assert_eq!(
-            state.effective_relay_owner_kind(),
-            inflight::RelayOwnerKind::Watcher,
-            "force-clean respawn must leave the relay watcher-owned, not degraded to None",
-        );
-        assert!(
-            state.watcher_owns_live_relay,
-            "the legacy bool must agree so older deserializers also see watcher ownership",
-        );
-        // rebind_origin and watcher ownership are independent flags and must coexist.
-        assert!(state.rebind_origin);
     }
 }
 

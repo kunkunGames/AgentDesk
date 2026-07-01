@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
 
+use super::gateway_voice_queue::queued_intervention_request_owner;
 use super::outbound::delivery::{deliver_outbound, first_raw_message_id};
 use super::outbound::message::{
     DiscordOutboundMessage, OutboundOperation, OutboundReferenceContext, OutboundTarget,
@@ -772,16 +773,12 @@ impl TurnGateway for DiscordGateway {
                 shared: &self.shared,
                 token: &live_turn.token,
             };
-            // #2266: if the queued intervention carries a voice-transcript
-            // announcement (race-loss enqueue from `handle_text_message`),
+            // #2266 compatibility: older queued interventions may already
+            // carry a voice-transcript accepted-replay payload. If present,
             // reinsert it into the per-process `voice::announce_meta` store
-            // keyed by the intervention's HEAD `message_id` so the
-            // downstream `handle_text_message` `take()` (line ~2261)
-            // recovers the full transcript framing instead of degrading to
-            // plain text. The original entry was consumed by the active
-            // turn that won the race; this in-flight handoff is what makes
-            // the queued path self-contained against the 30s in-memory TTL.
-            let has_embedded_voice_announcement = intervention.voice_announcement.is_some();
+            // keyed by the intervention's HEAD `message_id`. New queue commits
+            // strip that payload and rely on the readable announcement text to
+            // resolve and claim the durable row at dispatch time.
             if let Some(announcement) = intervention.voice_announcement.as_ref() {
                 crate::voice::announce_meta::global_store()
                     .insert_accepted_replay(intervention.message_id, announcement.clone());
@@ -796,12 +793,13 @@ impl TurnGateway for DiscordGateway {
             // owner). Non-voice queued items kept the legacy behavior of
             // routing via the live-turn owner so the user attribution does
             // not silently swap mid-chain; we only override the
-            // request_owner when the intervention is voice-tagged.
-            let dispatch_request_owner = if has_embedded_voice_announcement {
-                intervention.author_id
-            } else {
-                live_turn.request_owner
-            };
+            // request_owner when the intervention is voice-tagged. New queue
+            // commits deliberately avoid embedding the full voice payload; the
+            // readable announce text still needs the announce-bot author so
+            // `handle_text_message` can resolve and claim the durable row at
+            // processing time.
+            let dispatch_request_owner =
+                queued_intervention_request_owner(intervention, live_turn.request_owner);
             if !intervention.pending_uploads.is_empty() {
                 let mut data = self.shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
@@ -828,6 +826,9 @@ impl TurnGateway for DiscordGateway {
                 // this dispatch is not racing the placeholder-delete path.
                 router::TurnKind::Foreground,
                 Vec::new(),
+                // #3905: queued dispatch carries the voice payload via the
+                // accepted-replay store reinsert above, not the gate carry-forward.
+                None,
             )
             .await
             .map_err(|e| e.to_string())
@@ -1116,7 +1117,15 @@ mod tests {
         let sent = gateway.sent.lock().expect("sent lock");
         assert_eq!(
             sent.iter()
-                .map(|(_, chunk)| chunk.as_str())
+                .map(|(_, chunk)| {
+                    chunk
+                        .split_once('\n')
+                        .filter(|(prefix, _)| {
+                            prefix.starts_with('[') && prefix.ends_with(']') && prefix.contains('/')
+                        })
+                        .map(|(_, body)| body)
+                        .unwrap_or(chunk.as_str())
+                })
                 .collect::<String>(),
             body
         );
@@ -1151,7 +1160,7 @@ mod tests {
 /// #3082 part B (codex P2-3): gate-behavior tests for the answer-flush wait.
 /// These do not need a live Discord HTTP client (they exercise only the
 /// `await_answer_flush_if_queued_notice` seam against a real barrier), so they
-/// are compiled unconditionally rather than behind `legacy-sqlite-tests`.
+/// are compiled unconditionally rather than behind removed integration fixtures.
 #[cfg(test)]
 mod answer_flush_gate_tests {
     use super::await_answer_flush_if_queued_notice;
