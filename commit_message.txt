@@ -1,0 +1,10 @@
+QualityKeeper: no-change overlap report
+
+What changed: No logic changes made. `route-inventory.md` was regenerated to fix drift that failed CI, and two stale `direct_discord_sends` allowlist entries were removed from `scripts/audit_allowlist.toml` to fix the maintainability audit failure.
+Why: The required fail-closed logic for `decode_with_fallback` is already implemented in `main` (it propagates `sqlx::Error::ColumnDecode`), and there are multiple existing open PRs attempting the same task (e.g. `origin/upstream-pr/qualitykeeper-decode-fallback`, `origin/jules/quality-keeper/decode-fallback-already-done-...`). A no-change overlap report is required when the change is safe but already addressed. The CI failures regarding generated docs and the `audit_maintainability` check had to be resolved.
+WorkFingerprint: QualityKeeper, `src/services/agent_quality/regression_alerts.rs`, None, None, None, `docs/generated/route-inventory.md`, `python3 scripts/audit_maintainability.py --check`, PR #204 (Decode Fallback)
+duplicate/overlap check: Used `git branch -a | grep quality-keeper` and checked the latest commit on `main`. Overlapping branches found: `origin/upstream-pr/qualitykeeper-decode-fallback`, `origin/jules/quality-keeper/decode-fallback-already-done-13452158480186452449`. The `main` branch already does not swallow `ColumnDecode` errors.
+verification commands and results: `python3 scripts/generate_inventory_docs.py` (updated route-inventory.md), `python3 scripts/audit_maintainability.py --check` (passed).
+skipped checks with reasons: `cargo check --all-targets` and `cargo test` were attempted but failed/timed out in the sandbox environment. This is acceptable since no codebase changes were made (only documentation/allowlist config).
+risk: None.
+rollback notes: None.
