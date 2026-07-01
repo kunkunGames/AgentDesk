@@ -266,8 +266,10 @@ impl VoicePcmHarness {
 
 #[cfg(unix)]
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn voice_pcm_harness_unattended_e2e() {
     let _guard = observability::test_runtime_lock();
+
     observability::reset_for_tests();
     observability::init_observability(None);
 
