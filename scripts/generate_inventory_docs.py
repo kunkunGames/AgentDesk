@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import re
 import sys
 from collections import Counter
@@ -1485,7 +1486,19 @@ def generated_documents() -> dict[Path, str]:
     }
 
 
-def write_documents(documents: dict[Path, str], check: bool) -> int:
+def write_documents(documents: dict[Path, str], check: bool, checked_for_duplicate_prs: bool) -> int:
+    if not check and not checked_for_duplicate_prs and os.environ.get("GITHUB_ACTIONS") != "true":
+        has_drift = False
+        for path, content in documents.items():
+            current = path.read_text(encoding="utf-8") if path.exists() else None
+            if current != content:
+                has_drift = True
+                break
+        if has_drift:
+            print("ERROR: Refusing to update generated docs without --checked-for-duplicate-prs.", file=sys.stderr)
+            print("Please check for overlapping PRs first to avoid duplicate inventory refreshes.", file=sys.stderr)
+            return 1
+
     stale_paths: list[Path] = []
     wrote_files = False
     for path, content in documents.items():
@@ -1537,6 +1550,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail when committed generated docs differ from current source tree",
     )
+    parser.add_argument(
+        "--checked-for-duplicate-prs",
+        action="store_true",
+        help="explicitly acknowledge verification against overlapping open PRs before writing",
+    )
     return parser.parse_args()
 
 
@@ -1544,7 +1562,7 @@ def main() -> int:
     args = parse_args()
     try:
         documents = generated_documents()
-        return write_documents(documents, check=args.check)
+        return write_documents(documents, check=args.check, checked_for_duplicate_prs=args.checked_for_duplicate_prs)
     except ParseError as error:
         print(f"inventory generation failed: {error}", file=sys.stderr)
         return 2
