@@ -43,6 +43,7 @@ pub(super) struct RecallFeedbackTurnAnalysis {
 }
 
 impl RecallFeedbackTurnAnalysis {
+
     pub(super) fn needs_voluntary_feedback_reminder(&self) -> bool {
         self.recall_count > 0 && !self.pending_feedbacks.is_empty()
     }

@@ -6204,6 +6204,7 @@ pub(super) fn spawn_turn_bridge(
             );
         }
 
+
         if let Some(analysis) = recall_feedback_analysis.as_ref()
             && should_submit_automatic_feedback_fallback(
                 analysis,
@@ -6230,6 +6231,7 @@ pub(super) fn spawn_turn_bridge(
                     Default::default()
                 }
             };
+
             accumulated_memory_input_tokens = accumulated_memory_input_tokens
                 .saturating_add(submit_result.token_usage.input_tokens);
             accumulated_memory_output_tokens = accumulated_memory_output_tokens
