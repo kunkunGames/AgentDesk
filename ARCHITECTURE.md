@@ -450,10 +450,13 @@ src/
 │   │   ├── inflight/
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
+│   │   │   ├── clear_store.rs
 │   │   │   ├── finalizer_identity.rs
 │   │   │   ├── model.rs
 │   │   │   ├── orphan_relay_reclaim.rs
+│   │   │   ├── ownership_ops.rs
 │   │   │   ├── rebind_reap.rs
+│   │   │   ├── save_store.rs
 │   │   │   ├── store.rs
 │   │   │   └── watcher_state.rs
 │   │   ├── outbound/
@@ -474,7 +477,8 @@ src/
 │   │   │   ├── send_to_agent.rs
 │   │   │   ├── serenity_reference.rs
 │   │   │   ├── transport.rs
-│   │   │   └── turn_output_controller.rs
+│   │   │   ├── turn_output_controller.rs
+│   │   │   └── turn_output_controller_rollout_health.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── background_task_events.rs
 │   │   │   ├── common.rs
@@ -509,6 +513,7 @@ src/
 │   │   │   ├── phase_policy.rs
 │   │   │   ├── rebind_runtime.rs
 │   │   │   ├── routing_orphan.rs
+│   │   │   ├── runtime.rs
 │   │   │   ├── state_extractors.rs
 │   │   │   ├── status_panel.rs
 │   │   │   └── terminal_watcher.rs
@@ -536,6 +541,7 @@ src/
 │   │   │   │   ├── goal_lifecycle.rs
 │   │   │   │   ├── headless_turn.rs
 │   │   │   │   ├── intake_turn.rs
+│   │   │   │   ├── latency_spans.rs
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
@@ -596,13 +602,16 @@ src/
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
+│   │   │   ├── stall_exit.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
 │   │   │   ├── terminal_send.rs
+│   │   │   ├── tests.rs
 │   │   │   ├── turn_identity.rs
 │   │   │   ├── turn_identity_tests.rs
+│   │   │   ├── two_message_panel.rs
 │   │   │   ├── utf8_chunk_decoder.rs
 │   │   │   └── utf8_chunk_decoder_tests.rs
 │   │   ├── tui_direct_abort_marker/
@@ -610,6 +619,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── store.rs
 │   │   ├── tui_prompt_relay/
+│   │   │   ├── synthetic_start/
+│   │   │   │   └── stale_reclaim.rs
 │   │   │   ├── anchor_completion.rs
 │   │   │   ├── bridge_completion.rs
 │   │   │   ├── bridge_gateway.rs
@@ -623,7 +634,9 @@ src/
 │   │   │   ├── launch_script.rs
 │   │   │   ├── rehydration.rs
 │   │   │   ├── relay_ownership.rs
+│   │   │   ├── synthetic_orphan_reclaim.rs
 │   │   │   ├── synthetic_start.rs
+│   │   │   ├── synthetic_start_wiring.rs
 │   │   │   └── tests.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
@@ -633,11 +646,14 @@ src/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
 │   │   │   │   └── process_table.rs
+│   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── chunk_compose.rs
 │   │   │   ├── chunk_compose_tests.rs
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
+│   │   │   ├── early_tui_completion.rs
+│   │   │   ├── finalize_epilogue.rs
 │   │   │   ├── followup_requeue.rs
 │   │   │   ├── headless_delivery.rs
 │   │   │   ├── memory_lifecycle.rs
@@ -659,6 +675,7 @@ src/
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
+│   │   │   ├── two_message_panel.rs
 │   │   │   ├── voice_completion.rs
 │   │   │   ├── voice_completion_tests.rs
 │   │   │   ├── watcher_handoff.rs
@@ -694,6 +711,7 @@ src/
 │   │   ├── agentdesk_config.rs
 │   │   ├── answer_flush_barrier.rs
 │   │   ├── catch_up.rs
+│   │   ├── destructive_cancel_gate.rs
 │   │   ├── discord_io.rs
 │   │   ├── dispatch_policy.rs
 │   │   ├── formatting.rs
@@ -723,9 +741,12 @@ src/
 │   │   ├── placeholder_cleanup.rs
 │   │   ├── placeholder_controller.rs
 │   │   ├── placeholder_sweeper.rs
+│   │   ├── queue_dispatch.rs
 │   │   ├── queue_io.rs
+│   │   ├── queue_reactions.rs
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── reaction_cleanup.rs
+│   │   ├── reaction_lifecycle.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
@@ -741,6 +762,7 @@ src/
 │   │   ├── runtime_bootstrap.rs
 │   │   ├── runtime_store.rs
 │   │   ├── semantic_boundaries.rs
+│   │   ├── session_banner.rs
 │   │   ├── session_identity.rs
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
@@ -753,6 +775,7 @@ src/
 │   │   ├── standby_relay.rs
 │   │   ├── startup_reclaim.rs
 │   │   ├── status_panel_orphan_store.rs
+│   │   ├── status_panel_orphan_store_tests.rs
 │   │   ├── status_panel_timedout_reconcile.rs
 │   │   ├── status_panel_timedout_reconcile_tests.rs
 │   │   ├── steering.rs
@@ -772,6 +795,7 @@ src/
 │   │   ├── tmux_restart_handoff.rs
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
+│   │   ├── tui_busy_gate.rs
 │   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
 │   │   ├── tui_prompt_relay_controller_cutover.rs
@@ -897,6 +921,8 @@ src/
 │   ├── tui_prompt_dedupe/
 │   │   └── synthetic_prompt.rs
 │   ├── turn_orchestrator/
+│   │   ├── dispatch_reservation.rs
+│   │   ├── pending_queue_persistence.rs
 │   │   └── registry_purge.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs

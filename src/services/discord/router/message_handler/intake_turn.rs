@@ -5,22 +5,11 @@ mod race_loss;
 mod turn_watchdog;
 mod voice_intake;
 
-/// #3182: the queue-pending reaction(s) to strip from a user message when its
-/// queued turn is dequeued and promoted to active.
-///
-/// The intake gate reacts a queued user message with `📬` (standalone queue
-/// head) or `➕` (merged into a previous head) via `queue_pending_reaction_for`.
-/// At the normal dequeue/promotion point (`handle_text_message`, `started==true`)
-/// we only know the head `user_msg_id`, not whether it carried `📬` or `➕`, so
-/// we attempt to remove BOTH candidates. Removing a reaction that was never
-/// added is a harmless no-op, and this mirrors the existing live-dispatch
-/// cleanup in `DiscordGateway::dispatch_queued_turn` (gateway.rs) and the
-/// queue-exit drain (mod.rs), both of which remove `📬` and `➕` together.
-///
-/// Returned as a fixed array so the emoji set is unit-testable without driving
-/// the full async intake path.
-pub(super) const fn queue_pending_reactions_to_clear() -> [char; 2] {
-    ['📬', '➕']
+/// Queue-marker reactions to strip when a queued turn is promoted to active.
+/// The promotion point only knows the head message id, so it clears every
+/// marker the queue gate can add (standalone, merged, and reconcile-gate).
+pub(super) const fn queue_pending_reactions_to_clear() -> [char; 3] {
+    super::super::super::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS
 }
 
 /// Bundle of Discord-runtime dependencies that `handle_text_message`
@@ -1319,6 +1308,10 @@ pub(in crate::services::discord) async fn handle_text_message(
     )
     .await;
 
+    // #3813 Phase 1a: intake latency span anchor (turn claimed; observation-only
+    // — see latency_spans.rs). Never `.log()`'d on the early returns below.
+    let mut intake_latency = super::latency_spans::IntakeLatencySpans::turn_claimed();
+
     if started
         && let Some(stale) =
             super::super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)
@@ -1648,6 +1641,8 @@ pub(in crate::services::discord) async fn handle_text_message(
             }
         }
     };
+    // #3813 Phase 1a: the intake placeholder POST returned a live id.
+    intake_latency.mark_placeholder_posted();
     crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
     shared
         .turn_start_times
@@ -1857,6 +1852,9 @@ pub(in crate::services::discord) async fn handle_text_message(
         );
     }
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
+    // #3813 Phase 1a: prompt prep complete — this mark sits INSIDE the
+    // `[prompt-prep]` window below (overlaps it; do not sum — see latency_spans.rs).
+    intake_latency.mark_prep_done();
     let memory_backend_label = memory_settings.backend.as_str();
     let provider_label = match &provider {
         ProviderKind::Claude => "claude",
@@ -2083,6 +2081,16 @@ pub(in crate::services::discord) async fn handle_text_message(
                         );
                     }
                 }
+                // #3813 Phase 3 (§4 / AC#6): make the safe up-to-45s readiness
+                // wait visible so it doesn't look like a stalled session start.
+                // Borrow before `wait_readiness` moves into spawn_blocking below.
+                let _ = super::super::super::http::edit_channel_message(
+                    http,
+                    channel_id,
+                    placeholder_msg_id,
+                    readiness_wait_compact_status(&wait_readiness),
+                )
+                .await;
                 let wait_result =
                     tokio::task::spawn_blocking(move || {
                         match wait_readiness {
@@ -2413,6 +2421,10 @@ pub(in crate::services::discord) async fn handle_text_message(
             .cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         super::super::super::clear_watchdog_deadline_override(channel_id.get()).await;
+        // #3813 Phase 1a: prep done but input deferred pre-submit (TUI busy) —
+        // emit the partial span (input/total render `-`); the retry re-enters
+        // intake and emits its own `submitted` span.
+        intake_latency.log(channel_id.get(), provider_label, "deferred_busy");
         return Ok(());
     }
     #[cfg(unix)]
@@ -2738,6 +2750,8 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     });
 
+    // #3813 Phase 1a: provider input is about to be handed to the turn bridge.
+    intake_latency.mark_input_written();
     spawn_turn_bridge(
         shared.clone(),
         cancel_token.clone(),
@@ -2787,6 +2801,9 @@ pub(in crate::services::discord) async fn handle_text_message(
         },
     );
 
+    // #3813 Phase 1a: full intake span complete — emit the structured line + event.
+    intake_latency.log(channel_id.get(), provider_label, "submitted");
+
     if let Some(rx) = completion_rx {
         rx.await
             .map_err(|_| "queued turn completion wait failed".to_string())?;
@@ -2799,13 +2816,8 @@ pub(in crate::services::discord) async fn handle_text_message(
 mod queue_pending_reaction_clear_tests {
     use super::*;
 
-    /// #3182: the dequeue cleanup must attempt to remove BOTH queue-pending
-    /// reactions — `📬` (standalone head) and `➕` (merged) — because the
-    /// promotion point only knows the head message id, not which emoji it
-    /// carried. This guards against a regression that drops one (which would
-    /// re-strand the other variant, as in the original bug).
     #[test]
-    fn clears_both_standalone_and_merged_queue_reactions() {
+    fn clears_every_queue_marker_reaction() {
         let emojis = queue_pending_reactions_to_clear();
         assert!(
             emojis.contains(&'📬'),
@@ -2815,10 +2827,14 @@ mod queue_pending_reaction_clear_tests {
             emojis.contains(&'➕'),
             "merged queue ➕ must be cleared on dequeue"
         );
+        assert!(
+            emojis.contains(&'🔄'),
+            "reconcile queue 🔄 must be cleared on dequeue"
+        );
         assert_eq!(
             emojis.len(),
-            2,
-            "exactly the two intake-gate queue-pending emojis are cleared"
+            crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS.len(),
+            "exactly the shared queue-pending emojis are cleared"
         );
     }
 

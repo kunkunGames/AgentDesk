@@ -55,6 +55,13 @@ pub(in crate::services::discord) struct PlaceholderState {
         Arc<placeholder_live_events::PlaceholderLiveEvents>,
     pub(in crate::services::discord) placeholder_live_events_enabled: bool,
     pub(in crate::services::discord) status_panel_v2_enabled: bool,
+    /// #3805 P2: two-message panel rollout gate copied from
+    /// `placeholder.two_message_panel_enabled` at boot. Default OFF. PR-B wires
+    /// the SINK read: when ON the bridge creates the status panel as a NEW
+    /// message BELOW the answer (answer-first layout) via
+    /// `turn_bridge::two_message_panel`; when OFF the single-message path is
+    /// byte-identical. Later stages extend the same gate to re-anchor/recovery.
+    pub(in crate::services::discord) two_message_panel_enabled: bool,
 }
 
 /// #3038 cluster G — runtime Discord HTTP cache.
@@ -646,6 +653,11 @@ pub(in crate::services) struct RestartLifecycle {
     pub(in crate::services) reconcile_done: Arc<std::sync::atomic::AtomicBool>,
     /// Number of queued deferred idle-queue kickoffs waiting to run.
     pub(in crate::services) deferred_hook_backlog: std::sync::atomic::AtomicUsize,
+    /// Per-channel live deferred idle-queue kickoff guard. A channel may have at
+    /// most one fast/slow deferred drain task active; the task removes its entry
+    /// when its backlog guard drops.
+    pub(in crate::services) deferred_hook_channels:
+        dashmap::DashMap<ChannelId, Arc<tokio::sync::Notify>>,
     /// When this provider started reconcile/recovery for the current boot.
     pub(in crate::services) recovery_started_at: std::time::Instant,
     /// Captured reconcile/recovery duration for the current boot in milliseconds.

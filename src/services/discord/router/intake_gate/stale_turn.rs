@@ -154,7 +154,7 @@ pub(super) async fn thread_guard_should_force_clean_stale_thread(
 pub(super) async fn thread_guard_force_clean_stale_thread(
     shared: &std::sync::Arc<SharedData>,
     provider: &ProviderKind,
-    parent_channel_id: serenity::ChannelId,
+    _parent_channel_id: serenity::ChannelId,
     thread_id: serenity::ChannelId,
 ) {
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -162,7 +162,15 @@ pub(super) async fn thread_guard_force_clean_stale_thread(
         "  [{ts}] 🔓 THREAD-GUARD: stale inflight detected for thread {}, cleaning up and proceeding",
         thread_id
     );
-    shared.dispatch.thread_parents.remove(&parent_channel_id);
+    let thread_parent_kickoffs =
+        crate::services::discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(
+            shared, thread_id,
+        );
+    crate::services::discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+        shared,
+        provider,
+        thread_parent_kickoffs,
+    );
     crate::services::discord::inflight::delete_inflight_state_file(provider, thread_id.get());
     let cleared = mailbox_clear_channel(shared, provider, thread_id).await;
     crate::services::discord::stall_recovery::finalize_orphaned_clear(
@@ -221,10 +229,15 @@ async fn release_queue_blocked_stale_active_turn(
         finish.removed_token,
         "1456_queue_blocked_stale_proof",
     );
-    shared
-        .dispatch
-        .thread_parents
-        .retain(|_, thread_id| *thread_id != channel_id);
+    let thread_parent_kickoffs =
+        crate::services::discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(
+            shared, channel_id,
+        );
+    crate::services::discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+        shared,
+        provider,
+        thread_parent_kickoffs,
+    );
     if !finish.has_pending {
         shared.dispatch.role_overrides.remove(&channel_id);
     }
@@ -382,6 +395,8 @@ mod thread_guard_stale_pure_tests {
             has_pending_queue: false,
             mailbox_active_user_msg_id: Some(user_msg_id),
             inflight_terminal_delivery_committed: false,
+            inflight_identity: None,
+            inflight_finalizer_turn_id: None,
             relay_stall_state,
             relay_health,
         }

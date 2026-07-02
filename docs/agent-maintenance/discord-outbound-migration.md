@@ -40,6 +40,8 @@ Last refreshed: 2026-06-16 (against `main` @ `8ec7336e32eb6ef89e1143fab2543f2fc6
 >
 > Last refreshed: 2026-06-29 (#3809 — idle-recap relay diagnostics add a READ-ONLY current-generation delivered-frontier report path in `outbound/delivery_frontier_probe.rs`. `outbound/delivery_record.rs` only widens existing internal read primitives (`delivery_record_path`, `read_record_at`, generation guard, generation mtime) so the probe can reuse the same trusted durable frontier without adding a writer, retry, cleanup, delivery API, or direct-send callsite. The production callsite coverage map is unchanged).
 >
+> Last refreshed: 2026-07-01 (#3794 — turn-output controller rollout closeout. All six owner cutovers (A2b sink, A3 standby, A4 watcher, A5 turn_bridge, A6a recovery, A6b tui_prompt_relay) are wired behind their `AGENTDESK_*_CONTROLLER` flags; every flag is compiled default OFF (byte-identical legacy → per-owner rollback lever), while the release `~/.adk/release/config/launchd.env` forces all six `=1` so the controller path is effective on every release node. Release health now reports the effective per-node rollout as `turn_output_controller_rollout` in `outbound/turn_output_controller_rollout_health.rs` (read-only, side-effect-free env snapshot mirroring the #3746 `delivery_record_rollout` pattern; preserved on the public `/api/health` allowlist): per-owner `enabled`, `enabled_count`, and `effective_authority` of `controller`/`mixed`/`legacy`. NO controller path, default, or flip changed — the excluded arms (empty body, no cutover range, long-chunk/new-message, TUI-gate) stay legacy until the Phase-B excluded-arm migration, so the legacy branches are not vestigial and are not removed. Additive observability only).
+>
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
 This is the single source of truth for "where is each Discord outbound callsite
@@ -72,15 +74,26 @@ HTTP path.
 | **v3 delivery** `deliver_outbound<C>(...)` | `outbound/delivery.rs:46` | active | Executes the v3 message/policy/decision/result contract. Accepts an optional `CancelToken`; split delivery records ordered chunk metadata and duplicate replay preserves it. Success paths record the reservation; terminal skip/permanent-failure paths explicitly release it before returning. |
 | `DiscordOutboundClient`, `HttpOutboundClient`, `OutboundDeduper` | `outbound/transport.rs` | active | Transport trait, HTTP client, fingerprint helper, and in-memory dedup store with atomic `reserve` / in-flight wait semantics over the lookup -> send -> record/release window. v3 stores serialized `Vec<DeliveredMessage>`. |
 | `shared_outbound_deduper()` | `outbound/mod.rs` | active | Process-wide in-memory deduper shared by migrated producers once they have built a structured outbound delivery key. This is only the final in-process duplicate-send guard; durable SQL outbox uniqueness still belongs to the `message_outbox` enqueue/claim path. |
-| **turn-output controller** `deliver_turn_output<G, L>(...)` | `outbound/turn_output_controller.rs` | **first live owner wired: `session_relay_sink` short-replace, flag-gated (#3089 A2b)** | The single delivery entry point Phase A will route all seven turn-output surfaces through (sink / standby / watcher / turn_bridge / recovery / tui_prompt_relay). A2b cuts the FIRST owner over: `session_relay_sink`'s short-replace branch behind `AGENTDESK_SINK_SHORT_REPLACE_CONTROLLER` (default OFF → byte-identical legacy; the other six owners stay legacy). Owns lease `commit`+advance inline before any post-send await (I1), never advances on ambiguous/partial transport (I2), maps `ReplaceLongMessageOutcome::PartialContinuationFailure` to non-advance, and drives the live placeholder card to its terminal state via `PlaceholderController.transition` with the explicit `EditFailPlaceholderPolicy` (#2757) fence. The held lease is now RAII-released on future cancel/panic via the internal `ControllerLeaseGuard` (review-fix H1 r2), matching legacy `SinkDeliveryLeaseGuard::Drop`. The `DeliveryLease` trait abstracts the frozen #3041 `DeliveryLeaseCell` so the controller's commit invariants are mutation-tested. |
+| **turn-output controller** `deliver_turn_output<G, L>(...)` | `outbound/turn_output_controller.rs` | **all six owners wired + flag-gated (#3089 A2b–A6b); release `launchd.env` forces all six flags ON on every node; compiled default OFF is the per-owner rollback lever** | The single delivery entry point routes the turn-output surfaces through the controller (sink / standby / watcher / turn_bridge / recovery / tui_prompt_relay). All six owner cutovers are wired behind their `AGENTDESK_*_CONTROLLER` flags (A2b sink, A3 standby, A4 watcher, A5 turn_bridge, A6a recovery, A6b tui_prompt_relay). Each flag is **compiled default OFF → byte-identical legacy** so unsetting it is a per-owner rollback lever, but the release `~/.adk/release/config/launchd.env` sets all six `=1`, so on every release node the controller path is effective. Even when a flag is ON only the common short-replace arm leaves legacy; the intentionally-scoped **excluded arms** (empty body, no cutover range, long-chunk/new-message, TUI-gate) still route the legacy `else` and remain until the Phase-B excluded-arm migration (see §3). A2b (`session_relay_sink` short-replace) owns lease `commit`+advance inline before any post-send await (I1), never advances on ambiguous/partial transport (I2), maps `ReplaceLongMessageOutcome::PartialContinuationFailure` to non-advance, and drives the live placeholder card to its terminal state via `PlaceholderController.transition` with the explicit `EditFailPlaceholderPolicy` (#2757) fence. The held lease is RAII-released on future cancel/panic via the internal `ControllerLeaseGuard` (review-fix H1 r2), matching legacy `SinkDeliveryLeaseGuard::Drop`. The `DeliveryLease` trait abstracts the frozen #3041 `DeliveryLeaseCell` so the controller's commit invariants are mutation-tested. Release health surfaces the effective per-node rollout as `turn_output_controller_rollout` (#3794, read-only). |
 
 `outbound/mod.rs` re-exports the v3 message/policy/result and shared
 transport primitives. New production callsites should import
 `outbound::delivery::deliver_outbound` explicitly.
 
 The turn-output controller (`outbound/turn_output_controller.rs`, #3089) now has
-its FIRST live owner: the `session_relay_sink` short-replace branch, flag-gated
-(A2b, default OFF). The remaining owners cut over in §3 (A3–A6b).
+**all six owner cutovers wired** (A2b sink, A3 standby, A4 watcher, A5 turn_bridge,
+A6a recovery, A6b tui_prompt_relay), each behind its own `AGENTDESK_*_CONTROLLER`
+flag. Every flag is **compiled default OFF** (byte-identical legacy → per-owner
+rollback lever), but the release `~/.adk/release/config/launchd.env` sets all six
+`=1`, so on every release node the controller path is the effective delivery
+authority. A flag ON only moves the common short-replace arm off legacy; the
+scoped **excluded arms** (empty body, no cutover range, long-chunk/new-message,
+TUI-gate) still route the legacy `else` and stay there until the Phase-B
+excluded-arm migration, so the legacy branches are not yet vestigial. Release
+health reports the effective per-node rollout under `turn_output_controller_rollout`
+(#3794, read-only): per-owner `enabled`, `enabled_count`, and an
+`effective_authority` of `controller` / `mixed` / `legacy` so operators can detect
+a node that is missing an env override.
 
 ---
 
@@ -400,3 +413,95 @@ Expected counts as of the #1457 refresh:
   placeholder sends/edits).
 - legacy-facade production callsites and explicit compatibility shims still
   remain; migrate them in the order above.
+
+---
+
+## 8. Turn-output controller compiled-default flip — decision matrix (#3794 D3)
+
+> Last refreshed: 2026-07-01 (#3794 D3 — compiled-default flip decision matrix +
+> Phase-B tracking issue #3998. No code / default / flip changed; docs-only.)
+
+**Scope.** #3794 D1 (release-health `turn_output_controller_rollout` read-only
+exposure) and D2 (this page's rollout-state sync) landed in PR #3994. D3 is the
+remaining decision: should the six `AGENTDESK_*_CONTROLLER` flags be flipped from
+**compiled default OFF to compiled default ON**? This section records that
+decision. The Phase-B follow-up is tracked in **#3998**.
+
+**What "flip" means precisely.** Each owner getter today returns `false` when its
+env var is unset (`std::env::var(FLAG) … is_some_and(v == "1" || "true")`, with
+telemetry emitted *only* when ON so the default-OFF first evaluation is a
+byte-identical / deploy no-op). A "flip" changes that default so an unset var
+returns `true` (controller path), inverting the rollback semantics from
+"unset → legacy" to "must set `=0` → legacy". It does **not** delete any legacy
+code: even with a flag ON, only the common short-replace arm leaves legacy — the
+scoped excluded arms still route the legacy `else` (see §1 / §3).
+
+### 8.1 Current state (post-#3794 D1/D2)
+
+- Six owner getters, all **compiled default OFF** — `session_relay_sink.rs:57`,
+  `standby_relay.rs:51`, `tmux_watcher/terminal_send.rs:34`,
+  `turn_bridge/terminal_controller_cutover.rs:36`,
+  `recovery_paths/controller_cutover.rs:77`,
+  `tui_prompt_relay_controller_cutover.rs:78`.
+- Release `~/.adk/release/config/launchd.env` forces all six `=1`, so the
+  controller path is **already the effective delivery authority on every release
+  node**.
+- Read-only per-node rollout is reported under `turn_output_controller_rollout`
+  (`outbound/turn_output_controller_rollout_health.rs`, #3794 D1).
+- Excluded arms (empty body, no cutover range / `NoRange`, long-chunk /
+  new-message, TUI-gate) remain legacy by design.
+
+### 8.2 Per-flag flip evaluation
+
+| flag (owner) | flip runtime benefit | flip risk / blocker | decision |
+|---|---|---|---|
+| A2b `sink_short_replace` / A3 `standby_relay` | none — release already env-ON | loses the byte-identical rollback lever; excluded empty-body / `None`-range arms stay legacy | **DEFER** → couple with legacy retirement |
+| A4 `watcher_terminal` / A5 `turn_bridge_terminal` | none — release already env-ON | cleanest self-contained legacy-`else` deletion targets, but excluded arms (long-chunk / `NoRange` / no-placeholder / full-body / TUI-gate) must migrate into the controller first | **DEFER** → excluded-arm migration is the real blocker |
+| A6a `recovery_relay` | none — release already env-ON | #3297 recovery probe must survive; `None`-placeholder fresh-send stays legacy | **DEFER** |
+| A6b `tui_prompt_relay` | none — reuses the A5 path | no independent cutover | **DEFER** → retire with A5 |
+
+### 8.3 Why DEFER (flip cost/benefit)
+
+- **Benefit ≈ 0 on the surface it targets.** Release nodes already run the
+  controller via `launchd.env`; a compiled-default flip changes nothing there.
+  The only marginal gain is defense-in-depth for a node that *lost* its env
+  override — but "unset → known-good legacy" is precisely the safety property the
+  default-OFF lever provides, so the flip trades that away.
+- **Loses the clean rollback lever.** Today `unset env → byte-identical legacy`
+  is the safest rollback (no rebuild, no behavior delta). Compiled-default ON
+  makes rollback an explicit `=0` opt-out and removes the "unset = known-good"
+  guarantee.
+- **Does not complete #3089 single-authority.** The excluded-arm legacy `else`
+  branches survive a flip, so the flip alone cannot retire legacy — it is only
+  worth taking **coupled with legacy retirement** once the excluded arms are
+  migrated.
+- **CI OFF-assumption tests go red.** Six default-OFF assertions guard the
+  byte-identical-legacy contract (`if env::var_os(FLAG).is_none() {
+  assert!(!..._enabled()) }`). A naive flip inverts their premise and turns them
+  red; they must be re-authored (assert the new default + add `=0`-opt-out
+  coverage), not silently deleted.
+
+This mirrors #3933, which deferred the `AGENTDESK_DELIVERY_RECORD_AUTHORITY`
+default-ON flip until the combined flag was split / the enforce guard made
+precise.
+
+### 8.4 Phase-B GO conditions (tracked in #3998)
+
+The flip becomes a real single-authority win only when coupled with legacy
+retirement. Before flipping:
+
+1. **Excluded-arm migration** — migrate each owner's excluded arms into the
+   controller so a flag ON = full single-authority for that owner (A4/A5 `else`
+   are the cleanest targets; A6a keeps the #3297 probe; A6b retires with A5).
+2. **CI-wide OFF-assumption audit** — invert/re-author the six default-OFF
+   assertions and audit any other dev/CI default-OFF assumptions.
+3. **Release soak evidence** — record duplicate-relay / missed-terminal-body
+   metrics via `turn_output_controller_rollout` across a soak window (env-ON is
+   behaviorally identical to compiled-ON, so the soak transfers).
+4. **Then** flip compiled default OFF→ON **and delete the now-vestigial legacy
+   `else` branches in the same slice**, keeping `=0` as the explicit rollback
+   opt-out.
+
+**Recommendation: DEFER the compiled-default flip; fold it into the Phase-B
+excluded-arm migration + legacy retirement (#3998).** Do not flip standalone —
+it costs the rollback lever for no runtime gain.

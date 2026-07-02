@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use poise::serenity_prelude::{ChannelId, MessageId};
+use poise::serenity_prelude as serenity;
 use serde::Serialize;
+use serenity::{ChannelId, MessageId};
 
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::discord::{self as discord, SharedData};
@@ -47,6 +48,14 @@ pub struct IdleTmuxStaleTurnRepairResult {
     pub runtime_session_cleared: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IdleTmuxStaleTurnInflightPin {
+    identity: discord::inflight::InflightTurnIdentity,
+    finalizer_turn_id: u64,
+    updated_at: String,
+    save_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderMailboxState {
     pub channel_id: u64,
@@ -69,30 +78,86 @@ async fn shared_for_provider(
         .await
 }
 
+async fn owning_runtime_http_for_channel(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> Option<Arc<serenity::http::Http>> {
+    shared_for_provider(registry, provider, channel_id)
+        .await
+        .and_then(|shared| shared.serenity_http_or_token_fallback())
+}
+
 fn idle_tmux_repair_ready_for_input(
     provider: &ProviderKind,
     channel_id: u64,
     tmux_session: &str,
 ) -> bool {
-    let structured_ready = super::super::inflight::load_inflight_state(provider, channel_id)
-        .and_then(|state| {
-            let output_path = state
-                .output_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|path| !path.is_empty())?;
-            crate::services::tui_turn_state::jsonl_ready_for_input(
-                provider,
-                state.runtime_kind,
-                std::path::Path::new(output_path),
-                Some(state.last_offset),
-            )
-        });
-    structured_ready
-        .map(crate::services::tui_turn_state::TuiReadyState::is_ready)
-        .unwrap_or_else(|| {
-            crate::services::provider::tmux_session_ready_for_input(tmux_session, provider)
-        })
+    super::super::relay_recovery::idle_tmux_repair_ready_for_input(
+        provider,
+        channel_id,
+        tmux_session,
+    )
+}
+
+fn capture_idle_tmux_stale_turn_inflight_pin(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<IdleTmuxStaleTurnInflightPin> {
+    let state = discord::inflight::load_inflight_state(provider, channel_id)?;
+    let finalizer_turn_id = state.effective_finalizer_turn_id();
+    (finalizer_turn_id != 0).then(|| IdleTmuxStaleTurnInflightPin {
+        identity: discord::inflight::InflightTurnIdentity::from_state(&state),
+        finalizer_turn_id,
+        updated_at: state.updated_at,
+        save_generation: state.save_generation,
+    })
+}
+
+fn clear_idle_tmux_stale_turn_inflight_if_pinned(
+    provider: &ProviderKind,
+    channel_id: u64,
+    pin: Option<&IdleTmuxStaleTurnInflightPin>,
+) -> bool {
+    let Some(pin) = pin else {
+        return false;
+    };
+    let outcome = discord::inflight::clear_inflight_state_if_matches_identity_generation(
+        provider,
+        channel_id,
+        &pin.identity,
+        pin.finalizer_turn_id,
+        &pin.updated_at,
+        pin.save_generation,
+    );
+    match outcome {
+        discord::inflight::GuardedClearOutcome::Cleared => true,
+        discord::inflight::GuardedClearOutcome::Missing => false,
+        other => {
+            let current = discord::inflight::load_inflight_state(provider, channel_id);
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id,
+                clear_outcome = ?other,
+                expected_user_msg_id = pin.identity.user_msg_id,
+                expected_finalizer_turn_id = pin.finalizer_turn_id,
+                expected_updated_at = %pin.updated_at,
+                expected_save_generation = pin.save_generation,
+                current_user_msg_id = current.as_ref().map(|state| state.user_msg_id).unwrap_or(0),
+                current_finalizer_turn_id = current
+                    .as_ref()
+                    .map(|state| state.effective_finalizer_turn_id())
+                    .unwrap_or(0),
+                current_updated_at = %current
+                    .as_ref()
+                    .map(|state| state.updated_at.as_str())
+                    .unwrap_or("<missing>"),
+                current_save_generation = current.as_ref().map(|state| state.save_generation).unwrap_or(0),
+                "idle tmux stale-turn repair skipped persistent inflight clear because the readiness-time pin no longer matches"
+            );
+            false
+        }
+    }
 }
 
 fn preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
@@ -622,10 +687,13 @@ async fn apply_runtime_hard_stop_cleanup(
     }
 
     discord::clear_watchdog_deadline_override(channel_id.get()).await;
-    shared
-        .dispatch
-        .thread_parents
-        .retain(|_, thread| *thread != channel_id);
+    let thread_parent_kickoffs =
+        discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(shared, channel_id);
+    discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+        shared,
+        provider,
+        thread_parent_kickoffs,
+    );
     shared.restart.recovering_channels.remove(&channel_id);
     shared.turn_start_times.remove(&channel_id);
 
@@ -659,6 +727,158 @@ async fn apply_runtime_hard_stop_cleanup(
     runtime_session_cleared
 }
 
+async fn apply_runtime_hard_stop_finalizer_cleanup_pre_release(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    has_pending: bool,
+    pinned_tmux_session_name: Option<&str>,
+    stop_watcher: bool,
+) -> bool {
+    discord::clear_watchdog_deadline_override(channel_id.get()).await;
+    let thread_parent_kickoffs =
+        discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(shared, channel_id);
+    discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+        shared,
+        provider,
+        thread_parent_kickoffs,
+    );
+    shared.restart.recovering_channels.remove(&channel_id);
+    shared.turn_start_times.remove(&channel_id);
+
+    if !has_pending {
+        shared.dispatch.role_overrides.remove(&channel_id);
+    }
+
+    if stop_watcher {
+        stop_hard_stop_cleanup_watcher_if_current(shared, channel_id, pinned_tmux_session_name);
+    }
+
+    {
+        let mut data = shared.core.lock().await;
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            session.clear_provider_session();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn stop_hard_stop_cleanup_watcher_if_current(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    pinned_tmux_session_name: Option<&str>,
+) -> bool {
+    let Some(pinned_tmux_session_name) = pinned_tmux_session_name else {
+        tracing::info!(
+            channel_id = channel_id.get(),
+            "STALL-WATCHDOG: skipped hard-stop watcher cleanup because pinned tmux session is missing"
+        );
+        return false;
+    };
+
+    let guard = discord::lock_tmux_watcher_registry();
+    let current_tmux_session_name = shared
+        .tmux_watchers
+        .channel_binding(&channel_id)
+        .map(|binding| binding.tmux_session_name);
+    if current_tmux_session_name.as_deref() != Some(pinned_tmux_session_name) {
+        tracing::info!(
+            channel_id = channel_id.get(),
+            pinned_tmux_session = pinned_tmux_session_name,
+            current_tmux_session = current_tmux_session_name.as_deref(),
+            "STALL-WATCHDOG: skipped hard-stop watcher cleanup because channel watcher identity changed"
+        );
+        return false;
+    }
+    let Some((_, watcher)) = shared.tmux_watchers.remove_locked(&guard, &channel_id) else {
+        return false;
+    };
+    watcher.cancel.store(true, Ordering::Relaxed);
+    true
+}
+
+async fn cleanup_then_submit_explicit_background_watchdog_cancel<Submit, SubmitFuture>(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    revalidated: &ExplicitBackgroundWatchdogClear,
+    pinned_tmux_session_name: Option<&str>,
+    submit_terminal: Submit,
+) -> bool
+where
+    Submit: FnOnce() -> SubmitFuture,
+    SubmitFuture: std::future::Future<Output = discord::turn_finalizer::FinalizeOutcome>,
+{
+    debug_assert_eq!(
+        revalidated.clear_outcome,
+        discord::inflight::GuardedClearOutcome::Cleared
+    );
+    let pre_release_has_pending = !shared
+        .mailbox(channel_id)
+        .snapshot()
+        .await
+        .intervention_queue
+        .is_empty();
+    let _runtime_session_cleared = apply_runtime_hard_stop_finalizer_cleanup_pre_release(
+        shared,
+        provider,
+        channel_id,
+        pre_release_has_pending,
+        pinned_tmux_session_name,
+        true,
+    )
+    .await;
+    let outcome = submit_terminal().await;
+    match outcome {
+        discord::turn_finalizer::FinalizeOutcome::Finalized { has_pending, .. } => has_pending,
+        discord::turn_finalizer::FinalizeOutcome::AlreadyFinalized
+        | discord::turn_finalizer::FinalizeOutcome::Deferred => pre_release_has_pending,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExplicitBackgroundWatchdogClear {
+    clear_outcome: discord::inflight::GuardedClearOutcome,
+    pending_hourglass_user_msg_id: Option<u64>,
+    finalizer_turn_id: u64,
+}
+
+fn revalidate_and_clear_explicit_background_inflight(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    snapshot_identity: Option<&discord::inflight::InflightTurnIdentity>,
+    snapshot_finalizer_turn_id: Option<u64>,
+) -> ExplicitBackgroundWatchdogClear {
+    let Some(snapshot_identity) = snapshot_identity else {
+        return ExplicitBackgroundWatchdogClear {
+            clear_outcome: discord::inflight::GuardedClearOutcome::Missing,
+            pending_hourglass_user_msg_id: None,
+            finalizer_turn_id: 0,
+        };
+    };
+    let finalizer_turn_id = snapshot_finalizer_turn_id.unwrap_or(snapshot_identity.user_msg_id);
+    if finalizer_turn_id == 0 {
+        return ExplicitBackgroundWatchdogClear {
+            clear_outcome: discord::inflight::GuardedClearOutcome::UserMsgMismatch,
+            pending_hourglass_user_msg_id: None,
+            finalizer_turn_id,
+        };
+    }
+    let clear_outcome = discord::inflight::clear_inflight_state_if_matches_identity(
+        provider,
+        channel_id.get(),
+        snapshot_identity,
+    );
+    ExplicitBackgroundWatchdogClear {
+        clear_outcome,
+        pending_hourglass_user_msg_id: (snapshot_identity.user_msg_id != 0)
+            .then_some(snapshot_identity.user_msg_id),
+        finalizer_turn_id,
+    }
+}
+
 pub async fn hard_stop_runtime_turn(
     registry: Option<&HealthRegistry>,
     provider_name: Option<&str>,
@@ -688,6 +908,7 @@ pub async fn clear_idle_tmux_stale_turn(
     if !idle_tmux_repair_ready_for_input(&provider, channel_id, tmux_session) {
         return None;
     }
+    let inflight_pin = capture_idle_tmux_stale_turn_inflight_pin(&provider, channel_id);
 
     let channel_id = ChannelId::new(channel_id);
     let shared = shared_for_provider(registry, &provider, channel_id).await?;
@@ -701,7 +922,11 @@ pub async fn clear_idle_tmux_stale_turn(
         false,
     )
     .await;
-    let persistent_inflight_cleared = discord::clear_inflight_state(&provider, channel_id.get());
+    let persistent_inflight_cleared = clear_idle_tmux_stale_turn_inflight_if_pinned(
+        &provider,
+        channel_id.get(),
+        inflight_pin.as_ref(),
+    );
 
     Some(IdleTmuxStaleTurnRepairResult {
         had_active_turn: finish.removed_token.is_some(),
@@ -1421,22 +1646,50 @@ pub(crate) async fn run_stall_watchdog_pass(
                 "  [{ts}] ⚡ STALL-WATCHDOG: forced cleanup for orphan explicit background work in channel {}",
                 channel_id
             );
-            let pending_hourglass_user_msg_id =
-                discord::inflight::load_inflight_state(provider, channel_id.get())
-                    .filter(|state| state.user_msg_id != 0)
-                    .map(|state| state.user_msg_id);
-            discord::inflight::delete_inflight_state_file(provider, channel_id.get());
-            let finish = discord::mailbox_finish_turn(&shared, provider, channel_id).await;
-            apply_runtime_hard_stop_cleanup(
+            let revalidated = revalidate_and_clear_explicit_background_inflight(
+                provider,
+                channel_id,
+                snapshot.inflight_identity.as_ref(),
+                snapshot.inflight_finalizer_turn_id,
+            );
+            if revalidated.clear_outcome != discord::inflight::GuardedClearOutcome::Cleared {
+                tracing::info!(
+                    provider = %provider.as_str(),
+                    channel_id = channel_id.get(),
+                    clear_outcome = ?revalidated.clear_outcome,
+                    "STALL-WATCHDOG: skipped orphan explicit background cleanup because inflight identity changed before the destructive clear"
+                );
+                continue;
+            }
+            let finalizer_turn_id = revalidated.finalizer_turn_id;
+            let generation = shared.restart.current_generation;
+            let shared_for_submit = shared.clone();
+            let provider_for_submit = provider.clone();
+            let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
                 &shared,
                 provider,
                 channel_id,
-                &finish,
-                "2967_orphan_explicit_background_watchdog",
-                true,
+                &revalidated,
+                snapshot.tmux_session.as_deref(),
+                move || async move {
+                    shared_for_submit
+                        .turn_finalizer
+                        .submit_terminal(
+                            discord::turn_finalizer::TurnKey::new(
+                                channel_id,
+                                finalizer_turn_id,
+                                generation,
+                            ),
+                            provider_for_submit,
+                            discord::turn_finalizer::TerminalEvent::Cancel,
+                            discord::turn_finalizer::FinalizeContext::monitor(),
+                            shared_for_submit.clone(),
+                        )
+                        .await
+                },
             )
             .await;
-            if !finish.has_pending {
+            if !has_pending {
                 let hydrate = hydrate_pending_queue_from_disk(&shared, provider, channel_id).await;
                 if hydrate.queue_len_after > 0 && hydrate.persistence_error.is_none() {
                     discord::schedule_deferred_idle_queue_kickoff(
@@ -1447,8 +1700,25 @@ pub(crate) async fn run_stall_watchdog_pass(
                     );
                 }
             }
-            if let Some(user_msg_id) = pending_hourglass_user_msg_id
-                && let Ok(http) = super::resolve_bot_http(registry, provider.as_str()).await
+            crate::services::observability::emit_inflight_lifecycle_event(
+                provider.as_str(),
+                channel_id.get(),
+                None,
+                None,
+                Some(&format!(
+                    "discord:{}:{}",
+                    channel_id.get(),
+                    revalidated.finalizer_turn_id
+                )),
+                "cleared_by_explicit_background_watchdog",
+                serde_json::json!({
+                    "clear_outcome": format!("{:?}", revalidated.clear_outcome),
+                    "finalizer_turn_id": revalidated.finalizer_turn_id,
+                }),
+            );
+            if let Some(user_msg_id) = revalidated.pending_hourglass_user_msg_id
+                && let Some(http) =
+                    owning_runtime_http_for_channel(registry, provider, channel_id).await
             {
                 discord::formatting::remove_reaction_raw(
                     &http,
@@ -1706,12 +1976,16 @@ pub(crate) async fn run_stall_watchdog_pass(
             now_unix_secs,
         )
         .await;
-        shared
-            .dispatch
-            .thread_parents
-            .retain(|_, thread_id| *thread_id != channel_id);
+        let thread_parent_kickoffs =
+            discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(&shared, channel_id);
+        discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+            &shared,
+            provider,
+            thread_parent_kickoffs,
+        );
         if let Some(user_msg_id) = pending_hourglass_user_msg_id
-            && let Ok(http) = super::resolve_bot_http(registry, provider.as_str()).await
+            && let Some(http) =
+                owning_runtime_http_for_channel(registry, provider, channel_id).await
         {
             discord::formatting::remove_reaction_raw(&http, channel_id, user_msg_id.into(), '⏳')
                 .await;
@@ -1839,9 +2113,8 @@ async fn maybe_recover_completed_stale_leak(
     let mut confirmed_chunks =
         leak_recovery_confirmed_prefix_from_ledger(&ledger_identity).unwrap_or(0);
 
-    let http = match super::resolve_bot_http(registry, provider.as_str()).await {
-        Ok(http) => http,
-        Err(_) => return false,
+    let Some(http) = owning_runtime_http_for_channel(registry, provider, channel_id).await else {
+        return false;
     };
 
     let current_msg_id = MessageId::new(state.current_msg_id);
@@ -2391,17 +2664,25 @@ mod stall_watchdog_pure_tests {
         leak_recovery_confirmed_prefix_from_ledger, leak_recovery_record_confirmed_chunk,
         leak_recovery_unrelayed_range, render_leak_recovery_delivery,
     };
-    use super::preserve_cancel_should_skip_provider_interrupt_for_idle_tui;
     use super::watchdog_decisions::{
         STALL_WATCHDOG_THRESHOLD_SECS, completed_stale_no_answer_orphan_should_clean,
         force_clean_should_preserve_resume_selector, inflight_completed_stale_leak_detected,
         stale_idle_foreground_queue_detected, stall_watchdog_should_force_clean,
         stall_watchdog_should_force_clean_orphan_explicit_background_work,
     };
+    use super::{
+        capture_idle_tmux_stale_turn_inflight_pin, clear_idle_tmux_stale_turn_inflight_if_pinned,
+        preserve_cancel_should_skip_provider_interrupt_for_idle_tui,
+        revalidate_and_clear_explicit_background_inflight,
+    };
+    use crate::services::discord::inflight::{
+        self, GuardedClearOutcome, InflightTurnIdentity, InflightTurnState,
+    };
     use crate::services::discord::relay_health::{RelayActiveTurn, RelayStallState};
     use crate::services::discord::{InflightRestartMode, TmuxCleanupPolicy};
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use poise::serenity_prelude::ChannelId;
     use std::ffi::OsString;
 
     struct EnvVarReset {
@@ -2739,6 +3020,119 @@ mod stall_watchdog_pure_tests {
             .expect("valid local time")
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()
+    }
+
+    #[test]
+    fn explicit_background_watchdog_abort_preserves_new_identity_after_snapshot() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_019_230_001);
+        let mut old = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            None,
+            1,
+            4_019_230_101,
+            4_019_230_101,
+            "old explicit background".to_string(),
+            Some("old-session".to_string()),
+            Some("AgentDesk-claude-r2-watchdog".to_string()),
+            Some("/tmp/r2-watchdog-old.jsonl".to_string()),
+            None,
+            10,
+        );
+        old.turn_start_offset = Some(10);
+        inflight::save_inflight_state(&old).expect("save old row");
+        let old_identity = InflightTurnIdentity::from_state(&old);
+        let old_finalizer_turn_id = old.effective_finalizer_turn_id();
+
+        let mut newer_same_message = old.clone();
+        newer_same_message.started_at = "2099-01-01 00:00:00".to_string();
+        newer_same_message.turn_start_offset = Some(99);
+        newer_same_message.session_id = Some("new-session".to_string());
+        inflight::save_inflight_state(&newer_same_message).expect("replace row");
+
+        let outcome = revalidate_and_clear_explicit_background_inflight(
+            &provider,
+            channel_id,
+            Some(&old_identity),
+            Some(old_finalizer_turn_id),
+        );
+
+        assert_eq!(outcome.clear_outcome, GuardedClearOutcome::UserMsgMismatch);
+        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
+            .expect("newer row must survive mismatch");
+        assert_eq!(persisted.started_at, "2099-01-01 00:00:00");
+        assert_eq!(persisted.turn_start_offset, Some(99));
+    }
+
+    #[test]
+    fn idle_tmux_stale_turn_clear_preserves_fresh_inflight_after_finish_window() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_030_601);
+        let tmux_session = "AgentDesk-claude-stale-mailbox-toctou";
+        let mut stale = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            None,
+            1,
+            4_030_601_101,
+            4_030_601_102,
+            "stale idle turn".to_string(),
+            Some("stale-session".to_string()),
+            Some(tmux_session.to_string()),
+            Some("/tmp/agentdesk-stale-mailbox-toctou-t1.jsonl".to_string()),
+            None,
+            10,
+        );
+        stale.turn_start_offset = Some(10);
+        inflight::save_inflight_state(&stale).expect("save stale row");
+
+        let pin = capture_idle_tmux_stale_turn_inflight_pin(&provider, channel_id.get())
+            .expect("readiness-time pin");
+        assert_eq!(pin.identity.user_msg_id, 4_030_601_101);
+
+        let mut fresh = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            None,
+            1,
+            4_030_601_201,
+            4_030_601_202,
+            "fresh follow-up turn".to_string(),
+            Some("fresh-session".to_string()),
+            Some(tmux_session.to_string()),
+            Some("/tmp/agentdesk-stale-mailbox-toctou-t2.jsonl".to_string()),
+            None,
+            20,
+        );
+        fresh.turn_start_offset = Some(20);
+        inflight::save_inflight_state(&fresh).expect("save fresh row in finish-to-clear window");
+
+        assert!(!clear_idle_tmux_stale_turn_inflight_if_pinned(
+            &provider,
+            channel_id.get(),
+            Some(&pin),
+        ));
+        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
+            .expect("fresh row must survive guarded stale clear");
+        assert_eq!(persisted.user_msg_id, 4_030_601_201);
+        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
+        assert!(
+            persisted.save_generation > pin.save_generation,
+            "fresh row write must advance save_generation past the stale pin"
+        );
     }
 
     /// #3629: a completed-stale, no-unrelayed-answer row is cleaned ONLY when it
@@ -3545,12 +3939,37 @@ mod stall_watchdog_auto_heal_tests {
     use super::super::HealthRegistry;
     use crate::services::provider::{CancelToken, ProviderKind};
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
+    use std::ffi::OsString;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
+    struct EnvVarReset {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarReset {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarReset {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stall_watchdog_cleanup_releases_residual_orphan_pending_token() {
+        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
         let provider = ProviderKind::Codex;
         let registry = HealthRegistry::new();
         let shared = super::super::super::make_shared_data_for_tests();
@@ -3607,5 +4026,202 @@ mod stall_watchdog_auto_heal_tests {
         );
         assert!(token.cancelled.load(Ordering::Relaxed));
         assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod explicit_background_watchdog_cleanup_tests {
+    use super::{
+        ExplicitBackgroundWatchdogClear, cleanup_then_submit_explicit_background_watchdog_cancel,
+        stop_hard_stop_cleanup_watcher_if_current,
+    };
+    use crate::services::discord::inflight::GuardedClearOutcome;
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::ChannelId;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn watcher(
+        tmux_session_name: &str,
+        output_path: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> super::super::super::TmuxWatcherHandle {
+        super::super::super::TmuxWatcherHandle {
+            tmux_session_name: tmux_session_name.to_string(),
+            output_path: output_path.to_string(),
+            paused: Arc::new(AtomicBool::new(false)),
+            resume_offset: Arc::new(std::sync::Mutex::new(None)),
+            cancel,
+            pause_epoch: Arc::new(AtomicU64::new(0)),
+            turn_delivered: Arc::new(AtomicBool::new(false)),
+            last_heartbeat_ts_ms: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_background_cleanup_precedes_release_and_preserves_new_watcher() {
+        let shared = super::super::super::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_019_402_900);
+        let old_cancel = Arc::new(AtomicBool::new(false));
+        let new_cancel = Arc::new(AtomicBool::new(false));
+        shared.tmux_watchers.insert(
+            channel,
+            watcher(
+                "AgentDesk-codex-old-explicit-background",
+                "/tmp/agentdesk-old-explicit-background.jsonl",
+                old_cancel.clone(),
+            ),
+        );
+        let revalidated = ExplicitBackgroundWatchdogClear {
+            clear_outcome: GuardedClearOutcome::Cleared,
+            pending_hourglass_user_msg_id: Some(4_019_402_901),
+            finalizer_turn_id: 4_019_402_901,
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
+            &shared,
+            &ProviderKind::Codex,
+            channel,
+            &revalidated,
+            Some("AgentDesk-codex-old-explicit-background"),
+            {
+                let shared = shared.clone();
+                let old_cancel = old_cancel.clone();
+                let new_cancel = new_cancel.clone();
+                let order = order.clone();
+                move || async move {
+                    assert!(
+                        old_cancel.load(Ordering::Relaxed),
+                        "old watcher must be stopped before finalizer release"
+                    );
+                    assert!(
+                        !shared.tmux_watchers.contains_key(&channel),
+                        "old watcher must be removed before finalizer release"
+                    );
+                    order
+                        .lock()
+                        .expect("order lock")
+                        .extend(["cleanup", "finalizer_release"]);
+                    shared.tmux_watchers.insert(
+                        channel,
+                        watcher(
+                            "AgentDesk-codex-new-explicit-background",
+                            "/tmp/agentdesk-new-explicit-background.jsonl",
+                            new_cancel.clone(),
+                        ),
+                    );
+                    super::super::super::turn_finalizer::FinalizeOutcome::Finalized {
+                        removed_token: None,
+                        has_pending: false,
+                        mailbox_online: true,
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(!has_pending);
+        assert_eq!(
+            *order.lock().expect("order lock"),
+            ["cleanup", "finalizer_release"]
+        );
+        assert!(
+            shared.tmux_watchers.contains_key(&channel),
+            "watcher registered after finalizer release must survive pass completion"
+        );
+        let binding = shared
+            .tmux_watchers
+            .channel_binding(&channel)
+            .expect("new watcher binding");
+        assert_eq!(
+            binding.tmux_session_name,
+            "AgentDesk-codex-new-explicit-background"
+        );
+        assert!(!new_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn hard_stop_cleanup_watcher_stop_is_tmux_session_conditional() {
+        let shared = super::super::super::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_019_402_901);
+        let cancel = Arc::new(AtomicBool::new(false));
+        shared.tmux_watchers.insert(
+            channel,
+            watcher(
+                "AgentDesk-codex-current-turn",
+                "/tmp/agentdesk-current-turn.jsonl",
+                cancel.clone(),
+            ),
+        );
+
+        assert!(!stop_hard_stop_cleanup_watcher_if_current(
+            &shared,
+            channel,
+            Some("AgentDesk-codex-stalled-turn"),
+        ));
+        assert!(
+            shared.tmux_watchers.contains_key(&channel),
+            "mismatched current watcher must remain registered"
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        assert!(stop_hard_stop_cleanup_watcher_if_current(
+            &shared,
+            channel,
+            Some("AgentDesk-codex-current-turn"),
+        ));
+        assert!(!shared.tmux_watchers.contains_key(&channel));
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod owning_runtime_http_tests {
+    use super::super::HealthRegistry;
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::ChannelId;
+
+    #[tokio::test]
+    async fn owning_runtime_http_uses_channel_matched_runtime() {
+        let provider = ProviderKind::Claude;
+        let registry = HealthRegistry::new();
+        let first = super::super::super::make_shared_data_for_tests();
+        let second = super::super::super::make_shared_data_for_tests();
+        let first_channel = ChannelId::new(401_900_000_000_001);
+        let second_channel = ChannelId::new(401_900_000_000_002);
+
+        {
+            let mut settings = first.settings.write().await;
+            settings.allowed_channel_ids = vec![first_channel.get()];
+        }
+        {
+            let mut settings = second.settings.write().await;
+            settings.allowed_channel_ids = vec![second_channel.get()];
+        }
+        let _ = second
+            .http
+            .cached_bot_token
+            .set("test-owning-runtime-token".to_string());
+
+        registry
+            .register(provider.as_str().to_string(), first.clone())
+            .await;
+        registry
+            .register(provider.as_str().to_string(), second.clone())
+            .await;
+
+        assert!(
+            super::owning_runtime_http_for_channel(&registry, &provider, second_channel)
+                .await
+                .is_some(),
+            "channel-aware lookup must select the second same-provider runtime"
+        );
+        assert!(
+            super::owning_runtime_http_for_channel(&registry, &provider, first_channel)
+                .await
+                .is_none(),
+            "a first-runtime/name-only lookup would mask this missing owner HTTP"
+        );
     }
 }

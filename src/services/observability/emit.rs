@@ -398,6 +398,73 @@ pub fn emit_intake_placeholder_post_failed(
     );
 }
 
+/// #3813 Phase 1a: record the intake-side latency spans (observation-only) so
+/// the `claim → placeholder → prep → input` durations are PG-queryable and the
+/// downstream fast-lane tuning (Phase 2) can be made data-backed. `outcome`
+/// is `submitted` (input handed to the turn bridge) or `deferred_busy` (a
+/// pre-submission defer), and each `*_ms` is `None` when its milestone was not
+/// reached — a partial span, never a bogus zero. Emitted at most once per turn
+/// on the intake path (same non-blocking family as `emit_intake_placeholder_post_failed`).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_intake_latency_spans(
+    provider: &str,
+    channel_id: u64,
+    outcome: &str,
+    accept_to_placeholder_ms: Option<u64>,
+    placeholder_to_prep_ms: Option<u64>,
+    prep_to_input_ms: Option<u64>,
+    accept_to_input_ms: Option<u64>,
+) {
+    emit_event(
+        "intake_latency_spans",
+        Some(provider),
+        Some(channel_id),
+        None,
+        None,
+        None,
+        normalize_string(outcome).as_deref(),
+        CounterDelta::default(),
+        json!({
+            "outcome": normalize_string(outcome),
+            "accept_to_placeholder_ms": accept_to_placeholder_ms,
+            "placeholder_to_prep_ms": placeholder_to_prep_ms,
+            "prep_to_input_ms": prep_to_input_ms,
+            "accept_to_input_ms": accept_to_input_ms,
+        }),
+    );
+}
+
+/// #3813 AC#1 tail: record the bridge-side latency spans (observation-only) so
+/// the trailing half of acceptance criterion #1 — first provider output observed
+/// and first Discord relay delivered — is PG-queryable alongside the intake
+/// spans (`emit_intake_latency_spans`). Both `*_ms` are measured from the
+/// bridge-entry `turn_start` anchor and are `None` when their waypoint was not
+/// reached on the bridge-owned relay path (a partial span, never a bogus zero).
+/// Emitted at most once per turn on the bridge streaming loop's exit; the caller
+/// suppresses the emit when neither waypoint was reached (e.g. a watcher-owned
+/// relay), so this is never an all-`None` row.
+pub fn emit_bridge_latency_spans(
+    provider: &str,
+    channel_id: u64,
+    turn_start_to_first_output_ms: Option<u64>,
+    turn_start_to_first_relay_ms: Option<u64>,
+) {
+    emit_event(
+        "bridge_latency_spans",
+        Some(provider),
+        Some(channel_id),
+        None,
+        None,
+        None,
+        None,
+        CounterDelta::default(),
+        json!({
+            "turn_start_to_first_output_ms": turn_start_to_first_output_ms,
+            "turn_start_to_first_relay_ms": turn_start_to_first_relay_ms,
+        }),
+    );
+}
+
 /// #2838 (relay-stability P0-1): record a structured event at each terminal
 /// relay delivery decision so the duplicate-emit (root cause #1) and
 /// missing-answer (root cause #4) vectors are PG-queryable and attributable to

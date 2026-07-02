@@ -1,7 +1,11 @@
+mod bridge_latency_spans;
 mod cancel_finalize_policy;
 mod chunk_compose;
 mod completion_guard;
 mod context_window;
+#[cfg(unix)]
+mod early_tui_completion;
+mod finalize_epilogue;
 mod followup_requeue;
 mod headless_delivery;
 mod memory_lifecycle;
@@ -20,6 +24,11 @@ mod terminal_controller_cutover;
 mod terminal_delivery;
 mod tmux_runtime;
 mod turn_analytics;
+// #3805 P2 (PR-B): two-message sink creation order (answer-first, panel below)
+// + the pure generation-epoch staleness guard. Isolated sibling so the EXTREME
+// turn_bridge/mod.rs giant and the 700-capped status_panel.rs stay lean; the
+// call sites here and in single_message_footer.rs are thin.
+mod two_message_panel;
 mod voice_completion;
 mod watcher_handoff;
 mod watcher_orphan_cleanup;
@@ -63,6 +72,7 @@ use panel_lifecycle::{
 use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
+use bridge_latency_spans::BridgeLatencySpans;
 pub(super) use cancel_finalize_policy::{
     classify_turn_finished_dispatch_kind, is_done_setting_terminal_frame,
     resolve_bridge_owner_channel, should_finalize_cancel_after_recv,
@@ -82,11 +92,14 @@ pub(super) use stale_resume::result_event_has_stale_resume_error;
 pub(in crate::services::discord) use status_panel::{
     complete_status_panel_v2_with_http, normalize_status_panel_message_id,
 };
+// #3805 P2 (PR-C): the ONE generation staleness rule shared by the sink (here)
+// and the tmux WATCHER completion guard, so both paths supersede a stale
+// status edit by the SAME epoch semantics (parity).
 pub(super) use streaming_edit_text::{
     CLAUDE_TUI_FOLLOWUP_REQUEUE_DELIVERY_NOTICE, bridge_claude_tui_followup_requeue_prompt_error,
-    bridge_streaming_rollover_should_skip, bridge_tui_transport_error_should_skip_quiescence,
-    build_turn_bridge_streaming_edit_text, claude_tui_followup_requeue_streaming_aware,
-    claude_tui_followup_same_input_occupies_pane,
+    bridge_streaming_edit_gate_open, bridge_streaming_rollover_should_skip,
+    bridge_tui_transport_error_should_skip_quiescence, build_turn_bridge_streaming_edit_text,
+    claude_tui_followup_requeue_streaming_aware, claude_tui_followup_same_input_occupies_pane,
 };
 pub(super) use task_notification_lifecycle::{
     close_all_tracked_background_children, close_next_tracked_background_child,
@@ -100,6 +113,9 @@ pub(super) use tmux_runtime::cancel_token_has_tmux_session;
 pub(super) use tmux_runtime::handoff_interrupted_message;
 pub(super) use tmux_runtime::stale_inflight_message;
 pub(super) use tmux_runtime::stop_active_turn;
+pub(in crate::services::discord) use two_message_panel::{
+    two_message_should_reanchor_panel_on_rollover, two_message_status_edit_generation_is_stale,
+};
 pub(super) use watcher_orphan_cleanup::{
     cleanup_or_preserve_watcher_orphan_spinner,
     should_delete_bridge_created_watcher_orphan_response,
@@ -1579,6 +1595,9 @@ pub(super) fn spawn_turn_bridge(
             inflight_state.current_msg_id = current_msg_id.get();
         }
         let mut last_status_edit = tokio::time::Instant::now();
+        // #3813 Phase 1b fast-lane: the first non-empty assistant text chunk may
+        // bypass the status interval once, then normal throttling resumes.
+        let mut first_answer_relayed = false;
         let status_interval = super::status_update_interval();
         let mut last_session_panel_lifecycle_refresh =
             tokio::time::Instant::now() - status_interval;
@@ -1603,8 +1622,18 @@ pub(super) fn spawn_turn_bridge(
         let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
         let turn_start = std::time::Instant::now();
+        // #3813 AC#1 tail: bridge-side latency spans (observation-only), anchored
+        // on `turn_start` above. See bridge_latency_spans.rs for the invariants.
+        let mut bridge_spans = BridgeLatencySpans::starting_at(turn_start);
+
+        // #3805 P2 (PR-B): this turn's status-panel epoch. Seeded from the pinned
+        // inflight snapshot and threaded through the two-message create (which
+        // bumps it) and the terminal completion edit (which proves it against the
+        // on-disk epoch). Inert on the default-OFF path (stays 0).
+        let mut status_panel_generation = inflight_state.status_panel_generation;
 
         maybe_create_bridge_separate_status_panel_response(
+            shared_owned.ui.two_message_panel_enabled,
             single_message_panel_footer_mode,
             shared_owned.ui.status_panel_v2_enabled,
             gateway.as_ref(),
@@ -1615,6 +1644,7 @@ pub(super) fn spawn_turn_bridge(
             &mut bridge_created_response_placeholder_msg_id,
             &mut last_edit_text,
             &mut inflight_state,
+            &mut status_panel_generation,
             response_sent_offset,
             &full_response,
             &mut status_panel_dirty,
@@ -3359,6 +3389,7 @@ pub(super) fn spawn_turn_bridge(
                     channel_id,
                     turn_id.as_str(),
                     inflight_state.tmux_session_name.as_deref(),
+                    &provider, // #3983 item4: one-shot session banner render
                 )
                 .await;
             }
@@ -3366,11 +3397,21 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
+            // #3813 Phase 2: hold the status-panel / footer edit off the shared
+            // rate lane while the opening answer is pending so the #4006 fast lane
+            // wins it. `status_panel_dirty` stays set → renders next interval. See
+            // status_panel_edit_defer_for_first_answer for the #3477 guard.
+            let defer_status_panel_for_first_answer = status_panel_edit_defer_for_first_answer(
+                first_answer_relayed,
+                !response_portion_after_offset(&full_response, response_sent_offset).is_empty(),
+            );
+
             if shared_owned.ui.status_panel_v2_enabled
                 && bridge_status_panel_dirty_should_edit_separate_panel(
                     status_panel_dirty,
                     single_message_panel_footer_mode,
                 )
+                && !defer_status_panel_for_first_answer
                 && last_status_panel_edit.elapsed() >= status_interval
                 && let Some(status_msg_id) = status_panel_msg_id
             {
@@ -3404,6 +3445,7 @@ pub(super) fn spawn_turn_bridge(
             }
             if single_message_panel_footer_mode
                 && status_panel_dirty
+                && !defer_status_panel_for_first_answer
                 && last_status_panel_edit.elapsed() >= status_interval
             {
                 refresh_bridge_footer(
@@ -3417,9 +3459,15 @@ pub(super) fn spawn_turn_bridge(
                 status_panel_dirty = false;
             }
             if !watcher_owns_assistant_relay && !standby_relay_owns_output {
+                // #3805 P2 (PR-D): track whether an answer rollover created a fresh
+                // tail message this interval, so the two-message status panel is
+                // re-anchored BELOW it exactly once (not on quiet intervals).
+                let mut rolled_over_this_interval = false;
                 loop {
                     let current_portion =
                         response_portion_after_offset(&full_response, response_sent_offset);
+                    // #3813 AC#1 tail: mark first-output pre-rollover (first_output<=first_relay).
+                    bridge_spans.mark_first_output(!current_portion.is_empty());
                     if done || current_portion.is_empty() {
                         break;
                     }
@@ -3466,6 +3514,7 @@ pub(super) fn spawn_turn_bridge(
                                 response_sent_offset = next_response_sent_offset;
                                 streaming_rollover_frozen_msg_ids.push(current_msg_id);
                                 current_msg_id = next_msg_id;
+                                rolled_over_this_interval = true;
                                 last_edit_text = status_block;
                                 last_status_edit = tokio::time::Instant::now() - status_interval;
                                 inflight_state.current_msg_id = current_msg_id.get();
@@ -3473,6 +3522,8 @@ pub(super) fn spawn_turn_bridge(
                                 inflight_state.response_sent_offset = response_sent_offset;
                                 inflight_state.full_response = full_response.clone();
                                 state_dirty = true;
+                                // #3813 AC#1 tail: rollover send = bridge first relay.
+                                bridge_spans.mark_first_relay(true);
                                 if let Some((_, _, _, _, pending_new_key)) =
                                     pending_long_running_retarget_after_state_save.as_mut()
                                 {
@@ -3534,6 +3585,42 @@ pub(super) fn spawn_turn_bridge(
                     }
                 }
 
+                // #3805 P2 (PR-D): after a mid-turn answer rollover the live status
+                // panel is now stranded ABOVE the new tail answer chunk. Under the
+                // two-message flag, re-anchor it BELOW the new answer (send new,
+                // retire old, bump the generation epoch) so it stays pinned to the
+                // latest chunk. Gate is OFF-inert → the rollover path is
+                // byte-identical when the flag is off.
+                if rolled_over_this_interval
+                    && two_message_panel::two_message_should_reanchor_panel_on_rollover(
+                        shared_owned.ui.two_message_panel_enabled,
+                        status_panel_msg_id.is_some(),
+                    )
+                {
+                    let panel_text = shared_owned.ui.placeholder_live_events.render_status_panel(
+                        channel_id,
+                        &provider,
+                        status_panel_started_at,
+                    );
+                    let reanchored =
+                        two_message_panel::reanchor_bridge_two_message_status_panel_below_answer(
+                            gateway.as_ref(),
+                            shared_owned.as_ref(),
+                            channel_id,
+                            &provider,
+                            &panel_text,
+                            current_msg_id,
+                            &mut status_panel_msg_id,
+                            &mut inflight_state,
+                            &mut status_panel_generation,
+                            &mut last_status_panel_text,
+                        )
+                        .await;
+                    if reanchored {
+                        state_dirty = true;
+                    }
+                }
+
                 let current_portion =
                     response_portion_after_offset(&full_response, response_sent_offset);
                 let status_block = build_bridge_single_message_panel_status_block(
@@ -3559,7 +3646,11 @@ pub(super) fn spawn_turn_bridge(
                     &stable_display_text,
                 )
                     && !done
-                    && last_status_edit.elapsed() >= status_interval
+                    && bridge_streaming_edit_gate_open(
+                        last_status_edit.elapsed() >= status_interval,
+                        first_answer_relayed,
+                        current_portion.is_empty(),
+                    )
                     && long_running_placeholder_active.is_none()
                     && pending_long_running_open_after_state_save.is_none()
                     && pending_long_running_retarget_after_state_save.is_none()
@@ -3574,6 +3665,9 @@ pub(super) fn spawn_turn_bridge(
                     .is_ok();
                     last_status_edit = tokio::time::Instant::now();
                     if edit_ok {
+                        first_answer_relayed |= !current_portion.is_empty();
+                        // #3813 AC#1 tail: first bridge-owned relay delivered.
+                        bridge_spans.mark_first_relay(!current_portion.is_empty());
                         last_edit_text = stable_display_text;
                         inflight_state.current_msg_id = current_msg_id.get();
                         inflight_state.current_msg_len = last_edit_text.len();
@@ -3763,6 +3857,10 @@ pub(super) fn spawn_turn_bridge(
                 last_inflight_long_run_heartbeat = std::time::Instant::now();
             }
         }
+
+        // #3813 AC#1 tail: emit bridge-side latency spans once at loop exit
+        // (observation-only; self-suppresses when no bridge relay happened).
+        bridge_spans.log(channel_id.get(), provider.as_str());
 
         // codex round-9 P3 on PR #1308: drain any active long-running
         // placeholder on stream-error / receive-disconnect exits too. The
@@ -4064,48 +4162,33 @@ pub(super) fn spawn_turn_bridge(
         // later user messages behind a stale active turn. The hosted-TUI
         // pre-submit guard below is the correctness barrier that prevents
         // follow-up input from being injected into a still-busy pane.
+        // #3038: the early TUI completion gate (eligibility filter + bounded
+        // quiescence probe + timed-out warning) is extracted verbatim to
+        // `early_tui_completion.rs`. The two outputs are consumed later, so the
+        // `#[cfg]` `let` declarations stay here (preserving the exact unix /
+        // non-unix split) and the helper returns the computed values; behavior
+        // is byte-identical (see the module doc for the seam-fix note).
         #[cfg(unix)]
         let bridge_early_gate_timed_out;
         #[cfg(not(unix))]
         let bridge_early_gate_timed_out = false;
         #[cfg(unix)]
-        #[allow(unused_assignments, unused_mut)]
-        let mut bridge_tui_gate_outcome_early: Option<super::tmux::TuiCompletionGateOutcome> = None;
+        let bridge_tui_gate_outcome_early: Option<super::tmux::TuiCompletionGateOutcome>;
         #[cfg(unix)]
         {
-            // Reproduce the same eligibility filter the late gate already
-            // applies, but BEFORE the channel-mailbox release.
-            let eligible_for_early_gate =
-                !cancelled && !is_prompt_too_long && !transport_error && !recovery_retry;
-            if eligible_for_early_gate
-                && let Some(tmux_session_name) = inflight_state.tmux_session_name.as_deref()
-            {
-                bridge_tui_gate_outcome_early = Some(
-                    super::tmux::run_tui_completion_gate(
-                        &provider,
-                        channel_id,
-                        tmux_session_name,
-                        inflight_state.task_notification_kind,
-                    )
-                    .await,
-                );
-                if matches!(
-                    bridge_tui_gate_outcome_early,
-                    Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
-                ) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
-                        provider = %provider.as_str(),
-                        channel = channel_id.get(),
-                        tmux_session = %tmux_session_name,
-                        "[{ts}] ⚠ #2293/#2780: bridge TUI quiescence gate timed out before visible completion; mailbox release will continue and hosted-TUI pre-submit will guard follow-up injection"
-                    );
-                }
-            }
-            bridge_early_gate_timed_out = matches!(
-                bridge_tui_gate_outcome_early,
-                Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
-            );
+            let (outcome_early, gate_timed_out) =
+                early_tui_completion::run_early_tui_completion_gate(
+                    cancelled,
+                    is_prompt_too_long,
+                    transport_error,
+                    recovery_retry,
+                    &inflight_state,
+                    &provider,
+                    channel_id,
+                )
+                .await;
+            bridge_tui_gate_outcome_early = outcome_early;
+            bridge_early_gate_timed_out = gate_timed_out;
         }
         // #3268 (Defect B): on (gate timeout + non-terminal + genuinely-live
         // watcher) hand the busy turn back to the watcher — see `watcher_handoff`.
@@ -5891,6 +5974,7 @@ pub(super) fn spawn_turn_bridge(
                     is_external_input_tui_direct, // #3959: suppress mirror chrome footer
                     completion_footer_terminal_text.as_deref(),
                     indicator,
+                    status_panel_generation, // #3805 P2: prove this turn's panel epoch
                 )
                 .await;
         }
@@ -6601,105 +6685,22 @@ pub(super) fn spawn_turn_bridge(
         // implementation/review/rework turn can warm-resume from the same tmux.
         // New dispatch arrivals validate the managed tmux session before reuse.
 
-        // Finalization complete — decrement counters
-        shared_owned
-            .restart.finalizing_turns
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        shared_owned
-            .restart.global_finalizing
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        // Note: deferred restart exit is handled by the 5-second poll loop in mod.rs,
-        // which saves pending queues before calling check_deferred_restart.
-        // Calling it here would risk exiting before other providers save their queues.
-
-        if has_queued_turns {
-            // Drain mode: if restart is pending, don't start new turns from queue.
-            // The queued messages will be saved to disk and processed after restart.
-            if preserve_inflight_for_cleanup_retry {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!(
-                    "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} until placeholder cleanup retry commits",
-                    channel_id
-                );
-            } else if shared_owned
-                .restart.restart_pending
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] ⏸ DRAIN: skipping queued turn dequeue for channel {} (restart pending)",
-                    channel_id
-                );
-            } else if let Some(bot_owner_provider) = gateway.bot_owner_provider() {
-                if let Err(reason) = gateway.validate_live_routing(channel_id).await {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} (reason={})",
-                        channel_id,
-                        reason
-                    );
-                } else {
-                    let next_intervention = super::mailbox_take_next_soft_intervention(
-                        &shared_owned,
-                        &bot_owner_provider,
-                        channel_id,
-                    )
-                    .await;
-
-                    if let Some(error) = next_intervention.persistence_error.as_ref() {
-                        tracing::error!(
-                            provider = bot_owner_provider.as_str(),
-                            channel_id = channel_id.get(),
-                            error = %error,
-                            "QUEUE-GUARD: preserving queued command after pending-queue persistence failure"
-                        );
-                    } else if let Some((intervention, has_more_queued_turns)) =
-                        next_intervention.into_intervention()
-                    {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!("  [{ts}] 📋 Processing next queued command");
-                        if let Err(e) = gateway
-                            .dispatch_queued_turn(
-                                channel_id,
-                                &intervention,
-                                &request_owner_name,
-                                has_more_queued_turns,
-                            )
-                            .await
-                        {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            tracing::info!("  [{ts}]   ⚠ queued command failed: {e}");
-                            super::mailbox_requeue_intervention_front(
-                                &shared_owned,
-                                &bot_owner_provider,
-                                channel_id,
-                                intervention,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            } else {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain"
-                );
-                if let Some(offset) = tmux_last_offset
-                    && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
-                {
-                    if let Ok(mut guard) = watcher.resume_offset.lock() {
-                        *guard = Some(offset);
-                    }
-                    watcher.paused.store(false, Ordering::Relaxed);
-                }
-                super::schedule_deferred_idle_queue_kickoff(
-                    shared_owned.clone(),
-                    provider.clone(),
-                    channel_id,
-                    "turn bridge queued backlog",
-                );
-            }
-        }
+        // #3038: finalization epilogue (counter decrement + queued-turn drain)
+        // extracted verbatim to `finalize_epilogue.rs`. This is the LAST block of
+        // the async body, so every capture is threaded by value with its original
+        // ownership; behavior-preserving (see the module doc for the seam-fix note).
+        finalize_epilogue::finalize_and_drain_queued_turns(
+            shared_owned,
+            has_queued_turns,
+            preserve_inflight_for_cleanup_retry,
+            gateway,
+            channel_id,
+            provider,
+            request_owner_name,
+            tmux_last_offset,
+            watcher_owner_channel_id,
+        )
+        .await;
 
         // completion_tx is sent automatically by CompletionGuard on drop
     }.instrument(bridge_span));

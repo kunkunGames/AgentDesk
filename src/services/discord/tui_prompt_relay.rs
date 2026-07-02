@@ -30,6 +30,7 @@ use self::injected_prompt_policy::{
     format_system_continuation_note, is_slash_command_control_prompt,
     is_start_anchored_task_notification, should_suppress_local_only_kind_note_after_continuation,
     slash_command_control_kind, slash_command_control_prompt_is_caveat_only,
+    slash_command_control_prompt_is_local_command_stdout,
 };
 
 mod idle_transcript_scan;
@@ -102,12 +103,13 @@ use self::relay_ownership::{
     session_bound_discord_delivery_enabled,
 };
 
+mod synthetic_orphan_reclaim; // #3982 orphan-at-birth reclaim trigger (see module doc)
 mod synthetic_start;
+mod synthetic_start_wiring; // #4002 shared Path-X wiring reused by the suppress branch
 #[cfg(test)]
 pub(in crate::services::discord) use self::synthetic_start::synthetic_start_offset_carry_forward;
 use self::synthetic_start::{
-    build_tui_direct_synthetic_inflight_state, claim_tui_direct_synthetic_turn,
-    defer_synthetic_turn_start, restore_pending_starts, synthetic_start_prior_turn_view,
+    build_tui_direct_synthetic_inflight_state, restore_pending_starts,
     tui_direct_synthetic_inflight_active_for_prompt,
 };
 #[cfg(unix)]
@@ -338,18 +340,17 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     // turn's lease and its guard would clear that generation, stranding the first
     // bridge tail. Drop the duplicate here, before any lease/anchor/inflight exists;
     // a genuine second /loop / /compact falls outside the 2s window → fresh turn.
-    let injected_class = classify_injected_prompt(&prompt.prompt);
-    // #3305: hoist the slash-command kind so the first-sighting gate AND the
-    // local-only lifecycle-skip below share one computation. `local_only_slash`
-    // is true ONLY for a LOCAL-completing pass-through (/effort /compact /cost
-    // /context) — it posts a guidance note but mints no turn (an allow-list, so
-    // /loop and any unknown command keep full lifecycle, fail-safe).
-    let mut local_only_slash = false;
+    let relay_prompt_decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
+    let injected_class = relay_prompt_decision.injected_class;
+    // #3305/#4033: one pure decision drives dedupe and the local-only lifecycle
+    // skip, so stdout halves use the same allow-list as helper-level checks.
+    let local_only_slash = relay_prompt_decision.local_only_slash;
     if matches!(injected_class, InjectedPromptClass::SlashCommandControl) {
-        let kind = slash_command_control_kind(&prompt.prompt);
-        local_only_slash = super::commands::is_local_only_slash_command_kind(&kind)
-            || slash_command_control_prompt_is_caveat_only(&prompt.prompt);
-        if !slash_command_control_turn_is_first_sighting(&prompt.tmux_session_name, &kind) {
+        let kind = relay_prompt_decision
+            .slash_command_kind
+            .as_deref()
+            .expect("slash command control decisions carry a kind");
+        if !slash_command_control_turn_is_first_sighting(&prompt.tmux_session_name, kind) {
             // #3153 second half within the 2s window: drop before any lease/anchor/
             // inflight exists; the first half already relays via its own bridge tail.
             tracing::info!(
@@ -471,13 +472,15 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         // add≡remove invariant holds trivially: no add, no asymmetry); no
         // `claim_tui_direct_synthetic_turn` → no synthetic inflight → the next
         // injection is not FOREIGN-ABORTed and the #3302 sweeper sees no fake row.
-        let kind = slash_command_control_kind(&prompt.prompt);
+        let kind = relay_prompt_decision
+            .slash_command_kind
+            .as_deref()
+            .expect("local-only slash decisions carry a kind");
         // #3388: in-session /compact rewrites can replay the local command stub
         // seconds after the continuation banner; hide that duplicate note. The
         // real machine-injected /compact (#3262) happens minutes before compaction
         // completes, so it stays outside this narrow replay window.
-        if local_only_kind_note_suppressed_by_recent_continuation(&prompt.tmux_session_name, &kind)
-        {
+        if local_only_kind_note_suppressed_by_recent_continuation(&prompt.tmux_session_name, kind) {
             tracing::info!(
                 provider = %prompt.provider,
                 channel_id = channel_id.get(),
@@ -488,7 +491,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             return;
         }
         let note =
-            format_slash_command_control_note(&prompt.tmux_session_name, &kind, &prompt.prompt);
+            format_slash_command_control_note(&prompt.tmux_session_name, kind, &prompt.prompt);
         match channel_id.say(&*notify_http, note).await {
             Ok(message) => tracing::info!(
                 provider = %prompt.provider,
@@ -537,6 +540,31 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
                     note_message_id = message.id.get(),
                     "rendered system/compact continuation injection as neutral session note; no active-turn lifecycle, assistant output still relayed via bridge tail"
                 );
+                // #4002 (recap duplicate root fix): the compact-resume note is NOT an
+                // active-turn anchor — no ⏳/anchor-card/`record_prompt_anchor`/
+                // completion-drain ran above, so this stays a neutral "not an active
+                // turn" note. But the SystemContinuation output IS still relayed, and
+                // before this fix it fell through inflight-less: the observer spawned an
+                // UN-ARBITRATED BridgeAdapter tail that raced the real turn's owner →
+                // two live panels (2 slots). Route it through the SAME Path-X seam the
+                // active-turn else-branch uses: pin the note as this turn's anchor so
+                // the idle-tail drain-wait identity-pins our own row, then install a
+                // passive synthetic inflight + adopt the resolved relay_owner into the
+                // lease. The post-block bridge-tail gate then honours cross-relayer
+                // single-ownership: watcher-alive → adopt → tail stands down (1 slot);
+                // watcher-dead → BridgeAdapter → tail is the SOLE relayer (no GAP);
+                // deferred → observer stands down, the worker spawns exactly one tail.
+                current_turn_anchor_id = Some(message.id.get());
+                deferred_synthetic_start =
+                    synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
+                        shared,
+                        &prompt.provider,
+                        channel_id,
+                        &prompt,
+                        message.id,
+                        &mut lease,
+                    )
+                    .await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -558,8 +586,11 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         // live card or no-ops; the first sighting posts as the #3099 anchor).
         // HumanTuiDirect keeps the raw render; SystemContinuation handled above (#3100).
         let content = if matches!(injected_class, InjectedPromptClass::SlashCommandControl) {
-            let kind = slash_command_control_kind(&prompt.prompt);
-            format_slash_command_control_note(&prompt.tmux_session_name, &kind, &prompt.prompt)
+            let kind = relay_prompt_decision
+                .slash_command_kind
+                .as_deref()
+                .expect("slash command control decisions carry a kind");
+            format_slash_command_control_note(&prompt.tmux_session_name, kind, &prompt.prompt)
         } else if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
             // #3393: background-task / subagent completions arrive ONLY as this
             // `user`-record `<task-notification>` XML — never the stream-json
@@ -715,85 +746,30 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         // short-circuit here. Only SystemContinuation skips this active-turn block.
         debug_assert!(
             injected_class.is_human_active_turn()
-                || matches!(injected_class, InjectedPromptClass::TaskNotificationEvent),
-            "system-continuation injections must not reach active-turn handling",
+                || matches!(
+                    injected_class,
+                    InjectedPromptClass::TaskNotificationEvent
+                        | InjectedPromptClass::SlashCommandControl
+                ),
+            "passive system injections must not reach active-turn handling",
         );
-        // #3154 P1-3: set when the synthetic turn-start is DEFERRED to the detached
-        // per-channel worker; the observer then must NOT spawn its own BridgeAdapter
-        // tail below (a second observer tail would relay the SAME output twice — the
-        // original bug). The worker owns the relay-owner handoff.
-        if let Some(provider) = ProviderKind::from_str(&prompt.provider) {
-            // #3154 — TEMPORAL fix for turn-interleaving. An INLINE claim while the
-            // PRIOR turn's tail still drains seeds `turn_start_offset` from the prior
-            // cursor (duplicate relay), and an inline wait starves OTHER channels. So
-            // an un-finalized prior turn persists a DURABLE pending-start and hands
-            // the claim to a DETACHED per-channel worker (fresh EOF offset); the
-            // common no-interleave case stays on the inline fast path.
-            let prior = synthetic_start_prior_turn_view(
-                shared,
-                &provider,
-                channel_id,
-                &prompt.tmux_session_name,
-                anchor_message.id.get(),
-            )
-            .await;
-            if super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior.view) {
-                deferred_synthetic_start = true;
-                defer_synthetic_turn_start(
-                    shared,
-                    &provider,
-                    channel_id,
-                    &prompt,
-                    anchor_message.id,
-                    &lease,
-                );
-                tracing::info!(
-                    provider = %prompt.provider,
-                    channel_id = channel_id.get(),
-                    tmux_session_name = %prompt.tmux_session_name,
-                    anchor_message_id = anchor_message.id.get(),
-                    "deferred TUI-direct synthetic turn-start off the observer loop; prior turn not yet finalized (durable record persisted, detached per-channel worker spawned)"
-                );
-            } else {
-                let claim = claim_tui_direct_synthetic_turn(
-                    shared,
-                    &provider,
-                    channel_id,
-                    &prompt.tmux_session_name,
-                    &prompt.prompt,
-                    anchor_message.id,
-                    &lease,
-                )
-                .await;
-                if claim_should_adopt_relay_owner(
-                    claim.claimed,
-                    lease.relay_owner,
-                    claim.relay_owner,
-                ) {
-                    lease.relay_owner = claim.relay_owner;
-                    // Re-record overwrites the lease with a FRESH generation; adopt it
-                    // back into `lease` so the bridge-tail guard below captures the
-                    // exact stored identity (a stale generation's Drop would clear
-                    // nothing / the wrong lease).
-                    lease = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-                        provider.as_str(),
-                        &prompt.tmux_session_name,
-                        lease,
-                    );
-                }
-                // #3350: the INLINE claim records the same #3303 DeferredClaim marker
-                // as the deferred worker (drain ✅ / sweep TTL ⚠). SC3/own-row/I5 gates
-                // live in the recorder; a pending_start test pins this wiring.
-                super::tui_direct_pending_start::record_inline_claim_marker_if_claimed(
-                    claim.claimed,
-                    &prompt.provider,
-                    channel_id.get(),
-                    anchor_message.id.get(),
-                    &prompt.tmux_session_name,
-                    super::tui_direct_pending_start::record_claim_marker_if_watcher_owned,
-                );
-            }
-        }
+        // #3154 P1-3 / #4002: run the shared synthetic-start wiring. It reads the
+        // prior-turn view and either DEFERS to the detached per-channel worker when
+        // a prior turn is still draining — the observer then must NOT spawn its own
+        // BridgeAdapter tail below (a second observer tail would relay the SAME
+        // output twice — the original bug); the worker owns the relay-owner handoff
+        // — else INLINE-claims a passive synthetic inflight and adopts the resolved
+        // relay_owner into `lease` for the post-block bridge-tail ownership guard.
+        // Extracted so the SystemContinuation suppress branch reuses the SAME seam.
+        deferred_synthetic_start = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
+            shared,
+            &prompt.provider,
+            channel_id,
+            &prompt,
+            anchor_message.id,
+            &mut lease,
+        )
+        .await;
         tracing::info!(
             provider = %prompt.provider,
             channel_id = channel_id.get(),
@@ -934,6 +910,30 @@ fn resolve_owner_channel_authoritatively(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RelayObservedPromptInjectionDecision {
+    injected_class: InjectedPromptClass,
+    slash_command_kind: Option<String>,
+    local_only_slash: bool,
+}
+
+/// Pure classification used before relay lease/ownership side effects.
+fn relay_observed_prompt_injected_prompt_decision(
+    prompt: &str,
+) -> RelayObservedPromptInjectionDecision {
+    let injected_class = classify_injected_prompt(prompt);
+    let slash_command_kind = matches!(injected_class, InjectedPromptClass::SlashCommandControl)
+        .then(|| slash_command_control_kind(prompt));
+    let local_only_slash = matches!(injected_class, InjectedPromptClass::SlashCommandControl)
+        && is_local_only_slash_command_prompt(prompt);
+
+    RelayObservedPromptInjectionDecision {
+        injected_class,
+        slash_command_kind,
+        local_only_slash,
+    }
+}
+
 /// Local-completing slash-control prompts skip synthetic turn ownership.
 fn is_local_only_slash_command_prompt(prompt: &str) -> bool {
     if !is_slash_command_control_prompt(prompt) {
@@ -942,6 +942,7 @@ fn is_local_only_slash_command_prompt(prompt: &str) -> bool {
     let kind = slash_command_control_kind(prompt);
     super::commands::is_local_only_slash_command_kind(&kind)
         || slash_command_control_prompt_is_caveat_only(prompt)
+        || slash_command_control_prompt_is_local_command_stdout(prompt)
 }
 
 /// Dedupe the two slash-control halves before lease/anchor/synthetic ownership.

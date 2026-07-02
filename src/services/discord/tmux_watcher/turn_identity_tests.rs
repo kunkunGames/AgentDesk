@@ -143,6 +143,13 @@ fn pinned_finalizer_turn_id_uses_synthetic_identity_for_zero_user_msg_id() {
 }
 
 #[test]
+fn restored_watcher_finalize_skips_zero_id_submit() {
+    assert!(!should_submit_restored_watcher_finalize(false, 0));
+    assert!(!should_submit_restored_watcher_finalize(true, 777));
+    assert!(should_submit_restored_watcher_finalize(false, 777));
+}
+
+#[test]
 fn pinned_finalize_id_none_returns_zero() {
     // (e) No pre-relay snapshot → 0.
     assert_eq!(
@@ -871,7 +878,9 @@ fn watcher_has_no_persisted_panel_without_status_message_id() {
 #[test]
 fn tui_status_panel_bind_bound_adopts_without_delete() {
     let decision = resolve_tui_status_panel_bind_decision(
-        crate::services::discord::inflight::StatusPanelBindOutcome::Bound,
+        crate::services::discord::inflight::StatusPanelBindOutcome::Bound {
+            status_panel_generation: 0,
+        },
     );
     assert!(decision.adopt_sent_panel);
     assert!(!decision.delete_sent_panel);

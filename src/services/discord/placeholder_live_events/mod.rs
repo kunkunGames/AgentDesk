@@ -45,7 +45,7 @@ use common::{
     STATUS_PANEL_WORKFLOW_LIMIT, STATUS_PANEL_WORKFLOW_PHASE_LIMIT,
 };
 #[cfg(test)]
-use status_panel::{render_recent_section_header, truncate_status_panel_sections};
+use status_panel::truncate_status_panel_sections;
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
@@ -329,6 +329,28 @@ impl PlaceholderLiveEvents {
         self.set_session_panel_snapshot(channel_id, None)
     }
 
+    /// #3983 item4: atomically claim the one-shot top session banner for this
+    /// channel's CURRENT session snapshot, returning the rendered session line
+    /// EXACTLY ONCE per session. Both the sink and tmux-watcher refresh paths
+    /// call this after (re)setting the snapshot; the per-channel mutex makes the
+    /// claim a single atomic compare-and-record, so whichever path arrives first
+    /// for a given session emits the banner and the other observes the recorded
+    /// key and returns `None` (dual-path de-dup, no double post / no omission).
+    /// `None` when the channel has no session snapshot or its banner was already
+    /// claimed. See `StatusPanelState::claim_session_banner` for the identity
+    /// keying (session_instance_key → provider_session_id → rendered line).
+    pub(in crate::services::discord) fn claim_session_banner_line(
+        &self,
+        channel_id: ChannelId,
+        provider: &ProviderKind,
+    ) -> Option<String> {
+        let entry = self.status_by_channel.get(&channel_id)?;
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.claim_session_banner(provider)
+    }
+
     fn set_session_panel_snapshot(
         &self,
         channel_id: ChannelId,
@@ -563,19 +585,9 @@ impl PlaceholderLiveEvents {
             },
             TerminalUiObligationPanelStatus::Deadline => DerivedStatus::TerminalDeliveryUnconfirmed,
         };
-        let completed = matches!(status, TerminalUiObligationPanelStatus::Completed);
-        let request_anchor_line = self.request_anchor_line(channel_id, &snapshot);
-        let confidence_line = self.panel_confidence_line(channel_id, &snapshot, started_at_unix);
-        render_status_panel(
-            snapshot,
-            self.render_block(channel_id),
-            provider,
-            started_at_unix,
-            chrono::Utc::now().timestamp(),
-            !completed,
-            request_anchor_line,
-            confidence_line,
-        )
+        let turn_trigger_line = self.request_anchor_line(channel_id, &snapshot);
+        let time_line = self.panel_time_line(channel_id, started_at_unix);
+        render_status_panel(snapshot, provider, time_line, turn_trigger_line)
     }
 
     // True when the live-panel compaction counts for this channel differ from
@@ -600,7 +612,9 @@ impl PlaceholderLiveEvents {
         channel_id: ChannelId,
         provider: &ProviderKind,
         started_at_unix: i64,
-        heartbeat_at_unix: i64,
+        // #3983: retained for call-site parity (the footer time line anchors to the
+        // stable stored last-activity stamp, not this render-time heartbeat).
+        _heartbeat_at_unix: i64,
     ) -> String {
         let snapshot = self
             .status_by_channel
@@ -627,28 +641,9 @@ impl PlaceholderLiveEvents {
                 "#3404: compacted delivered terminal slots from the live status panel"
             );
         }
-        // #3477 item 3: a live batch counts as "fresh" when it arrived strictly
-        // after the turn's completion instant. `None` completed_at means the turn
-        // never completed (still running), so any present live content is fresh.
-        let live_content_fresh = match snapshot.completed_at {
-            Some(completed_at) => self
-                .last_recent_event_at
-                .get(&channel_id)
-                .is_some_and(|stamp| *stamp.value() > completed_at),
-            None => true,
-        };
-        let request_anchor_line = self.request_anchor_line(channel_id, &snapshot);
-        let confidence_line = self.panel_confidence_line(channel_id, &snapshot, started_at_unix);
-        render_status_panel(
-            snapshot,
-            self.render_block(channel_id),
-            provider,
-            started_at_unix,
-            heartbeat_at_unix,
-            live_content_fresh,
-            request_anchor_line,
-            confidence_line,
-        )
+        let turn_trigger_line = self.request_anchor_line(channel_id, &snapshot);
+        let time_line = self.panel_time_line(channel_id, started_at_unix);
+        render_status_panel(snapshot, provider, time_line, turn_trigger_line)
     }
 
     pub(in crate::services::discord) fn render_completion_footer(

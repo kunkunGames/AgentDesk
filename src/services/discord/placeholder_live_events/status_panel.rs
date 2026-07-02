@@ -98,6 +98,17 @@ pub(super) struct StatusPanelState {
     // #3811: intake-set original-request user_msg_id; drives the `요청:` deeplink
     // (`None` for headless/synthetic/voice/id-0 — no real Discord message).
     pub(super) request_user_msg_id: Option<u64>,
+    // #3983 item4: dedup token for the one-shot session banner. Holds the
+    // identity (session_instance_key, falling back to provider_session_id, then
+    // the rendered line) of the session whose banner was already emitted, so the
+    // dual-path refresh (sink + watcher) posts the top banner EXACTLY ONCE per
+    // session. `None` until the first banner for this channel is claimed; a new
+    // session identity (new spawn nonce / provider session) makes the stored key
+    // stale and re-arms the claim for the next session boundary. This is
+    // bookkeeping only and is intentionally excluded from the `session ==
+    // snapshot` boundary compare in `set_session_panel_snapshot` (which compares
+    // the `session` field alone).
+    session_banner_emitted_key: Option<String>,
 }
 
 impl StatusPanelState {
@@ -112,6 +123,36 @@ impl StatusPanelState {
         self.workflows.clear();
         self.completed_at = None; // #3477 item 3: drop the stale freshness gate.
         self.request_user_msg_id = None; // #3811: new session = new request context.
+    }
+
+    /// #3983 item4: atomically claim the one-shot session banner for the CURRENT
+    /// session snapshot, returning the rendered session line EXACTLY ONCE per
+    /// session identity. The identity is the stable `session_instance_key` (the
+    /// per-spawn nonce marker), falling back to the provider session id, then the
+    /// rendered line itself when neither id is available. A repeat call for the
+    /// same identity — the sibling refresh path arriving second, or a later
+    /// status tick — returns `None`; a NEW session identity (new spawn / provider
+    /// session) makes the stored key stale so the next boundary re-emits. `None`
+    /// when there is no session snapshot to banner.
+    ///
+    /// Callers hold the per-channel `StatusPanelState` mutex across this call, so
+    /// the read-current-identity + compare-and-record is a single atomic step:
+    /// whichever of the sink/watcher refresh paths reaches it FIRST for a given
+    /// session wins the banner, and the other observes the recorded key and skips
+    /// (no double emit, no omission).
+    pub(super) fn claim_session_banner(&mut self, provider: &ProviderKind) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let line = render_session_panel_line(session, provider);
+        let key = session
+            .session_instance_key()
+            .map(str::to_owned)
+            .or_else(|| session.provider_session_id().map(str::to_owned))
+            .unwrap_or_else(|| line.clone());
+        if self.session_banner_emitted_key.as_deref() == Some(key.as_str()) {
+            return None;
+        }
+        self.session_banner_emitted_key = Some(key);
+        Some(line)
     }
 
     pub(super) fn reset_turn_content_preserving_unfinished_footer_residuals(&mut self) -> bool {
@@ -458,15 +499,12 @@ impl StatusPanelState {
 
 pub(super) fn render_status_panel(
     snapshot: StatusPanelState,
-    live_block: Option<String>,
     provider: &ProviderKind,
-    started_at_unix: i64,
-    _heartbeat_at_unix: i64,
-    // #3477 item 3: live batch arrived AFTER `completed_at` → a Completed turn
-    // keeps 🖥️ Recent (late batch not blanked; stale idle block still dropped).
-    live_content_fresh: bool,
-    request_anchor_line: Option<String>, // #3811: precomputed `요청:` line, or `None`
-    confidence_line: Option<String>,     // #3812: precomputed live/stale confidence line
+    // #3983 item 2: precomputed `마지막 업데이트 : … / 턴 시작 : …` time line (line 2).
+    time_line: String,
+    // #3983 item 3: precomputed `턴 트리거:` deeplink, appended as the LAST footer
+    // line (or `None` for headless/synthetic/id-0 turns with no real user message).
+    turn_trigger_line: Option<String>,
 ) -> String {
     let header_status = if matches!(provider, ProviderKind::Codex)
         && matches!(snapshot.status, DerivedStatus::SubagentRunning { .. })
@@ -475,19 +513,23 @@ pub(super) fn render_status_panel(
     } else {
         snapshot.status.clone()
     };
-    // #3812: header + freshness confidence line built in the colocated `freshness`
-    // module (status_panel.rs is at the namespace cap — keep it to the call site).
-    let mut sections = vec![super::freshness::render_status_header(
-        &header_status,
-        provider,
-        started_at_unix,
-        confidence_line.as_deref(),
-    )];
-    super::turn_anchor::prepend_request_anchor(&mut sections, request_anchor_line); // #3811
+    // #3983: line 1 = derived-status ACTIVITY label, line 2 = relative TIME line
+    // (both built in the colocated `freshness` module — status_panel.rs is at the
+    // namespace cap). The pre-#3983 confidence line + `진행 중 — provider` header is
+    // retired (item 2); the request anchor no longer prepends here (item 3, see the
+    // trailing `턴 트리거:` push below).
+    let mut sections = vec![
+        super::freshness::render_activity_line(&header_status),
+        time_line,
+    ];
 
-    if let Some(session) = snapshot.session.as_ref() {
-        sections.push(render_session_panel_line(session, provider));
-    }
+    // #3983 item4: the session line is NO LONGER rendered in the every-tick
+    // footer. It is emitted once, at the top, per session boundary via
+    // `StatusPanelState::claim_session_banner` (see `session_banner.rs`), so the
+    // repeated per-tick footer echo of `🆕 새 세션 시작 · provider session … · tmux …`
+    // is retired. `render_session_panel_line` is now used only by that one-shot
+    // banner claim. Track A's 3-line header (activity / time / 턴 트리거) is
+    // unaffected.
 
     if let Some(task) = snapshot.task.as_ref() {
         sections.push(render_task_panel_line(task));
@@ -518,23 +560,8 @@ pub(super) fn render_status_panel(
         sections.push(format!("Plan\n{}", lines.join("\n")));
     }
 
-    // #3477 item 4: 🖥️ Recent renders BEFORE Tasks/Subagents/Workflow (top
-    // signal + shielded from the trailing-section footer-budget drop — item 3).
-    let cluster_config = &crate::config::load_graceful().cluster;
-    let recent_header = render_recent_section_header(
-        snapshot.task.as_ref(),
-        cluster_config.enabled,
-        cluster_config.instance_id.as_deref(),
-    );
-    // #3394 self-contained fenced section (overflow drops it whole). #3477 item 3:
-    // a Completed turn suppresses it only when stale; a fresh late batch shows.
-    let completed = matches!(header_status, DerivedStatus::Completed { .. });
-    if (!completed || live_content_fresh)
-        && let Some(block) = live_block.filter(|block| !block.trim().is_empty())
-    {
-        sections.push(format!("{recent_header}\n{block}"));
-    }
-
+    // #3983 item 5a: the compact 🖥️ Recent + host block is removed from the footer
+    // (the terminal echo is retired from the status panel entirely).
     if !snapshot.tasks.is_empty() {
         let lines = snapshot
             .tasks
@@ -572,6 +599,13 @@ pub(super) fn render_status_panel(
         }
     }
 
+    // #3983 item 3: the `턴 트리거:` original-request deeplink is the LAST footer
+    // line (it previously prepended above the header). Absent for headless /
+    // synthetic / id-0 turns that carry no real Discord user message.
+    if let Some(trigger) = turn_trigger_line.filter(|line| !line.trim().is_empty()) {
+        sections.push(trigger);
+    }
+
     truncate_status_panel_sections(sections)
 }
 
@@ -595,29 +629,6 @@ pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> Strin
         return repair_fence_parity(&joined);
     }
     repair_fence_parity(&truncate_chars(&joined, STATUS_PANEL_MAX_CHARS))
-}
-
-pub(super) fn render_recent_section_header(
-    task: Option<&TaskPanelSnapshot>,
-    cluster_enabled: bool,
-    local_instance_id: Option<&str>,
-) -> String {
-    if !cluster_enabled {
-        return "🖥️ Recent".to_string();
-    }
-    let dispatch_owner = task
-        .and_then(|task| task.owner_instance_id.as_deref())
-        .map(str::trim)
-        .filter(|owner| !owner.is_empty());
-    let owner = dispatch_owner.or_else(|| {
-        local_instance_id
-            .map(str::trim)
-            .filter(|owner| !owner.is_empty())
-    });
-    match owner {
-        Some(owner) => format!("🖥️ Recent ({})", escape_status_panel_markdown(owner)),
-        None => "🖥️ Recent".to_string(),
-    }
 }
 
 pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {

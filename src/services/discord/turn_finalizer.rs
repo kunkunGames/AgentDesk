@@ -34,7 +34,7 @@ use super::SharedData;
 // #3041 P1-0: dormant lease types for the *Delivery messages below (mod.rs §2-§3).
 use super::{DeliveryLeaseCell, LeaseHolder, LeaseOutcome};
 
-mod cleanup;
+pub(in crate::services::discord) mod cleanup;
 mod completion_signal;
 mod delivery_lease;
 mod finalize;
@@ -184,8 +184,9 @@ fn ledger_has_live_watcher_pending(
 ///
 /// - A real `user_msg_id` uses its exact key.
 /// - A channel-only id collapses onto the single non-terminal entry ONLY when
-///   no terminal entry exists for the same channel/generation (ambiguous
-///   otherwise → route to the literal orphan key, a no-op for the caller).
+///   exactly one live entry exists and no terminal entry exists for the same
+///   channel/generation (ambiguous otherwise → route to the literal orphan key,
+///   a no-op for the caller).
 pub(in crate::services::discord) fn resolve_channel_only<'a>(
     key: TurnKey,
     candidates: impl Iterator<Item = (&'a LedgerKey, bool)> + Clone,
@@ -199,13 +200,16 @@ pub(in crate::services::discord) fn resolve_channel_only<'a>(
     if channel_has_terminal {
         return key.exact_key();
     }
-    candidates
-        .into_iter()
-        .find(|(lk, is_terminal)| {
-            lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
-        })
-        .map(|(lk, _)| *lk)
-        .unwrap_or_else(|| key.exact_key())
+    let mut live_matches = candidates.into_iter().filter(|(lk, is_terminal)| {
+        lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
+    });
+    let Some((only_live, _)) = live_matches.next() else {
+        return key.exact_key();
+    };
+    if live_matches.next().is_some() {
+        return key.exact_key();
+    }
+    *only_live
 }
 
 /// Every actor submits ONE of these terminal events. The finalizer's ledger
@@ -325,6 +329,7 @@ enum FinalizeMsg {
         provider: ProviderKind,
         event: TerminalEvent,
         ctx: FinalizeContext,
+        claim_snapshot: Option<SyntheticClaimSnapshot>,
         shared: Arc<SharedData>,
         ack: oneshot::Sender<FinalizeOutcome>,
     },
@@ -471,6 +476,7 @@ impl TurnFinalizer {
                 provider: provider.clone(),
                 event: event.clone(),
                 ctx,
+                claim_snapshot,
                 shared: shared.clone(),
                 ack,
             })
@@ -720,6 +726,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                         provider,
                         event,
                         ctx,
+                        claim_snapshot,
                         shared,
                         ack,
                     } => {
@@ -741,6 +748,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                             provider,
                             event,
                             ctx,
+                            claim_snapshot,
                             &shared,
                         ))
                         .catch_unwind()
@@ -916,6 +924,7 @@ async fn handle_terminal(
     provider: ProviderKind,
     event: TerminalEvent,
     ctx: FinalizeContext,
+    claim_snapshot: Option<SyntheticClaimSnapshot>,
     shared: &Arc<SharedData>,
 ) -> FinalizeOutcome {
     // #3866: test-only injection point — lets a test drive a real finalize
@@ -1054,6 +1063,7 @@ async fn handle_terminal(
         provider,
         &event,
         effective_ctx,
+        claim_snapshot.as_ref(),
         shared,
     ))
     .catch_unwind()
@@ -1464,6 +1474,65 @@ mod tests {
                 shared.restart.global_active.load(Ordering::Relaxed),
                 0,
                 "cleanup decrements the active counter exactly when it removes a token"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn already_finalized_loser_removes_thread_parent_and_kicks_parent_queue() {
+        use serenity::model::id::{MessageId, UserId};
+
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let parent = ChannelId::new(4_024_260);
+            let thread = ChannelId::new(4_024_261);
+            let turn_id = 4_024_262u64;
+            let key = TurnKey::new(thread, turn_id, 0);
+
+            fin.register_start(key, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
+            let first = fin
+                .submit_terminal(
+                    key,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
+
+            shared.dispatch.thread_parents.insert(parent, thread);
+            shared.restart.global_active.store(1, Ordering::Relaxed);
+            shared
+                .mailbox(thread)
+                .restore_active_turn(
+                    Arc::new(CancelToken::new()),
+                    UserId::new(7),
+                    MessageId::new(turn_id),
+                )
+                .await;
+
+            let late = fin
+                .submit_terminal(
+                    key,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+
+            assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
+            assert!(
+                !shared.dispatch.thread_parents.contains_key(&parent),
+                "AlreadyFinalized cleanup must drop the finalized thread's parent mapping"
+            );
+            assert_eq!(
+                shared.restart.deferred_hook_backlog.load(Ordering::Relaxed),
+                1,
+                "dropping the parent mapping must schedule the parent queue kick"
             );
         })
         .await;
@@ -3244,6 +3313,33 @@ mod tests {
             zero_key.exact_key(),
             "with a terminal entry present, id-0 routes to the orphan no-op key, \
              not the newer live entry"
+        );
+    }
+
+    #[test]
+    fn channel_only_resolve_refuses_multi_live_collapse() {
+        let ch = ChannelId::new(4243);
+        let generation = 0u64;
+        let live_a = LedgerKey {
+            channel_id: ch,
+            generation,
+            user_msg_id: 1001,
+        };
+        let live_b = LedgerKey {
+            channel_id: ch,
+            generation,
+            user_msg_id: 1002,
+        };
+        let zero_key = TurnKey::new(ch, 0, generation);
+        let candidates = [
+            (&live_a, /* is_terminal */ false),
+            (&live_b, /* is_terminal */ false),
+        ];
+
+        assert_eq!(
+            resolve_channel_only(zero_key, candidates.iter().copied()),
+            zero_key.exact_key(),
+            "an id-0 terminal with multiple live candidates must not pick a HashMap-arbitrary entry"
         );
     }
 

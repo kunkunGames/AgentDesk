@@ -72,6 +72,10 @@ pub(super) const PENDING_START_MAX_CLAIM_ATTEMPTS: u32 = 5;
 /// Backoff between claim retries after a transient `claimed == false`.
 pub(super) const PENDING_START_CLAIM_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
+/// #4030 mirrors the #4020 positive stale-owner age gate for reclaiming a row
+/// that still looks FOREIGN-live but has stopped advancing.
+pub(super) const STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS: i64 = 120;
+
 /// Lifecycle state of a durable pending-start record. Kept tiny and
 /// string-serialized so a forward/backward dcserver swap reads it tolerantly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -588,6 +592,402 @@ pub(super) type AbortCleanupFn = Box<
         + Sync,
 >;
 
+/// #3982: the worker's per-escalation-cycle orphan-reclaim attempt, consulted in
+/// the `BackstopForeignInflightLive` branch BEFORE the terminal abort. The
+/// backstop can only observe an inflight row; it cannot tell a genuinely live
+/// FOREIGN turn from a producer-dead `SessionBoundRelay` orphan born after its
+/// per-turn StreamRelay producer already exited (a stale `get_producer` `Some`
+/// stamps the owner `SessionBoundRelay`; the row never commits and is perpetually
+/// misread as live-foreign → every later TUI-direct turn aborts). This closure
+/// loads the row and, IFF it is orphan-shaped (300s-quiescent, zero-progress,
+/// never-delivered), downgrades its relay owner to `None` via the
+/// identity-guarded `downgrade_orphaned_session_bound_relay_owner_locked`.
+///
+/// Returns `true` ONLY when the owner was downgraded — the worker then
+/// re-evaluates immediately (`continue`): the next view's ownerless-stale filter
+/// drops the now-`None` row, so the deferred claim proceeds instead of aborting.
+/// Returns `false` for a genuinely live turn (not orphan-shaped), an
+/// identity/lifecycle mismatch, or an I/O failure → the worker keeps its EXISTING
+/// bounded escalation/abort (no new infinite spin). Provided by
+/// [`super::tui_prompt_relay`] (it owns inflight access); it NEVER gates on the
+/// proven-stale `get_producer` oracle — the authoritative guard is the in-lock
+/// orphan-shape re-check + identity inside the downgrade primitive (#3982).
+pub(super) type ReclaimOrphanFn = Box<
+    dyn for<'a> Fn(
+            &'a Arc<SharedData>,
+            &'a TuiDirectPendingStart,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = ReclaimStaleForeignOutcome> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReclaimStaleForeignOutcome {
+    None,
+    StaleForeignDemoted,
+    SessionBoundOrphanReclaimed,
+}
+
+impl ReclaimStaleForeignOutcome {
+    fn is_reclaimed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn event_key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::StaleForeignDemoted => "tui_direct_pending_start.backstop_stale_foreign_demoted",
+            Self::SessionBoundOrphanReclaimed => {
+                "tui_direct_pending_start.backstop_orphan_reclaimed"
+            }
+        }
+    }
+}
+
+fn stale_foreign_inflight_age_permits_reclaim(
+    state: &super::inflight::InflightTurnState,
+    now_unix_secs: i64,
+) -> bool {
+    let Some(updated_at_unix) = super::inflight::parse_updated_at_unix(&state.updated_at) else {
+        return false;
+    };
+    let age_secs = now_unix_secs.saturating_sub(updated_at_unix);
+    age_secs >= STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS
+}
+
+fn output_capture_offset(state: &super::inflight::InflightTurnState) -> Option<u64> {
+    state
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+}
+
+fn stale_foreign_inflight_is_reclaimable_at(
+    state: &super::inflight::InflightTurnState,
+    record: &TuiDirectPendingStart,
+    now_unix_secs: i64,
+) -> bool {
+    let is_own_anchor = state.turn_source == super::inflight::TurnSource::ExternalInput
+        && state.tmux_session_name.as_deref() == Some(record.tmux_session_name.as_str())
+        && state.user_msg_id == record.anchor_message_id;
+    !is_own_anchor
+        && state.tmux_session_name.as_deref() == Some(record.tmux_session_name.as_str())
+        && state.effective_relay_owner_kind() != super::inflight::RelayOwnerKind::SessionBoundRelay
+        && !state.terminal_delivery_committed
+        && stale_foreign_inflight_age_permits_reclaim(state, now_unix_secs)
+}
+
+fn stale_foreign_cancel_finalize_context() -> super::turn_finalizer::FinalizeContext {
+    super::turn_finalizer::FinalizeContext {
+        clear_inflight: true,
+        allow_completion_cleanup: false,
+        drain_voice: false,
+        kickoff_queue: true,
+        expected_idempotent_guard_miss: false,
+    }
+}
+
+fn committed_foreign_complete_finalize_context() -> super::turn_finalizer::FinalizeContext {
+    super::turn_finalizer::FinalizeContext {
+        clear_inflight: true,
+        allow_completion_cleanup: false,
+        drain_voice: false,
+        kickoff_queue: true,
+        expected_idempotent_guard_miss: false,
+    }
+}
+
+fn committed_foreign_inflight_is_finalize_clearable(
+    state: &super::inflight::InflightTurnState,
+    record: &TuiDirectPendingStart,
+) -> bool {
+    let is_own_anchor = state.turn_source == super::inflight::TurnSource::ExternalInput
+        && state.tmux_session_name.as_deref() == Some(record.tmux_session_name.as_str())
+        && state.user_msg_id == record.anchor_message_id;
+    !is_own_anchor
+        && state.tmux_session_name.as_deref() == Some(record.tmux_session_name.as_str())
+        && state.terminal_delivery_committed
+}
+
+async fn submit_stale_foreign_inflight_cancel(
+    shared: &Arc<SharedData>,
+    provider: &crate::services::provider::ProviderKind,
+    channel_id: poise::serenity_prelude::ChannelId,
+    probe: &super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
+) -> bool {
+    let finalizer_turn_id = probe.pin.finalizer_turn_id;
+    if finalizer_turn_id == 0 {
+        return false;
+    }
+    let Some(current) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            finalizer_turn_id,
+            "tui_direct_pending_start: stale FOREIGN cancel no-op; inflight disappeared before finalizer submit"
+        );
+        return false;
+    };
+    let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel_id)
+        .await
+        .active_user_message_id
+        .map(|id| id.get());
+    if !probe.pin.matches_state(&current)
+        || mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id
+        || current.updated_at != probe.updated_at
+        || current.save_generation != probe.save_generation
+    {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            expected_finalizer_turn_id = finalizer_turn_id,
+            current_finalizer_turn_id = current.effective_finalizer_turn_id(),
+            expected_mailbox_active_user_msg_id = probe.pin.mailbox_active_user_msg_id.unwrap_or(0),
+            mailbox_active_user_msg_id = mailbox_active_user_msg_id.unwrap_or(0),
+            expected_tmux_session = ?probe.pin.tmux_session_name,
+            current_tmux_session = ?current.tmux_session_name,
+            expected_updated_at = %probe.updated_at,
+            current_updated_at = %current.updated_at,
+            expected_save_generation = probe.save_generation,
+            current_save_generation = current.save_generation,
+            "tui_direct_pending_start: stale FOREIGN cancel no-op; identity/death-evidence pin no longer matches"
+        );
+        return false;
+    }
+    let stale_identity = super::inflight::InflightTurnIdentity::from_state(&current);
+    let _ = shared
+        .turn_finalizer
+        .submit_terminal(
+            super::turn_finalizer::TurnKey::new(
+                channel_id,
+                finalizer_turn_id,
+                shared.restart.current_generation,
+            ),
+            provider.clone(),
+            super::turn_finalizer::TerminalEvent::Cancel,
+            stale_foreign_cancel_finalize_context(),
+            shared.clone(),
+        )
+        .await;
+
+    let lifecycle_clear_outcome =
+        super::inflight::clear_lifecycle_inflight_state_if_matches_identity_after_death_evidence(
+            provider,
+            channel_id.get(),
+            &stale_identity,
+            &probe.updated_at,
+            probe.save_generation,
+        );
+
+    let gone_or_changed = !super::inflight::load_inflight_state(provider, channel_id.get())
+        .is_some_and(|current| {
+            stale_identity == super::inflight::InflightTurnIdentity::from_state(&current)
+                && current.effective_finalizer_turn_id() == finalizer_turn_id
+        });
+    tracing::warn!(
+        provider = %provider.as_str(),
+        channel_id = channel_id.get(),
+        finalizer_turn_id,
+        lifecycle_clear_outcome = ?lifecycle_clear_outcome,
+        gone_or_changed,
+        "tui_direct_pending_start: stale FOREIGN finalizer cancel completed under death-evidence gate"
+    );
+    gone_or_changed
+}
+
+async fn submit_committed_foreign_inflight_complete(
+    shared: &Arc<SharedData>,
+    provider: &crate::services::provider::ProviderKind,
+    channel_id: poise::serenity_prelude::ChannelId,
+    probe: &super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
+) -> bool {
+    let finalizer_turn_id = probe.pin.finalizer_turn_id;
+    if finalizer_turn_id == 0 {
+        return false;
+    }
+    let Some(current) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            finalizer_turn_id,
+            "tui_direct_pending_start: committed FOREIGN complete no-op; inflight disappeared before finalizer submit"
+        );
+        return false;
+    };
+    let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel_id)
+        .await
+        .active_user_message_id
+        .map(|id| id.get());
+    if !current.terminal_delivery_committed
+        || !super::destructive_cancel_gate::terminal_envelope_present(provider, probe)
+        || !probe.pin.matches_state(&current)
+        || mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id
+        || current.updated_at != probe.updated_at
+        || current.save_generation != probe.save_generation
+    {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            expected_finalizer_turn_id = finalizer_turn_id,
+            current_finalizer_turn_id = current.effective_finalizer_turn_id(),
+            expected_mailbox_active_user_msg_id = probe.pin.mailbox_active_user_msg_id.unwrap_or(0),
+            mailbox_active_user_msg_id = mailbox_active_user_msg_id.unwrap_or(0),
+            expected_tmux_session = ?probe.pin.tmux_session_name,
+            current_tmux_session = ?current.tmux_session_name,
+            terminal_delivery_committed = current.terminal_delivery_committed,
+            expected_updated_at = %probe.updated_at,
+            current_updated_at = %current.updated_at,
+            expected_save_generation = probe.save_generation,
+            current_save_generation = current.save_generation,
+            "tui_direct_pending_start: committed FOREIGN complete no-op; terminal envelope or identity pin no longer matches"
+        );
+        return false;
+    }
+
+    let committed_identity = super::inflight::InflightTurnIdentity::from_state(&current);
+    let outcome = shared
+        .turn_finalizer
+        .submit_terminal(
+            super::turn_finalizer::TurnKey::new(
+                channel_id,
+                finalizer_turn_id,
+                shared.restart.current_generation,
+            ),
+            provider.clone(),
+            super::turn_finalizer::TerminalEvent::Complete,
+            committed_foreign_complete_finalize_context(),
+            shared.clone(),
+        )
+        .await;
+
+    let gone_or_changed = !super::inflight::load_inflight_state(provider, channel_id.get())
+        .is_some_and(|current| {
+            committed_identity == super::inflight::InflightTurnIdentity::from_state(&current)
+                && current.effective_finalizer_turn_id() == finalizer_turn_id
+                && current.save_generation == probe.save_generation
+        });
+    tracing::warn!(
+        provider = %provider.as_str(),
+        channel_id = channel_id.get(),
+        finalizer_turn_id,
+        finalize_outcome = ?std::mem::discriminant(&outcome),
+        gone_or_changed,
+        "tui_direct_pending_start: committed FOREIGN inflight cleared via finalizer Complete under terminal-envelope gate"
+    );
+    gone_or_changed
+}
+
+pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_current(
+    shared: &Arc<SharedData>,
+    record: &TuiDirectPendingStart,
+) -> bool {
+    let Some(provider) = crate::services::provider::ProviderKind::from_str(&record.provider) else {
+        return false;
+    };
+    let channel = poise::serenity_prelude::ChannelId::new(record.channel_id);
+    let Some(state) = super::inflight::load_inflight_state(&provider, record.channel_id) else {
+        return false;
+    };
+    let relay_frontier = shared.committed_relay_offset(channel);
+    let capture_offset = output_capture_offset(&state);
+    if committed_foreign_inflight_is_finalize_clearable(&state, record) {
+        let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel)
+            .await
+            .active_user_message_id
+            .map(|id| id.get());
+        let probe = super::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+            &state,
+            mailbox_active_user_msg_id,
+            Some(relay_frontier),
+        );
+        if !super::destructive_cancel_gate::terminal_envelope_present(&provider, &probe) {
+            tracing::warn!(
+                provider = %record.provider,
+                channel_id = record.channel_id,
+                tmux_session_name = %record.tmux_session_name,
+                anchor_message_id = record.anchor_message_id,
+                committed_user_msg_id = state.user_msg_id,
+                committed_started_at = %state.started_at,
+                committed_updated_at = %state.updated_at,
+                relay_frontier,
+                capture_offset = ?capture_offset,
+                "tui_direct_pending_start: skipped committed FOREIGN finalize-clear; terminal envelope evidence missing"
+            );
+            return false;
+        }
+        let cleared =
+            submit_committed_foreign_inflight_complete(shared, &provider, channel, &probe).await;
+        if cleared {
+            tracing::warn!(
+                provider = %record.provider,
+                channel_id = record.channel_id,
+                tmux_session_name = %record.tmux_session_name,
+                anchor_message_id = record.anchor_message_id,
+                committed_user_msg_id = state.user_msg_id,
+                committed_started_at = %state.started_at,
+                committed_updated_at = %state.updated_at,
+                relay_frontier,
+                capture_offset = ?capture_offset,
+                "tui_direct_pending_start: cleared committed FOREIGN inflight with terminal envelope via finalizer Complete; re-evaluating before claiming (#4035)"
+            );
+        }
+        return cleared;
+    }
+    if !stale_foreign_inflight_is_reclaimable_at(&state, record, chrono::Utc::now().timestamp()) {
+        return false;
+    }
+    let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel)
+        .await
+        .active_user_message_id
+        .map(|id| id.get());
+    let probe = super::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+        &state,
+        mailbox_active_user_msg_id,
+        Some(relay_frontier),
+    );
+    let gate =
+        super::destructive_cancel_gate::evaluate(shared, &provider, channel, channel, &probe).await;
+    if !gate.is_allowed() {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            tmux_session_name = %record.tmux_session_name,
+            anchor_message_id = record.anchor_message_id,
+            stale_user_msg_id = state.user_msg_id,
+            stale_started_at = %state.started_at,
+            stale_updated_at = %state.updated_at,
+            relay_frontier,
+            capture_offset = ?capture_offset,
+            denied_reason = gate.denied_reason().unwrap_or("unknown"),
+            "tui_direct_pending_start: skipped destructive stale FOREIGN demotion; death/identity gate did not pass (#4030)"
+        );
+        return false;
+    }
+
+    let demoted = submit_stale_foreign_inflight_cancel(shared, &provider, channel, &probe).await;
+    if demoted {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            tmux_session_name = %record.tmux_session_name,
+            anchor_message_id = record.anchor_message_id,
+            stale_user_msg_id = state.user_msg_id,
+            stale_started_at = %state.started_at,
+            stale_updated_at = %state.updated_at,
+            relay_frontier,
+            capture_offset = ?capture_offset,
+            death_evidence = gate.allowed_reason().unwrap_or("unknown"),
+            min_stale_age_secs = STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS,
+            "tui_direct_pending_start: demoted stale FOREIGN inflight with dead relay frontier via finalizer Cancel; re-evaluating before claiming (#4030)"
+        );
+    }
+    demoted
+}
+
 /// #3296 codex r3: choose the foreign identity an aborted-anchor marker pins.
 /// The worker's LAST-VIEW identity is PRIMARY — that row was observed LIVE
 /// during the backstop window, so it is definitionally the turn the ABORT
@@ -622,11 +1022,20 @@ pub(super) fn spawn_worker(
     view_fn: ViewFn,
     claim_fn: ClaimFn,
     abort_cleanup_fn: AbortCleanupFn,
+    reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
     let active_guard = active_worker_guard_for_spawn(&record.provider, record.channel_id);
     super::task_supervisor::spawn_observed("tui_direct_pending_start_worker", async move {
         let _active_guard = active_guard;
-        run_worker_inner(shared, record, view_fn, claim_fn, abort_cleanup_fn).await;
+        run_worker_inner(
+            shared,
+            record,
+            view_fn,
+            claim_fn,
+            abort_cleanup_fn,
+            reclaim_orphan_fn,
+        )
+        .await;
     });
 }
 
@@ -650,9 +1059,18 @@ async fn run_worker(
     view_fn: ViewFn,
     claim_fn: ClaimFn,
     abort_cleanup_fn: AbortCleanupFn,
+    reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
     let _active_guard = ActiveWorkerGuard::new(&record.provider, record.channel_id);
-    run_worker_inner(shared, record, view_fn, claim_fn, abort_cleanup_fn).await;
+    run_worker_inner(
+        shared,
+        record,
+        view_fn,
+        claim_fn,
+        abort_cleanup_fn,
+        reclaim_orphan_fn,
+    )
+    .await;
 }
 
 async fn run_worker_inner(
@@ -661,6 +1079,7 @@ async fn run_worker_inner(
     view_fn: ViewFn,
     claim_fn: ClaimFn,
     abort_cleanup_fn: AbortCleanupFn,
+    reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
     let lock = channel_lock(&record.provider, record.channel_id);
     let _guard = lock.lock().await;
@@ -717,6 +1136,29 @@ async fn run_worker_inner(
                 );
             }
             WaitOutcome::BackstopForeignInflightLive => {
+                // #4030 + #3982: before escalating, try the bounded stale-foreign
+                // recovery hook. It first demotes a FOREIGN inflight whose
+                // `updated_at` crossed the #4020 120s positive-stale gate AND
+                // whose relay frontier never advanced despite captured output;
+                // then it falls back to the #3982 producer-dead SessionBoundRelay
+                // orphan downgrade. Either success only causes an immediate
+                // re-evaluation; the worker never claims on this stale view.
+                let reclaim_outcome = reclaim_orphan_fn(&shared, &record).await;
+                if reclaim_outcome.is_reclaimed() {
+                    tracing::warn!(
+                        provider = %record.provider,
+                        channel_id = record.channel_id,
+                        tmux_session_name = %record.tmux_session_name,
+                        anchor_message_id = record.anchor_message_id,
+                        backstop_cycle = backstop_cycles,
+                        event = reclaim_outcome.event_key(),
+                        "tui_direct_pending_start: reclaimed/demoted a stale FOREIGN inflight blocking this synthetic start; re-evaluating immediately before any claim (#4030/#3982)"
+                    );
+                    continue;
+                }
+                // No stale/demotable row matched. Keep the existing bounded
+                // escalation/abort behavior; a failed recovery attempt must not
+                // turn into an infinite spin or an unsafe overwrite.
                 backstop_cycles = backstop_cycles.saturating_add(1);
                 if backstop_cycles >= PENDING_START_MAX_BACKSTOP_CYCLES {
                     // ABORT SAFELY (P1-1): a foreign prior inflight stayed live
@@ -1303,6 +1745,13 @@ mod tests {
         (cleanup, calls, identity)
     }
 
+    /// A [`ReclaimOrphanFn`] that never reclaims. Preserves the
+    /// pre-#3982 backstop behavior for every test that does not exercise the
+    /// orphan-reclaim path — the worker escalates/aborts exactly as before.
+    fn never_reclaim_orphan() -> ReclaimOrphanFn {
+        Box::new(|_shared, _record| Box::pin(async move { ReclaimStaleForeignOutcome::None }))
+    }
+
     fn record(provider: &str, channel_id: u64, anchor: u64) -> TuiDirectPendingStart {
         TuiDirectPendingStart {
             provider: provider.to_string(),
@@ -1320,6 +1769,109 @@ mod tests {
             state: PendingStartState::Waiting,
             attempt_count: 0,
         }
+    }
+
+    fn local_timestamp_age_secs(age_secs: i64) -> String {
+        (chrono::Local::now() - chrono::Duration::seconds(age_secs))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    fn inflight_fixture_path(
+        root: &std::path::Path,
+        provider: &crate::services::provider::ProviderKind,
+        channel_id: u64,
+    ) -> std::path::PathBuf {
+        root.join("runtime")
+            .join("discord_inflight")
+            .join(provider.as_str())
+            .join(format!("{channel_id}.json"))
+    }
+
+    fn write_inflight_fixture(
+        root: &std::path::Path,
+        provider: &crate::services::provider::ProviderKind,
+        state: &super::super::inflight::InflightTurnState,
+    ) {
+        let path = inflight_fixture_path(root, provider, state.channel_id);
+        std::fs::create_dir_all(path.parent().expect("inflight parent"))
+            .expect("create inflight fixture dir");
+        let existing_generation = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| {
+                serde_json::from_str::<super::super::inflight::InflightTurnState>(&content).ok()
+            })
+            .map(|state| state.save_generation)
+            .unwrap_or(0);
+        let mut state = state.clone();
+        state.save_generation = existing_generation.saturating_add(1);
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&state).expect("serialize inflight fixture"),
+        )
+        .expect("write inflight fixture");
+    }
+
+    fn stale_foreign_state(
+        provider: crate::services::provider::ProviderKind,
+        channel_id: u64,
+        user_msg_id: u64,
+        tmux_session_name: &str,
+        output_path: &std::path::Path,
+    ) -> super::super::inflight::InflightTurnState {
+        let mut state = super::super::inflight::InflightTurnState::new(
+            provider,
+            channel_id,
+            None,
+            1,
+            user_msg_id,
+            user_msg_id + 1,
+            "stale foreign turn".to_string(),
+            None,
+            Some(tmux_session_name.to_string()),
+            Some(output_path.to_string_lossy().to_string()),
+            None,
+            0,
+        );
+        let stale_at = local_timestamp_age_secs(STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS + 1);
+        state.started_at = stale_at.clone();
+        state.updated_at = stale_at;
+        state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+        state
+    }
+
+    fn stamp_claude_ready_for_input_evidence(
+        state: &mut super::super::inflight::InflightTurnState,
+        output_path: &std::path::Path,
+    ) {
+        state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
+        state.last_offset = std::fs::metadata(output_path)
+            .expect("ready output metadata")
+            .len();
+    }
+
+    #[test]
+    fn stale_foreign_demote_excludes_session_bound_relay_for_orphan_reclaim() {
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        let provider = crate::services::provider::ProviderKind::Claude;
+        let channel_id = 4_030_109;
+        let tmux = "tmux-4030-session-bound";
+        let output_path = root.path().join("session-bound.jsonl");
+        std::fs::write(&output_path, "").expect("write output");
+        let mut state = stale_foreign_state(provider, channel_id, 4_030_209, tmux, &output_path);
+        state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::SessionBoundRelay);
+        let mut rec = record("claude", channel_id, 4_030_309);
+        rec.tmux_session_name = tmux.to_string();
+
+        assert!(
+            !stale_foreign_inflight_is_reclaimable_at(&state, &rec, chrono::Utc::now().timestamp(),),
+            "SessionBoundRelay rows must be left to the #3982 orphan downgrade path"
+        );
     }
 
     /// #3154 interleave integration test (design point: tokio interleave with
@@ -1341,6 +1893,12 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
         reset_present_for_tests();
         let shared = super::super::make_shared_data_for_tests();
 
@@ -1396,6 +1954,7 @@ mod tests {
             a_view,
             a_claim,
             a_cleanup,
+            never_reclaim_orphan(),
         ));
 
         // ---- Channel B: prior turn already finalized → relays immediately. ----
@@ -1428,6 +1987,7 @@ mod tests {
             b_view,
             b_claim,
             b_cleanup,
+            never_reclaim_orphan(),
         ));
 
         // B is on a DIFFERENT channel lock; it must finish without waiting for A.
@@ -1517,10 +2077,647 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn stale_foreign_inflight_dead_frontier_is_demoted_via_finalizer_cancel() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_110;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_210;
+            let anchor = 4_030_310;
+            let tmux = "tmux-4030-stale-foreign";
+            let output_path = root.path().join("stale-foreign.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            )
+            .expect("write output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let mut state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            stamp_claude_ready_for_input_evidence(&mut state, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let mut rec = record("claude", channel_id, anchor);
+            rec.tmux_session_name = tmux.to_string();
+
+            assert!(
+                stale_foreign_inflight_is_reclaimable_at(
+                    &state,
+                    &rec,
+                    chrono::Utc::now().timestamp(),
+                ),
+                "fixture must satisfy the #4030 age + dead-frontier cutoff"
+            );
+            assert!(demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+
+            assert!(
+                super::super::inflight::load_inflight_state(&provider, channel_id).is_none(),
+                "stale foreign inflight must be cleared through the finalizer"
+            );
+            assert!(
+                token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                "stale foreign finalizer cancel must release the owning mailbox token"
+            );
+            assert_eq!(
+                shared
+                    .restart
+                    .global_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn committed_leaked_foreign_row_clears_then_pending_start_claims() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        reset_present_for_tests();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_035_020;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_035_120;
+            let anchor = 4_035_220;
+            let tmux = "tmux-4035-committed-leak";
+            let stale_output = temp.path().join("committed-leak.jsonl");
+            std::fs::write(
+                &stale_output,
+                r#"{"type":"result","result":"delivered","session_id":"s"}"#,
+            )
+            .expect("write terminal jsonl");
+            let stale_token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    stale_token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+
+            let mut stale_state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &stale_output);
+            stale_state.terminal_delivery_committed = true;
+            stale_state.full_response = "delivered".to_string();
+            stale_state.response_sent_offset = stale_state.full_response.len();
+            stale_state.last_offset = std::fs::metadata(&stale_output)
+                .expect("terminal jsonl metadata")
+                .len();
+            write_inflight_fixture(temp.path(), &provider, &stale_state);
+
+            let mut rec = record("claude", channel_id, anchor);
+            rec.tmux_session_name = tmux.to_string();
+            persist(&rec).unwrap();
+            assert!(pending_synthetic_start_present("claude", channel_id));
+
+            let provider_for_view = provider.clone();
+            let view: ViewFn = Box::new(move |_shared, record| {
+                let provider = provider_for_view.clone();
+                Box::pin(async move {
+                    let inflight =
+                        super::super::inflight::load_inflight_state(&provider, record.channel_id);
+                    let inflight_is_own_anchor = inflight.as_ref().is_some_and(|state| {
+                        state.turn_source == super::super::inflight::TurnSource::ExternalInput
+                            && state.tmux_session_name.as_deref()
+                                == Some(record.tmux_session_name.as_str())
+                            && state.user_msg_id == record.anchor_message_id
+                    });
+                    let foreign_inflight_identity = inflight
+                        .as_ref()
+                        .filter(|_| !inflight_is_own_anchor)
+                        .map(|state| (state.user_msg_id, state.started_at.clone()));
+                    Some(PriorTurnObservation {
+                        view: PriorTurnView {
+                            inflight_present: inflight.is_some(),
+                            inflight_is_own_anchor,
+                            mailbox_blocking_turn_present: false,
+                            mailbox_turn_is_own_anchor: false,
+                            runtime_binding_present: true,
+                        },
+                        foreign_inflight_identity,
+                    })
+                })
+            });
+
+            let claim_calls = Arc::new(AtomicU32::new(0));
+            let claim_calls_for_fn = claim_calls.clone();
+            let provider_for_claim = provider.clone();
+            let root_for_claim = temp.path().to_path_buf();
+            let claim: ClaimFn = Box::new(move |shared, record| {
+                let calls = claim_calls_for_fn.clone();
+                let provider = provider_for_claim.clone();
+                let root = root_for_claim.clone();
+                Box::pin(async move {
+                    let channel = poise::serenity_prelude::ChannelId::new(record.channel_id);
+                    let token = Arc::new(crate::services::provider::CancelToken::new());
+                    let started = super::super::mailbox_try_start_turn(
+                        shared,
+                        channel,
+                        token,
+                        poise::serenity_prelude::UserId::new(1),
+                        poise::serenity_prelude::MessageId::new(record.anchor_message_id),
+                    )
+                    .await;
+                    if !started {
+                        return false;
+                    }
+                    let fresh_output = root.join("fresh-claim.jsonl");
+                    std::fs::write(&fresh_output, "").expect("write fresh output");
+                    let mut fresh = super::super::inflight::InflightTurnState::new(
+                        provider.clone(),
+                        record.channel_id,
+                        None,
+                        1,
+                        record.anchor_message_id,
+                        record.anchor_message_id + 1,
+                        record.prompt_text.clone(),
+                        None,
+                        Some(record.tmux_session_name.clone()),
+                        Some(fresh_output.to_string_lossy().to_string()),
+                        None,
+                        0,
+                    );
+                    fresh.turn_source = super::super::inflight::TurnSource::ExternalInput;
+                    fresh.injected_prompt_message_id = Some(record.anchor_message_id);
+                    fresh.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+                    write_inflight_fixture(&root, &provider, &fresh);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            });
+            let reclaim: ReclaimOrphanFn = Box::new(|shared, record| {
+                Box::pin(async move {
+                    if demote_stale_foreign_inflight_if_current(shared, record).await {
+                        ReclaimStaleForeignOutcome::StaleForeignDemoted
+                    } else {
+                        ReclaimStaleForeignOutcome::None
+                    }
+                })
+            });
+
+            let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
+            let handle = tokio::spawn(run_worker(
+                shared.clone(),
+                rec,
+                view,
+                claim,
+                abort_cleanup,
+                reclaim,
+            ));
+            tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
+            tokio::task::yield_now().await;
+            handle.await.unwrap();
+
+            assert_eq!(
+                claim_calls.load(Ordering::SeqCst),
+                1,
+                "committed leaked row must clear before the new pending start claims"
+            );
+            assert_eq!(
+                abort_cleanup_calls.load(Ordering::SeqCst),
+                0,
+                "committed delivery self-heal is a completion clear, not an abort"
+            );
+            assert!(
+                stale_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "finalizer Complete must release the stale committed mailbox token"
+            );
+            let current = super::super::inflight::load_inflight_state(&provider, channel_id)
+                .expect("fresh claimed inflight must exist");
+            assert_eq!(current.user_msg_id, anchor);
+            assert_eq!(
+                current.turn_source,
+                super::super::inflight::TurnSource::ExternalInput
+            );
+            assert!(
+                !pending_synthetic_start_present("claude", channel_id),
+                "successful fresh claim must release the pending-start gate"
+            );
+            reset_present_for_tests();
+        });
+    }
+
+    #[test]
+    fn stale_foreign_demote_uses_no_progress_not_absolute_zero_frontier() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_112;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_212;
+            let anchor = 4_030_312;
+            let tmux = "tmux-4030-nonzero-frontier";
+            let output_path = root.path().join("ready-capture.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            )
+            .expect("write ready output");
+            shared
+                .tmux_relay_coord(channel)
+                .confirmed_end_offset
+                .store(64, std::sync::atomic::Ordering::Release);
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let mut state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            stamp_claude_ready_for_input_evidence(&mut state, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let mut rec = record("claude", channel_id, anchor);
+            rec.tmux_session_name = tmux.to_string();
+
+            assert!(demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+            assert!(
+                super::super::inflight::load_inflight_state(&provider, channel_id).is_none(),
+                "frozen nonzero relay frontier with unchanged ready capture is death evidence"
+            );
+            assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        });
+    }
+
+    #[test]
+    fn stale_foreign_death_gate_clears_rebind_origin_lifecycle_row() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_113;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_213;
+            let anchor = 4_030_313;
+            let tmux = "tmux-4030-rebind-origin";
+            let output_path = root.path().join("rebind-origin.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            )
+            .expect("write output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let mut state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            stamp_claude_ready_for_input_evidence(&mut state, &output_path);
+            state.rebind_origin = true;
+            write_inflight_fixture(root.path(), &provider, &state);
+            let mut rec = record("claude", channel_id, anchor);
+            rec.tmux_session_name = tmux.to_string();
+
+            assert!(demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+            assert!(
+                super::super::inflight::load_inflight_state(&provider, channel_id).is_none(),
+                "death-evidence finalizer path must clear lifecycle rows that ordinary guarded clears preserve"
+            );
+            assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        });
+    }
+
+    #[test]
+    fn stale_foreign_same_identity_revival_blocks_destructive_cancel() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_114;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_214;
+            let anchor = 4_030_314;
+            let tmux = "tmux-4030-revival";
+            let output_path = root.path().join("revival.jsonl");
+            std::fs::write(&output_path, "halted").expect("write output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let mut rec = record("claude", channel_id, anchor);
+            rec.tmux_session_name = tmux.to_string();
+
+            let root_path = root.path().to_path_buf();
+            let provider_for_task = provider.clone();
+            let mut revived = state.clone();
+            let revival = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                revived.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                write_inflight_fixture(&root_path, &provider_for_task, &revived);
+            });
+
+            assert!(
+                !demote_stale_foreign_inflight_if_current(&shared, &rec).await,
+                "same identity with refreshed updated_at is revival evidence, not death evidence"
+            );
+            revival.await.expect("revival task");
+            let current = super::super::inflight::load_inflight_state(&provider, channel_id)
+                .expect("revived inflight must remain");
+            assert_eq!(current.user_msg_id, stale_msg);
+            assert!(
+                current.save_generation > state.save_generation,
+                "same-second revival must be observed via save_generation"
+            );
+            assert!(
+                !token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                "revived same-identity turn must not be canceled"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_foreign_demote_racing_fresh_claim_does_not_clear_fresh_row() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_111;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let tmux = "tmux-4030-race";
+            let stale_output = root.path().join("stale.jsonl");
+            let fresh_output = root.path().join("fresh.jsonl");
+            std::fs::write(&stale_output, "stale captured").expect("write stale output");
+            std::fs::write(&fresh_output, "fresh captured").expect("write fresh output");
+            let stale_state =
+                stale_foreign_state(provider.clone(), channel_id, 4_030_211, tmux, &stale_output);
+
+            let fresh_msg = 4_030_212;
+            let fresh_token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    fresh_token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(fresh_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let fresh_state =
+                stale_foreign_state(provider.clone(), channel_id, fresh_msg, tmux, &fresh_output);
+            write_inflight_fixture(root.path(), &provider, &fresh_state);
+
+            let stale_probe =
+                crate::services::discord::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+                    &stale_state,
+                    Some(4_030_211),
+                    Some(shared.committed_relay_offset(channel)),
+                );
+            assert!(
+                !submit_stale_foreign_inflight_cancel(&shared, &provider, channel, &stale_probe).await,
+                "identity mismatch is a no-op; the fresh turn must remain live"
+            );
+            let current = super::super::inflight::load_inflight_state(&provider, channel_id)
+                .expect("fresh inflight must remain");
+            assert_eq!(current.user_msg_id, fresh_msg);
+            assert!(
+                !fresh_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "identity-guarded finalizer cancel must not release a fresh claim's token"
+            );
+            assert_eq!(
+                shared
+                    .restart
+                    .global_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        });
+    }
+
     /// P2-2 (a): backstop expires while a FOREIGN prior inflight stays live
     /// across the WHOLE escalation budget. The worker must NEVER claim (no
     /// overwrite) and, after the budget, ABORT safely WITHOUT resubmitting —
     /// proven by the claim closure never running.
+    // Sync test + explicit block_on: the std-mutex test-env guards live only in
+    // this sync scope and never span an await, so no await_holding_lock allow is
+    // needed (#3034 ratchet stays frozen at its baseline).
+    #[test]
+    fn backstop_foreign_inflight_live_aborts_without_claim() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        reset_present_for_tests();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+
+            // A foreign prior inflight is live FOREVER (never drains, never ours).
+            // Every poll observes its identity — the worker must thread the
+            // LAST-VIEW identity into the abort cleanup (codex r2).
+            let view: ViewFn = Box::new(move |_shared, _record| {
+                Box::pin(async move {
+                    Some(PriorTurnObservation {
+                        view: PriorTurnView {
+                            inflight_present: true,
+                            inflight_is_own_anchor: false,
+                            mailbox_blocking_turn_present: true,
+                            mailbox_turn_is_own_anchor: false,
+                            runtime_binding_present: true,
+                        },
+                        foreign_inflight_identity: Some((777, "2026-06-10 12:00:00".to_string())),
+                    })
+                })
+            });
+
+            let claim_calls = Arc::new(AtomicU32::new(0));
+            let claim_calls_for_fn = claim_calls.clone();
+            let claim: ClaimFn = Box::new(move |_shared, _record| {
+                let calls = claim_calls_for_fn.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            });
+
+            let rec = record("claude", 10, 100);
+            persist(&rec).unwrap();
+            assert!(pending_synthetic_start_present("claude", 10));
+
+            let (abort_cleanup, abort_cleanup_calls, abort_cleanup_identity) =
+                recording_abort_cleanup();
+            let handle = tokio::spawn(run_worker(
+                shared.clone(),
+                rec,
+                view,
+                claim,
+                abort_cleanup,
+                never_reclaim_orphan(),
+            ));
+
+            // Advance through the full escalation budget of backstop windows.
+            for _ in 0..(PENDING_START_MAX_BACKSTOP_CYCLES + 1) {
+                tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
+                tokio::task::yield_now().await;
+            }
+            handle.await.unwrap();
+
+            assert_eq!(
+                claim_calls.load(Ordering::SeqCst),
+                0,
+                "the claim must NEVER run while a foreign inflight is live — claiming \
+             would overwrite the live prior turn (the #3154 regression). RED if the \
+             backstop reverts to 'claim anyway' on expiry."
+            );
+            assert!(
+                !pending_synthetic_start_present("claude", 10),
+                "after the escalation budget the worker ABORTS and drops only the \
+             ownership record (no prompt resubmit). RED if abort leaks the record \
+             or never fires."
+            );
+            assert_eq!(
+                abort_cleanup_calls.load(Ordering::SeqCst),
+                1,
+                "#3282/#3296: the terminal backstop ABORT must run the abort \
+             reconcile hook EXACTLY ONCE (records the aborted-anchor marker — \
+             no claim will ever drive the normal ⏳ → ✅ completion for this \
+             anchor). RED if the ABORT branch skips abort_cleanup_fn (the \
+             hourglass would linger with no reconcile owner)."
+            );
+            assert_eq!(
+                abort_cleanup_identity
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+                Some(Some((777, "2026-06-10 12:00:00".to_string()))),
+                "codex r2: the worker must thread the LAST-VIEW foreign inflight \
+             identity into the cleanup, so a row that vanishes before the \
+             cleanup's own read still yields an identity-pinned marker — RED \
+             if the hook receives None (the marker would be sweep-only and \
+             tombstone 대조 could never ✅ it)"
+            );
+            reset_present_for_tests();
+        });
+    }
+
+    /// #3982: the orphan-at-birth reclaim trigger on the synthetic-start backstop
+    /// path. A producer-dead `SessionBoundRelay` orphan (born with a stale
+    /// `get_producer` `Some`, never commits) is perpetually misread as a live
+    /// FOREIGN inflight, so pre-#3982 EVERY later TUI-direct turn escalated to the
+    /// terminal abort and never relayed. The worker must, on the backstop, attempt
+    /// the orphan downgrade; once it reclaims (owner → `None`), the next view drops
+    /// the now-ownerless row and the deferred claim PROCEEDS. Proven by: the
+    /// reclaim runs, the claim runs exactly once, and the abort cleanup NEVER runs.
     // SAFETY (await_holding_lock): `worker_test_lock()` serializes tests that
     // mutate the process-wide PRESENT index / durable store root; the guard is
     // held across `tokio::time::advance` awaits that drive `run_worker`.
@@ -1528,16 +2725,151 @@ mod tests {
     // Test-only.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(start_paused = true)]
-    async fn backstop_foreign_inflight_live_aborts_without_claim() {
-        use std::sync::atomic::{AtomicU32, Ordering};
+    async fn backstop_orphan_reclaim_downgrades_then_claims() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
         let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
         reset_present_for_tests();
         let shared = super::super::make_shared_data_for_tests();
 
-        // A foreign prior inflight is live FOREVER (never drains, never ours).
-        // Every poll observes its identity — the worker must thread the
-        // LAST-VIEW identity into the abort cleanup (codex r2).
+        // The orphan blocks (a live FOREIGN inflight, never own-anchor) until the
+        // reclaim downgrades it; the reclaim then flips `reclaimed` so the next
+        // view reports the row gone — exactly what the production view builder's
+        // ownerless-stale filter does once the owner is `None`.
+        let reclaimed = Arc::new(AtomicBool::new(false));
+        let reclaimed_for_view = reclaimed.clone();
+        let view: ViewFn = Box::new(move |_shared, _record| {
+            let reclaimed = reclaimed_for_view.clone();
+            Box::pin(async move {
+                if reclaimed.load(Ordering::SeqCst) {
+                    // Post-downgrade the row is owner=None but KEEPS its old,
+                    // already-stale `updated_at` (#3982 preserves it rather than
+                    // bumping), so the real view builder's
+                    // `ownerless_external_input_inflight_is_stale` filter drops it
+                    // on the very next fresh read → no prior inflight → finalized.
+                    // This mock models that IMMEDIATE, preserved-`updated_at`-driven
+                    // drop (it is immediate BECAUSE the timestamp was not reset; a
+                    // bumped `updated_at` would keep the row ~0 s "fresh" → not
+                    // stale → kept → the turn would abort again).
+                    Some(obs(base_view()))
+                } else {
+                    Some(PriorTurnObservation {
+                        view: PriorTurnView {
+                            inflight_present: true,
+                            inflight_is_own_anchor: false,
+                            mailbox_blocking_turn_present: true,
+                            mailbox_turn_is_own_anchor: false,
+                            runtime_binding_present: true,
+                        },
+                        foreign_inflight_identity: Some((777, "2026-06-10 12:00:00".to_string())),
+                    })
+                }
+            })
+        });
+
+        let claim_calls = Arc::new(AtomicU32::new(0));
+        let claim_calls_for_fn = claim_calls.clone();
+        let claim: ClaimFn = Box::new(move |_shared, _record| {
+            let calls = claim_calls_for_fn.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        });
+
+        // The reclaim downgrades the orphan on the first backstop attempt.
+        let reclaim_calls = Arc::new(AtomicU32::new(0));
+        let reclaim_calls_for_fn = reclaim_calls.clone();
+        let reclaimed_for_fn = reclaimed.clone();
+        let reclaim_orphan: ReclaimOrphanFn = Box::new(move |_shared, _record| {
+            let calls = reclaim_calls_for_fn.clone();
+            let reclaimed = reclaimed_for_fn.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                reclaimed.store(true, Ordering::SeqCst);
+                ReclaimStaleForeignOutcome::SessionBoundOrphanReclaimed // downgraded
+            })
+        });
+
+        let rec = record("claude", 15, 150);
+        persist(&rec).unwrap();
+        assert!(pending_synthetic_start_present("claude", 15));
+
+        let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
+        let handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec,
+            view,
+            claim,
+            abort_cleanup,
+            reclaim_orphan,
+        ));
+
+        // One backstop window to hit `BackstopForeignInflightLive` + reclaim, then
+        // a poll for the re-evaluated (now-finalized) view to claim. Advancing a
+        // few windows is harmless once the worker has claimed and returned.
+        for _ in 0..3 {
+            tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
+            tokio::task::yield_now().await;
+        }
+        handle.await.unwrap();
+
+        assert!(
+            reclaim_calls.load(Ordering::SeqCst) >= 1,
+            "the worker MUST attempt the orphan reclaim on the backstop before \
+             aborting — RED if the BackstopForeignInflightLive branch never calls \
+             reclaim_orphan_fn (#3982)"
+        );
+        assert_eq!(
+            claim_calls.load(Ordering::SeqCst),
+            1,
+            "after the orphan is downgraded the deferred claim PROCEEDS (the row is \
+             no longer a live foreign inflight) — RED if the worker aborts instead \
+             of re-evaluating + claiming (#3982)"
+        );
+        assert_eq!(
+            abort_cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "#3982: a reclaimed orphan must NEVER reach the terminal backstop abort \
+             — the successful claim owns the ⏳ → ✅ completion. RED if the worker \
+             escalates to the abort despite a successful downgrade."
+        );
+        assert!(
+            !pending_synthetic_start_present("claude", 15),
+            "the successful claim deletes the durable record (gate releases)"
+        );
+        reset_present_for_tests();
+    }
+
+    /// #3982 — a FAILED downgrade (the reclaim returns `false`: not orphan-shaped,
+    /// identity mismatch, or I/O) must fall back to the EXISTING bounded escalation
+    /// + terminal abort, exactly as pre-#3982. Proven by: the reclaim is attempted
+    /// every cycle, the claim NEVER runs (no overwrite of the live foreign turn),
+    /// and the abort cleanup runs exactly once. Guards the "no new infinite spin"
+    /// invariant — a reclaim that never succeeds cannot dodge the escalation cap.
+    // SAFETY (await_holding_lock): see `backstop_orphan_reclaim_downgrades_then_claims`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(start_paused = true)]
+    async fn backstop_failed_reclaim_falls_back_to_bounded_abort() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        reset_present_for_tests();
+        let shared = super::super::make_shared_data_for_tests();
+
+        // A genuinely live foreign inflight forever (never orphan-shaped).
         let view: ViewFn = Box::new(move |_shared, _record| {
             Box::pin(async move {
                 Some(PriorTurnObservation {
@@ -1548,7 +2880,7 @@ mod tests {
                         mailbox_turn_is_own_anchor: false,
                         runtime_binding_present: true,
                     },
-                    foreign_inflight_identity: Some((777, "2026-06-10 12:00:00".to_string())),
+                    foreign_inflight_identity: Some((888, "2026-06-10 12:00:00".to_string())),
                 })
             })
         });
@@ -1563,54 +2895,56 @@ mod tests {
             })
         });
 
-        let rec = record("claude", 10, 100);
+        // The reclaim is always attempted but never succeeds (live turn).
+        let reclaim_calls = Arc::new(AtomicU32::new(0));
+        let reclaim_calls_for_fn = reclaim_calls.clone();
+        let reclaim_orphan: ReclaimOrphanFn = Box::new(move |_shared, _record| {
+            let calls = reclaim_calls_for_fn.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ReclaimStaleForeignOutcome::None // never orphan-shaped → no downgrade
+            })
+        });
+
+        let rec = record("claude", 16, 160);
         persist(&rec).unwrap();
-        assert!(pending_synthetic_start_present("claude", 10));
+        assert!(pending_synthetic_start_present("claude", 16));
 
-        let (abort_cleanup, abort_cleanup_calls, abort_cleanup_identity) =
-            recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+        let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
+        let handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec,
+            view,
+            claim,
+            abort_cleanup,
+            reclaim_orphan,
+        ));
 
-        // Advance through the full escalation budget of backstop windows.
         for _ in 0..(PENDING_START_MAX_BACKSTOP_CYCLES + 1) {
             tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
             tokio::task::yield_now().await;
         }
         handle.await.unwrap();
 
+        assert!(
+            reclaim_calls.load(Ordering::SeqCst) >= 1,
+            "the reclaim is attempted on the backstop before escalating (#3982)"
+        );
         assert_eq!(
             claim_calls.load(Ordering::SeqCst),
             0,
-            "the claim must NEVER run while a foreign inflight is live — claiming \
-             would overwrite the live prior turn (the #3154 regression). RED if the \
-             backstop reverts to 'claim anyway' on expiry."
-        );
-        assert!(
-            !pending_synthetic_start_present("claude", 10),
-            "after the escalation budget the worker ABORTS and drops only the \
-             ownership record (no prompt resubmit). RED if abort leaks the record \
-             or never fires."
+            "a failed reclaim must NOT claim over a genuinely live foreign inflight \
+             (the #3154 overwrite regression) — RED if a false reclaim still claims"
         );
         assert_eq!(
             abort_cleanup_calls.load(Ordering::SeqCst),
             1,
-            "#3282/#3296: the terminal backstop ABORT must run the abort \
-             reconcile hook EXACTLY ONCE (records the aborted-anchor marker — \
-             no claim will ever drive the normal ⏳ → ✅ completion for this \
-             anchor). RED if the ABORT branch skips abort_cleanup_fn (the \
-             hourglass would linger with no reconcile owner)."
+            "a reclaim that never succeeds falls back to the bounded terminal abort \
+             exactly once (#3982 — no new infinite spin)"
         );
-        assert_eq!(
-            abort_cleanup_identity
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone(),
-            Some(Some((777, "2026-06-10 12:00:00".to_string()))),
-            "codex r2: the worker must thread the LAST-VIEW foreign inflight \
-             identity into the cleanup, so a row that vanishes before the \
-             cleanup's own read still yields an identity-pinned marker — RED \
-             if the hook receives None (the marker would be sweep-only and \
-             tombstone 대조 could never ✅ it)"
+        assert!(
+            !pending_synthetic_start_present("claude", 16),
+            "the terminal abort still drops the ownership record (gate releases)"
         );
         reset_present_for_tests();
     }
@@ -1693,7 +3027,14 @@ mod tests {
             assert!(pending_synthetic_start_present("claude", 14));
 
             let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-            let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+            let handle = tokio::spawn(run_worker(
+                shared.clone(),
+                rec,
+                view,
+                claim,
+                abort_cleanup,
+                never_reclaim_orphan(),
+            ));
 
             for _ in 0..(PENDING_START_MAX_BACKSTOP_CYCLES + 1) {
                 tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
@@ -1749,6 +3090,19 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let _guard = worker_test_lock();
+        // Isolate the durable store root to a per-test temp dir under the crate
+        // env lock — mirrors the sibling `claim_false_exhausted_still_retains_record`.
+        // Without it this test reads the ambient `AGENTDESK_ROOT_DIR`, so a
+        // concurrent env-mutating test in ANOTHER module under the combined CI
+        // filter (e.g. `tui_prompt_relay::tests`'s `EnvRootGuard`) racing
+        // `set_var`/`var_os` — which is not thread-safe — tears the path and this
+        // test's `persist` fails (a pre-existing isolation gap).
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
         reset_present_for_tests();
         let shared = super::super::make_shared_data_for_tests();
 
@@ -1770,7 +3124,14 @@ mod tests {
         let rec = record("claude", 11, 111);
         persist(&rec).unwrap();
         let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+        let handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec,
+            view,
+            claim,
+            abort_cleanup,
+            never_reclaim_orphan(),
+        ));
 
         // Drive the retry backoffs. After the first false, assert the record is
         // STILL present (RETAINED) before the eventual success deletes it.
@@ -1846,7 +3207,14 @@ mod tests {
         let rec = record("claude", 12, 122);
         persist(&rec).unwrap();
         let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+        let handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec,
+            view,
+            claim,
+            abort_cleanup,
+            never_reclaim_orphan(),
+        ));
 
         for _ in 0..(PENDING_START_MAX_CLAIM_ATTEMPTS + 2) {
             tokio::time::advance(PENDING_START_CLAIM_RETRY_BACKOFF + PENDING_START_POLL).await;
@@ -1935,7 +3303,14 @@ mod tests {
             rec.attempt_count = PENDING_START_MAX_CLAIM_ATTEMPTS;
             persist(&rec).unwrap();
             let (abort_cleanup, _, _) = recording_abort_cleanup();
-            let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+            let handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec,
+            view,
+            claim,
+            abort_cleanup,
+            never_reclaim_orphan(),
+        ));
 
             tokio::task::yield_now().await;
             assert!(
@@ -2169,6 +3544,7 @@ mod tests {
             finalized_view(),
             claim_succeeds(),
             cleanup,
+            never_reclaim_orphan(),
         ));
 
         let markers = super::super::tui_direct_abort_marker::load_for_channel("claude", 21);
@@ -2246,6 +3622,7 @@ mod tests {
             finalized_view(),
             claim_succeeds(),
             cleanup,
+            never_reclaim_orphan(),
         ));
 
         assert!(
@@ -2300,6 +3677,7 @@ mod tests {
             finalized_view(),
             claim_succeeds(),
             cleanup,
+            never_reclaim_orphan(),
         ));
 
         let markers = super::super::tui_direct_abort_marker::load_for_channel("claude", 23);
