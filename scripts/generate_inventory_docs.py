@@ -267,8 +267,8 @@ def module_path_for_file(path: Path) -> str:
     return "::".join(parts)
 
 
-def format_path_with_line(path: Path, line: int) -> str:
-    return f"`{rel_posix(path)}:{line}`"
+def format_path_without_line(path: Path) -> str:
+    return f"`{rel_posix(path)}`"
 
 
 def strip_wrapping_whitespace(text: str) -> str:
@@ -1060,8 +1060,8 @@ def parse_route_file(
                     method=method,
                     path=f"{path_prefix}{route_path}",
                     handler=f"`{handler}`",
-                    handler_source=format_path_with_line(handler_path, handler_line),
-                    route_decl=format_path_with_line(path, decl_line),
+                    handler_source=format_path_without_line(handler_path),
+                    route_decl=format_path_without_line(path),
                 )
             )
     return entries
@@ -1280,7 +1280,7 @@ def collect_workers() -> list[WorkerEntry]:
                 worker=worker,
                 kind=kind,
                 target=f"`{target}`",
-                source=format_path_with_line(registry_path, line),
+                source=format_path_without_line(registry_path),
                 notes=(
                     f"stage={stage}; order={start_order}; restart={restart}; shutdown={shutdown}; "
                     f"owner={owner}; health={health_owner}; responsibility={responsibility}; {notes}"
@@ -1288,7 +1288,7 @@ def collect_workers() -> list[WorkerEntry]:
             )
         )
 
-    workers.sort(key=lambda item: int(item.source.rsplit(":", 1)[-1].rstrip("`")))
+    workers.sort(key=lambda item: item.worker)
     return workers
 
 
