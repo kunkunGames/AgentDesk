@@ -524,15 +524,12 @@ var autoQueue = {
     // represent an explicit operator stop and must never be resurrected by
     // the tick. Only `pending` entries are re-dispatchable.
     var activeRuns = agentdesk.db.query(
-      "SELECT r.id " +
-      "FROM auto_queue_runs r " +
-      "WHERE r.status = 'active' AND EXISTS (" +
-      "  SELECT 1 FROM auto_queue_entries e " +
-      "  WHERE e.run_id = r.id AND e.status = 'pending'" +
-      ") ORDER BY (" +
-      "  SELECT MIN(e.updated_at) FROM auto_queue_entries e " +
-      "  WHERE e.run_id = r.id AND e.status = 'pending'" +
-      ") ASC LIMIT 50",
+      "SELECT e.run_id AS id " +
+      "FROM auto_queue_entries e " +
+      "JOIN auto_queue_runs r ON r.id = e.run_id " +
+      "WHERE e.status = 'pending' AND r.status = 'active' " +
+      "GROUP BY e.run_id " +
+      "ORDER BY MIN(e.updated_at) ASC LIMIT 50",
       []
     );
 
