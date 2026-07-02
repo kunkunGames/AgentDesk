@@ -30,5 +30,7 @@
 - Risk:
 - Rollback notes:
 - Queue hygiene invariant:
+- Public API impact:
+- Docs impact:
 - Related PRs/issues checked:
 - Why this is non-overlapping:
