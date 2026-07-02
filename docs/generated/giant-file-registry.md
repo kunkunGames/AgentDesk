@@ -56,7 +56,7 @@
 | `src/server/routes/agents.rs` | 1278 |
 | `src/server/routes/agents_crud.rs` | 1903 |
 | `src/server/routes/agents_setup.rs` | 1365 |
-| `src/server/routes/docs.rs` | 6277 |
+| `src/server/routes/docs.rs` | 6279 |
 | `src/server/routes/escalation.rs` | 1376 |
 | `src/server/routes/health_api.rs` | 1655 |
 | `src/server/routes/kanban.rs` | 2677 |
