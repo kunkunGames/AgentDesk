@@ -32,10 +32,10 @@ use crate::services::provider::{CancelToken, ProviderKind};
 
 use super::SharedData;
 // #3041 P1-0: dormant lease types for the *Delivery messages below (mod.rs §2-§3).
-use super::{DeliveryLeaseCell, LeaseHolder, LeaseOutcome};
+use super::{DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome};
 
 pub(in crate::services::discord) mod cleanup;
-mod completion_signal;
+pub(in crate::services::discord) mod completion_signal;
 mod delivery_lease;
 mod finalize;
 mod finalize_context;
@@ -339,7 +339,7 @@ enum FinalizeMsg {
     /// sink/bridge wiring.
     #[allow(dead_code)] // #3041: no sender until sink/bridge wiring (P1-2..).
     AcquireDelivery {
-        key: TurnKey,
+        key: DeliveryLeaseKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -355,7 +355,7 @@ enum FinalizeMsg {
     /// reopened the #3143 duplicate window; kept for the §5.3 phase.
     #[allow(dead_code)] // #3041: wired in a later phase (ledger-coupled commit, §5.3).
     CommitDelivery {
-        key: TurnKey,
+        key: DeliveryLeaseKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -371,7 +371,7 @@ enum FinalizeMsg {
     /// via this awaited actor round-trip. Kept defined for a later phase.
     #[allow(dead_code)] // #3041: wired in a later phase (alongside CommitDelivery).
     ReleaseDelivery {
-        key: TurnKey,
+        key: DeliveryLeaseKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -508,7 +508,7 @@ impl TurnFinalizer {
     #[allow(dead_code)] // #3041: wired in a later phase (ledger-coupled commit, §5.3).
     pub(in crate::services::discord) async fn commit_delivery(
         &self,
-        key: TurnKey,
+        key: DeliveryLeaseKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -550,7 +550,7 @@ impl TurnFinalizer {
     #[allow(dead_code)] // #3041: wired in a later phase (alongside commit_delivery).
     pub(in crate::services::discord) async fn release_delivery(
         &self,
-        key: TurnKey,
+        key: DeliveryLeaseKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -1153,7 +1153,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn exactly_once_complete_then_late_complete() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = key(101);
@@ -1192,7 +1192,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn panic_in_handle_terminal_does_not_kill_actor_loop() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
 
             // First turn: arm the one-shot panic so this finalize unwinds inside
@@ -1252,7 +1252,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn panic_inside_do_finalize_resets_stuck_finalizing_entry() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(38662);
             let generation = 0;
@@ -1328,7 +1328,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn panic_on_reconcile_backstop_path_is_contained() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(38663);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1403,7 +1403,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(3274);
             let turn_id = 3274_1001u64;
@@ -1484,7 +1484,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let parent = ChannelId::new(4_024_260);
             let thread = ChannelId::new(4_024_261);
@@ -1547,7 +1547,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(3275);
             let turn1_id = 3275_1001u64;
@@ -1645,7 +1645,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn unknown_user_msg_id_collapses_onto_registered_turn() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(606);
             let registered = TurnKey::new(ch, 99_999, 0);
@@ -1692,7 +1692,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sequential_same_channel_turns_each_finalize() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(909);
             let turn1 = TurnKey::new(ch, 1001, 0);
@@ -1748,7 +1748,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stale_channel_only_terminal_does_not_finalize_next_turn() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(919);
             let turn1 = TurnKey::new(ch, 2001, 0);
@@ -1822,7 +1822,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_underflow_on_double_terminal() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             // No active mailbox turn → mailbox_finish_turn returns removed_token=None.
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
@@ -1858,7 +1858,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_busy_finalizes_after_backstop() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(303);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1907,7 +1907,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn repeated_gate_timeout_does_not_postpone_backstop() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(313);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1960,7 +1960,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(404);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1986,7 +1986,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_then_late_complete_already_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(505);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -2025,7 +2025,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bridge_watcher_race_finalizes_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = key(707);
@@ -2074,7 +2074,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_then_complete_before_deadline_no_double() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let k = key(808);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -2142,7 +2142,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(1101);
 
@@ -2236,7 +2236,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(1313);
             let turn1_id = 5001u64;
             let turn2_id = 5002u64;
@@ -2407,7 +2407,7 @@ mod tests {
         use crate::services::discord::inflight::{InflightTurnState, save_inflight_state};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(1414);
         let turn1_id = 6001u64;
         let turn2_id = 6002u64;
@@ -2471,7 +2471,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(1515);
         let registered_id = 7001u64; // the ledger entry's real identity
         let live_active_id = 7002u64; // the DIFFERENT turn live in the mailbox
@@ -2579,7 +2579,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_bridge_finalizes_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2001);
             let tid = 8001u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2647,7 +2647,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_watcher_then_late_complete_already_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2002);
             let tid = 8002u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2709,7 +2709,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_orphan_no_active_turn_no_underflow() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = TurnKey::new(ChannelId::new(2003), 0, 0);
@@ -2771,7 +2771,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_watcher_finalizes_and_releases_token() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2004);
             let tid = 8004u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2841,7 +2841,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn reconciler_backstop_finalizes_deferred_gate_timeout_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2005);
             let tid = 8005u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2931,7 +2931,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_none_watcher_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2006);
             let tid = 8006u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2988,7 +2988,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_none_bridge_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2007);
             let tid = 8007u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3066,7 +3066,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn orphan_id0_recovery_finalizes_and_releases_token() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2008);
             let tid = 8008u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3133,7 +3133,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn watcher_then_bridge_handoff_double_terminal_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2009);
             let tid = 8009u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3185,7 +3185,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn double_cancel_finalizes_exactly_once_no_underflow() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let ch = ChannelId::new(2010);
             let tid = 8010u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3356,7 +3356,7 @@ mod tests {
         // #3016 phase-5a: `register_start` now takes `&Arc<SharedData>` (to prime
         // the reconcile cache). This test only registers + probes the ledger (no
         // terminal, no reconcile), so an inert shared suffices.
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let fin = TurnFinalizer::spawn();
         let ch = ChannelId::new(7001);
         fin.register_start(
@@ -3380,7 +3380,7 @@ mod tests {
     async fn watcher_pending_false_for_bridge_owned_entry() {
         // #3016 phase-5a: inert shared for the `register_start` Arc param (this
         // test only registers + probes; no terminal, no reconcile).
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let fin = TurnFinalizer::spawn();
         let ch = ChannelId::new(7101);
         // `RelayOwnerKind::SessionBoundRelay` is a bridge-owned (non-watcher)
@@ -3399,7 +3399,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn watcher_pending_false_after_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(7201);
             let k = TurnKey::new(ch, 42, 0);
@@ -3446,7 +3446,7 @@ mod tests {
         // → discord). `with_isolated_runtime_root` is in the parent `tests` mod.
         use super::super::super::make_shared_data_for_tests_with_storage;
         use super::with_isolated_runtime_root;
-        use crate::services::discord::DeliveryLeaseCell;
+        use crate::services::discord::{DeliveryLeaseCell, DeliveryLeaseKey};
         use crate::services::provider::ProviderKind;
         use serenity::model::id::ChannelId;
         use std::sync::Arc;
@@ -3455,22 +3455,26 @@ mod tests {
             LeaseHolder::Watcher { instance_id: id }
         }
 
+        fn lease_key(ch: ChannelId, user_msg_id: u64) -> DeliveryLeaseKey {
+            DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, user_msg_id, 0))
+        }
+
         /// Watcher/Delivered: a freshly-acquired lease committed `Delivered`
         /// advances `confirmed_end_offset` to the leased `end` EXACTLY ONCE, and
         /// no duplicate occurs.
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_delivered_advances_offset_once() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7001);
                 let lease = shared.delivery_lease(ch);
-                let turn = TurnKey::new(ch, 11, 0);
+                let turn = lease_key(ch, 11);
                 let h = watcher(1);
 
                 // Acquire on the cell (the watcher fast-path), then commit through
                 // the actor (the path the watcher uses).
-                assert!(lease.try_acquire(turn, h, 0, 64, 1_000));
+                assert!(lease.try_acquire(turn.clone(), h, 0, 64, 1_000));
                 let committed = fin
                     .commit_delivery(
                         turn,
@@ -3500,15 +3504,15 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_acquire_contention_admits_one_holder() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(7002);
                 let lease = shared.delivery_lease(ch);
-                let turn = TurnKey::new(ch, 22, 0);
+                let turn = lease_key(ch, 22);
 
                 let w1 = watcher(1);
                 let w2 = watcher(2);
                 // First watcher acquires for [0,32).
-                assert!(lease.try_acquire(turn, w1, 0, 32, 5_000));
+                assert!(lease.try_acquire(turn.clone(), w1, 0, 32, 5_000));
                 // Replacement watcher's acquire for the SAME turn/range loses
                 // while w1 still holds it (B2: it must NOT re-acquire+re-emit).
                 assert!(
@@ -3526,14 +3530,14 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_unknown_commit_does_not_advance_offset() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7003);
                 let lease = shared.delivery_lease(ch);
-                let turn = TurnKey::new(ch, 33, 0);
+                let turn = lease_key(ch, 33);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn, h, 0, 48, 1_000));
+                assert!(lease.try_acquire(turn.clone(), h, 0, 48, 1_000));
                 let committed = fin
                     .commit_delivery(
                         turn,
@@ -3563,17 +3567,17 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_second_commit_is_idempotent_on_offset() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7004);
                 let lease = shared.delivery_lease(ch);
-                let turn = TurnKey::new(ch, 44, 0);
+                let turn = lease_key(ch, 44);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn, h, 0, 80, 1_000));
+                assert!(lease.try_acquire(turn.clone(), h, 0, 80, 1_000));
                 assert!(
                     fin.commit_delivery(
-                        turn,
+                        turn.clone(),
                         lease.clone(),
                         h,
                         0,
@@ -3620,22 +3624,22 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn deadline_reclaim_frees_cell_for_later_acquire() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(7005);
                 let lease = shared.delivery_lease(ch);
-                let turn_a = TurnKey::new(ch, 55, 0);
+                let turn_a = lease_key(ch, 55);
                 let dead = watcher(1);
 
                 // A holder acquires with deadline 100ms (monotonic units) but never
                 // commits/releases (dead).
-                assert!(lease.try_acquire(turn_a, dead, 0, 16, 100));
+                assert!(lease.try_acquire(turn_a.clone(), dead, 0, 16, 100));
                 // Before the deadline, the sweep is a no-op and the cell stays held.
                 assert_eq!(shared.reclaim_expired_delivery_leases(50), 0);
                 assert!(!lease.try_acquire(turn_a, watcher(2), 0, 16, 100));
                 // Past the deadline, the sweep reclaims exactly this cell.
                 assert_eq!(shared.reclaim_expired_delivery_leases(100), 1);
                 // A later legitimate acquire (new instance, new turn) succeeds.
-                let turn_b = TurnKey::new(ch, 66, 0);
+                let turn_b = lease_key(ch, 66);
                 assert!(
                     lease.try_acquire(turn_b, watcher(3), 16, 32, 1_000),
                     "a reclaimed cell is acquirable again"
@@ -3649,17 +3653,17 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn release_after_commit_frees_cell_for_next_turn() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7006);
                 let lease = shared.delivery_lease(ch);
-                let turn1 = TurnKey::new(ch, 77, 0);
+                let turn1 = lease_key(ch, 77);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn1, h, 0, 24, 1_000));
+                assert!(lease.try_acquire(turn1.clone(), h, 0, 24, 1_000));
                 assert!(
                     fin.commit_delivery(
-                        turn1,
+                        turn1.clone(),
                         lease.clone(),
                         h,
                         0,
@@ -3676,7 +3680,7 @@ mod tests {
                     "the holder releases its committed lease"
                 );
                 // Next turn (different range) can now acquire the freed cell.
-                let turn2 = TurnKey::new(ch, 88, 0);
+                let turn2 = lease_key(ch, 88);
                 assert!(
                     lease.try_acquire(turn2, watcher(2), 24, 48, 1_000),
                     "released cell is free for the next turn"
@@ -3697,16 +3701,16 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_inline_acquire_reclaims_dead_holder_without_terminal() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(7007);
                 let lease = shared.delivery_lease(ch);
-                let dead_turn = TurnKey::new(ch, 101, 0);
+                let dead_turn = lease_key(ch, 101);
                 let dead = watcher(1);
 
                 // Dead holder acquires with deadline 100 (monotonic units) and
                 // then dies — never commits, never releases. No `SharedData` was
                 // ever cached in any finalizer (we never spawn/route a Terminal).
-                assert!(lease.try_acquire(dead_turn, dead, 0, 40, 100));
+                assert!(lease.try_acquire(dead_turn.clone(), dead, 0, 40, 100));
 
                 // BEFORE the deadline: a NON-expired live lease still B2-skips —
                 // the replacement's acquire-time reclaim is a no-op and the
@@ -3717,7 +3721,7 @@ mod tests {
                     "a non-expired lease must NOT be reclaimed (would reintroduce duplicates)"
                 );
                 assert!(
-                    !lease.try_acquire(dead_turn, live, 0, 40, 100),
+                    !lease.try_acquire(dead_turn.clone(), live, 0, 40, 100),
                     "B2: a replacement cannot acquire while the holder's lease is live (non-expired)"
                 );
 
@@ -3761,13 +3765,13 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_inline_commit_advances_offset_synchronously() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None, None);
+                let shared = make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(7008);
                 let lease = shared.delivery_lease(ch);
-                let turn = TurnKey::new(ch, 202, 0);
+                let turn = lease_key(ch, 202);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn, h, 0, 96, 1_000));
+                assert!(lease.try_acquire(turn.clone(), h, 0, 96, 1_000));
                 assert_eq!(
                     shared.committed_relay_offset(ch),
                     0,
@@ -3776,7 +3780,7 @@ mod tests {
 
                 // The INLINE production sequence: synchronous cell commit, then
                 // (on Delivered) the synchronous offset advance — NO actor await.
-                let committed = lease.commit(h, turn, 0, 96, LeaseOutcome::Delivered);
+                let committed = lease.commit(h, turn.clone(), 0, 96, LeaseOutcome::Delivered);
                 assert!(committed, "fresh lease commits");
                 super::super::super::tmux::advance_watcher_confirmed_end(
                     &shared,
@@ -3880,7 +3884,7 @@ mod tests {
     async fn watcher_register_start_backstop_finalizes_unterminated_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5101);
             let active_token = Arc::new(CancelToken::new());
@@ -3950,7 +3954,7 @@ mod tests {
     async fn fresh_actor_watcher_backstop_finalizes_without_prior_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5111);
             let active_token = Arc::new(CancelToken::new());
@@ -4012,7 +4016,7 @@ mod tests {
     async fn watcher_register_start_backstop_defers_paused_live_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5202);
             let active_token = Arc::new(CancelToken::new());
@@ -4084,7 +4088,7 @@ mod tests {
     /// probe / pulled re-check, `false`) must DEFER all three shapes.
     #[test]
     fn dead_watcher_handle_is_terminal_while_live_handle_defers_busy_transcript() {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
 
         // A busy transcript: content present but NO Claude turn terminator →
         // `completion_signal_from_transcript` returns `PausedLive`.
@@ -4173,7 +4177,7 @@ mod tests {
     async fn jsonl_done_terminal_finalizes_promptly_with_backstop_armed() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5303);
             let active_token = Arc::new(CancelToken::new());
@@ -4221,7 +4225,7 @@ mod tests {
     async fn watcher_backstop_no_double_finalize_after_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5404);
             let active_token = Arc::new(CancelToken::new());
@@ -4282,7 +4286,7 @@ mod tests {
     async fn watcher_backstop_fast_path_finalizes_proven_terminal_promptly() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5501);
             let active_token = Arc::new(CancelToken::new());
@@ -4350,7 +4354,7 @@ mod tests {
     async fn watcher_backstop_fast_path_never_counts_absent_or_dead_handle() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(3, Ordering::Relaxed);
 
             // Busy transcript: content but NO Claude turn terminator →
@@ -4434,7 +4438,7 @@ mod tests {
     async fn watcher_backstop_fast_path_defers_live_paused_handle() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5502);
             let active_token = Arc::new(CancelToken::new());
@@ -4490,7 +4494,7 @@ mod tests {
     async fn watcher_backstop_fast_path_flapping_resets_streak() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5503);
             let active_token = Arc::new(CancelToken::new());
@@ -4557,7 +4561,7 @@ mod tests {
     async fn watcher_backstop_fast_path_noop_after_real_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5504);
             let active_token = Arc::new(CancelToken::new());
@@ -4630,7 +4634,7 @@ mod tests {
     async fn watcher_backstop_probe_resolves_owner_keyed_watcher_for_dispatched_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let owner_ch = ChannelId::new(6601);
             let dispatch_ch = ChannelId::new(6602);
@@ -4719,7 +4723,7 @@ mod tests {
     async fn non_jsonl_runtime_turn_does_not_take_fast_path() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(6603);
             let active_token = Arc::new(CancelToken::new());

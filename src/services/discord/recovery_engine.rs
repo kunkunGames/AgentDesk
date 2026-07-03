@@ -28,6 +28,9 @@ use std::process::Command;
 
 #[path = "recovery_engine/status_panel.rs"]
 mod recovery_status_panel;
+#[path = "recovery_engine/status_panel_completion_producer.rs"]
+mod status_panel_completion_producer;
+use self::status_panel_completion_producer::*;
 
 // #3479 r8: behavior-preserving extraction of pure clusters into leaf modules.
 #[path = "recovery_engine/jsonl_extract.rs"]
@@ -58,6 +61,8 @@ mod state_extractors;
 mod manual_rebind;
 #[path = "recovery_engine/routing_orphan.rs"] // #3869 routing-orphan finalize
 mod routing_orphan;
+#[path = "recovery_engine/terminal_text_idempotency.rs"]
+mod terminal_text_idempotency;
 // #3834: behavior-preserving extraction of the runtime-rediscovery recovery path
 // (`reregister_active_turn_from_inflight` + its private
 // `reseed_watcher_owned_finalizer_ledger` helper and unit tests) into a leaf
@@ -121,6 +126,7 @@ pub(crate) use self::manual_rebind::rebind_inflight_for_channel;
 // byte-identical. Its private `reseed_watcher_owned_finalizer_ledger` helper is
 // not re-exported.
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
+pub(in crate::services::discord) use self::terminal_text_idempotency::RecoveryDeliveryContext;
 // #3479: re-import the analytics + transcript helpers so root call sites stay
 // byte-identical. `recovered_transcript_turn_id` is gated on cfg(test) — the root
 // reaches it only from its unit test (prod calls it inside analytics_transcript).
@@ -353,15 +359,23 @@ fn should_advance_recovery_dispatch_after_relay(relay_ok: bool) -> bool {
 async fn relay_recovery_terminal_notice(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
+    provider: &ProviderKind,
     state: &super::inflight::InflightTurnState,
     text: &str,
 ) -> RecoveryRelayOutcome {
+    let recovery_context = RecoveryDeliveryContext::from_state(
+        provider,
+        state,
+        None,
+        shared.restart.current_generation,
+    );
     relay_recovered_terminal_text_to_placeholder(
         http,
         shared,
         ChannelId::new(state.channel_id),
         super::inflight::optional_message_id(state.current_msg_id),
         text,
+        Some(&recovery_context),
     )
     .await
 }
@@ -381,22 +395,46 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
     channel_id: ChannelId,
     placeholder: Option<MessageId>,
     text: &str,
+    recovery_context: Option<&RecoveryDeliveryContext>,
 ) -> RecoveryRelayOutcome {
+    let mut reused_recorded_anchor = false;
+    let placeholder = match placeholder {
+        Some(placeholder) => Some(placeholder),
+        None => match recovery_context.and_then(RecoveryDeliveryContext::anchor_reuse_decision) {
+            Some(terminal_text_idempotency::RecoveryAnchorReuse::DurableAlreadyDelivered(
+                anchor,
+            )) => {
+                tracing::info!(
+                    channel_id = channel_id.get(),
+                    anchor_msg_id = anchor.get(),
+                    "recovery no-anchor delivery: durable range already delivered; skipping Discord POST"
+                );
+                return RecoveryRelayOutcome::Delivered;
+            }
+            Some(terminal_text_idempotency::RecoveryAnchorReuse::InflightAnchor(anchor)) => {
+                reused_recorded_anchor = true;
+                Some(anchor)
+            }
+            None => None,
+        },
+    };
     if let Some(placeholder) = placeholder {
         smp::completion_footer_forget_registered_target_if_message(channel_id, placeholder);
+        if reused_recorded_anchor {
+            tracing::info!(
+                channel_id = channel_id.get(),
+                anchor_msg_id = placeholder.get(),
+                "recovery no-anchor delivery: reusing recorded anchor"
+            );
+        }
     }
     let delivery = match placeholder {
         Some(placeholder) => {
             use super::recovery_paths::controller_cutover as cc;
-            // #3089 A6a: anchored short-replace via the unified controller behind a flag
-            // (default OFF); the adapter maps the verdict to `RecoveryRelayOutcome` AND
-            // re-runs the #3297 probe, returning the legacy path's equal. OFF / None / empty
-            // → verbatim legacy. Provider is cosmetic on the markerless `NoLease` path.
-            if cc::recovery_short_replace_should_cutover(
-                cc::recovery_relay_controller_enabled(),
-                true,
-                text,
-            ) {
+            // #3089 A6a/#3998 S1-f2: anchored short-replace via the unified
+            // controller; the adapter maps the verdict to `RecoveryRelayOutcome`
+            // AND re-runs the #3297 probe. None / empty stay legacy.
+            if cc::recovery_short_replace_should_cutover(true, text) {
                 let gateway =
                     DiscordGateway::new(http.clone(), shared.clone(), ProviderKind::Claude, None);
                 return cc::deliver_recovery_replace_via_controller(
@@ -407,13 +445,30 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
                     channel_id,
                     placeholder,
                     text,
+                    recovery_context,
                 )
                 .await;
             }
-            super::formatting::replace_long_message_raw(http, channel_id, placeholder, text, shared)
-                .await
+            terminal_text_idempotency::replace_anchored_terminal_text(
+                http,
+                channel_id,
+                placeholder,
+                text,
+                shared,
+                recovery_context,
+            )
+            .await
         }
-        None => super::formatting::send_long_message_raw(http, channel_id, text, shared).await,
+        None => {
+            return terminal_text_idempotency::relay_no_anchor_terminal_text(
+                http,
+                shared,
+                channel_id,
+                text,
+                recovery_context,
+            )
+            .await;
+        }
     };
     match delivery {
         Ok(()) => RecoveryRelayOutcome::Delivered,
@@ -430,30 +485,19 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
 }
 
 /// Outcome of `complete_recovery_visible_turn` exposed to callers so they can
-/// tell whether the visible completion UI was emitted. A TUI quiescence timeout
-/// may suppress that UI, but once recovery has terminal delivery evidence it
-/// must still release mailbox/inflight ownership.
+/// tell whether recovery emitted the visible completion UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RecoveryCompletionOutcome {
     /// Visible completion emitted (or status-panel-v2 was disabled / no
     /// status message id was wired). Callers may proceed with downstream
     /// dispatch / analytics / mailbox finalization as before.
     Emitted,
-    /// Terminal response delivery is authoritative, but the visible completion
-    /// status/reaction was suppressed because the TUI quiescence probe timed
-    /// out. Callers still proceed with cleanup.
-    VisibleCompletionSuppressed,
 }
 
 impl RecoveryCompletionOutcome {
     /// `true` when callers should proceed with downstream side effects.
-    /// Visible completion suppression is not a mailbox correctness primitive.
     pub(super) fn should_proceed(self) -> bool {
-        matches!(
-            self,
-            RecoveryCompletionOutcome::Emitted
-                | RecoveryCompletionOutcome::VisibleCompletionSuppressed
-        )
+        matches!(self, RecoveryCompletionOutcome::Emitted)
     }
 }
 
@@ -483,6 +527,34 @@ async fn complete_recovery_visible_turn(
     background: bool,
     source: &'static str,
 ) -> RecoveryCompletionOutcome {
+    complete_recovery_visible_turn_with_sniffer(
+        http,
+        shared,
+        provider,
+        state,
+        background,
+        source,
+        |tmux_session_name| async move {
+            super::tmux::sniff_background_agent_pending_for_completion(tmux_session_name.as_deref())
+                .await
+        },
+    )
+    .await
+}
+
+async fn complete_recovery_visible_turn_with_sniffer<S, SniffFuture>(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &super::inflight::InflightTurnState,
+    background: bool,
+    source: &'static str,
+    sniff_background_agent_pending: S,
+) -> RecoveryCompletionOutcome
+where
+    S: FnOnce(Option<String>) -> SniffFuture,
+    SniffFuture: std::future::Future<Output = bool>,
+{
     let channel_id = ChannelId::new(state.channel_id);
     // A recovery/orphan turn may carry no user message (user_msg_id == 0,
     // e.g. a TUI-direct turn). There is then no user message to react against,
@@ -490,19 +562,9 @@ async fn complete_recovery_visible_turn(
     // status-panel completion still run. `MessageId::new(0)` would panic.
     let user_msg_id = super::inflight::optional_message_id(state.user_msg_id);
 
-    // #2161 (Codex round-2 M1): recovery completes a turn based on JSONL
-    // `result` + output-file drain, not tmux pane readiness. For ClaudeTui
-    // sessions the same premature-completion bug applies — gate the
-    // user-visible `응답 완료` emit on quiescence, and on timeout skip
-    // the emit so the next watcher pass / placeholder sweeper reconciles.
-    // The gate lives in the `tmux` module (`#[cfg(unix)]`); on non-unix
-    // targets we skip it and emit completion as normal.
-    //
-    // #2293 H3 — the gate is hoisted ABOVE the ⏳ → ✅ reaction so a
-    // TimedOut outcome ALSO suppresses the reaction (was: reaction ran
-    // before the gate, lying about completion to the user). Recovery's
-    // visible side effects now follow the same ordering as the bridge and
-    // watcher paths.
+    // #4047: recovery completes from terminal evidence, not pane quiescence.
+    // The TUI gate is retained as observation-only liveness/strict-signal
+    // telemetry; it must not suppress the visible completion event or reaction.
     #[cfg(unix)]
     if let Some(tmux_session_name) = state.tmux_session_name.as_deref() {
         let outcome = super::tmux::run_tui_completion_gate(
@@ -512,16 +574,7 @@ async fn complete_recovery_visible_turn(
             state.task_notification_kind,
         )
         .await;
-        if !outcome.should_emit_completion() {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                source = source,
-                "[{ts}] ⚠ #2935 recovery visible completion suppressed — TUI quiescence gate timed out; continuing dispatch / analytics / mailbox cleanup because recovery already has terminal response delivery evidence"
-            );
-            return RecoveryCompletionOutcome::VisibleCompletionSuppressed;
-        }
+        let _ = outcome;
     }
 
     if let Some(user_msg_id) = user_msg_id {
@@ -576,21 +629,19 @@ async fn complete_recovery_visible_turn(
         return RecoveryCompletionOutcome::Emitted;
     };
 
-    let mut last_status_panel_text = String::new();
-    let _committed = super::turn_bridge::complete_status_panel_v2_with_http(
-        shared,
+    complete_recovery_status_panel_with_sniffer(
         http,
+        shared,
+        provider,
+        state,
         channel_id,
         status_msg_id,
-        provider,
         started_at_unix,
-        &mut last_status_panel_text,
         background,
         source,
-        (Some(state.user_msg_id), Some(state)),
+        sniff_background_agent_pending,
     )
-    .await;
-    RecoveryCompletionOutcome::Emitted
+    .await
 }
 
 #[cfg(test)]
@@ -605,8 +656,44 @@ mod recovery_dispatch_gate_tests {
 #[cfg(test)]
 mod recovery_completion_outcome_tests {
     use super::{RecoveryCompletionOutcome, recovery_status_panel};
+    use crate::services::agent_protocol::StatusEvent;
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::{ChannelId, MessageId};
+    use std::sync::{Arc, Mutex};
+
+    struct RuntimeRootGuard {
+        previous: Option<std::ffi::OsString>,
+        _root: tempfile::TempDir,
+    }
+
+    impl RuntimeRootGuard {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("runtime root");
+            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+            Self {
+                previous,
+                _root: root,
+            }
+        }
+    }
+
+    impl Drop for RuntimeRootGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    fn isolate_agentdesk_runtime_root() -> (std::sync::MutexGuard<'static, ()>, RuntimeRootGuard) {
+        let lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = RuntimeRootGuard::new();
+        (lock, root)
+    }
 
     fn state_for_recovery(user_msg_id: u64) -> super::inflight::InflightTurnState {
         serde_json::from_value(serde_json::json!({
@@ -636,14 +723,6 @@ mod recovery_completion_outcome_tests {
     #[test]
     fn emitted_lets_callers_proceed_with_dispatch_finalize() {
         assert!(RecoveryCompletionOutcome::Emitted.should_proceed());
-    }
-
-    #[test]
-    fn visible_completion_suppression_still_allows_cleanup() {
-        assert!(
-            RecoveryCompletionOutcome::VisibleCompletionSuppressed.should_proceed(),
-            "#2935: quiescence timeout may hide 응답 완료, but must not preserve stale active ownership"
-        );
     }
 
     #[test]
@@ -721,6 +800,120 @@ mod recovery_completion_outcome_tests {
             Some(None),
             "flag-off v2 recovery preserves the SendFallback rollback behavior when no status_message_id was persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_status_panel_completion_emits_background_agent_pending_payload() {
+        let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
+        let mut shared = super::super::make_shared_data_for_tests();
+        Arc::get_mut(&mut shared)
+            .expect("fresh test shared data should be uniquely owned")
+            .ui
+            .status_panel_v2_enabled = true;
+        let http = poise::serenity_prelude::Http::new("Bot test-token");
+        let provider = ProviderKind::Claude;
+        let state = state_for_recovery(9101);
+        let channel_id = ChannelId::new(state.channel_id);
+        let started_at_unix = 1_700_000_000;
+        shared.ui.placeholder_live_events.push_status_event(
+            channel_id,
+            StatusEvent::TurnCompleted {
+                background: false,
+                background_agent_pending: true,
+            },
+        );
+        let mut last_status_panel_text = shared.ui.placeholder_live_events.render_status_panel(
+            channel_id,
+            &provider,
+            started_at_unix,
+        );
+
+        let committed = super::super::turn_bridge::complete_status_panel_v2_with_http(
+            &shared,
+            &http,
+            channel_id,
+            Some(MessageId::new(4_047_301)),
+            &provider,
+            started_at_unix,
+            &mut last_status_panel_text,
+            false,
+            true,
+            "test_recovery_background_agent_pending_payload",
+            (Some(state.user_msg_id), Some(&state)),
+        )
+        .await;
+
+        assert!(committed);
+        let rendered = shared
+            .ui
+            .placeholder_live_events
+            .render_completion_footer(channel_id, &provider, "⠸");
+        let block = rendered.block.expect("background-agent pending footer");
+
+        assert!(rendered.has_unfinished_entries);
+        assert!(block.contains("Background agents"));
+        assert!(block.contains("Waiting for background agents ⠸"));
+    }
+
+    #[tokio::test]
+    async fn recovery_status_panel_completion_producer_threads_sniffed_background_agent_pending() {
+        let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
+        for (pending, channel_raw) in [(true, 4_047_311), (false, 4_047_312)] {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let mut state = state_for_recovery(9101);
+            state.channel_id = channel_raw;
+            state.tmux_session_name = Some("AgentDesk-claude-recovery-background-test".to_string());
+            let channel_id = ChannelId::new(state.channel_id);
+            let observed_tmux_session = Arc::new(Mutex::new(Vec::new()));
+            let sniffer_observed_tmux_session = observed_tmux_session.clone();
+            let sink_shared = shared.clone();
+
+            let outcome = super::complete_recovery_status_panel_with_sniffer_and_sink(
+                &state,
+                move |tmux_session_name| async move {
+                    sniffer_observed_tmux_session
+                        .lock()
+                        .expect("observed tmux session lock")
+                        .push(tmux_session_name);
+                    pending
+                },
+                move |background_agent_pending| async move {
+                    sink_shared.ui.placeholder_live_events.push_status_event(
+                        channel_id,
+                        StatusEvent::TurnCompleted {
+                            background: false,
+                            background_agent_pending,
+                        },
+                    );
+                    true
+                },
+            )
+            .await;
+
+            assert_eq!(outcome, RecoveryCompletionOutcome::Emitted);
+            assert_eq!(
+                observed_tmux_session
+                    .lock()
+                    .expect("observed tmux session lock")
+                    .as_slice(),
+                &[Some(
+                    "AgentDesk-claude-recovery-background-test".to_string()
+                )]
+            );
+
+            let rendered = shared
+                .ui
+                .placeholder_live_events
+                .render_completion_footer(channel_id, &provider, "⠸");
+            let block_has_background_agents = rendered
+                .block
+                .as_deref()
+                .is_some_and(|block| block.contains("Background agents"));
+
+            assert_eq!(rendered.has_unfinished_entries, pending);
+            assert_eq!(block_has_background_agents, pending);
+        }
     }
 
     #[test]
@@ -1274,12 +1467,20 @@ pub(super) async fn restore_inflight_turns(
                 // in-place edit (the helper handles both); `relay_ok` still
                 // reflects actual delivery so recovery never advances without
                 // posting. `MessageId::new(0)` would panic.
+                let recovery_context = RecoveryDeliveryContext::from_state(
+                    provider,
+                    &state,
+                    completed_during_downtime_end
+                        .map(|confirmed_end| (state.last_offset, confirmed_end)),
+                    shared.restart.current_generation,
+                );
                 let relay_ok = relay_recovered_terminal_text_to_placeholder(
                     http,
                     shared,
                     channel_id,
                     optional_message_id(state.current_msg_id),
                     &final_text,
+                    Some(&recovery_context),
                 )
                 .await
                 .delivered();
@@ -1329,42 +1530,39 @@ pub(super) async fn restore_inflight_turns(
                 let role_binding = resolve_role_binding(channel_id, state.channel_name.as_deref());
                 let duration_ms =
                     recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
-                let has_completion_evidence =
-                    if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
-                        if let Some(user_msg_id) = user_msg_id {
-                            super::turn_bridge::persist_turn_analytics_row_with_handles(
-                                None::<&crate::db::Db>,
-                                shared.pg_pool.as_ref(),
-                                provider,
-                                channel_id,
-                                user_msg_id,
-                                role_binding.as_ref(),
-                                recovered_dispatch_id
-                                    .as_deref()
-                                    .or(state.dispatch_id.as_deref()),
-                                state.session_key.as_deref(),
-                                recovered_session_id
-                                    .as_deref()
-                                    .or(state.session_id.as_deref()),
-                                &state,
-                                recovered_usage.unwrap_or_default(),
-                                duration_ms,
-                            );
-                        }
-                        persist_recovered_transcript(
-                            None::<&crate::db::Db>,
+                let has_completion_evidence = if shared.pg_pool.is_some() {
+                    if let Some(user_msg_id) = user_msg_id {
+                        super::turn_bridge::persist_turn_analytics_row_with_handles(
                             shared.pg_pool.as_ref(),
                             provider,
-                            &state,
+                            channel_id,
+                            user_msg_id,
+                            role_binding.as_ref(),
                             recovered_dispatch_id
                                 .as_deref()
                                 .or(state.dispatch_id.as_deref()),
-                            &assistant_response,
-                        )
-                        .await
-                    } else {
-                        !assistant_response.trim().is_empty()
-                    };
+                            state.session_key.as_deref(),
+                            recovered_session_id
+                                .as_deref()
+                                .or(state.session_id.as_deref()),
+                            &state,
+                            recovered_usage.unwrap_or_default(),
+                            duration_ms,
+                        );
+                    }
+                    persist_recovered_transcript(
+                        shared.pg_pool.as_ref(),
+                        provider,
+                        &state,
+                        recovered_dispatch_id
+                            .as_deref()
+                            .or(state.dispatch_id.as_deref()),
+                        &assistant_response,
+                    )
+                    .await
+                } else {
+                    !assistant_response.trim().is_empty()
+                };
                 let completion_context = has_completion_evidence
                     .then(|| serde_json::json!({ "agent_response_present": true }));
                 let fallback_result = completion_context
@@ -1399,7 +1597,6 @@ pub(super) async fn restore_inflight_turns(
                         // #143: Use finalize_dispatch directly with retry.
                         for attempt in 1..=3u8 {
                             match crate::dispatch::finalize_dispatch_with_backends(
-                                None::<&crate::db::Db>,
                                 engine,
                                 did,
                                 "recovery_completed_during_downtime",
@@ -1917,12 +2114,19 @@ pub(super) async fn restore_inflight_turns(
             let assistant_response = state.full_response.clone();
             let final_text =
                 super::formatting::format_for_discord_with_provider(&assistant_response, provider);
+            let recovery_context = RecoveryDeliveryContext::from_state(
+                provider,
+                &state,
+                terminal_success_end.map(|confirmed_end| (state.last_offset, confirmed_end)),
+                shared.restart.current_generation,
+            );
             let relay_ok = relay_recovered_terminal_text_to_placeholder(
                 http,
                 shared,
                 channel_id,
                 current_msg_id,
                 &final_text,
+                Some(&recovery_context),
             )
             .await
             .delivered();
@@ -1961,43 +2165,40 @@ pub(super) async fn restore_inflight_turns(
             let role_binding = resolve_role_binding(channel_id, state.channel_name.as_deref());
             let duration_ms =
                 recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
-            let has_completion_evidence =
-                if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
-                    // No user message (user_msg_id == 0) → no analytics row to
-                    // key (`discord:<channel>:0` would be bogus); skip the
-                    // analytics persist but still write the transcript.
-                    if let Some(user_msg_id) = user_msg_id {
-                        super::turn_bridge::persist_turn_analytics_row_with_handles(
-                            None::<&crate::db::Db>,
-                            shared.pg_pool.as_ref(),
-                            provider,
-                            channel_id,
-                            user_msg_id,
-                            role_binding.as_ref(),
-                            recovered_dispatch_id
-                                .as_deref()
-                                .or(state.dispatch_id.as_deref()),
-                            state.session_key.as_deref(),
-                            state.session_id.as_deref(),
-                            &state,
-                            TurnTokenUsage::default(),
-                            duration_ms,
-                        );
-                    }
-                    persist_recovered_transcript(
-                        None::<&crate::db::Db>,
+            let has_completion_evidence = if shared.pg_pool.is_some() {
+                // No user message (user_msg_id == 0) → no analytics row to
+                // key (`discord:<channel>:0` would be bogus); skip the
+                // analytics persist but still write the transcript.
+                if let Some(user_msg_id) = user_msg_id {
+                    super::turn_bridge::persist_turn_analytics_row_with_handles(
                         shared.pg_pool.as_ref(),
                         provider,
-                        &state,
+                        channel_id,
+                        user_msg_id,
+                        role_binding.as_ref(),
                         recovered_dispatch_id
                             .as_deref()
                             .or(state.dispatch_id.as_deref()),
-                        &assistant_response,
-                    )
-                    .await
-                } else {
-                    !assistant_response.trim().is_empty()
-                };
+                        state.session_key.as_deref(),
+                        state.session_id.as_deref(),
+                        &state,
+                        TurnTokenUsage::default(),
+                        duration_ms,
+                    );
+                }
+                persist_recovered_transcript(
+                    shared.pg_pool.as_ref(),
+                    provider,
+                    &state,
+                    recovered_dispatch_id
+                        .as_deref()
+                        .or(state.dispatch_id.as_deref()),
+                    &assistant_response,
+                )
+                .await
+            } else {
+                !assistant_response.trim().is_empty()
+            };
             let completion_context = has_completion_evidence
                 .then(|| serde_json::json!({ "agent_response_present": true }));
             let fallback_result = completion_context
@@ -2037,7 +2238,6 @@ pub(super) async fn restore_inflight_turns(
                         } else if let Some(engine) = &shared.policy.engine {
                             for attempt in 1..=3u8 {
                                 match crate::dispatch::finalize_dispatch_with_backends(
-                                    None::<&crate::db::Db>,
                                     engine,
                                     did,
                                     "recovery_captured_full_response",
@@ -2170,12 +2370,19 @@ pub(super) async fn restore_inflight_turns(
                 super::formatting::format_for_discord_with_provider(&assistant_response, provider)
             };
             // #225 P1-1: Track relay success — only clear inflight if Discord delivery succeeds
+            let recovery_context = RecoveryDeliveryContext::from_state(
+                provider,
+                &state,
+                terminal_success_end.map(|confirmed_end| (state.last_offset, confirmed_end)),
+                shared.restart.current_generation,
+            );
             let relay_ok = relay_recovered_terminal_text_to_placeholder(
                 http,
                 shared,
                 channel_id,
                 current_msg_id,
                 &final_text,
+                Some(&recovery_context),
             )
             .await
             .delivered();
@@ -2219,45 +2426,42 @@ pub(super) async fn restore_inflight_turns(
             let role_binding = resolve_role_binding(channel_id, state.channel_name.as_deref());
             let duration_ms =
                 recovered_turn_duration_ms(Some(state.started_at.as_str())).unwrap_or(0);
-            let has_completion_evidence =
-                if None::<&crate::db::Db>.is_some() || shared.pg_pool.is_some() {
-                    // No user message (user_msg_id == 0) → no analytics row to
-                    // key (`discord:<channel>:0` would be bogus); skip the
-                    // analytics persist but still write the transcript.
-                    if let Some(user_msg_id) = user_msg_id {
-                        super::turn_bridge::persist_turn_analytics_row_with_handles(
-                            None::<&crate::db::Db>,
-                            shared.pg_pool.as_ref(),
-                            provider,
-                            channel_id,
-                            user_msg_id,
-                            role_binding.as_ref(),
-                            recovered_dispatch_id
-                                .as_deref()
-                                .or(state.dispatch_id.as_deref()),
-                            state.session_key.as_deref(),
-                            recovered_session_id
-                                .as_deref()
-                                .or(state.session_id.as_deref()),
-                            &state,
-                            recovered_usage.unwrap_or_default(),
-                            duration_ms,
-                        );
-                    }
-                    persist_recovered_transcript(
-                        None::<&crate::db::Db>,
+            let has_completion_evidence = if shared.pg_pool.is_some() {
+                // No user message (user_msg_id == 0) → no analytics row to
+                // key (`discord:<channel>:0` would be bogus); skip the
+                // analytics persist but still write the transcript.
+                if let Some(user_msg_id) = user_msg_id {
+                    super::turn_bridge::persist_turn_analytics_row_with_handles(
                         shared.pg_pool.as_ref(),
                         provider,
-                        &state,
+                        channel_id,
+                        user_msg_id,
+                        role_binding.as_ref(),
                         recovered_dispatch_id
                             .as_deref()
                             .or(state.dispatch_id.as_deref()),
-                        &assistant_response,
-                    )
-                    .await
-                } else {
-                    !assistant_response.trim().is_empty()
-                };
+                        state.session_key.as_deref(),
+                        recovered_session_id
+                            .as_deref()
+                            .or(state.session_id.as_deref()),
+                        &state,
+                        recovered_usage.unwrap_or_default(),
+                        duration_ms,
+                    );
+                }
+                persist_recovered_transcript(
+                    shared.pg_pool.as_ref(),
+                    provider,
+                    &state,
+                    recovered_dispatch_id
+                        .as_deref()
+                        .or(state.dispatch_id.as_deref()),
+                    &assistant_response,
+                )
+                .await
+            } else {
+                !assistant_response.trim().is_empty()
+            };
             let completion_context = has_completion_evidence
                 .then(|| serde_json::json!({ "agent_response_present": true }));
             let fallback_result = completion_context
@@ -2295,7 +2499,6 @@ pub(super) async fn restore_inflight_turns(
                         } else if let Some(engine) = &shared.policy.engine {
                             for attempt in 1..=3u8 {
                                 match crate::dispatch::finalize_dispatch_with_backends(
-                                    None::<&crate::db::Db>,
                                     engine,
                                     did,
                                     "recovery_output_completed",
@@ -2442,7 +2645,8 @@ pub(super) async fn restore_inflight_turns(
                     provider,
                 );
                 let outcome =
-                    relay_recovery_terminal_notice(http, shared, &state, &final_text).await;
+                    relay_recovery_terminal_notice(http, shared, provider, &state, &final_text)
+                        .await;
                 // #3293: tmux_alive=true — budget force-clear forbidden here
                 // (pane-alive invariant); only a permanent verdict clears.
                 dispose_recovery_relay_outcome(
@@ -2503,10 +2707,10 @@ pub(super) async fn restore_inflight_turns(
                     best_response.len()
                 );
             }
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &stale_text).await;
+            let outcome =
+                relay_recovery_terminal_notice(http, shared, provider, &state, &stale_text).await;
             if let Some(ref sk) = state.session_key {
                 crate::services::termination_audit::record_termination_with_handles(
-                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     sk,
                     state.dispatch_id.as_deref(),
@@ -2542,7 +2746,8 @@ pub(super) async fn restore_inflight_turns(
                 state.channel_id
             );
             let text = stale_inflight_message("tmux session name missing during recovery");
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
+            let outcome =
+                relay_recovery_terminal_notice(http, shared, provider, &state, &text).await;
             // #3297 finding 4: past the can_recover gate tmux absence is NOT
             // established — tmux_alive=true forbids budget force-clear here.
             dispose_recovery_relay_outcome(
@@ -2566,7 +2771,8 @@ pub(super) async fn restore_inflight_turns(
                 state.channel_id
             );
             let text = stale_inflight_message("output path missing during recovery");
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
+            let outcome =
+                relay_recovery_terminal_notice(http, shared, provider, &state, &text).await;
             // #3297 finding 4: tmux session existence was confirmed above
             // (can_recover consumed the missing-tmux rows) — tmux_alive=true,
             // so the budget can never clear a possibly-live pane here.
@@ -2619,7 +2825,8 @@ pub(super) async fn restore_inflight_turns(
                     runtime_kind.as_str()
                 );
                 let text = stale_inflight_message(reason);
-                let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
+                let outcome =
+                    relay_recovery_terminal_notice(http, shared, provider, &state, &text).await;
                 // #3297 finding 4: tmux existence already confirmed —
                 // tmux_alive=true (budget clear forbidden; permanent only).
                 dispose_recovery_relay_outcome(
@@ -2750,12 +2957,19 @@ pub(super) async fn restore_inflight_turns(
                             recovery_agent_id.as_deref(),
                             "worktree_missing_main_fallback_blocked",
                         );
+                        let recovery_context = RecoveryDeliveryContext::from_state(
+                            provider,
+                            &state,
+                            None,
+                            shared.restart.current_generation,
+                        );
                         let relay_ok = relay_recovered_terminal_text_to_placeholder(
                             http,
                             shared,
                             channel_id,
                             current_msg_id,
                             &format!("❌ {error}\nmain workspace fallback blocked."),
+                            Some(&recovery_context),
                         )
                         .await
                         .delivered();
@@ -2991,12 +3205,19 @@ pub(super) async fn restore_inflight_turns(
                     recovery_agent_id.as_deref(),
                     "worktree_missing_main_fallback_blocked",
                 );
+                let recovery_context = RecoveryDeliveryContext::from_state(
+                    provider,
+                    &state,
+                    None,
+                    shared.restart.current_generation,
+                );
                 let relay_ok = relay_recovered_terminal_text_to_placeholder(
                     http,
                     shared,
                     channel_id,
                     current_msg_id,
                     &format!("❌ {error}\nmain workspace fallback blocked."),
+                    Some(&recovery_context),
                 )
                 .await
                 .delivered();
@@ -3119,9 +3340,11 @@ pub(super) async fn restore_inflight_turns(
                 start_offset,
                 tx.clone(),
                 Some(cancel_for_reader),
-                crate::services::provider::SessionProbe::tmux(
+                crate::services::provider::SessionProbe::tmux_with_structured_output(
                     tmux_for_reader.clone(),
                     provider_for_reader,
+                    Some(runtime_kind_for_reader),
+                    output_for_reader.clone(),
                 ),
             ) {
                 Ok(ReadOutputResult::Completed { offset })

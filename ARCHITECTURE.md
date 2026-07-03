@@ -102,7 +102,6 @@ src/
 │   ├── intake_outbox.rs
 │   ├── kanban.rs
 │   ├── meetings.rs
-│   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
 │   ├── session_agent_resolution.rs
@@ -222,6 +221,11 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
+│   │   ├── routines/
+│   │   │   ├── audit.rs
+│   │   │   ├── handlers.rs
+│   │   │   ├── helpers.rs
+│   │   │   └── responses.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -364,6 +368,8 @@ src/
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
+│   │   ├── stream_relay/
+│   │   │   └── identity.rs
 │   │   ├── capability_routing.rs
 │   │   ├── intake_router_hook.rs
 │   │   ├── intake_routing.rs
@@ -477,8 +483,7 @@ src/
 │   │   │   ├── send_to_agent.rs
 │   │   │   ├── serenity_reference.rs
 │   │   │   ├── transport.rs
-│   │   │   ├── turn_output_controller.rs
-│   │   │   └── turn_output_controller_rollout_health.rs
+│   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── background_task_events.rs
 │   │   │   ├── common.rs
@@ -516,6 +521,8 @@ src/
 │   │   │   ├── runtime.rs
 │   │   │   ├── state_extractors.rs
 │   │   │   ├── status_panel.rs
+│   │   │   ├── status_panel_completion_producer.rs
+│   │   │   ├── terminal_text_idempotency.rs
 │   │   │   └── terminal_watcher.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── controller_cutover.rs
@@ -592,6 +599,8 @@ src/
 │   │   │   ├── commit_decisions.rs
 │   │   │   ├── completion_gate.rs
 │   │   │   ├── completion_gate_tests.rs
+│   │   │   ├── completion_producer.rs
+│   │   │   ├── controller_heartbeat.rs
 │   │   │   ├── liveness.rs
 │   │   │   ├── orphan_status_panel_cleanup.rs
 │   │   │   ├── panel_decisions.rs
@@ -602,9 +611,11 @@ src/
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
+│   │   │   ├── single_message_footer_tests.rs
 │   │   │   ├── stall_exit.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
+│   │   │   ├── terminal_long_chunks.rs
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
 │   │   │   ├── terminal_send.rs
@@ -711,6 +722,7 @@ src/
 │   │   ├── agentdesk_config.rs
 │   │   ├── answer_flush_barrier.rs
 │   │   ├── catch_up.rs
+│   │   ├── delivery_lease_key.rs
 │   │   ├── destructive_cancel_gate.rs
 │   │   ├── discord_io.rs
 │   │   ├── dispatch_policy.rs
@@ -776,8 +788,6 @@ src/
 │   │   ├── startup_reclaim.rs
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── status_panel_orphan_store_tests.rs
-│   │   ├── status_panel_timedout_reconcile.rs
-│   │   ├── status_panel_timedout_reconcile_tests.rs
 │   │   ├── steering.rs
 │   │   ├── streaming_finalizer.rs
 │   │   ├── subagent_notification_card.rs
@@ -798,7 +808,6 @@ src/
 │   │   ├── tui_busy_gate.rs
 │   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
-│   │   ├── tui_prompt_relay_controller_cutover.rs
 │   │   ├── tui_task_card.rs
 │   │   ├── turn_end_wip_warning.rs
 │   │   ├── turn_finalizer.rs
@@ -920,6 +929,8 @@ src/
 │   │   └── mod.rs
 │   ├── tui_prompt_dedupe/
 │   │   └── synthetic_prompt.rs
+│   ├── tui_turn_state/
+│   │   └── completion_scan.rs
 │   ├── turn_orchestrator/
 │   │   ├── dispatch_reservation.rs
 │   │   ├── pending_queue_persistence.rs
@@ -956,6 +967,7 @@ src/
 │   ├── monitoring_store.rs
 │   ├── opencode.rs
 │   ├── operator_connectors.rs
+│   ├── pane_readiness.rs
 │   ├── pipeline_override.rs
 │   ├── pipeline_routes.rs
 │   ├── pr_summary.rs
@@ -1028,6 +1040,7 @@ src/
 │   ├── stt_streaming.rs
 │   ├── turn_link.rs
 │   └── utils.rs
+├── api_caller_observability.rs
 ├── app_state.rs
 ├── bootstrap.rs
 ├── config.rs
@@ -1072,6 +1085,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/ui/` | Compatibility shims for persisted UI/session types used by the Discord runtime. |
 | `src/utils/` | Shared formatting and Unicode-safe string utilities. |
 | `src/voice/` | Voice command, STT/TTS, prompt, progress, metrics, receiver, and barge-in helpers. |
+| `src/api_caller_observability.rs` | Request-principal classification and uniform log-only API caller attribution records for identity-consuming mutation paths. |
 | `src/app_state.rs` | Shared HTTP route-handler state (`AppState`); lives at crate root below server+services so service-layer handlers reference it without a service→server backflow. |
 | `src/bootstrap.rs` | Builds config, database, policy engine, and shared app state before launch. |
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |

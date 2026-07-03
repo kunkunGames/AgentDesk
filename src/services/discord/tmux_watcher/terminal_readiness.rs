@@ -207,11 +207,12 @@ pub(super) fn watcher_session_ready_for_input(
     ) {
         return ready;
     }
-    if crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind) {
-        crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
-    } else {
-        false
-    }
+    crate::services::provider::tmux_session_fallback_ready_for_input(
+        tmux_session_name,
+        provider,
+        runtime_kind,
+    )
+    .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
 }
 
 pub(super) fn discard_watcher_pending_buffer_after_suppressed_turn(
@@ -219,12 +220,14 @@ pub(super) fn discard_watcher_pending_buffer_after_suppressed_turn(
     all_data_start_offset: &mut u64,
     all_data_fully_mirrored_to_session_relay: &mut bool,
     all_data_session_bound_relay_ack: &mut Option<SessionBoundRelayAckTarget>,
+    all_data_first_forwarded_relay_sequence: &mut Option<u64>,
     current_offset: u64,
 ) {
     all_data.clear();
     *all_data_start_offset = current_offset;
     *all_data_fully_mirrored_to_session_relay = true;
     *all_data_session_bound_relay_ack = None;
+    *all_data_first_forwarded_relay_sequence = None;
 }
 
 #[cfg(test)]

@@ -221,7 +221,7 @@ mod reregister_ledger_reseed_tests {
     // the row — so the live pane auto-reconciles WITHOUT a new user turn.
     #[tokio::test(flavor = "current_thread")]
     async fn reattach_reseeds_watcher_owned_ledger_entry() {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_481);
         let state = active_turn_state(ch.get(), 9001);
 
@@ -258,7 +258,7 @@ mod reregister_ledger_reseed_tests {
     // finalized turn. The turn stays a single live Watcher-pending entry.
     #[tokio::test(flavor = "current_thread")]
     async fn repeated_reattach_is_idempotent_single_watcher_entry() {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_482);
         let state = active_turn_state(ch.get(), 9101);
 
@@ -283,7 +283,7 @@ mod reregister_ledger_reseed_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn zero_user_msg_id_reseeds_with_finalizer_turn_id() {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_483);
         let mut state = active_turn_state(ch.get(), 0);
         state.user_msg_id = 0;
@@ -311,46 +311,30 @@ mod reregister_ledger_reseed_tests {
                     shared.restart.current_generation,
                 ),
                 ProviderKind::Claude,
-                super::super::turn_finalizer::TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(false),
-                },
+                super::super::turn_finalizer::TerminalEvent::Complete,
                 super::super::turn_finalizer::FinalizeContext::watcher(),
                 shared.clone(),
             )
             .await;
         assert!(matches!(
             outcome,
-            super::super::turn_finalizer::FinalizeOutcome::Deferred
+            super::super::turn_finalizer::FinalizeOutcome::Finalized { .. }
         ));
     }
 
     // #3089 A0 — characterization of the recovery probe-classified outcome
     // (design §5 A0 item 3, signal #5 of 5). `RecoveryCompletionOutcome` is the
-    // recovery engine's terminal-completion signal; BOTH arms `should_proceed()`
-    // (a suppressed visible completion is NOT a delivery failure, so callers
-    // still release mailbox/inflight ownership). Pinned inline in this
+    // recovery engine's terminal-completion signal. Pinned inline in this
     // `#[cfg(test)] mod` block of the FROZEN (baseline 4090) file => ZERO prod
     // LoC.
     mod a0_characterization_tests {
         use super::super::RecoveryCompletionOutcome;
 
         #[test]
-        fn a0_both_recovery_outcomes_proceed_with_cleanup() {
+        fn a0_recovery_completion_proceeds_with_cleanup() {
             assert!(
                 RecoveryCompletionOutcome::Emitted.should_proceed(),
                 "Emitted proceeds"
-            );
-            assert!(
-                RecoveryCompletionOutcome::VisibleCompletionSuppressed.should_proceed(),
-                "VisibleCompletionSuppressed still proceeds (terminal delivery is authoritative)"
-            );
-        }
-
-        #[test]
-        fn a0_recovery_outcomes_are_two_distinct_arms() {
-            assert_ne!(
-                RecoveryCompletionOutcome::Emitted,
-                RecoveryCompletionOutcome::VisibleCompletionSuppressed
             );
         }
     }

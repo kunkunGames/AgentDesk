@@ -1,12 +1,15 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use poise::serenity_prelude::ChannelId;
 use serde_json::json;
 
 use super::AppState;
+use crate::api_caller_observability::{
+    RequestPrincipal, log_identity_consumption, manager_channel_check_relied_on_claimed_header,
+};
 use crate::db::kanban_cards as kanban_db;
 use crate::db::kanban_cards::{IssueCardUpsert, upsert_card_from_issue_pg};
 pub use crate::server::dto::kanban::{
@@ -251,7 +254,7 @@ fn execute_transition_intent_pg(
 fn review_state_sync_pg(state: &AppState, payload: serde_json::Value) -> anyhow::Result<String> {
     let pool = state.pg_pool_ref().ok_or_else(pg_pool_required_anyhow)?;
     let result =
-        crate::engine::ops::review_state_sync_with_backends(None, Some(pool), &payload.to_string());
+        crate::engine::ops::review_state_sync_with_backends(Some(pool), &payload.to_string());
     let parsed = serde_json::from_str::<serde_json::Value>(&result).unwrap_or_else(|_| {
         json!({
             "error": format!("invalid review_state_sync response: {result}")
@@ -480,7 +483,7 @@ pub async fn update_card(
     // doesn't drain them itself. drain_hook_side_effects now also queues Discord
     // notifications for created dispatches, replacing the previous latest_dispatch_id
     // re-query that was susceptible to race conditions.
-    crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
+    crate::kanban::drain_hook_side_effects_with_backends(&state.engine);
 
     match load_card_json_pg(pool, &id).await {
         Ok(Some(card)) => {
@@ -1022,7 +1025,7 @@ pub async fn defer_dod(
     }
 
     if restart_review_state {
-        crate::kanban::fire_enter_hooks_with_backends(None, &state.engine, &id, &card_status);
+        crate::kanban::fire_enter_hooks_with_backends(&state.engine, &id, &card_status);
         tracing::info!(
             "[dod] Card {} DoD all-complete — restarting review from awaiting_dod",
             id
@@ -1496,7 +1499,6 @@ pub async fn pm_decision(
             };
         for dispatch_id in pending_dispatch_ids {
             crate::dispatch::set_dispatch_status_with_backends(
-                None,
                 Some(transition_pool),
                 &dispatch_id,
                 "completed",
@@ -1624,7 +1626,6 @@ pub async fn pm_decision(
                     };
                     for dispatch_id in pending_dispatch_ids {
                         crate::dispatch::set_dispatch_status_with_backends(
-                            None,
                             Some(transition_pool),
                             &dispatch_id,
                             "completed",
@@ -1782,6 +1783,30 @@ pub async fn pm_decision(
 // below call them through the services facade.
 use crate::services::kanban::{require_explicit_bearer_token, resolve_requesting_agent_id_with_pg};
 
+fn request_principal_ref(
+    principal: &Option<Extension<RequestPrincipal>>,
+) -> Option<&RequestPrincipal> {
+    principal.as_ref().map(|Extension(principal)| principal)
+}
+
+fn log_kanban_identity_consumption(
+    endpoint: &'static str,
+    headers: &HeaderMap,
+    principal: &Option<Extension<RequestPrincipal>>,
+    consumed_agent_id: &str,
+) {
+    let config = crate::config::load_graceful();
+    log_identity_consumption(
+        endpoint,
+        request_principal_ref(principal),
+        Some(consumed_agent_id),
+        manager_channel_check_relied_on_claimed_header(
+            headers,
+            config.kanban.manager_channel_id.as_deref(),
+        ),
+    );
+}
+
 /// POST /api/kanban-cards/:id/rereview
 ///
 /// Recovery endpoint. Forces a card back through counter-model review
@@ -1790,6 +1815,7 @@ pub async fn rereview_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    principal: Option<Extension<RequestPrincipal>>,
     Json(body): Json<RereviewBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(response) = require_explicit_bearer_token(&headers, "rereview") {
@@ -1827,6 +1853,12 @@ pub async fn rereview_card(
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await
         .unwrap_or_else(|| "api".to_string());
+    log_kanban_identity_consumption(
+        "POST /api/kanban-cards/{id}/rereview",
+        &headers,
+        &principal,
+        &caller_source,
+    );
 
     let assigned_agent_id = match assigned_agent_id.filter(|value| !value.is_empty()) {
         Some(value) => value,
@@ -1904,7 +1936,7 @@ pub async fn rereview_card(
             );
         }
     } else {
-        crate::kanban::fire_enter_hooks_with_backends(None, &state.engine, &id, "review");
+        crate::kanban::fire_enter_hooks_with_backends(&state.engine, &id, "review");
     }
 
     let mut review_dispatch_id = kanban_db::find_active_review_dispatch_id_pg(pool, &id).await;
@@ -1913,7 +1945,7 @@ pub async fn rereview_card(
         let _ = state
             .engine
             .fire_hook_by_name_blocking("OnReviewEnter", json!({ "card_id": id }));
-        crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
+        crate::kanban::drain_hook_side_effects_with_backends(&state.engine);
         review_dispatch_id = kanban_db::find_active_review_dispatch_id_pg(pool, &id).await;
     }
 
@@ -1947,7 +1979,7 @@ pub async fn rereview_card(
         );
     };
 
-    crate::kanban::correct_tn_to_fn_on_reopen(None, state.pg_pool_ref(), &id);
+    crate::kanban::correct_tn_to_fn_on_reopen(state.pg_pool_ref(), &id);
 
     if let Err(error) = kanban_db::reset_completed_at_pg(pool, &id).await {
         return (
@@ -2040,6 +2072,7 @@ pub async fn rereview_card(
 pub async fn batch_rereview(
     State(state): State<AppState>,
     headers: HeaderMap,
+    principal: Option<Extension<RequestPrincipal>>,
     Json(body): Json<BatchRereviewBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(response) = require_explicit_bearer_token(&headers, "batch rereview") {
@@ -2090,6 +2123,7 @@ pub async fn batch_rereview(
             State(state.clone()),
             Path(card_id),
             headers.clone(),
+            principal.clone(),
             Json(rereview_body),
         )
         .await;
@@ -2121,6 +2155,7 @@ pub async fn reopen_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    principal: Option<Extension<RequestPrincipal>>,
     Json(body): Json<ReopenBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let reset_full = body.reset_full.unwrap_or(false);
@@ -2135,6 +2170,12 @@ pub async fn reopen_card(
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await
         .unwrap_or_else(|| "api".to_string());
+    log_kanban_identity_consumption(
+        "POST /api/kanban-cards/{id}/reopen",
+        &headers,
+        &principal,
+        &caller_source,
+    );
 
     // ── Pre-check: card must be in done state ──
     let current_status: String = match kanban_db::card_status_pg(pool, &id).await {
@@ -2224,7 +2265,7 @@ pub async fn reopen_card(
 
         match transition_result {
             Ok((from_status, to_status, cleanup_counts)) => {
-                crate::kanban::correct_tn_to_fn_on_reopen(None, state.pg_pool_ref(), &id);
+                crate::kanban::correct_tn_to_fn_on_reopen(state.pg_pool_ref(), &id);
 
                 if reset_full {
                     if let Err(error) = kanban_db::clear_all_threads_pg(pool, &id).await {
@@ -2383,6 +2424,7 @@ pub async fn force_transition(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    principal: Option<Extension<RequestPrincipal>>,
     Json(body): Json<ForceTransitionBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(response) = require_explicit_bearer_token(&headers, "force-transition") {
@@ -2412,6 +2454,12 @@ pub async fn force_transition(
     let caller_source = resolve_requesting_agent_id_with_pg(pool, &headers)
         .await
         .unwrap_or_else(|| "api".to_string());
+    log_kanban_identity_consumption(
+        "POST /api/kanban-cards/{id}/transition",
+        &headers,
+        &principal,
+        &caller_source,
+    );
     // Snapshot active dispatch IDs before transition so we can report which
     // were cancelled by the cleanup paths (#1442). The cleanup helpers report
     // counts but not IDs; we reconcile by querying the post-transition status
@@ -2535,7 +2583,7 @@ pub async fn force_transition(
     match transition_result {
         Ok(result) => {
             let (mut cancelled_dispatches, mut skipped_auto_queue_entries) = cleanup_counts;
-            crate::kanban::drain_hook_side_effects_with_backends(None, &state.engine);
+            crate::kanban::drain_hook_side_effects_with_backends(&state.engine);
 
             // #1444 codex iter-2 P1: when target_status equals current status
             // (transition is a NoOp at the FSM level) AND the caller forced

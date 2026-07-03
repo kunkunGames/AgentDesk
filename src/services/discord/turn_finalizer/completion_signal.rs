@@ -39,7 +39,13 @@ pub(in crate::services::discord) fn completion_signal_from_transcript(
     ) {
         return CompletionSignal::Unknown;
     }
-    if crate::services::tui_turn_state::jsonl_turn_end_terminator_idle(provider, transcript_path) {
+    let Ok(metadata) = std::fs::metadata(transcript_path) else {
+        return CompletionSignal::PausedLive;
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return CompletionSignal::PausedLive;
+    }
+    if crate::services::tui_turn_state::jsonl_completion_scan_idle(provider, transcript_path) {
         CompletionSignal::Done
     } else {
         CompletionSignal::PausedLive

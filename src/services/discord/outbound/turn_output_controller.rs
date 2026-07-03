@@ -36,8 +36,8 @@ use super::super::placeholder_controller::{
 };
 use super::super::turn_finalizer::TurnKey;
 use super::super::{
-    DELIVERY_LEASE_DEADLINE_MS, DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot,
-    lease_now_ms,
+    DELIVERY_LEASE_DEADLINE_MS, DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome,
+    LeaseSnapshot, lease_now_ms,
 };
 use super::decision::LengthPolicyDecision;
 
@@ -56,7 +56,7 @@ use super::decision::LengthPolicyDecision;
 pub(in crate::services::discord) trait DeliveryLease {
     fn try_acquire(
         &self,
-        turn: TurnKey,
+        key: DeliveryLeaseKey,
         holder: LeaseHolder,
         start: u64,
         end: u64,
@@ -65,20 +65,20 @@ pub(in crate::services::discord) trait DeliveryLease {
     fn commit(
         &self,
         holder: LeaseHolder,
-        turn: TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
         outcome: LeaseOutcome,
     ) -> bool;
-    fn release(&self, holder: LeaseHolder, turn: TurnKey, start: u64, end: u64) -> bool;
-    /// Push this `(holder, turn)`'s lease deadline to `new_deadline_ms` (range is
+    fn release(&self, holder: LeaseHolder, key: DeliveryLeaseKey, start: u64, end: u64) -> bool;
+    /// Push this `(holder, key)` lease deadline to `new_deadline_ms` (range is
     /// not matched — see [`DeliveryLeaseCell::renew`]). A no-op `false` once the
     /// lease is no longer ours (committed / released / reclaimed). The A2a POST
     /// heartbeat ([`PostHeartbeat`]) calls this on a fixed interval so the
     /// `Leased{holder, fresh}` deadline stays ahead of the reconciler while a slow
     /// POST is in flight (#3151) — replacing A1's fixed-TTL acquire.
     #[allow(dead_code)] // #3089 A2a: driven by the owner's PostHeartbeat at A2b cutover.
-    fn renew(&self, holder: LeaseHolder, turn: TurnKey, new_deadline_ms: u64) -> bool;
+    fn renew(&self, holder: LeaseHolder, key: DeliveryLeaseKey, new_deadline_ms: u64) -> bool;
     #[allow(dead_code)] // #3089 A1: read by the controller's own tests only.
     fn read(&self) -> LeaseSnapshot;
 }
@@ -86,29 +86,29 @@ pub(in crate::services::discord) trait DeliveryLease {
 impl DeliveryLease for DeliveryLeaseCell {
     fn try_acquire(
         &self,
-        turn: TurnKey,
+        key: DeliveryLeaseKey,
         holder: LeaseHolder,
         start: u64,
         end: u64,
         deadline_ms: u64,
     ) -> bool {
-        DeliveryLeaseCell::try_acquire(self, turn, holder, start, end, deadline_ms)
+        DeliveryLeaseCell::try_acquire(self, key, holder, start, end, deadline_ms)
     }
     fn commit(
         &self,
         holder: LeaseHolder,
-        turn: TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
         outcome: LeaseOutcome,
     ) -> bool {
-        DeliveryLeaseCell::commit(self, holder, turn, start, end, outcome)
+        DeliveryLeaseCell::commit(self, holder, key, start, end, outcome)
     }
-    fn release(&self, holder: LeaseHolder, turn: TurnKey, start: u64, end: u64) -> bool {
-        DeliveryLeaseCell::release(self, holder, turn, start, end)
+    fn release(&self, holder: LeaseHolder, key: DeliveryLeaseKey, start: u64, end: u64) -> bool {
+        DeliveryLeaseCell::release(self, holder, key, start, end)
     }
-    fn renew(&self, holder: LeaseHolder, turn: TurnKey, new_deadline_ms: u64) -> bool {
-        DeliveryLeaseCell::renew(self, holder, turn, new_deadline_ms)
+    fn renew(&self, holder: LeaseHolder, key: DeliveryLeaseKey, new_deadline_ms: u64) -> bool {
+        DeliveryLeaseCell::renew(self, holder, key, new_deadline_ms)
     }
     fn read(&self) -> LeaseSnapshot {
         DeliveryLeaseCell::read(self)
@@ -131,7 +131,7 @@ pub(in crate::services::discord) struct NoLease;
 impl DeliveryLease for NoLease {
     fn try_acquire(
         &self,
-        _turn: TurnKey,
+        _key: DeliveryLeaseKey,
         _holder: LeaseHolder,
         _start: u64,
         _end: u64,
@@ -144,7 +144,7 @@ impl DeliveryLease for NoLease {
     fn commit(
         &self,
         _holder: LeaseHolder,
-        _turn: TurnKey,
+        _key: DeliveryLeaseKey,
         _start: u64,
         _end: u64,
         _outcome: LeaseOutcome,
@@ -153,10 +153,16 @@ impl DeliveryLease for NoLease {
         // a no-op keeps the trait honest.
         false
     }
-    fn release(&self, _holder: LeaseHolder, _turn: TurnKey, _start: u64, _end: u64) -> bool {
+    fn release(
+        &self,
+        _holder: LeaseHolder,
+        _key: DeliveryLeaseKey,
+        _start: u64,
+        _end: u64,
+    ) -> bool {
         false
     }
-    fn renew(&self, _holder: LeaseHolder, _turn: TurnKey, _new_deadline_ms: u64) -> bool {
+    fn renew(&self, _holder: LeaseHolder, _key: DeliveryLeaseKey, _new_deadline_ms: u64) -> bool {
         false
     }
     fn read(&self) -> LeaseSnapshot {
@@ -212,8 +218,13 @@ pub(in crate::services::discord) enum OutputPlan {
     /// drive the correct terminal placeholder state (recon risk #5).
     Replace { lifecycle: PlaceholderLifecycle },
     /// Send `chunk_count` new chunked messages (Split body over the inline
-    /// limit).
-    SendNewChunks { chunk_count: usize },
+    /// limit). `delete_anchor` is an owner capability bit for terminal arms
+    /// whose legacy long-chunk path deletes the placeholder anchor only after
+    /// every chunk has landed.
+    SendNewChunks {
+        chunk_count: usize,
+        delete_anchor: bool,
+    },
     /// Nothing to deliver (empty / suppressed body).
     NoOp,
 }
@@ -225,7 +236,7 @@ impl OutputPlan {
     ///   place). The replace `lifecycle` is supplied by the caller because the
     ///   length decision alone cannot tell cancel / prompt-too-long / normal
     ///   apart.
-    /// - `Split` → `SendNewChunks { chunk_count }`.
+    /// - `Split` → `SendNewChunks { chunk_count, delete_anchor: false }`.
     /// - `Compact` collapses to its single rendered message → `Replace`.
     /// - `FileAttachment` / `RejectOverLimit` are not turn-body relays through
     ///   this controller → `NoOp` (the owner handles those out of band).
@@ -242,6 +253,7 @@ impl OutputPlan {
             }
             LengthPolicyDecision::Split { chunk_count, .. } => OutputPlan::SendNewChunks {
                 chunk_count: *chunk_count,
+                delete_anchor: false,
             },
             LengthPolicyDecision::FileAttachment { .. }
             | LengthPolicyDecision::RejectOverLimit { .. } => OutputPlan::NoOp,
@@ -266,12 +278,30 @@ pub(in crate::services::discord) enum ReplaceDeliveryKind {
     /// The in-place edit failed; the body was delivered via a FRESH send and the
     /// original placeholder is preserved (#2757). `edit_error` (the failing edit's
     /// error) lets the watcher record the legacy `failed(edit_error)` cleanup.
-    FreshFallbackAfterEditFailure { edit_error: String },
+    FreshFallbackAfterEditFailure {
+        edit_error: String,
+        replacement_anchor: Option<MessageId>,
+    },
+}
+
+/// Metadata for a confirmed `SendNewChunks` delivery. Owners use this to mirror
+/// legacy long-terminal side effects after the controller has performed the
+/// transport: durable tail-anchor recording and placeholder-delete cleanup
+/// bookkeeping.
+#[allow(dead_code)] // #3998 S1-d: read by A4/A5 long-chunk cutovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::services::discord) struct NewChunksDelivery {
+    pub(in crate::services::discord) first_message_id: Option<MessageId>,
+    pub(in crate::services::discord) tail_message_id: Option<MessageId>,
+    pub(in crate::services::discord) anchor_delete_error: Option<String>,
 }
 
 /// The three-way committed result of a delivery attempt. The returned outcome
 /// is ALREADY committed (I1): `Delivered` means the lease was committed
-/// `Delivered` and the offset advanced before any post-send await ran.
+/// `Delivered` and the offset advanced before owner post-send finalization ran.
+/// For the opt-in long-chunk anchor-delete arm, the anchor delete is classified
+/// as part of the transport result so the controller mirrors legacy ordering
+/// (chunks, then best-effort anchor delete, then Delivered/NotDelivered commit).
 ///
 /// `Transient` (and its `retry_from_offset`) is part of the contract owners
 /// consume from A2; A1 (no owner wired) has no transient transport
@@ -281,12 +311,14 @@ pub(in crate::services::discord) enum DeliveryOutcome {
     /// Confirmed delivered to Discord; the committed offset advanced to
     /// `committed_to`. `replace_kind` carries HOW a `Replace` plan's body reached
     /// Discord (edit-in-place vs fresh fallback after an edit failure) so an owner
-    /// can mirror the legacy per-variant post-send cleanup (#3089 A4 r2). `None`
-    /// for non-`Replace` plans / `NewSend` / markerless — those owners are
-    /// unaffected and ignore the field.
+    /// can mirror the legacy per-variant post-send cleanup (#3089 A4 r2).
+    /// `new_chunks` carries long-chunk tail-anchor/delete metadata for owners
+    /// that opt into anchor deletion. `None` values are ignored by owners that
+    /// do not need the corresponding side effect.
     Delivered {
         committed_to: u64,
         replace_kind: Option<ReplaceDeliveryKind>,
+        new_chunks: Option<NewChunksDelivery>,
     },
     /// Transport was confirmed, but the owner's identity-gated advance callback
     /// REFUSED to advance the offset (e.g. the inflight turn was cleared /
@@ -446,7 +478,7 @@ pub(in crate::services::discord) type ConfirmedAdvance<'a> =
 ///
 /// `release` is full-identity-gated and valid from BOTH `Leased` (failure) and
 /// `Committed` (success), so dropping the guard after a commit clears ONLY our
-/// own `(holder, turn, [start,end))` marker — a newer turn that re-leased the
+/// own `(holder, key, [start,end))` marker — a newer turn that re-leased the
 /// cell survives, exactly as the legacy guard. `disarm` (via `release_and_disarm`)
 /// is called once an explicit release has run so the Drop cannot double-release
 /// (a second release is a no-op under the identity gate, but disarming keeps the
@@ -454,22 +486,26 @@ pub(in crate::services::discord) type ConfirmedAdvance<'a> =
 struct ControllerLeaseGuard<'a, L: DeliveryLease + ?Sized> {
     lease: &'a L,
     holder: LeaseHolder,
-    turn: TurnKey,
+    key: DeliveryLeaseKey,
     start: u64,
     end: u64,
     armed: bool,
 }
 
 impl<'a, L: DeliveryLease + ?Sized> ControllerLeaseGuard<'a, L> {
-    fn arm(lease: &'a L, holder: LeaseHolder, turn: TurnKey, start: u64, end: u64) -> Self {
+    fn arm(lease: &'a L, holder: LeaseHolder, key: DeliveryLeaseKey, start: u64, end: u64) -> Self {
         Self {
             lease,
             holder,
-            turn,
+            key,
             start,
             end,
             armed: true,
         }
+    }
+
+    fn lease_key(&self) -> DeliveryLeaseKey {
+        self.key.clone()
     }
 
     /// Release now and disarm so the Drop is a no-op. Used by the normal arms so
@@ -479,7 +515,7 @@ impl<'a, L: DeliveryLease + ?Sized> ControllerLeaseGuard<'a, L> {
         if self.armed {
             self.armed = false;
             self.lease
-                .release(self.holder, self.turn, self.start, self.end);
+                .release(self.holder, self.key.clone(), self.start, self.end);
         }
     }
 }
@@ -488,7 +524,7 @@ impl<L: DeliveryLease + ?Sized> Drop for ControllerLeaseGuard<'_, L> {
     fn drop(&mut self) {
         if self.armed {
             self.lease
-                .release(self.holder, self.turn, self.start, self.end);
+                .release(self.holder, self.key.clone(), self.start, self.end);
         }
     }
 }
@@ -518,11 +554,11 @@ impl<L: DeliveryLease + ?Sized> Drop for ControllerLeaseGuard<'_, L> {
 pub(in crate::services::discord) trait PostHeartbeat:
     Send + Sync
 {
-    /// Begin renewing `(holder, turn)`'s lease deadline for the duration of the
+    /// Begin renewing `(holder, key)`'s lease deadline for the duration of the
     /// POST. Returns an opaque guard; dropping it stops the heartbeat (mirrors
     /// `DeliveryLeaseHeartbeat`'s `Drop`/`stop`). Called ONLY on the held-lease
     /// path (a markerless `ProceedMarkerless` send holds no lease to renew).
-    fn start(&self, holder: LeaseHolder, turn: TurnKey) -> Box<dyn PostHeartbeatGuard>;
+    fn start(&self, holder: LeaseHolder, key: DeliveryLeaseKey) -> Box<dyn PostHeartbeatGuard>;
 }
 
 /// RAII guard returned by [`PostHeartbeat::start`]. Dropping it stops the
@@ -541,7 +577,11 @@ pub(in crate::services::discord) struct TurnOutputCtx<
     'a,
     L: DeliveryLease + ?Sized = DeliveryLeaseCell,
 > {
+    #[allow(dead_code)] // Transport/finalizer metadata; lease identity is `lease_key`.
     pub(in crate::services::discord) turn: TurnKey,
+    /// Canonical delivery-lease identity for real lease owners. `None` is reserved
+    /// for transport-only / markerless paths such as [`NoLease`].
+    pub(in crate::services::discord) lease_key: Option<DeliveryLeaseKey>,
     /// Durable relay-owner identity carried for the durable-lease join (Phase
     /// B) and owner-scoped routing at cutover (A2); not read by the A1
     /// skeleton itself.
@@ -607,7 +647,7 @@ where
     let chunk_count = match &ctx.plan {
         OutputPlan::NoOp => return DeliveryOutcome::Skipped,
         OutputPlan::Replace { .. } => 1usize,
-        OutputPlan::SendNewChunks { chunk_count } => *chunk_count,
+        OutputPlan::SendNewChunks { chunk_count, .. } => *chunk_count,
     };
     if ctx.body.is_empty() {
         return DeliveryOutcome::Skipped;
@@ -617,10 +657,14 @@ where
     // A2a: acquire with the shared HOLDER-LIVENESS deadline (15s); the POST
     // heartbeat (below) keeps it fresh — no fixed 60s TTL.
     let deadline_ms = lease_now_ms().saturating_add(TURN_OUTPUT_LEASE_TTL_MS);
-    let lease_held = ctx
-        .lease
-        .try_acquire(ctx.turn, ctx.holder, start, end, deadline_ms);
-    if !lease_held {
+    let held_lease_key = match ctx.lease_key.as_ref() {
+        Some(key) => ctx
+            .lease
+            .try_acquire(key.clone(), ctx.holder, start, end, deadline_ms)
+            .then_some(key),
+        _ => None,
+    };
+    if held_lease_key.is_none() {
         // A2a capability 1: another holder owns this (channel, turn, range).
         match ctx.acquire_failure_mode {
             AcquireFailureMode::Transient => {
@@ -644,19 +688,16 @@ where
     // `release_and_disarm()` so the release ORDERING stays explicit (after the
     // inline commit + post-send finalize, I1) while the Drop is the cancel/panic
     // safety net only.
-    let mut lease_guard =
-        lease_held.then(|| ControllerLeaseGuard::arm(ctx.lease, ctx.holder, ctx.turn, start, end));
+    let mut lease_guard = held_lease_key
+        .map(|key| ControllerLeaseGuard::arm(ctx.lease, ctx.holder, key.clone(), start, end));
 
     // A2a capability 3: while the POST is in flight, keep the (held) lease
     // deadline fresh. Only the held-lease path has a lease to renew; a
     // markerless send holds none. The guard's Drop stops the heartbeat, so an
     // early return / panic in `drive_transport` can never leak the renew task;
     // it is also dropped explicitly BEFORE the inline commit (#3151 ordering).
-    let heartbeat_guard = if lease_held {
-        ctx.heartbeat.map(|hb| hb.start(ctx.holder, ctx.turn))
-    } else {
-        None
-    };
+    let heartbeat_guard =
+        held_lease_key.and_then(|key| ctx.heartbeat.map(|hb| hb.start(ctx.holder, key.clone())));
 
     // ---- send (transport) ------------------------------------------------
     // Any post-send work (placeholder terminal transition, fallback cleanup,
@@ -664,7 +705,10 @@ where
     let transport = drive_transport(gateway, &ctx, chunk_count).await;
 
     match transport {
-        TransportResult::Delivered(replace_kind) => {
+        TransportResult::Delivered {
+            replace_kind,
+            new_chunks,
+        } => {
             // ---- I1: commit + advance INLINE, before any post-send await --
             // Stop the heartbeat FIRST (#3151) so its renew loop cannot race the
             // commit, THEN run the single commit+advance authority. The advance
@@ -682,8 +726,17 @@ where
                 end,
                 lease_guard.as_mut(),
                 replace_kind,
+                new_chunks,
             )
             .await
+        }
+        TransportResult::NotDelivered => {
+            // Long terminal chunk send failed after the rollback-aware sender
+            // reported a clean failure. Legacy A4/A5 commit `NotDelivered` for
+            // this arm (no advance, anchor preserved) rather than leaving the
+            // range ambiguous.
+            drop(heartbeat_guard);
+            commit_not_delivered_and_release(&ctx, start, end, lease_guard.as_mut())
         }
         TransportResult::Transient => {
             // I2: ambiguous-but-retriable. Do NOT commit/advance — release the
@@ -725,7 +778,7 @@ where
 /// the acquire LOST: with no lease there is nothing to commit/release, but the
 /// owner's identity-gated advance still runs (the marker only gated the watcher;
 /// the advance authority was always the identity gate, not the lease). The held
-/// path commits through the same `(holder, turn, range)` the guard owns, then
+/// path commits through the same `(holder, key, range)` the guard owns, then
 /// releases via the guard AFTER `post_send_finalize` (so its Drop stays the
 /// cancel/panic safety net without double-releasing).
 async fn commit_and_finalize<G, L>(
@@ -735,6 +788,7 @@ async fn commit_and_finalize<G, L>(
     end: u64,
     lease_guard: Option<&mut ControllerLeaseGuard<'_, L>>,
     replace_kind: Option<ReplaceDeliveryKind>,
+    new_chunks: Option<NewChunksDelivery>,
 ) -> DeliveryOutcome
 where
     G: TurnGateway + ?Sized,
@@ -751,19 +805,21 @@ where
         None => true,
     };
 
-    // commit() verifies the full (holder, turn, range) identity and records the
+    // commit() verifies the full (holder, key, range) identity and records the
     // outcome. On the advanced arm the committed frontier moves to `end`; on the
     // refused arm we commit `NotDelivered` so the owner's committed-offset
     // reconciliation re-sends (the sink's `advanced == false` arm). On the
     // markerless path there is no lease to commit — the advance bool alone
     // decides the outcome. Runs synchronously here, BEFORE the post-send awaits.
-    if lease_guard.is_some() {
+    if let Some(guard) = lease_guard.as_ref() {
         let outcome = if advanced {
             LeaseOutcome::Delivered
         } else {
             LeaseOutcome::NotDelivered
         };
-        let committed = ctx.lease.commit(ctx.holder, ctx.turn, start, end, outcome);
+        let committed = ctx
+            .lease
+            .commit(ctx.holder, guard.lease_key(), start, end, outcome);
         debug_assert!(committed, "confirmed commit must match the acquired lease");
     }
 
@@ -784,11 +840,45 @@ where
             // plans. The advance refusal drops `replace_kind` on the floor because
             // the body was NOT committed — there is no delivered original to footer.
             replace_kind,
+            new_chunks,
         }
     } else {
         DeliveryOutcome::NotDelivered {
             committed_from: start,
         }
+    }
+}
+
+/// Commit a clean non-delivery result for rollback-aware long-chunk sends. This
+/// mirrors the legacy terminal long-chunk arms: failed send ⇒ commit
+/// `NotDelivered`, do not advance, do not delete the placeholder anchor.
+fn commit_not_delivered_and_release<L>(
+    ctx: &TurnOutputCtx<'_, L>,
+    start: u64,
+    end: u64,
+    lease_guard: Option<&mut ControllerLeaseGuard<'_, L>>,
+) -> DeliveryOutcome
+where
+    L: DeliveryLease + ?Sized,
+{
+    if let Some(guard) = lease_guard.as_ref() {
+        let committed = ctx.lease.commit(
+            ctx.holder,
+            guard.lease_key(),
+            start,
+            end,
+            LeaseOutcome::NotDelivered,
+        );
+        debug_assert!(
+            committed,
+            "confirmed NotDelivered commit must match the acquired lease"
+        );
+    }
+    if let Some(guard) = lease_guard {
+        guard.release_and_disarm();
+    }
+    DeliveryOutcome::NotDelivered {
+        committed_from: start,
     }
 }
 
@@ -802,8 +892,16 @@ enum TransportResult {
     /// Confirmed delivered. `Option<ReplaceDeliveryKind>` carries the replace
     /// identity (edit-in-place vs fresh fallback) for `Replace` plans so the
     /// owner write-back can mirror the legacy per-variant cleanup (#3089 A4 r2);
-    /// `None` for `NewSend` / chunked / NoOp.
-    Delivered(Option<ReplaceDeliveryKind>),
+    /// `None` for `NewSend` / chunked / NoOp. `new_chunks` carries the tail
+    /// chunk + anchor-delete metadata for confirmed long-chunk sends.
+    Delivered {
+        replace_kind: Option<ReplaceDeliveryKind>,
+        new_chunks: Option<NewChunksDelivery>,
+    },
+    /// Clean non-delivery for rollback-aware long-chunk sends. The owner wants a
+    /// committed `NotDelivered` lease result (retryable, no advance), not an
+    /// ambiguous `Unknown`.
+    NotDelivered,
     Transient,
     /// Ambiguous, never advance (I2). `fell_back` (#3089 A5): see
     /// [`DeliveryOutcome::Unknown`] — true only on NoCommitOnFallback fresh-fallback.
@@ -839,11 +937,14 @@ where
         // (there was no original placeholder to edit) → `None`.
         (OutputPlan::Replace { .. }, PlaceholderSlot::None) => {
             match gateway.send_message(ctx.channel_id, ctx.body).await {
-                Ok(_) => TransportResult::Delivered(None),
+                Ok(_) => TransportResult::Delivered {
+                    replace_kind: None,
+                    new_chunks: None,
+                },
                 Err(_) => transient_or_unknown(ctx),
             }
         }
-        (OutputPlan::SendNewChunks { .. }, slot) => {
+        (OutputPlan::SendNewChunks { delete_anchor, .. }, slot) => {
             let anchor = match slot {
                 PlaceholderSlot::Active { message_id, .. } => *message_id,
                 PlaceholderSlot::None => MessageId::new(1),
@@ -857,14 +958,55 @@ where
                 // send — ambiguous — and must NEVER advance (I2, review-fix H1).
                 // `chunk_count` is always >= 1 (exact-or-more contract). Chunked
                 // sends carry no replace identity → `None`.
-                Ok(ids) if ids.len() >= chunk_count => TransportResult::Delivered(None),
+                Ok(ids) if ids.len() >= chunk_count => {
+                    let anchor_delete_error = if *delete_anchor {
+                        delete_active_anchor_after_chunks(gateway, ctx, slot).await
+                    } else {
+                        None
+                    };
+                    TransportResult::Delivered {
+                        replace_kind: None,
+                        new_chunks: Some(NewChunksDelivery {
+                            first_message_id: ids.first().copied(),
+                            tail_message_id: ids.last().copied(),
+                            anchor_delete_error,
+                        }),
+                    }
+                }
                 // Short chunked write: ambiguous, nothing fell back (#3089 A5).
                 Ok(_) => TransportResult::Unknown { fell_back: false },
+                Err(_) if *delete_anchor => TransportResult::NotDelivered,
                 Err(_) => transient_or_unknown(ctx),
             }
         }
-        (OutputPlan::NoOp, _) => TransportResult::Delivered(None),
+        (OutputPlan::NoOp, _) => TransportResult::Delivered {
+            replace_kind: None,
+            new_chunks: None,
+        },
     }
+}
+
+async fn delete_active_anchor_after_chunks<G, L>(
+    gateway: &G,
+    ctx: &TurnOutputCtx<'_, L>,
+    slot: &PlaceholderSlot,
+) -> Option<String>
+where
+    G: TurnGateway + ?Sized,
+    L: DeliveryLease + ?Sized,
+{
+    if let PlaceholderSlot::Active { message_id, .. } = slot {
+        if let Err(error) = gateway.delete_message(ctx.channel_id, *message_id).await {
+            tracing::warn!(
+                channel = ctx.channel_id.get(),
+                message_id = message_id.get(),
+                error = %error,
+                "long chunk delivery succeeded but anchor delete failed; proceeding as delivered"
+            );
+            return Some(error);
+        }
+    }
+    None
 }
 
 /// Map a `replace_message_with_outcome` success into the controller's transport
@@ -895,21 +1037,28 @@ fn classify_replace_outcome(
     match outcome {
         // Edited in place → carry the `EditedOriginal` replace identity so the
         // owner takes its delivered side-effects (footer register, Succeeded).
-        ReplaceLongMessageOutcome::EditedOriginal => {
-            TransportResult::Delivered(Some(ReplaceDeliveryKind::EditedOriginal))
-        }
+        ReplaceLongMessageOutcome::EditedOriginal => TransportResult::Delivered {
+            replace_kind: Some(ReplaceDeliveryKind::EditedOriginal),
+            new_chunks: None,
+        },
         // Owner-specific (H1 r3): the edit failed but a fallback POST carried the
         // body. Honour the owner's `FallbackCommitPolicy` (sink/standby advance;
         // turn_bridge does not). On the committing arm carry the
-        // `FreshFallbackAfterEditFailure { edit_error }` identity (#3089 A4 r2) so
-        // the watcher mirrors the legacy fallback cleanup.
-        ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error } => {
+        // `FreshFallbackAfterEditFailure { edit_error, replacement_anchor }`
+        // identity (#3089 A4 r2 + D1) so the watcher mirrors the legacy fallback
+        // cleanup and recovery can durably bind a stale-anchor fallback POST.
+        ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+            edit_error,
+            replacement_anchor,
+        } => {
             match fallback_commit_policy {
-                FallbackCommitPolicy::CommitOnFallback => TransportResult::Delivered(Some(
-                    ReplaceDeliveryKind::FreshFallbackAfterEditFailure {
+                FallbackCommitPolicy::CommitOnFallback => TransportResult::Delivered {
+                    replace_kind: Some(ReplaceDeliveryKind::FreshFallbackAfterEditFailure {
                         edit_error: edit_error.clone(),
-                    },
-                )),
+                        replacement_anchor: *replacement_anchor,
+                    }),
+                    new_chunks: None,
+                },
                 // #3089 A5: edit FAILED but fallback POST landed the body → no
                 // advance + `fell_back = true` (see `DeliveryOutcome::Unknown`).
                 FallbackCommitPolicy::NoCommitOnFallback => {
@@ -1060,19 +1209,18 @@ mod tests {
     impl DeliveryLease for RecordingLease {
         fn try_acquire(
             &self,
-            turn: TurnKey,
+            key: DeliveryLeaseKey,
             holder: LeaseHolder,
             start: u64,
             end: u64,
             deadline_ms: u64,
         ) -> bool {
-            self.inner
-                .try_acquire(turn, holder, start, end, deadline_ms)
+            self.inner.try_acquire(key, holder, start, end, deadline_ms)
         }
         fn commit(
             &self,
             holder: LeaseHolder,
-            turn: TurnKey,
+            key: DeliveryLeaseKey,
             start: u64,
             end: u64,
             outcome: LeaseOutcome,
@@ -1099,15 +1247,21 @@ mod tests {
                 }
                 LeaseOutcome::Unknown => {}
             }
-            self.inner.commit(holder, turn, start, end, outcome)
+            self.inner.commit(holder, key, start, end, outcome)
         }
-        fn release(&self, holder: LeaseHolder, turn: TurnKey, start: u64, end: u64) -> bool {
+        fn release(
+            &self,
+            holder: LeaseHolder,
+            key: DeliveryLeaseKey,
+            start: u64,
+            end: u64,
+        ) -> bool {
             self.release_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.release(holder, turn, start, end)
+            self.inner.release(holder, key, start, end)
         }
-        fn renew(&self, holder: LeaseHolder, turn: TurnKey, new_deadline_ms: u64) -> bool {
+        fn renew(&self, holder: LeaseHolder, key: DeliveryLeaseKey, new_deadline_ms: u64) -> bool {
             self.renew_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.renew(holder, turn, new_deadline_ms)
+            self.inner.renew(holder, key, new_deadline_ms)
         }
         fn read(&self) -> LeaseSnapshot {
             self.inner.read()
@@ -1116,6 +1270,10 @@ mod tests {
 
     fn turn_key(channel_id: ChannelId) -> TurnKey {
         TurnKey::new(channel_id, 7, 1)
+    }
+
+    fn lease_key(channel_id: ChannelId) -> DeliveryLeaseKey {
+        DeliveryLeaseKey::from_turn_key(turn_key(channel_id))
     }
 
     fn placeholder_key(channel_id: ChannelId, message_id: MessageId) -> PlaceholderKey {
@@ -1210,6 +1368,9 @@ mod tests {
         edit_fails: AtomicBool,
         /// Count of `delete_message` calls (the DeleteIfProvenStale arm).
         delete_calls: AtomicUsize,
+        delete_step: AtomicUsize,
+        committed_at_delete: AtomicBool,
+        delete_fails: AtomicBool,
     }
 
     impl ObservingGateway {
@@ -1229,6 +1390,9 @@ mod tests {
                 replace_outcome: ReplaceLongMessageOutcome::EditedOriginal,
                 edit_fails: AtomicBool::new(false),
                 delete_calls: AtomicUsize::new(0),
+                delete_step: AtomicUsize::new(0),
+                committed_at_delete: AtomicBool::new(false),
+                delete_fails: AtomicBool::new(false),
             }
         }
 
@@ -1267,6 +1431,10 @@ mod tests {
             self.first_commit_step.store(0, Ordering::SeqCst);
             self.first_commit_was_delivered
                 .store(false, Ordering::SeqCst);
+            self.delete_calls.store(0, Ordering::SeqCst);
+            self.delete_step.store(0, Ordering::SeqCst);
+            self.committed_at_delete.store(false, Ordering::SeqCst);
+            self.delete_fails.store(false, Ordering::SeqCst);
         }
 
         fn lease_is_committed_delivered(&self) -> bool {
@@ -1354,7 +1522,15 @@ mod tests {
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.delete_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                self.delete_step
+                    .store(self.clock.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+                self.committed_at_delete
+                    .store(self.lease_is_committed_delivered(), Ordering::SeqCst);
+                if self.delete_fails.load(Ordering::SeqCst) {
+                    Err("fake delete failure".to_string())
+                } else {
+                    Ok(())
+                }
             })
         }
 
@@ -1461,6 +1637,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -1592,6 +1769,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -1778,6 +1956,7 @@ mod tests {
             &gateway,
             TurnOutputCtx {
                 turn,
+                lease_key: Some(DeliveryLeaseKey::from_turn_key(turn)),
                 owner: RelayOwnerKind::SessionBoundRelay,
                 holder: LeaseHolder::Sink,
                 lease: lease.as_ref(),
@@ -1843,7 +2022,7 @@ mod tests {
         // Re-acquirable proof: the cell is genuinely free, not stranded leased.
         assert!(
             lease.try_acquire(
-                turn,
+                DeliveryLeaseKey::from_turn_key(turn),
                 LeaseHolder::Sink,
                 0,
                 body.len() as u64,
@@ -1865,6 +2044,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::None,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -1919,6 +2099,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -1927,7 +2108,10 @@ mod tests {
             placeholder: PlaceholderSlot::None,
             body,
             send_range: (0, body.len() as u64),
-            plan: OutputPlan::SendNewChunks { chunk_count: 3 },
+            plan: OutputPlan::SendNewChunks {
+                chunk_count: 3,
+                delete_anchor: false,
+            },
             edit_fail_policy: EditFailPlaceholderPolicy::PreserveAlways,
             fallback_commit_policy: FallbackCommitPolicy::CommitOnFallback,
             acquire_failure_mode: AcquireFailureMode::Transient,
@@ -1968,6 +2152,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -1976,7 +2161,10 @@ mod tests {
             placeholder: PlaceholderSlot::None,
             body,
             send_range: (0, body.len() as u64),
-            plan: OutputPlan::SendNewChunks { chunk_count: 1 },
+            plan: OutputPlan::SendNewChunks {
+                chunk_count: 1,
+                delete_anchor: false,
+            },
             edit_fail_policy: EditFailPlaceholderPolicy::PreserveAlways,
             fallback_commit_policy: FallbackCommitPolicy::CommitOnFallback,
             acquire_failure_mode: AcquireFailureMode::Transient,
@@ -2003,6 +2191,184 @@ mod tests {
             matches!(lease.read(), LeaseSnapshot::Unleased),
             "delivered split must release the lease"
         );
+    }
+
+    #[tokio::test]
+    async fn split_anchor_delete_runs_after_full_chunk_send_before_commit() {
+        let channel = ChannelId::new(112);
+        let lease = Arc::new(RecordingLease::new(channel));
+        let gateway =
+            ObservingGateway::new(lease.clone() as Arc<dyn DeliveryLease + Send + Sync>, true);
+        let controller = PlaceholderController::default();
+        let placeholder_msg = MessageId::new(4242);
+
+        let outcome = deliver_turn_output(
+            &gateway,
+            TurnOutputCtx {
+                turn: turn_key(channel),
+                lease_key: Some(lease_key(channel)),
+                owner: RelayOwnerKind::Watcher,
+                holder: LeaseHolder::Sink,
+                lease: lease.as_ref(),
+                channel_id: channel,
+                placeholder_controller: &controller,
+                placeholder: PlaceholderSlot::Active {
+                    message_id: placeholder_msg,
+                    key: placeholder_key(channel, placeholder_msg),
+                },
+                body: "single chunk body",
+                send_range: (0, 17),
+                plan: OutputPlan::SendNewChunks {
+                    chunk_count: 1,
+                    delete_anchor: true,
+                },
+                edit_fail_policy: EditFailPlaceholderPolicy::PreserveAlways,
+                fallback_commit_policy: FallbackCommitPolicy::CommitOnFallback,
+                acquire_failure_mode: AcquireFailureMode::Transient,
+                advance: None,
+                heartbeat: None,
+            },
+        )
+        .await;
+
+        match outcome {
+            DeliveryOutcome::Delivered {
+                committed_to,
+                new_chunks: Some(chunks),
+                ..
+            } => {
+                assert_eq!(committed_to, 17);
+                assert_eq!(chunks.first_message_id, Some(MessageId::new(42)));
+                assert_eq!(chunks.tail_message_id, Some(MessageId::new(42)));
+                assert_eq!(chunks.anchor_delete_error, None);
+            }
+            other => panic!(
+                "expected Delivered with chunk metadata, got {}",
+                debug_outcome(&other)
+            ),
+        }
+        assert_eq!(gateway.delete_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            gateway.send_step.load(Ordering::SeqCst) < gateway.delete_step.load(Ordering::SeqCst),
+            "anchor delete must run after the chunk send"
+        );
+        assert!(
+            !gateway.committed_at_delete.load(Ordering::SeqCst),
+            "legacy long-chunk ordering deletes the anchor before the Delivered commit"
+        );
+        assert_eq!(lease.delivered_commit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn split_anchor_delete_failure_still_delivers() {
+        let channel = ChannelId::new(113);
+        let lease = Arc::new(RecordingLease::new(channel));
+        let gateway =
+            ObservingGateway::new(lease.clone() as Arc<dyn DeliveryLease + Send + Sync>, true);
+        gateway.delete_fails.store(true, Ordering::SeqCst);
+        let controller = PlaceholderController::default();
+        let placeholder_msg = MessageId::new(4343);
+
+        let outcome = deliver_turn_output(
+            &gateway,
+            TurnOutputCtx {
+                turn: turn_key(channel),
+                lease_key: Some(lease_key(channel)),
+                owner: RelayOwnerKind::Watcher,
+                holder: LeaseHolder::Sink,
+                lease: lease.as_ref(),
+                channel_id: channel,
+                placeholder_controller: &controller,
+                placeholder: PlaceholderSlot::Active {
+                    message_id: placeholder_msg,
+                    key: placeholder_key(channel, placeholder_msg),
+                },
+                body: "single chunk body",
+                send_range: (0, 17),
+                plan: OutputPlan::SendNewChunks {
+                    chunk_count: 1,
+                    delete_anchor: true,
+                },
+                edit_fail_policy: EditFailPlaceholderPolicy::PreserveAlways,
+                fallback_commit_policy: FallbackCommitPolicy::CommitOnFallback,
+                acquire_failure_mode: AcquireFailureMode::Transient,
+                advance: None,
+                heartbeat: None,
+            },
+        )
+        .await;
+
+        match outcome {
+            DeliveryOutcome::Delivered {
+                new_chunks: Some(chunks),
+                ..
+            } => {
+                assert_eq!(chunks.first_message_id, Some(MessageId::new(42)));
+                assert_eq!(chunks.tail_message_id, Some(MessageId::new(42)));
+                assert_eq!(
+                    chunks.anchor_delete_error.as_deref(),
+                    Some("fake delete failure")
+                );
+            }
+            other => panic!(
+                "delete failure must not un-deliver, got {}",
+                debug_outcome(&other)
+            ),
+        }
+        assert_eq!(gateway.delete_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.delivered_commit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn split_anchor_send_failure_commits_not_delivered_without_delete() {
+        let channel = ChannelId::new(114);
+        let lease = Arc::new(RecordingLease::new(channel));
+        let gateway =
+            ObservingGateway::new(lease.clone() as Arc<dyn DeliveryLease + Send + Sync>, false);
+        let controller = PlaceholderController::default();
+        let placeholder_msg = MessageId::new(4444);
+
+        let outcome = deliver_turn_output(
+            &gateway,
+            TurnOutputCtx {
+                turn: turn_key(channel),
+                lease_key: Some(lease_key(channel)),
+                owner: RelayOwnerKind::Watcher,
+                holder: LeaseHolder::Sink,
+                lease: lease.as_ref(),
+                channel_id: channel,
+                placeholder_controller: &controller,
+                placeholder: PlaceholderSlot::Active {
+                    message_id: placeholder_msg,
+                    key: placeholder_key(channel, placeholder_msg),
+                },
+                body: "single chunk body",
+                send_range: (0, 17),
+                plan: OutputPlan::SendNewChunks {
+                    chunk_count: 1,
+                    delete_anchor: true,
+                },
+                edit_fail_policy: EditFailPlaceholderPolicy::PreserveAlways,
+                fallback_commit_policy: FallbackCommitPolicy::CommitOnFallback,
+                acquire_failure_mode: AcquireFailureMode::Transient,
+                advance: None,
+                heartbeat: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::NotDelivered { committed_from: 0 }),
+            "rollback-aware long-chunk send failure commits NotDelivered"
+        );
+        assert_eq!(
+            gateway.delete_calls.load(Ordering::SeqCst),
+            0,
+            "failed chunk sends must preserve the anchor"
+        );
+        assert_eq!(lease.not_delivered_commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.delivered_commit_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(lease.read(), LeaseSnapshot::Unleased));
     }
 
     /// H2 — a `ReplaceLongMessageOutcome::PartialContinuationFailure` is a
@@ -2039,6 +2405,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2098,6 +2465,7 @@ mod tests {
             ObservingGateway::new(lease.clone() as Arc<dyn DeliveryLease + Send + Sync>, true)
                 .with_replace_outcome(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                     edit_error: "edit 500, fallback POST succeeded".to_string(),
+                    replacement_anchor: None,
                 });
         let controller = PlaceholderController::default();
         prime_active(&controller, &gateway, key.clone()).await;
@@ -2105,6 +2473,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2170,6 +2539,7 @@ mod tests {
             ObservingGateway::new(lease.clone() as Arc<dyn DeliveryLease + Send + Sync>, true)
                 .with_replace_outcome(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                     edit_error: "edit 500, fallback POST succeeded".to_string(),
+                    replacement_anchor: None,
                 });
         let controller = PlaceholderController::default();
         // Prime Active so a wrongful commit would expose itself via the
@@ -2179,6 +2549,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             // turn_bridge is the watcher-owned terminal-delivery path.
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Watcher { instance_id: 1 },
@@ -2257,6 +2628,7 @@ mod tests {
             let body = "turn_bridge short-replace body (NoCommitOnFallback)";
             let ctx = TurnOutputCtx {
                 turn: turn_key(channel),
+                lease_key: Some(lease_key(channel)),
                 owner: RelayOwnerKind::None,
                 holder: LeaseHolder::Bridge,
                 lease: lease.as_ref(),
@@ -2288,6 +2660,7 @@ mod tests {
             55551,
             ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "edit 500; fallback POST succeeded".to_string(),
+                replacement_anchor: None,
             },
         )
         .await;
@@ -2352,6 +2725,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Watcher { instance_id: 1 },
             lease: lease.as_ref(),
@@ -2411,6 +2785,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2526,7 +2901,7 @@ mod tests {
     }
 
     impl PostHeartbeat for RecordingHeartbeat {
-        fn start(&self, holder: LeaseHolder, turn: TurnKey) -> Box<dyn PostHeartbeatGuard> {
+        fn start(&self, holder: LeaseHolder, key: DeliveryLeaseKey) -> Box<dyn PostHeartbeatGuard> {
             self.started.fetch_add(1, Ordering::SeqCst);
             *self.started_holder.lock().unwrap() = Some(holder);
             // Fire the renew loop's ticks now: each pushes the deadline forward,
@@ -2534,7 +2909,7 @@ mod tests {
             let mut last = 0u64;
             for i in 1..=self.ticks {
                 last = lease_now_ms().saturating_add(DELIVERY_LEASE_DEADLINE_MS) + i;
-                let renewed = self.lease.renew(holder, turn, last);
+                let renewed = self.lease.renew(holder, key.clone(), last);
                 assert!(
                     renewed,
                     "A2a heartbeat: renew must succeed against the live lease the \
@@ -2553,7 +2928,7 @@ mod tests {
     /// `try_acquire` LOSES — the precondition for both acquire-failure-mode
     /// tests. Returns the foreign holder/turn/range that owns the cell.
     fn occupy_lease_with_foreign_holder(lease: &RecordingLease, channel: ChannelId) {
-        let foreign_turn = TurnKey::new(channel, 99, 1);
+        let foreign_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(channel, 99, 1));
         let ok = lease.try_acquire(
             foreign_turn,
             LeaseHolder::Watcher { instance_id: 7 },
@@ -2583,6 +2958,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2665,6 +3041,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::Watcher,
             holder: LeaseHolder::Watcher { instance_id: 1 },
             lease: lease.as_ref(),
@@ -2734,6 +3111,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2815,6 +3193,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2883,6 +3262,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -2946,6 +3326,7 @@ mod tests {
 
         let ctx = TurnOutputCtx {
             turn: turn_key(channel),
+            lease_key: Some(lease_key(channel)),
             owner: RelayOwnerKind::SessionBoundRelay,
             holder: LeaseHolder::Sink,
             lease: lease.as_ref(),
@@ -3056,7 +3437,10 @@ mod tests {
         };
         assert!(matches!(
             OutputPlan::from_length_decision(&split, PlaceholderLifecycle::Completed),
-            OutputPlan::SendNewChunks { chunk_count: 3 }
+            OutputPlan::SendNewChunks {
+                chunk_count: 3,
+                delete_anchor: false
+            }
         ));
 
         let reject = LengthPolicyDecision::RejectOverLimit {

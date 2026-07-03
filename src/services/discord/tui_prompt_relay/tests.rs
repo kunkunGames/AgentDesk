@@ -1254,6 +1254,45 @@ fn local_only_slash_prompt_preserves_loop_wakeup_lifecycle() {
     }
 }
 
+#[test]
+fn command_message_skill_wakeup_preserves_assistant_relay_lifecycle() {
+    let wakeup = "<command-message>agentdesk-issue-pipeline</command-message>\n\
+                  <command-args>issue 4041 --continue autonomous pipeline</command-args>";
+
+    assert_eq!(
+        classify_injected_prompt(wakeup),
+        InjectedPromptClass::SlashCommandControl,
+        "machine command-message wakeups should hide the raw echo without becoming human text",
+    );
+    assert_eq!(
+        slash_command_control_kind(wakeup),
+        "agentdesk-issue-pipeline",
+        "command-message-only wakeups need a stable non-fallback kind for lifecycle dedupe",
+    );
+
+    let decision = relay_observed_prompt_injected_prompt_decision(wakeup);
+    assert_eq!(
+        decision.injected_class,
+        InjectedPromptClass::SlashCommandControl,
+    );
+    assert_eq!(
+        decision.slash_command_kind.as_deref(),
+        Some("agentdesk-issue-pipeline"),
+    );
+    assert!(
+        !decision.local_only_slash,
+        "a skill wakeup starts a model turn and must not take the local-only echo path",
+    );
+    assert!(
+        !decision.injected_class.suppresses_user_turn_lifecycle(),
+        "wakeup turns still need anchor/reaction/synthetic ownership",
+    );
+    assert!(
+        decision.injected_class.still_delivers_assistant_output(),
+        "wakeup assistant prose must stay relayable even when the injected echo is sanitized",
+    );
+}
+
 // #3305: non-command text, the system-continuation banner, task notifications,
 // a token-boundary near-miss, and an UNLISTED command must all be rejected so
 // the local-only skip never fires for a real turn (fail-safe = lifecycle kept).
@@ -1743,6 +1782,18 @@ fn slash_command_control_kind_distinguishes_distinct_unknown_commands() {
         slash_command_control_kind(foo),
         slash_command_control_kind(bar),
         "distinct unknown commands must NOT collapse to one kind"
+    );
+
+    let skill = "<command-message>agentdesk-issue-pipeline</command-message>\n\
+                 <command-args>issue 4041</command-args>";
+    assert_eq!(
+        slash_command_control_kind(skill),
+        "agentdesk-issue-pipeline"
+    );
+    assert_ne!(
+        slash_command_control_kind(skill),
+        slash_command_control_kind("<local-command-caveat>x</local-command-caveat>"),
+        "a local-only caveat fallback must not consume a command-message wakeup dedupe key",
     );
 }
 
@@ -2581,11 +2632,9 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
     );
 }
 
-// #3089 A6b r2 [High]: the codex external-input bridge frame builder moved to
-// `tui_prompt_relay_controller_cutover::codex_external_input_bridge_stream_messages`
-// (flag-gated `OutputOffset` plumbing). Its OFF (`[Text, Done]`, byte-identical
-// legacy) and ON (`[Text, OutputOffset, Done]`, reaches the controller) shapes are
-// pinned in that sibling's test module under the shared env lock.
+// #3089 A6b r2 [High]/#3998 S1-f2: the codex external-input bridge frame
+// builder emits `OutputOffset` so the bridge has a real ordered range for the
+// unconditional A5 controller route.
 
 // ====================================================================
 // #3256: stream-through of operator external-input prose. These tests pin

@@ -1,7 +1,7 @@
 //! #3089 A6a: route the recovery engine's anchored short-replace delivery
-//! through the unified turn-output controller (`deliver_turn_output`), behind a
-//! flag (default OFF). This is an A3-clone — recovery's anchored relay, like
-//! standby, is TRANSPORT-ONLY: it never held a `DeliveryLeaseCell`, never
+//! through the unified turn-output controller (`deliver_turn_output`). This is an
+//! A3-clone — recovery's anchored relay, like standby, is TRANSPORT-ONLY: it never
+//! held a `DeliveryLeaseCell`, never
 //! advanced an offset, and ran no heartbeat — so the controller is driven with
 //! [`toc::NoLease`] (acquire always fails → `ProceedMarkerless`: no lease held,
 //! `heartbeat = None`) and `advance = None` (no offset authority → the confirmed
@@ -51,52 +51,25 @@
 //! left untouched. #3016/#3419 (inflight finalizer reregister) and #3418 D1
 //! (`recovery_text.rs`) are not delivery surfaces and are untouched.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
-
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId};
+use std::sync::Arc;
 
 use super::super::SharedData;
 use super::super::gateway::TurnGateway;
 use super::super::inflight::RelayOwnerKind;
 use super::super::outbound::turn_output_controller as toc;
 use super::super::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
+use super::super::recovery_engine::RecoveryDeliveryContext;
 use super::restart::probe_channel_liveness;
 use super::shared::{RecoveryRelayOutcome, escalate_transient_relay_outcome_with_probe};
 use crate::services::provider::ProviderKind;
 
-/// #3089 A6a: flag gating ONLY the recovery anchored short-replace branch onto
-/// the turn-output controller (`deliver_turn_output`). Default OFF → the legacy
-/// `formatting::replace_long_message_raw` path runs byte-identically (including
-/// the #3297 probe escalation); ON → that branch routes through the controller
-/// as a transport-only `ProceedMarkerless` delivery (recovery holds no lease,
-/// advances no offset, runs no heartbeat — see [`toc::NoLease`]). OnceLock+env,
-/// mirroring `standby_relay_controller_enabled`. The `None` (TUI-direct
-/// fresh-send) branch stays legacy.
-pub(in crate::services::discord) fn recovery_relay_controller_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let on = std::env::var("AGENTDESK_RECOVERY_RELAY_CONTROLLER")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .is_some_and(|v| v == "1" || v == "true");
-        // Telemetry ONLY when ENABLED — the default-OFF first evaluation must
-        // have NO observable side effect (byte-identical / deploy no-op),
-        // matching the A3 standby cutover.
-        if on {
-            tracing::info!("  ✓ recovery_relay_controller: enabled");
-        }
-        on
-    })
-}
-
 /// #3089 A6a: pure short-replace cut-over decision. Routes the recovery anchored
-/// short-replace branch onto the unified controller IFF the flag is ON **and**
-/// an anchored placeholder exists **and** the body is non-empty.
+/// short-replace branch onto the unified controller IFF an anchored placeholder
+/// exists **and** the body is non-empty.
 ///
 /// Each exclusion is LOAD-BEARING (a controller divergence the gate guards):
-/// - `enabled` OFF → byte-identical legacy (deploy no-op).
 /// - `has_placeholder` false (`placeholder == None`) → the legacy `None` arm
 ///   sends a NEW message via `send_long_message_raw`; the controller's
 ///   `Replace { Active }` plan edits the anchor `MessageId` in place. With no
@@ -109,11 +82,10 @@ pub(in crate::services::discord) fn recovery_relay_controller_enabled() -> bool 
 ///   non-delivered. Dropping this half would flip an empty body
 ///   `Delivered → TransientFailure`. Pinned by the truth-table test.
 pub(in crate::services::discord) fn recovery_short_replace_should_cutover(
-    enabled: bool,
     has_placeholder: bool,
     body: &str,
 ) -> bool {
-    enabled && has_placeholder && !body.is_empty()
+    has_placeholder && !body.is_empty()
 }
 
 /// #3089 A6a: deliver the recovered terminal text via the unified controller,
@@ -151,6 +123,7 @@ pub(in crate::services::discord) async fn deliver_recovery_replace_via_controlle
     channel_id: ChannelId,
     placeholder: MessageId,
     body: &str,
+    recovery_context: Option<&RecoveryDeliveryContext>,
 ) -> RecoveryRelayOutcome
 where
     G: TurnGateway + ?Sized,
@@ -162,6 +135,7 @@ where
         channel_id,
         placeholder,
         body,
+        recovery_context,
         || probe_channel_liveness(http, channel_id),
     )
     .await;
@@ -198,6 +172,7 @@ async fn deliver_recovery_replace_via_controller_with_probe<G, F, Fut>(
     channel_id: ChannelId,
     placeholder: MessageId,
     body: &str,
+    recovery_context: Option<&RecoveryDeliveryContext>,
     probe: F,
 ) -> RecoveryRelayOutcome
 where
@@ -219,6 +194,7 @@ where
         gateway,
         toc::TurnOutputCtx {
             turn,
+            lease_key: None,
             // No `Recovery` owner variant exists and the enum lives in a frozen
             // baseline; `StandbyRelay` is cosmetic on the markerless path (no
             // owner-scoped routing fires), so it is reused as the closest
@@ -265,6 +241,25 @@ where
         // controller ran the (no-op markerless) commit; legacy returned `Ok(())`
         // → `Delivered` for both. `fell_back` is ignored — CommitOnFallback never
         // yields `Unknown { fell_back: true }`.
+        toc::DeliveryOutcome::Delivered {
+            replace_kind:
+                Some(toc::ReplaceDeliveryKind::FreshFallbackAfterEditFailure {
+                    replacement_anchor: Some(anchor),
+                    ..
+                }),
+            ..
+        } => {
+            if let Some(context) = recovery_context {
+                context.record_successful_fresh_send(anchor, body);
+            } else {
+                tracing::warn!(
+                    channel_id = channel_id.get(),
+                    anchor_msg_id = anchor.get(),
+                    "recovery controller delivery fell back to fresh send without D1 context; replacement anchor not recorded"
+                );
+            }
+            RecoveryRelayOutcome::Delivered
+        }
         toc::DeliveryOutcome::Delivered { .. } => RecoveryRelayOutcome::Delivered,
         // Anything else (`Unknown` from PartialContinuation/transport Err, or the
         // dormant `Transient`/`NotDelivered`/`Skipped`) is the legacy `Err` arm:
@@ -286,7 +281,9 @@ mod tests {
     use super::*;
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::gateway::{GatewayFuture, TurnGateway};
+    use crate::services::discord::inflight;
     use crate::services::discord::make_shared_data_for_tests;
+    use crate::services::discord::outbound::delivery_frontier_probe;
     use crate::services::discord::recovery_paths::shared::ChannelProbeVerdict;
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::{ChannelId, MessageId};
@@ -296,16 +293,13 @@ mod tests {
 
     #[test]
     fn should_cutover_truth_table() {
-        // (false, *, *) → false (flag OFF defers, byte-identical legacy).
-        assert!(!recovery_short_replace_should_cutover(false, true, "x"));
-        assert!(!recovery_short_replace_should_cutover(false, false, ""));
-        // (true, false, _) → false: None defers to the legacy fresh-send branch.
-        assert!(!recovery_short_replace_should_cutover(true, false, "x"));
-        // (true, true, "") → false: empty body defers (legacy zero-chunk →
+        // (false, _) → false: None defers to the legacy fresh-send branch.
+        assert!(!recovery_short_replace_should_cutover(false, "x"));
+        // (true, "") → false: empty body defers (legacy zero-chunk →
         // EditedOriginal → Delivered; controller → Skipped → not delivered).
-        assert!(!recovery_short_replace_should_cutover(true, true, ""));
-        // (true, true, "x") → true: the cutover row.
-        assert!(recovery_short_replace_should_cutover(true, true, "x"));
+        assert!(!recovery_short_replace_should_cutover(true, ""));
+        // (true, "x") → true: the cutover row.
+        assert!(recovery_short_replace_should_cutover(true, "x"));
     }
 
     #[test]
@@ -314,14 +308,14 @@ mod tests {
         // dropping `!body.is_empty()` flips the empty row; both true→false
         // under their respective mutations.
         assert!(
-            !recovery_short_replace_should_cutover(true, false, "x"),
+            !recovery_short_replace_should_cutover(false, "x"),
             "has_placeholder is load-bearing: None must defer"
         );
         assert!(
-            !recovery_short_replace_should_cutover(true, true, ""),
+            !recovery_short_replace_should_cutover(true, ""),
             "!body.is_empty() is load-bearing: empty must defer"
         );
-        assert!(recovery_short_replace_should_cutover(true, true, "x"));
+        assert!(recovery_short_replace_should_cutover(true, "x"));
     }
 
     // ---- controller adapter (fake gateway driving the REAL controller) --
@@ -446,6 +440,15 @@ mod tests {
         ok: bool,
         probe: ChannelProbeVerdict,
     ) -> (RecoveryRelayOutcome, usize, usize) {
+        run_with_context(outcome, ok, probe, None)
+    }
+
+    fn run_with_context(
+        outcome: ReplaceLongMessageOutcome,
+        ok: bool,
+        probe: ChannelProbeVerdict,
+        recovery_context: Option<&RecoveryDeliveryContext>,
+    ) -> (RecoveryRelayOutcome, usize, usize) {
         let shared = make_shared_data_for_tests();
         let provider = ProviderKind::Claude;
         let channel = ChannelId::new(9_061);
@@ -458,6 +461,7 @@ mod tests {
                 channel,
                 MessageId::new(77),
                 "answer",
+                recovery_context,
                 || async move { probe },
             ));
         (
@@ -491,6 +495,7 @@ mod tests {
         let (outcome, replace_calls, delete_calls) = run(
             ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "edit failed".to_string(),
+                replacement_anchor: None,
             },
             true,
             // Probe verdict is irrelevant on the Delivered arm; supply Gone to
@@ -550,22 +555,109 @@ mod tests {
         assert_eq!(replace_calls, 1, "the single POST was attempted and failed");
     }
 
+    struct EnvReset(Option<std::ffi::OsString>);
+
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    fn set_runtime_root() -> (tempfile::TempDir, EnvReset) {
+        let reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        (temp, reset)
+    }
+
+    fn write_generation_marker(tmux_session_name: &str) {
+        let path = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).expect("generation parent");
+        }
+        std::fs::write(path, "1").expect("generation marker");
+    }
+
+    fn state(provider: ProviderKind, channel_id: u64) -> inflight::InflightTurnState {
+        let mut state = inflight::InflightTurnState::new(
+            provider,
+            channel_id,
+            Some("adk-test".to_string()),
+            343_742_347_365_974_026,
+            0,
+            77_009,
+            "recover this".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-codex-adk-test".to_string()),
+            Some("/tmp/recovery-controller-idempotent.jsonl".to_string()),
+            None,
+            128,
+        );
+        state.turn_start_offset = Some(128);
+        state.save_generation = 9;
+        state.full_response = "answer".to_string();
+        state
+    }
+
     #[test]
-    fn flag_off_predicate_defers_no_side_effect() {
-        // Predicate OFF → the production gate never calls the controller adapter,
-        // so the legacy path runs with no telemetry side-effect.
-        assert!(!recovery_short_replace_should_cutover(false, true, "x"));
-        // Default OFF when the env var is unset (deploy no-op). Only assert when
-        // truly unset, since `OnceLock` caches the first observation and the
-        // flag-ON gate run sets `AGENTDESK_RECOVERY_RELAY_CONTROLLER=1`.
+    fn controller_fallback_records_replacement_anchor() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if std::env::var_os("AGENTDESK_RECOVERY_RELAY_CONTROLLER").is_none() {
-            assert!(
-                !recovery_relay_controller_enabled(),
-                "flag defaults OFF (deploy no-op / byte-identical legacy)"
-            );
-        }
+        let (_temp, _reset) = set_runtime_root();
+        let provider = ProviderKind::Codex;
+        let state = state(provider.clone(), 44_009);
+        let tmux = state.tmux_session_name.as_deref().unwrap();
+        write_generation_marker(tmux);
+        inflight::save_inflight_state(&state).expect("save inflight");
+        let shared = make_shared_data_for_tests();
+        let context = RecoveryDeliveryContext::from_state(
+            &provider,
+            &state,
+            Some((128, 256)),
+            shared.restart.current_generation,
+        );
+        let gateway = RecoveryFakeGateway::new(
+            ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+                edit_error: "404 stale anchor".to_string(),
+                replacement_anchor: Some(MessageId::new(88_009)),
+            },
+            true,
+        );
+
+        let outcome =
+            futures::executor::block_on(deliver_recovery_replace_via_controller_with_probe(
+                &gateway,
+                &shared,
+                &provider,
+                ChannelId::new(state.channel_id),
+                MessageId::new(state.current_msg_id),
+                "answer",
+                Some(&context),
+                || async move { ChannelProbeVerdict::Gone },
+            ));
+
+        assert_eq!(outcome, RecoveryRelayOutcome::Delivered);
+        assert_eq!(gateway.replace_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gateway.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            inflight::load_inflight_state(&provider, state.channel_id)
+                .expect("inflight row")
+                .current_msg_id,
+            88_009,
+            "controller fallback replacement should become the next anchored-edit target"
+        );
+        let anchor = delivery_frontier_probe::current_generation_delivered_anchor(
+            &provider,
+            ChannelId::new(state.delivery_record_owner_channel_id()),
+            tmux,
+        )
+        .expect("replacement durable anchor");
+        assert_eq!(anchor.panel_msg_id, 88_009);
+        assert_eq!(anchor.panel_channel_id, state.channel_id);
+        assert_eq!(anchor.range, (128, 256));
     }
 }

@@ -7,6 +7,7 @@ mod answer_flush_barrier;
 // recovery) subsystem extracted verbatim to its own sibling module.
 mod catch_up;
 mod commands;
+mod delivery_lease_key;
 mod destructive_cancel_gate;
 mod discord_io;
 mod dispatch_policy;
@@ -110,7 +111,6 @@ mod tui_busy_gate;
 mod tui_direct_abort_marker;
 mod tui_direct_pending_start;
 mod tui_prompt_relay;
-pub(super) mod tui_prompt_relay_controller_cutover; // #3089 A6b: see module doc (closes #3088)
 mod tui_task_card;
 mod turn_bridge;
 mod turn_finalizer;
@@ -124,6 +124,7 @@ mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
 
+pub(in crate::services::discord) use delivery_lease_key::DeliveryLeaseKey;
 pub(crate) use meeting_orchestrator as meeting;
 // #3479 item-2: re-export the catch-up subsystem entry points referenced
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
@@ -1428,9 +1429,11 @@ impl TmuxRelayCoord {
 // tagged with this issue/phase, to be wired/removed by the follow-up phases.
 //
 // Design (faithful to #3041 §2-§3):
-//   lease = (channel_id, turn_identity: TurnKey, byte_range [start,end))
+//   lease = (delivery_lease_key, byte_range [start,end))
 //           → a "one-time terminal-delivery right".
-//   The turn identity reuses `TurnKey` from `turn_finalizer.rs` (no new key).
+//   The lease key is deliberately separate from the finalizer's `TurnKey`: the
+//   finalizer keeps its id-0 channel-collapse semantics, while delivery leasing
+//   needs id-0 turns disambiguated by their inflight start identity.
 //   State machine:
 //     Unleased --(CAS acquire)--> Leased{holder, deadline, range}
 //               --(commit)-------> Committed{Delivered|NotDelivered|Unknown}
@@ -1485,27 +1488,27 @@ pub(in crate::services::discord) enum LeaseOutcome {
 enum LeaseState {
     /// No holder; the lease is available to acquire.
     Unleased,
-    /// Held by `holder` for turn identity `turn` until `deadline` (monotonic ms
+    /// Held by `holder` for delivery identity `key` until `deadline` (monotonic ms
     /// since process start); covers the half-open byte range `[start, end)`.
-    /// The lease key is the FULL `(channel_id, turn, [start,end))` identity
+    /// The lease key is the FULL `(DeliveryLeaseKey, [start,end))` identity
     /// (#3041 §2): `commit`/`release` verify it so a stale commit or release
     /// from an OLDER turn (or the same turn with a different range) cannot act
     /// on a reacquired NEWER lease. `reclaim_if_expired` is intentionally
     /// deadline-only (identity-agnostic) — it force-returns an expired lease
-    /// regardless of holder/turn so a dead holder cannot strand the cell.
+    /// regardless of holder/key so a dead holder cannot strand the cell.
     Leased {
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         deadline_ms: u64,
         start: u64,
         end: u64,
     },
-    /// Committed with a three-way outcome; carries the same `(holder, turn,
+    /// Committed with a three-way outcome; carries the same `(holder, key,
     /// range)` identity forward so a stale release is rejected. Awaits a
     /// `release` to return to `Unleased`.
     Committed {
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
         outcome: LeaseOutcome,
@@ -1569,14 +1572,14 @@ pub(in crate::services::discord) enum LeaseSnapshot {
     Unleased,
     Leased {
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         deadline_ms: u64,
         start: u64,
         end: u64,
     },
     Committed {
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
         outcome: LeaseOutcome,
@@ -1585,8 +1588,8 @@ pub(in crate::services::discord) enum LeaseSnapshot {
 
 #[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
 impl DeliveryLeaseCell {
-    /// Construct a fresh `Unleased` cell for `channel_id`. The turn identity
-    /// (`TurnKey`) and byte range are supplied per-acquire, not at
+    /// Construct a fresh `Unleased` cell for `channel_id`. The lease key and
+    /// byte range are supplied per-acquire, not at
     /// construction, so one cell serves the channel across sequential turns.
     pub(in crate::services::discord) fn new(channel_id: ChannelId) -> Self {
         Self {
@@ -1618,26 +1621,26 @@ impl DeliveryLeaseCell {
             LeaseState::Unleased => LeaseSnapshot::Unleased,
             LeaseState::Leased {
                 holder,
-                turn,
+                key,
                 deadline_ms,
                 start,
                 end,
             } => LeaseSnapshot::Leased {
                 holder: *holder,
-                turn: *turn,
+                key: key.clone(),
                 deadline_ms: *deadline_ms,
                 start: *start,
                 end: *end,
             },
             LeaseState::Committed {
                 holder,
-                turn,
+                key,
                 start,
                 end,
                 outcome,
             } => LeaseSnapshot::Committed {
                 holder: *holder,
-                turn: *turn,
+                key: key.clone(),
                 start: *start,
                 end: *end,
                 outcome: *outcome,
@@ -1645,9 +1648,9 @@ impl DeliveryLeaseCell {
         }
     }
 
-    /// CAS-acquire the lease for the full `(channel, turn, [start,end))`
+    /// CAS-acquire the lease for the full `(delivery_lease_key, [start,end))`
     /// identity (#3041 §2) on behalf of `holder` until `deadline_ms`. Records
-    /// `turn` so a later `commit`/`release` carrying a STALE older turn key is
+    /// `key` so a later `commit`/`release` carrying a STALE older lease key is
     /// rejected (the §2 hazard: a reclaim+reacquire reuses the same holder kind,
     /// so holder alone is insufficient).
     ///
@@ -1659,7 +1662,7 @@ impl DeliveryLeaseCell {
     /// tag under the lock and returns `false` without mutating the payload.
     pub(in crate::services::discord) fn try_acquire(
         &self,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         holder: LeaseHolder,
         start: u64,
         end: u64,
@@ -1687,7 +1690,7 @@ impl DeliveryLeaseCell {
         }
         *guard = LeaseState::Leased {
             holder,
-            turn,
+            key,
             deadline_ms,
             start,
             end,
@@ -1695,9 +1698,9 @@ impl DeliveryLeaseCell {
         true
     }
 
-    /// Commit the lease three-way (#3041 §3). Verifies the FULL `(holder, turn,
+    /// Commit the lease three-way (#3041 §3). Verifies the FULL `(holder, key,
     /// [start,end))` identity against the currently-`Leased` lease (#3041 §2):
-    /// any mismatch — wrong holder, a STALE older `turn`, or a different range
+    /// any mismatch — wrong holder, a STALE older lease key, or a different range
     /// — or a non-`Leased` state is a no-op that returns `false`. This closes
     /// the §2 hazard where a stale commit from an older turn could act on a
     /// reacquired same-channel/same-holder-kind lease. On success the tag
@@ -1706,7 +1709,7 @@ impl DeliveryLeaseCell {
     pub(in crate::services::discord) fn commit(
         &self,
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
         outcome: LeaseOutcome,
@@ -1719,18 +1722,18 @@ impl DeliveryLeaseCell {
         match &*guard {
             LeaseState::Leased {
                 holder: cur_holder,
-                turn: cur_turn,
+                key: cur_key,
                 start: cur_start,
                 end: cur_end,
                 ..
             } if *cur_holder == holder
-                && cur_turn.exact_key() == turn.exact_key()
+                && cur_key == &key
                 && *cur_start == start
                 && *cur_end == end =>
             {
                 *guard = LeaseState::Committed {
                     holder,
-                    turn,
+                    key,
                     start,
                     end,
                     outcome,
@@ -1744,8 +1747,8 @@ impl DeliveryLeaseCell {
     }
 
     /// Compare-and-release: return the cell to `Unleased` ONLY if the FULL
-    /// `(holder, turn, [start,end))` identity matches the recorded lease (#3041
-    /// §2-§3) — symmetric with `commit`. Verifying the turn AND the byte range
+    /// `(holder, key, [start,end))` identity matches the recorded lease (#3041
+    /// §2-§3) — symmetric with `commit`. Verifying the key AND the byte range
     /// (not just the holder) is what closes the §2 hazard: a stale release from
     /// an OLDER turn — or from the SAME turn but an OLDER byte range after a
     /// reclaim+reacquire re-leased a different range (e.g. a continuation chunk)
@@ -1755,7 +1758,7 @@ impl DeliveryLeaseCell {
     pub(in crate::services::discord) fn release(
         &self,
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         start: u64,
         end: u64,
     ) -> bool {
@@ -1767,23 +1770,18 @@ impl DeliveryLeaseCell {
         let matches = match &*guard {
             LeaseState::Leased {
                 holder: cur,
-                turn: cur_turn,
+                key: cur_key,
                 start: cur_start,
                 end: cur_end,
                 ..
             }
             | LeaseState::Committed {
                 holder: cur,
-                turn: cur_turn,
+                key: cur_key,
                 start: cur_start,
                 end: cur_end,
                 ..
-            } => {
-                *cur == holder
-                    && cur_turn.exact_key() == turn.exact_key()
-                    && *cur_start == start
-                    && *cur_end == end
-            }
+            } => *cur == holder && cur_key == &key && *cur_start == start && *cur_end == end,
             LeaseState::Unleased => false,
         };
         if !matches {
@@ -1798,26 +1796,26 @@ impl DeliveryLeaseCell {
     /// terminal send future is in flight, the holder periodically calls this to
     /// extend the lease deadline so the (deliberately SHORT) deadline is a
     /// HOLDER-LIVENESS signal, not a hard cap on delivery duration. If the cell
-    /// is `Leased` by EXACTLY `(holder, turn)` (matched on holder + the turn's
-    /// `exact_key()`), its `deadline_ms` is overwritten with `new_deadline_ms`
+    /// is `Leased` by EXACTLY `(holder, key)` (matched on holder + delivery lease
+    /// key), its `deadline_ms` is overwritten with `new_deadline_ms`
     /// and `true` is returned. ANY other state — a different holder, a stale
-    /// older turn, a `Committed`/`Unleased` cell, or a cell already reclaimed and
+    /// older key, a `Committed`/`Unleased` cell, or a cell already reclaimed and
     /// reacquired by someone else — is a no-op returning `false`. The range is
     /// intentionally NOT matched: a renew only ever needs to prove "this exact
-    /// holder for this exact turn is still alive", and the live holder's range is
+    /// holder for this exact lease key is still alive", and the live holder's range is
     /// fixed for the lifetime of the lease anyway.
     ///
     /// Race-safety (why renew can never extend SOMEONE ELSE's lease): the match
-    /// requires the recorded `holder` AND `turn` to equal the caller's, both
+    /// requires the recorded `holder` AND `key` to equal the caller's, both
     /// taken UNDER the same payload mutex as every other mutation. If the cell
     /// was reclaimed (→ `Unleased`) and reacquired by a replacement, the holder
-    /// or turn will differ and the renew no-ops. A late heartbeat tick that
+    /// or key will differ and the renew no-ops. A late heartbeat tick that
     /// fires after the holder already committed sees `Committed` (not `Leased`)
     /// and no-ops. The ONLY successful renew extends the caller's OWN live lease.
     pub(in crate::services::discord) fn renew(
         &self,
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
         new_deadline_ms: u64,
     ) -> bool {
         let mut guard = self
@@ -1826,12 +1824,12 @@ impl DeliveryLeaseCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let LeaseState::Leased {
             holder: cur_holder,
-            turn: cur_turn,
+            key: cur_key,
             deadline_ms,
             ..
         } = &mut *guard
         {
-            if *cur_holder == holder && cur_turn.exact_key() == turn.exact_key() {
+            if *cur_holder == holder && cur_key == &key {
                 *deadline_ms = new_deadline_ms;
                 return true;
             }
@@ -1890,7 +1888,7 @@ pub(in crate::services::discord) const DELIVERY_LEASE_HEARTBEAT_MS: u64 = 5_000;
 /// (`renew`); if the holder TASK dies the spawned heartbeat is dropped/aborted
 /// with it → the lease stops being renewed → it expires → a replacement reclaims
 /// it. A heartbeat tick can only ever `renew` THIS holder's OWN still-`Leased`
-/// lease (matched on holder+turn), so a last tick that races `stop()`+commit
+/// lease (matched on holder+key), so a last tick that races `stop()`+commit
 /// merely extends our own deadline, which the immediately-following commit then
 /// flips to `Committed` — harmless.
 pub(in crate::services::discord) struct DeliveryLeaseHeartbeat {
@@ -1898,7 +1896,7 @@ pub(in crate::services::discord) struct DeliveryLeaseHeartbeat {
 }
 
 impl DeliveryLeaseHeartbeat {
-    /// Spawn a background task that renews `(holder, turn)`'s lease on `cell`
+    /// Spawn a background task that renews `(holder, key)`'s lease on `cell`
     /// every [`DELIVERY_LEASE_HEARTBEAT_MS`], each time pushing the deadline to
     /// `lease_now_ms() + DELIVERY_LEASE_DEADLINE_MS`. The first tick fires AFTER
     /// one interval (the acquire already set a fresh deadline). The loop exits on
@@ -1908,7 +1906,7 @@ impl DeliveryLeaseHeartbeat {
     pub(in crate::services::discord) fn spawn(
         cell: std::sync::Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
-        turn: turn_finalizer::TurnKey,
+        key: DeliveryLeaseKey,
     ) -> Self {
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -1921,7 +1919,7 @@ impl DeliveryLeaseHeartbeat {
                 interval.tick().await;
                 let renewed = cell.renew(
                     holder,
-                    turn,
+                    key.clone(),
                     lease_now_ms().saturating_add(DELIVERY_LEASE_DEADLINE_MS),
                 );
                 if !renewed {
@@ -2304,15 +2302,13 @@ impl SharedData {
 
 #[cfg(test)]
 pub(super) fn make_shared_data_for_tests() -> Arc<SharedData> {
-    make_shared_data_for_tests_with_storage(None, None)
+    make_shared_data_for_tests_with_storage(None)
 }
 
 #[cfg(test)]
 pub(super) fn make_shared_data_for_tests_with_storage(
-    sqlite: Option<crate::db::Db>,
     pg_pool: Option<sqlx::PgPool>,
 ) -> Arc<SharedData> {
-    let _ = &sqlite;
     Arc::new(SharedData {
         core: tokio::sync::Mutex::new(CoreState {
             sessions: std::collections::HashMap::new(),
@@ -4323,7 +4319,7 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
             // Clean up worktree if session had one
             if let Some(session) = data.sessions.get(&ch) {
                 if let Some(ref wt) = session.worktree {
-                    cleanup_git_worktree(None::<&crate::db::Db>, shared.pg_pool.as_ref(), wt);
+                    cleanup_git_worktree(shared.pg_pool.as_ref(), wt);
                 }
             }
             data.sessions.remove(&ch);
@@ -4348,18 +4344,14 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
     // Record termination audit for cleaned-up sessions
     for expired_session in &expired {
         if let Some(session_key) = expired_session.session_key.as_deref() {
-            let should_record = mark_session_disconnected_for_idle_cleanup(
-                None::<&crate::db::Db>,
-                shared.pg_pool.as_ref(),
-                session_key,
-            )
-            .await;
+            let should_record =
+                mark_session_disconnected_for_idle_cleanup(shared.pg_pool.as_ref(), session_key)
+                    .await;
             if !should_record {
                 continue;
             }
 
             crate::services::termination_audit::record_termination_with_handles(
-                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 session_key,
                 None,
@@ -4376,7 +4368,6 @@ async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
 }
 
 async fn mark_session_disconnected_for_idle_cleanup(
-    _db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     session_key: &str,
 ) -> bool {
@@ -4518,7 +4509,7 @@ mod idle_cleanup_selector_tests {
         .await
         .unwrap();
 
-        assert!(mark_session_disconnected_for_idle_cleanup(None, Some(&pool), session_key).await);
+        assert!(mark_session_disconnected_for_idle_cleanup(Some(&pool), session_key).await);
 
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
             "SELECT status, active_dispatch_id, claude_session_id, raw_provider_session_id
@@ -5112,11 +5103,13 @@ mod queued_placeholder_cluster_characterization_tests {
     // file => ZERO production LoC.
     mod a0_failure_signal_characterization_tests {
         use super::super::turn_finalizer::TurnKey;
-        use super::super::{DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot};
+        use super::super::{
+            DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome, LeaseSnapshot,
+        };
         use serenity::model::id::ChannelId;
 
-        fn turn() -> TurnKey {
-            TurnKey::new(ChannelId::new(7), 11, 0)
+        fn turn() -> DeliveryLeaseKey {
+            DeliveryLeaseKey::from_turn_key(TurnKey::new(ChannelId::new(7), 11, 0))
         }
 
         #[test]

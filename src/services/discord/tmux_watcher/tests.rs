@@ -471,7 +471,7 @@ async fn terminal_delivery_timeout_cleanup_releases_mailbox_and_preserves_follow
 
     let side_effects = watcher_terminal_commit_side_effects_for_test(
         true,
-        TuiCompletionGateOutcome::TimedOut,
+        TuiCompletionGateOutcome::BusyObserved,
         true,
     );
     assert!(side_effects.clear_inflight);
@@ -2116,7 +2116,8 @@ fn watcher_terminal_edit_detaches_placeholder_from_later_cleanup() {
     ));
     assert!(!watcher_terminal_edit_consumes_placeholder(
         &ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
-            edit_error: "edit failed".to_string()
+            edit_error: "edit failed".to_string(),
+            replacement_anchor: None,
         }
     ));
 }
@@ -2147,7 +2148,7 @@ mod delivery_lease_heartbeat {
     };
     use crate::services::discord::turn_finalizer::TurnKey;
     use crate::services::discord::{
-        DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
+        DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
     };
     use serenity::model::id::ChannelId;
     use std::sync::Arc;
@@ -2163,6 +2164,10 @@ mod delivery_lease_heartbeat {
         }
     }
 
+    fn lease_turn(ch: ChannelId, user_msg_id: u64) -> DeliveryLeaseKey {
+        DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, user_msg_id, 0))
+    }
+
     /// (a) A send that runs LONGER than the (short) deadline, but with the
     /// heartbeat renewing every interval, is NEVER reclaimed mid-send: the
     /// ORIGINAL holder's commit SUCCEEDS and advances the offset exactly once.
@@ -2173,18 +2178,18 @@ mod delivery_lease_heartbeat {
     async fn long_send_heartbeat_renew_prevents_midsend_reclaim() {
         let ch = ChannelId::new(7101);
         let cell = Arc::new(DeliveryLeaseCell::new(ch));
-        let turn = TurnKey::new(ch, 11, 0);
+        let turn = lease_turn(ch, 11);
         let h = watcher(1);
 
         // Acquire with a TINY deadline relative to lease_now_ms(): without a
         // heartbeat it would be reclaimable almost immediately.
         let acquire_now = lease_now_ms();
         let short_deadline = acquire_now.saturating_add(100);
-        assert!(cell.try_acquire(turn, h, 0, 64, short_deadline));
+        assert!(cell.try_acquire(turn.clone(), h, 0, 64, short_deadline));
         assert_eq!(deadline_of(&cell), Some(short_deadline));
 
         // Start the heartbeat (owned by this "watcher" frame).
-        let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), h, turn);
+        let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), h, turn.clone());
 
         // Drive the gated clock across SEVERAL heartbeat intervals — i.e. a
         // long multi-chunk send. Each crossed interval fires one renew.
@@ -2237,12 +2242,12 @@ mod delivery_lease_heartbeat {
     async fn dead_holder_no_renew_is_reclaimed_after_short_deadline() {
         let ch = ChannelId::new(7102);
         let cell = Arc::new(DeliveryLeaseCell::new(ch));
-        let turn = TurnKey::new(ch, 22, 0);
+        let turn = lease_turn(ch, 22);
         let dead = watcher(1);
 
         let acquire_now = lease_now_ms();
         let deadline = acquire_now.saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS);
-        assert!(cell.try_acquire(turn, dead, 0, 40, deadline));
+        assert!(cell.try_acquire(turn.clone(), dead, 0, 40, deadline));
 
         // The holder "dies": its heartbeat is dropped immediately (Drop aborts
         // it) WITHOUT ever renewing.
@@ -2259,7 +2264,7 @@ mod delivery_lease_heartbeat {
         );
         // And a replacement (new instance, new turn) can acquire the freed cell.
         let replacement = watcher(2);
-        let turn_b = TurnKey::new(ch, 33, 0);
+        let turn_b = lease_turn(ch, 33);
         assert!(
             cell.try_acquire(
                 turn_b,
@@ -2279,20 +2284,20 @@ mod delivery_lease_heartbeat {
     async fn renew_by_non_holder_or_wrong_turn_is_noop() {
         let ch = ChannelId::new(7103);
         let cell = DeliveryLeaseCell::new(ch);
-        let turn = TurnKey::new(ch, 44, 0);
+        let turn = lease_turn(ch, 44);
         let holder = watcher(1);
 
         let now = lease_now_ms();
         let deadline = now.saturating_add(1_000);
-        assert!(cell.try_acquire(turn, holder, 0, 16, deadline));
+        assert!(cell.try_acquire(turn.clone(), holder, 0, 16, deadline));
 
         // Wrong holder, correct turn → no-op.
         assert!(
-            !cell.renew(watcher(2), turn, now.saturating_add(99_999)),
+            !cell.renew(watcher(2), turn.clone(), now.saturating_add(99_999)),
             "a different holder cannot renew the lease"
         );
         // Correct holder, wrong (stale) turn → no-op.
-        let wrong_turn = TurnKey::new(ch, 45, 0);
+        let wrong_turn = lease_turn(ch, 45);
         assert!(
             !cell.renew(holder, wrong_turn, now.saturating_add(99_999)),
             "a stale/wrong turn cannot renew the lease"
@@ -2306,12 +2311,12 @@ mod delivery_lease_heartbeat {
 
         // The TRUE holder/turn CAN renew → deadline extends.
         let extended = now.saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS);
-        assert!(cell.renew(holder, turn, extended));
+        assert!(cell.renew(holder, turn.clone(), extended));
         assert_eq!(deadline_of(&cell), Some(extended));
 
         // After commit (Committed, not Leased) even the true holder's renew
         // no-ops — a late heartbeat tick after commit cannot disturb the cell.
-        assert!(cell.commit(holder, turn, 0, 16, LeaseOutcome::Delivered));
+        assert!(cell.commit(holder, turn.clone(), 0, 16, LeaseOutcome::Delivered));
         assert!(
             !cell.renew(holder, turn, extended.saturating_add(1)),
             "a renew on a Committed lease (a late tick after commit) is a no-op"
@@ -2327,6 +2332,10 @@ mod delivery_lease_heartbeat {
 // identity-gated advance, heartbeat) is exercised end-to-end. Pinned inline in
 // this `#[cfg(test)] mod tests` block of the FROZEN file => ZERO production LoC.
 mod watcher_short_replace_controller {
+    use super::super::terminal_long_chunks::{
+        WatcherLongChunksLocals, apply_watcher_long_chunks_result,
+        deliver_long_chunks_via_controller,
+    };
     use super::super::terminal_send::{
         WatcherShortReplaceResult, deliver_short_replace_via_controller,
         watcher_terminal_lease_range,
@@ -2339,9 +2348,11 @@ mod watcher_short_replace_controller {
         PlaceholderController, PlaceholderKey, PlaceholderLifecycle,
     };
     use crate::services::discord::turn_finalizer::TurnKey;
-    use crate::services::discord::{DeliveryLeaseCell, LeaseHolder, LeaseSnapshot, lease_now_ms};
+    use crate::services::discord::{
+        DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseSnapshot, lease_now_ms,
+    };
     use crate::services::provider::ProviderKind;
-    use serenity::all::{ChannelId, MessageId};
+    use serenity::all::{ChannelId, Http, MessageId};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2436,6 +2447,123 @@ mod watcher_short_replace_controller {
         }
     }
 
+    struct LongChunksFakeGateway {
+        send_ok: bool,
+        delete_ok: bool,
+        send_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+        clock: AtomicUsize,
+        send_step: AtomicUsize,
+        delete_step: AtomicUsize,
+    }
+
+    impl TurnGateway for LongChunksFakeGateway {
+        fn send_long_message_with_rollback<'a>(
+            &'a self,
+            _c: ChannelId,
+            _a: MessageId,
+            _content: &'a str,
+        ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
+            Box::pin(async move {
+                self.send_calls.fetch_add(1, Ordering::SeqCst);
+                self.send_step
+                    .store(self.clock.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+                if self.send_ok {
+                    Ok(vec![MessageId::new(9100), MessageId::new(9101)])
+                } else {
+                    Err("chunk send failed after rollback".to_string())
+                }
+            })
+        }
+        fn delete_message<'a>(
+            &'a self,
+            _c: ChannelId,
+            _m: MessageId,
+        ) -> GatewayFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                self.delete_calls.fetch_add(1, Ordering::SeqCst);
+                self.delete_step
+                    .store(self.clock.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+                if self.delete_ok {
+                    Ok(())
+                } else {
+                    Err("delete failed".to_string())
+                }
+            })
+        }
+        fn replace_message_with_outcome<'a>(
+            &'a self,
+            _c: ChannelId,
+            _m: MessageId,
+            _content: &'a str,
+        ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
+            panic!("long chunks never replace")
+        }
+        fn send_message<'a>(
+            &'a self,
+            _c: ChannelId,
+            _x: &'a str,
+        ) -> GatewayFuture<'a, Result<MessageId, String>> {
+            panic!("long chunks use send_long_message_with_rollback")
+        }
+        fn edit_message<'a>(
+            &'a self,
+            _c: ChannelId,
+            _m: MessageId,
+            _x: &'a str,
+        ) -> GatewayFuture<'a, Result<(), String>> {
+            panic!("long chunks never edit")
+        }
+        fn add_reaction<'a>(
+            &'a self,
+            _c: ChannelId,
+            _m: MessageId,
+            _e: char,
+        ) -> GatewayFuture<'a, ()> {
+            panic!("unused on long chunks")
+        }
+        fn remove_reaction<'a>(
+            &'a self,
+            _c: ChannelId,
+            _m: MessageId,
+            _e: char,
+        ) -> GatewayFuture<'a, ()> {
+            panic!("unused on long chunks")
+        }
+        fn schedule_retry_with_history<'a>(
+            &'a self,
+            _c: ChannelId,
+            _u: MessageId,
+            _t: &'a str,
+        ) -> GatewayFuture<'a, ()> {
+            panic!("unused on long chunks")
+        }
+        fn dispatch_queued_turn<'a>(
+            &'a self,
+            _c: ChannelId,
+            _i: &'a crate::services::discord::Intervention,
+            _o: &'a str,
+            _h: bool,
+        ) -> GatewayFuture<'a, Result<(), String>> {
+            panic!("unused on long chunks")
+        }
+        fn validate_live_routing<'a>(
+            &'a self,
+            _c: ChannelId,
+        ) -> GatewayFuture<'a, Result<(), String>> {
+            panic!("unused on long chunks")
+        }
+        fn requester_mention(&self) -> Option<String> {
+            None
+        }
+        fn can_chain_locally(&self) -> bool {
+            true
+        }
+        fn bot_owner_provider(&self) -> Option<ProviderKind> {
+            None
+        }
+    }
+
     const CH: u64 = 8_141;
     const MSG: u64 = 99;
     const START: u64 = 10;
@@ -2448,6 +2576,9 @@ mod watcher_short_replace_controller {
     fn turn() -> TurnKey {
         TurnKey::new(ch(), 11, 0)
     }
+    fn lease_key() -> DeliveryLeaseKey {
+        DeliveryLeaseKey::from_turn_key(turn())
+    }
     fn watcher() -> LeaseHolder {
         LeaseHolder::Watcher {
             instance_id: INSTANCE,
@@ -2458,6 +2589,18 @@ mod watcher_short_replace_controller {
             outcome,
             ok,
             replace_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn long_gateway(send_ok: bool, delete_ok: bool) -> LongChunksFakeGateway {
+        LongChunksFakeGateway {
+            send_ok,
+            delete_ok,
+            send_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            clock: AtomicUsize::new(1),
+            send_step: AtomicUsize::new(0),
+            delete_step: AtomicUsize::new(0),
         }
     }
 
@@ -2480,11 +2623,45 @@ mod watcher_short_replace_controller {
             "answer",
             cell,
             turn(),
+            Some(lease_key()),
             INSTANCE,
             START,
             END,
         )
         .await
+    }
+
+    async fn run_long(
+        gw: &LongChunksFakeGateway,
+        shared: &Arc<crate::services::discord::SharedData>,
+        cell: &Arc<DeliveryLeaseCell>,
+    ) -> toc::DeliveryOutcome {
+        deliver_long_chunks_via_controller(
+            gw,
+            shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            &"x".repeat(crate::services::discord::DISCORD_MSG_LIMIT + 10),
+            cell,
+            turn(),
+            Some(lease_key()),
+            INSTANCE,
+            START,
+            END,
+        )
+        .await
+    }
+
+    fn toc_debug_outcome(outcome: &toc::DeliveryOutcome) -> &'static str {
+        match outcome {
+            toc::DeliveryOutcome::Delivered { .. } => "Delivered",
+            toc::DeliveryOutcome::NotDelivered { .. } => "NotDelivered",
+            toc::DeliveryOutcome::Transient { .. } => "Transient",
+            toc::DeliveryOutcome::Unknown { .. } => "Unknown",
+            toc::DeliveryOutcome::Skipped => "Skipped",
+        }
     }
 
     // (1) lease pre-held by ANOTHER holder → controller acquire fails →
@@ -2499,7 +2676,7 @@ mod watcher_short_replace_controller {
         // controller's `try_acquire` loses and `reclaim_if_expired` cannot free it.
         let other = LeaseHolder::Watcher { instance_id: 999 };
         assert!(cell.try_acquire(
-            turn(),
+            lease_key(),
             other,
             START,
             END,
@@ -2572,6 +2749,7 @@ mod watcher_short_replace_controller {
                 Box::pin(async move {
                     Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                         edit_error: "edit failed".to_string(),
+                        replacement_anchor: None,
                     })
                 })
             }
@@ -2699,6 +2877,9 @@ mod watcher_short_replace_controller {
                 &gw,
                 toc::TurnOutputCtx {
                     turn: turn(),
+                    lease_key: Some(crate::services::discord::DeliveryLeaseKey::from_turn_key(
+                        turn(),
+                    )),
                     owner: RelayOwnerKind::Watcher,
                     holder: watcher(),
                     lease: &*cell,
@@ -2754,8 +2935,8 @@ mod watcher_short_replace_controller {
         use crate::services::discord::DeliveryLeaseHeartbeat;
         let cell = Arc::new(DeliveryLeaseCell::new(ch()));
         let short = lease_now_ms().saturating_add(100);
-        assert!(cell.try_acquire(turn(), watcher(), START, END, short));
-        let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), watcher(), turn());
+        assert!(cell.try_acquire(lease_key(), watcher(), START, END, short));
+        let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), watcher(), lease_key());
         for _ in 0..3 {
             tokio::time::advance(std::time::Duration::from_millis(
                 WATCHER_DELIVERY_LEASE_HEARTBEAT_MS,
@@ -2779,7 +2960,7 @@ mod watcher_short_replace_controller {
         assert!(
             cell.commit(
                 watcher(),
-                turn(),
+                lease_key(),
                 START,
                 END,
                 crate::services::discord::LeaseOutcome::Delivered
@@ -2800,6 +2981,7 @@ mod watcher_short_replace_controller {
         let gw = gateway(
             ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "edit failed".to_string(),
+                replacement_anchor: None,
             },
             true,
         );
@@ -2838,6 +3020,133 @@ mod watcher_short_replace_controller {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_controller_delivered_deletes_anchor_and_advances() {
+        let temp = match tempfile::tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("runtime root tempdir failed: {error}"),
+        };
+        let _root = super::AgentdeskRootGuard::set(temp.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = long_gateway(true, true);
+        let outcome = run_long(&gw, &shared, &cell).await;
+        match outcome {
+            toc::DeliveryOutcome::Delivered {
+                new_chunks: Some(chunks),
+                ..
+            } => {
+                assert_eq!(chunks.first_message_id, Some(MessageId::new(9100)));
+                assert_eq!(chunks.tail_message_id, Some(MessageId::new(9101)));
+                assert_eq!(chunks.anchor_delete_error, None);
+            }
+            other => panic!("expected Delivered, got {}", toc_debug_outcome(&other)),
+        }
+        assert_eq!(gw.send_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gw.delete_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            gw.send_step.load(Ordering::SeqCst) < gw.delete_step.load(Ordering::SeqCst),
+            "placeholder delete must run after the full chunk send"
+        );
+        assert_eq!(shared.committed_relay_offset(ch()), END);
+        assert!(matches!(cell.read(), LeaseSnapshot::Unleased));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_delete_failure_still_delivers() {
+        let temp = match tempfile::tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("runtime root tempdir failed: {error}"),
+        };
+        let _root = super::AgentdeskRootGuard::set(temp.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = long_gateway(true, false);
+        let outcome = run_long(&gw, &shared, &cell).await;
+        match outcome {
+            toc::DeliveryOutcome::Delivered {
+                new_chunks: Some(chunks),
+                ..
+            } => assert_eq!(chunks.anchor_delete_error.as_deref(), Some("delete failed")),
+            other => panic!(
+                "delete failure should still be Delivered, got {}",
+                toc_debug_outcome(&other)
+            ),
+        }
+        assert_eq!(shared.committed_relay_offset(ch()), END);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_send_failure_not_delivered_and_preserved() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = long_gateway(false, true);
+        let outcome = run_long(&gw, &shared, &cell).await;
+        assert!(
+            matches!(outcome, toc::DeliveryOutcome::NotDelivered { .. }),
+            "send failure maps to NotDelivered"
+        );
+        assert_eq!(gw.delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.committed_relay_offset(ch()), 0);
+
+        let http = Arc::new(Http::new("test-token"));
+        let mut relay_ok = true;
+        let mut direct = false;
+        let mut visible = false;
+        let mut external = false;
+        let mut placeholder = Some(MessageId::new(MSG));
+        let mut restored = true;
+        let mut last_edit = String::from("streamed");
+        let mut frozen = Vec::new();
+        apply_watcher_long_chunks_result(
+            outcome,
+            &http,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            true,
+            &mut frozen,
+            None,
+            WatcherLongChunksLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct,
+                tui_direct_anchor_terminal_body_visible: &mut visible,
+                external_input_lease_consumed_by_relay: &mut external,
+                placeholder_msg_id: &mut placeholder,
+                placeholder_from_restored_inflight: &mut restored,
+                last_edit_text: &mut last_edit,
+            },
+        )
+        .await;
+        assert!(
+            !relay_ok,
+            "failure maps back to retry-preserving relay_ok=false"
+        );
+        assert_eq!(placeholder, Some(MessageId::new(MSG)));
+        assert!(restored);
+        assert_eq!(last_edit, "streamed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_acquire_transient_no_send() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        assert!(cell.try_acquire(
+            lease_key(),
+            LeaseHolder::Watcher { instance_id: 999 },
+            START,
+            END,
+            lease_now_ms().saturating_add(60_000),
+        ));
+        let gw = long_gateway(true, true);
+        let outcome = run_long(&gw, &shared, &cell).await;
+        assert!(matches!(outcome, toc::DeliveryOutcome::Transient { .. }));
+        assert_eq!(gw.send_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.committed_relay_offset(ch()), 0);
+    }
+
     // (6) the cut-over turn must SKIP the watcher's own lease acquire (the controller
     // owns the single lease). The pure `watcher_terminal_lease_range` returns None for
     // any cut-over turn; dropping `!cutover_short_replace` (the guard-skip mutation)
@@ -2862,44 +3171,20 @@ mod watcher_short_replace_controller {
     #[test]
     fn watcher_terminal_lease_range_pins_cutover() {
         use super::super::terminal_send::watcher_short_replace_cutover as cut;
-        // All gate terms satisfied (controller on, will-send, ordered, placeholder,
+        // All gate terms satisfied (will-send, ordered, placeholder,
         // not-ordered-chunks, non-empty, not-tui-gated) → cut over.
-        assert!(cut(true, true, true, true, false, false, false));
-        // Flag OFF → never cut over.
-        assert!(!cut(false, true, true, true, false, false, false));
+        assert!(cut(true, true, true, false, false, false));
         // No placeholder → legacy (the prompt-anchor reference-send branch).
-        assert!(!cut(true, true, true, false, false, false, false));
-        // should_send_ordered_new_chunks → legacy (long-chunk fallback).
-        assert!(!cut(true, true, true, true, true, false, false));
+        assert!(!cut(true, true, false, false, false, false));
+        // should_send_ordered_new_chunks → controller long-chunk route.
+        assert!(cut(true, true, true, true, false, false));
         // empty formatted body → legacy (controller would Skip; legacy advances).
-        assert!(!cut(true, true, true, true, false, true, false));
+        assert!(!cut(true, true, true, false, true, false));
         // TUI-completion-gate required → legacy (post-send lifecycle_stage_paused).
-        assert!(!cut(true, true, true, true, false, false, true));
+        assert!(!cut(true, true, true, false, false, true));
         // not will-direct-send / not ordered range → legacy.
-        assert!(!cut(true, false, true, true, false, false, false));
-        assert!(!cut(true, true, false, true, false, false, false));
-    }
-
-    // (8) OFF byte-identical characterization: with the flag default-OFF the cut-over
-    // decision is false regardless of the other terms, so the legacy
-    // `replace_long_message_raw_with_outcome` arm runs verbatim. (Pure: the flag
-    // helper short-circuits before formatting, so OFF has no observable side effect.)
-    #[test]
-    fn off_byte_identical() {
-        use super::super::terminal_send::watcher_short_replace_cutover_decision as decide;
-        // controller_enabled = false → false even with every other term cut-over-true.
-        assert!(!decide(
-            false,
-            false,
-            false,
-            &ProviderKind::Claude,
-            "non-empty answer",
-            true,
-            true,
-            true,
-            false,
-            false,
-        ));
+        assert!(!cut(false, true, true, false, false, false));
+        assert!(!cut(true, false, true, false, false, false));
     }
 
     // (9) #3089 A4 r2 (codex r1 [High]): the controller write-back MUST mirror
