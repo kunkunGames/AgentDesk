@@ -145,7 +145,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite Number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `스프라이트 미선택 (이모지 대체)`, en: `No sprite (Emoji fallback)` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -166,6 +166,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -189,6 +190,7 @@ export default function AgentFormModal({
                       alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
+                      aria-hidden="true"
                     />
                   ) : (
                     <span
@@ -198,6 +200,7 @@ export default function AgentFormModal({
                         ko: `선택된 이모지 미리보기: ${formValues.avatar_emoji || "🤖"}`,
                         en: `Selected emoji preview: ${formValues.avatar_emoji || "🤖"}`,
                       })}
+                      aria-hidden="true"
                     >
                       {formValues.avatar_emoji || "🤖"}
                     </span>
@@ -206,6 +209,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -306,10 +310,11 @@ export default function AgentFormModal({
             )}
             <div className="grid grid-cols-[72px_1fr] gap-2">
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor="agent-emoji-picker" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("이모지", "Emoji")}
                 </label>
                 <EmojiPicker
+                  id="agent-emoji-picker"
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={

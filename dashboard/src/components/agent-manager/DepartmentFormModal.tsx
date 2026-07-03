@@ -312,10 +312,11 @@ export default function DepartmentFormModal({
             <div className="space-y-4">
               <div className="flex items-start gap-3">
                 <div>
-                  <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <label htmlFor="dept-icon-picker" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     {tr("아이콘", "Icon")}
                   </label>
                   <EmojiPicker
+                    id="dept-icon-picker"
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
                     aria-label={

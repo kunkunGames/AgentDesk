@@ -38,12 +38,14 @@ export default function EmojiPicker({
   size = "md",
   "aria-label": ariaLabel,
   dialogLabel,
+  id,
 }: {
   value: string;
   onChange: (emoji: string) => void;
   size?: "sm" | "md";
   "aria-label"?: string;
   dialogLabel?: string;
+  id?: string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -86,6 +88,7 @@ export default function EmojiPicker({
   return (
     <div className="relative" ref={ref}>
       <button
+        id={id}
         ref={buttonRef}
         type="button"
         onClick={() => setOpen(!open)}
