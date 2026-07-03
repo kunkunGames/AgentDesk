@@ -917,7 +917,8 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
       }
     ],
     dbQuery: createSqlRouter([
-            {
+      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
+      {
         match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
         result: []
       },
@@ -930,7 +931,8 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /장시간 턴/);
   assert.match(state.deadlockAlerts[0].message, /90분 단계/);
-  assert.strictEqual(state.kv.get("long_turn_tier:codex:channel-1"), "90");
+  assert.match(state.executions[0].sql, /INSERT OR REPLACE INTO kv_meta/);
+  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "90"]);
 });
 
 test("timeouts long turn monitor module skips synthetic reattach placeholders", () => {
@@ -972,7 +974,6 @@ test("timeouts long turn monitor module skips synthetic reattach placeholders", 
 
 test("timeouts long turn monitor module skips repeated 30-minute threshold", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
-    kv: new Map([["long_turn_tier:codex:channel-1", "90"]]),
     inflights: [
       {
         provider: "codex",
@@ -985,8 +986,12 @@ test("timeouts long turn monitor module skips repeated 30-minute threshold", () 
       }
     ],
     dbQuery: createSqlRouter([
-
-            { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
+      {
+        match: (sql, params) => sql.includes("SELECT value FROM kv_meta WHERE key = ?") && params[0] === "long_turn_tier:codex:channel-1",
+        result: [{ value: "90" }]
+      },
+      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
     ])
   });
@@ -1011,7 +1016,8 @@ test("timeouts long turn monitor module uses configured alert interval", () => {
       }
     ],
     dbQuery: createSqlRouter([
-            {
+      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
+      {
         match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
         result: []
       },
@@ -1024,7 +1030,7 @@ test("timeouts long turn monitor module uses configured alert interval", () => {
 
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /80분 단계/);
-  assert.strictEqual(state.kv.get("long_turn_tier:codex:channel-1"), "80");
+  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "80"]);
 });
 
 test("timeouts workspace branch guard module recovers wt branches", () => {
