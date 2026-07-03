@@ -13,6 +13,28 @@ from scripts.analyze_prs import (
 )
 
 
+
+class PrAnalyzerPublicApiDocsImpactTests(unittest.TestCase):
+    def test_missing_impact_fields_is_not_meaningful(self):
+        body = "- Agent: Steward"
+        self.assertFalse(has_non_empty_body_field(body, ["public api impact"], allow_none=True))
+        self.assertFalse(has_non_empty_body_field(body, ["docs impact"], allow_none=True))
+
+    def test_empty_impact_fields_is_not_meaningful(self):
+        body = "- Public API impact:\n- Docs impact:"
+        self.assertFalse(has_non_empty_body_field(body, ["public api impact"], allow_none=True))
+        self.assertFalse(has_non_empty_body_field(body, ["docs impact"], allow_none=True))
+
+    def test_none_is_meaningful_for_impact_fields_when_allow_none_is_true(self):
+        body = "- Public API impact: None\n- Docs impact: None"
+        self.assertTrue(has_non_empty_body_field(body, ["public api impact"], allow_none=True))
+        self.assertTrue(has_non_empty_body_field(body, ["docs impact"], allow_none=True))
+
+    def test_na_is_not_meaningful_even_when_allow_none_is_true(self):
+        body = "- Public API impact: N/A\n- Docs impact: N/A"
+        self.assertFalse(has_non_empty_body_field(body, ["public api impact"], allow_none=True))
+        self.assertFalse(has_non_empty_body_field(body, ["docs impact"], allow_none=True))
+
 class PrAnalyzerBodyFieldTests(unittest.TestCase):
     def test_blank_risk_does_not_borrow_populated_rollback(self):
         body = "- Risk:\n- Rollback notes: revert this PR"
