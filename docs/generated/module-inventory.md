@@ -263,7 +263,7 @@
 | `server::routes::github_dashboard` | `src/server/routes/github_dashboard.rs` | 188 | 188 | 0 |  |
 | `server::routes::health_api` | `src/server/routes/health_api.rs` | 2349 | 1658 | 691 | giant-file |
 | `server::routes::home_metrics` | `src/server/routes/home_metrics.rs` | 352 | 352 | 0 |  |
-| `server::routes::hooks` | `src/server/routes/hooks.rs` | 129 | 129 | 0 |  |
+| `server::routes::hooks` | `src/server/routes/hooks.rs` | 241 | 130 | 111 |  |
 | `server::routes::idle_recap` | `src/server/routes/idle_recap.rs` | 357 | 357 | 0 |  |
 | `server::routes::kanban` | `src/server/routes/kanban.rs` | 2788 | 2725 | 63 | giant-file |
 | `server::routes::kanban_repos` | `src/server/routes/kanban_repos.rs` | 266 | 266 | 0 |  |

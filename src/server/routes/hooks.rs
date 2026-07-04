@@ -127,3 +127,115 @@ async fn disconnect_session_pg(pool: &PgPool, session_key: &str) -> Result<bool,
         .await
         .map(|result| result.rows_affected() > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::routes::AppState;
+    use crate::services::PolicyEngine;
+    use axum::http::{Request, StatusCode};
+    use axum::{Router, body::Body};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn setup_test_app(pool: PgPool) -> Router {
+        let state = AppState {
+            pg_pool: Some(pool),
+            engine: PolicyEngine::default(),
+            config: Arc::new(crate::config::Config::default()),
+            broadcast_tx: crate::server::ws::BroadcastTx::new(),
+            batch_buffer: crate::server::ws::BatchBuffer::new(),
+            health_registry: None,
+            cluster_instance_id: None,
+        };
+
+        Router::new()
+            .route("/api/hook/reset-status", axum::routing::post(reset_status))
+            .route("/api/hook/skill-usage", axum::routing::post(skill_usage))
+            .route("/api/hook/session/:sessionKey", axum::routing::delete(disconnect_session))
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn test_reset_status_ok(pool: PgPool) {
+        let app = setup_test_app(pool.clone());
+
+        sqlx::query("INSERT INTO agents (id, status) VALUES ('agent_1', 'working')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/hook/reset-status")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM agents WHERE id = 'agent_1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "idle");
+    }
+
+    #[sqlx::test]
+    async fn test_skill_usage_ok(pool: PgPool) {
+        let app = setup_test_app(pool.clone());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/hook/skill-usage")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"skill_id": "test_skill"}"#))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skill_usage WHERE skill_id = 'test_skill'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_disconnect_session_ok(pool: PgPool) {
+        let app = setup_test_app(pool.clone());
+
+        sqlx::query("INSERT INTO sessions (session_key, status) VALUES ('sess_1', 'connected')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/hook/session/sess_1")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM sessions WHERE session_key = 'sess_1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "disconnected");
+    }
+
+    #[sqlx::test]
+    async fn test_disconnect_session_not_found(pool: PgPool) {
+        let app = setup_test_app(pool);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/hook/session/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
