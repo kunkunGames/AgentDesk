@@ -251,12 +251,12 @@
 | `server::routes::docs::taxonomy` | `src/server/routes/docs/taxonomy.rs` | 253 | 253 | 0 |  |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 | 8 | 0 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 13 | 13 | 0 |  |
-| `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 93 | 93 | 0 |  |
+| `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 96 | 96 | 0 |  |
 | `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 59 | 59 | 0 |  |
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 78 | 78 | 0 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 87 | 87 | 0 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 | 39 | 0 |  |
-| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 340 | 340 | 0 |  |
+| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 337 | 337 | 0 |  |
 | `server::routes::domains::reviews` | `src/server/routes/domains/reviews.rs` | 33 | 33 | 0 |  |
 | `server::routes::escalation` | `src/server/routes/escalation.rs` | 1641 | 1376 | 265 | giant-file |
 | `server::routes::github` | `src/server/routes/github.rs` | 949 | 680 | 269 |  |

@@ -6,7 +6,7 @@ use axum::{
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
     health_api, idle_recap, maintenance, messages, monitoring, pipeline, prompt_manifest_retention,
-    protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
+    protected_api_domain, provider_cli_api, queue_api, routines, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -212,9 +212,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/messages",
                 get(messages::list_messages).post(messages::create_message),
             )
-            .route("/skills/catalog", get(skills_api::catalog))
-            .route("/skills/ranking", get(skills_api::ranking))
-            .route("/skills/prune", post(skills_api::prune))
             .route("/cron-jobs", get(cron_api::list_cron_jobs))
             .route("/maintenance/jobs", get(maintenance::list_jobs))
             .route(
