@@ -132,7 +132,7 @@ async fn disconnect_session_pg(pool: &PgPool, session_key: &str) -> Result<bool,
 mod tests {
     use super::*;
     use crate::server::PolicyEngine;
-    use crate::server::routes::AppState;
+    use super::AppState;
     use axum::http::{Request, StatusCode};
     use axum::{Router, body::Body};
     use std::sync::Arc;
@@ -140,11 +140,11 @@ mod tests {
 
     fn setup_test_app(pool: PgPool) -> Router {
         let state = AppState {
-            pg_pool: Some(pool),
-            engine: PolicyEngine::default(),
+            pg_pool: Some(pool.clone()),
+            engine: PolicyEngine::new_with_pg(&crate::config::Config::default(), Some(pool.clone())).unwrap(),
             config: Arc::new(crate::config::Config::default()),
-            broadcast_tx: crate::server::ws::BroadcastTx::default(),
-            batch_buffer: crate::server::ws::BatchBuffer::default(),
+            broadcast_tx: crate::eventbus::new_broadcast(),
+            batch_buffer: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             health_registry: None,
             cluster_instance_id: None,
         };
