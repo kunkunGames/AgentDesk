@@ -131,8 +131,8 @@ async fn disconnect_session_pg(pool: &PgPool, session_key: &str) -> Result<bool,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::PolicyEngine;
     use crate::server::routes::AppState;
-    use crate::services::PolicyEngine;
     use axum::http::{Request, StatusCode};
     use axum::{Router, body::Body};
     use std::sync::Arc;
@@ -143,8 +143,8 @@ mod tests {
             pg_pool: Some(pool),
             engine: PolicyEngine::default(),
             config: Arc::new(crate::config::Config::default()),
-            broadcast_tx: crate::server::ws::BroadcastTx::new(),
-            batch_buffer: crate::server::ws::BatchBuffer::new(),
+            broadcast_tx: crate::server::ws::BroadcastTx::default(),
+            batch_buffer: crate::server::ws::BatchBuffer::default(),
             health_registry: None,
             cluster_instance_id: None,
         };
@@ -152,7 +152,10 @@ mod tests {
         Router::new()
             .route("/api/hook/reset-status", axum::routing::post(reset_status))
             .route("/api/hook/skill-usage", axum::routing::post(skill_usage))
-            .route("/api/hook/session/:sessionKey", axum::routing::delete(disconnect_session))
+            .route(
+                "/api/hook/session/:sessionKey",
+                axum::routing::delete(disconnect_session),
+            )
             .with_state(state)
     }
 
@@ -195,10 +198,11 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM skill_usage WHERE skill_id = 'test_skill'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM skill_usage WHERE skill_id = 'test_skill'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -220,10 +224,11 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let status: String = sqlx::query_scalar("SELECT status FROM sessions WHERE session_key = 'sess_1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM sessions WHERE session_key = 'sess_1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "disconnected");
     }
 
