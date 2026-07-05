@@ -88,6 +88,16 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
                 break
     return False
 
+def has_honest_verification_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*honest verification:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "honest verification",
+        ],
+    )
+
 def has_duplicate_guard_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*duplicate pr guard:\*\*", body):
         return True
@@ -253,6 +263,8 @@ def main():
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
+        if not has_honest_verification_ack(body):
+            print("  [!] MISSING HONEST VERIFICATION CHECK: PR body lacks a completed honest verification acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
         if not has_non_empty_body_field(
