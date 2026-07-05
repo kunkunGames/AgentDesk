@@ -2,7 +2,9 @@ use super::*;
 use crate::services::discord::InflightTurnState;
 use crate::services::discord::http::{edit_channel_message, send_channel_message};
 use crate::services::discord::outbound::delivery_record as dr; // #3089 B2b
-use crate::services::discord::replace_outcome_policy::watcher_partial_continuation_retry_plan;
+use crate::services::discord::replace_outcome_policy::{
+    watcher_full_send_failure_retry_plan, watcher_partial_continuation_retry_plan,
+};
 
 #[path = "tmux_watcher/liveness.rs"]
 mod liveness;
@@ -5307,7 +5309,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
-                                    relay_ok = false;
+                                    let plan = watcher_full_send_failure_retry_plan();
+                                    relay_ok = plan.relay_ok;
+                                    retry_terminal_delivery_from_offset = plan.retry_offset;
                                 }
                             }
                         }
@@ -5372,7 +5376,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
-                                relay_ok = false;
+                                let plan = watcher_full_send_failure_retry_plan();
+                                relay_ok = plan.relay_ok;
+                                retry_terminal_delivery_from_offset = plan.retry_offset;
                             }
                         }
                     }

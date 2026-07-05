@@ -22,6 +22,7 @@ use crate::services::agent_protocol::RuntimeHandoffKind;
 use crate::services::discord::InflightTurnState;
 use crate::services::discord::formatting::ReplaceLongMessageOutcome;
 use crate::services::discord::inflight::{RelayOwnerKind, TurnSource};
+use crate::services::discord::replace_outcome_policy::watcher_full_send_failure_retry_plan;
 use crate::services::discord::{
     mailbox_enqueue_intervention, mailbox_snapshot, mailbox_take_next_soft_intervention,
     mailbox_try_start_turn,
@@ -2179,6 +2180,63 @@ fn no_inflight_user_boundary_without_fresh_text_preserves_body_bearing_seed_for_
 }
 
 #[test]
+fn placeholderless_full_send_failure_rewinds_then_retries_body_once_4115() {
+    struct FailOnceSender {
+        attempts: usize,
+        delivered: Vec<String>,
+    }
+
+    impl FailOnceSender {
+        fn send(&mut self, body: &str) -> Result<(), &'static str> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                Err("discord 5xx")
+            } else {
+                self.delivered.push(body.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    let turn_data_start_offset = 128;
+    let turn_end_offset = 384;
+    let body = "placeholder-less terminal body";
+    let mut next_read_offset = turn_data_start_offset;
+    let mut sender = FailOnceSender {
+        attempts: 0,
+        delivered: Vec::new(),
+    };
+
+    for _ in 0..2 {
+        let mut current_offset = turn_end_offset;
+        let mut all_data = b"{\"type\":\"result\",\"result\":\"body\"}\n".to_vec();
+        let mut all_data_start_offset = next_read_offset;
+        assert_eq!(
+            all_data_start_offset, turn_data_start_offset,
+            "retry pass must re-read the same turn body"
+        );
+        assert_eq!(current_offset, turn_end_offset);
+        assert!(!all_data.is_empty());
+
+        if sender.send(body).is_ok() {
+            break;
+        }
+
+        let plan = watcher_full_send_failure_retry_plan();
+        assert!(!plan.relay_ok);
+        assert!(plan.retry_offset);
+        current_offset = turn_data_start_offset;
+        all_data.clear();
+        assert!(all_data.is_empty());
+        all_data_start_offset = current_offset;
+        next_read_offset = all_data_start_offset;
+    }
+
+    assert_eq!(sender.attempts, 2);
+    assert_eq!(sender.delivered, vec![body.to_string()]);
+}
+
+#[test]
 fn compact_local_only_boundary_without_seed_delivery_fingerprint_preserves_restored_seed_4096() {
     let _lock = crate::config::shared_test_env_lock()
         .lock()
@@ -2851,8 +2909,8 @@ mod watcher_short_replace_controller {
         deliver_long_chunks_via_controller,
     };
     use super::super::terminal_send::{
-        WatcherShortReplaceResult, deliver_short_replace_via_controller,
-        watcher_terminal_lease_range,
+        WatcherShortReplaceLocals, WatcherShortReplaceResult, apply_watcher_short_replace_result,
+        deliver_short_replace_via_controller, watcher_terminal_lease_range,
     };
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::gateway::{GatewayFuture, TurnGateway};
@@ -3517,6 +3575,60 @@ mod watcher_short_replace_controller {
                 "I2: a partial/ambiguous result NEVER advances the offset"
             );
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_short_replace_transport_failure_requests_offset_retry_4115() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = gateway(ReplaceLongMessageOutcome::EditedOriginal, false);
+        let result = run(&gw, &shared, &cell).await;
+        assert_eq!(
+            result,
+            WatcherShortReplaceResult::PartialFailureRetry,
+            "transport failure means no confirmed body; watcher must retry the same range"
+        );
+        assert_eq!(gw.replace_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.committed_relay_offset(ch()), 0);
+
+        let mut relay_ok = true;
+        let mut direct_send_delivered = false;
+        let mut tui_direct_anchor_terminal_body_visible = false;
+        let mut external_input_lease_consumed_by_relay = false;
+        let mut placeholder_msg_id = Some(MessageId::new(MSG));
+        let mut placeholder_from_restored_inflight = true;
+        let mut last_edit_text = "streamed body".to_string();
+        let mut completion_footer_terminal_target = None;
+        let mut retry_terminal_delivery_from_offset = false;
+        apply_watcher_short_replace_result(
+            result,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            "answer",
+            false,
+            None,
+            WatcherShortReplaceLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct_send_delivered,
+                tui_direct_anchor_terminal_body_visible:
+                    &mut tui_direct_anchor_terminal_body_visible,
+                external_input_lease_consumed_by_relay: &mut external_input_lease_consumed_by_relay,
+                placeholder_msg_id: &mut placeholder_msg_id,
+                placeholder_from_restored_inflight: &mut placeholder_from_restored_inflight,
+                last_edit_text: &mut last_edit_text,
+                completion_footer_terminal_target: &mut completion_footer_terminal_target,
+                retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+            },
+        );
+        assert!(!relay_ok);
+        assert!(retry_terminal_delivery_from_offset);
+        assert!(!direct_send_delivered);
+        assert_eq!(placeholder_msg_id, Some(MessageId::new(MSG)));
+        assert!(placeholder_from_restored_inflight);
+        assert_eq!(last_edit_text, "streamed body");
     }
 
     #[test]

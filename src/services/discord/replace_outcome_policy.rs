@@ -7,7 +7,7 @@
 //!
 //!   1. relay_ok          — is the response considered delivered/committed?
 //!   2. retry_from_offset — must the watcher reset the offset and retry the
-//!                          SAME range (the 5th of 5 failure representations)?
+//!                          SAME range after no confirmed full delivery?
 //!   3. preserve_original — after `SentFallbackAfterEditFailure` the original
 //!                          msg_id is NEVER deleted (#2757): a transient edit
 //!                          failure must not vacuum a message that may already
@@ -63,9 +63,8 @@ pub(super) struct WatcherTerminalRelayPlan {
 }
 
 /// The watcher's post-edit disposition for each outcome of
-/// `replace_long_message_raw_with_outcome`. Only `PartialContinuationFailure`
-/// is the offset-retry signal; everything else either committed already or is a
-/// plain failure handled by the `relay_ok = false` paths.
+/// `replace_long_message_raw_with_outcome`. Any uncommitted full-delivery
+/// failure resets the offset; committed edit/fallback outcomes do not.
 pub(super) fn watcher_terminal_relay_plan(kind: ReplaceOutcomeKind) -> WatcherTerminalRelayPlan {
     match kind {
         // Committed in their own arms (edit consumed / fallback preserved the
@@ -77,17 +76,13 @@ pub(super) fn watcher_terminal_relay_plan(kind: ReplaceOutcomeKind) -> WatcherTe
                 retry_offset: false,
             }
         }
-        // The 5th failure representation: partial send => reset offset and retry
-        // the SAME range next loop; no terminal commit.
-        ReplaceOutcomeKind::PartialContinuationFailure => WatcherTerminalRelayPlan {
-            relay_ok: false,
-            retry_offset: true,
-        },
-        // Transport failure: not committed, but no offset retry either.
-        ReplaceOutcomeKind::TransportError => WatcherTerminalRelayPlan {
-            relay_ok: false,
-            retry_offset: false,
-        },
+        // No confirmed full delivery: reset offset and retry the SAME range next loop.
+        ReplaceOutcomeKind::PartialContinuationFailure | ReplaceOutcomeKind::TransportError => {
+            WatcherTerminalRelayPlan {
+                relay_ok: false,
+                retry_offset: true,
+            }
+        }
     }
 }
 
@@ -104,6 +99,12 @@ pub(super) fn relay_outcome_is_committed(kind: ReplaceOutcomeKind) -> bool {
 /// alias so the deeply-nested watcher arm can read the plan in one short line.
 pub(super) fn watcher_partial_continuation_retry_plan() -> WatcherTerminalRelayPlan {
     watcher_terminal_relay_plan(ReplaceOutcomeKind::PartialContinuationFailure)
+}
+
+/// The watcher's plan for failed full-send paths where no body is confirmed
+/// delivered: preserve failure semantics and rewind for a re-read/re-send.
+pub(super) fn watcher_full_send_failure_retry_plan() -> WatcherTerminalRelayPlan {
+    watcher_terminal_relay_plan(ReplaceOutcomeKind::TransportError)
 }
 
 /// #2757 disposition for the `SentFallbackAfterEditFailure` arm shared by
@@ -196,22 +197,26 @@ mod a0_replace_outcome_policy_tests {
     }
 
     #[test]
-    fn a0_partial_continuation_is_the_offset_retry_failure_signal() {
-        // The 5th of 5 failure representations: not committed, retry the SAME
-        // range from the reset offset. Deleting `retry_... = true` from the
-        // production plan (the codex mutation) makes this assertion fail.
+    fn a0_uncommitted_failures_are_offset_retry_signals() {
+        // Not committed, retry the SAME range from the reset offset. Deleting
+        // `retry_... = true` from the production plan makes these assertions fail.
         let plan = watcher_terminal_relay_plan(ReplaceOutcomeKind::PartialContinuationFailure);
         assert!(!plan.relay_ok, "partial send is NOT a terminal commit");
         assert!(
             plan.retry_offset,
             "partial send MUST reset the offset and retry the same range"
         );
+        let transport = watcher_terminal_relay_plan(ReplaceOutcomeKind::TransportError);
+        assert!(!transport.relay_ok, "a transport error is not committed");
+        assert!(
+            transport.retry_offset,
+            "a transport error MUST reset the offset and retry the same range"
+        );
     }
 
     #[test]
-    fn a0_committed_and_transport_arms_never_request_offset_retry() {
-        // Only PartialContinuationFailure retries. If a mutation made e.g.
-        // EditedOriginal retry, or made a committed arm not-ok, these fail.
+    fn a0_committed_arms_never_request_offset_retry() {
+        // If a mutation made a committed arm retry, or made it not-ok, these fail.
         let edited = watcher_terminal_relay_plan(ReplaceOutcomeKind::EditedOriginal);
         assert!(edited.relay_ok, "an edited original is committed");
         assert!(!edited.retry_offset);
@@ -220,13 +225,6 @@ mod a0_replace_outcome_policy_tests {
             watcher_terminal_relay_plan(ReplaceOutcomeKind::SentFallbackAfterEditFailure);
         assert!(fallback.relay_ok, "a preserved fallback is committed");
         assert!(!fallback.retry_offset);
-
-        let transport = watcher_terminal_relay_plan(ReplaceOutcomeKind::TransportError);
-        assert!(!transport.relay_ok, "a transport error is not committed");
-        assert!(
-            !transport.retry_offset,
-            "a transport error is a plain failure, NOT the offset-retry signal"
-        );
     }
 
     // -- High 2: sink/standby #2757 preserve arm ------------------------------
