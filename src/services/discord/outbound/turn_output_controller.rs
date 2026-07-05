@@ -36,6 +36,7 @@ use super::super::placeholder_controller::{
 };
 use super::super::replace_outcome_policy::{
     WatcherSendFailureClass, classify_watcher_send_failure_message,
+    strip_watcher_send_failure_class_marker,
 };
 use super::super::turn_finalizer::TurnKey;
 use super::super::{
@@ -1100,11 +1101,12 @@ fn classify_transport_failure<L: DeliveryLease + ?Sized>(
             WatcherSendFailureClass::Permanent | WatcherSendFailureClass::RollbackIncomplete
         )
     {
+        let display_error = strip_watcher_send_failure_class_marker(error);
         tracing::warn!(
             channel = ctx.channel_id.get(),
             owner = ?ctx.owner,
             failure_class = class.as_str(),
-            error = %error,
+            error = %display_error,
             "turn-output controller: permanent watcher transport failure will not retry"
         );
         return TransportResult::PermanentFailure;

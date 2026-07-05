@@ -883,7 +883,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         reset_rewind_attempts(
             &mut terminal_rewind_attempt_key,
             &mut terminal_rewind_attempts,
-            watcher_rewind_attempt_key(turn_data_start_offset, watcher_turn_identity.as_ref()),
+            watcher_rewind_attempt_key(
+                turn_data_start_offset,
+                watcher_turn_identity.as_ref(),
+                watcher_instance_id,
+            ),
         );
         // #3041 P1-3 R7: reset carried ACKs after terminal/next-turn splits so later turns cannot inherit them and black-hole.
         let mut split_trailing_turn_follows = false;
@@ -5291,6 +5295,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     error,
                                 }) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
+                                    let display_error = stripped_send_error(&error);
                                     tracing::warn!(
                                         "  [{ts}] ⚠ watcher: terminal response partially delivered in channel {} msg {} (sent_chunks={}, total_chunks={}, failed_chunk_index={}, cleaned_continuations={}, cleanup_errors={}, error={}); preserving inflight for retry",
                                         channel_id.get(),
@@ -5300,7 +5305,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         failed_chunk_index,
                                         sent_continuation_message_ids.len(),
                                         cleanup_errors.len(),
-                                        error
+                                        display_error
                                     );
                                     record_placeholder_cleanup(
                                         &shared,
@@ -5310,7 +5315,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         &tmux_session_name,
                                         PlaceholderCleanupOperation::EditTerminal,
                                         PlaceholderCleanupOutcome::failed(format!(
-                                            "{error}; cleaned_continuations={}; cleanup_errors={}",
+                                            "{display_error}; cleaned_continuations={}; cleanup_errors={}",
                                             sent_continuation_message_ids.len(),
                                             cleanup_errors.len()
                                         )),
@@ -5332,8 +5337,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     retry_terminal_delivery_from_offset = plan.retry_offset;
                                 }
                                 Err(e) => {
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
+                                    info_watcher_failed_relay(e.as_ref());
                                     let plan = watcher_send_failure_plan_warned(
                                         classify_watcher_send_failure(e.as_ref()),
                                         WatcherNoRewindWarnSite::EditFull,
@@ -5416,8 +5420,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 );
                             }
                             Err(e) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
+                                info_watcher_failed_relay(e.as_ref());
                                 let plan = watcher_send_failure_plan_warned(
                                     classify_watcher_send_failure(e.as_ref()),
                                     WatcherNoRewindWarnSite::PlaceholderlessFull,

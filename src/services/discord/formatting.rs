@@ -40,6 +40,10 @@ static REPLACE_CONTINUATION_ROLLBACKS: LazyLock<
     Mutex<HashMap<(u64, u64), ReplaceContinuationRollback>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+static REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 #[path = "formatting/long_send_rollback.rs"]
 mod long_send_rollback;
 
@@ -122,6 +126,31 @@ enum ReplaceContinuationRollbackClaim {
     None,
     Owner(Vec<u64>),
     InProgress(Vec<u64>),
+}
+
+fn remove_replace_continuation_rollback_file(
+    key: (u64, u64),
+    path: &PathBuf,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key)
+        {
+            return Err(std::io::Error::other("forced rollback remove failure"));
+        }
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+fn force_next_replace_continuation_rollback_remove_failure(key: (u64, u64)) {
+    REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key);
 }
 
 pub(crate) fn redact_sensitive_for_placeholder(input: &str) -> String {
@@ -2625,9 +2654,20 @@ fn replace_continuation_rollback_path(key: (u64, u64)) -> Option<PathBuf> {
 
 fn load_persisted_replace_continuation_rollback(key: (u64, u64)) -> Option<Vec<u64>> {
     let path = replace_continuation_rollback_path(key)?;
-    let content = fs::read_to_string(path).ok()?;
+    let content = fs::read_to_string(&path).ok()?;
     let persisted: PersistedReplaceContinuationRollback = serde_json::from_str(&content).ok()?;
+    if persisted.message_ids.is_empty() {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     (!persisted.message_ids.is_empty()).then_some(persisted.message_ids)
+}
+
+fn replace_continuation_rollback_cleared_marker() -> Result<String, String> {
+    serde_json::to_string_pretty(&PersistedReplaceContinuationRollback {
+        message_ids: Vec::new(),
+    })
+    .map_err(|error| format!("serialize cleared continuation rollback marker: {error}"))
 }
 
 fn persist_replace_continuation_rollback(
@@ -2638,14 +2678,19 @@ fn persist_replace_continuation_rollback(
         return Err("runtime root unavailable for continuation rollback".to_string());
     };
     if message_ids.is_empty() {
-        match fs::remove_file(&path) {
+        match remove_replace_continuation_rollback_file(key, &path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!(
-                    "remove continuation rollback {}: {error}",
-                    path.display()
-                ));
+                let cleared_marker = replace_continuation_rollback_cleared_marker()?;
+                super::runtime_store::atomic_write(&path, &cleared_marker).map_err(
+                    |write_error| {
+                        format!(
+                            "remove continuation rollback {}: {error}; write cleared marker failed: {write_error}",
+                            path.display()
+                        )
+                    },
+                )?;
             }
         }
         return Ok(());
@@ -2747,10 +2792,7 @@ fn clear_replace_continuation_rollback_memory_only(key: (u64, u64)) {
 
 fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
     persist_replace_continuation_rollback(key, &[])?;
-    REPLACE_CONTINUATION_ROLLBACKS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&key);
+    clear_replace_continuation_rollback_memory_only(key);
     Ok(())
 }
 
@@ -2955,6 +2997,43 @@ mod replace_long_message_tests {
         );
 
         super::clear_replace_continuation_rollback(key).expect("clear rollback");
+    }
+
+    #[test]
+    fn continuation_rollback_clear_remove_failure_writes_cleared_marker_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(35), MessageId::new(41));
+
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+        super::record_replace_continuation_rollback(key, vec![721, 722]).expect("record rollback");
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        assert!(rollback_path.exists(), "rollback sidecar must be persisted");
+
+        super::force_next_replace_continuation_rollback_remove_failure(key);
+        super::clear_replace_continuation_rollback(key)
+            .expect("clear should write a cleared marker after remove failure");
+        let marker = std::fs::read_to_string(&rollback_path).expect("cleared marker");
+        assert!(
+            marker.contains("\"message_ids\": []"),
+            "clear marker must erase delivered rollback ids"
+        );
+
+        super::REPLACE_CONTINUATION_ROLLBACKS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            !rollback_path.exists(),
+            "claiming a cleared marker should best-effort remove it"
+        );
     }
 
     #[test]

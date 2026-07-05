@@ -104,6 +104,21 @@ fn parse_watcher_send_failure_class_marker(message: &str) -> Option<WatcherSendF
     }
 }
 
+pub(in crate::services::discord) fn strip_watcher_send_failure_class_marker(message: &str) -> &str {
+    let Some(rest) = message.strip_prefix(WATCHER_SEND_FAILURE_CLASS_PREFIX) else {
+        return message;
+    };
+    let Some((class, unmarked)) = rest.split_once(']') else {
+        return message;
+    };
+    match class {
+        "transient" | "permanent" | "rollback_incomplete" => {
+            unmarked.strip_prefix(' ').unwrap_or(unmarked)
+        }
+        _ => message,
+    }
+}
+
 pub(in crate::services::discord) fn watcher_send_failure_message_has_class_marker(
     message: &str,
 ) -> bool {
@@ -354,9 +369,9 @@ mod a0_replace_outcome_policy_tests {
         EditFailFallbackDisposition, ReplaceOutcomeKind, WatcherRewindAttemptDisposition,
         WatcherSendFailureClass, classify_watcher_send_failure_message,
         classify_watcher_send_failure_status, edit_fail_fallback_disposition,
-        relay_outcome_is_committed, watcher_rewind_attempt_disposition,
-        watcher_send_failure_classified_message, watcher_send_failure_retry_plan,
-        watcher_terminal_relay_plan,
+        relay_outcome_is_committed, strip_watcher_send_failure_class_marker,
+        watcher_rewind_attempt_disposition, watcher_send_failure_classified_message,
+        watcher_send_failure_retry_plan, watcher_terminal_relay_plan,
     };
 
     fn partial_continuation() -> ReplaceLongMessageOutcome {
@@ -508,6 +523,28 @@ mod a0_replace_outcome_policy_tests {
             WatcherSendFailureClass::Permanent,
             "structured class must beat fallback string sniffing"
         );
+    }
+
+    #[test]
+    fn watcher_send_failure_strip_class_marker_removes_only_valid_prefix_4154() {
+        let marked = watcher_send_failure_classified_message(
+            WatcherSendFailureClass::RollbackIncomplete,
+            "cleanup incomplete",
+        );
+        assert_eq!(
+            strip_watcher_send_failure_class_marker(&marked),
+            "cleanup incomplete"
+        );
+
+        let embedded = format!("log context: {marked}");
+        assert_eq!(
+            strip_watcher_send_failure_class_marker(&embedded),
+            embedded,
+            "only a leading valid class marker is stripped"
+        );
+
+        let unknown = "[agentdesk-watcher-send-failure-class:unknown] cleanup incomplete";
+        assert_eq!(strip_watcher_send_failure_class_marker(unknown), unknown);
     }
 
     #[test]

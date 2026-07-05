@@ -840,6 +840,10 @@ async fn deliver_response(
                     cleanup_errors,
                     error,
                 }) => {
+                    let display_error =
+                        super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                            &error,
+                        );
                     tracing::warn!(
                         "  [{ts}] ⚠ standby_relay partially delivered terminal response in channel {} msg {} (sent_chunks={}, total_chunks={}, failed_chunk_index={}, cleaned_continuations={}, cleanup_errors={}, error={})",
                         channel_id.get(),
@@ -849,7 +853,7 @@ async fn deliver_response(
                         failed_chunk_index,
                         sent_continuation_message_ids.len(),
                         cleanup_errors.len(),
-                        error
+                        display_error
                     );
                     committed
                 }
