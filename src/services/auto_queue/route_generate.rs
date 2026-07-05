@@ -176,18 +176,22 @@ pub async fn generate(
     // — return 500 so the caller does not silently get a duplicate dispatch.
     let mut active_dispatch_skips: Vec<serde_json::Value> = Vec::new();
     {
-        let card_ids: Vec<String> = cards.iter().map(|c| c.card_id.clone()).collect();
-        let active_dispatches = match active_dispatch_ids_for_cards_pg(pool, &card_ids).await {
-            Ok(map) => map,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": format!(
-                            "active-dispatch batch lookup failed: {error}"
-                        ),
-                    })),
-                );
+        let active_dispatches = if cards.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let card_ids: Vec<String> = cards.iter().map(|c| c.card_id.clone()).collect();
+            match active_dispatch_ids_for_cards_pg(pool, &card_ids).await {
+                Ok(map) => map,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!(
+                                "active-dispatch batch lookup failed: {error}"
+                            ),
+                        })),
+                    );
+                }
             }
         };
 
@@ -724,6 +728,9 @@ pub(crate) async fn active_dispatch_ids_for_cards_pg(
     pool: &sqlx::PgPool,
     card_ids: &[String],
 ) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    if card_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
     let rows = sqlx::query_as::<_, (String, String)>(
         "SELECT DISTINCT ON (kanban_card_id) kanban_card_id, id
          FROM task_dispatches

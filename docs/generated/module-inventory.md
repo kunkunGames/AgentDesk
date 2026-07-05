@@ -346,7 +346,7 @@
 | `services::auto_queue::planning` | `src/services/auto_queue/planning.rs` | 285 | 285 | 0 |  |
 | `services::auto_queue::query` | `src/services/auto_queue/query.rs` | 270 | 250 | 20 |  |
 | `services::auto_queue::route` | `src/services/auto_queue/route.rs` | 96 | 96 | 0 |  |
-| `services::auto_queue::route_generate` | `src/services/auto_queue/route_generate.rs` | 743 | 743 | 0 |  |
+| `services::auto_queue::route_generate` | `src/services/auto_queue/route_generate.rs` | 750 | 750 | 0 |  |
 | `services::auto_queue::route_request_generate` | `src/services/auto_queue/route_request_generate.rs` | 369 | 275 | 94 |  |
 | `services::auto_queue::route_types` | `src/services/auto_queue/route_types.rs` | 152 | 152 | 0 |  |
 | `services::auto_queue::runtime` | `src/services/auto_queue/runtime.rs` | 387 | 387 | 0 |  |
