@@ -194,43 +194,41 @@ pub(in crate::services::discord) async fn evaluate(
     // Fresh watcher heartbeat wins before terminal-envelope evidence. A live
     // watcher is the safer owner for a just-finished turn; if it disappears, the
     // next gate pass can still accept the terminal envelope.
-    let watcher_heartbeat_stale =
-        if let Some(tmux_session) = snapshot.pin.tmux_session_name.as_deref() {
-            match shared.tmux_watchers.tmux_session_is_stale(tmux_session) {
-                Some(false) => {
-                    if let Some(output_path) = shared
-                        .tmux_watchers
-                        .watcher_output_path(tmux_session)
-                    {
-                        if fresh_watcher_heartbeat_should_block(
-                            shared,
-                            watcher_owner_channel,
-                            snapshot,
-                            &output_path,
-                        ) {
-                            return DestructiveCancelGate::Denied("fresh_watcher_heartbeat");
-                        }
+    let watcher_heartbeat_stale = if let Some(tmux_session) =
+        snapshot.pin.tmux_session_name.as_deref()
+    {
+        match shared.tmux_watchers.tmux_session_is_stale(tmux_session) {
+            Some(false) => {
+                if let Some(output_path) = shared.tmux_watchers.watcher_output_path(tmux_session) {
+                    if fresh_watcher_heartbeat_should_block(
+                        shared,
+                        watcher_owner_channel,
+                        snapshot,
+                        &output_path,
+                    ) {
+                        return DestructiveCancelGate::Denied("fresh_watcher_heartbeat");
                     }
-                    true
                 }
-                Some(true) => true,
-                None => false,
+                true
             }
-        } else if let Some(watcher) = shared.tmux_watchers.get(&watcher_owner_channel) {
-            if !watcher.heartbeat_stale() {
-                if fresh_watcher_heartbeat_should_block(
-                    shared,
-                    watcher_owner_channel,
-                    snapshot,
-                    &watcher.output_path,
-                ) {
-                    return DestructiveCancelGate::Denied("fresh_watcher_heartbeat");
-                }
+            Some(true) => true,
+            None => false,
+        }
+    } else if let Some(watcher) = shared.tmux_watchers.get(&watcher_owner_channel) {
+        if !watcher.heartbeat_stale() {
+            if fresh_watcher_heartbeat_should_block(
+                shared,
+                watcher_owner_channel,
+                snapshot,
+                &watcher.output_path,
+            ) {
+                return DestructiveCancelGate::Denied("fresh_watcher_heartbeat");
             }
-            true
-        } else {
-            false
-        };
+        }
+        true
+    } else {
+        false
+    };
 
     if terminal_envelope_present(provider, snapshot) {
         return DestructiveCancelGate::Allowed("terminal_envelope_present");

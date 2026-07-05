@@ -1148,9 +1148,7 @@ fn selected_provider_resume_selector(
         .or_else(|| raw_provider_resume_selector(ids))
 }
 
-fn raw_provider_resume_selector(
-    ids: &dispatched_sessions_db::ProviderSessionIds,
-) -> Option<&str> {
+fn raw_provider_resume_selector(ids: &dispatched_sessions_db::ProviderSessionIds) -> Option<&str> {
     ids.raw_provider_session_id
         .as_deref()
         .map(str::trim)
@@ -1200,17 +1198,21 @@ fn claude_selector_file_activity(
     )
     .ok()?;
     let Ok(metadata) = std::fs::metadata(&path) else {
-        return Some(crate::services::session_selector_validity::SelectorFileActivity {
-            exists: false,
-            len: 0,
-            mtime_age_secs: None,
-        });
+        return Some(
+            crate::services::session_selector_validity::SelectorFileActivity {
+                exists: false,
+                len: 0,
+                mtime_age_secs: None,
+            },
+        );
     };
-    Some(crate::services::session_selector_validity::SelectorFileActivity {
-        exists: true,
-        len: metadata.len(),
-        mtime_age_secs: file_mtime_age_secs(&metadata),
-    })
+    Some(
+        crate::services::session_selector_validity::SelectorFileActivity {
+            exists: true,
+            len: metadata.len(),
+            mtime_age_secs: file_mtime_age_secs(&metadata),
+        },
+    )
 }
 
 fn file_mtime_age_secs(metadata: &std::fs::Metadata) -> Option<i64> {
@@ -1241,7 +1243,8 @@ fn provider_resume_selector_is_effective_with_claude_home(
         return selected_provider_resume_selector(ids).is_some();
     }
 
-    let Some(selector) = selected_provider_resume_selector_with_claude_home(ids, claude_home) else {
+    let Some(selector) = selected_provider_resume_selector_with_claude_home(ids, claude_home)
+    else {
         return false;
     };
 

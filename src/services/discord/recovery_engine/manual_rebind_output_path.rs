@@ -55,13 +55,10 @@ pub(super) async fn saved_output_path_for_rebind_resolution<'a>(
     existing_session_id: Option<&str>,
     tmux_session_name: &str,
 ) -> Option<&'a str> {
-    let session_cache_selector_present = session_cache_selector_present_for_rebind(
-        shared,
-        provider,
-        tmux_session_name,
-    )
-    .await
-    .unwrap_or_else(|| existing_session_id.is_some_and(|id| !id.trim().is_empty()));
+    let session_cache_selector_present =
+        session_cache_selector_present_for_rebind(shared, provider, tmux_session_name)
+            .await
+            .unwrap_or_else(|| existing_session_id.is_some_and(|id| !id.trim().is_empty()));
     saved_output_path_for_rebind_resolution_with_cache_state(
         existing_saved_output_path,
         session_cache_selector_present,
@@ -129,9 +126,8 @@ fn saved_output_path_activity(path: &str) -> Option<SavedOutputPathActivity> {
 }
 
 fn latest_runtime_activity_age_secs(tmux_session_name: &str) -> Option<i64> {
-    let activity = crate::services::dispatched_sessions::latest_runtime_activity_unix_nanos(
-        tmux_session_name,
-    );
+    let activity =
+        crate::services::dispatched_sessions::latest_runtime_activity_unix_nanos(tmux_session_name);
     if activity <= 0 {
         return None;
     }

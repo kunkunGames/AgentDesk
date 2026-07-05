@@ -15,8 +15,8 @@
 //! stays valid for its `health` caller; the rest of the cluster is private to this
 //! module. Moved verbatim — zero logic change.
 
-use super::*;
 use super::manual_rebind_output_path::saved_output_path_for_rebind_resolution;
+use super::*;
 
 struct PendingCodexTuiRebindRelay {
     rollout_path: String,
