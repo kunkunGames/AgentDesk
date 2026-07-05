@@ -729,7 +729,7 @@ pub(crate) async fn active_dispatch_ids_for_cards_pg(
          FROM task_dispatches
          WHERE kanban_card_id = ANY($1)
            AND status IN ('pending', 'dispatched')
-         ORDER BY kanban_card_id, created_at DESC"
+         ORDER BY kanban_card_id, created_at DESC",
     )
     .bind(card_ids)
     .fetch_all(pool)
