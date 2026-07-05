@@ -749,9 +749,14 @@ async fn deliver_response(
                 )
                 .await
                 {
+                    let error = error.to_string();
+                    let display_error =
+                        super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                            &error,
+                        );
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!(
-                        "  [{ts}] ⚠ standby_relay long send failed for channel {}: {error}",
+                        "  [{ts}] ⚠ standby_relay long send failed for channel {}: {display_error}",
                         channel_id.get()
                     );
                     return false;
@@ -858,8 +863,13 @@ async fn deliver_response(
                     committed
                 }
                 Err(e) => {
+                    let error = e.to_string();
+                    let display_error =
+                        super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                            &error,
+                        );
                     tracing::warn!(
-                        "  [{ts}] ⚠ standby_relay edit failed for channel {} msg {}: {e}",
+                        "  [{ts}] ⚠ standby_relay edit failed for channel {} msg {}: {display_error}",
                         channel_id.get(),
                         msg_id.get()
                     );

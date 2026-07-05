@@ -87,6 +87,8 @@ pub(in crate::services::discord) fn watcher_send_failure_classified_message(
     class: WatcherSendFailureClass,
     message: impl std::fmt::Display,
 ) -> String {
+    let message = message.to_string();
+    let message = strip_watcher_send_failure_class_marker(&message);
     format!(
         "{WATCHER_SEND_FAILURE_CLASS_PREFIX}{}] {message}",
         class.as_str()
@@ -105,17 +107,20 @@ fn parse_watcher_send_failure_class_marker(message: &str) -> Option<WatcherSendF
 }
 
 pub(in crate::services::discord) fn strip_watcher_send_failure_class_marker(message: &str) -> &str {
-    let Some(rest) = message.strip_prefix(WATCHER_SEND_FAILURE_CLASS_PREFIX) else {
-        return message;
-    };
-    let Some((class, unmarked)) = rest.split_once(']') else {
-        return message;
-    };
-    match class {
-        "transient" | "permanent" | "rollback_incomplete" => {
-            unmarked.strip_prefix(' ').unwrap_or(unmarked)
+    let mut unmarked = message;
+    loop {
+        let Some(rest) = unmarked.strip_prefix(WATCHER_SEND_FAILURE_CLASS_PREFIX) else {
+            return unmarked;
+        };
+        let Some((class, rest)) = rest.split_once(']') else {
+            return unmarked;
+        };
+        match class {
+            "transient" | "permanent" | "rollback_incomplete" => {
+                unmarked = rest.strip_prefix(' ').unwrap_or(rest);
+            }
+            _ => return unmarked,
         }
-        _ => message,
     }
 }
 
@@ -523,6 +528,23 @@ mod a0_replace_outcome_policy_tests {
             WatcherSendFailureClass::Permanent,
             "structured class must beat fallback string sniffing"
         );
+
+        let reclassified = watcher_send_failure_classified_message(
+            WatcherSendFailureClass::Permanent,
+            watcher_send_failure_classified_message(
+                WatcherSendFailureClass::Transient,
+                "Error while sending HTTP request.",
+            ),
+        );
+        assert_eq!(
+            classify_watcher_send_failure_message(&reclassified),
+            WatcherSendFailureClass::Permanent,
+            "outer classification should replace an existing prefix marker"
+        );
+        assert_eq!(
+            strip_watcher_send_failure_class_marker(&reclassified),
+            "Error while sending HTTP request."
+        );
     }
 
     #[test]
@@ -534,6 +556,16 @@ mod a0_replace_outcome_policy_tests {
         assert_eq!(
             strip_watcher_send_failure_class_marker(&marked),
             "cleanup incomplete"
+        );
+        let double_marked = format!(
+            "{}{}",
+            watcher_send_failure_classified_message(WatcherSendFailureClass::Transient, ""),
+            marked
+        );
+        assert_eq!(
+            strip_watcher_send_failure_class_marker(&double_marked),
+            "cleanup incomplete",
+            "legacy repeated leading class markers should all be stripped"
         );
 
         let embedded = format!("log context: {marked}");

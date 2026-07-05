@@ -36,6 +36,10 @@ pub(super) use super::reaction_lifecycle::is_real_discord_message_id;
 #[cfg(test)]
 pub(super) use super::reaction_lifecycle::reaction_target_channel_for_shared;
 
+// This mutex serializes both the process-local rollback map and every sidecar
+// mutation for the same protocol: atomic writes, clears, empty-marker writes,
+// and claim-side empty-marker GC. Keeping the fs operation under the same lock
+// prevents a claimer from deleting a freshly-written durable debt.
 static REPLACE_CONTINUATION_ROLLBACKS: LazyLock<
     Mutex<HashMap<(u64, u64), ReplaceContinuationRollback>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -119,6 +123,13 @@ struct ReplaceContinuationRollback {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct PersistedReplaceContinuationRollback {
     message_ids: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistReplaceContinuationRollbackOutcome {
+    Recorded,
+    Removed,
+    ClearedMarkerWritten,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2654,8 +2665,39 @@ fn replace_continuation_rollback_path(key: (u64, u64)) -> Option<PathBuf> {
 
 fn load_persisted_replace_continuation_rollback(key: (u64, u64)) -> Option<Vec<u64>> {
     let path = replace_continuation_rollback_path(key)?;
-    let content = fs::read_to_string(&path).ok()?;
-    let persisted: PersistedReplaceContinuationRollback = serde_json::from_str(&content).ok()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            // Fail open for corrupt/unreadable sidecars: runtime_store::atomic_write
+            // uses a temp file, fsync, and same-dir rename, so torn files cannot be
+            // self-produced. Treating an unparseable file as debt would reintroduce
+            // the r4 permanent send-block without a bounded probe.
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
+            );
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+    };
+    let persisted: PersistedReplaceContinuationRollback = match serde_json::from_str(&content) {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            // Fail open for corrupt sidecars: runtime_store::atomic_write uses a
+            // temp file, fsync, and same-dir rename, so torn files cannot be
+            // self-produced. Treating corrupt data as debt would reintroduce the
+            // r4 permanent send-block without a bounded probe.
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to parse continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
+            );
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+    };
     if persisted.message_ids.is_empty() {
         let _ = fs::remove_file(&path);
         return None;
@@ -2673,7 +2715,7 @@ fn replace_continuation_rollback_cleared_marker() -> Result<String, String> {
 fn persist_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: &[u64],
-) -> Result<(), String> {
+) -> Result<PersistReplaceContinuationRollbackOutcome, String> {
     let Some(path) = replace_continuation_rollback_path(key) else {
         return Err("runtime root unavailable for continuation rollback".to_string());
     };
@@ -2691,16 +2733,18 @@ fn persist_replace_continuation_rollback(
                         )
                     },
                 )?;
+                return Ok(PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten);
             }
         }
-        return Ok(());
+        return Ok(PersistReplaceContinuationRollbackOutcome::Removed);
     }
     let persisted = PersistedReplaceContinuationRollback {
         message_ids: message_ids.to_vec(),
     };
     let json = serde_json::to_string_pretty(&persisted)
         .map_err(|error| format!("serialize continuation rollback: {error}"))?;
-    super::runtime_store::atomic_write(&path, &json)
+    super::runtime_store::atomic_write(&path, &json)?;
+    Ok(PersistReplaceContinuationRollbackOutcome::Recorded)
 }
 
 fn claim_replace_continuation_rollback(key: (u64, u64)) -> ReplaceContinuationRollbackClaim {
@@ -2743,12 +2787,26 @@ fn record_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: Vec<u64>,
 ) -> Result<(), String> {
-    persist_replace_continuation_rollback(key, &message_ids)?;
     let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let outcome = persist_replace_continuation_rollback(key, &message_ids)?;
     if message_ids.is_empty() {
-        rollbacks.remove(&key);
+        match outcome {
+            PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
+                rollbacks.insert(
+                    key,
+                    ReplaceContinuationRollback {
+                        message_ids: Vec::new(),
+                        claimed: false,
+                    },
+                );
+            }
+            PersistReplaceContinuationRollbackOutcome::Removed
+            | PersistReplaceContinuationRollbackOutcome::Recorded => {
+                rollbacks.remove(&key);
+            }
+        }
     } else {
         rollbacks.insert(
             key,
@@ -2791,8 +2849,24 @@ fn clear_replace_continuation_rollback_memory_only(key: (u64, u64)) {
 }
 
 fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
-    persist_replace_continuation_rollback(key, &[])?;
-    clear_replace_continuation_rollback_memory_only(key);
+    let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match persist_replace_continuation_rollback(key, &[])? {
+        PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
+            rollbacks.insert(
+                key,
+                ReplaceContinuationRollback {
+                    message_ids: Vec::new(),
+                    claimed: false,
+                },
+            );
+        }
+        PersistReplaceContinuationRollbackOutcome::Removed
+        | PersistReplaceContinuationRollbackOutcome::Recorded => {
+            rollbacks.remove(&key);
+        }
+    }
     Ok(())
 }
 
@@ -3033,6 +3107,54 @@ mod replace_long_message_tests {
         assert!(
             !rollback_path.exists(),
             "claiming a cleared marker should best-effort remove it"
+        );
+    }
+
+    #[test]
+    fn continuation_rollback_successful_clear_removes_memory_entry_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(37), MessageId::new(41));
+
+        super::record_replace_continuation_rollback(key, vec![731, 732]).expect("record rollback");
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+
+        assert!(
+            !super::REPLACE_CONTINUATION_ROLLBACKS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key),
+            "successful clear should leave absence, not a permanent tombstone"
+        );
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+    }
+
+    #[test]
+    fn continuation_rollback_corrupt_sidecar_warns_open_and_removes_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(39), MessageId::new(45));
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        std::fs::create_dir_all(rollback_path.parent().expect("rollback parent"))
+            .expect("create rollback parent");
+        std::fs::write(&rollback_path, "{not-json").expect("write corrupt sidecar");
+
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            !rollback_path.exists(),
+            "corrupt rollback sidecar should be removed after fail-open"
         );
     }
 

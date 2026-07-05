@@ -883,11 +883,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         reset_rewind_attempts(
             &mut terminal_rewind_attempt_key,
             &mut terminal_rewind_attempts,
-            watcher_rewind_attempt_key(
-                turn_data_start_offset,
-                watcher_turn_identity.as_ref(),
-                watcher_instance_id,
-            ),
+            watcher_rewind_attempt_key(turn_data_start_offset, watcher_turn_identity.as_ref()),
         );
         // #3041 P1-3 R7: reset carried ACKs after terminal/next-turn splits so later turns cannot inherit them and black-hole.
         let mut split_trailing_turn_follows = false;

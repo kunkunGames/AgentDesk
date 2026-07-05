@@ -134,26 +134,26 @@ pub(super) fn watcher_terminal_rewind_seed(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct WatcherRewindAttemptKey {
+    // The rewind cap state is task-local in the watcher loop, so watcher
+    // instance IDs are reborn with the state and cannot discriminate production
+    // equality. Per-turn separation comes from turn_data_start_offset because
+    // the buffered output start offset advances when the watcher moves to the
+    // next terminal turn.
     turn_data_start_offset: u64,
     user_msg_id: u64,
     started_at: Option<String>,
     inflight_turn_start_offset: Option<u64>,
-    identityless_watcher_instance_id: Option<u64>,
 }
 
 pub(super) fn watcher_rewind_attempt_key(
     turn_data_start_offset: u64,
     identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
-    watcher_instance_id: u64,
 ) -> WatcherRewindAttemptKey {
     WatcherRewindAttemptKey {
         turn_data_start_offset,
         user_msg_id: identity.map(|identity| identity.user_msg_id).unwrap_or(0),
         started_at: identity.map(|identity| identity.started_at.clone()),
         inflight_turn_start_offset: identity.and_then(|identity| identity.turn_start_offset),
-        // Real inflight identities already carry durable turn components. Only
-        // the no-inflight fallback needs a watcher-instance discriminator.
-        identityless_watcher_instance_id: identity.is_none().then_some(watcher_instance_id),
     }
 }
 
@@ -381,7 +381,7 @@ mod rewind_attempt_key_tests {
         reset_rewind_attempts(
             &mut key,
             &mut attempts,
-            watcher_rewind_attempt_key(128, Some(&first), 1),
+            watcher_rewind_attempt_key(128, Some(&first)),
         );
         assert_eq!(attempts, 0);
 
@@ -389,55 +389,18 @@ mod rewind_attempt_key_tests {
         reset_rewind_attempts(
             &mut key,
             &mut attempts,
-            watcher_rewind_attempt_key(128, Some(&first), 2),
+            watcher_rewind_attempt_key(128, Some(&first)),
         );
-        assert_eq!(
-            attempts, 3,
-            "same offset and identity keeps the cap across watcher instances"
-        );
+        assert_eq!(attempts, 3, "same offset and identity keeps the cap");
 
         reset_rewind_attempts(
             &mut key,
             &mut attempts,
-            watcher_rewind_attempt_key(128, Some(&second), 2),
+            watcher_rewind_attempt_key(128, Some(&second)),
         );
         assert_eq!(
             attempts, 0,
             "same offset with a new turn identity resets the rewind cap"
-        );
-    }
-
-    #[test]
-    fn reset_rewind_attempts_keys_identityless_turns_by_watcher_instance_4115() {
-        let mut key = None;
-        let mut attempts = 3;
-
-        reset_rewind_attempts(
-            &mut key,
-            &mut attempts,
-            watcher_rewind_attempt_key(128, None, 1),
-        );
-        assert_eq!(attempts, 0);
-
-        attempts = 3;
-        reset_rewind_attempts(
-            &mut key,
-            &mut attempts,
-            watcher_rewind_attempt_key(128, None, 1),
-        );
-        assert_eq!(
-            attempts, 3,
-            "same offset without identity keeps the cap within one watcher instance"
-        );
-
-        reset_rewind_attempts(
-            &mut key,
-            &mut attempts,
-            watcher_rewind_attempt_key(128, None, 2),
-        );
-        assert_eq!(
-            attempts, 0,
-            "same offset without identity resets across watcher instances"
         );
     }
 }
