@@ -223,21 +223,70 @@ pub(in crate::services::discord) use store::{
 use store::{root, tombstone_root};
 
 /// `true` iff this tombstone is commit evidence for this marker's recorded
-/// foreign turn: same tmux session AND the committed identity IS the pinned
-/// foreign identity (the codex-r1 positive correlation — identity-absent
-/// markers match nothing, and an unrelated turn's tombstone never covers).
+/// turn: same tmux session AND the committed turn satisfies this marker kind's
+/// cover gate. Abort markers require exact foreign identity (codex-r1 positive
+/// correlation); DeferredClaim markers require the pinned committed user id
+/// plus a turn start at-or-after the recorded own-start boundary (#4159).
 fn commit_tombstone_matches_marker(marker: &AbortedAnchorMarker, t: &CommitTombstone) -> bool {
     t.tmux_session_name == marker.tmux_session_name
-        && marker.matches_foreign_identity(t.committed_user_msg_id, &t.committed_started_at)
+        && commit_identity_covers_marker(marker, t.committed_user_msg_id, &t.committed_started_at)
+}
+
+fn local_started_at(value: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()
+}
+
+fn rfc3339_started_at(value: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value).ok()
+}
+
+/// Fail-closed start-boundary proof for DeferredClaim commit evidence (#4159).
+/// Inflight `started_at` is persisted as a lexicographically sortable local
+/// timestamp today, while some frame tests use RFC3339. Compare only when both
+/// sides parse under the same representation; mixed/unknown formats are not
+/// proof that the commit belongs to a turn started at-or-after the boundary.
+fn committed_started_at_on_or_after_boundary(committed_started_at: &str, boundary: &str) -> bool {
+    if let (Some(committed), Some(boundary)) = (
+        local_started_at(committed_started_at),
+        local_started_at(boundary),
+    ) {
+        return committed >= boundary;
+    }
+    if let (Some(committed), Some(boundary)) = (
+        rfc3339_started_at(committed_started_at),
+        rfc3339_started_at(boundary),
+    ) {
+        return committed >= boundary;
+    }
+    false
+}
+
+fn commit_identity_covers_marker(
+    marker: &AbortedAnchorMarker,
+    committed_user_msg_id: u64,
+    committed_started_at: &str,
+) -> bool {
+    match marker.origin {
+        MarkerOrigin::Abort => {
+            marker.matches_foreign_identity(committed_user_msg_id, committed_started_at)
+        }
+        MarkerOrigin::DeferredClaim => {
+            let Some(boundary) = marker.foreign_started_at.as_deref() else {
+                return false;
+            };
+            marker.foreign_user_msg_id == Some(committed_user_msg_id)
+                && committed_started_at_on_or_after_boundary(committed_started_at, boundary)
+        }
+    }
 }
 
 /// Record-instant 대조 (codex r2 — replaces the unfounded "pre-covered"
-/// promotion): a tombstone matching the marker's foreign identity ALREADY
-/// durable at record time means that turn terminal-committed before this
-/// marker existed (its drain pass could never see it) → stamp covered with
-/// the commit instant. No wall-clock condition — the structural argument that
-/// makes the sweep 대조's `>=` safe ([`post_abort_commit_tombstone`]) holds a
-/// fortiori for evidence predating the marker.
+/// promotion): a tombstone satisfying the marker's commit-evidence gate
+/// ALREADY durable at record time means that turn terminal-committed before
+/// this marker existed (its drain pass could never see it) → stamp covered
+/// with the commit instant. No wall-clock condition — the structural argument
+/// that makes the sweep 대조's `>=` safe ([`post_abort_commit_tombstone`])
+/// holds a fortiori for evidence predating the marker.
 pub(super) fn cover_from_commit_tombstone(marker: &mut AbortedAnchorMarker) -> bool {
     if marker.covered_at_ms.is_some() {
         return false;
@@ -252,15 +301,16 @@ pub(super) fn cover_from_commit_tombstone(marker: &mut AbortedAnchorMarker) -> b
     true
 }
 
-/// Sweep-side 대조: a tombstone covers an UNCOVERED marker when it matches the
-/// foreign identity AND its commit is not EARLIER than the abort. `>=`, not
-/// `>` (codex r3): identity is the PRIMARY evidence — the ABORT fired because
-/// the recorded foreign turn stayed live through the whole 32s backstop, so a
-/// commit of THAT turn cannot predate the input submission (itself before the
-/// marker existed); an identity-matched same-ms commit is therefore
-/// necessarily post-submission, and strict `>` only ever rejected ANSWERED
-/// anchors at the ms boundary (false `⚠`). The record-instant 대조 above owns
-/// evidence predating the marker; this subsidiary guard mirrors the drain's.
+/// Sweep-side 대조: a tombstone covers an UNCOVERED marker when it satisfies
+/// the marker's commit-evidence gate AND its commit is not EARLIER than the
+/// abort. `>=`, not `>` (codex r3): identity/start evidence is PRIMARY — the
+/// ABORT fired because the recorded foreign turn stayed live through the whole
+/// 32s backstop, so a commit of THAT turn cannot predate the input submission
+/// (itself before the marker existed); an evidence-matched same-ms commit is
+/// therefore necessarily post-submission, and strict `>` only ever rejected
+/// ANSWERED anchors at the ms boundary (false `⚠`). The record-instant 대조
+/// above owns evidence predating the marker; this subsidiary guard mirrors the
+/// drain's.
 pub(super) fn post_abort_commit_tombstone(marker: &AbortedAnchorMarker) -> Option<u64> {
     load_commit_tombstones(&marker.provider, marker.channel_id)
         .into_iter()
@@ -345,17 +395,20 @@ pub(super) fn decide_marker_disposition(
 }
 
 /// Does a terminal commit by `(committed_user_msg_id, committed_started_at)`
-/// cover this marker? Codex r1: POSITIVE correlation required — the committed
-/// turn must BE the foreign prior inflight recorded at ABORT time (the old
-/// wall-clock-only condition let a racing prior-owner commit, a re-created
-/// same-name tmux session, and a dropped-input prior commit each false-`✅` a
-/// possibly-unanswered anchor); not-earlier-than-abort stays as a SUBSIDIARY
-/// guard only (`>=` since codex r3 — a commit in the abort's OWN millisecond
-/// covers; safety argument at [`post_abort_commit_tombstone`]). Identity-
-/// absent (legacy) markers never cover here — the sweep bound is their sole
-/// terminator. Deliberately NO TTL upper bound (verify r1): the sweep defers
-/// to a live same-session inflight, so a foreign turn streaming past the TTL
-/// must still have its eventual commit accepted.
+/// cover this marker? Codex r1: POSITIVE correlation required. Abort markers
+/// still require the committed turn to BE the foreign prior inflight recorded
+/// at ABORT time. DeferredClaim markers add the #4159 own-start boundary:
+/// same committed user id, and a committed `started_at` proven at-or-after the
+/// marker's recorded own synthetic turn start. The old wall-clock-only
+/// condition let a racing prior-owner commit, a re-created same-name tmux
+/// session, and a dropped-input prior commit each false-`✅` a possibly-
+/// unanswered anchor; not-earlier-than-abort stays as a SUBSIDIARY guard only
+/// (`>=` since codex r3 — a commit in the abort's OWN millisecond covers;
+/// safety argument at [`post_abort_commit_tombstone`]). Identity/start-absent
+/// markers never cover here — the sweep bound is their sole terminator.
+/// Deliberately NO TTL upper bound (verify r1): the sweep defers to a live
+/// same-session inflight, so a foreign turn streaming past the TTL must still
+/// have its eventual commit accepted.
 pub(super) fn terminal_commit_covers_marker(
     now_ms: u64,
     marker: &AbortedAnchorMarker,
@@ -364,7 +417,7 @@ pub(super) fn terminal_commit_covers_marker(
 ) -> bool {
     marker.anchor_message_id != 0
         && now_ms >= marker.aborted_at_ms
-        && marker.matches_foreign_identity(committed_user_msg_id, committed_started_at)
+        && commit_identity_covers_marker(marker, committed_user_msg_id, committed_started_at)
 }
 
 /// Does a live same-channel inflight defer the sweep's `⚠` fallback for this
@@ -2100,6 +2153,102 @@ mod tests {
             "exactly one ⏳ → ✅ on the pinned anchor (I4)"
         );
         assert!(load_for_channel("claude", 100).is_empty());
+    }
+
+    /// #4159: DeferredClaim drain evidence is start-bounded by the marker's
+    /// recorded OWN synthetic turn start. This simulates the synthetic-id
+    /// shape where successive terminal frames share `user_msg_id == 0`: a
+    /// leftover terminal commit from a turn that started BEFORE the marker's
+    /// own start must leave the anchor pending, while a later turn can drain it.
+    #[test]
+    fn deferred_claim_marker_drain_requires_commit_started_at_or_after_own_boundary() {
+        let _root = test_root();
+        let marker = AbortedAnchorMarker::for_deferred_claim(
+            "claude".into(),
+            100,
+            710,
+            "tmux-100".into(),
+            10_000,
+            (0, OWN_STARTED_AT.into()),
+        );
+        record(&marker).unwrap();
+        let (applier, calls) = recording_applier(ReactionDelivery::Delivered);
+        let rt = test_rt();
+
+        let drained = rt.block_on(drain_on_terminal_commit_with_applier(
+            "claude",
+            "tmux-100",
+            100,
+            10_005,
+            0,
+            "2026-06-10 12:59:59",
+            &applier,
+        ));
+        assert_eq!(
+            drained, 0,
+            "a terminal commit from a turn started before the DeferredClaim \
+             own-start boundary must not drain the anchor"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no premature ⏳ → ✅ reaction may be attempted"
+        );
+        assert_eq!(
+            load_for_channel("claude", 100),
+            vec![marker.clone()],
+            "the marker stays pending for the real terminal commit or TTL sweep"
+        );
+
+        let drained = rt.block_on(drain_on_terminal_commit_with_applier(
+            "claude",
+            "tmux-100",
+            100,
+            10_010,
+            0,
+            "2026-06-10 13:00:01",
+            &applier,
+        ));
+        assert_eq!(
+            drained, 1,
+            "a terminal commit from a turn started after the DeferredClaim \
+             own-start boundary may drain the anchor"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(710, ReactionOp::Complete)]
+        );
+        assert!(load_for_channel("claude", 100).is_empty());
+    }
+
+    /// #4159: the same start-boundary gate must apply to durable tombstone
+    /// evidence, otherwise a direct drain blocked for being pre-boundary could
+    /// still become a false sweep `✅` on the next pass.
+    #[test]
+    fn deferred_claim_tombstone_cover_requires_commit_started_at_or_after_own_boundary() {
+        let _root = test_root();
+        let marker = AbortedAnchorMarker::for_deferred_claim(
+            "claude".into(),
+            100,
+            711,
+            "tmux-100".into(),
+            10_000,
+            (0, OWN_STARTED_AT.into()),
+        );
+        record(&marker).unwrap();
+
+        record_commit_tombstone_at(20_000, "claude", "tmux-100", 100, 0, "2026-06-10 12:59:59");
+        assert_eq!(
+            post_abort_commit_tombstone(&marker),
+            None,
+            "a pre-boundary terminal commit tombstone is not DeferredClaim cover evidence"
+        );
+
+        record_commit_tombstone_at(20_001, "claude", "tmux-100", 100, 0, "2026-06-10 13:00:01");
+        assert_eq!(
+            post_abort_commit_tombstone(&marker),
+            Some(20_001),
+            "a post-boundary terminal commit tombstone remains valid cover evidence"
+        );
     }
 
     /// R3 (#3303 SC1 regression guard, lens2-①): the FOREIGN prior turn's
