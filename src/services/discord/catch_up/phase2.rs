@@ -23,8 +23,7 @@ pub(super) fn classify_phase2_enqueue_commit(
     if outcome.persistence_error.is_none()
         && matches!(
             outcome.refusal_reason,
-            Some(EnqueueRefusalReason::AlreadyActiveTurn)
-                | Some(EnqueueRefusalReason::SourceIdAlreadyQueued)
+            Some(EnqueueRefusalReason::SourceIdAlreadyQueued)
         )
     {
         return Phase2EnqueueCommit::Duplicate;

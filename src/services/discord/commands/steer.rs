@@ -123,8 +123,7 @@ pub(in crate::services::discord) async fn cmd_steer(
         }
         SteeringOutcome::Refused { reason } => {
             let message = match reason {
-                EnqueueRefusalReason::AlreadyActiveTurn
-                | EnqueueRefusalReason::SourceIdAlreadyQueued
+                EnqueueRefusalReason::SourceIdAlreadyQueued
                 | EnqueueRefusalReason::LastItemDedup => "중복으로 판단되어 큐잉되지 않았습니다.",
                 EnqueueRefusalReason::ActorUnreachable | EnqueueRefusalReason::MailboxClosed => {
                     "세션 액터에 접근할 수 없어 일시적으로 실패했습니다. 잠시 후 다시 시도하세요."

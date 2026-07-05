@@ -95,11 +95,6 @@ pub struct WatcherStateSnapshot {
     /// a false-positive guard so a normally-finished-then-sleeping session is
     /// never force-cleaned as a deadlock.
     pub(in crate::services::discord) inflight_terminal_delivery_committed: bool,
-    #[serde(skip)]
-    pub(in crate::services::discord) inflight_identity:
-        Option<discord::inflight::InflightTurnIdentity>,
-    #[serde(skip)]
-    pub(in crate::services::discord) inflight_finalizer_turn_id: Option<u64>,
     /// #1455: Pure relay-stall classifier output derived from the nested
     /// relay-health snapshot. Read-only diagnostic; no recovery behavior is
     /// triggered from this value.
@@ -567,14 +562,6 @@ async fn watcher_state_snapshot_for_shared(
         has_pending_queue,
         mailbox_active_user_msg_id,
         inflight_terminal_delivery_committed: session.inflight_terminal_delivery_committed(),
-        inflight_identity: session
-            .inflight
-            .as_ref()
-            .map(discord::inflight::InflightTurnIdentity::from_state),
-        inflight_finalizer_turn_id: session
-            .inflight
-            .as_ref()
-            .map(|state| state.effective_finalizer_turn_id()),
         relay_stall_state,
         relay_health,
     })
@@ -888,29 +875,14 @@ pub(super) fn observe_global_active_invariant(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
-    use super::{
-        HealthRegistry, build_health_snapshot, rebind_origin_inflight_is_idle,
-        relay_active_turn_from_inflight,
-    };
+    use super::{HealthRegistry, rebind_origin_inflight_is_idle, relay_active_turn_from_inflight};
     use crate::services::discord::inflight::InflightTurnState;
     use crate::services::discord::relay_health::RelayActiveTurn;
     use crate::services::provider::{CancelToken, ProviderKind};
     use chrono::TimeZone;
-
-    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
-    static NEXT_ABSENT_MAILBOX_CHANNEL: AtomicU64 = AtomicU64::new(9_406_800_000_000);
-
-    struct EnvGuard;
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-        }
-    }
 
     /// #3631: a rebind-origin row with NO cancel token is idle (so the channel
     /// is not falsely reported as an active foreground stream and queued
@@ -1008,58 +980,6 @@ mod tests {
         assert!(
             snapshot.is_none(),
             "provider/channel resolve timeout must not scan a possibly wrong same-provider runtime"
-        );
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn mailbox_snapshot_absent_channel_is_peek_only_for_health() {
-        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
-        let tmp = tempfile::tempdir().expect("temp runtime root");
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-        let _env_guard = EnvGuard;
-
-        let registry = HealthRegistry::new();
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        registry
-            .register(ProviderKind::Codex.as_str().to_string(), shared.clone())
-            .await;
-
-        let channel = ChannelId::new(NEXT_ABSENT_MAILBOX_CHANNEL.fetch_add(1, Ordering::Relaxed));
-        assert!(
-            crate::services::discord::ChannelMailboxRegistry::global_handle(channel).is_none(),
-            "test channel should start without a process-global mailbox"
-        );
-
-        let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel).await;
-        assert!(snapshot.cancel_token.is_none());
-        assert!(snapshot.active_user_message_id.is_none());
-        assert!(snapshot.intervention_queue.is_empty());
-        assert!(
-            crate::services::discord::ChannelMailboxRegistry::global_handle(channel).is_none(),
-            "snapshotting an absent mailbox must not create or globalize one"
-        );
-
-        let watcher = registry
-            .snapshot_watcher_state_for_provider(&ProviderKind::Codex, channel.get())
-            .await;
-        assert!(
-            watcher.is_none(),
-            "health watcher-state for an absent mailbox/session should report absence"
-        );
-        assert!(
-            crate::services::discord::ChannelMailboxRegistry::global_handle(channel).is_none(),
-            "health observation must not materialize a mailbox"
-        );
-
-        let health = build_health_snapshot(&registry).await;
-        assert!(
-            health.mailboxes.is_empty(),
-            "health snapshot should tolerate providers with no mailbox entries"
-        );
-        assert!(
-            crate::services::discord::ChannelMailboxRegistry::global_handle(channel).is_none(),
-            "health snapshot construction must remain peek-only for absent channels"
         );
     }
 }

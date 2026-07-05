@@ -1,18 +1,14 @@
-mod bridge_latency_spans;
 mod cancel_finalize_policy;
 mod chunk_compose;
 mod completion_guard;
 mod context_window;
-#[cfg(unix)]
-mod early_tui_completion;
-mod finalize_epilogue;
 mod followup_requeue;
 mod headless_delivery;
 mod memory_lifecycle;
 mod output_lifecycle;
 mod panel_lifecycle;
 mod recall_feedback;
-pub(in crate::services::discord) mod recovery_text;
+mod recovery_text;
 mod retry_state;
 mod single_message_footer;
 mod skill_usage;
@@ -24,11 +20,6 @@ mod terminal_controller_cutover;
 mod terminal_delivery;
 mod tmux_runtime;
 mod turn_analytics;
-// #3805 P2 (PR-B): two-message sink creation order (answer-first, panel below)
-// + the pure generation-epoch staleness guard. Isolated sibling so the EXTREME
-// turn_bridge/mod.rs giant and the 700-capped status_panel.rs stay lean; the
-// call sites here and in single_message_footer.rs are thin.
-mod two_message_panel;
 mod voice_completion;
 mod watcher_handoff;
 mod watcher_orphan_cleanup;
@@ -47,11 +38,6 @@ use response_delivery::{
 
 use super::gateway::TurnGateway;
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
-use super::turn_view_reconciler::{
-    note_intake_turn_cleared_via_shared as tv_clear,
-    note_intake_turn_completed_via_shared as tv_done,
-    note_intake_turn_failed_via_shared as tv_fail, note_intake_turn_stopped_via_shared as tv_stop,
-};
 use super::*;
 use crate::db::session_observability::{
     BackgroundChildSpawn, close_background_child_pg, insert_background_child_pg,
@@ -77,7 +63,6 @@ use panel_lifecycle::{
 use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
-use bridge_latency_spans::BridgeLatencySpans;
 pub(super) use cancel_finalize_policy::{
     classify_turn_finished_dispatch_kind, is_done_setting_terminal_frame,
     resolve_bridge_owner_channel, should_finalize_cancel_after_recv,
@@ -97,14 +82,10 @@ pub(super) use stale_resume::result_event_has_stale_resume_error;
 pub(in crate::services::discord) use status_panel::{
     complete_status_panel_v2_with_http, normalize_status_panel_message_id,
 };
-// #3805 P2 (PR-C): the ONE generation staleness rule shared by the sink (here)
-// and the tmux WATCHER completion guard, so both paths supersede a stale
-// status edit by the SAME epoch semantics (parity).
 pub(super) use streaming_edit_text::{
     CLAUDE_TUI_FOLLOWUP_REQUEUE_DELIVERY_NOTICE, bridge_claude_tui_followup_requeue_prompt_error,
-    bridge_streaming_edit_gate_open, bridge_streaming_rollover_should_skip,
-    bridge_tui_transport_error_should_skip_quiescence, build_turn_bridge_streaming_edit_text,
-    claude_tui_followup_requeue_streaming_aware, claude_tui_followup_same_input_occupies_pane,
+    bridge_streaming_rollover_should_skip, bridge_tui_transport_error_should_skip_quiescence,
+    build_turn_bridge_streaming_edit_text,
 };
 pub(super) use task_notification_lifecycle::{
     close_all_tracked_background_children, close_next_tracked_background_child,
@@ -118,9 +99,6 @@ pub(super) use tmux_runtime::cancel_token_has_tmux_session;
 pub(super) use tmux_runtime::handoff_interrupted_message;
 pub(super) use tmux_runtime::stale_inflight_message;
 pub(super) use tmux_runtime::stop_active_turn;
-pub(in crate::services::discord) use two_message_panel::{
-    two_message_should_reanchor_panel_on_rollover, two_message_status_edit_generation_is_stale,
-};
 pub(super) use watcher_orphan_cleanup::{
     cleanup_or_preserve_watcher_orphan_spinner,
     should_delete_bridge_created_watcher_orphan_response,
@@ -190,10 +168,8 @@ use recall_feedback::{
     transcript_contains_explicit_memento_tool_call,
 };
 use retry_state::{
-    bridge_confirmed_response_sent_offset_seed, bridge_should_reclaim_relay_from_missing_watcher,
     clear_local_session_state, handle_gemini_retry_boundary, reset_session_for_auto_retry,
-    rewind_and_persist_delivery_on_reclaim, sync_response_delivery_state,
-    sync_terminal_error_delivery_state_for_bridge_owner,
+    sync_response_delivery_state,
 };
 use skill_usage::record_skill_usage_from_tool_use;
 use stale_resume::{
@@ -202,18 +178,16 @@ use stale_resume::{
 };
 use status_panel::{
     bridge_epilogue_identity_guards_inflight_clear, migrate_separate_status_panel_to_footer,
-    record_status_panel_events, should_open_long_running_placeholder_controller,
+    should_open_long_running_placeholder_controller,
     status_panel_completion_ready_after_terminal_body, status_panel_message_id_for_turn,
 };
 use terminal_delivery::{
-    BridgeLeaseAcquire, bridge_delivery_lease_for_inflight, bridge_delivery_lease_key_for_inflight,
-    bridge_epilogue_clears_inflight, bridge_epilogue_marks_watcher_delivered,
-    bridge_epilogue_skip_save_is_identity_guarded, empty_sink_commits_fully_consumed_response,
-    empty_sink_preserves_retry, mirror_frozen_prefix_ids, send_ordered_long_terminal_response,
-    should_complete_work_dispatch_after_terminal_delivery,
+    BridgeDeliveryLease, BridgeLeaseAcquire, bridge_epilogue_clears_inflight,
+    bridge_epilogue_marks_watcher_delivered, bridge_epilogue_skip_save_is_identity_guarded,
+    send_ordered_long_terminal_response, should_complete_work_dispatch_after_terminal_delivery,
     should_fail_dispatch_after_terminal_delivery, silent_turn_skip_marks_committed,
-    terminal_delivery_should_send_new_chunks, turn_bridge_replace_outcome_committed,
-    warn_preserved_uncommitted as td_warn,
+    terminal_delivery_should_send_new_chunks, tui_quiescence_timeout_requires_inflight_retry,
+    turn_bridge_replace_outcome_committed, warn_preserved_uncommitted as td_warn,
 };
 use tmux_runtime::is_dcserver_restart_command;
 pub(super) use turn_analytics::persist_turn_analytics_row_with_handles;
@@ -268,6 +242,22 @@ fn record_placeholder_live_event(
             .ui
             .placeholder_live_events
             .push_event(channel_id, event);
+    }
+}
+
+fn record_status_panel_events(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    events: Vec<StatusEvent>,
+) -> bool {
+    if shared.ui.status_panel_v2_enabled && !events.is_empty() {
+        shared
+            .ui
+            .placeholder_live_events
+            .push_status_events(channel_id, events);
+        true
+    } else {
+        false
     }
 }
 
@@ -387,9 +377,9 @@ pub(super) struct TurnBridgeContext {
     /// response instead of editing an old panel buried in scrollback.
     pub(super) reuse_status_panel_message: bool,
     pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    /// `true` ONLY at the two TUI external-input idle callers. Default `false`
-    /// for every other bridge caller; used by footer/chrome decisions that need
-    /// the origin without a `request_owner_name` string compare.
+    /// #3089 A6b: `true` ONLY at the two TUI external-input idle callers; scopes the
+    /// A6b site-5 controller OR-in to external-input (NOT a `request_owner_name`
+    /// string compare). Default `false` for every other bridge caller. See :6096.
     pub(super) is_external_input_tui_direct: bool,
     pub(super) inflight_state: InflightTurnState,
 }
@@ -615,6 +605,14 @@ mod streaming_edit_text_tests {
         assert_eq!(rendered, "(No response)");
         assert!(full_response.is_empty());
     }
+}
+
+fn bridge_should_reclaim_relay_from_missing_watcher(
+    watcher_owns_assistant_relay: bool,
+    standby_relay_owns_output: bool,
+    live_watcher_registered: bool,
+) -> bool {
+    watcher_owns_assistant_relay && !standby_relay_owns_output && !live_watcher_registered
 }
 
 #[cfg(test)]
@@ -872,7 +870,10 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
     };
     let thread_channel_id = active_turn_thread_channel_id(adk_session_name, inflight_state);
 
+    let legacy_db = None::<&crate::db::Db>;
+
     if super::tmux::refresh_session_heartbeat_from_tmux_output(
+        legacy_db,
         shared.pg_pool.as_ref(),
         &shared.token_hash,
         provider,
@@ -1378,9 +1379,21 @@ pub(super) fn spawn_turn_bridge(
         let mut api_friction_reports = Vec::new();
         let mut transcript_events = Vec::<SessionTranscriptEvent>::new();
         let mut resume_failure_detected = false;
-        // #2451: Init is the authoritative resume-success witness; elapsed
-        // time is only a backstop. Snapshot prior session state before any reset.
+        // #2451 H5 graduation: `StreamMessage::Init { session_id, .. }` is
+        // the explicit provider handshake — it lands as soon as the
+        // provider has a live session bound to the new turn. We use its
+        // arrival as the authoritative "resume succeeded" witness so the
+        // empty-response classification no longer has to guess from
+        // `turn_start.elapsed() < 10s`. The elapsed-time heuristic is
+        // retained only as a 30s safety backstop.
         let mut session_handshake_seen = false;
+        // #2451: snapshot whether the channel had a prior provider
+        // session_id at turn-start time. The previous logic re-read
+        // `shared.core.sessions` at empty-response classification time,
+        // which races with `reset_session_for_auto_retry` and produces
+        // false negatives ("session was already cleared, so we never
+        // attempted resume"). Capturing this once at the top closes the
+        // race.
         let had_prior_session_id_at_turn_start = {
             let data = shared_owned.core.lock().await;
             data.sessions
@@ -1412,8 +1425,13 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_control_ready_observed = false;
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
         let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
-        // Recovery turns without an anchored placeholder create one up front;
-        // on failure the synthetic sentinel lets the first streaming edit retry.
+        // A recovery turn with no anchored placeholder (current_msg_id == 0,
+        // e.g. a TUI-direct turn) reaches the bridge with `None`. The bridge
+        // streams into a concrete placeholder, so create a fresh one now; if
+        // creation fails we fall back to the channel and the first streaming
+        // edit re-creates it. This keeps the working `current_msg_id` a real
+        // `MessageId` for the ~30 downstream relay sites without panicking on
+        // `MessageId::new(0)`.
         let mut current_msg_id = match bridge.current_msg_id {
             Some(id) => id,
             None => {
@@ -1440,8 +1458,6 @@ pub(super) fn spawn_turn_bridge(
             }
         };
         let mut response_sent_offset = bridge.response_sent_offset;
-        let mut bridge_confirmed_response_sent_offset =
-            bridge_confirmed_response_sent_offset_seed(initial_relay_owner_kind, response_sent_offset);
         let mut streamed_assistant_text_this_turn = false;
         let mut streaming_rollover_frozen_msg_ids: Vec<MessageId> = Vec::new();
         let mut terminal_full_replay_cleanup_msg_ids: Vec<MessageId> = Vec::new();
@@ -1456,7 +1472,7 @@ pub(super) fn spawn_turn_bridge(
         let mut new_session_id = bridge.new_session_id.clone();
         let mut new_raw_provider_session_id: Option<String> = None;
         let defer_watcher_resume = bridge.defer_watcher_resume;
-        let is_external_input_tui_direct = bridge.is_external_input_tui_direct;
+        let is_external_input_tui_direct = bridge.is_external_input_tui_direct; // #3089 A6b: site-5 scope
         let completion_tx = bridge.completion_tx;
         // Guard: ensure completion_tx fires even if the task panics or
         // exits early, preventing the parent from hanging on completion_rx.
@@ -1508,30 +1524,20 @@ pub(super) fn spawn_turn_bridge(
             provider: Option<ProviderKind>,
             channel_id: u64,
             user_msg_id: u64,
-            token_hash: String,
         }
         impl Drop for InflightCleanupGuard {
             fn drop(&mut self) {
                 if let Some(ref provider) = self.provider {
-                    // #3859: this Drop runs on ANY abnormal exit (panic /
-                    // early-return) while the turn may still own a live
-                    // "🔄 처리 중" placeholder. Route through the abandon-request
-                    // helper — identical ownership guards to the plain guarded
-                    // clear, but it durably records the placeholder for the
-                    // placeholder sweeper to finalize to "중단됨" BEFORE deleting
-                    // the row (which still frees the channel immediately).
                     if self.user_msg_id != 0 {
-                        super::inflight::request_inflight_abandon_if_matches(
+                        super::inflight::clear_inflight_state_if_matches(
                             provider,
                             self.channel_id,
                             self.user_msg_id,
-                            &self.token_hash,
                         );
                     } else {
-                        super::inflight::request_inflight_abandon_if_matches_zero_owned(
+                        super::inflight::clear_inflight_state_if_matches_zero_owned(
                             provider,
                             self.channel_id,
-                            &self.token_hash,
                         );
                     }
                 }
@@ -1541,7 +1547,6 @@ pub(super) fn spawn_turn_bridge(
             provider: Some(provider.clone()),
             channel_id: channel_id.get(),
             user_msg_id: user_msg_id.map(|id| id.get()).unwrap_or(0),
-            token_hash: shared_owned.token_hash.clone(),
         };
 
         let mut inflight_state = bridge.inflight_state.clone();
@@ -1562,9 +1567,6 @@ pub(super) fn spawn_turn_bridge(
             inflight_state.current_msg_id = current_msg_id.get();
         }
         let mut last_status_edit = tokio::time::Instant::now();
-        // #3813 Phase 1b fast-lane: the first non-empty assistant text chunk may
-        // bypass the status interval once, then normal throttling resumes.
-        let mut first_answer_relayed = false;
         let status_interval = super::status_update_interval();
         let mut last_session_panel_lifecycle_refresh =
             tokio::time::Instant::now() - status_interval;
@@ -1589,18 +1591,8 @@ pub(super) fn spawn_turn_bridge(
         let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
         let turn_start = std::time::Instant::now();
-        // #3813 AC#1 tail: bridge-side latency spans (observation-only), anchored
-        // on `turn_start` above. See bridge_latency_spans.rs for the invariants.
-        let mut bridge_spans = BridgeLatencySpans::starting_at(turn_start);
-
-        // #3805 P2 (PR-B): this turn's status-panel epoch. Seeded from the pinned
-        // inflight snapshot and threaded through the two-message create (which
-        // bumps it) and the terminal completion edit (which proves it against the
-        // on-disk epoch). Inert on the default-OFF path (stays 0).
-        let mut status_panel_generation = inflight_state.status_panel_generation;
 
         maybe_create_bridge_separate_status_panel_response(
-            shared_owned.ui.two_message_panel_enabled,
             single_message_panel_footer_mode,
             shared_owned.ui.status_panel_v2_enabled,
             gateway.as_ref(),
@@ -1611,7 +1603,6 @@ pub(super) fn spawn_turn_bridge(
             &mut bridge_created_response_placeholder_msg_id,
             &mut last_edit_text,
             &mut inflight_state,
-            &mut status_panel_generation,
             response_sent_offset,
             &full_response,
             &mut status_panel_dirty,
@@ -2645,8 +2636,21 @@ pub(super) fn spawn_turn_bridge(
                             }
                             state_dirty = true;
                             done = true;
-                            // #2449: only arm the 250ms drain when handoff is still
-                            // ambiguous; fresh managed turns may pre-stamp runtime_kind.
+                            // #2449 H4 graduation: only arm the 250ms drain
+                            // window when handoff is genuinely ambiguous.
+                            // If a runtime handoff has already been observed
+                            // (`tmux_handed_off` flipped or
+                            // `inflight_state.runtime_kind` stamped), the
+                            // ownership question is already settled and any
+                            // further drain just delays bridge exit by up to
+                            // 250ms. The drain remains armed for
+                            // warm-followup providers that emit `Done` before
+                            // their handoff frame — in those cases the
+                            // handoff arm clears the deadline to `None` as
+                            // soon as the frame lands. Do not use persisted
+                            // `runtime_kind` as this signal: fresh managed
+                            // turns can be pre-stamped before the control
+                            // frame arrives.
                             if !terminal_control_ready_observed {
                                 terminal_control_drain_until = Some(
                                     std::time::Instant::now()
@@ -2697,14 +2701,6 @@ pub(super) fn spawn_turn_bridge(
                             } else {
                                 full_response = format!("Error: {}", message);
                             }
-                            sync_terminal_error_delivery_state_for_bridge_owner(
-                                &full_response,
-                                &mut response_sent_offset,
-                                &mut bridge_confirmed_response_sent_offset,
-                                &mut inflight_state,
-                                channel_id,
-                                watcher_owns_assistant_relay && watcher_relay_available_for_turn,
-                            );
                             push_transcript_event(
                                 &mut transcript_events,
                                 SessionTranscriptEvent {
@@ -2734,6 +2730,7 @@ pub(super) fn spawn_turn_bridge(
                                     channel_id,
                                 );
                             }
+                            inflight_state.full_response = full_response.clone();
                             close_all_tracked_background_children(
                                 shared_owned.pg_pool.as_ref(),
                                 &mut active_background_child_session_ids,
@@ -3350,7 +3347,6 @@ pub(super) fn spawn_turn_bridge(
                     channel_id,
                     turn_id.as_str(),
                     inflight_state.tmux_session_name.as_deref(),
-                    &provider, // #3983 item4: one-shot session banner render
                 )
                 .await;
             }
@@ -3358,21 +3354,11 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            // #3813 Phase 2: hold the status-panel / footer edit off the shared
-            // rate lane while the opening answer is pending so the #4006 fast lane
-            // wins it. `status_panel_dirty` stays set → renders next interval. See
-            // status_panel_edit_defer_for_first_answer for the #3477 guard.
-            let defer_status_panel_for_first_answer = status_panel_edit_defer_for_first_answer(
-                first_answer_relayed,
-                !response_portion_after_offset(&full_response, response_sent_offset).is_empty(),
-            );
-
             if shared_owned.ui.status_panel_v2_enabled
                 && bridge_status_panel_dirty_should_edit_separate_panel(
                     status_panel_dirty,
                     single_message_panel_footer_mode,
                 )
-                && !defer_status_panel_for_first_answer
                 && last_status_panel_edit.elapsed() >= status_interval
                 && let Some(status_msg_id) = status_panel_msg_id
             {
@@ -3406,7 +3392,6 @@ pub(super) fn spawn_turn_bridge(
             }
             if single_message_panel_footer_mode
                 && status_panel_dirty
-                && !defer_status_panel_for_first_answer
                 && last_status_panel_edit.elapsed() >= status_interval
             {
                 refresh_bridge_footer(
@@ -3420,15 +3405,9 @@ pub(super) fn spawn_turn_bridge(
                 status_panel_dirty = false;
             }
             if !watcher_owns_assistant_relay && !standby_relay_owns_output {
-                // #3805 P2 (PR-D): track whether an answer rollover created a fresh
-                // tail message this interval, so the two-message status panel is
-                // re-anchored BELOW it exactly once (not on quiet intervals).
-                let mut rolled_over_this_interval = false;
                 loop {
                     let current_portion =
                         response_portion_after_offset(&full_response, response_sent_offset);
-                    // #3813 AC#1 tail: mark first-output pre-rollover (first_output<=first_relay).
-                    bridge_spans.mark_first_output(!current_portion.is_empty());
                     if done || current_portion.is_empty() {
                         break;
                     }
@@ -3473,14 +3452,8 @@ pub(super) fn spawn_turn_bridge(
                                     "src/services/discord/turn_bridge/mod.rs:rollover_response_sent_offset",
                                 );
                                 response_sent_offset = next_response_sent_offset;
-                                bridge_confirmed_response_sent_offset = response_sent_offset;
                                 streaming_rollover_frozen_msg_ids.push(current_msg_id);
-                                mirror_frozen_prefix_ids(
-                                    &streaming_rollover_frozen_msg_ids,
-                                    &mut inflight_state,
-                                );
                                 current_msg_id = next_msg_id;
-                                rolled_over_this_interval = true;
                                 last_edit_text = status_block;
                                 last_status_edit = tokio::time::Instant::now() - status_interval;
                                 inflight_state.current_msg_id = current_msg_id.get();
@@ -3488,8 +3461,6 @@ pub(super) fn spawn_turn_bridge(
                                 inflight_state.response_sent_offset = response_sent_offset;
                                 inflight_state.full_response = full_response.clone();
                                 state_dirty = true;
-                                // #3813 AC#1 tail: rollover send = bridge first relay.
-                                bridge_spans.mark_first_relay(true);
                                 if let Some((_, _, _, _, pending_new_key)) =
                                     pending_long_running_retarget_after_state_save.as_mut()
                                 {
@@ -3551,42 +3522,6 @@ pub(super) fn spawn_turn_bridge(
                     }
                 }
 
-                // #3805 P2 (PR-D): after a mid-turn answer rollover the live status
-                // panel is now stranded ABOVE the new tail answer chunk. Under the
-                // two-message flag, re-anchor it BELOW the new answer (send new,
-                // retire old, bump the generation epoch) so it stays pinned to the
-                // latest chunk. Gate is OFF-inert → the rollover path is
-                // byte-identical when the flag is off.
-                if rolled_over_this_interval
-                    && two_message_panel::two_message_should_reanchor_panel_on_rollover(
-                        shared_owned.ui.two_message_panel_enabled,
-                        status_panel_msg_id.is_some(),
-                    )
-                {
-                    let panel_text = shared_owned.ui.placeholder_live_events.render_status_panel(
-                        channel_id,
-                        &provider,
-                        status_panel_started_at,
-                    );
-                    let reanchored =
-                        two_message_panel::reanchor_bridge_two_message_status_panel_below_answer(
-                            gateway.as_ref(),
-                            shared_owned.as_ref(),
-                            channel_id,
-                            &provider,
-                            &panel_text,
-                            current_msg_id,
-                            &mut status_panel_msg_id,
-                            &mut inflight_state,
-                            &mut status_panel_generation,
-                            &mut last_status_panel_text,
-                        )
-                        .await;
-                    if reanchored {
-                        state_dirty = true;
-                    }
-                }
-
                 let current_portion =
                     response_portion_after_offset(&full_response, response_sent_offset);
                 let status_block = build_bridge_single_message_panel_status_block(
@@ -3612,11 +3547,7 @@ pub(super) fn spawn_turn_bridge(
                     &stable_display_text,
                 )
                     && !done
-                    && bridge_streaming_edit_gate_open(
-                        last_status_edit.elapsed() >= status_interval,
-                        first_answer_relayed,
-                        current_portion.is_empty(),
-                    )
+                    && last_status_edit.elapsed() >= status_interval
                     && long_running_placeholder_active.is_none()
                     && pending_long_running_open_after_state_save.is_none()
                     && pending_long_running_retarget_after_state_save.is_none()
@@ -3631,9 +3562,6 @@ pub(super) fn spawn_turn_bridge(
                     .is_ok();
                     last_status_edit = tokio::time::Instant::now();
                     if edit_ok {
-                        first_answer_relayed |= !current_portion.is_empty();
-                        // #3813 AC#1 tail: first bridge-owned relay delivered.
-                        bridge_spans.mark_first_relay(!current_portion.is_empty());
                         last_edit_text = stable_display_text;
                         inflight_state.current_msg_id = current_msg_id.get();
                         inflight_state.current_msg_len = last_edit_text.len();
@@ -3679,13 +3607,6 @@ pub(super) fn spawn_turn_bridge(
                 watcher_owns_assistant_relay = false;
                 watcher_relay_available_for_turn = false;
                 inflight_state.set_relay_owner_kind(super::inflight::RelayOwnerKind::None);
-                rewind_and_persist_delivery_on_reclaim(
-                    &full_response,
-                    bridge_confirmed_response_sent_offset,
-                    &mut response_sent_offset,
-                    &mut inflight_state,
-                    channel_id,
-                );
                 state_dirty = true;
             }
 
@@ -3831,10 +3752,6 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        // #3813 AC#1 tail: emit bridge-side latency spans once at loop exit
-        // (observation-only; self-suppresses when no bridge relay happened).
-        bridge_spans.log(channel_id.get(), provider.as_str());
-
         // codex round-9 P3 on PR #1308: drain any active long-running
         // placeholder on stream-error / receive-disconnect exits too. The
         // cancel branch already drives the controller to `Aborted`; here we
@@ -3942,47 +3859,13 @@ pub(super) fn spawn_turn_bridge(
             tracing::warn!("  [{ts}] ⚠ invalid API_FRICTION marker: {error}");
         }
 
-        let claude_tui_followup_pre_submit_requeue_candidate = {
-            let base = crate::services::claude::claude_tui_followup_requeue_enabled()
+        let claude_tui_followup_pre_submit_requeue_candidate =
+            crate::services::claude::claude_tui_followup_requeue_enabled()
                 && bridge_claude_tui_followup_requeue_prompt_error(
                     &provider,
                     inflight_state.runtime_kind,
                     &full_response,
                 );
-            // #3885 (reworked): a follow-up pre-submit readiness timeout normally
-            // requeues the inflight ("prompt never reached the pane → safe to
-            // retry"). The dup risk is re-injecting an input that ALREADY landed:
-            // when the SAME input is the turn the pane is streaming (or just
-            // completed), that turn already delivers the response, so a requeue
-            // produces duplicate prose. The first cut gated on a channel-scoped
-            // busy probe, which (a) DROPPED a genuinely-unsubmitted follow-up that
-            // happened to sit behind a DIFFERENT streaming turn, and (b) missed
-            // the already-completed same-input case (idle pane). Gate instead on
-            // INPUT CORRELATION: suppress ONLY when the recorded prompt anchor for
-            // this pane resolves to THIS inflight's user_msg_id (the relay records
-            // the submitted prompt's anchor as the synthetic inflight's
-            // user_msg_id; a non-consuming peek leaves it for the watcher). A
-            // different / absent anchor means the follow-up is genuinely
-            // unsubmitted, so it STILL requeues and remains preserved in the
-            // mailbox behind the active turn until the completion event kicks the
-            // drain.
-            let same_input_occupies_pane = base
-                && claude_tui_followup_same_input_occupies_pane(
-                    inflight_state
-                        .tmux_session_name
-                        .as_deref()
-                        .and_then(|tmux_session_name| {
-                            crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
-                                provider.as_str(),
-                                tmux_session_name,
-                                channel_id.get(),
-                            )
-                        })
-                        .map(|anchor| anchor.message_id),
-                    inflight_state.user_msg_id,
-                );
-            claude_tui_followup_requeue_streaming_aware(base, same_input_occupies_pane)
-        };
         if claude_tui_followup_pre_submit_requeue_candidate {
             full_response = CLAUDE_TUI_FOLLOWUP_REQUEUE_DELIVERY_NOTICE.to_string();
             inflight_state.full_response = full_response.clone();
@@ -4135,33 +4018,48 @@ pub(super) fn spawn_turn_bridge(
         // later user messages behind a stale active turn. The hosted-TUI
         // pre-submit guard below is the correctness barrier that prevents
         // follow-up input from being injected into a still-busy pane.
-        // #3038: the early TUI completion gate (eligibility filter + bounded
-        // quiescence probe + timed-out warning) is extracted verbatim to
-        // `early_tui_completion.rs`. The two outputs are consumed later, so the
-        // `#[cfg]` `let` declarations stay here (preserving the exact unix /
-        // non-unix split) and the helper returns the computed values; behavior
-        // is byte-identical (see the module doc for the seam-fix note).
         #[cfg(unix)]
         let bridge_early_gate_timed_out;
         #[cfg(not(unix))]
         let bridge_early_gate_timed_out = false;
         #[cfg(unix)]
-        let bridge_tui_gate_outcome_early: Option<super::tmux::TuiCompletionGateOutcome>;
+        #[allow(unused_assignments, unused_mut)]
+        let mut bridge_tui_gate_outcome_early: Option<super::tmux::TuiCompletionGateOutcome> = None;
         #[cfg(unix)]
         {
-            let (outcome_early, gate_timed_out) =
-                early_tui_completion::run_early_tui_completion_gate(
-                    cancelled,
-                    is_prompt_too_long,
-                    transport_error,
-                    recovery_retry,
-                    &inflight_state,
-                    &provider,
-                    channel_id,
-                )
-                .await;
-            bridge_tui_gate_outcome_early = outcome_early;
-            bridge_early_gate_timed_out = gate_timed_out;
+            // Reproduce the same eligibility filter the late gate already
+            // applies, but BEFORE the channel-mailbox release.
+            let eligible_for_early_gate =
+                !cancelled && !is_prompt_too_long && !transport_error && !recovery_retry;
+            if eligible_for_early_gate
+                && let Some(tmux_session_name) = inflight_state.tmux_session_name.as_deref()
+            {
+                bridge_tui_gate_outcome_early = Some(
+                    super::tmux::run_tui_completion_gate(
+                        &provider,
+                        channel_id,
+                        tmux_session_name,
+                        inflight_state.task_notification_kind,
+                    )
+                    .await,
+                );
+                if matches!(
+                    bridge_tui_gate_outcome_early,
+                    Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
+                ) {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        provider = %provider.as_str(),
+                        channel = channel_id.get(),
+                        tmux_session = %tmux_session_name,
+                        "[{ts}] ⚠ #2293/#2780: bridge TUI quiescence gate timed out before visible completion; mailbox release will continue and hosted-TUI pre-submit will guard follow-up injection"
+                    );
+                }
+            }
+            bridge_early_gate_timed_out = matches!(
+                bridge_tui_gate_outcome_early,
+                Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
+            );
         }
         // #3268 (Defect B): on (gate timeout + non-terminal + genuinely-live
         // watcher) hand the busy turn back to the watcher — see `watcher_handoff`.
@@ -4435,14 +4333,15 @@ pub(super) fn spawn_turn_bridge(
         // non-unix targets where the tmux module is configured out.
         #[allow(unused_mut)]
         let mut bridge_should_emit_completion = true;
-        let inflight_generation = inflight_state.born_generation;
 
+        // Remove ⏳ only if the bridge still owns output delivery.
+        // Relay owners commit their own visible lifecycle.
         if !bridge_output_owner
             .map(|owner| owner.skips_bridge_spinner_cleanup())
             .unwrap_or(false)
             && let Some(user_msg_id) = user_msg_id
         {
-            tv_clear(&shared_owned, channel_id, user_msg_id, inflight_generation, "clear").await;
+            gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
 
         // Recovery auto-retry: session died during restart recovery
@@ -4638,11 +4537,15 @@ pub(super) fn spawn_turn_bridge(
             // channel the WATCHER uses (a reused watcher can own a channel != this
             // bridge's `channel_id`), so the two CONTEND on one cell (single-holder
             // B2) instead of both delivering = duplicate.
-            let stop_lease_acquire = bridge_delivery_lease_for_inflight(
+            let stop_lease_acquire = BridgeDeliveryLease::acquire(
                 shared_owned.as_ref(),
                 watcher_owner_channel_id,
-                shared_owned.restart.current_generation,
-                &inflight_state,
+                super::turn_finalizer::TurnKey::new(
+                    watcher_owner_channel_id,
+                    inflight_state.user_msg_id,
+                    shared_owned.restart.current_generation,
+                ),
+                inflight_state.turn_start_offset.unwrap_or(0),
                 tmux_last_offset,
             );
             if matches!(stop_lease_acquire, BridgeLeaseAcquire::Skip) {
@@ -4701,14 +4604,14 @@ pub(super) fn spawn_turn_bridge(
                         outcome,
                     );
                     if replace_committed && committed {
-                        terminal_delivery::record_stopped_turn_terminal_replace_delivery(
+                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
                             shared_owned.as_ref(),
                             &provider,
                             watcher_owner_channel_id,
                             lease_range,
-                            current_msg_id,
-                            channel_id,
-                            remaining_response,
+                            true,
+                            Some(current_msg_id.get()),
+                            Some(channel_id.get()),
                         );
                     }
                 }
@@ -4720,7 +4623,7 @@ pub(super) fn spawn_turn_bridge(
             if preserved_restart_mode.is_none()
                 && let Some(user_msg_id) = user_msg_id
             {
-                tv_stop(&shared_owned, channel_id, user_msg_id, inflight_generation, "stop").await;
+                gateway.add_reaction(channel_id, user_msg_id, '🛑').await;
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4736,11 +4639,15 @@ pub(super) fn spawn_turn_bridge(
             // #3041 P1-2 (site 2 — prompt-too-long terminal replace): same lease
             // routing as site 1 — acquire before replace; B2-skip if held. (codex
             // P1-a) lease on `watcher_owner_channel_id` (shared cell + TurnKey).
-            let plt_lease_acquire = bridge_delivery_lease_for_inflight(
+            let plt_lease_acquire = BridgeDeliveryLease::acquire(
                 shared_owned.as_ref(),
                 watcher_owner_channel_id,
-                shared_owned.restart.current_generation,
-                &inflight_state,
+                super::turn_finalizer::TurnKey::new(
+                    watcher_owner_channel_id,
+                    inflight_state.user_msg_id,
+                    shared_owned.restart.current_generation,
+                ),
+                inflight_state.turn_start_offset.unwrap_or(0),
                 tmux_last_offset,
             );
             if matches!(plt_lease_acquire, BridgeLeaseAcquire::Skip) {
@@ -4793,14 +4700,14 @@ pub(super) fn spawn_turn_bridge(
                         outcome,
                     );
                     if replace_committed && committed {
-                        super::outbound::delivery_record::record_delivered_frontier_with_body(
+                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
                             shared_owned.as_ref(),
                             &provider,
                             watcher_owner_channel_id,
                             lease_range,
-                            current_msg_id.get(),
-                            channel_id.get(),
-                            &full_response,
+                            true,
+                            Some(current_msg_id.get()),
+                            Some(channel_id.get()),
                         );
                     }
                 }
@@ -4810,7 +4717,7 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if let Some(user_msg_id) = user_msg_id {
-                tv_fail(&shared_owned, channel_id, user_msg_id, inflight_generation, "fail").await;
+                gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -5090,7 +4997,6 @@ pub(super) fn spawn_turn_bridge(
                 tracing::warn!("  [{ts}] ⚠ invalid API_FRICTION marker: {error}");
             }
 
-            let resume_retry_queued = (recovery_retry || resume_failure_detected) && user_msg_id.is_some();
             let mut delivery_response = terminal_delivery_response_after_offset(
                 &full_response,
                 response_sent_offset,
@@ -5128,11 +5034,15 @@ pub(super) fn spawn_turn_bridge(
                 // `terminal_delivery_committed` is set ONLY when THIS actor resolves
                 // the range (`Held`→commit / `NoRange`); on `Skip` the watcher owns
                 // delivery → NO-OP on completion side-effects, leave the turn retry-able.
-                let lease_acquire = bridge_delivery_lease_for_inflight(
+                let lease_acquire = BridgeDeliveryLease::acquire(
                     shared_owned.as_ref(),
                     watcher_owner_channel_id,
-                    shared_owned.restart.current_generation,
-                    &inflight_state,
+                    super::turn_finalizer::TurnKey::new(
+                        watcher_owner_channel_id,
+                        inflight_state.user_msg_id,
+                        shared_owned.restart.current_generation,
+                    ),
+                    inflight_state.turn_start_offset.unwrap_or(0),
                     tmux_last_offset,
                 );
                 // (codex P1-c) one source of truth for "does this acquire outcome
@@ -5174,23 +5084,14 @@ pub(super) fn spawn_turn_bridge(
                     }
                 }
             } else if delivery_response.trim().is_empty() {
-                if empty_sink_commits_fully_consumed_response(&full_response, response_sent_offset) {
-                    (terminal_delivery_committed, terminal_body_visible) = (true, true);
-                } else if empty_sink_preserves_retry(
-                    &full_response,
-                    resume_retry_queued,
-                    response_sent_offset,
-                    channel_id,
-                ) {
-                    preserve_inflight_for_cleanup_retry = true;
-                } else if TurnGateway::edit_message(
-                    gateway.as_ref(),
-                    channel_id,
-                    current_msg_id,
-                    "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
-                )
-                .await
-                .is_ok()
+                if gateway
+                    .edit_message(
+                        channel_id,
+                        current_msg_id,
+                        "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
+                    )
+                    .await
+                    .is_ok()
                 {
                     terminal_delivery_committed = true;
                     terminal_body_visible = true;
@@ -5212,125 +5113,153 @@ pub(super) fn spawn_turn_bridge(
                         can_chain_locally,
                         &delivery_response,
                     ) {
-                        let bridge_start = inflight_state.turn_start_offset.unwrap_or(0);
-                        let bridge_end = tmux_last_offset.unwrap_or(0);
-                        if terminal_controller_cutover::bridge_long_chunks_cutover_decision(
-                            can_chain_locally,
-                            &delivery_response,
-                            bridge_end > bridge_start,
-                            true,
-                        ) {
-                            let bridge_turn = super::turn_finalizer::TurnKey::new(
+                        // #3041 P1-2 (site 4 — long chunked terminal delivery): the
+                        // one bridge delivery that can run PAST the 15s deadline
+                        // (multi-chunk `send_long_message_with_rollback`), so the
+                        // lease HEARTBEAT keeps it alive mid-send. Acquire BEFORE the
+                        // send; B2-skip if another holder owns it. (codex P1-a) lease
+                        // on `watcher_owner_channel_id` (shared cell + TurnKey).
+                        let lease_acquire = BridgeDeliveryLease::acquire(
+                            shared_owned.as_ref(),
+                            watcher_owner_channel_id,
+                            super::turn_finalizer::TurnKey::new(
                                 watcher_owner_channel_id,
                                 inflight_state.user_msg_id,
                                 shared_owned.restart.current_generation,
+                            ),
+                            inflight_state.turn_start_offset.unwrap_or(0),
+                            tmux_last_offset,
+                        );
+                        if matches!(lease_acquire, BridgeLeaseAcquire::Skip) {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                channel = channel_id.get(),
+                                "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate long terminal send (channel {})",
+                                channel_id
                             );
-                            let bridge_lease_key = bridge_delivery_lease_key_for_inflight(
-                                watcher_owner_channel_id,
-                                shared_owned.restart.current_generation,
-                                &inflight_state,
-                            );
-                            let cell = shared_owned.delivery_lease(watcher_owner_channel_id);
-                            terminal_controller_cutover::apply_bridge_long_chunks_controller(
-                                gateway.as_ref(),
-                                shared_owned.as_ref(),
-                                &provider,
-                                channel_id,
-                                watcher_owner_channel_id,
-                                inflight_state.tmux_session_name.as_deref(),
-                                &cell,
-                                &shared_owned.ui.placeholder_controller,
-                                current_msg_id,
-                                &delivery_response,
-                                &spoken_delivery_response,
-                                full_response.len(),
-                                bridge_turn,
-                                bridge_start,
-                                bridge_end,
-                                single_message_panel_footer_mode,
-                                dispatch_id.as_deref(),
-                                adk_session_key.as_deref(),
-                                Some(turn_id.as_str()),
-                                Some(bridge_lease_key.clone()),
-                                terminal_controller_cutover::BridgeLongChunksLocals {
-                                    terminal_delivery_committed: &mut terminal_delivery_committed,
-                                    terminal_body_visible: &mut terminal_body_visible,
-                                    completion_footer_terminal_text:
-                                        &mut completion_footer_terminal_text,
-                                    preserve_inflight_for_cleanup_retry:
-                                        &mut preserve_inflight_for_cleanup_retry,
-                                    bridge_skip_holder_owns_inflight:
-                                        &mut bridge_skip_holder_owns_inflight,
-                                    response_sent_offset: &mut response_sent_offset,
-                                    inflight_response_sent_offset:
-                                        &mut inflight_state.response_sent_offset,
-                                },
-                            )
-                            .await;
+                            // #3041 P1-2 (codex P1-c): preserve retry state on a B2
+                            // Skip — the holder owns delivery; do NOT clear inflight
+                            // or mark the watcher delivered. (codex P1-2 R3) holder
+                            // owns the inflight lifecycle → identity-guard the save.
+                            preserve_inflight_for_cleanup_retry = true;
+                            bridge_skip_holder_owns_inflight = true;
                         } else {
-                            let lease_acquire = bridge_delivery_lease_for_inflight(
+                            let lease = match lease_acquire {
+                                BridgeLeaseAcquire::Held(lease) => Some(lease),
+                                _ => None,
+                            };
+                            match send_ordered_long_terminal_response(
                                 shared_owned.as_ref(),
-                                watcher_owner_channel_id,
-                                shared_owned.restart.current_generation,
-                                &inflight_state,
-                                tmux_last_offset,
-                            );
-                            terminal_controller_cutover::apply_bridge_long_chunks_legacy(
-                                lease_acquire,
                                 gateway.as_ref(),
-                                shared_owned.as_ref(),
                                 &provider,
                                 channel_id,
-                                watcher_owner_channel_id,
-                                inflight_state.tmux_session_name.as_deref(),
                                 current_msg_id,
+                                inflight_state.tmux_session_name.as_deref(),
                                 &delivery_response,
-                                &spoken_delivery_response,
-                                full_response.len(),
-                                single_message_panel_footer_mode,
                                 dispatch_id.as_deref(),
                                 adk_session_key.as_deref(),
                                 Some(turn_id.as_str()),
-                                terminal_controller_cutover::BridgeLongChunksLocals {
-                                    terminal_delivery_committed: &mut terminal_delivery_committed,
-                                    terminal_body_visible: &mut terminal_body_visible,
-                                    completion_footer_terminal_text:
-                                        &mut completion_footer_terminal_text,
-                                    preserve_inflight_for_cleanup_retry:
-                                        &mut preserve_inflight_for_cleanup_retry,
-                                    bridge_skip_holder_owns_inflight:
-                                        &mut bridge_skip_holder_owns_inflight,
-                                    response_sent_offset: &mut response_sent_offset,
-                                    inflight_response_sent_offset:
-                                        &mut inflight_state.response_sent_offset,
-                                },
                             )
-                            .await;
+                            .await
+                            {
+                                Ok((_first, last_chunk_msg_id)) => {
+                                    terminal_delivery_committed = true;
+                                    terminal_body_visible = true;
+                                    if single_message_panel_footer_mode {
+                                        completion_footer_terminal_text =
+                                            Some(delivery_response.clone());
+                                    }
+                                    response_sent_offset = full_response.len();
+                                    inflight_state.response_sent_offset = response_sent_offset;
+                                    // B6 (codex P1-b): advance ONLY via a successful
+                                    // lease commit (Delivered). `NoRange` has no new
+                                    // bytes to commit → no advance outside the lease.
+                                    // #3610 PR-1c: record the durable terminal anchor
+                                    // (last chunk msg id) on the SAME Delivered commit —
+                                    // frontier keyed by watcher_owner_channel_id, anchor
+                                    // pair in the delivery `channel_id`. Helper body +
+                                    // gating live in outbound/delivery_record.rs.
+                                    if let Some(lease) = lease {
+                                        let lease_range = lease.range();
+                                        // #3610 (codex review): gate the durable
+                                        // anchor record on the commit ACTUALLY
+                                        // succeeding. `commit_and_advance` advances
+                                        // `confirmed_end_offset` IFF its inner
+                                        // `DeliveryLeaseCell::commit` succeeds and
+                                        // returns `true`; a non-Leased / identity-
+                                        // mismatch / reclaimed cell returns `false`
+                                        // and does NOT advance. Recording the durable
+                                        // `delivered_frontier.range = end` without an
+                                        // in-memory advance would violate M4 (durable
+                                        // frontier END must mirror confirmed_end_offset).
+                                        let committed = lease.commit_and_advance(
+                                            shared_owned.as_ref(),
+                                            watcher_owner_channel_id,
+                                            inflight_state.tmux_session_name.as_deref(),
+                                            crate::services::discord::LeaseOutcome::Delivered,
+                                        );
+                                        if committed {
+                                            super::outbound::delivery_record::record_long_chunk_terminal_delivery(
+                                                shared_owned.as_ref(),
+                                                &provider,
+                                                watcher_owner_channel_id,
+                                                channel_id,
+                                                lease_range,
+                                                last_chunk_msg_id.map(|m| m.get()),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::warn!(
+                                        "  [{ts}] ⚠ terminal long response send failed for channel {}: {} — preserving inflight for retry",
+                                        channel_id,
+                                        error
+                                    );
+                                    // Send failed: NotDelivered → no advance;
+                                    // commit_and_advance records + releases.
+                                    if let Some(lease) = lease {
+                                        lease.commit_and_advance(
+                                            shared_owned.as_ref(),
+                                            watcher_owner_channel_id,
+                                            inflight_state.tmux_session_name.as_deref(),
+                                            crate::services::discord::LeaseOutcome::NotDelivered,
+                                        );
+                                    }
+                                    preserve_inflight_for_cleanup_retry = true;
+                                }
+                            }
                         }
                     } else {
-                        // #3089 A5/#3998 S1-f2: route structurally eligible
-                        // short-replace through the controller
-                        // (`terminal_controller_cutover`).
+                        // #3089 A5/A6b (flags, default OFF): route short-replace through the controller (`terminal_controller_cutover`); OFF → legacy below.
+                        let bridge_turn = super::turn_finalizer::TurnKey::new(
+                            watcher_owner_channel_id,
+                            inflight_state.user_msg_id,
+                            shared_owned.restart.current_generation,
+                        );
                         let bridge_start = inflight_state.turn_start_offset.unwrap_or(0);
                         let ordered_range = tmux_last_offset.is_some_and(|e| e > bridge_start);
-                        let cutover_short_replace =
+                        // #3089 A5 OR A6b: route short-replace via the controller when A5 is ON (both origins) OR A6b is ON AND this is a TUI external-input turn (closes #3088). The OR-in IS the pure `bridge_short_replace_route_decision` (r2 [Medium]) so the production expression cannot be silently weakened — the `is_external_input_tui_direct &&` scoping is mutation-pinned by `a6b_flag_does_not_route_discord_origin_when_a5_off`.
+                        use super::tui_prompt_relay_controller_cutover as a6b;
+                        let cutover_short_replace = a6b::bridge_short_replace_route_decision(
                             terminal_controller_cutover::bridge_short_replace_cutover_decision(
+                                terminal_controller_cutover::turn_bridge_terminal_controller_enabled(),
                                 can_chain_locally,
                                 &delivery_response,
                                 ordered_range,
                                 true,
+                            ),
+                            a6b::tui_prompt_relay_controller_enabled(),
+                            is_external_input_tui_direct,
+                            a6b::tui_prompt_relay_short_replace_should_cutover_decision(
+                                a6b::tui_prompt_relay_controller_enabled(),
+                                can_chain_locally,
+                                &delivery_response,
+                                ordered_range,
+                            ),
                         );
                         if cutover_short_replace {
-                            let bridge_turn = super::turn_finalizer::TurnKey::new(
-                                watcher_owner_channel_id,
-                                inflight_state.user_msg_id,
-                                shared_owned.restart.current_generation,
-                            );
-                            let bridge_lease_key = bridge_delivery_lease_key_for_inflight(
-                                watcher_owner_channel_id,
-                                shared_owned.restart.current_generation,
-                                &inflight_state,
-                            );
                             let cell = shared_owned.delivery_lease(watcher_owner_channel_id);
                             terminal_controller_cutover::apply_bridge_short_replace_controller(
                                 gateway.as_ref(),
@@ -5343,7 +5272,6 @@ pub(super) fn spawn_turn_bridge(
                                 &shared_owned.ui.placeholder_controller,
                                 current_msg_id,
                                 &delivery_response,
-                                &spoken_delivery_response,
                                 full_response.len(),
                                 bridge_turn,
                                 bridge_start,
@@ -5352,7 +5280,6 @@ pub(super) fn spawn_turn_bridge(
                                 dispatch_id.as_deref(),
                                 adk_session_key.as_deref(),
                                 Some(turn_id.as_str()),
-                                Some(bridge_lease_key.clone()),
                                 terminal_controller_cutover::BridgeShortReplaceLocals {
                                     terminal_delivery_committed: &mut terminal_delivery_committed,
                                     terminal_body_visible: &mut terminal_body_visible,
@@ -5368,125 +5295,122 @@ pub(super) fn spawn_turn_bridge(
                             )
                             .await;
                         } else {
-                            // #3041 P1-2 (site 5 — normal bridge terminal replace):
-                            // acquire the shared delivery lease on
-                            // `watcher_owner_channel_id` BEFORE delivering so the
-                            // watcher and bridge serialize. On B2 Skip the holder owns
-                            // this range/turn, so do NOT deliver+advance.
-                            let lease_acquire = match terminal_controller_cutover::bridge_terminal_lease_range(
-                                Some((bridge_start, tmux_last_offset.unwrap_or(0))),
-                                cutover_short_replace,
-                            ) {
-                                Some(_) => bridge_delivery_lease_for_inflight(
-                                    shared_owned.as_ref(),
-                                    watcher_owner_channel_id,
-                                    shared_owned.restart.current_generation,
-                                    &inflight_state,
-                                    tmux_last_offset,
-                                ),
-                                None => BridgeLeaseAcquire::NoRange,
+                        // #3041 P1-2 (site 5 — normal bridge terminal replace): acquire the shared delivery lease on `watcher_owner_channel_id` (shared cell + TurnKey) BEFORE delivering so the watcher and the bridge serialize. On a B2 Skip the holder owns this range/turn → do NOT deliver+advance. (codex P1-a) The lease-range gate keeps the acquire off the cut-over set.
+                        let lease_acquire = match terminal_controller_cutover::bridge_terminal_lease_range(
+                            Some((bridge_start, tmux_last_offset.unwrap_or(0))),
+                            cutover_short_replace,
+                        ) {
+                            Some(_) => BridgeDeliveryLease::acquire(
+                                shared_owned.as_ref(),
+                                watcher_owner_channel_id,
+                                bridge_turn,
+                                bridge_start,
+                                tmux_last_offset,
+                            ),
+                            None => BridgeLeaseAcquire::NoRange,
+                        };
+                        if matches!(lease_acquire, BridgeLeaseAcquire::Skip) {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                channel = channel_id.get(),
+                                "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate terminal replace (channel {})",
+                                channel_id
+                            );
+                            // #3041 P1-2 (codex P1-c): preserve retry on a B2 Skip —
+                            // holder owns delivery; do NOT clear inflight / mark the
+                            // watcher delivered. (codex P1-2 R3) identity-guard the save.
+                            preserve_inflight_for_cleanup_retry = true;
+                            bridge_skip_holder_owns_inflight = true;
+                        } else {
+                            // `Held(lease)` → commit via the lease; `NoRange` → deliver without a lease (no offset to advance).
+                            let lease = match lease_acquire {
+                                BridgeLeaseAcquire::Held(lease) => Some(lease),
+                                _ => None,
                             };
-                            if matches!(lease_acquire, BridgeLeaseAcquire::Skip) {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::warn!(
-                                    channel = channel_id.get(),
-                                    "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate terminal replace (channel {})",
-                                    channel_id
-                                );
-                                // #3041 P1-2 (codex P1-c): preserve retry on a B2
-                                // Skip — holder owns delivery; do NOT clear inflight /
-                                // mark the watcher delivered. (codex P1-2 R3)
-                                // identity-guard the save.
-                                preserve_inflight_for_cleanup_retry = true;
-                                bridge_skip_holder_owns_inflight = true;
-                            } else {
-                                // `Held(lease)` commits through the lease; `NoRange`
-                                // delivers without a lease and without offset advance.
-                                let lease = match lease_acquire {
-                                    BridgeLeaseAcquire::Held(lease) => Some(lease),
-                                    _ => None,
-                                };
-                                {
-                                    let replace_outcome = gateway
-                                        .replace_message_with_outcome(
-                                            channel_id,
-                                            current_msg_id,
-                                            &delivery_response,
-                                        )
-                                        .await;
-                                    // #2860: delivered if the placeholder was edited OR a
-                                    // fallback posted the full delivery_response as a fresh
-                                    // message (edit non-committed); record it delivered so
-                                    // stall-watchdog recovery does not re-deliver this turn.
-                                    let fallback_delivered = matches!(
-                                        &replace_outcome,
-                                        Ok(super::formatting::ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { .. })
-                                    );
-                                    let replace_committed = turn_bridge_replace_outcome_committed(
-                                        shared_owned.as_ref(),
-                                        &provider,
+                            {
+                                let replace_outcome = gateway
+                                    .replace_message_with_outcome(
                                         channel_id,
                                         current_msg_id,
-                                        inflight_state.tmux_session_name.as_deref(),
-                                        replace_outcome,
-                                        dispatch_id.as_deref(),
-                                        adk_session_key.as_deref(),
-                                        Some(turn_id.as_str()),
-                                        "turn_bridge_terminal_replace",
-                                    );
-                                    // #3041 P1-2 / B6: confirmed_end advance flows ONLY
-                                    // through the lease commit — `Delivered` on a committed
-                                    // replace, `NotDelivered` otherwise.
-                                    let outcome = if let Some(lease) = lease {
-                                        let lease_range = lease.range();
-                                        let outcome = if replace_committed {
-                                            crate::services::discord::LeaseOutcome::Delivered
-                                        } else {
-                                            crate::services::discord::LeaseOutcome::NotDelivered
-                                        };
-                                        let committed = lease.commit_and_advance(
-                                            shared_owned.as_ref(),
-                                            watcher_owner_channel_id,
-                                            inflight_state.tmux_session_name.as_deref(),
-                                            outcome,
-                                        );
-                                        // #3630: mirror delivered frontier for post-restart no-inflight dedup.
-                                        if replace_committed && committed {
-                                            super::outbound::delivery_record::record_delivered_frontier_with_body(
-                                                shared_owned.as_ref(),
-                                                &provider,
-                                                watcher_owner_channel_id,
-                                                lease_range,
-                                                current_msg_id.get(),
-                                                channel_id.get(),
-                                                &spoken_delivery_response,
-                                            );
-                                        }
-                                        replace_committed
+                                        &delivery_response,
+                                    )
+                                    .await;
+                                // #2860: delivered if the placeholder was edited OR a fallback
+                                // posted the full delivery_response as a fresh message (edit
+                                // non-committed); record it delivered so stall-watchdog recovery
+                                // does not re-deliver this turn.
+                                let fallback_delivered = matches!(
+                                    &replace_outcome,
+                                    Ok(super::formatting::ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { .. })
+                                );
+                                let replace_committed = turn_bridge_replace_outcome_committed(
+                                    shared_owned.as_ref(),
+                                    &provider,
+                                    channel_id,
+                                    current_msg_id,
+                                    inflight_state.tmux_session_name.as_deref(),
+                                    replace_outcome,
+                                    dispatch_id.as_deref(),
+                                    adk_session_key.as_deref(),
+                                    Some(turn_id.as_str()),
+                                    "turn_bridge_terminal_replace",
+                                );
+                                // #3041 P1-2 / B6: confirmed_end advance flows ONLY through the lease commit — `Delivered` on a committed replace, `NotDelivered` otherwise (mirrors pre-P1-2).
+                                let outcome = if let Some(lease) = lease {
+                                    let lease_range = lease.range();
+                                    let outcome = if replace_committed {
+                                        crate::services::discord::LeaseOutcome::Delivered
                                     } else {
-                                        // NoRange: no new bytes, so deliver without a lease
-                                        // and without advancing.
-                                        replace_committed
+                                        crate::services::discord::LeaseOutcome::NotDelivered
                                     };
-                                    if outcome {
-                                        terminal_delivery_committed = true;
-                                        terminal_body_visible = true;
-                                        if single_message_panel_footer_mode {
-                                            completion_footer_terminal_text =
-                                                Some(delivery_response.clone());
-                                        }
-                                    } else {
-                                        preserve_inflight_for_cleanup_retry = true;
-                                        if fallback_delivered {
-                                            // The fallback carried the whole response; persist
-                                            // that offset so recovery never treats it as
-                                            // never-delivered.
-                                            inflight_state.response_sent_offset =
-                                                full_response.len();
-                                        }
+                                    let committed = lease.commit_and_advance(
+                                        shared_owned.as_ref(),
+                                        watcher_owner_channel_id,
+                                        inflight_state.tmux_session_name.as_deref(),
+                                        outcome,
+                                    );
+                                    // #3630: durably mirror the delivered frontier (like
+                                    // the cutover/long-chunk paths) so a post-restart
+                                    // no-inflight watcher dedups it instead of re-relaying
+                                    // the already-delivered body as a DUPLICATE. Gate on
+                                    // `replace_committed && committed`: commit_and_advance
+                                    // returns true on ANY successful lease commit (incl.
+                                    // NotDelivered) but only Delivered advances
+                                    // confirmed_end_offset — recording on NotDelivered would
+                                    // break M4 (durable END must mirror confirmed_end) and
+                                    // wrongly suppress a retry (#3610, codex #3630 review).
+                                    if replace_committed && committed {
+                                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
+                                            shared_owned.as_ref(),
+                                            &provider,
+                                            watcher_owner_channel_id,
+                                            lease_range,
+                                            true,
+                                            Some(current_msg_id.get()),
+                                            Some(channel_id.get()),
+                                        );
+                                    }
+                                    replace_committed
+                                } else {
+                                    // NoRange (zero/inverted range or no tmux session): NO new bytes → deliver without a lease and WITHOUT advancing (codex P1-b: no advance outside a commit).
+                                    replace_committed
+                                };
+                                if outcome {
+                                    terminal_delivery_committed = true;
+                                    terminal_body_visible = true;
+                                    if single_message_panel_footer_mode {
+                                        completion_footer_terminal_text =
+                                            Some(delivery_response.clone());
+                                    }
+                                } else {
+                                    preserve_inflight_for_cleanup_retry = true;
+                                    if fallback_delivered {
+                                        // Mark the whole response delivered: the fallback carried it; the preserved-inflight save below persists this offset so the turn never re-presents as a never-delivered leak for recovery.
+                                        inflight_state.response_sent_offset = full_response.len();
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 } else {
@@ -5754,6 +5678,44 @@ pub(super) fn spawn_turn_bridge(
 
                 bridge_should_emit_completion = bridge_gate_outcome.should_emit_completion();
 
+                // On TimedOut we preserve the inflight + suppress dispatch
+                // completion so queued turns do not drain into a busy pane. The
+                // next watcher pass / placeholder sweeper reconciles when the
+                // pane finally reports idle.
+                if matches!(
+                    bridge_gate_outcome,
+                    super::tmux::TuiCompletionGateOutcome::TimedOut
+                ) {
+                    if tui_quiescence_timeout_requires_inflight_retry(terminal_delivery_committed) {
+                        preserve_inflight_for_cleanup_retry = true;
+                    } else {
+                        let terminal_ui_status_msg_id = normalize_status_panel_message_id(
+                            inflight_state.status_message_id.map(MessageId::new),
+                        );
+                        if super::terminal_ui_obligation::should_record_terminal_ui_obligation(
+                                terminal_delivery_committed,
+                                true,
+                                terminal_ui_status_msg_id.is_some(),
+                            )
+                            && let Some(status_msg_id) = terminal_ui_status_msg_id
+                        {
+                            super::terminal_ui_obligation::record_terminal_ui_obligation_pending_status(
+                                shared_owned.as_ref(),
+                                &provider,
+                                channel_id,
+                                status_msg_id,
+                                status_panel_started_at,
+                                &inflight_state,
+                            )
+                            .await;
+                        }
+                        tracing::warn!(
+                            provider = %provider.as_str(),
+                            channel = channel_id.get(),
+                            "TUI completion quiescence timed out after terminal delivery committed; suppressing visible completion only and continuing inflight cleanup"
+                        );
+                    }
+                }
             }
 
             if should_complete_work_dispatch_after_terminal_delivery(
@@ -5807,7 +5769,7 @@ pub(super) fn spawn_turn_bridge(
                 && !delivery_response.trim().is_empty()
                 && let Some(user_msg_id) = user_msg_id
             {
-                tv_done(&shared_owned, channel_id, user_msg_id, inflight_generation, "done").await;
+                gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
 
             td_warn(terminal_delivery_committed, preserve_inflight_for_cleanup_retry, channel_id);
@@ -5866,8 +5828,9 @@ pub(super) fn spawn_turn_bridge(
                     );
                 }
             }
-            let indicator =
-                super::single_message_panel::single_message_panel_spinner_frame(spin_idx);
+            let indicator = super::single_message_panel::single_message_panel_spinner_frame(
+                spin_idx,
+            );
             status_panel_completion_committed =
                 complete_bridge_terminal_footer_or_status_panel(
                     shared_owned.as_ref(),
@@ -5880,11 +5843,8 @@ pub(super) fn spawn_turn_bridge(
                     status_panel_started_at,
                     &mut last_status_panel_text,
                     single_message_panel_footer_mode,
-                    is_external_input_tui_direct, // #3959: suppress mirror chrome footer
                     completion_footer_terminal_text.as_deref(),
                     indicator,
-                    status_panel_generation, // #3805 P2: prove this turn's panel epoch
-                    inflight_state.tmux_session_name.as_deref(),
                 )
                 .await;
         }
@@ -6112,9 +6072,12 @@ pub(super) fn spawn_turn_bridge(
             }),
         );
 
-        if should_persist_transcript && shared_owned.pg_pool.is_some() {
+        if should_persist_transcript
+            && (None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some())
+        {
             let channel_id_text = channel_id.get().to_string();
             if let Err(e) = crate::db::session_transcripts::persist_turn_db(
+                None::<&crate::db::Db>,
                 shared_owned.pg_pool.as_ref(),
                 crate::db::session_transcripts::PersistSessionTranscript {
                     turn_id: turn_id.as_str(),
@@ -6138,8 +6101,11 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if shared_owned.pg_pool.is_some() && !api_friction_reports.is_empty() {
+        if (None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some())
+            && !api_friction_reports.is_empty()
+        {
             match crate::services::api_friction::record_api_friction_reports(
+                None::<&crate::db::Db>,
                 shared_owned.pg_pool.as_ref(),
                 &capture_memory_settings,
                 crate::services::api_friction::ApiFrictionRecordContext {
@@ -6171,10 +6137,11 @@ pub(super) fn spawn_turn_bridge(
 
         // No user message (user_msg_id == 0) → no analytics row to key
         // (`discord:<channel>:0` is the bogus form); skip the persist.
-        if shared_owned.pg_pool.is_some()
+        if (None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some())
             && let Some(user_msg_id) = user_msg_id
         {
             persist_turn_analytics_row_with_handles(
+                None::<&crate::db::Db>,
                 shared_owned.pg_pool.as_ref(),
                 &provider,
                 channel_id,
@@ -6191,6 +6158,7 @@ pub(super) fn spawn_turn_bridge(
             );
         }
 
+        let mut auto_feedback_count = 0usize;
         if let Some(analysis) = recall_feedback_analysis.as_ref()
             && should_submit_automatic_feedback_fallback(
                 analysis,
@@ -6217,7 +6185,7 @@ pub(super) fn spawn_turn_bridge(
                     Default::default()
                 }
             };
-            let _submitted_count = submit_result.submitted_count;
+            auto_feedback_count = submit_result.submitted_count;
             accumulated_memory_input_tokens = accumulated_memory_input_tokens
                 .saturating_add(submit_result.token_usage.input_tokens);
             accumulated_memory_output_tokens = accumulated_memory_output_tokens
@@ -6225,6 +6193,32 @@ pub(super) fn spawn_turn_bridge(
             for error in submit_result.errors {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!("  [{ts}] ⚠ failed to auto-submit recall tool_feedback: {error}");
+            }
+        }
+
+        if let (Some(db), Some(analysis)) =
+            (None::<&crate::db::Db>, recall_feedback_analysis.as_ref())
+            && analysis.recall_count > 0
+        {
+            let stat = crate::db::memento_feedback_stats::MementoFeedbackTurnStat {
+                turn_id: turn_id.clone(),
+                stat_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+                agent_id: memory_role_id.clone(),
+                provider: provider.as_str().to_string(),
+                recall_count: i64::try_from(analysis.recall_count).unwrap_or(i64::MAX),
+                manual_tool_feedback_count: i64::try_from(analysis.manual_feedback_count)
+                    .unwrap_or(i64::MAX),
+                manual_covered_recall_count: i64::try_from(analysis.manual_covered_recall_count)
+                    .unwrap_or(i64::MAX),
+                auto_tool_feedback_count: i64::try_from(auto_feedback_count).unwrap_or(i64::MAX),
+                covered_recall_count: i64::try_from(
+                    analysis.covered_recall_count_after(auto_feedback_count),
+                )
+                .unwrap_or(i64::MAX),
+            };
+            if let Err(error) = crate::db::memento_feedback_stats::upsert_turn_stat(db, &stat) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!("  [{ts}] ⚠ failed to persist memento feedback stats: {error}");
             }
         }
 
@@ -6561,22 +6555,105 @@ pub(super) fn spawn_turn_bridge(
         // implementation/review/rework turn can warm-resume from the same tmux.
         // New dispatch arrivals validate the managed tmux session before reuse.
 
-        // #3038: finalization epilogue (counter decrement + queued-turn drain)
-        // extracted verbatim to `finalize_epilogue.rs`. This is the LAST block of
-        // the async body, so every capture is threaded by value with its original
-        // ownership; behavior-preserving (see the module doc for the seam-fix note).
-        finalize_epilogue::finalize_and_drain_queued_turns(
-            shared_owned,
-            has_queued_turns,
-            preserve_inflight_for_cleanup_retry,
-            gateway,
-            channel_id,
-            provider,
-            request_owner_name,
-            tmux_last_offset,
-            watcher_owner_channel_id,
-        )
-        .await;
+        // Finalization complete — decrement counters
+        shared_owned
+            .restart.finalizing_turns
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        shared_owned
+            .restart.global_finalizing
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // Note: deferred restart exit is handled by the 5-second poll loop in mod.rs,
+        // which saves pending queues before calling check_deferred_restart.
+        // Calling it here would risk exiting before other providers save their queues.
+
+        if has_queued_turns {
+            // Drain mode: if restart is pending, don't start new turns from queue.
+            // The queued messages will be saved to disk and processed after restart.
+            if preserve_inflight_for_cleanup_retry {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} until placeholder cleanup retry commits",
+                    channel_id
+                );
+            } else if shared_owned
+                .restart.restart_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] ⏸ DRAIN: skipping queued turn dequeue for channel {} (restart pending)",
+                    channel_id
+                );
+            } else if let Some(bot_owner_provider) = gateway.bot_owner_provider() {
+                if let Err(reason) = gateway.validate_live_routing(channel_id).await {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] ⚠ QUEUE-GUARD: preserving queued command(s) for channel {} (reason={})",
+                        channel_id,
+                        reason
+                    );
+                } else {
+                    let next_intervention = super::mailbox_take_next_soft_intervention(
+                        &shared_owned,
+                        &bot_owner_provider,
+                        channel_id,
+                    )
+                    .await;
+
+                    if let Some(error) = next_intervention.persistence_error.as_ref() {
+                        tracing::error!(
+                            provider = bot_owner_provider.as_str(),
+                            channel_id = channel_id.get(),
+                            error = %error,
+                            "QUEUE-GUARD: preserving queued command after pending-queue persistence failure"
+                        );
+                    } else if let Some((intervention, has_more_queued_turns)) =
+                        next_intervention.into_intervention()
+                    {
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        tracing::info!("  [{ts}] 📋 Processing next queued command");
+                        if let Err(e) = gateway
+                            .dispatch_queued_turn(
+                                channel_id,
+                                &intervention,
+                                &request_owner_name,
+                                has_more_queued_turns,
+                            )
+                            .await
+                        {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!("  [{ts}]   ⚠ queued command failed: {e}");
+                            super::mailbox_requeue_intervention_front(
+                                &shared_owned,
+                                &bot_owner_provider,
+                                channel_id,
+                                intervention,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 📦 preserving queued command(s): missing live Discord context — scheduling deferred drain"
+                );
+                if let Some(offset) = tmux_last_offset
+                    && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
+                {
+                    if let Ok(mut guard) = watcher.resume_offset.lock() {
+                        *guard = Some(offset);
+                    }
+                    watcher.paused.store(false, Ordering::Relaxed);
+                }
+                super::schedule_deferred_idle_queue_kickoff(
+                    shared_owned.clone(),
+                    provider.clone(),
+                    channel_id,
+                    "turn bridge queued backlog",
+                );
+            }
+        }
 
         // completion_tx is sent automatically by CompletionGuard on drop
     }.instrument(bridge_span));

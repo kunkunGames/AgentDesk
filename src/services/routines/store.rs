@@ -10,7 +10,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::api_caller_observability::{RequestPrincipal, log_identity_consumption};
 use crate::services::automation_candidate_contract::{
     PIPELINE_STAGE_ID, has_complete_loop_contract,
 };
@@ -422,102 +421,6 @@ pub struct RoutineMetrics {
     pub runs_interrupted: i64,
     pub runs_error: i64,
     pub avg_latency_ms: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeleteRoutineResult {
-    Deleted {
-        run_history_deleted: u64,
-        routine_agent_id: Option<String>,
-        caller_agent_id: Option<String>,
-    },
-    NotFound {
-        caller_agent_id: Option<String>,
-    },
-    NotDetached {
-        status: String,
-        routine_agent_id: Option<String>,
-        caller_agent_id: Option<String>,
-    },
-    InFlight {
-        routine_agent_id: Option<String>,
-        caller_agent_id: Option<String>,
-    },
-    Forbidden {
-        owner: String,
-        caller_agent_id: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RoutineHardDeleteGate {
-    Allowed,
-    NotDetached { status: String },
-    InFlight,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RoutineDeleteScopeGate {
-    Allowed,
-    Unresolved { owner: String },
-    OtherAgent { owner: String, caller: String },
-}
-
-fn routine_hard_delete_gate(
-    status: &str,
-    in_flight_run_id: Option<&str>,
-    has_running_run: bool,
-) -> RoutineHardDeleteGate {
-    if in_flight_run_id
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-        || has_running_run
-    {
-        return RoutineHardDeleteGate::InFlight;
-    }
-    if status == "detached" {
-        RoutineHardDeleteGate::Allowed
-    } else {
-        RoutineHardDeleteGate::NotDetached {
-            status: status.to_string(),
-        }
-    }
-}
-
-fn routine_delete_scope_gate(
-    routine_agent_id: Option<&str>,
-    caller_agent_id: Option<&str>,
-    principal: Option<&RequestPrincipal>,
-) -> RoutineDeleteScopeGate {
-    log_identity_consumption(
-        "DELETE /api/routines/{id}",
-        principal,
-        caller_agent_id,
-        false,
-    );
-
-    let Some(owner) = routine_agent_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return RoutineDeleteScopeGate::Allowed;
-    };
-    let Some(caller) = caller_agent_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return RoutineDeleteScopeGate::Unresolved {
-            owner: owner.to_string(),
-        };
-    };
-    if caller == owner {
-        RoutineDeleteScopeGate::Allowed
-    } else {
-        RoutineDeleteScopeGate::OtherAgent {
-            owner: owner.to_string(),
-            caller: caller.to_string(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -2659,140 +2562,6 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn delete_detached_routine(
-        &self,
-        routine_id: &str,
-        caller_agent_id: Option<&str>,
-        principal: Option<&RequestPrincipal>,
-    ) -> Result<DeleteRoutineResult> {
-        let caller_agent_id = caller_agent_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        let row = sqlx::query(
-            r#"
-            SELECT status, in_flight_run_id, agent_id
-            FROM routines
-            WHERE id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(routine_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        let Some(row) = row else {
-            return Ok(DeleteRoutineResult::NotFound { caller_agent_id });
-        };
-
-        let status: String = row
-            .try_get("status")
-            .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-        let in_flight_run_id: Option<String> = row
-            .try_get("in_flight_run_id")
-            .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-        let routine_agent_id: Option<String> = row
-            .try_get("agent_id")
-            .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        match routine_delete_scope_gate(
-            routine_agent_id.as_deref(),
-            caller_agent_id.as_deref(),
-            principal,
-        ) {
-            RoutineDeleteScopeGate::Allowed => {}
-            RoutineDeleteScopeGate::Unresolved { owner } => {
-                return Ok(DeleteRoutineResult::Forbidden {
-                    owner,
-                    caller_agent_id: None,
-                });
-            }
-            RoutineDeleteScopeGate::OtherAgent { owner, caller } => {
-                return Ok(DeleteRoutineResult::Forbidden {
-                    owner,
-                    caller_agent_id: Some(caller),
-                });
-            }
-        }
-
-        let has_running_run: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM routine_runs
-                WHERE routine_id = $1
-                  AND status = 'running'
-            )
-            "#,
-        )
-        .bind(routine_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        match routine_hard_delete_gate(&status, in_flight_run_id.as_deref(), has_running_run) {
-            RoutineHardDeleteGate::Allowed => {}
-            RoutineHardDeleteGate::InFlight => {
-                return Ok(DeleteRoutineResult::InFlight {
-                    routine_agent_id,
-                    caller_agent_id,
-                });
-            }
-            RoutineHardDeleteGate::NotDetached { status } => {
-                return Ok(DeleteRoutineResult::NotDetached {
-                    status,
-                    routine_agent_id,
-                    caller_agent_id,
-                });
-            }
-        }
-
-        let deleted_runs = sqlx::query(
-            r#"
-            DELETE FROM routine_runs
-            WHERE routine_id = $1
-            "#,
-        )
-        .bind(routine_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("delete routine run history for {routine_id}: {e}"))?;
-
-        let deleted_routine = sqlx::query(
-            r#"
-            DELETE FROM routines
-            WHERE id = $1
-            "#,
-        )
-        .bind(routine_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        if deleted_routine.rows_affected() != 1 {
-            return Err(anyhow!(
-                "delete routine {routine_id}: locked routine row disappeared before delete"
-            ));
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| anyhow!("delete routine {routine_id}: {e}"))?;
-
-        Ok(DeleteRoutineResult::Deleted {
-            run_history_deleted: deleted_runs.rows_affected(),
-            routine_agent_id,
-            caller_agent_id,
-        })
-    }
-
     /// Extend the lease for a running routine run.
     ///
     /// Executors must call this periodically while JS execution is active.
@@ -3690,42 +3459,14 @@ mod tests {
         parse_schedule_interval, precomputed_observation_from_kv,
         resume_without_next_due_is_invalid, truncate_chars, validate_routine_schedule,
     };
-    use crate::api_caller_observability::{AuthStrength, LOG_TARGET, RequestPrincipal};
     use chrono::{TimeZone, Timelike, Utc};
     use serde_json::Value;
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::writer::MakeWriter;
 
     // Integration tests that require a live PG connection live in
     // src/integration_tests.rs and are gated on the `integration` feature.
     // The store SQL is compiled by `cargo check`; concurrent claim/recovery
     // behavior should be covered by PG integration tests once the runtime
     // harness starts executing routines.
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     #[test]
     fn resume_omitted_next_due_rejects_legacy_schedule_less_rows() {
@@ -4140,125 +3881,6 @@ mod tests {
         assert!(
             evidence_ref.starts_with("routine_runs:"),
             "evidence_ref must be prefixed with 'routine_runs:'"
-        );
-    }
-
-    #[test]
-    fn routine_hard_delete_gate_allows_only_detached_without_inflight() {
-        assert_eq!(
-            super::routine_hard_delete_gate("detached", None, false),
-            super::RoutineHardDeleteGate::Allowed
-        );
-        assert_eq!(
-            super::routine_hard_delete_gate("paused", None, false),
-            super::RoutineHardDeleteGate::NotDetached {
-                status: "paused".to_string()
-            }
-        );
-        assert_eq!(
-            super::routine_hard_delete_gate("enabled", None, false),
-            super::RoutineHardDeleteGate::NotDetached {
-                status: "enabled".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn routine_hard_delete_gate_rejects_inflight_signals() {
-        assert_eq!(
-            super::routine_hard_delete_gate("detached", Some("run-1"), false),
-            super::RoutineHardDeleteGate::InFlight
-        );
-        assert_eq!(
-            super::routine_hard_delete_gate("detached", Some("  "), true),
-            super::RoutineHardDeleteGate::InFlight
-        );
-        assert_eq!(
-            super::routine_hard_delete_gate("enabled", Some("run-1"), true),
-            super::RoutineHardDeleteGate::InFlight
-        );
-    }
-
-    #[test]
-    fn routine_hard_delete_scope_gate_fails_closed_for_owned_routine() {
-        assert_eq!(
-            super::routine_delete_scope_gate(Some("codex"), Some("codex"), None),
-            super::RoutineDeleteScopeGate::Allowed
-        );
-        assert_eq!(
-            super::routine_delete_scope_gate(None, None, None),
-            super::RoutineDeleteScopeGate::Allowed
-        );
-        assert_eq!(
-            super::routine_delete_scope_gate(Some("codex"), None, None),
-            super::RoutineDeleteScopeGate::Unresolved {
-                owner: "codex".to_string()
-            }
-        );
-        assert_eq!(
-            super::routine_delete_scope_gate(Some("codex"), Some("claude"), None),
-            super::RoutineDeleteScopeGate::OtherAgent {
-                owner: "codex".to_string(),
-                caller: "claude".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn routine_delete_scope_gate_logs_delete_path_identity_consumption() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = CapturingWriter {
-            buffer: buffer.clone(),
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(true)
-            .with_writer(writer)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let principal = RequestPrincipal {
-            auth_strength: AuthStrength::ServerAdmin,
-            claimed_agent_id: Some("codex".to_string()),
-            claimed_channel_id: Some("manager-channel".to_string()),
-        };
-
-        assert_eq!(
-            super::routine_delete_scope_gate(
-                Some("codex"),
-                Some("resolved-codex"),
-                Some(&principal)
-            ),
-            super::RoutineDeleteScopeGate::OtherAgent {
-                owner: "codex".to_string(),
-                caller: "resolved-codex".to_string()
-            }
-        );
-        drop(_guard);
-
-        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains(LOG_TARGET), "logs={logs}");
-        assert!(
-            logs.contains("endpoint=\"DELETE /api/routines/{id}\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("auth_strength=\"ServerAdmin\""),
-            "logs={logs}"
-        );
-        assert!(logs.contains("claimed_agent_id=\"codex\""), "logs={logs}");
-        assert!(
-            logs.contains("claimed_channel_id=\"manager-channel\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("consumed_agent_id=\"resolved-codex\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("manager_channel_check_relied_on_claimed_header=false"),
-            "logs={logs}"
         );
     }
 

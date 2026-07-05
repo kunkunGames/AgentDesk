@@ -1,37 +1,5 @@
 use super::*;
 
-#[cfg(unix)]
-#[derive(Clone)]
-struct IdleStreamFrameLogContext {
-    provider: String,
-    channel_id: u64,
-    tmux_session_name: String,
-    mailbox_owner_user_msg_id: u64,
-    inflight_user_msg_id: u64,
-    inflight_current_msg_id: u64,
-}
-
-#[cfg(unix)]
-fn log_idle_stream_text_decision(
-    ctx: Option<&IdleStreamFrameLogContext>,
-    decision: &'static str,
-    content_len: usize,
-) {
-    if let Some(ctx) = ctx {
-        tracing::debug!(
-            provider = %ctx.provider,
-            channel_id = ctx.channel_id,
-            tmux_session_name = %ctx.tmux_session_name,
-            mailbox_owner_user_msg_id = ctx.mailbox_owner_user_msg_id,
-            inflight_user_msg_id = ctx.inflight_user_msg_id,
-            inflight_current_msg_id = ctx.inflight_current_msg_id,
-            text_len = content_len,
-            decision,
-            "idle-tail text frame relay decision"
-        );
-    }
-}
-
 /// #3256: a transcript-reader frame counts as "content" for the idle-tail
 /// stream-through when it carries body the operator actually produced — prose
 /// (`Text`), an authoritative terminal body (`Done` with a non-empty result),
@@ -99,27 +67,6 @@ pub(super) fn compose_tui_idle_response(
 }
 
 #[cfg(unix)]
-fn codex_external_input_bridge_stream_messages(
-    response: &str,
-    final_offset: u64,
-) -> Vec<StreamMessage> {
-    let mut messages = Vec::new();
-    if !response.trim().is_empty() {
-        messages.push(StreamMessage::Text {
-            content: response.to_string(),
-        });
-    }
-    messages.push(StreamMessage::OutputOffset {
-        offset: final_offset,
-    });
-    messages.push(StreamMessage::Done {
-        result: response.to_string(),
-        session_id: None,
-    });
-    messages
-}
-
-#[cfg(unix)]
 #[allow(dead_code)]
 pub(super) async fn relay_tui_idle_response_through_bridge(
     shared: &Arc<SharedData>,
@@ -128,10 +75,10 @@ pub(super) async fn relay_tui_idle_response_through_bridge(
     tmux_session_name: &str,
     output_path: &Path,
     start_offset: u64,
-    // #3089 A6b r2 [High]/#3998 S1-f2: the tail's authoritative end offset.
-    // Plumbed into the bridge stream as `OutputOffset` so codex external-input's
-    // `ordered_range` becomes true and the unconditional A5 controller route is
-    // structurally eligible.
+    // #3089 A6b r2 [High]: the tail's authoritative end offset. Plumbed into the
+    // bridge stream as `OutputOffset` ONLY when the A6b flag is ON (OFF-safe — see
+    // `codex_external_input_bridge_stream_messages`) so codex external-input's
+    // `ordered_range` becomes true and the cutover reaches the controller.
     final_offset: u64,
     prompt_text: &str,
     response: &str,
@@ -230,16 +177,21 @@ pub(super) async fn relay_tui_idle_response_through_bridge(
         defer_watcher_resume: false,
         reuse_status_panel_message: false,
         completion_tx: Some(completion_tx),
-        is_external_input_tui_direct: true, // #3959: suppress mirror chrome footer
+        is_external_input_tui_direct: true, // #3089 A6b: scope the controller OR-in
         inflight_state,
     };
 
     spawn_turn_bridge(shared.clone(), Arc::new(CancelToken::new()), rx, bridge);
-    // #3089 A6b r2 [High]/#3998 S1-f2: feed the bridge
-    // `[Text?, OutputOffset, Done]`. `OutputOffset` advances `tmux_last_offset`
-    // to `final_offset` so codex external-input's `ordered_range` is true and
-    // the A5 controller route is structurally eligible.
-    for message in codex_external_input_bridge_stream_messages(response, final_offset) {
+    // #3089 A6b r2 [High]: feed the bridge `[Text?, OutputOffset?(flag-gated), Done]`.
+    // The flag-gated `OutputOffset` advances `tmux_last_offset` to `final_offset` so
+    // codex external-input's `ordered_range` is true and the cutover reaches the
+    // controller; OFF → no `OutputOffset` → byte-identical legacy `NoRange`.
+    for message in
+        super::super::tui_prompt_relay_controller_cutover::codex_external_input_bridge_stream_messages(
+            response,
+            final_offset,
+        )
+    {
         tx.send(message)
             .map_err(|error| format!("send TUI-direct bridge stream event: {error}"))?;
     }
@@ -411,33 +363,20 @@ pub(super) async fn stream_tui_idle_response_through_bridge(
         defer_watcher_resume: false,
         reuse_status_panel_message: false,
         completion_tx: Some(completion_tx),
-        is_external_input_tui_direct: true, // #3959: suppress mirror chrome footer
+        is_external_input_tui_direct: true, // #3089 A6b: scope the controller OR-in
         inflight_state,
     };
 
     // EXACTLY ONE spawn_turn_bridge per external turn.
     spawn_turn_bridge(shared.clone(), Arc::new(CancelToken::new()), rx, bridge);
-    let frame_log_context = IdleStreamFrameLogContext {
-        provider: provider.as_str().to_string(),
-        channel_id: channel_id.get(),
-        tmux_session_name: tmux_session_name.to_string(),
-        mailbox_owner_user_msg_id: super::super::mailbox_snapshot(shared, channel_id)
-            .await
-            .active_user_message_id
-            .map(|id| id.get())
-            .unwrap_or(0),
-        inflight_user_msg_id: user_msg_id.get(),
-        inflight_current_msg_id: current_msg_id.get(),
-    };
 
     // Forward the buffered prefix + the live reader stream into the SINGLE
     // bridge `tx` on a blocking thread (the reader receiver and the bridge
     // sender are both sync `mpsc`). The bridge finalizes on the first terminal
     // `Done`; we send a fallback `Done` only if the reader closed without one
     // so the bridge always finalizes EXACTLY ONCE.
-    let forward_handle = tokio::task::spawn_blocking(move || {
-        forward_idle_stream_into_bridge_with_logging(prefix, reader_rx, tx, Some(frame_log_context))
-    });
+    let forward_handle =
+        tokio::task::spawn_blocking(move || forward_idle_stream_into_bridge(prefix, reader_rx, tx));
 
     // #3256: the forward thread runs for the WHOLE turn — it only returns once the
     // transcript reader closes (turn done / idle / dead), having forwarded every
@@ -511,21 +450,10 @@ pub(super) async fn stream_tui_idle_response_through_bridge(
 /// Returns the number of `Text`-content frames forwarded (used by tests to
 /// prove progressive relay: more than one before the terminal `Done`).
 #[cfg(unix)]
-#[allow(dead_code)]
 pub(super) fn forward_idle_stream_into_bridge(
     prefix: Vec<StreamMessage>,
     reader_rx: mpsc::Receiver<StreamMessage>,
     tx: mpsc::Sender<StreamMessage>,
-) -> usize {
-    forward_idle_stream_into_bridge_with_logging(prefix, reader_rx, tx, None)
-}
-
-#[cfg(unix)]
-fn forward_idle_stream_into_bridge_with_logging(
-    prefix: Vec<StreamMessage>,
-    reader_rx: mpsc::Receiver<StreamMessage>,
-    tx: mpsc::Sender<StreamMessage>,
-    log_context: Option<IdleStreamFrameLogContext>,
 ) -> usize {
     let mut first_text_seen = false;
     let mut done_forwarded = false;
@@ -537,13 +465,6 @@ fn forward_idle_stream_into_bridge_with_logging(
                    text_frames_forwarded: &mut usize|
      -> bool {
         if *done_forwarded {
-            if let StreamMessage::Text { content } = &message {
-                log_idle_stream_text_decision(
-                    log_context.as_ref(),
-                    "drop_after_done",
-                    content.len(),
-                );
-            }
             // Bridge already finalized on the terminal Done; drop trailing
             // frames (e.g. the reader's synthetic empty Done after the real
             // result Done) to avoid any double-finalize ambiguity.
@@ -558,30 +479,13 @@ fn forward_idle_stream_into_bridge_with_logging(
             }
             other => other,
         };
-        let text_len = if let StreamMessage::Text { content } = &message {
-            Some(content.len())
-        } else {
-            None
-        };
-        let non_empty_text =
-            matches!(message, StreamMessage::Text { ref content } if !content.trim().is_empty());
+        if matches!(message, StreamMessage::Text { ref content } if !content.trim().is_empty()) {
+            *text_frames_forwarded += 1;
+        }
         let is_done = matches!(message, StreamMessage::Done { .. });
         if tx.send(message).is_err() {
-            if let Some(content_len) = text_len {
-                log_idle_stream_text_decision(
-                    log_context.as_ref(),
-                    "drop_receiver_closed",
-                    content_len,
-                );
-            }
             // Bridge receiver gone; stop forwarding.
             return false;
-        }
-        if let Some(content_len) = text_len {
-            log_idle_stream_text_decision(log_context.as_ref(), "accept", content_len);
-        }
-        if non_empty_text {
-            *text_frames_forwarded += 1;
         }
         if is_done {
             *done_forwarded = true;

@@ -126,7 +126,7 @@ fn forget_completion_footer_for_restart_handoff(
     channel_id: ChannelId,
     message_id: serenity::MessageId,
 ) -> bool {
-    super::footer_view_reconciler::note_footer_suppressed_for_message_takeover(
+    super::single_message_panel::completion_footer_forget_registered_target_if_message(
         channel_id, message_id,
     )
 }
@@ -535,10 +535,8 @@ mod notice_target_tests {
     fn restart_handoff_takeover_forgets_registered_completion_footer_target() {
         let channel_id = ChannelId::new(3_089_202);
         let shared = super::super::make_shared_data_for_tests();
-        super::super::footer_view_reconciler::completion_footer_forget_registered_target(
-            channel_id,
-        );
-        let _ = super::super::footer_view_reconciler::register_completion_footer_target(
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
+        let _ = super::super::single_message_panel::register_completion_footer_target(
             channel_id,
             MessageId::new(3_089_302),
             &ProviderKind::Codex,
@@ -554,7 +552,7 @@ mod notice_target_tests {
         ));
 
         assert_eq!(
-            super::super::footer_view_reconciler::completion_footer_edit_for_registered_target_at(
+            super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
                 shared.as_ref(),
                 channel_id,
                 "⠸",
@@ -568,10 +566,8 @@ mod notice_target_tests {
     fn restart_handoff_keeps_different_completion_footer_target() {
         let channel_id = ChannelId::new(3_089_212);
         let shared = super::super::make_shared_data_for_tests();
-        super::super::footer_view_reconciler::completion_footer_forget_registered_target(
-            channel_id,
-        );
-        let _ = super::super::footer_view_reconciler::register_completion_footer_target(
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
+        let _ = super::super::single_message_panel::register_completion_footer_target(
             channel_id,
             MessageId::new(3_089_312),
             &ProviderKind::Codex,
@@ -587,7 +583,7 @@ mod notice_target_tests {
         ));
 
         assert!(
-            super::super::footer_view_reconciler::completion_footer_edit_for_registered_target_at(
+            super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
                 shared.as_ref(),
                 channel_id,
                 "⠸",
@@ -595,8 +591,6 @@ mod notice_target_tests {
             )
             .is_some()
         );
-        super::super::footer_view_reconciler::completion_footer_forget_registered_target(
-            channel_id,
-        );
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
     }
 }

@@ -4,8 +4,8 @@ use crate::services::provider::ProviderKind;
 use super::common::{
     EVENT_LINE_MAX_CHARS, STATUS_PANEL_MAX_CHARS, STATUS_PANEL_SUBAGENT_LIMIT,
     STATUS_PANEL_TASK_LIMIT, STATUS_PANEL_TODO_LIMIT, STATUS_PANEL_WORKFLOW_LIMIT,
-    escape_status_panel_markdown, normalize_summary, sanitized_tool_name, truncate_chars,
-    truncate_chars_with_marker,
+    escape_status_panel_markdown, normalize_summary, sanitized_tool_name, tool_prefix,
+    truncate_chars, truncate_chars_with_marker,
 };
 use super::completion_footer::compact_live_panel_terminal_lines;
 use super::context_panel::{ContextPanelSnapshot, render_context_panel_line};
@@ -48,6 +48,8 @@ pub(super) enum DerivedStatus {
     Running,
     MonitorWait,
     ScheduleWakeup(Option<u64>),
+    TerminalDeliveryPending,
+    TerminalDeliveryUnconfirmed,
     Completed {
         kind: CompletedKind,
     },
@@ -93,21 +95,6 @@ pub(super) struct StatusPanelState {
     // #3477 item 3: instant the turn entered `Completed` (None until then); vs the
     // store's `last_recent_event_at` it gates the late-batch 🖥️ Recent freshness.
     pub(super) completed_at: Option<std::time::Instant>,
-    pub(super) background_agent_pending: bool,
-    // #3811: intake-set original-request user_msg_id; drives the `요청:` deeplink
-    // (`None` for headless/synthetic/voice/id-0 — no real Discord message).
-    pub(super) request_user_msg_id: Option<u64>,
-    // #3983 item4: dedup token for the one-shot session banner. Holds the
-    // identity (session_instance_key, falling back to provider_session_id, then
-    // the rendered line) of the session whose banner was already emitted, so the
-    // dual-path refresh (sink + watcher) posts the top banner EXACTLY ONCE per
-    // session. `None` until the first banner for this channel is claimed; a new
-    // session identity (new spawn nonce / provider session) makes the stored key
-    // stale and re-arms the claim for the next session boundary. This is
-    // bookkeeping only and is intentionally excluded from the `session ==
-    // snapshot` boundary compare in `set_session_panel_snapshot` (which compares
-    // the `session` field alone).
-    session_banner_emitted_key: Option<String>,
 }
 
 impl StatusPanelState {
@@ -121,38 +108,6 @@ impl StatusPanelState {
         self.subagents.clear();
         self.workflows.clear();
         self.completed_at = None; // #3477 item 3: drop the stale freshness gate.
-        self.background_agent_pending = false;
-        self.request_user_msg_id = None; // #3811: new session = new request context.
-    }
-
-    /// #3983 item4: atomically claim the one-shot session banner for the CURRENT
-    /// session snapshot, returning the rendered session line EXACTLY ONCE per
-    /// session identity. The identity is the stable `session_instance_key` (the
-    /// per-spawn nonce marker), falling back to the provider session id, then the
-    /// rendered line itself when neither id is available. A repeat call for the
-    /// same identity — the sibling refresh path arriving second, or a later
-    /// status tick — returns `None`; a NEW session identity (new spawn / provider
-    /// session) makes the stored key stale so the next boundary re-emits. `None`
-    /// when there is no session snapshot to banner.
-    ///
-    /// Callers hold the per-channel `StatusPanelState` mutex across this call, so
-    /// the read-current-identity + compare-and-record is a single atomic step:
-    /// whichever of the sink/watcher refresh paths reaches it FIRST for a given
-    /// session wins the banner, and the other observes the recorded key and skips
-    /// (no double emit, no omission).
-    pub(super) fn claim_session_banner(&mut self, provider: &ProviderKind) -> Option<String> {
-        let session = self.session.as_ref()?;
-        let line = render_session_panel_line(session, provider);
-        let key = session
-            .session_instance_key()
-            .map(str::to_owned)
-            .or_else(|| session.provider_session_id().map(str::to_owned))
-            .unwrap_or_else(|| line.clone());
-        if self.session_banner_emitted_key.as_deref() == Some(key.as_str()) {
-            return None;
-        }
-        self.session_banner_emitted_key = Some(key);
-        Some(line)
     }
 
     pub(super) fn reset_turn_content_preserving_unfinished_footer_residuals(&mut self) -> bool {
@@ -176,10 +131,8 @@ impl StatusPanelState {
         *self = StatusPanelState {
             tasks,
             subagents,
-            background_agent_pending: self.background_agent_pending,
             // #3391: carry the counter so a residual ordinal is never reissued.
             next_slot_ordinal: self.next_slot_ordinal,
-            request_user_msg_id: self.request_user_msg_id, // #3811: survive turn reset
             ..StatusPanelState::default()
         };
         has_residuals
@@ -207,39 +160,25 @@ impl StatusPanelState {
                 tool_use_id,
                 background,
             } => {
-                // #3920: keep "was a real value provided?" BEFORE defaulting, so a
-                // background-promotion re-affirmation (an async launch ack carries
-                // no desc/type) never overwrites the launching slot's real
-                // description with the `subagent`/`Task` placeholders.
-                let provided_desc = desc.filter(|value| !value.trim().is_empty());
-                let provided_type = subagent_type.filter(|value| !value.trim().is_empty());
-                // A background `SubagentStart` re-affirms (and #3920: PROMOTES) the
-                // still-running slot for this tool-use id. Matching ANY unfinished
-                // slot — not only an already-background one — lets an async/
-                // `run_in_background` Agent launch (whose async-ness is known only
-                // from the launch-ack `toolUseResult`, not the tool INPUT) flip its
-                // foreground-looking slot to a background subagent. That keeps it
-                // alive across turn-boundary resets like a Bash `run_in_background`
-                // task, instead of being dropped a turn later (#3920).
+                let desc = desc
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "subagent".to_string());
+                let subagent_type = subagent_type
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "Task".to_string());
                 if background
                     && let Some(id) = tool_use_id.as_deref().filter(|id| !id.trim().is_empty())
                     && let Some(slot) = self.subagents.iter_mut().rev().find(|slot| {
-                        slot.finished.is_none() && slot.tool_use_id.as_deref() == Some(id)
+                        slot.background
+                            && slot.finished.is_none()
+                            && slot.tool_use_id.as_deref() == Some(id)
                     })
                 {
-                    slot.background = true;
-                    if let Some(subagent_type) = provided_type {
-                        slot.subagent_type = subagent_type;
-                    }
-                    if let Some(desc) = provided_desc {
-                        slot.desc = desc;
-                    }
-                    let running_desc = slot.desc.clone();
-                    self.status = DerivedStatus::SubagentRunning { desc: running_desc };
+                    slot.subagent_type = subagent_type;
+                    slot.desc = desc.clone();
+                    self.status = DerivedStatus::SubagentRunning { desc };
                     return;
                 }
-                let desc = provided_desc.unwrap_or_else(|| "subagent".to_string());
-                let subagent_type = provided_type.unwrap_or_else(|| "Task".to_string());
                 let ordinal = take_slot_ordinal(&mut self.next_slot_ordinal);
                 self.subagents.push(SubagentSlot {
                     subagent_type,
@@ -444,15 +383,12 @@ impl StatusPanelState {
                     self.status = DerivedStatus::Running;
                 }
             }
-            StatusEvent::TurnCompleted {
-                background,
-                background_agent_pending,
-            } => {
+            StatusEvent::TurnCompleted { background } => {
                 self.status = DerivedStatus::Completed {
                     kind: CompletedKind::from_background(background),
                 };
-                self.background_agent_pending = background_agent_pending;
-                self.completed_at = Some(std::time::Instant::now()); // #3477 item 3
+                // #3477 item 3: stamp the late-batch freshness gate.
+                self.completed_at = Some(std::time::Instant::now());
             }
             StatusEvent::Heartbeat => {
                 if matches!(self.status, DerivedStatus::Running) {
@@ -503,12 +439,13 @@ impl StatusPanelState {
 
 pub(super) fn render_status_panel(
     snapshot: StatusPanelState,
+    live_block: Option<String>,
     provider: &ProviderKind,
-    // #3983 item 2: precomputed `마지막 업데이트 : … / 턴 시작 : …` time line (line 2).
-    time_line: String,
-    // #3983 item 3: precomputed `턴 트리거:` deeplink, appended as the LAST footer
-    // line (or `None` for headless/synthetic/id-0 turns with no real user message).
-    turn_trigger_line: Option<String>,
+    started_at_unix: i64,
+    _heartbeat_at_unix: i64,
+    // #3477 item 3: live batch arrived AFTER `completed_at` → a Completed turn
+    // keeps 🖥️ Recent (late batch not blanked; stale idle block still dropped).
+    live_content_fresh: bool,
 ) -> String {
     let header_status = if matches!(provider, ProviderKind::Codex)
         && matches!(snapshot.status, DerivedStatus::SubagentRunning { .. })
@@ -517,23 +454,15 @@ pub(super) fn render_status_panel(
     } else {
         snapshot.status.clone()
     };
-    // #3983: line 1 = derived-status ACTIVITY label, line 2 = relative TIME line
-    // (both built in the colocated `freshness` module — status_panel.rs is at the
-    // namespace cap). The pre-#3983 confidence line + `진행 중 — provider` header is
-    // retired (item 2); the request anchor no longer prepends here (item 3, see the
-    // trailing `턴 트리거:` push below).
-    let mut sections = vec![
-        super::freshness::render_activity_line(&header_status),
-        time_line,
-    ];
+    let mut sections = vec![format!(
+        "{} — {} (<t:{started_at_unix}:R>)",
+        render_derived_status(&header_status),
+        provider.as_str()
+    )];
 
-    // #3983 item4: the session line is NO LONGER rendered in the every-tick
-    // footer. It is emitted once, at the top, per session boundary via
-    // `StatusPanelState::claim_session_banner` (see `session_banner.rs`), so the
-    // repeated per-tick footer echo of `🆕 새 세션 시작 · provider session … · tmux …`
-    // is retired. `render_session_panel_line` is now used only by that one-shot
-    // banner claim. Track A's 3-line header (activity / time / 턴 트리거) is
-    // unaffected.
+    if let Some(session) = snapshot.session.as_ref() {
+        sections.push(render_session_panel_line(session, provider));
+    }
 
     if let Some(task) = snapshot.task.as_ref() {
         sections.push(render_task_panel_line(task));
@@ -564,8 +493,23 @@ pub(super) fn render_status_panel(
         sections.push(format!("Plan\n{}", lines.join("\n")));
     }
 
-    // #3983 item 5a: the compact 🖥️ Recent + host block is removed from the footer
-    // (the terminal echo is retired from the status panel entirely).
+    // #3477 item 4: 🖥️ Recent renders BEFORE Tasks/Subagents/Workflow (top
+    // signal + shielded from the trailing-section footer-budget drop — item 3).
+    let cluster_config = &crate::config::load_graceful().cluster;
+    let recent_header = render_recent_section_header(
+        snapshot.task.as_ref(),
+        cluster_config.enabled,
+        cluster_config.instance_id.as_deref(),
+    );
+    // #3394 self-contained fenced section (overflow drops it whole). #3477 item 3:
+    // a Completed turn suppresses it only when stale; a fresh late batch shows.
+    let completed = matches!(header_status, DerivedStatus::Completed { .. });
+    if (!completed || live_content_fresh)
+        && let Some(block) = live_block.filter(|block| !block.trim().is_empty())
+    {
+        sections.push(format!("{recent_header}\n{block}"));
+    }
+
     if !snapshot.tasks.is_empty() {
         let lines = snapshot
             .tasks
@@ -603,13 +547,6 @@ pub(super) fn render_status_panel(
         }
     }
 
-    // #3983 item 3: the `턴 트리거:` original-request deeplink is the LAST footer
-    // line (it previously prepended above the header). Absent for headless /
-    // synthetic / id-0 turns that carry no real Discord user message.
-    if let Some(trigger) = turn_trigger_line.filter(|line| !line.trim().is_empty()) {
-        sections.push(trigger);
-    }
-
     truncate_status_panel_sections(sections)
 }
 
@@ -633,6 +570,62 @@ pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> Strin
         return repair_fence_parity(&joined);
     }
     repair_fence_parity(&truncate_chars(&joined, STATUS_PANEL_MAX_CHARS))
+}
+
+pub(super) fn render_recent_section_header(
+    task: Option<&TaskPanelSnapshot>,
+    cluster_enabled: bool,
+    local_instance_id: Option<&str>,
+) -> String {
+    if !cluster_enabled {
+        return "🖥️ Recent".to_string();
+    }
+    let dispatch_owner = task
+        .and_then(|task| task.owner_instance_id.as_deref())
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty());
+    let owner = dispatch_owner.or_else(|| {
+        local_instance_id
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+    });
+    match owner {
+        Some(owner) => format!("🖥️ Recent ({})", escape_status_panel_markdown(owner)),
+        None => "🖥️ Recent".to_string(),
+    }
+}
+
+fn render_derived_status(status: &DerivedStatus) -> String {
+    match status {
+        DerivedStatus::Running => "🟢 진행 중".to_string(),
+        DerivedStatus::MonitorWait => "💤 monitor 대기".to_string(),
+        DerivedStatus::ScheduleWakeup(Some(eta_secs)) => {
+            format!("⏰ scheduled wakeup ({eta_secs}s 후)")
+        }
+        DerivedStatus::ScheduleWakeup(None) => "⏰ scheduled wakeup".to_string(),
+        DerivedStatus::TerminalDeliveryPending => "↻ 응답 전달됨 · 세션 종료 확인 중".to_string(),
+        DerivedStatus::TerminalDeliveryUnconfirmed => {
+            "⚠ 응답 전달됨 · 세션 종료 미확인".to_string()
+        }
+        DerivedStatus::Completed {
+            kind: CompletedKind::Background,
+        } => "✅ **백그라운드 완료**".to_string(),
+        DerivedStatus::Completed {
+            kind: CompletedKind::Foreground,
+        } => "✅ **응답 완료**".to_string(),
+        DerivedStatus::ToolRunning { name, summary: _ } => {
+            let rendered = tool_prefix(name);
+            format!("🔧 도구 실행 중 ({})", truncate_chars(&rendered, 140))
+        }
+        DerivedStatus::SubagentRunning { desc } => {
+            let desc = escape_status_panel_markdown(desc);
+            format!("🧵 subagent 실행 중 ({})", truncate_chars(&desc, 120))
+        }
+        DerivedStatus::WorkflowRunning { label } => {
+            let label = escape_status_panel_markdown(label);
+            format!("🧬 workflow 실행 중 ({})", truncate_chars(&label, 120))
+        }
+    }
 }
 
 pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {

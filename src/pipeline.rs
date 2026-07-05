@@ -152,6 +152,32 @@ impl PipelineOverrideHealthReport {
     }
 }
 
+// reason: postgres override-health loader exercised by pipeline tests; the live
+// refresh path persists via refresh_override_health_report, so this read-back
+// helper has no production caller yet.
+#[allow(dead_code)]
+pub async fn load_persisted_override_health_report(
+    _db: &crate::db::Db,
+    pg_pool: Option<&PgPool>,
+) -> Option<PipelineOverrideHealthReport> {
+    if let Some(pool) = pg_pool {
+        match sqlx::query_scalar::<_, String>("SELECT value FROM kv_meta WHERE key = $1")
+            .bind(PIPELINE_OVERRIDE_HEALTH_KV_KEY)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(raw)) => return serde_json::from_str(&raw).ok(),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "[pipeline] failed to load persisted postgres override health report: {error}"
+                );
+            }
+        }
+    }
+    None
+}
+
 pub async fn refresh_override_health_report(
     pg_pool: Option<&PgPool>,
 ) -> PipelineOverrideHealthReport {
@@ -742,14 +768,10 @@ impl Default for BackoffPolicy {
     }
 }
 
-/// `on_failure` policy for stages/states (#1082).
-// reason: consumed by the `decide_timeout` reducer (src/engine/transition.rs),
-// which resolves `TimeoutConfig::effective_on_failure` into a transition
-// decision (retry-with-backoff / escalate / fallback / fail). NOTE: the live
-// timeout sweep (policies/timeouts/card-timeouts.js) does not yet emit
-// `TimeoutExpired`, so the reducer is not on the production timeout path and a
-// configured policy does not affect live cards yet — routing the live sweep
-// through the reducer is the deferred follow-up to #3916.
+/// `on_failure` policy for stages (#1082).
+// reason: staged-rollout policy enum retained for config compatibility; the
+// runtime mirror lives in services::pipeline_routes and is not yet wired here.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OnFailurePolicy {
@@ -803,28 +825,14 @@ pub struct TimeoutConfig {
     /// Backoff policy between retries (#1082).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff: Option<BackoffPolicy>,
-    /// Typed failure policy (#1082). Resolved by the `decide_timeout` reducer:
-    /// `retry-with-backoff` retries up to `max_retries` honoring `backoff` then
-    /// applies the exhaust policy; `escalate` transitions to `on_exhaust`; `fail`
-    /// forces a terminal state; `fallback-stage` jumps to `on_failure_target`.
-    /// Absent (and no `max_retries`/`backoff`/`on_exhaust_policy`) ⇒ the legacy
-    /// immediate `on_exhaust` transition, so the surface stays additive. (Not yet
-    /// on the live timeout path — see the `OnFailurePolicy` note.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_failure: Option<OnFailurePolicy>,
-    /// Target state for `on_failure: fallback-stage` (#1082).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_failure_target: Option<String>,
     #[serde(default)]
     pub condition: Option<String>,
 }
 
-// reason: #1082 timeout retry/backoff resolution surface, consumed by the
-// `decide_timeout` reducer (src/engine/transition.rs) to resolve
-// max_retries/backoff/on_failure/on_exhaust into a transition decision. NOTE:
-// the reducer is not yet on the production timeout path (the live JS sweep does
-// not emit `TimeoutExpired`); these resolvers define the semantics the deferred
-// live-wiring follow-up to #3916 will execute.
+// reason: #1082 timeout retry/backoff resolution surface retained for staged
+// policy rollout; currently consumed only by the #1082 DoD unit tests, pending
+// wiring into the live timeout executor.
+#[allow(dead_code)]
 impl TimeoutConfig {
     /// Default max_retries when caller did not specify (1, per #1082 DoD).
     pub const DEFAULT_MAX_RETRIES: u32 = 1;
@@ -859,31 +867,6 @@ impl TimeoutConfig {
                 _ => 15 * 60,
             },
         }
-    }
-
-    /// Whether a typed retry/failure/exhaust policy is configured (#3916). When
-    /// false, `decide_timeout` keeps the legacy immediate `on_exhaust`
-    /// transition so the surface is additive — default/None pipelines are
-    /// unchanged. A standalone typed `on_exhaust_policy` (no retry fields) also
-    /// engages so notify/fail exhaust semantics are honored (#3916 P1-4).
-    pub fn retry_policy_engaged(&self) -> bool {
-        self.on_failure.is_some()
-            || self.max_retries.is_some()
-            || self.backoff.is_some()
-            || self.on_exhaust_policy.is_some()
-    }
-
-    /// Resolve the effective `OnFailurePolicy` (#3916). An explicit `on_failure`
-    /// wins; otherwise a configured `max_retries`/`backoff` implies
-    /// retry-with-backoff; absent ⇒ the backward-compatible `Fail`.
-    pub fn effective_on_failure(&self) -> OnFailurePolicy {
-        if let Some(policy) = self.on_failure {
-            return policy;
-        }
-        if self.max_retries.is_some() || self.backoff.is_some() {
-            return OnFailurePolicy::RetryWithBackoff;
-        }
-        OnFailurePolicy::Fail
     }
 }
 

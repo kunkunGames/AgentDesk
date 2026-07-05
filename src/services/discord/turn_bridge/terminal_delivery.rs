@@ -53,26 +53,6 @@ pub(super) fn terminal_delivery_should_send_new_chunks(
     can_chain_locally && formatted_response.len() > super::super::DISCORD_MSG_LIMIT
 }
 
-pub(super) fn record_stopped_turn_terminal_replace_delivery(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    watcher_owner_channel_id: ChannelId,
-    range: (u64, u64),
-    terminal_anchor_msg_id: MessageId,
-    terminal_anchor_channel_id: ChannelId,
-    raw_response_body: &str,
-) {
-    super::super::outbound::delivery_record::record_delivered_frontier_with_body(
-        shared,
-        provider,
-        watcher_owner_channel_id,
-        range,
-        terminal_anchor_msg_id.get(),
-        terminal_anchor_channel_id.get(),
-        raw_response_body,
-    );
-}
-
 /// Returns `(first_chunk_msg_id, last_chunk_msg_id)` on a FULL commit. The send
 /// is all-or-nothing: `send_ordered_long_terminal_chunks` propagates the
 /// rollback-aware `send_long_message_with_rollback` `Err` (which deletes any
@@ -183,7 +163,7 @@ pub(super) fn turn_bridge_replace_outcome_committed(
             );
             true
         }
-        Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error, .. }) => {
+        Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
             record_turn_bridge_terminal_replace_cleanup(
                 shared,
                 provider,
@@ -278,45 +258,10 @@ pub(super) fn should_fail_dispatch_after_terminal_delivery(
     fail_candidate && terminal_delivery_committed && !preserve_inflight_for_cleanup_retry
 }
 
-pub(super) fn empty_sink_preserves_retry(
-    full_response: &str,
-    resume_retry_queued: bool,
-    response_sent_offset: usize,
-    channel_id: ChannelId,
+pub(super) fn tui_quiescence_timeout_requires_inflight_retry(
+    terminal_delivery_committed: bool,
 ) -> bool {
-    if full_response.is_empty() && resume_retry_queued {
-        return false;
-    }
-    tracing::warn!(
-        channel = channel_id.get(),
-        full_response_len = full_response.len(),
-        response_sent_offset,
-        "turn_bridge reached empty terminal delivery without queued resume retry; preserving inflight for retry"
-    );
-    true
-}
-
-pub(super) fn empty_sink_commits_fully_consumed_response(
-    full_response: &str,
-    response_sent_offset: usize,
-) -> bool {
-    !full_response.trim().is_empty() && response_sent_offset >= full_response.len()
-}
-
-pub(super) fn mirror_frozen_prefix_ids(
-    frozen_msg_ids: &[MessageId],
-    inflight_state: &mut InflightTurnState,
-) {
-    for msg_id in frozen_msg_ids.iter().map(|msg_id| msg_id.get()) {
-        if !inflight_state
-            .streaming_rollover_frozen_msg_ids
-            .contains(&msg_id)
-        {
-            inflight_state
-                .streaming_rollover_frozen_msg_ids
-                .push(msg_id);
-        }
-    }
+    !terminal_delivery_committed
 }
 
 pub(super) fn warn_preserved_uncommitted(
@@ -451,14 +396,14 @@ static BRIDGE_DELIVERY_LEASE_SEQ: std::sync::atomic::AtomicU64 =
 ///
 /// Lifecycle (mirrors the watcher's inline P1-1 wiring):
 ///   1. [`Self::acquire`] — `reclaim_if_expired` (self-heal a dead holder) then
-///      `try_acquire(key, Bridge, [start,end), now+deadline)`. On success spawns
+///      `try_acquire(turn, Bridge, [start,end), now+deadline)`. On success spawns
 ///      a [`crate::services::discord::DeliveryLeaseHeartbeat`] so a long chunked
 ///      send (which can exceed the 15s deadline) is never reclaimed mid-flight.
 ///      On FAILURE the cell is held by the watcher (or another bridge path) for
 ///      this range/turn → the caller MUST take a B2-style skip (NOT deliver+
 ///      advance); the live holder owns delivery.
 ///   2. caller performs `replace_message_with_outcome` / chunked send.
-///   3. [`Self::commit_and_advance`] — stop the heartbeat, `commit(Bridge, key,
+///   3. [`Self::commit_and_advance`] — stop the heartbeat, `commit(Bridge, turn,
 ///      start, end, outcome)`; on `Delivered` AND a successful commit, advance
 ///      `confirmed_end_offset` (the B6 gate: the advance now ONLY happens via a
 ///      successful lease commit), then `release` so the cell is free for the next
@@ -472,7 +417,7 @@ static BRIDGE_DELIVERY_LEASE_SEQ: std::sync::atomic::AtomicU64 =
 pub(super) struct BridgeDeliveryLease {
     cell: std::sync::Arc<crate::services::discord::DeliveryLeaseCell>,
     holder: crate::services::discord::LeaseHolder,
-    key: crate::services::discord::DeliveryLeaseKey,
+    turn: super::super::turn_finalizer::TurnKey,
     start: u64,
     end: u64,
     heartbeat: Option<crate::services::discord::DeliveryLeaseHeartbeat>,
@@ -570,38 +515,9 @@ pub(super) fn bridge_epilogue_marks_watcher_delivered(
     !preserve_inflight_for_cleanup_retry && !bridge_relay_delegated_to_watcher
 }
 
-pub(super) fn bridge_delivery_lease_key_for_inflight(
-    watcher_owner_channel_id: ChannelId,
-    generation: u64,
-    inflight: &crate::services::discord::inflight::InflightTurnState,
-) -> crate::services::discord::DeliveryLeaseKey {
-    crate::services::discord::DeliveryLeaseKey::from_inflight_state_for_site(
-        watcher_owner_channel_id,
-        generation,
-        inflight,
-        "bridge",
-    )
-}
-
-pub(super) fn bridge_delivery_lease_for_inflight(
-    shared: &SharedData,
-    watcher_owner_channel_id: ChannelId,
-    generation: u64,
-    inflight: &crate::services::discord::inflight::InflightTurnState,
-    target_end: Option<u64>,
-) -> BridgeLeaseAcquire {
-    BridgeDeliveryLease::acquire(
-        shared,
-        watcher_owner_channel_id,
-        bridge_delivery_lease_key_for_inflight(watcher_owner_channel_id, generation, inflight),
-        inflight.turn_start_offset.unwrap_or(0),
-        target_end,
-    )
-}
-
 impl BridgeDeliveryLease {
     /// Acquire the per-channel delivery lease for the bridge's terminal delivery
-    /// covering `[start, end)` for `key`. `target_end` is the same end offset the
+    /// covering `[start, end)` for `turn`. `target_end` is the same end offset the
     /// pre-P1-2 `advance_tmux_relay_confirmed_end` advanced to (the bridge's
     /// `tmux_last_offset`); `start` is the turn's start offset (`turn_start_offset`,
     /// falling back to the same end so an unknown start yields an empty range that
@@ -620,7 +536,7 @@ impl BridgeDeliveryLease {
     pub(super) fn acquire(
         shared: &SharedData,
         channel_id: ChannelId,
-        key: crate::services::discord::DeliveryLeaseKey,
+        turn: super::super::turn_finalizer::TurnKey,
         start: u64,
         target_end: Option<u64>,
     ) -> BridgeLeaseAcquire {
@@ -639,7 +555,7 @@ impl BridgeDeliveryLease {
         // heartbeat, so it is NOT reclaimed and we correctly B2-skip it below.
         cell.reclaim_if_expired(crate::services::discord::lease_now_ms());
         let acquired = cell.try_acquire(
-            key.clone(),
+            turn,
             holder,
             start,
             end,
@@ -653,12 +569,12 @@ impl BridgeDeliveryLease {
         let heartbeat = Some(crate::services::discord::DeliveryLeaseHeartbeat::spawn(
             cell.clone(),
             holder,
-            key.clone(),
+            turn,
         ));
         BridgeLeaseAcquire::Held(BridgeDeliveryLease {
             cell,
             holder,
-            key,
+            turn,
             start,
             end,
             heartbeat,
@@ -691,9 +607,9 @@ impl BridgeDeliveryLease {
         if let Some(hb) = self.heartbeat.take() {
             hb.stop();
         }
-        let committed =
-            self.cell
-                .commit(self.holder, self.key.clone(), self.start, self.end, outcome);
+        let committed = self
+            .cell
+            .commit(self.holder, self.turn, self.start, self.end, outcome);
         debug_assert!(
             committed,
             "bridge must be able to commit its own freshly-acquired delivery lease"
@@ -714,7 +630,7 @@ impl BridgeDeliveryLease {
         // dead) in the meantime.
         let _ = self
             .cell
-            .release(self.holder, self.key.clone(), self.start, self.end);
+            .release(self.holder, self.turn, self.start, self.end);
         committed
     }
 }
@@ -731,7 +647,7 @@ impl Drop for BridgeDeliveryLease {
         self.heartbeat.take();
         let _ = self
             .cell
-            .release(self.holder, self.key.clone(), self.start, self.end);
+            .release(self.holder, self.turn, self.start, self.end);
     }
 }
 
@@ -739,18 +655,14 @@ impl Drop for BridgeDeliveryLease {
 mod tests {
     use super::{
         bridge_epilogue_clears_inflight, bridge_epilogue_marks_watcher_delivered,
-        bridge_epilogue_skip_save_is_identity_guarded, empty_sink_commits_fully_consumed_response,
-        empty_sink_preserves_retry, mirror_frozen_prefix_ids,
-        record_stopped_turn_terminal_replace_delivery, replace_outcome_commits_terminal_delivery,
+        bridge_epilogue_skip_save_is_identity_guarded, replace_outcome_commits_terminal_delivery,
         send_ordered_long_terminal_chunks, should_complete_work_dispatch_after_terminal_delivery,
         should_fail_dispatch_after_terminal_delivery, terminal_delivery_should_send_new_chunks,
+        tui_quiescence_timeout_requires_inflight_retry,
     };
     use crate::services::discord::formatting;
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::gateway::{GatewayFuture, TurnGateway};
-    use crate::services::discord::{
-        DeliveryLeaseKey, InflightTurnState, make_shared_data_for_tests,
-    };
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::{ChannelId, MessageId};
     use std::sync::{Arc, Mutex};
@@ -828,6 +740,24 @@ mod tests {
             _content: &'a str,
         ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
             Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+        }
+
+        fn add_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> GatewayFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn remove_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> GatewayFuture<'a, ()> {
+            Box::pin(async {})
         }
 
         fn schedule_retry_with_history<'a>(
@@ -937,6 +867,15 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn tui_quiescence_timeout_preserves_inflight_only_before_terminal_delivery() {
+        assert!(tui_quiescence_timeout_requires_inflight_retry(false));
+        assert!(
+            !tui_quiescence_timeout_requires_inflight_retry(true),
+            "after Discord terminal delivery commits, timeout may suppress visible completion but must not preserve stale inflight ownership"
+        );
+    }
+
     // #3041 P1-2 (codex P1-c): every bridge skip arm sets
     // `preserve_inflight_for_cleanup_retry = true`. These predicates encode the two
     // downstream epilogue gates the production loop now routes through; the
@@ -961,58 +900,6 @@ mod tests {
     // identity-guarded ONLY on a Skip (the holder owns the inflight lifecycle and
     // may have cleared the row on success). Bridge-owned preserve sites and the
     // delegated-owner path keep the blind save (no competing holder).
-    #[test]
-    fn empty_sink_preserves_retry_unless_resume_retry_was_queued() {
-        let channel = ChannelId::new(42);
-        assert!(empty_sink_preserves_retry(
-            "Error: transport failed",
-            false,
-            4096,
-            channel,
-        ));
-        assert!(!empty_sink_preserves_retry("", true, 0, channel));
-    }
-
-    #[test]
-    fn empty_sink_commits_nonempty_response_that_was_already_fully_consumed() {
-        assert!(empty_sink_commits_fully_consumed_response(
-            "already delivered",
-            "already delivered".len()
-        ));
-        assert!(empty_sink_commits_fully_consumed_response(
-            "already delivered",
-            "already delivered".len() + 10
-        ));
-        assert!(!empty_sink_commits_fully_consumed_response("", 0));
-        assert!(!empty_sink_commits_fully_consumed_response(
-            "tail remains",
-            "tail ".len()
-        ));
-    }
-
-    #[test]
-    fn bridge_rollover_frozen_prefix_ids_are_mirrored_for_watcher_cleanup() {
-        let mut inflight = InflightTurnState::new(
-            ProviderKind::Codex,
-            42,
-            Some("agentdesk-test".to_string()),
-            7,
-            1001,
-            1002,
-            "prompt".to_string(),
-            None,
-            Some("AgentDesk-codex-prefix-cleanup".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            None,
-            0,
-        );
-        inflight.streaming_rollover_frozen_msg_ids = vec![10];
-
-        mirror_frozen_prefix_ids(&[MessageId::new(10), MessageId::new(11)], &mut inflight);
-
-        assert_eq!(inflight.streaming_rollover_frozen_msg_ids, vec![10, 11]);
-    }
-
     #[test]
     fn bridge_skip_save_is_identity_guarded_only_when_holder_owns_inflight() {
         // Skip → holder (watcher) owns inflight → the save MUST be identity-guarded
@@ -1063,7 +950,6 @@ mod tests {
     fn sent_fallback_after_edit_failure_does_not_commit_terminal_delivery() {
         let outcome = ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
             edit_error: "edit 500; fallback POST succeeded".to_string(),
-            replacement_anchor: None,
         };
 
         // The commit predicate: a fallback-after-edit-failure is NOT a commit.
@@ -1238,85 +1124,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stopped_turn_terminal_replace_raw_fingerprint_refuses_phantom_rerelay_4081() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let temp = tempfile::TempDir::new().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-
-        let shared = make_shared_data_for_tests();
-        let provider = ProviderKind::Codex;
-        let session = "AgentDesk-codex-adk-cdx-stop-raw-4081";
-        let channel_id = ChannelId::new(7_4084);
-        let raw_body = "# stopped heading\nraw extractor body";
-        let display_body = format!(
-            "{}\n\n[Stopped]",
-            formatting::format_for_discord_with_provider(raw_body, &provider)
-        );
-        assert_ne!(raw_body, display_body);
-
-        let gen_path = crate::services::tmux_common::session_temp_path(session, "generation");
-        std::fs::create_dir_all(std::path::Path::new(&gen_path).parent().unwrap()).unwrap();
-        std::fs::write(&gen_path, b"1").unwrap();
-        crate::services::discord::tmux::advance_watcher_confirmed_end(
-            &shared,
-            &provider,
-            channel_id,
-            session,
-            raw_body.len() as u64,
-            "terminal_delivery_tests:stopped_turn_terminal_replace_raw_fingerprint_refuses_phantom_rerelay_4081",
-        );
-        record_stopped_turn_terminal_replace_delivery(
-            &shared,
-            &provider,
-            channel_id,
-            (0, raw_body.len() as u64),
-            MessageId::new(94_084),
-            channel_id,
-            raw_body,
-        );
-
-        let degenerate_key =
-            DeliveryLeaseKey::new_for_site(channel_id, 33, 0, None, None, "watcher");
-        let recent_raw =
-            super::super::super::outbound::delivery_record::recent_delivered_content_matches(
-                &provider, channel_id, session, raw_body,
-            );
-        assert!(degenerate_key.is_degenerate_legacy());
-        assert!(
-            recent_raw,
-            "stopped-turn terminal replace must fingerprint the raw extractor body"
-        );
-        assert!(
-            !super::super::super::outbound::delivery_record::recent_delivered_content_matches(
-                &provider,
-                channel_id,
-                session,
-                &display_body,
-            ),
-            "display formatting plus [Stopped] must not enter the duplicate fingerprint"
-        );
-        let fresh_assistant_text_in_observed_range = false;
-        assert!(
-            degenerate_key.is_degenerate_legacy()
-                && recent_raw
-                && !fresh_assistant_text_in_observed_range,
-            "phantom degenerate-key re-relay of the same raw bytes must be refused"
-        );
-    }
-
     // #3041 P1-2: matrix tests for the BRIDGE delivery-lease wiring. These drive
     // `BridgeDeliveryLease::acquire` / `commit_and_advance` against a REAL
     // per-channel `DeliveryLeaseCell` (the SAME cell the watcher uses), proving:
@@ -1333,16 +1140,12 @@ mod tests {
     mod bridge_delivery_lease {
         use crate::services::discord::turn_finalizer::TurnKey;
         use crate::services::discord::{
-            DELIVERY_LEASE_DEADLINE_MS, DeliveryLeaseKey, LeaseHolder, LeaseOutcome, LeaseSnapshot,
-            lease_now_ms, make_shared_data_for_tests,
+            DELIVERY_LEASE_DEADLINE_MS, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
+            make_shared_data_for_tests,
         };
         use poise::serenity_prelude::ChannelId;
 
-        use super::super::{
-            BridgeDeliveryLease, BridgeLeaseAcquire, bridge_delivery_lease_key_for_inflight,
-        };
-        use crate::services::discord::inflight::InflightTurnState;
-        use crate::services::provider::ProviderKind;
+        use super::super::{BridgeDeliveryLease, BridgeLeaseAcquire};
 
         const CH: u64 = 909_001;
 
@@ -1350,8 +1153,8 @@ mod tests {
             ChannelId::new(CH)
         }
 
-        fn turn(user_msg_id: u64) -> DeliveryLeaseKey {
-            DeliveryLeaseKey::from_turn_key(TurnKey::new(channel(), user_msg_id, 1))
+        fn turn(user_msg_id: u64) -> TurnKey {
+            TurnKey::new(channel(), user_msg_id, 1)
         }
 
         #[tokio::test(start_paused = true)]
@@ -1453,55 +1256,6 @@ mod tests {
                     ..
                 }
             ));
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn bridge_id0_without_offset_acquires_degenerate_key_instead_of_skip() {
-            let _lock = crate::config::shared_test_env_lock()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            struct EnvReset(Option<std::ffi::OsString>);
-            impl Drop for EnvReset {
-                fn drop(&mut self) {
-                    match self.0.take() {
-                        Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                        None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                    }
-                }
-            }
-            let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-            let temp = tempfile::TempDir::new().expect("temp runtime root");
-            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-
-            let shared = make_shared_data_for_tests();
-            let ch = channel();
-            let mut inflight = InflightTurnState::new(
-                ProviderKind::Codex,
-                ch.get(),
-                Some("agentdesk-test".to_string()),
-                7,
-                0,
-                123,
-                "prompt".to_string(),
-                None,
-                Some("AgentDesk-codex-degenerate-bridge".to_string()),
-                Some("/tmp/out.jsonl".to_string()),
-                Some("/tmp/in.fifo".to_string()),
-                0,
-            );
-            inflight.started_at = "2026-07-03T06:00:00Z".to_string();
-            inflight.turn_start_offset = None;
-
-            let key = bridge_delivery_lease_key_for_inflight(ch, 1, &inflight);
-            let acquire = BridgeDeliveryLease::acquire(&shared, ch, key, 0, Some(64));
-            let lease = match acquire {
-                BridgeLeaseAcquire::Held(lease) => lease,
-                BridgeLeaseAcquire::Skip => panic!("degenerate id-0 bridge key must acquire"),
-                BridgeLeaseAcquire::NoRange => panic!("test range is non-empty"),
-            };
-
-            assert!(lease.commit_and_advance(&shared, ch, None, LeaseOutcome::Delivered));
-            assert_eq!(shared.committed_relay_offset(ch), 64);
         }
 
         #[tokio::test(start_paused = true)]
@@ -1610,7 +1364,7 @@ mod tests {
             // leases on its own `channel_id` == owner).
             let owner_cell = shared.delivery_lease(owner_ch);
             let watcher = LeaseHolder::Watcher { instance_id: 70 };
-            let watcher_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(owner_ch, 99, 1));
+            let watcher_turn = TurnKey::new(owner_ch, 99, 1);
             assert!(owner_cell.try_acquire(
                 watcher_turn,
                 watcher,
@@ -1621,7 +1375,7 @@ mod tests {
 
             // P1-a fix: the bridge acquires on `watcher_owner_channel_id` (the OWNER
             // channel) → SAME cell → B2-skip (contention detected, NOT both-deliver).
-            let bridge_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(owner_ch, 99, 1));
+            let bridge_turn = TurnKey::new(owner_ch, 99, 1);
             assert!(
                 matches!(
                     BridgeDeliveryLease::acquire(&shared, owner_ch, bridge_turn, 0, Some(64)),
@@ -1633,7 +1387,7 @@ mod tests {
             // Regression contrast: keying on the unrelated DISPATCH channel hits a
             // DIFFERENT cell → the bridge would WRONGLY acquire (the pre-fix
             // duplicate). This documents WHY the bridge must use the owner channel.
-            let dispatch_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(dispatch_ch, 99, 1));
+            let dispatch_turn = TurnKey::new(dispatch_ch, 99, 1);
             assert!(
                 matches!(
                     BridgeDeliveryLease::acquire(&shared, dispatch_ch, dispatch_turn, 0, Some(64)),
@@ -1906,9 +1660,7 @@ mod tests {
     mod a0_i2_advance_characterization_tests {
         use super::super::{BridgeDeliveryLease, BridgeLeaseAcquire};
         use crate::services::discord::turn_finalizer::TurnKey;
-        use crate::services::discord::{
-            DeliveryLeaseKey, LeaseOutcome, make_shared_data_for_tests,
-        };
+        use crate::services::discord::{LeaseOutcome, make_shared_data_for_tests};
         use poise::serenity_prelude::ChannelId;
 
         const CH: u64 = 909_777;
@@ -1921,7 +1673,7 @@ mod tests {
             match BridgeDeliveryLease::acquire(
                 shared,
                 ch,
-                DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, user_msg_id, 1)),
+                TurnKey::new(ch, user_msg_id, 1),
                 0,
                 Some(64),
             ) {

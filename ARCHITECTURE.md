@@ -102,6 +102,7 @@ src/
 │   ├── intake_outbox.rs
 │   ├── kanban.rs
 │   ├── meetings.rs
+│   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
 │   ├── session_agent_resolution.rs
@@ -152,8 +153,7 @@ src/
 │   ├── ops.rs
 │   ├── sql_guard.rs
 │   ├── transition.rs
-│   ├── transition_executor_pg.rs
-│   └── transition_timeout.rs
+│   └── transition_executor_pg.rs
 ├── github/
 │   ├── mod.rs
 │   ├── sync.rs
@@ -222,11 +222,6 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
-│   │   ├── routines/
-│   │   │   ├── audit.rs
-│   │   │   ├── handlers.rs
-│   │   │   ├── helpers.rs
-│   │   │   └── responses.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -239,7 +234,6 @@ src/
 │   │   ├── auth.rs
 │   │   ├── auto_queue.rs
 │   │   ├── automation_candidates.rs
-│   │   ├── claude_accounts_api.rs
 │   │   ├── cluster.rs
 │   │   ├── cron_api.rs
 │   │   ├── departments.rs
@@ -346,8 +340,6 @@ src/
 │   ├── automation_candidate_materializer/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
-│   ├── claude/
-│   │   └── backend_routing.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
 │   │   ├── jsonl_parser.rs
@@ -372,8 +364,6 @@ src/
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
-│   │   ├── stream_relay/
-│   │   │   └── identity.rs
 │   │   ├── capability_routing.rs
 │   │   ├── intake_router_hook.rs
 │   │   ├── intake_routing.rs
@@ -437,9 +427,6 @@ src/
 │   │   │   ├── text_commands.rs
 │   │   │   ├── tui_passthrough.rs
 │   │   │   └── voice.rs
-│   │   ├── footer_view_reconciler/
-│   │   │   ├── mod.rs
-│   │   │   └── registry.rs
 │   │   ├── health/
 │   │   │   ├── recovery/
 │   │   │   │   ├── leak_recovery_ledger.rs
@@ -461,15 +448,10 @@ src/
 │   │   │   ├── relay_integrity.rs
 │   │   │   └── scrollback.rs
 │   │   ├── inflight/
-│   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
-│   │   │   ├── clear_store.rs
 │   │   │   ├── finalizer_identity.rs
 │   │   │   ├── model.rs
-│   │   │   ├── orphan_relay_reclaim.rs
-│   │   │   ├── ownership_ops.rs
 │   │   │   ├── rebind_reap.rs
-│   │   │   ├── save_store.rs
 │   │   │   ├── store.rs
 │   │   │   └── watcher_state.rs
 │   │   ├── outbound/
@@ -496,7 +478,6 @@ src/
 │   │   │   ├── common.rs
 │   │   │   ├── completion_footer.rs
 │   │   │   ├── context_panel.rs
-│   │   │   ├── freshness.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── recent_events.rs
 │   │   │   ├── session_panel.rs
@@ -507,7 +488,6 @@ src/
 │   │   │   ├── subagent_summary.rs
 │   │   │   ├── task_panel.rs
 │   │   │   ├── tests.rs
-│   │   │   ├── turn_anchor.rs
 │   │   │   └── workflow_panel.rs
 │   │   ├── prompt_builder/
 │   │   │   ├── dispatch_contract.rs
@@ -519,19 +499,12 @@ src/
 │   │   │   └── section_dedupe.rs
 │   │   ├── recovery_engine/
 │   │   │   ├── analytics_transcript.rs
-│   │   │   ├── completion_delivery.rs
 │   │   │   ├── jsonl_extract.rs
-│   │   │   ├── manual_rebind.rs
 │   │   │   ├── output_path_detect.rs
 │   │   │   ├── phase_policy.rs
 │   │   │   ├── rebind_runtime.rs
-│   │   │   ├── restore_inflight.rs
-│   │   │   ├── routing_orphan.rs
-│   │   │   ├── runtime.rs
 │   │   │   ├── state_extractors.rs
 │   │   │   ├── status_panel.rs
-│   │   │   ├── status_panel_completion_producer.rs
-│   │   │   ├── terminal_text_idempotency.rs
 │   │   │   └── terminal_watcher.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── controller_cutover.rs
@@ -548,16 +521,11 @@ src/
 │   │   │   │   ├── reaction_remove.rs
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
-│   │   │   │   ├── intake_turn/
-│   │   │   │   │   ├── race_loss.rs
-│   │   │   │   │   ├── turn_watchdog.rs
-│   │   │   │   │   └── voice_intake.rs
 │   │   │   │   ├── attachments.rs
 │   │   │   │   ├── control.rs
 │   │   │   │   ├── goal_lifecycle.rs
 │   │   │   │   ├── headless_turn.rs
 │   │   │   │   ├── intake_turn.rs
-│   │   │   │   ├── latency_spans.rs
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
@@ -590,9 +558,7 @@ src/
 │   │   │   ├── startup_doctor.rs
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
-│   │   │   ├── idle_jsonl.rs
-│   │   │   ├── orphan_reclaim.rs
-│   │   │   └── relay_format.rs
+│   │   │   └── idle_jsonl.rs
 │   │   ├── session_runtime/
 │   │   │   ├── channel_routing.rs
 │   │   │   ├── restore_cwd.rs
@@ -603,34 +569,28 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── single_message_panel/
+│   │   │   └── completion_footer_registry.rs
 │   │   ├── tmux_watcher/
 │   │   │   ├── commit_decisions.rs
 │   │   │   ├── completion_gate.rs
 │   │   │   ├── completion_gate_tests.rs
-│   │   │   ├── completion_producer.rs
-│   │   │   ├── controller_heartbeat.rs
 │   │   │   ├── liveness.rs
 │   │   │   ├── orphan_status_panel_cleanup.rs
 │   │   │   ├── panel_decisions.rs
-│   │   │   ├── panel_decisions_tests.rs
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── prompt_observe.rs
 │   │   │   ├── provider_session_persistence.rs
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
-│   │   │   ├── single_message_footer_tests.rs
-│   │   │   ├── stall_exit.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
-│   │   │   ├── terminal_long_chunks.rs
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
 │   │   │   ├── terminal_send.rs
-│   │   │   ├── tests.rs
 │   │   │   ├── turn_identity.rs
 │   │   │   ├── turn_identity_tests.rs
-│   │   │   ├── two_message_panel.rs
 │   │   │   ├── utf8_chunk_decoder.rs
 │   │   │   └── utf8_chunk_decoder_tests.rs
 │   │   ├── tui_direct_abort_marker/
@@ -638,8 +598,6 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── store.rs
 │   │   ├── tui_prompt_relay/
-│   │   │   ├── synthetic_start/
-│   │   │   │   └── stale_reclaim.rs
 │   │   │   ├── anchor_completion.rs
 │   │   │   ├── bridge_completion.rs
 │   │   │   ├── bridge_gateway.rs
@@ -653,9 +611,7 @@ src/
 │   │   │   ├── launch_script.rs
 │   │   │   ├── rehydration.rs
 │   │   │   ├── relay_ownership.rs
-│   │   │   ├── synthetic_orphan_reclaim.rs
 │   │   │   ├── synthetic_start.rs
-│   │   │   ├── synthetic_start_wiring.rs
 │   │   │   └── tests.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
@@ -664,16 +620,12 @@ src/
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
-│   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
-│   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── chunk_compose.rs
 │   │   │   ├── chunk_compose_tests.rs
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
-│   │   │   ├── early_tui_completion.rs
-│   │   │   ├── finalize_epilogue.rs
 │   │   │   ├── followup_requeue.rs
 │   │   │   ├── headless_delivery.rs
 │   │   │   ├── memory_lifecycle.rs
@@ -695,7 +647,6 @@ src/
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
-│   │   │   ├── two_message_panel.rs
 │   │   │   ├── voice_completion.rs
 │   │   │   ├── voice_completion_tests.rs
 │   │   │   ├── watcher_handoff.rs
@@ -704,12 +655,7 @@ src/
 │   │   │   ├── cleanup.rs
 │   │   │   ├── completion_signal.rs
 │   │   │   ├── delivery_lease.rs
-│   │   │   ├── finalize.rs
-│   │   │   ├── finalize_context.rs
-│   │   │   ├── reconcile.rs
 │   │   │   └── watcher_backstop.rs
-│   │   ├── turn_view_reconciler/
-│   │   │   └── tests.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── tests/
 │   │   │   │   └── pcm_harness_tests.rs
@@ -727,14 +673,11 @@ src/
 │   │   │   ├── codex_tui_restore.rs
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
-│   │   ├── abandon_request_store.rs
 │   │   ├── adk_session.rs
 │   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── answer_flush_barrier.rs
 │   │   ├── catch_up.rs
-│   │   ├── delivery_lease_key.rs
-│   │   ├── destructive_cancel_gate.rs
 │   │   ├── discord_io.rs
 │   │   ├── dispatch_policy.rs
 │   │   ├── formatting.rs
@@ -764,13 +707,9 @@ src/
 │   │   ├── placeholder_cleanup.rs
 │   │   ├── placeholder_controller.rs
 │   │   ├── placeholder_sweeper.rs
-│   │   ├── queue_dispatch.rs
 │   │   ├── queue_io.rs
-│   │   ├── queue_marker.rs
-│   │   ├── queue_reactions.rs
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── reaction_cleanup.rs
-│   │   ├── reaction_lifecycle.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
@@ -786,7 +725,6 @@ src/
 │   │   ├── runtime_bootstrap.rs
 │   │   ├── runtime_store.rs
 │   │   ├── semantic_boundaries.rs
-│   │   ├── session_banner.rs
 │   │   ├── session_identity.rs
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
@@ -799,7 +737,6 @@ src/
 │   │   ├── standby_relay.rs
 │   │   ├── startup_reclaim.rs
 │   │   ├── status_panel_orphan_store.rs
-│   │   ├── status_panel_orphan_store_tests.rs
 │   │   ├── steering.rs
 │   │   ├── streaming_finalizer.rs
 │   │   ├── subagent_notification_card.rs
@@ -819,11 +756,10 @@ src/
 │   │   ├── tmux_watcher.rs
 │   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
+│   │   ├── tui_prompt_relay_controller_cutover.rs
 │   │   ├── tui_task_card.rs
-│   │   ├── turn_completion_events.rs
 │   │   ├── turn_end_wip_warning.rs
 │   │   ├── turn_finalizer.rs
-│   │   ├── turn_view_reconciler.rs
 │   │   ├── voice_acknowledgement.rs
 │   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
@@ -862,7 +798,6 @@ src/
 │   │   │   ├── memento_consolidation.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── target_sweep.rs
-│   │   │   ├── voice_cache_sweep.rs
 │   │   │   └── worktree_orphan_sweep.rs
 │   │   └── mod.rs
 │   ├── memory/
@@ -893,8 +828,6 @@ src/
 │   │   ├── mod.rs
 │   │   └── provider.rs
 │   ├── platform/
-│   │   ├── tmux/
-│   │   │   └── availability.rs
 │   │   ├── binary_resolver.rs
 │   │   ├── dump_tool.rs
 │   │   ├── mod.rs
@@ -929,7 +862,6 @@ src/
 │   │   ├── action.rs
 │   │   ├── agent_executor.rs
 │   │   ├── discord_log.rs
-│   │   ├── fresh_session_reaper.rs
 │   │   ├── loader.rs
 │   │   ├── migrated.rs
 │   │   ├── mod.rs
@@ -944,12 +876,7 @@ src/
 │   │   └── mod.rs
 │   ├── tui_prompt_dedupe/
 │   │   └── synthetic_prompt.rs
-│   ├── tui_turn_state/
-│   │   └── completion_scan.rs
 │   ├── turn_orchestrator/
-│   │   ├── active_source_dedup.rs
-│   │   ├── dispatch_reservation.rs
-│   │   ├── pending_queue_persistence.rs
 │   │   └── registry_purge.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
@@ -961,7 +888,6 @@ src/
 │   ├── codex.rs
 │   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs
-│   ├── cswap.rs
 │   ├── discord_config_audit.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs
@@ -984,7 +910,6 @@ src/
 │   ├── monitoring_store.rs
 │   ├── opencode.rs
 │   ├── operator_connectors.rs
-│   ├── pane_readiness.rs
 │   ├── pipeline_override.rs
 │   ├── pipeline_routes.rs
 │   ├── pr_summary.rs
@@ -1057,7 +982,6 @@ src/
 │   ├── stt_streaming.rs
 │   ├── turn_link.rs
 │   └── utils.rs
-├── api_caller_observability.rs
 ├── app_state.rs
 ├── bootstrap.rs
 ├── config.rs
@@ -1102,7 +1026,6 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/ui/` | Compatibility shims for persisted UI/session types used by the Discord runtime. |
 | `src/utils/` | Shared formatting and Unicode-safe string utilities. |
 | `src/voice/` | Voice command, STT/TTS, prompt, progress, metrics, receiver, and barge-in helpers. |
-| `src/api_caller_observability.rs` | Request-principal classification and uniform log-only API caller attribution records for identity-consuming mutation paths. |
 | `src/app_state.rs` | Shared HTTP route-handler state (`AppState`); lives at crate root below server+services so service-layer handlers reference it without a service→server backflow. |
 | `src/bootstrap.rs` | Builds config, database, policy engine, and shared app state before launch. |
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |

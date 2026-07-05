@@ -232,9 +232,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route(
                 "/routines/{id}",
-                get(routines::get_routine)
-                    .patch(routines::patch_routine)
-                    .delete(routines::delete_routine),
+                get(routines::get_routine).patch(routines::patch_routine),
             )
             .route("/routines/{id}/runs", get(routines::list_routine_runs))
             .route("/routines/{id}/pause", post(routines::pause_routine))

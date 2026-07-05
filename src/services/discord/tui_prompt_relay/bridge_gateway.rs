@@ -93,12 +93,35 @@ impl TurnGateway for TuiDirectBridgeGateway {
                 message_id,
                 content,
                 &self.shared,
-                // #3805 P1: bridge gateway returns the outcome only; the last-chunk
-                // footer anchor is consumed exclusively by the tmux watcher.
-                &mut None,
             )
             .await
             .map_err(|error| error.to_string())
+        })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            super::super::formatting::add_reaction_raw(&self.http, channel_id, message_id, emoji)
+                .await;
+        })
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            super::super::formatting::remove_reaction_raw(
+                &self.http, channel_id, message_id, emoji,
+            )
+            .await;
         })
     }
 
@@ -151,7 +174,7 @@ impl TurnGateway for TuiDirectBridgeGateway {
                 self.shared.clone(),
                 self.provider.clone(),
                 channel_id,
-                "requeue-front after bridge dispatch failure",
+                "tui_direct_bridge_queued_turn",
             );
             tracing::info!(
                 provider = %self.provider.as_str(),

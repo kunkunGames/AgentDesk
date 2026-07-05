@@ -24,20 +24,11 @@ use crate::services::provider::{
 use crate::services::provider_hosting::ProviderSessionDriver;
 use crate::services::remote::RemoteProfile;
 use crate::services::session_backend::{
-    ReadHarvestStats, StreamLineState, emit_status_events_from_stream_json,
-    insert_process_session_and_mark_active_turn, mark_process_session_active_turn,
+    ReadHarvestStats, StreamLineState, emit_status_events_from_stream_json, insert_process_session,
     observe_stream_context, parse_assistant_extra_tool_uses, parse_stream_message_with_state,
-    process_session_available_for_followup, process_session_pid, process_session_probe,
+    process_session_is_alive, process_session_pid, process_session_probe,
     read_output_file_until_result, read_output_file_until_result_with_harvest,
     remove_process_session, send_process_session_input, terminate_process_handle,
-};
-#[cfg(unix)]
-mod backend_routing;
-#[cfg(unix)]
-use self::backend_routing::{
-    LocalTmuxStartupPlan, classify_local_tmux_startup_plan, cleanup_process_backend_before_tmux,
-    prepare_tmux_backend_after_refused_process_demotion, process_backend_demotion_guard_liveness,
-    should_preserve_live_reused_provider_session, should_refuse_process_backend_demotion,
 };
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
@@ -773,17 +764,14 @@ IMPORTANT: Format your responses using Markdown for better readability:
     // Session execution path: wrap Claude in a managed session
     if let Some(tmux_name) = tmux_session_name {
         #[cfg(unix)]
-        let tmux_available = is_tmux_available();
-        #[cfg(unix)]
         {
             if remote_profile.is_none()
-                && tmux_available
+                && is_tmux_available()
                 && session_selection.driver == ProviderSessionDriver::TuiHosting
             {
                 if let Some(hook_endpoint) =
                     crate::services::claude_tui::hook_server::current_hook_endpoint()
                 {
-                    cleanup_process_backend_before_tmux(tmux_name);
                     debug_log(&format!("Claude TUI hosting session: {}", tmux_name));
                     return execute_streaming_local_tui_tmux(
                         prompt,
@@ -814,7 +802,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         {
             if let Some(profile) = remote_profile {
                 // Remote sessions always use tmux (TmuxBackend only)
-                if tmux_available {
+                if is_tmux_available() {
                     debug_log(&format!("Remote tmux session: {}", tmux_name));
                     return execute_streaming_remote_tmux(
                         profile,
@@ -828,9 +816,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 } else {
                     debug_log("Remote session requested but tmux not available");
                 }
-            } else if tmux_available {
+            } else if is_tmux_available() {
                 // Local with tmux → TmuxBackend (existing path)
-                cleanup_process_backend_before_tmux(tmux_name);
                 debug_log(&format!("TmuxBackend session: {}", tmux_name));
                 return execute_streaming_local_tmux(
                     &args,
@@ -846,28 +833,6 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     cache_ttl_minutes,
                 );
             } else {
-                let (tmux_missing, pane_liveness) =
-                    process_backend_demotion_guard_liveness(Some(tmux_name));
-                if should_refuse_process_backend_demotion(
-                    tmux_available,
-                    tmux_missing,
-                    pane_liveness,
-                ) {
-                    prepare_tmux_backend_after_refused_process_demotion(tmux_name, pane_liveness);
-                    return execute_streaming_local_tmux(
-                        &args,
-                        prompt,
-                        session_id,
-                        working_dir,
-                        sender,
-                        cancel_token,
-                        tmux_name,
-                        report_channel_id,
-                        report_provider,
-                        compact_percent,
-                        cache_ttl_minutes,
-                    );
-                }
                 // Local without tmux → ProcessBackend (new path)
                 debug_log(&format!("ProcessBackend session (no tmux): {}", tmux_name));
                 return execute_streaming_local_process(
@@ -1670,6 +1635,53 @@ pub fn is_tmux_available() -> bool {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalTmuxStartupPlan {
+    /// Existing tmux pane plus both runtime paths are present. The provider
+    /// writes the prompt to FIFO, reads this turn from the current JSONL
+    /// offset, then emits `TmuxReady` for watcher handoff.
+    WarmFollowup,
+    /// A tmux session name exists, but the pane or runtime paths are stale.
+    /// The provider kills it and recreates it through the cold-start path.
+    RecreateStaleSession,
+    /// No usable existing session exists. The provider starts a new wrapper
+    /// and hands JSONL ownership to the watcher from offset 0.
+    ColdStart,
+}
+
+#[cfg(unix)]
+fn classify_local_tmux_startup_plan(
+    session_exists: bool,
+    has_live_pane: bool,
+    has_output_path: bool,
+    has_input_fifo_path: bool,
+) -> LocalTmuxStartupPlan {
+    if session_exists && has_live_pane && has_output_path && has_input_fifo_path {
+        LocalTmuxStartupPlan::WarmFollowup
+    } else if session_exists {
+        LocalTmuxStartupPlan::RecreateStaleSession
+    } else {
+        LocalTmuxStartupPlan::ColdStart
+    }
+}
+
+/// Decide whether a stale-classified tmux session must be preserved rather than
+/// killed-and-recreated. Mirrors the Codex (`codex.rs`) and Qwen (`qwen.rs`)
+/// guards: a pane that is still live (`has_live_pane`) AND was selected for
+/// provider-session reuse (a non-empty resume id) is carrying an active
+/// conversation, so missing wrapper I/O files alone must not trigger a kill.
+#[cfg(unix)]
+fn should_preserve_live_reused_provider_session(
+    resume_session_id: Option<&str>,
+    has_live_pane: bool,
+) -> bool {
+    resume_session_id
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        && has_live_pane
+}
+
+#[cfg(unix)]
 fn emit_fresh_session_watcher_handoff(
     sender: &Sender<StreamMessage>,
     output_path: String,
@@ -2150,13 +2162,7 @@ fn run_claude_tui_fresh_turn_with_ready_retry(
 
 #[cfg(unix)]
 fn should_retry_claude_tui_fresh_prompt_ready(error: &str, attempt: usize) -> bool {
-    // #3889: a cold-boot stranded on the MCP-authentication-required welcome
-    // screen is a terminal, operator-actionable condition — retrying just reboots
-    // into the same blocked screen and burns another readiness window. It is
-    // already a distinct (non-timeout) error, but guard it explicitly so the
-    // retry loop can never re-enter it even if classification shifts.
-    !crate::services::claude_tui::input::is_mcp_auth_required_error(error)
-        && crate::services::claude_tui::input::is_prompt_ready_timeout_error(error)
+    crate::services::claude_tui::input::is_prompt_ready_timeout_error(error)
         && attempt < CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS
 }
 
@@ -3022,7 +3028,7 @@ pub(crate) fn execute_streaming_local_process(
 
     // Check for existing process session (follow-up)
     // ProcessBackend sessions don't persist across restarts, so we track via static map
-    if process_session_available_for_followup(session_name) {
+    if process_session_is_alive(session_name) {
         debug_log("Existing process session found — sending follow-up");
         match send_followup_to_process(
             prompt,
@@ -3106,8 +3112,8 @@ pub(crate) fn execute_streaming_local_process(
         *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.pid());
     }
 
-    // Store handle for follow-up messages and protect it from tmux-takeover cleanup.
-    let active_turn = insert_process_session_and_mark_active_turn(session_name.to_string(), handle);
+    // Store handle for follow-up messages
+    insert_process_session(session_name.to_string(), handle);
 
     // Poll output file until result
     let read_result = read_output_file_until_result(
@@ -3117,7 +3123,6 @@ pub(crate) fn execute_streaming_local_process(
         cancel_token,
         process_session_probe(session_name),
     )?;
-    drop(active_turn);
 
     fold_read_output_result(
         read_result,
@@ -3168,7 +3173,6 @@ fn send_followup_to_process(
         }
     });
 
-    let active_turn = mark_process_session_active_turn(session_name);
     if let Err(e) = send_process_session_input(session_name, &msg.to_string()) {
         if should_recreate_session_after_stdin_error(&e) {
             debug_log(&format!(
@@ -3194,7 +3198,6 @@ fn send_followup_to_process(
         cancel_token,
         process_session_probe(session_name),
     )?;
-    drop(active_turn);
 
     let outcome = classify_followup_result(
         read_result,
@@ -3296,117 +3299,6 @@ mod local_tmux_lifecycle_tests {
             Some(""),
             true
         ));
-    }
-
-    #[test]
-    fn issue_4113_process_demotion_guard_truth_table_pins_cached_missing_cells() {
-        use crate::services::platform::tmux::PaneLiveness;
-
-        let cases = [
-            (PaneLiveness::Live, false, true),
-            (PaneLiveness::Live, true, true),
-            (PaneLiveness::DeadOrAbsent, false, false),
-            (PaneLiveness::DeadOrAbsent, true, false),
-            (PaneLiveness::ProbeError, false, true),
-            (PaneLiveness::ProbeError, true, false),
-        ];
-
-        for (pane_liveness, tmux_missing, expected_refuse) in cases {
-            assert_eq!(
-                should_refuse_process_backend_demotion(false, tmux_missing, pane_liveness),
-                expected_refuse,
-                "pane_liveness={pane_liveness:?}, tmux_missing={tmux_missing}"
-            );
-        }
-
-        assert!(!should_refuse_process_backend_demotion(
-            true,
-            false,
-            PaneLiveness::Live,
-        ));
-    }
-
-    #[test]
-    fn issue_4113_cached_missing_probe_error_allows_process_fallback() {
-        let (tmux_missing, pane_liveness) =
-            backend_routing::process_backend_demotion_guard_liveness_from_cached_missing(
-                true,
-                Some("claude-existing-session"),
-                |_| crate::services::platform::tmux::PaneLiveness::ProbeError,
-            );
-
-        assert!(tmux_missing);
-        assert_eq!(
-            pane_liveness,
-            crate::services::platform::tmux::PaneLiveness::ProbeError
-        );
-        assert!(!should_refuse_process_backend_demotion(
-            false,
-            tmux_missing,
-            pane_liveness,
-        ));
-    }
-
-    #[test]
-    fn issue_4113_cached_missing_without_recorded_session_skips_probe() {
-        let (tmux_missing, pane_liveness) =
-            backend_routing::process_backend_demotion_guard_liveness_from_cached_missing(
-                true,
-                None,
-                |_| panic!("pane liveness must not be probed without a session name"),
-            );
-
-        assert!(tmux_missing);
-        assert_eq!(
-            pane_liveness,
-            crate::services::platform::tmux::PaneLiveness::DeadOrAbsent
-        );
-        assert!(!should_refuse_process_backend_demotion(
-            false,
-            tmux_missing,
-            pane_liveness,
-        ));
-    }
-
-    #[test]
-    fn issue_4113_active_process_wrapper_is_reaped_by_terminal_completion_after_tmux_skip() {
-        let session_name = format!("claude-tmux-return-cleanup-{}", uuid::Uuid::new_v4());
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::services::session_backend::insert_process_session(
-            session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess {
-                pid: 4113,
-                alive: alive.clone(),
-            },
-        );
-        let active_turn =
-            crate::services::session_backend::mark_process_session_active_turn(&session_name);
-
-        assert!(crate::services::session_backend::process_session_is_alive(
-            &session_name
-        ));
-        assert!(!cleanup_process_backend_before_tmux(&session_name));
-
-        assert!(alive.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(crate::services::session_backend::process_session_is_alive(
-            &session_name
-        ));
-
-        alive.store(false, std::sync::atomic::Ordering::Relaxed);
-        fold_read_output_result(
-            ReadOutputResult::SessionDied { offset: 0 },
-            |_| panic!("terminal death path must not emit ProcessReady"),
-            |_| {
-                crate::services::session_backend::remove_process_session(&session_name);
-            },
-        );
-        drop(active_turn);
-        assert_eq!(
-            crate::services::session_backend::process_session_pid(&session_name),
-            None,
-            "terminal completion must remove the process wrapper registry entry"
-        );
-        assert!(!cleanup_process_backend_before_tmux(&session_name));
     }
 
     #[test]
@@ -3680,12 +3572,6 @@ mod local_tmux_lifecycle_tests {
         ));
         assert!(!should_retry_claude_tui_fresh_prompt_ready(
             "claude tui session died before prompt input was ready",
-            1
-        ));
-        // #3889: the terminal MCP-authentication block must never be retried —
-        // rebooting just lands on the same blocked welcome screen.
-        assert!(!should_retry_claude_tui_fresh_prompt_ready(
-            "claude tui blocked on MCP server authentication: the Claude Code cold-boot welcome screen is waiting on MCP server authentication and is silently dropping prompt submissions; run /mcp in tmux session 'AgentDesk-ch-ad' to authenticate the server, then resend",
             1
         ));
     }
@@ -4067,118 +3953,6 @@ mod claude_tui_session_resolution_tests {
 ────────────────────────────────────────────────────────────────────────────
 ❯\u{00a0}좋아, 잘 동작하네
 ────────────────────────────────────────────────────────────────────────────
-  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
-  ⏵⏵ bypass permissions on"
-                .to_string(),
-        };
-
-        assert_eq!(
-            claude_tui_followup_stranded_prompt_draft_state(&snapshot, &transcript_path),
-            None
-        );
-    }
-
-    #[test]
-    fn stranded_followup_user_draft_below_finished_block_fires_recovery() {
-        // #3924 (a, end-to-end): turn1 finished and turn2's `[User:]` follow-up
-        // Enter was dropped, leaving it editable below the finished block under
-        // idle-suggestion chrome. Previously the bare `[User:]` exclusion read
-        // this as no-draft, so the recovery net never fired and the turn was
-        // killed at the 120s transcript timeout. The recovery net must now
-        // recognize the stranded draft (transcript Idle from the finished turn1
-        // ⇒ IdleTranscript) so it can clear + resubmit instead of killing.
-        let transcript_dir = tempfile::tempdir().unwrap();
-        let transcript_path = transcript_dir.path().join("session.jsonl");
-        std::fs::write(
-            &transcript_path,
-            r#"{"type":"system","subtype":"turn_duration","session_id":"s"}"#,
-        )
-        .unwrap();
-        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            prompt_draft_detected: true,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: "\
-⏺ previous response
-✻ Brewed for 2s
-─────────────────────────────────────────────────────────────────────────────
-❯ [User: 0hbujang (ID: 343742347365974026)] follow-up whose Enter was dropped
-─────────────────────────────────────────────────────────────────────────────
-  CLAUDE.md: 1, MCP: 2 │ Tools: 4 done
-  ⏵⏵ bypass permissions on"
-                .to_string(),
-        };
-
-        assert_eq!(
-            claude_tui_followup_stranded_prompt_draft_state(&snapshot, &transcript_path),
-            Some(ClaudeTuiStrandedPromptDraftState::IdleTranscript)
-        );
-    }
-
-    #[test]
-    fn stranded_followup_user_draft_below_zero_tool_block_fires_recovery() {
-        // #3924 codex re-review: the previously-MISSED shape. turn1 finished
-        // having run ZERO tools (idle footer shows `Tools: 0 done`) and turn2's
-        // `[User:]` follow-up Enter was DROPPED below it. The transcript is Idle
-        // (turn1 completed, no in-progress turn), so the recovery net MUST fire —
-        // the finished-0-tool `Tools: 0 done` footer must not be read as a running
-        // turn. This is the false-negative the first fix re-introduced.
-        let transcript_dir = tempfile::tempdir().unwrap();
-        let transcript_path = transcript_dir.path().join("session.jsonl");
-        std::fs::write(
-            &transcript_path,
-            r#"{"type":"system","subtype":"turn_duration","session_id":"s"}"#,
-        )
-        .unwrap();
-        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            prompt_draft_detected: true,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: "\
-⏺ acknowledged, nothing to run
-✻ Brewed for 1s
-─────────────────────────────────────────────────────────────────────────────
-❯ [User: 0hbujang (ID: 343742347365974026)] follow-up whose Enter was dropped
-─────────────────────────────────────────────────────────────────────────────
-  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
-  ⏵⏵ bypass permissions on"
-                .to_string(),
-        };
-
-        assert_eq!(
-            claude_tui_followup_stranded_prompt_draft_state(&snapshot, &transcript_path),
-            Some(ClaudeTuiStrandedPromptDraftState::IdleTranscript)
-        );
-    }
-
-    #[test]
-    fn freshly_submitted_zero_tool_user_turn_is_not_recovered() {
-        // #3924 codex re-review (the other direction): a `[User:]` turn that DID
-        // submit and is RUNNING shares the exact pane shape (`Tools: 0 done`, no
-        // `⏺` below the draft yet) as the stranded-below-0-tool case above — the
-        // CAPTURE cannot tell them apart. The JSONL transcript is the authority:
-        // an in-progress (assistant-streaming) turn classifies as non-Idle, so the
-        // recovery net must return None and NOT clear/resubmit a live turn.
-        let transcript_dir = tempfile::tempdir().unwrap();
-        let transcript_path = transcript_dir.path().join("running.jsonl");
-        std::fs::write(
-            &transcript_path,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"streaming"}]}}"#,
-        )
-        .unwrap();
-        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            prompt_draft_detected: true,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: "\
-⏺ previous response
-✻ Brewed for 2s
-─────────────────────────────────────────────────────────────────────────────
-❯ [User: 0hbujang (ID: 343742347365974026)] follow-up that just submitted
-─────────────────────────────────────────────────────────────────────────────
   CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
   ⏵⏵ bypass permissions on"
                 .to_string(),

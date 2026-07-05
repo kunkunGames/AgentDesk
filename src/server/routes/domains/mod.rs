@@ -1,5 +1,6 @@
 pub(super) mod access;
 pub(super) mod admin;
+pub(super) mod analytics;
 pub(super) mod agents;
 pub(super) mod analytics;
 pub(super) mod integrations;

@@ -4,6 +4,7 @@ use super::audit::log_transition_audit_pg;
 use super::github_sync::github_sync_on_transition_pg;
 use super::review_tuning::record_true_negative_if_pass_with_backends;
 use super::terminal_cleanup::sync_terminal_transition_followups_pg;
+use crate::db::Db;
 use crate::engine::PolicyEngine;
 use serde_json::json;
 use sqlx::Row as SqlxRow;
@@ -49,7 +50,13 @@ pub(super) fn fire_dynamic_hooks(
 ///
 /// Hooks cannot re-enter the engine, so transition requests and dispatch
 /// creations are accumulated for post-hook replay.
-pub fn drain_hook_side_effects_with_backends(engine: &PolicyEngine) {
+// reason: pub kanban hook side-effect drainer; lib-build callers are cfg/test-gated. See #3034.
+#[allow(dead_code)]
+pub fn drain_hook_side_effects(db: &Db, engine: &PolicyEngine) {
+    drain_hook_side_effects_with_backends(Some(db), engine);
+}
+
+pub fn drain_hook_side_effects_with_backends(db: Option<&Db>, engine: &PolicyEngine) {
     loop {
         let intent_result = engine.drain_pending_intents();
         let mut transitions = intent_result.transitions;
@@ -61,6 +68,7 @@ pub fn drain_hook_side_effects_with_backends(engine: &PolicyEngine) {
 
         for (card_id, old_status, new_status) in &transitions {
             fire_transition_hooks_with_backends(
+                db,
                 engine.pg_pool(),
                 engine,
                 card_id,
@@ -76,7 +84,20 @@ pub fn drain_hook_side_effects_with_backends(engine: &PolicyEngine) {
 /// Looks up the `events` section of the effective pipeline and fires each
 /// hook name via `try_fire_hook_by_name`. Falls back to firing the default
 /// hook name if no pipeline config or no event binding is found.
+// reason: pub kanban event-hook firer used by dispatched_sessions; lib-build callers are cfg/test-gated. See #3034.
+#[allow(dead_code)]
+pub fn fire_event_hooks(
+    db: &Db,
+    engine: &PolicyEngine,
+    event: &str,
+    default_hook: &str,
+    payload: serde_json::Value,
+) {
+    fire_event_hooks_with_backends(Some(db), engine, event, default_hook, payload);
+}
+
 pub fn fire_event_hooks_with_backends(
+    db: Option<&Db>,
     engine: &PolicyEngine,
     event: &str,
     default_hook: &str,
@@ -91,6 +112,7 @@ pub fn fire_event_hooks_with_backends(
     }
     // Event hook callers already own transition draining; only materialize
     // deferred dispatch intents here so follow-up notification queries can see them.
+    let _ = db;
     let _ = engine.drain_pending_intents();
 }
 
@@ -101,6 +123,7 @@ pub fn fire_event_hooks_with_backends(
 /// Use this when callers already handle those concerns separately
 /// (e.g. dispatch creation, route handlers).
 fn resolve_effective_pipeline_for_hooks(
+    db: Option<&Db>,
     pg_pool: Option<&sqlx::PgPool>,
     card_id: &str,
 ) -> Option<crate::pipeline::PipelineConfig> {
@@ -159,26 +182,52 @@ fn resolve_effective_pipeline_for_hooks(
         };
     }
 
-    None
+    {
+        let _ = db;
+        None
+    }
 }
 
-pub fn fire_state_hooks_with_backends(engine: &PolicyEngine, card_id: &str, from: &str, to: &str) {
+// reason: pub kanban state-hook firer used by dispatch_create; lib-build callers are cfg/test-gated. See #3034.
+#[allow(dead_code)]
+pub fn fire_state_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &str, to: &str) {
+    fire_state_hooks_with_backends(Some(db), engine, card_id, from, to);
+}
+
+pub fn fire_state_hooks_with_backends(
+    db: Option<&Db>,
+    engine: &PolicyEngine,
+    card_id: &str,
+    from: &str,
+    to: &str,
+) {
     if from == to {
         return;
     }
-    let effective = resolve_effective_pipeline_for_hooks(engine.pg_pool(), card_id);
+    let effective = resolve_effective_pipeline_for_hooks(db, engine.pg_pool(), card_id);
     if let Some(ref pipeline) = effective {
         fire_dynamic_hooks(engine, pipeline, card_id, from, to, None);
     }
-    drain_hook_side_effects_with_backends(engine);
+    drain_hook_side_effects_with_backends(db, engine);
 }
 
 /// Fire only the on_enter hooks for a specific state, without requiring a transition.
 ///
 /// Used when re-entering the same state (e.g., restarting review from awaiting_dod)
 /// where `fire_state_hooks` would no-op because from == to.
-pub fn fire_enter_hooks_with_backends(engine: &PolicyEngine, card_id: &str, state: &str) {
-    let effective = resolve_effective_pipeline_for_hooks(engine.pg_pool(), card_id);
+// reason: pub kanban enter-hook firer; lib-build callers are cfg/test-gated. See #3034.
+#[allow(dead_code)]
+pub fn fire_enter_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, state: &str) {
+    fire_enter_hooks_with_backends(Some(db), engine, card_id, state);
+}
+
+pub fn fire_enter_hooks_with_backends(
+    db: Option<&Db>,
+    engine: &PolicyEngine,
+    card_id: &str,
+    state: &str,
+) {
+    let effective = resolve_effective_pipeline_for_hooks(db, engine.pg_pool(), card_id);
     if let Some(ref pipeline) = effective {
         if let Some(bindings) = pipeline.hooks_for_state(state) {
             let payload = json!({
@@ -192,12 +241,19 @@ pub fn fire_enter_hooks_with_backends(engine: &PolicyEngine, card_id: &str, stat
             }
         }
     }
-    drain_hook_side_effects_with_backends(engine);
+    drain_hook_side_effects_with_backends(db, engine);
 }
 
 /// Fire hooks for a status transition that already happened in the DB.
 /// Use this when the DB UPDATE was done elsewhere (e.g., update_card with mixed fields).
+// reason: pub kanban transition-hook firer; lib-build callers are cfg/test-gated. See #3034.
+#[allow(dead_code)]
+pub fn fire_transition_hooks(db: &Db, engine: &PolicyEngine, card_id: &str, from: &str, to: &str) {
+    fire_transition_hooks_with_backends(Some(db), engine.pg_pool(), engine, card_id, from, to);
+}
+
 pub fn fire_transition_hooks_with_backends(
+    db: Option<&Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: &PolicyEngine,
     card_id: &str,
@@ -209,17 +265,18 @@ pub fn fire_transition_hooks_with_backends(
     }
 
     if let Some(pg_pool) = pg_pool {
-        fire_transition_hooks_pg(pg_pool, engine, card_id, from, to);
+        fire_transition_hooks_pg(db, pg_pool, engine, card_id, from, to);
         return;
     }
 
     {
-        let _ = (engine, card_id, from, to);
+        let _ = (db, engine, card_id, from, to);
         return;
     }
 }
 
 fn fire_transition_hooks_pg(
+    db: Option<&Db>,
     pg_pool: &sqlx::PgPool,
     engine: &PolicyEngine,
     card_id: &str,
@@ -337,7 +394,7 @@ fn fire_transition_hooks_pg(
         fire_dynamic_hooks(engine, pipeline, card_id, from, to, Some("hook"));
 
         if pipeline.is_terminal(to)
-            && record_true_negative_if_pass_with_backends(Some(pg_pool), card_id)
+            && record_true_negative_if_pass_with_backends(db, Some(pg_pool), card_id)
         {
             crate::server::routes::review_verdict::spawn_aggregate_if_needed_with_pg(Some(
                 pg_pool.clone(),

@@ -820,13 +820,6 @@ async fn join_voice_channel(
         Event::Core(CoreEvent::SpeakingStateUpdate),
         receiver_handler.clone(),
     );
-    // #3914: subscribe to ClientDisconnect so the receiver can drop a leaver's
-    // SSRC→user mapping; otherwise `ssrc_users` grows monotonically under
-    // long-running channel churn (every (re)join allocates a fresh SSRC).
-    handler.add_global_event(
-        Event::Core(CoreEvent::ClientDisconnect),
-        receiver_handler.clone(),
-    );
     handler.add_global_event(Event::Core(CoreEvent::VoiceTick), receiver_handler);
     Ok(())
 }
@@ -851,10 +844,7 @@ async fn leave_voice_channel(
         .shared
         .voice_barge_in
         .control_channel_ids_for_guild(guild_id);
-    data.shared
-        .voice_barge_in
-        .unregister_voice_guild(guild_id)
-        .await;
+    data.shared.voice_barge_in.unregister_voice_guild(guild_id);
     let mut flushed = 0usize;
     for cc_id in control_channel_ids {
         flushed += data

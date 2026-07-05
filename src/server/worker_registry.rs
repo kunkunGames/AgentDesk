@@ -17,7 +17,6 @@ use super::ws::{BatchBuffer, BroadcastTx};
 static LEADER_ONLY_WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
 static LEADER_ONLY_WORKER_ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS: AtomicI64 = AtomicI64::new(0);
-static RATE_LIMIT_SYNC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static WORKER_LOCAL_LOOP_OWNED_TERMINAL_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WORKER_LOCAL_LOOP_OWNED_UNEXPECTED_TERMINAL_SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WORKER_LOCAL_LOOP_OWNED_LAST_TERMINAL_SIGNAL: LazyLock<
@@ -72,10 +71,6 @@ pub(crate) fn leader_only_worker_status_json() -> serde_json::Value {
         "worker_local_loop_owned_unexpected_terminal_signal_count": WORKER_LOCAL_LOOP_OWNED_UNEXPECTED_TERMINAL_SIGNAL_COUNT.load(Ordering::Acquire),
         "last_worker_local_loop_owned_terminal_signal": last_worker_local_signal,
     })
-}
-
-pub(crate) fn rate_limit_sync_active() -> bool {
-    RATE_LIMIT_SYNC_ACTIVE.load(Ordering::Acquire)
 }
 
 fn worker_local_loop_owned_terminal_signal_snapshot() -> Option<WorkerLocalTerminalSignal> {
@@ -220,9 +215,6 @@ fn record_worker_local_tokio_join_result(
 fn record_leader_only_worker_started(spec: WorkerSpec) {
     LEADER_ONLY_WORKERS_STARTED.store(true, Ordering::Release);
     LEADER_ONLY_WORKER_ACTIVE_COUNT.fetch_add(1, Ordering::AcqRel);
-    if spec.id == ServerWorkerId::RateLimitSync {
-        RATE_LIMIT_SYNC_ACTIVE.store(true, Ordering::Release);
-    }
     LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS
         .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
     tracing::info!(
@@ -248,9 +240,6 @@ fn record_leader_only_worker_stopped(spec: WorkerSpec, reason: &str) {
         Ordering::Acquire,
         |count| Some(count.saturating_sub(1)),
     );
-    if spec.id == ServerWorkerId::RateLimitSync {
-        RATE_LIMIT_SYNC_ACTIVE.store(false, Ordering::Release);
-    }
     tracing::warn!(
         worker = spec.name,
         target = spec.target,
@@ -848,24 +837,13 @@ impl SupervisedWorkerRegistry {
                     return Ok(None);
                 };
                 let prompt_manifest_retention = self.config.prompt_manifest_retention.clone();
-                // #3909 — resolve the voice TTS cache/temp sweep dirs from the
-                // loaded runtime VoiceConfig (the same source of truth the TTS
-                // write path uses) so operator overrides of
-                // `voice.tts.progress_cache_dir` / `voice.audio.temp_dir` are
-                // swept, not the defaults.
-                let voice_cache_sweep =
-                    crate::services::maintenance::jobs::voice_cache_sweep::Config::from_voice_config(
-                        &self.config.voice,
-                    );
                 self.register_leader_tokio(spec, move || {
                     let maintenance_pg_pool = maintenance_pg_pool.clone();
                     let prompt_manifest_retention = prompt_manifest_retention.clone();
-                    let voice_cache_sweep = voice_cache_sweep.clone();
                     async move {
                         super::maintenance::scheduler_loop(
                             maintenance_pg_pool,
                             prompt_manifest_retention,
-                            voice_cache_sweep,
                         )
                         .await;
                     }

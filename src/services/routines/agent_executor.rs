@@ -1519,7 +1519,7 @@ fn routine_thread_title(routine_name: &str, agent_id: &str) -> String {
     base.chars().take(90).collect()
 }
 
-pub(crate) fn routine_agent_session_name(routine_name: &str, agent_id: &str) -> String {
+fn routine_agent_session_name(routine_name: &str, agent_id: &str) -> String {
     // Put the distinguishing routine name FIRST: `build_tmux_session_name`
     // truncates to 44 chars, so leading with `agent_id` made two routines on the
     // same agent collide to one tmux session (reusing provider/transcript state)
@@ -2264,51 +2264,6 @@ mod tests {
         assert_eq!(
             history[1].get("targetKey").and_then(Value::as_str),
             Some("obujang")
-        );
-    }
-
-    #[test]
-    fn fresh_dm_probe_transcript_completion_promotes_pending_delivery_marker() {
-        let completion = completion_with_evidence(AgentTurnCompletionEvidence::AssistantTranscript);
-        let result = pending_checkpoint_for_completion(
-            Some(&json!({
-                "status": "started",
-                "turn_id": "discord:500:run-family-profile",
-                "agent_id": "family-counsel",
-                "provider": "codex",
-                "channel_id": "500",
-                "parent_channel_id": "100",
-                "dm_user_id": "343742347365974026",
-                "is_dm": true,
-                "routine_id": "routine-family-profile",
-                "run_id": "run-family-profile",
-                "script_ref": "family-profile-probe-obujang.js",
-                "execution_strategy": "fresh",
-                "completion_evidence": "session_transcripts",
-                "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
-                "checkpoint": {
-                    "plan": {"date": "2026-05-30", "hour": 12, "minute": 0},
-                    "pendingDelivery": {
-                        "kind": "family-profile-probe",
-                        "targetKey": "obujang",
-                        "target": "343742347365974026",
-                        "triggerDate": "2026-05-30",
-                        "triggeredAt": "2026-05-30T12:00:00+09:00",
-                        "plan": {"date": "2026-05-30", "hour": 12, "minute": 0}
-                    }
-                }
-            })),
-            &completion,
-        )
-        .expect("checkpoint");
-
-        assert_eq!(
-            result.get("lastTriggeredDate").and_then(Value::as_str),
-            Some("2026-05-30")
-        );
-        assert!(
-            result.get("pendingDelivery").is_none(),
-            "fresh DM transcript evidence must consume the pending delivery marker"
         );
     }
 

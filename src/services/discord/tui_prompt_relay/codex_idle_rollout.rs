@@ -472,7 +472,6 @@ async fn run_codex_idle_response_tail(
                 &ProviderKind::Codex,
                 channel_id,
                 &tmux_session_name,
-                lease.session_key.as_deref(),
                 "codex_tui_direct_tail_panicked",
             )
             .await;
@@ -494,7 +493,6 @@ async fn run_codex_idle_response_tail(
             &ProviderKind::Codex,
             channel_id,
             &tmux_session_name,
-            lease.session_key.as_deref(),
             "codex_tui_direct_empty_response",
         )
         .await;
@@ -519,7 +517,6 @@ async fn run_codex_idle_response_tail(
             &ProviderKind::Codex,
             channel_id,
             &tmux_session_name,
-            lease.session_key.as_deref(),
             "codex_tui_direct_delivery_failed",
         )
         .await;
@@ -548,7 +545,6 @@ async fn run_codex_idle_response_tail(
                 &ProviderKind::Codex,
                 channel_id,
                 &tmux_session_name,
-                lease.session_key.as_deref(),
                 "codex_tui_direct_tail_failed",
             )
             .await;

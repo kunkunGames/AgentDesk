@@ -18,9 +18,8 @@
 //! `removed_token.is_some()`, a double-finalize is a harmless no-op — never an
 //! underflow, never a double Discord notice.
 
-use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use futures::FutureExt;
 use serenity::model::id::ChannelId;
 // `tokio::time::Instant` (not `std::time::Instant`) so deadlines respect the
 // paused/virtual test clock and the production `interval` clock alike.
@@ -32,14 +31,11 @@ use crate::services::provider::{CancelToken, ProviderKind};
 
 use super::SharedData;
 // #3041 P1-0: dormant lease types for the *Delivery messages below (mod.rs §2-§3).
-use super::{DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome};
+use super::{DeliveryLeaseCell, LeaseHolder, LeaseOutcome};
 
-pub(in crate::services::discord) mod cleanup;
-pub(in crate::services::discord) mod completion_signal;
+mod cleanup;
+mod completion_signal;
 mod delivery_lease;
-mod finalize;
-mod finalize_context;
-mod reconcile;
 mod watcher_backstop;
 
 pub(in crate::services::discord) use cleanup::SyntheticClaimSnapshot;
@@ -61,16 +57,6 @@ use self::watcher_backstop::{
     WATCHER_BACKSTOP_TERMINAL_PROBE_INTERVAL, WATCHER_BACKSTOP_TERMINAL_STREAK,
     watcher_backstop_turn_is_terminal,
 };
-// #3894: per-submission finalize context extracted; re-exported so external
-// submit sites + the routed in-file call sites reference `FinalizeContext`
-// unqualified, byte-identical.
-pub(in crate::services::discord) use self::finalize_context::FinalizeContext;
-// #3894: the finalize side-effect chokepoint extracted; re-imported so
-// `handle_terminal` + the reconcile/backstop child call it byte-identically.
-use self::finalize::do_finalize;
-// #3894: the timer-driven reconcile/backstop cluster extracted; re-imported so
-// the actor loop's reconcile `select!` arm stays byte-identical.
-use self::reconcile::reconcile;
 
 /// How often the reconciler `Tick` fires to re-check deadline-armed
 /// gate-timeout entries and garbage-collect the ledger.
@@ -184,9 +170,8 @@ fn ledger_has_live_watcher_pending(
 ///
 /// - A real `user_msg_id` uses its exact key.
 /// - A channel-only id collapses onto the single non-terminal entry ONLY when
-///   exactly one live entry exists and no terminal entry exists for the same
-///   channel/generation (ambiguous otherwise → route to the literal orphan key,
-///   a no-op for the caller).
+///   no terminal entry exists for the same channel/generation (ambiguous
+///   otherwise → route to the literal orphan key, a no-op for the caller).
 pub(in crate::services::discord) fn resolve_channel_only<'a>(
     key: TurnKey,
     candidates: impl Iterator<Item = (&'a LedgerKey, bool)> + Clone,
@@ -200,16 +185,13 @@ pub(in crate::services::discord) fn resolve_channel_only<'a>(
     if channel_has_terminal {
         return key.exact_key();
     }
-    let mut live_matches = candidates.into_iter().filter(|(lk, is_terminal)| {
-        lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
-    });
-    let Some((only_live, _)) = live_matches.next() else {
-        return key.exact_key();
-    };
-    if live_matches.next().is_some() {
-        return key.exact_key();
-    }
-    *only_live
+    candidates
+        .into_iter()
+        .find(|(lk, is_terminal)| {
+            lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
+        })
+        .map(|(lk, _)| *lk)
+        .unwrap_or_else(|| key.exact_key())
 }
 
 /// Every actor submits ONE of these terminal events. The finalizer's ledger
@@ -246,6 +228,103 @@ fn terminal_event_kind_str(event: &TerminalEvent) -> &'static str {
         TerminalEvent::Cancel => "cancel",
         TerminalEvent::GateTimeout { .. } => "gate_timeout",
         TerminalEvent::RelayMiss => "relay_miss",
+    }
+}
+
+/// Per-submission knobs that keep each routed call-site behaviourally
+/// identical to its pre-#3016 inline sequence during the incremental window.
+/// Routed sites preserve their old side-effects; only ownership moves.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::services::discord) struct FinalizeContext {
+    /// Whether `do_finalize` clears inflight as part of the finalize. Bridge
+    /// branches and the watcher clear inflight inline in their own flow before
+    /// submitting, so they pass `false`; only the deadline-armed reconcile
+    /// backstop (no caller to clear it) passes `true`.
+    pub(in crate::services::discord) clear_inflight: bool,
+    /// Whether to mark the removed token's completion-cleanup. The bridge did
+    /// this on a non-cancel terminal (still gated on `!event.is_cancel()`); the
+    /// watcher's `finish_restored_watcher_active_turn` did NOT — it only set
+    /// `cancelled`. Keeping this per-site avoids changing provider-watchdog
+    /// semantics on the watcher path.
+    pub(in crate::services::discord) allow_completion_cleanup: bool,
+    /// Whether to drain voice barge-in deferred prompts as part of finalize.
+    /// The bridge branches drain voice; the watcher path did NOT.
+    pub(in crate::services::discord) drain_voice: bool,
+    /// Whether to schedule a deferred idle-queue kickoff when the finalize
+    /// leaves a pending soft-queue (gated on `mailbox_online && has_pending`).
+    /// The watcher's `finish_restored_watcher_active_turn` did this; the bridge
+    /// branches deferred kickoff to a later site, so they pass `false`.
+    pub(in crate::services::discord) kickoff_queue: bool,
+}
+
+impl FinalizeContext {
+    /// Bridge non-delegation / missing-handoff branches: bridge owns the
+    /// inflight clear elsewhere, marks completion-cleanup on non-cancel, drains
+    /// voice, defers queue kickoff.
+    pub(in crate::services::discord) fn bridge() -> Self {
+        Self {
+            clear_inflight: false,
+            allow_completion_cleanup: true,
+            drain_voice: true,
+            kickoff_queue: false,
+        }
+    }
+
+    /// Watcher terminal via `finish_restored_watcher_active_turn`: the watcher
+    /// clears inflight inline before submitting, does NOT mark completion
+    /// cleanup, does NOT drain voice. The queue kickoff stays at the caller
+    /// because it is gated on the caller's `dispatch_ok`, which the finalizer
+    /// cannot see — so the context leaves kickoff to the submitter.
+    pub(in crate::services::discord) fn watcher() -> Self {
+        Self {
+            clear_inflight: false,
+            allow_completion_cleanup: false,
+            drain_voice: false,
+            kickoff_queue: false,
+        }
+    }
+
+    /// Monitor-auto-turn / recovery terminal (#3016 phase 4): the caller owns
+    /// the inflight clear (or there is none — synthetic monitor turn / recovery
+    /// already cleared it), does NOT mark completion-cleanup, does NOT drain
+    /// voice, but DOES kick off any queued backlog (the pre-#3016
+    /// `finish_monitor_auto_turn` / `finish_recovered_turn_mailbox` both
+    /// scheduled the deferred idle-queue kickoff on `has_pending`). This is
+    /// `watcher()` plus the queue kickoff.
+    pub(in crate::services::discord) fn monitor() -> Self {
+        Self {
+            clear_inflight: false,
+            allow_completion_cleanup: false,
+            drain_voice: false,
+            kickoff_queue: true,
+        }
+    }
+
+    /// Deadline-armed gate-timeout backstop, fired from the reconciler with no
+    /// caller to have cleared inflight: finalize fully (clear inflight here),
+    /// no completion-cleanup or voice drain (watcher semantics), kick off the
+    /// queue if backlog remains.
+    fn gate_backstop() -> Self {
+        Self {
+            clear_inflight: true,
+            allow_completion_cleanup: false,
+            drain_voice: false,
+            kickoff_queue: true,
+        }
+    }
+
+    /// #3041 §3 P1-0 (DORMANT): context for a lease-release-driven finalize once
+    /// the watcher terminal migrates onto the delivery lease (P1-1..). Mirrors
+    /// `watcher()` today (no live caller), but kept as a distinct constructor so
+    /// wired phases can tune the lease-release knobs independently.
+    #[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+    pub(in crate::services::discord) fn delivery_lease() -> Self {
+        Self {
+            clear_inflight: false,
+            allow_completion_cleanup: false,
+            drain_voice: false,
+            kickoff_queue: false,
+        }
     }
 }
 
@@ -329,7 +408,6 @@ enum FinalizeMsg {
         provider: ProviderKind,
         event: TerminalEvent,
         ctx: FinalizeContext,
-        claim_snapshot: Option<SyntheticClaimSnapshot>,
         shared: Arc<SharedData>,
         ack: oneshot::Sender<FinalizeOutcome>,
     },
@@ -339,7 +417,7 @@ enum FinalizeMsg {
     /// sink/bridge wiring.
     #[allow(dead_code)] // #3041: no sender until sink/bridge wiring (P1-2..).
     AcquireDelivery {
-        key: DeliveryLeaseKey,
+        key: TurnKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -355,7 +433,7 @@ enum FinalizeMsg {
     /// reopened the #3143 duplicate window; kept for the §5.3 phase.
     #[allow(dead_code)] // #3041: wired in a later phase (ledger-coupled commit, §5.3).
     CommitDelivery {
-        key: DeliveryLeaseKey,
+        key: TurnKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -371,7 +449,7 @@ enum FinalizeMsg {
     /// via this awaited actor round-trip. Kept defined for a later phase.
     #[allow(dead_code)] // #3041: wired in a later phase (alongside CommitDelivery).
     ReleaseDelivery {
-        key: DeliveryLeaseKey,
+        key: TurnKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -476,7 +554,6 @@ impl TurnFinalizer {
                 provider: provider.clone(),
                 event: event.clone(),
                 ctx,
-                claim_snapshot,
                 shared: shared.clone(),
                 ack,
             })
@@ -508,7 +585,7 @@ impl TurnFinalizer {
     #[allow(dead_code)] // #3041: wired in a later phase (ledger-coupled commit, §5.3).
     pub(in crate::services::discord) async fn commit_delivery(
         &self,
-        key: DeliveryLeaseKey,
+        key: TurnKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -550,7 +627,7 @@ impl TurnFinalizer {
     #[allow(dead_code)] // #3041: wired in a later phase (alongside commit_delivery).
     pub(in crate::services::discord) async fn release_delivery(
         &self,
-        key: DeliveryLeaseKey,
+        key: TurnKey,
         lease: Arc<DeliveryLeaseCell>,
         holder: LeaseHolder,
         start: u64,
@@ -634,19 +711,6 @@ impl TurnFinalizer {
     }
 }
 
-/// #3866: render a caught panic payload for the actor's error log without
-/// re-panicking. `catch_unwind` yields `Box<dyn Any + Send>`; the common
-/// payloads are `&'static str` and `String`.
-fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_string()
-}
-
 /// The single owning task. Owns the ledger and a NON-owning cached handle to
 /// `SharedData`, and drives the reconcile timer in the same task via `select!`
 /// so the deadline-armed gate-timeout finalize fires deterministically (no
@@ -726,44 +790,13 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                         provider,
                         event,
                         ctx,
-                        claim_snapshot,
                         shared,
                         ack,
                     } => {
                         cached_shared = Some(Arc::downgrade(&shared));
-                        // #3866: the actor is a single, never-respawned task that
-                        // owns finalize for the whole process. The crate unwinds
-                        // (not `panic = "abort"`), so without this guard ONE panic
-                        // in a finalize side-effect would silently kill the loop
-                        // and every subsequent turn would fall through to
-                        // `AlreadyFinalized` (placeholder stuck / final answer
-                        // never delivered) for the rest of the process lifetime.
-                        // Contain the per-message handler: a caught panic logs and
-                        // resolves the ack as `AlreadyFinalized` so the submitter
-                        // does not hang, and the loop survives to finalize the next
-                        // turn.
-                        let outcome = match AssertUnwindSafe(handle_terminal(
-                            &mut ledger,
-                            key,
-                            provider,
-                            event,
-                            ctx,
-                            claim_snapshot,
-                            &shared,
-                        ))
-                        .catch_unwind()
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(payload) => {
-                                tracing::error!(
-                                    panic = %panic_payload_summary(payload.as_ref()),
-                                    "TurnFinalizer handle_terminal panicked; actor loop \
-                                     contained the panic and stays alive (#3866)"
-                                );
-                                FinalizeOutcome::AlreadyFinalized
-                            }
-                        };
+                        let outcome =
+                            handle_terminal(&mut ledger, key, provider, event, ctx, &shared)
+                                .await;
                         let _ = ack.send(outcome);
                     }
                     // #3041 §2-§3 P1-0 (DORMANT, UNREACHABLE today). Routing these
@@ -838,30 +871,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
             }
             _ = reconcile_timer.tick() => {
                 if let Some(shared) = cached_shared.as_ref().and_then(std::sync::Weak::upgrade) {
-                    // #3866: the reconcile arm runs the SAME finalize side-effect
-                    // surface as the Terminal arm — the gate-timeout deadline
-                    // backstop and the watcher far-backstop both drive
-                    // `run_backstop_finalize -> do_finalize`. Guarding ONLY the
-                    // Terminal arm left this path naked: a panic in a backstop
-                    // finalize (or in the proven-terminal probe / lease reclaim /
-                    // GC) would unwind the single never-respawned actor and
-                    // silently kill finalize for the rest of the process. Contain
-                    // the whole reconcile pass exactly like `handle_terminal`.
-                    // `do_finalize` is ALSO guarded inside `run_backstop_finalize`
-                    // (so a mid-finalize panic still flips the entry
-                    // Finalizing->Finalized and is never left stuck); this outer
-                    // guard additionally contains the non-finalize reconcile
-                    // surface and keeps the loop alive.
-                    if let Err(payload) = AssertUnwindSafe(reconcile(&mut ledger, &shared))
-                        .catch_unwind()
-                        .await
-                    {
-                        tracing::error!(
-                            panic = %panic_payload_summary(payload.as_ref()),
-                            "TurnFinalizer reconcile panicked; actor loop contained the panic \
-                             and stays alive (#3866)"
-                        );
-                    }
+                    reconcile(&mut ledger, &shared).await;
                 }
             }
         }
@@ -870,69 +880,14 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
 
 /// Exactly-once gate + immediate-finalize / deferral decision. Runs inside the
 /// actor task, so the check-and-set on `Phase` needs no synchronization.
-/// #3866: test-only one-shot panic injection. A test arms the next
-/// `handle_terminal` to panic so the live actor loop (single-threaded test
-/// runtime → same thread as the spawned actor task) exercises the real
-/// `catch_unwind` containment path.
-#[cfg(test)]
-mod test_panic_hook {
-    use std::cell::Cell;
-
-    thread_local! {
-        static ARMED: Cell<bool> = const { Cell::new(false) };
-        // #3866: a SEPARATE one-shot fired from INSIDE `do_finalize` (after the
-        // caller flipped the entry Pending->Finalizing), so a test can prove the
-        // caught-panic path resets the entry instead of leaving it stuck
-        // `Finalizing`. The top-of-`handle_terminal` arm panics BEFORE any ledger
-        // mutation and so under-proves the reset (the original #3866 test).
-        static ARMED_IN_FINALIZE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Arm the next (and only the next) `handle_terminal` to panic at the TOP,
-    /// before `resolve_ledger_key` / the phase flip — exercises only the actor
-    /// loop's outer guard (no ledger mutation runs).
-    pub(super) fn arm_once() {
-        ARMED.with(|a| a.set(true));
-    }
-
-    /// Arm the next (and only the next) `do_finalize` to panic — fired AFTER the
-    /// caller flipped the entry to `Finalizing`, so the test exercises the
-    /// reset-to-`Finalized` repair on BOTH the terminal and reconcile/backstop
-    /// paths (both run `do_finalize`).
-    pub(super) fn arm_in_finalize_once() {
-        ARMED_IN_FINALIZE.with(|a| a.set(true));
-    }
-
-    /// Consume the one-shot arm and panic if set.
-    pub(super) fn maybe_panic() {
-        if ARMED.with(|a| a.replace(false)) {
-            panic!("injected finalize side-effect panic (#3866 test)");
-        }
-    }
-
-    /// Consume the one-shot `do_finalize` arm and panic if set.
-    pub(super) fn maybe_panic_in_finalize() {
-        if ARMED_IN_FINALIZE.with(|a| a.replace(false)) {
-            panic!("injected do_finalize side-effect panic after phase flip (#3866 test)");
-        }
-    }
-}
-
 async fn handle_terminal(
     ledger: &mut HashMap<LedgerKey, LedgerEntry>,
     key: TurnKey,
     provider: ProviderKind,
     event: TerminalEvent,
     ctx: FinalizeContext,
-    claim_snapshot: Option<SyntheticClaimSnapshot>,
     shared: &Arc<SharedData>,
 ) -> FinalizeOutcome {
-    // #3866: test-only injection point — lets a test drive a real finalize
-    // side-effect panic through the live actor loop to prove the catch_unwind
-    // guard keeps the loop alive. No effect in production builds.
-    #[cfg(test)]
-    test_panic_hook::maybe_panic();
-
     // Resolve to the entry this terminal acts on: a real id keys exactly; a
     // channel-only id-0 collapses onto the channel's single live entry
     // (recovery/orphan). An unregistered turn (post-restart inflight, no live
@@ -1025,11 +980,12 @@ async fn handle_terminal(
         // No live relay owner → nothing will drive the pane to quiescence;
         // finalize now. This recovered/orphan watcher case (post-restart
         // inflight, no `register_start`) has no later watcher block to clear
-        // inflight — the caller's `watcher()` submit SKIPS its cleanup block and
-        // discards this outcome, so reproduce the deadline-armed
-        // `gate_backstop()` context shape: clear inflight here (else the file
-        // keeps blocking the channel after the mailbox release) and preserve the
-        // queue-admission bit; actual drain is the #4048 `do_finalize` event.
+        // inflight or kick the queue — the caller's `watcher()` submit SKIPS
+        // its cleanup block and discards this outcome, so reproduce what the
+        // deadline-armed `gate_backstop()` would have done: clear inflight
+        // here (else the file keeps blocking the channel after the mailbox
+        // release) AND kick off the queued soft-queue backlog (else a queued
+        // follow-up stays stuck — the EPIC restart/#3011 regression).
         effective_ctx.clear_inflight = true;
         effective_ctx.kickoff_queue = true;
     }
@@ -1047,46 +1003,372 @@ async fn handle_terminal(
     } else {
         key
     };
-    // #3866/#4048: `do_finalize` is the single chokepoint for finalize
-    // side-effects (inflight clear, mailbox token release, `global_active`
-    // decrement, voice drain, completion-event publish). Contain a panic HERE
-    // rather than only at the actor loop so the Finalizing->Finalized flip below
-    // STILL runs on a caught panic.
-    // That matters: the entry was just flipped to `Finalizing`, and reconcile GC
-    // reaps only `Finalized` while every backstop/probe gates on `Pending`, so an
-    // entry left stuck in `Finalizing` after a panic would leak FOREVER and
-    // poison `ledger_has_live_watcher_pending` / `resolve_channel_only` for this
-    // channel+generation. Resetting it to `Finalized` (the normal post-finalize
-    // flip) lets GC reap it and frees the channel for the next turn.
-    let outcome = match AssertUnwindSafe(do_finalize(
-        finalize_key,
-        provider,
-        &event,
-        effective_ctx,
-        claim_snapshot.as_ref(),
-        shared,
-    ))
-    .catch_unwind()
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(payload) => {
-            tracing::error!(
-                panic = %panic_payload_summary(payload.as_ref()),
-                channel = ledger_key.channel_id.get(),
-                user_msg_id = ledger_key.user_msg_id,
-                "TurnFinalizer do_finalize panicked on the terminal path; contained, the \
-                 ledger entry is reset Finalizing->Finalized below so it is never stuck (#3866)"
-            );
-            FinalizeOutcome::AlreadyFinalized
-        }
-    };
+    let outcome = do_finalize(finalize_key, provider, &event, effective_ctx, shared).await;
     if let Some(entry) = ledger.get_mut(&ledger_key) {
         entry.phase = Phase::Finalized;
         entry.finalized_at = Some(Instant::now());
         entry.terminal_deadline = None;
     }
     outcome
+}
+
+/// The single owner of finalize's side-effects. Reproduces today's exact
+/// `clear_inflight (per-site) + mailbox_finish_turn + counter-- + trailing
+/// terminal side-effects` sequence so each routed call-site stays
+/// behaviourally identical during the incremental landing.
+async fn do_finalize(
+    key: TurnKey,
+    provider: ProviderKind,
+    event: &TerminalEvent,
+    ctx: FinalizeContext,
+    shared: &Arc<SharedData>,
+) -> FinalizeOutcome {
+    let channel_id = key.channel_id;
+
+    // #3350 ②: ensure the #3303 DeferredClaim marker for a watcher-owned TUI-direct
+    // synthetic turn BEFORE (A) erases the row evidence. Codex r1-1: watcher
+    // submitters cleared the row pre-submit, so for them this row re-load proves
+    // nothing — their guarantee runs at submit time from the pre-clear snapshot
+    // (`submit_terminal_with_claim_snapshot`); rationale/gates: cleanup.rs.
+    cleanup::ensure_synthetic_claim_marker_before_clear(key, &provider, None);
+
+    // (A) inflight clear. Only the gate-timeout backstop and the immediate
+    //     no-owner restored-watcher path set `clear_inflight` (live bridge /
+    //     watcher sites clear inline, pass `false`). They consolidate the
+    //     pre-#3016 IDENTITY-GUARDED 1800s sweeper: a real identity clears via
+    //     `clear_inflight_state_if_matches` — never a newer turn's inflight,
+    //     preserving `PlannedRestartSkipped` / `RebindOriginSkipped`; a true
+    //     orphan (id-0, nothing to authenticate) keeps the unguarded clear.
+    if ctx.clear_inflight {
+        if key.user_msg_id != 0 {
+            let _ = super::inflight::clear_inflight_state_if_matches(
+                &provider,
+                channel_id.get(),
+                key.user_msg_id,
+            );
+        } else {
+            super::inflight::clear_inflight_state(&provider, channel_id.get());
+        }
+    }
+
+    // (B) mailbox cancel_token release — the routed sites' single, idempotent
+    //     `mailbox_finish_turn` (`removed_token = None` on a second call).
+    //     #3016 root-cause: a real identity uses the IDENTITY-GUARDED finish so
+    //     finalize only releases the token it owns — a stale channel-scoped
+    //     terminal post-finalize/ledger-GC must not release the NEWER turn's
+    //     token or decrement `global_active`. Ambiguous id-0 (recovery/orphan)
+    //     keeps the channel-scoped finish (ledger gate + id-0 no-op bound it).
+    let finish = if key.user_msg_id != 0 {
+        super::mailbox_finish_turn_if_matches(
+            shared,
+            &provider,
+            channel_id,
+            serenity::model::id::MessageId::new(key.user_msg_id),
+        )
+        .await
+    } else {
+        super::mailbox_finish_turn(shared, &provider, channel_id).await
+    };
+
+    if let Some(token) = finish.removed_token.as_ref() {
+        // A normal completion releases lingering token observers via
+        // `mark_completion_cleanup` so provider watchdogs don't treat the
+        // post-terminal `cancelled` flip as a live mid-stream cancel. A real
+        // cancel must NOT mark completion-cleanup; nor does the watcher path
+        // (it historically only set `cancelled`).
+        if ctx.allow_completion_cleanup && !matches!(event, TerminalEvent::Cancel) {
+            token.mark_completion_cleanup();
+        }
+        // Stop any lingering watchdog timer from firing on a newer turn's
+        // token.
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // (C) #3019 active-counter — decrement ONLY here, ONLY when this submission
+    //     actually removed the active turn. Gating on `removed_token.is_some()`
+    //     is what guarantees no underflow even under a transitional
+    //     double-call.
+    if finish.removed_token.is_some() {
+        super::saturating_decrement_global_active(shared);
+    }
+
+    // The CHANNEL-SCOPED trailing side-effects (D)/(E) below mutate per-channel
+    // routing/watchdog state that belongs to whatever turn is CURRENTLY active
+    // in the channel. They are safe to run when this finalize actually finished
+    // the turn (`removed_token.is_some()`), and harmlessly idempotent on the
+    // legacy unguarded id-0 path (which always ran them). But when the
+    // IDENTITY-GUARDED finish MISSED — a real `user_msg_id` that did NOT match
+    // the live active turn, so `removed_token` is `None` — a DIFFERENT (newer)
+    // turn owns the channel. Running these would clear the newer turn's
+    // watchdog override, drop its `dispatch_thread_parents` / `dispatch_role_
+    // overrides`, and drain its voice deferrals, corrupting a turn this stale
+    // terminal does not own (Codex P2). So when the guard was used and missed,
+    // skip the channel cleanup entirely — exactly as we already skip the token
+    // release and counter decrement. (An id-0 orphan keeps today's behaviour.)
+    let guarded_finish_missed = key.user_msg_id != 0 && finish.removed_token.is_none();
+
+    let has_pending_after_voice = if guarded_finish_missed {
+        // No-op finalize on a stale terminal: leave the live newer turn's
+        // channel state untouched. Report NO backlog (Codex P2): the newer turn
+        // is still active and owns its queue. Surfacing `finish.has_pending`
+        // here would let the bridge propagate `has_queued_turns` and later drain
+        // a queued soft message behind the live turn — concurrently dispatching
+        // a follow-up this stale terminal does not own. A guarded miss is a true
+        // no-op: no queue kickoff, no backlog reporting.
+        false
+    } else {
+        // (D) trailing terminal side-effects that today follow
+        //     `mailbox_finish_turn` inline at the bridge/watcher call-sites.
+        //     Moved here so they cannot diverge between the routed paths.
+        super::clear_watchdog_deadline_override(channel_id.get()).await;
+        shared
+            .dispatch
+            .thread_parents
+            .retain(|_, thread| *thread != channel_id);
+
+        let voice_deferred_enqueued = if ctx.drain_voice {
+            shared
+                .voice_barge_in
+                .drain_deferred_after_turn(shared, &provider, channel_id)
+                .await
+        } else {
+            false
+        };
+        let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
+        if !has_pending_after_voice {
+            shared.dispatch.role_overrides.remove(&channel_id);
+        }
+
+        // (E) optional deferred queue kickoff (watcher path), gated exactly as
+        //     `finish_restored_watcher_active_turn` did.
+        if ctx.kickoff_queue && finish.mailbox_online && has_pending_after_voice {
+            // #3005: idle has just been confirmed on this finalize, so let the
+            // first kickoff attempt run immediately (skipping the 2s pre-sleep)
+            // instead of waiting the full deferred-drain INITIAL_DELAY before a
+            // queued follow-up can start. Subsequent retries keep the existing
+            // 2s cadence (e.g. if the hosted TUI is still transiently Busy).
+            super::schedule_deferred_idle_queue_kickoff_immediate(
+                shared.clone(),
+                provider.clone(),
+                channel_id,
+                "turn_finalizer terminal completion with queued backlog",
+            );
+        }
+        has_pending_after_voice
+    };
+
+    cleanup::finalized_reaction_lifecycle(key, event, ctx, shared, "finalized");
+
+    // (F) relay-miss observability — emitted from inside the finalizer so the
+    //     signal fires exactly once per finalize regardless of submitter.
+    if matches!(event, TerminalEvent::RelayMiss) {
+        crate::services::observability::emit_inflight_lifecycle_event(
+            provider.as_str(),
+            channel_id.get(),
+            None,
+            None,
+            None,
+            "relay_miss_finalized",
+            serde_json::json!({
+                "removed_token": finish.removed_token.is_some(),
+                "has_pending": has_pending_after_voice,
+            }),
+        );
+    }
+
+    FinalizeOutcome::Finalized {
+        removed_token: finish.removed_token,
+        has_pending: has_pending_after_voice,
+        mailbox_online: finish.mailbox_online,
+    }
+}
+
+/// Run the deadline-elapsed backstop finalize for ONE entry: flip
+/// `Pending → Finalizing` (skip if a concurrent terminal already advanced it),
+/// run `do_finalize` on the backstop context, then flip `Finalized`. Shared by
+/// the gate-timeout deadline arm and the phase-5a watcher far-backstop arm so
+/// exactly-once is decided in one place. (#3016 phase-5b2: the legacy
+/// `mailbox_finalize_owed` revoke that used to run here is gone with the flag.)
+async fn run_backstop_finalize(
+    ledger: &mut HashMap<LedgerKey, LedgerEntry>,
+    ledger_key: LedgerKey,
+    turn_key: TurnKey,
+    provider: ProviderKind,
+    shared: &Arc<SharedData>,
+    now: Instant,
+) {
+    match ledger.get_mut(&ledger_key) {
+        Some(entry) if entry.phase == Phase::Pending => entry.phase = Phase::Finalizing,
+        _ => return,
+    }
+    // Backstop finalize: the deferred terminal originated from the watcher but
+    // no caller is around to clear inflight, so the backstop context clears it
+    // here — and the row, still on disk, feeds the marker-ensure row fallback.
+    let _ = do_finalize(
+        turn_key,
+        provider,
+        &TerminalEvent::GateTimeout {
+            pane_quiescent: Some(true),
+        },
+        FinalizeContext::gate_backstop(),
+        shared,
+    )
+    .await;
+    // #3016 phase-5b2: the legacy `mailbox_finalize_owed` revoke that ran here
+    // is gone — the ledger's exactly-once phase gate is the sole arbiter, so
+    // there is no stale flag a surviving watcher could swap.
+    if let Some(entry) = ledger.get_mut(&ledger_key) {
+        entry.phase = Phase::Finalized;
+        entry.finalized_at = Some(now);
+        entry.terminal_deadline = None;
+        entry.watcher_backstop_deadline = None;
+    }
+}
+
+/// The one reconciler. Finalizes deadline-armed gate-timeouts whose backstop
+/// elapsed, GUARANTEES the phase-5a watcher far-backstop for watcher-owned
+/// `register_start` Pending entries that never received a terminal (re-checking
+/// liveness so a paused-live turn is deferred, never over-finalized), and
+/// garbage-collects `Finalized` entries past their TTL so the ledger stays
+/// bounded.
+async fn reconcile(ledger: &mut HashMap<LedgerKey, LedgerEntry>, shared: &Arc<SharedData>) {
+    let now = Instant::now();
+
+    // #3041 P1-1 (B3): reclaim any delivery lease whose acquire deadline has
+    // elapsed (a dead/stuck holder), so a legitimate successor can acquire. This
+    // runs on the reconcile tick (1s) and is identity-agnostic; a `Committed`
+    // lease is never reclaimed (it awaits an explicit holder release). Uses the
+    // process-monotonic `lease_now_ms()` clock — the SAME clock the watcher's
+    // acquire deadline is computed against — so a live holder mid-send (whose
+    // ~15s deadline is kept ahead by the watcher's heartbeat-renew) is never
+    // reclaimed.
+    let _ = shared.reclaim_expired_delivery_leases(super::lease_now_ms());
+
+    // Collect deadline-elapsed gate-timeout entries to finalize. We must not
+    // hold a `&mut` borrow across the `do_finalize` await, so snapshot first.
+    // The stored `turn_key` carries the identity `do_finalize` needs.
+    let due: Vec<(LedgerKey, TurnKey, ProviderKind)> = ledger
+        .iter()
+        .filter_map(|(ledger_key, entry)| {
+            if entry.phase == Phase::Pending
+                && let Some(deadline) = entry.terminal_deadline
+                && now >= deadline
+            {
+                Some((*ledger_key, entry.turn_key, entry.provider.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (ledger_key, turn_key, provider) in due {
+        run_backstop_finalize(ledger, ledger_key, turn_key, provider, shared, now).await;
+    }
+
+    // #3277 (Defect C) — proven-terminal fast-path probe (no await). For
+    // watcher-owned Pending entries whose far deadline is still distant, run
+    // the STRICT (`at_deadline = false`) predicate: transcript-proven `Done`
+    // under a LIVE unpaused handle ONLY — absent/cancelled/stale handles and
+    // non-JSONL runtimes always defer here (codex r1, #3277 verify-3). After
+    // WATCHER_BACKSTOP_TERMINAL_STREAK interval-spaced terminal probes, pull
+    // the deadline in to GATE_BACKSTOP for the deadline arm's third (still
+    // strict — the entry is flagged `pulled`) confirmation within seconds
+    // instead of 1800s. Any non-terminal probe resets the streak.
+    let probe_due: Vec<(LedgerKey, ChannelId, ProviderKind)> = ledger
+        .iter()
+        .filter_map(|(ledger_key, entry)| {
+            let probe_spacing_elapsed = entry.watcher_backstop_probe_at.is_none_or(|at| {
+                now.duration_since(at) >= WATCHER_BACKSTOP_TERMINAL_PROBE_INTERVAL
+            });
+            if entry.phase == Phase::Pending
+                && entry.relay_owner == RelayOwnerKind::Watcher
+                && probe_spacing_elapsed
+                && let Some(deadline) = entry.watcher_backstop_deadline
+                && deadline > now + GATE_BACKSTOP
+            {
+                Some((
+                    *ledger_key,
+                    entry.turn_key.channel_id,
+                    entry.provider.clone(),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (ledger_key, channel_id, provider) in probe_due {
+        let terminal = watcher_backstop_turn_is_terminal(shared, channel_id, &provider, false);
+        let Some(entry) = ledger.get_mut(&ledger_key) else {
+            continue;
+        };
+        entry.watcher_backstop_probe_at = Some(now);
+        if !terminal {
+            entry.watcher_backstop_terminal_streak = 0;
+            continue;
+        }
+        entry.watcher_backstop_terminal_streak =
+            entry.watcher_backstop_terminal_streak.saturating_add(1);
+        if entry.watcher_backstop_terminal_streak == WATCHER_BACKSTOP_TERMINAL_STREAK {
+            entry.watcher_backstop_deadline = Some(now + GATE_BACKSTOP);
+            entry.watcher_backstop_deadline_pulled = true;
+            tracing::warn!(
+                channel = channel_id.get(),
+                provider = %provider.as_str(),
+                streak = entry.watcher_backstop_terminal_streak,
+                "#3277: watcher-owned turn is provably terminal but no terminal was ever \
+                 submitted — pulling the far-backstop deadline in (finalize after a final \
+                 at-deadline liveness re-check)"
+            );
+        }
+    }
+
+    // #3016 phase-5a — the watcher-owned `register_start` FAR backstop. Collect
+    // watcher-owned Pending entries whose generous `watcher_backstop_deadline`
+    // elapsed (those the watcher fresh-idle finalize never caught — the
+    // under-finalize gap the `placeholder_sweeper` SKIPS once content was
+    // delivered). Snapshot first so no `&mut` borrow is held across the awaits.
+    let watcher_due: Vec<(LedgerKey, TurnKey, ProviderKind, bool)> = ledger
+        .iter()
+        .filter_map(|(ledger_key, entry)| {
+            if entry.phase == Phase::Pending
+                && entry.relay_owner == RelayOwnerKind::Watcher
+                && let Some(deadline) = entry.watcher_backstop_deadline
+                && now >= deadline
+            {
+                let pulled = entry.watcher_backstop_deadline_pulled;
+                Some((*ledger_key, entry.turn_key, entry.provider.clone(), pulled))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (ledger_key, turn_key, provider, pulled) in watcher_due {
+        // Liveness re-check: NEVER finalize a paused-live / still-busy turn at
+        // the deadline; a still-live one EXTENDS its backstop a full horizon.
+        // A fast-path-PULLED deadline stays STRICT (codex r1) so a transiently
+        // absent/stale handle cannot smuggle a busy turn past the third check.
+        if watcher_backstop_turn_is_terminal(shared, turn_key.channel_id, &provider, !pulled) {
+            run_backstop_finalize(ledger, ledger_key, turn_key, provider, shared, now).await;
+        } else if let Some(entry) = ledger.get_mut(&ledger_key) {
+            if entry.phase == Phase::Pending {
+                entry.watcher_backstop_deadline = Some(now + WATCHER_REGISTER_BACKSTOP);
+                // #3277: re-prove from scratch on the restored generous horizon.
+                entry.watcher_backstop_deadline_pulled = false;
+                entry.watcher_backstop_terminal_streak = 0;
+            }
+        }
+    }
+
+    // GC finalized entries past their TTL.
+    ledger.retain(|_, entry| {
+        !(entry.phase == Phase::Finalized
+            && entry
+                .finalized_at
+                .is_some_and(|t| now.duration_since(t) >= FINALIZED_TTL))
+    });
 }
 
 #[cfg(test)]
@@ -1153,7 +1435,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn exactly_once_complete_then_late_complete() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = key(101);
@@ -1184,215 +1466,6 @@ mod tests {
         .await;
     }
 
-    /// #3866: a panic inside a single `handle_terminal` must NOT kill the actor
-    /// task. The next turn must still finalize. Without the `catch_unwind`
-    /// guard in the actor loop the spawned task would unwind and die, so the
-    /// second turn below would hang on its ack `oneshot` (the actor never
-    /// replies) — the test would time out instead of observing `Finalized`.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn panic_in_handle_terminal_does_not_kill_actor_loop() {
-        with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
-            let fin = TurnFinalizer::spawn();
-
-            // First turn: arm the one-shot panic so this finalize unwinds inside
-            // the actor task.
-            let k1 = key(3866);
-            fin.register_start(k1, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            test_panic_hook::arm_once();
-            let first = fin
-                .submit_terminal(
-                    k1,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            // The caught panic resolves the ack as `AlreadyFinalized` (not a
-            // hang) — the submitter survives too.
-            assert!(
-                matches!(first, FinalizeOutcome::AlreadyFinalized),
-                "panicking finalize should resolve the ack as AlreadyFinalized (not hang)"
-            );
-
-            // Second, independent turn: the actor loop must still be alive and
-            // finalize it normally. If the panic had killed the task this await
-            // would hang forever (the start-paused runtime would stall).
-            shared.restart.global_active.store(1, Ordering::Relaxed);
-            let k2 = key(38661);
-            fin.register_start(k2, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            let second = fin
-                .submit_terminal(
-                    k2,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(
-                matches!(second, FinalizeOutcome::Finalized { .. }),
-                "actor loop must survive the earlier panic and finalize the next turn"
-            );
-        })
-        .await;
-    }
-
-    /// #3866 (Finding 2 / 3a): a panic INSIDE `do_finalize` — fired AFTER the
-    /// caller flipped the entry `Pending -> Finalizing` — must NOT leave the
-    /// ledger entry stuck in `Finalizing`. A stuck `Finalizing` entry is never
-    /// GC'd (reconcile reaps only `Finalized`) and never re-finalized (every
-    /// backstop/probe gates on `Pending`), so it would leak forever and keep
-    /// reporting the channel as a live watcher-pending turn. The earlier
-    /// top-of-`handle_terminal` panic test arms BEFORE any ledger mutation, so it
-    /// cannot prove this repair. Here the caught panic must reset the entry to
-    /// `Finalized` (observed via `has_live_watcher_pending` flipping false), the
-    /// actor loop must survive, and a same-channel follow-up turn must finalize.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn panic_inside_do_finalize_resets_stuck_finalizing_entry() {
-        with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
-            let fin = TurnFinalizer::spawn();
-            let ch = ChannelId::new(38662);
-            let generation = 0;
-
-            // A live, watcher-owned turn.
-            let k1 = TurnKey::new(ch, 11, generation);
-            fin.register_start(k1, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            tokio::task::yield_now().await;
-            assert!(
-                fin.has_live_watcher_pending(ch, generation).await,
-                "the registered watcher turn must start out live/pending"
-            );
-
-            // Arm a panic INSIDE do_finalize (after the Finalizing flip) and submit
-            // the terminal. The actor flips Pending->Finalizing, calls do_finalize,
-            // which panics; the guard contains it and the post-call flip resets the
-            // entry to Finalized.
-            shared.restart.global_active.store(1, Ordering::Relaxed);
-            test_panic_hook::arm_in_finalize_once();
-            let first = fin
-                .submit_terminal(
-                    k1,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(
-                matches!(first, FinalizeOutcome::AlreadyFinalized),
-                "a panic inside do_finalize must resolve the ack (not hang)"
-            );
-
-            // KEY assertion (Finding 2): the entry is reset to Finalized, NOT left
-            // stuck Finalizing. A stuck entry would still be reported as a live
-            // watcher-pending turn for this channel+generation forever.
-            assert!(
-                !fin.has_live_watcher_pending(ch, generation).await,
-                "after a contained do_finalize panic the entry must be Finalized (not stuck \
-                 Finalizing, which would stay watcher-pending forever)"
-            );
-
-            // The actor loop survived AND the channel is free: a same-channel
-            // follow-up turn (new user_msg_id) still finalizes normally.
-            shared.restart.global_active.store(1, Ordering::Relaxed);
-            let k2 = TurnKey::new(ch, 22, generation);
-            fin.register_start(k2, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            let second = fin
-                .submit_terminal(
-                    k2,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(
-                matches!(second, FinalizeOutcome::Finalized { .. }),
-                "a same-channel follow-up turn must still finalize after the contained panic"
-            );
-        })
-        .await;
-    }
-
-    /// #3866 (Finding 1 / 3b): a panic on the RECONCILE/BACKSTOP finalize path
-    /// must be contained too. The original guard wrapped only the Terminal arm, so
-    /// a panic in a gate-timeout backstop finalize (driven by the reconcile timer,
-    /// NOT a terminal submission) would still unwind and permanently kill the
-    /// single never-respawned actor. Here a deferred gate-timeout's deadline
-    /// elapses, the reconciler runs the backstop `do_finalize` which panics; the
-    /// guard must contain it, reset the entry to Finalized, and keep the loop
-    /// alive to finalize a fresh turn.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn panic_on_reconcile_backstop_path_is_contained() {
-        with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
-            let fin = TurnFinalizer::spawn();
-            let k = key(38663);
-            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-
-            // Defer via a busy-pane gate-timeout (arms the backstop deadline).
-            let deferred = fin
-                .submit_terminal(
-                    k,
-                    ProviderKind::Claude,
-                    TerminalEvent::GateTimeout {
-                        pane_quiescent: Some(false),
-                    },
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(matches!(deferred, FinalizeOutcome::Deferred));
-
-            // Arm the panic so the reconciler's backstop do_finalize unwinds, then
-            // let the deadline elapse so the reconcile tick fires it. Under
-            // start_paused the runtime auto-advances once all tasks idle on timers.
-            test_panic_hook::arm_in_finalize_once();
-            tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 3).await;
-            tokio::task::yield_now().await;
-
-            // The contained panic reset the deferred entry to Finalized: a late
-            // terminal now sees AlreadyFinalized (the ack completing at all proves
-            // the actor loop is still alive — a dead actor would hang it forever
-            // under the paused runtime).
-            let late = fin
-                .submit_terminal(
-                    k,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(
-                matches!(late, FinalizeOutcome::AlreadyFinalized),
-                "the backstop entry must be reset to Finalized after the contained panic"
-            );
-
-            // And the loop still finalizes a brand-new, independent turn.
-            shared.restart.global_active.store(1, Ordering::Relaxed);
-            let k2 = key(386631);
-            fin.register_start(k2, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            let fresh = fin
-                .submit_terminal(
-                    k2,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(
-                matches!(fresh, FinalizeOutcome::Finalized { .. }),
-                "actor loop must survive a reconcile/backstop panic and finalize the next turn"
-            );
-        })
-        .await;
-    }
-
     /// #3274 residual: a terminal loser that receives `AlreadyFinalized` must
     /// still perform identity-guarded active-state cleanup. This models the
     /// bridge/watcher migration gap where the ledger says "done" but the same
@@ -1403,7 +1476,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(3274);
             let turn_id = 3274_1001u64;
@@ -1479,65 +1552,6 @@ mod tests {
         .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn already_finalized_loser_removes_thread_parent_and_kicks_parent_queue() {
-        use serenity::model::id::{MessageId, UserId};
-
-        with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
-            let fin = TurnFinalizer::spawn();
-            let parent = ChannelId::new(4_024_260);
-            let thread = ChannelId::new(4_024_261);
-            let turn_id = 4_024_262u64;
-            let key = TurnKey::new(thread, turn_id, 0);
-
-            fin.register_start(key, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
-            let first = fin
-                .submit_terminal(
-                    key,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-            assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
-
-            shared.dispatch.thread_parents.insert(parent, thread);
-            shared.restart.global_active.store(1, Ordering::Relaxed);
-            shared
-                .mailbox(thread)
-                .restore_active_turn(
-                    Arc::new(CancelToken::new()),
-                    UserId::new(7),
-                    MessageId::new(turn_id),
-                )
-                .await;
-
-            let late = fin
-                .submit_terminal(
-                    key,
-                    ProviderKind::Claude,
-                    TerminalEvent::Complete,
-                    FinalizeContext::watcher(),
-                    shared.clone(),
-                )
-                .await;
-
-            assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
-            assert!(
-                !shared.dispatch.thread_parents.contains_key(&parent),
-                "AlreadyFinalized cleanup must drop the finalized thread's parent mapping"
-            );
-            assert_eq!(
-                shared.restart.deferred_hook_backlog.load(Ordering::Relaxed),
-                1,
-                "dropping the parent mapping must schedule the parent queue kick"
-            );
-        })
-        .await;
-    }
-
     /// #3274 residual safety: the `AlreadyFinalized` cleanup is keyed to the
     /// terminal's turn id. A stale turn-1 loser must not clear turn-2's active
     /// mailbox token or durable inflight row.
@@ -1547,7 +1561,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(3275);
             let turn1_id = 3275_1001u64;
@@ -1645,7 +1659,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn unknown_user_msg_id_collapses_onto_registered_turn() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(606);
             let registered = TurnKey::new(ch, 99_999, 0);
@@ -1692,7 +1706,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sequential_same_channel_turns_each_finalize() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(909);
             let turn1 = TurnKey::new(ch, 1001, 0);
@@ -1748,7 +1762,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stale_channel_only_terminal_does_not_finalize_next_turn() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(919);
             let turn1 = TurnKey::new(ch, 2001, 0);
@@ -1822,7 +1836,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_underflow_on_double_terminal() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             // No active mailbox turn → mailbox_finish_turn returns removed_token=None.
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
@@ -1858,7 +1872,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_busy_finalizes_after_backstop() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let k = key(303);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1907,7 +1921,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn repeated_gate_timeout_does_not_postpone_backstop() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let k = key(313);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1960,7 +1974,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let k = key(404);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -1986,7 +2000,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_then_late_complete_already_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let k = key(505);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -2025,7 +2039,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bridge_watcher_race_finalizes_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = key(707);
@@ -2074,7 +2088,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_then_complete_before_deadline_no_double() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let k = key(808);
             fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
@@ -2130,20 +2144,19 @@ mod tests {
     /// must finalize IMMEDIATELY (not Deferred — no owner will ever drive the
     /// pane to quiescence and the caller discards the outcome while the
     /// `!lifecycle_stage_paused` cleanup block is skipped), AND it must honor
-    /// the pending-queue state so a queued follow-up is visible to the
-    /// completion-event drain listener:
+    /// the pending-queue state so a queued follow-up actually kicks off:
     ///   * outcome is `Finalized` (the channel does NOT stay stuck), and
     ///   * `removed_token` is `Some` (the active turn's mailbox token is
     ///     released — inflight/mailbox not orphaned), and
-    ///   * `has_pending` is `true` (the queued follow-up is surfaced while the
-    ///     #4048 completion event schedules its dispatch).
+    ///   * `has_pending` is `true` (the queued follow-up is surfaced so the
+    ///     finalizer's `kickoff_queue` schedules its dispatch).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn restored_unregistered_watcher_gate_timeout_finalizes_and_kicks_off_queue() {
         use crate::services::turn_orchestrator::{Intervention, InterventionMode};
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(1101);
 
@@ -2156,8 +2169,7 @@ mod tests {
                 .restore_active_turn(active_token.clone(), UserId::new(7), MessageId::new(70))
                 .await;
             // A queued soft follow-up behind the active turn so `has_pending` is
-            // true; the immediate-no-owner path must surface it for the
-            // completion-event queue drain.
+            // true; the immediate-no-owner path must surface it (kickoff_queue).
             shared
                 .mailbox(ch)
                 .replace_queue(
@@ -2165,10 +2177,7 @@ mod tests {
                         author_id: UserId::new(1),
                         author_is_bot: false,
                         message_id: MessageId::new(71),
-                        queued_generation: crate::services::discord::runtime_store::load_generation(
-                        ),
                         source_message_ids: vec![MessageId::new(71)],
-                        source_message_queued_generations: Vec::new(),
                         text: "queued follow-up".to_string(),
                         mode: InterventionMode::Soft,
                         created_at: std::time::Instant::now(),
@@ -2211,7 +2220,7 @@ mod tests {
                     );
                     assert!(
                         has_pending,
-                        "the queued follow-up must be honored for the completion-event queue drain"
+                        "the queued follow-up must be honored so the finalizer kicks off the queue"
                     );
                 }
                 other => panic!(
@@ -2241,7 +2250,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(1313);
             let turn1_id = 5001u64;
             let turn2_id = 5002u64;
@@ -2268,10 +2277,7 @@ mod tests {
                         author_id: UserId::new(1),
                         author_is_bot: false,
                         message_id: MessageId::new(5003),
-                        queued_generation: crate::services::discord::runtime_store::load_generation(
-                        ),
                         source_message_ids: vec![MessageId::new(5003)],
-                        source_message_queued_generations: Vec::new(),
                         text: "queued behind turn-2".to_string(),
                         mode: InterventionMode::Soft,
                         created_at: std::time::Instant::now(),
@@ -2415,7 +2421,7 @@ mod tests {
         use crate::services::discord::inflight::{InflightTurnState, save_inflight_state};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
         let ch = ChannelId::new(1414);
         let turn1_id = 6001u64;
         let turn2_id = 6002u64;
@@ -2479,7 +2485,7 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
         let ch = ChannelId::new(1515);
         let registered_id = 7001u64; // the ledger entry's real identity
         let live_active_id = 7002u64; // the DIFFERENT turn live in the mailbox
@@ -2587,7 +2593,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_bridge_finalizes_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2001);
             let tid = 8001u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2655,7 +2661,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_watcher_then_late_complete_already_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2002);
             let tid = 8002u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2717,7 +2723,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_miss_orphan_no_active_turn_no_underflow() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(0, Ordering::Relaxed);
             let fin = TurnFinalizer::spawn();
             let k = TurnKey::new(ChannelId::new(2003), 0, 0);
@@ -2779,7 +2785,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_watcher_finalizes_and_releases_token() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2004);
             let tid = 8004u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2849,7 +2855,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn reconciler_backstop_finalizes_deferred_gate_timeout_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2005);
             let tid = 8005u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2939,7 +2945,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_none_watcher_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2006);
             let tid = 8006u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -2996,7 +3002,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_none_bridge_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2007);
             let tid = 8007u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3074,7 +3080,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn orphan_id0_recovery_finalizes_and_releases_token() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2008);
             let tid = 8008u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3141,7 +3147,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn watcher_then_bridge_handoff_double_terminal_exactly_once() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2009);
             let tid = 8009u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3193,7 +3199,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn double_cancel_finalizes_exactly_once_no_underflow() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let ch = ChannelId::new(2010);
             let tid = 8010u64;
             shared.restart.global_active.store(1, Ordering::Relaxed);
@@ -3324,33 +3330,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn channel_only_resolve_refuses_multi_live_collapse() {
-        let ch = ChannelId::new(4243);
-        let generation = 0u64;
-        let live_a = LedgerKey {
-            channel_id: ch,
-            generation,
-            user_msg_id: 1001,
-        };
-        let live_b = LedgerKey {
-            channel_id: ch,
-            generation,
-            user_msg_id: 1002,
-        };
-        let zero_key = TurnKey::new(ch, 0, generation);
-        let candidates = [
-            (&live_a, /* is_terminal */ false),
-            (&live_b, /* is_terminal */ false),
-        ];
-
-        assert_eq!(
-            resolve_channel_only(zero_key, candidates.iter().copied()),
-            zero_key.exact_key(),
-            "an id-0 terminal with multiple live candidates must not pick a HashMap-arbitrary entry"
-        );
-    }
-
     // =======================================================================
     // #3016 S1 — read-only watcher-pending probes. (#3479 r9: the
     // completion-signal derivation tests moved to the `completion_signal`
@@ -3364,7 +3343,7 @@ mod tests {
         // #3016 phase-5a: `register_start` now takes `&Arc<SharedData>` (to prime
         // the reconcile cache). This test only registers + probes the ledger (no
         // terminal, no reconcile), so an inert shared suffices.
-        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
         let fin = TurnFinalizer::spawn();
         let ch = ChannelId::new(7001);
         fin.register_start(
@@ -3388,7 +3367,7 @@ mod tests {
     async fn watcher_pending_false_for_bridge_owned_entry() {
         // #3016 phase-5a: inert shared for the `register_start` Arc param (this
         // test only registers + probes; no terminal, no reconcile).
-        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
         let fin = TurnFinalizer::spawn();
         let ch = ChannelId::new(7101);
         // `RelayOwnerKind::SessionBoundRelay` is a bridge-owned (non-watcher)
@@ -3407,7 +3386,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn watcher_pending_false_after_finalized() {
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             let fin = TurnFinalizer::spawn();
             let ch = ChannelId::new(7201);
             let k = TurnKey::new(ch, 42, 0);
@@ -3454,7 +3433,7 @@ mod tests {
         // → discord). `with_isolated_runtime_root` is in the parent `tests` mod.
         use super::super::super::make_shared_data_for_tests_with_storage;
         use super::with_isolated_runtime_root;
-        use crate::services::discord::{DeliveryLeaseCell, DeliveryLeaseKey};
+        use crate::services::discord::DeliveryLeaseCell;
         use crate::services::provider::ProviderKind;
         use serenity::model::id::ChannelId;
         use std::sync::Arc;
@@ -3463,26 +3442,22 @@ mod tests {
             LeaseHolder::Watcher { instance_id: id }
         }
 
-        fn lease_key(ch: ChannelId, user_msg_id: u64) -> DeliveryLeaseKey {
-            DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, user_msg_id, 0))
-        }
-
         /// Watcher/Delivered: a freshly-acquired lease committed `Delivered`
         /// advances `confirmed_end_offset` to the leased `end` EXACTLY ONCE, and
         /// no duplicate occurs.
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_delivered_advances_offset_once() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7001);
                 let lease = shared.delivery_lease(ch);
-                let turn = lease_key(ch, 11);
+                let turn = TurnKey::new(ch, 11, 0);
                 let h = watcher(1);
 
                 // Acquire on the cell (the watcher fast-path), then commit through
                 // the actor (the path the watcher uses).
-                assert!(lease.try_acquire(turn.clone(), h, 0, 64, 1_000));
+                assert!(lease.try_acquire(turn, h, 0, 64, 1_000));
                 let committed = fin
                     .commit_delivery(
                         turn,
@@ -3512,15 +3487,15 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_acquire_contention_admits_one_holder() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let ch = ChannelId::new(7002);
                 let lease = shared.delivery_lease(ch);
-                let turn = lease_key(ch, 22);
+                let turn = TurnKey::new(ch, 22, 0);
 
                 let w1 = watcher(1);
                 let w2 = watcher(2);
                 // First watcher acquires for [0,32).
-                assert!(lease.try_acquire(turn.clone(), w1, 0, 32, 5_000));
+                assert!(lease.try_acquire(turn, w1, 0, 32, 5_000));
                 // Replacement watcher's acquire for the SAME turn/range loses
                 // while w1 still holds it (B2: it must NOT re-acquire+re-emit).
                 assert!(
@@ -3538,14 +3513,14 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_unknown_commit_does_not_advance_offset() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7003);
                 let lease = shared.delivery_lease(ch);
-                let turn = lease_key(ch, 33);
+                let turn = TurnKey::new(ch, 33, 0);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn.clone(), h, 0, 48, 1_000));
+                assert!(lease.try_acquire(turn, h, 0, 48, 1_000));
                 let committed = fin
                     .commit_delivery(
                         turn,
@@ -3575,17 +3550,17 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_second_commit_is_idempotent_on_offset() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7004);
                 let lease = shared.delivery_lease(ch);
-                let turn = lease_key(ch, 44);
+                let turn = TurnKey::new(ch, 44, 0);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn.clone(), h, 0, 80, 1_000));
+                assert!(lease.try_acquire(turn, h, 0, 80, 1_000));
                 assert!(
                     fin.commit_delivery(
-                        turn.clone(),
+                        turn,
                         lease.clone(),
                         h,
                         0,
@@ -3632,22 +3607,22 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn deadline_reclaim_frees_cell_for_later_acquire() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let ch = ChannelId::new(7005);
                 let lease = shared.delivery_lease(ch);
-                let turn_a = lease_key(ch, 55);
+                let turn_a = TurnKey::new(ch, 55, 0);
                 let dead = watcher(1);
 
                 // A holder acquires with deadline 100ms (monotonic units) but never
                 // commits/releases (dead).
-                assert!(lease.try_acquire(turn_a.clone(), dead, 0, 16, 100));
+                assert!(lease.try_acquire(turn_a, dead, 0, 16, 100));
                 // Before the deadline, the sweep is a no-op and the cell stays held.
                 assert_eq!(shared.reclaim_expired_delivery_leases(50), 0);
                 assert!(!lease.try_acquire(turn_a, watcher(2), 0, 16, 100));
                 // Past the deadline, the sweep reclaims exactly this cell.
                 assert_eq!(shared.reclaim_expired_delivery_leases(100), 1);
                 // A later legitimate acquire (new instance, new turn) succeeds.
-                let turn_b = lease_key(ch, 66);
+                let turn_b = TurnKey::new(ch, 66, 0);
                 assert!(
                     lease.try_acquire(turn_b, watcher(3), 16, 32, 1_000),
                     "a reclaimed cell is acquirable again"
@@ -3661,17 +3636,17 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn release_after_commit_frees_cell_for_next_turn() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let fin = TurnFinalizer::spawn();
                 let ch = ChannelId::new(7006);
                 let lease = shared.delivery_lease(ch);
-                let turn1 = lease_key(ch, 77);
+                let turn1 = TurnKey::new(ch, 77, 0);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn1.clone(), h, 0, 24, 1_000));
+                assert!(lease.try_acquire(turn1, h, 0, 24, 1_000));
                 assert!(
                     fin.commit_delivery(
-                        turn1.clone(),
+                        turn1,
                         lease.clone(),
                         h,
                         0,
@@ -3688,7 +3663,7 @@ mod tests {
                     "the holder releases its committed lease"
                 );
                 // Next turn (different range) can now acquire the freed cell.
-                let turn2 = lease_key(ch, 88);
+                let turn2 = TurnKey::new(ch, 88, 0);
                 assert!(
                     lease.try_acquire(turn2, watcher(2), 24, 48, 1_000),
                     "released cell is free for the next turn"
@@ -3709,16 +3684,16 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_inline_acquire_reclaims_dead_holder_without_terminal() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let ch = ChannelId::new(7007);
                 let lease = shared.delivery_lease(ch);
-                let dead_turn = lease_key(ch, 101);
+                let dead_turn = TurnKey::new(ch, 101, 0);
                 let dead = watcher(1);
 
                 // Dead holder acquires with deadline 100 (monotonic units) and
                 // then dies — never commits, never releases. No `SharedData` was
                 // ever cached in any finalizer (we never spawn/route a Terminal).
-                assert!(lease.try_acquire(dead_turn.clone(), dead, 0, 40, 100));
+                assert!(lease.try_acquire(dead_turn, dead, 0, 40, 100));
 
                 // BEFORE the deadline: a NON-expired live lease still B2-skips —
                 // the replacement's acquire-time reclaim is a no-op and the
@@ -3729,7 +3704,7 @@ mod tests {
                     "a non-expired lease must NOT be reclaimed (would reintroduce duplicates)"
                 );
                 assert!(
-                    !lease.try_acquire(dead_turn.clone(), live, 0, 40, 100),
+                    !lease.try_acquire(dead_turn, live, 0, 40, 100),
                     "B2: a replacement cannot acquire while the holder's lease is live (non-expired)"
                 );
 
@@ -3773,13 +3748,13 @@ mod tests {
         #[tokio::test(flavor = "current_thread", start_paused = true)]
         async fn watcher_inline_commit_advances_offset_synchronously() {
             with_isolated_runtime_root(|| async move {
-                let shared = make_shared_data_for_tests_with_storage(None);
+                let shared = make_shared_data_for_tests_with_storage(None, None);
                 let ch = ChannelId::new(7008);
                 let lease = shared.delivery_lease(ch);
-                let turn = lease_key(ch, 202);
+                let turn = TurnKey::new(ch, 202, 0);
                 let h = watcher(1);
 
-                assert!(lease.try_acquire(turn.clone(), h, 0, 96, 1_000));
+                assert!(lease.try_acquire(turn, h, 0, 96, 1_000));
                 assert_eq!(
                     shared.committed_relay_offset(ch),
                     0,
@@ -3788,7 +3763,7 @@ mod tests {
 
                 // The INLINE production sequence: synchronous cell commit, then
                 // (on Delivered) the synchronous offset advance — NO actor await.
-                let committed = lease.commit(h, turn.clone(), 0, 96, LeaseOutcome::Delivered);
+                let committed = lease.commit(h, turn, 0, 96, LeaseOutcome::Delivered);
                 assert!(committed, "fresh lease commits");
                 super::super::super::tmux::advance_watcher_confirmed_end(
                     &shared,
@@ -3892,7 +3867,7 @@ mod tests {
     async fn watcher_register_start_backstop_finalizes_unterminated_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5101);
             let active_token = Arc::new(CancelToken::new());
@@ -3962,7 +3937,7 @@ mod tests {
     async fn fresh_actor_watcher_backstop_finalizes_without_prior_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5111);
             let active_token = Arc::new(CancelToken::new());
@@ -4024,7 +3999,7 @@ mod tests {
     async fn watcher_register_start_backstop_defers_paused_live_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5202);
             let active_token = Arc::new(CancelToken::new());
@@ -4096,7 +4071,7 @@ mod tests {
     /// probe / pulled re-check, `false`) must DEFER all three shapes.
     #[test]
     fn dead_watcher_handle_is_terminal_while_live_handle_defers_busy_transcript() {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
 
         // A busy transcript: content present but NO Claude turn terminator →
         // `completion_signal_from_transcript` returns `PausedLive`.
@@ -4185,7 +4160,7 @@ mod tests {
     async fn jsonl_done_terminal_finalizes_promptly_with_backstop_armed() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5303);
             let active_token = Arc::new(CancelToken::new());
@@ -4233,7 +4208,7 @@ mod tests {
     async fn watcher_backstop_no_double_finalize_after_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5404);
             let active_token = Arc::new(CancelToken::new());
@@ -4294,7 +4269,7 @@ mod tests {
     async fn watcher_backstop_fast_path_finalizes_proven_terminal_promptly() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5501);
             let active_token = Arc::new(CancelToken::new());
@@ -4362,7 +4337,7 @@ mod tests {
     async fn watcher_backstop_fast_path_never_counts_absent_or_dead_handle() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(3, Ordering::Relaxed);
 
             // Busy transcript: content but NO Claude turn terminator →
@@ -4446,7 +4421,7 @@ mod tests {
     async fn watcher_backstop_fast_path_defers_live_paused_handle() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5502);
             let active_token = Arc::new(CancelToken::new());
@@ -4502,7 +4477,7 @@ mod tests {
     async fn watcher_backstop_fast_path_flapping_resets_streak() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5503);
             let active_token = Arc::new(CancelToken::new());
@@ -4569,7 +4544,7 @@ mod tests {
     async fn watcher_backstop_fast_path_noop_after_real_terminal() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(5504);
             let active_token = Arc::new(CancelToken::new());
@@ -4642,7 +4617,7 @@ mod tests {
     async fn watcher_backstop_probe_resolves_owner_keyed_watcher_for_dispatched_turn() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let owner_ch = ChannelId::new(6601);
             let dispatch_ch = ChannelId::new(6602);
@@ -4731,7 +4706,7 @@ mod tests {
     async fn non_jsonl_runtime_turn_does_not_take_fast_path() {
         use serenity::model::id::{MessageId, UserId};
         with_isolated_runtime_root(|| async move {
-            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
             shared.restart.global_active.store(1, Ordering::Relaxed);
             let ch = ChannelId::new(6603);
             let active_token = Arc::new(CancelToken::new());

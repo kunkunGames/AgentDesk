@@ -11,7 +11,6 @@ pub mod action;
 /// so there are zero side effects for non-PG deployments.
 pub mod agent_executor;
 pub mod discord_log;
-pub mod fresh_session_reaper;
 pub mod loader;
 pub mod migrated;
 pub mod runtime;
@@ -28,6 +27,6 @@ pub use runtime::{execute_claimed_script_run, poll_agent_turns, run_due_tick};
 pub use runtime_config::validate_routine_runtime_config;
 pub use session_control::{RoutineSessionCommand, RoutineSessionController};
 pub use store::{
-    DeleteRoutineResult, NewRoutine, RoutinePatch, RoutineStore,
-    is_resume_routine_requires_next_due_at, validate_routine_schedule,
+    NewRoutine, RoutinePatch, RoutineStore, is_resume_routine_requires_next_due_at,
+    validate_routine_schedule,
 };

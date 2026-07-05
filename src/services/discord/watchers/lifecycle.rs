@@ -501,25 +501,7 @@ pub(super) fn cancel_suppression_applies_to_watcher_death(
     cancel_induced_candidate && !terminal_delivery_observed
 }
 
-/// #3898 — whether a watcher-observed tmux death should attempt the
-/// resume-aborted restart handoff (`resume_aborted_restart_turn`). This is the
-/// ONLY user-facing lifecycle signal for a genuinely abnormal mid-turn pane
-/// crash: the turn was aborted *before* terminal delivery and the pane did not
-/// exit through a normal-completion path (`turn completed` / `exit:0` /
-/// `routine fresh`).
-///
-/// The legacy "session ended: tmux pane exited. Send a new message to start a
-/// new session." Discord notice (removed in #3898) is intentionally NOT
-/// reinstated here. It was both noise and factually wrong:
-/// - It required `terminal_delivery_observed`, so it never covered a genuine
-///   mid-turn crash — that case routes to the restart handoff below, not to a
-///   notice. The only deaths it actually fired on were delivered-then-idle /
-///   cleanup / force-kill teardowns that left no normal-completion marker,
-///   i.e. normal idle exits (false positive).
-/// - A pane death does NOT start a fresh session: the DB `claude_session_id`
-///   persists and the next message resumes the conversation with `--resume`,
-///   so "start a new session" was incorrect for every death that reached it.
-pub(super) fn tmux_death_should_attempt_restart_handoff(
+pub(super) fn should_send_session_ended_notice(
     cancel_induced: bool,
     prompt_too_long_killed: bool,
     terminal_delivery_observed: bool,
@@ -527,8 +509,39 @@ pub(super) fn tmux_death_should_attempt_restart_handoff(
 ) -> bool {
     !cancel_induced
         && !prompt_too_long_killed
-        && !terminal_delivery_observed
+        && terminal_delivery_observed
         && !is_normal_completion
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TmuxDeathLifecycleDecision {
+    pub(super) cancel_induced: bool,
+    pub(super) send_session_ended_notice: bool,
+}
+
+pub(super) fn tmux_death_lifecycle_decision(
+    cancel_induced_candidate: bool,
+    prompt_too_long_killed: bool,
+    terminal_delivery_observed: bool,
+    is_normal_completion: bool,
+) -> TmuxDeathLifecycleDecision {
+    let cancel_induced = cancel_suppression_applies_to_watcher_death(
+        cancel_induced_candidate,
+        terminal_delivery_observed,
+    );
+    TmuxDeathLifecycleDecision {
+        cancel_induced,
+        send_session_ended_notice: should_send_session_ended_notice(
+            cancel_induced,
+            prompt_too_long_killed,
+            terminal_delivery_observed,
+            is_normal_completion,
+        ),
+    }
+}
+
+pub(super) fn session_ended_notice() -> &'static str {
+    "session ended: tmux pane exited. Send a new message to start a new session."
 }
 
 pub(super) async fn handle_tmux_watcher_observed_death(
@@ -580,25 +593,14 @@ pub(super) async fn handle_tmux_watcher_observed_death(
         shared.pg_pool.as_ref(),
     )
     .await;
-    let cancel_induced = cancel_suppression_applies_to_watcher_death(
+    let decision = tmux_death_lifecycle_decision(
         cancel_induced_candidate,
-        terminal_delivery_observed,
-    );
-    // #3898 — the legacy "session ended … start a new session" Discord notice was
-    // removed. It false-fired on normal idle / cleanup / force-kill teardown
-    // (no `turn completed` / `exit:0` / `routine fresh` marker → classified
-    // abnormal) and was factually wrong (a pane death resumes via `--resume`, it
-    // does not start a fresh session). The genuine mid-turn crash signal is the
-    // restart handoff below; cancel suppression is still computed because it
-    // gates that handoff. `is_normal_completion` already folds in the exit-reason
-    // normal-completion check (`tmux_death_is_normal_completion`), so it is the
-    // single source of truth for the restart-handoff suppression.
-    let attempt_restart_handoff = tmux_death_should_attempt_restart_handoff(
-        cancel_induced,
         prompt_too_long_killed,
         terminal_delivery_observed,
         is_normal_completion,
     );
+    let cancel_induced = decision.cancel_induced;
+    let send_session_ended_notice = decision.send_session_ended_notice;
     if cancel_induced {
         tracing::info!(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after recent cancel/turn-stop, skipping lifecycle notification + restart handoff"
@@ -606,6 +608,10 @@ pub(super) async fn handle_tmux_watcher_observed_death(
     } else if cancel_induced_candidate {
         tracing::info!(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after a relayed terminal turn; ignoring stale cancel/turn-stop suppression"
+        );
+    } else if send_session_ended_notice {
+        tracing::info!(
+            "  [{ts}] 👁 tmux session {tmux_session_name} ended without normal completion, sending session-ended notice"
         );
     } else if !is_normal_completion {
         tracing::info!(
@@ -616,10 +622,36 @@ pub(super) async fn handle_tmux_watcher_observed_death(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after normal completion, skipping lifecycle notification"
         );
     }
-    if attempt_restart_handoff {
-        let _ =
-            resume_aborted_restart_turn(channel_id, http, shared, tmux_session_name, output_path)
-                .await;
+    if !cancel_induced && !prompt_too_long_killed && !terminal_delivery_observed {
+        // Suppress warning for normal dispatch completion — not an error.
+        let suppress_restart = is_normal_completion
+            || reason_short
+                .as_deref()
+                .is_some_and(tmux_exit_reason_is_normal_completion);
+        if !suppress_restart {
+            let _ = resume_aborted_restart_turn(
+                channel_id,
+                http,
+                shared,
+                tmux_session_name,
+                output_path,
+            )
+            .await;
+        }
+    }
+    if send_session_ended_notice {
+        rate_limit_wait(shared, channel_id).await;
+        if let Err(error) = crate::services::discord::http::send_channel_message(
+            http,
+            channel_id,
+            session_ended_notice(),
+        )
+        .await
+        {
+            tracing::warn!(
+                "  [{ts}] ⚠ tmux session {tmux_session_name} ended but session-ended notice send failed: {error}"
+            );
+        }
     }
 }
 
@@ -659,6 +691,7 @@ pub(super) fn extract_result_error_text(value: &serde_json::Value) -> String {
 /// `channel_id` rows are intentionally NOT reused (that is exactly the hazard
 /// being closed — reuse self-heals on the next turn once the row is stamped).
 pub(super) fn load_restored_session_cwd(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     session_keys: &[String],
     channel_id: u64,
@@ -693,7 +726,7 @@ pub(super) fn load_restored_session_cwd(
         .flatten();
     }
 
-    let _ = (session_keys, channel_id);
+    let _ = (db, session_keys, channel_id);
     None
 }
 
@@ -748,6 +781,7 @@ pub(super) fn inflight_duration_ms(started_at: Option<&str>) -> Option<i64> {
 }
 
 pub(super) fn load_restored_provider_session_id(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     token_hash: &str,
     provider: &ProviderKind,
@@ -789,12 +823,20 @@ pub(super) fn load_restored_provider_session_id(
         .flatten();
     }
 
-    let _ = session_keys;
+    let _ = (db, session_keys);
     None
 }
 
 pub(super) fn recovery_handled_channel_key(channel_id: u64) -> String {
     format!("recovery_handled_channel:{channel_id}")
+}
+
+pub(super) fn sqlite_runtime_db(shared: &SharedData) -> Option<&crate::db::Db> {
+    if shared.pg_pool.is_some() {
+        None
+    } else {
+        None::<&crate::db::Db>
+    }
 }
 
 pub(super) fn watcher_has_post_work_ready_evidence(
@@ -824,73 +866,6 @@ mod tests {
             turn_delivered: Arc::new(AtomicBool::new(false)),
             last_heartbeat_ts_ms: Arc::new(AtomicI64::new(tmux_watcher_now_ms())),
         }
-    }
-
-    // #3898 — cancel suppression is the surviving gate that protects the restart
-    // handoff (and previously gated the now-removed "session ended" notice).
-    #[test]
-    fn cancel_suppression_only_applies_before_terminal_delivery() {
-        // A cancel/turn-stop candidate that died before delivering its turn is
-        // suppressed (no restart handoff; historically no notice either).
-        assert!(cancel_suppression_applies_to_watcher_death(true, false));
-        // Once a terminal turn was delivered, a later pane death is a real
-        // lifecycle event for that turn — stale cancel suppression must NOT apply.
-        assert!(!cancel_suppression_applies_to_watcher_death(true, true));
-        // No cancel candidate → never suppressed.
-        assert!(!cancel_suppression_applies_to_watcher_death(false, false));
-        assert!(!cancel_suppression_applies_to_watcher_death(false, true));
-    }
-
-    // #3898 — the false-positive fix. A tmux pane that exits *after* delivering
-    // its turn (normal idle / cleanup / force-kill, which leave no
-    // normal-completion marker → `is_normal_completion == false`) must NOT
-    // surface any lifecycle signal: the removed notice never fires, and the
-    // restart handoff is gated off by `terminal_delivery_observed`. This is the
-    // noise the issue reported — a normal idle exit emitting a spurious notice.
-    #[test]
-    fn delivered_then_idle_death_surfaces_no_lifecycle_signal() {
-        let cancel_induced = cancel_suppression_applies_to_watcher_death(false, true);
-        assert!(!cancel_induced);
-        // Even with an "abnormal" exit reason (no normal-completion marker), a
-        // delivered turn means this is a normal idle/cleanup/force-kill teardown.
-        assert!(!tmux_death_should_attempt_restart_handoff(
-            cancel_induced,
-            /* prompt_too_long_killed */ false,
-            /* terminal_delivery_observed */ true,
-            /* is_normal_completion */ false,
-        ));
-        // The same holds when the pane DID exit through a normal-completion path.
-        assert!(!tmux_death_should_attempt_restart_handoff(
-            cancel_induced,
-            false,
-            true,
-            true,
-        ));
-    }
-
-    // #3898 — a genuinely abnormal mid-turn pane crash (turn aborted BEFORE
-    // terminal delivery, no normal-completion marker) STILL surfaces a signal:
-    // the resume-aborted restart handoff fires. This is the case the removed
-    // notice never covered (it required `terminal_delivery_observed`), so
-    // removing the notice does not lose any genuine-crash signal.
-    #[test]
-    fn genuine_mid_turn_crash_triggers_restart_handoff() {
-        assert!(tmux_death_should_attempt_restart_handoff(
-            /* cancel_induced */ false, /* prompt_too_long_killed */ false,
-            /* terminal_delivery_observed */ false, /* is_normal_completion */ false,
-        ));
-        // Suppressed when the user canceled the turn themselves …
-        assert!(!tmux_death_should_attempt_restart_handoff(
-            true, false, false, false
-        ));
-        // … when the prompt-too-long teardown already handled it …
-        assert!(!tmux_death_should_attempt_restart_handoff(
-            false, true, false, false
-        ));
-        // … or when the pane exited through a normal-completion path.
-        assert!(!tmux_death_should_attempt_restart_handoff(
-            false, false, false, true
-        ));
     }
 
     #[test]
@@ -1206,6 +1181,7 @@ pub(in crate::services::discord) async fn fail_dispatch_for_ready_for_input_stal
         "tmux_session_name": tmux_session_name,
     });
     let changed = crate::dispatch::set_dispatch_status_with_backends(
+        sqlite_runtime_db(shared.as_ref()),
         shared.pg_pool.as_ref(),
         dispatch_id,
         "failed",
@@ -1222,6 +1198,11 @@ pub(in crate::services::discord) async fn fail_dispatch_for_ready_for_input_stal
         card_marked = if let Some(pool) = shared.pg_pool.as_ref() {
             update_card_ready_failure_marker_pg(pool, card_id_ref, READY_FOR_INPUT_STUCK_REASON)
                 .await?
+        } else if let Some(db) = sqlite_runtime_db(shared.as_ref()) {
+            {
+                let _ = db;
+                false
+            }
         } else {
             false
         };
@@ -1234,6 +1215,7 @@ pub(in crate::services::discord) async fn fail_dispatch_for_ready_for_input_stal
                 "자동큐 safety-net 발동: dispatch {dispatch_id} / card {card_label} / session {tmux_session_name} / {READY_FOR_INPUT_STUCK_REASON}"
             );
             enqueue_lifecycle_notification_best_effort(
+                sqlite_runtime_db(shared.as_ref()),
                 shared.pg_pool.as_ref(),
                 &target,
                 Some(dispatch_id),
@@ -2202,8 +2184,12 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             &provider,
             session_name,
         );
-        let restored_cwd =
-            load_restored_session_cwd(shared.pg_pool.as_ref(), &session_keys, channel_id.get());
+        let restored_cwd = load_restored_session_cwd(
+            None::<&crate::db::Db>,
+            shared.pg_pool.as_ref(),
+            &session_keys,
+            channel_id.get(),
+        );
 
         let mut selected_claude_tui_fallback_transcript: Option<std::path::PathBuf> = None;
         let mut codex_direct_resume_fallback = None;
@@ -2426,6 +2412,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                 channel_id.get(),
             );
             let persisted_session_id = load_restored_provider_session_id(
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 &provider,
@@ -2439,8 +2426,12 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                 &provider,
                 &tmux_name,
             );
-            let db_cwd =
-                load_restored_session_cwd(shared.pg_pool.as_ref(), &session_keys, channel_id.get());
+            let db_cwd = load_restored_session_cwd(
+                None::<&crate::db::Db>,
+                shared.pg_pool.as_ref(),
+                &session_keys,
+                channel_id.get(),
+            );
 
             let session =
                 data.sessions
@@ -2612,6 +2603,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         for dc in &dead_cleanups {
             let dispatch_protection =
                 super::super::tmux_lifecycle::resolve_dispatch_tmux_protection(
+                    None::<&crate::db::Db>,
                     shared.pg_pool.as_ref(),
                     &shared.token_hash,
                     &provider,
@@ -2787,7 +2779,7 @@ mod restored_session_cwd_channel_isolation_tests {
         .await;
 
         // Owner channel recovers its own cwd.
-        let owner = load_restored_session_cwd(Some(&pool), &session_keys, channel_a);
+        let owner = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_a);
         assert_eq!(
             owner.as_deref(),
             Some(owner_cwd.as_str()),
@@ -2796,7 +2788,7 @@ mod restored_session_cwd_channel_isolation_tests {
 
         // The colliding (different-id) channel must NOT recover channel A's cwd
         // (RED before the P0-b `channel_id = $2` fix).
-        let cross = load_restored_session_cwd(Some(&pool), &session_keys, channel_b);
+        let cross = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_b);
         assert_eq!(
             cross, None,
             "a different channel sharing the same session_key must NOT recover \
@@ -2829,7 +2821,7 @@ mod restored_session_cwd_channel_isolation_tests {
         // A row written before the channel_id column existed has NULL channel_id.
         seed_session(&pool, &session_key, None, &cwd).await;
 
-        let resolved = load_restored_session_cwd(Some(&pool), &session_keys, channel_id);
+        let resolved = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_id);
         assert_eq!(
             resolved, None,
             "a legacy NULL-channel_id row must not be reused for watcher recovery"

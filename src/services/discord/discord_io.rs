@@ -63,6 +63,7 @@ pub(super) async fn check_owner(user_id: UserId, shared: &Arc<SharedData>) -> bo
 /// in the consumed row's context (as `_answer`), and a notification is sent
 /// to the source agent's Discord channel so its session can process the reply.
 pub(super) async fn try_handle_pending_dm_reply(
+    _db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     msg: &serenity::Message,
 ) -> bool {
@@ -205,7 +206,10 @@ fn resolve_channel_to_u64(raw: &str) -> Result<u64, String> {
 
 /// Retry DM reply notifications that previously failed (`_notify_failed` in context).
 /// Called from the 5-min tick loop.
-pub async fn retry_failed_dm_notifications(pg_pool: Option<&sqlx::PgPool>) {
+pub async fn retry_failed_dm_notifications(
+    _db: Option<&crate::db::Db>,
+    pg_pool: Option<&sqlx::PgPool>,
+) {
     let entries =
         match crate::services::discord_dm_reply_store::load_failed_consumed_dm_replies_db(pg_pool)
             .await
@@ -352,6 +356,22 @@ pub(super) async fn rate_limit_wait(shared: &Arc<SharedData>, channel_id: Channe
         target
     };
     tokio::time::sleep_until(sleep_until).await;
+}
+
+/// Add a reaction to a message
+pub(super) async fn add_reaction(
+    http: &Arc<serenity::http::Http>,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    emoji: char,
+) {
+    let reaction = serenity::ReactionType::Unicode(emoji.to_string());
+    if let Err(e) = channel_id.create_reaction(http, message_id, reaction).await {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}"
+        );
+    }
 }
 
 /// Send a file to a Discord channel (called from CLI --discord-sendfile)

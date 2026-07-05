@@ -89,12 +89,11 @@ pub(super) fn watcher_backstop_turn_is_terminal(
         ),
         at_deadline,
         || {
-            crate::services::provider::tmux_session_fallback_ready_for_input(
-                &tmux_session_name,
-                provider,
-                runtime_kind,
-            )
-            .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
+            crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind)
+                && crate::services::provider::tmux_session_ready_for_input(
+                    &tmux_session_name,
+                    provider,
+                )
         },
     )
 }

@@ -765,7 +765,7 @@ fn persisted_runtime_overrides_with_fallbacks(
         .get("dispatchRateLimitGateEnabled")
         .and_then(Value::as_bool)
         .filter(|enabled| {
-            explicit_keys.contains("dispatchRateLimitGateEnabled") || *enabled != true
+            explicit_keys.contains("dispatchRateLimitGateEnabled") || !*enabled
         });
     let danger = value
         .get("dispatchRateLimitGateDangerPct")

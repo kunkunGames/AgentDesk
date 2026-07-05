@@ -82,13 +82,6 @@ pub(super) fn discord_restart_reports_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_restart_reports"))
 }
 
-/// #4049 S4-a1: durable turn-view reaction state. The reconciler stores the
-/// bot token hash that added a lifecycle reaction so cold terminal/clear
-/// notifications after restart remove with the same Discord @me identity.
-pub(super) fn discord_turn_view_reconciler_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_turn_view_reconciler"))
-}
-
 /// #3293 verify r1 (finding 3): durable preservation of the full assistant
 /// response + row metadata for every recovery force-clear. Kept OUT of
 /// `discord_restart_reports/` because that store is flushed-and-deleted on
@@ -134,19 +127,6 @@ pub(crate) fn tui_direct_commit_tombstone_root() -> Option<PathBuf> {
 /// stopped/cancelled TUI-direct turn). Drained by the placeholder sweeper.
 pub(super) fn discord_status_panel_orphans_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_status_panel_orphans"))
-}
-
-/// #3859: durable abandon-request store. A SYNC failure-path site (turn-task
-/// `InflightCleanupGuard` Drop, heartbeat-gap sweeper) that evicts an inflight
-/// row with a live "🔄 처리 중" placeholder cannot drive the async Discord edit
-/// itself, and deleting the row strands the placeholder forever. Instead it
-/// records `(channel_id, placeholder_msg_id, started_at, current_tool_line)`
-/// here — independent of the inflight lifecycle — and deletes the row
-/// immediately (freeing the channel, like the pre-#3859 path). The placeholder
-/// sweeper drains this store and finalizes each placeholder to its terminal
-/// "중단됨" card BY MESSAGE ID. Mirrors `discord_status_panel_orphans`.
-pub(super) fn discord_abandon_requests_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_abandon_requests"))
 }
 
 /// #3607: durable UI-only obligations for terminal-delivered turns whose TUI

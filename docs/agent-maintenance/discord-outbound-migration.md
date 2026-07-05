@@ -1,6 +1,6 @@
 # Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436 / #1457)
 
-> Last refreshed: 2026-07-03 (against #3874 dead-code removal — manual outbound callsite coverage map refreshed after removing permanently-None `Option<&Db>` threading; no delivery semantics change).
+Last refreshed: 2026-06-16 (against `main` @ `8ec7336e32eb6ef89e1143fab2543f2fc644ebac`)
 
 > #3664 outbound bot-selection note: the outbox drain (`src/server/mod.rs`)
 > now resolves the delivery bot via `message_outbox::delivery_bot_for_target_session`.
@@ -25,7 +25,7 @@
 >
 > Last refreshed: 2026-06-20 (against #3610 codex review — M4 invariant gate on the bridge long-chunk arm. The durable-frontier helper `record_long_chunk_terminal_delivery` in `outbound/delivery_record.rs` is now documented to fire ONLY when the caller's `lease.commit_and_advance(.., Delivered)` returned `true`; the `turn_bridge/mod.rs` long-chunk `Ok` arm captures that bool and gates the helper call on it. A non-Leased / identity-mismatch / reclaimed cell makes `commit_and_advance` return `false` WITHOUT advancing the in-memory `confirmed_end_offset`, so recording `delivered_frontier.range = end` in that case would leave the durable frontier END ahead of the authority — the exact M4 violation. No signature / callsite-map change; the helper's coverage row and outbound delivery semantics are otherwise unchanged).
 >
-> Last refreshed: 2026-06-20 (#3610 PR-1d — watcher legacy long-chunk arm now also records a durable terminal delivery. The same `record_long_chunk_terminal_delivery` helper in `outbound/delivery_record.rs` is now reached from the watcher long-chunk fallback (`tmux_watcher::terminal_send`, the `watcher_should_send_ordered_new_chunks_for_terminal_fallback` path, later controller-routed by #3998 S1-d), which is the arm that watcher-owned sessions — `relay_owner_kind=watcher`, the production majority — actually take for long messages. Same M4 gate: the call lives in that arm's `if committed && Delivered` success branch, so it fires only when the in-memory advance succeeded. Anchor is the last-chunk `message_ids.last()` msg_id (placeholders dropped → range-only), same-channel (frontier key = delivery = `channel_id`), range = (`watcher_lease_start`, `watcher_lease_end`); dedup byte-0. Recording logic mirrors the bridge sibling; `tmux_watcher.rs` only wires the anchor through. No outbound API / callsite-map change).
+> Last refreshed: 2026-06-20 (#3610 PR-1d — watcher legacy long-chunk arm now also records a durable terminal delivery. The same `record_long_chunk_terminal_delivery` helper in `outbound/delivery_record.rs` is now reached from the watcher long-chunk fallback (`tmux_watcher::terminal_send`, the `watcher_should_send_ordered_new_chunks_for_terminal_fallback` path that A4 EXCLUDES from the bridge controller), which is the arm that watcher-owned sessions — `relay_owner_kind=watcher`, the production majority — actually take for long messages. Same M4 gate: the call lives in that arm's `if committed && Delivered` success branch, so it fires only when the in-memory advance succeeded. Anchor is the last-chunk `message_ids.last()` msg_id (placeholders dropped → range-only), same-channel (frontier key = delivery = `channel_id`), range = (`watcher_lease_start`, `watcher_lease_end`); dedup byte-0. Recording logic mirrors the bridge sibling; `tmux_watcher.rs` only wires the anchor through. No outbound API / callsite-map change).
 >
 > Last refreshed: 2026-06-20 (#3610 PR-2 + codex r2 — adds a READ-ONLY recovery anchor reader, now housed in `outbound/delivery_frontier_probe.rs`: `current_generation_delivered_anchor(provider, channel, tmux_session_name) -> Option<CurrentGenerationAnchor>` (and its path-based core `…_at`), returning the durable `delivered_frontier`'s `(panel_msg_id, panel_channel_id, range)` ONLY when (a) the #1270 generation gate passes and (b) the anchor pair is fully populated/non-zero. It is the structural stale-anchor guard for the default-OFF `recovery_paths/restart.rs::try_recover_anchor_repost` fallback (#3607 "committed-then-gone" repost); it NEVER writes and resolves NO new offset, so it adds no new dedup writer. codex r2 follow-ups touch ONLY non-outbound files: (Issue-2 storm guard) the committed-branch dispose in `recovery_engine.rs` passes `tmux_alive = false` so a repeatedly-transient send-new is budget-bounded rather than pane-preserved forever; (Issue-1) `restart.rs` documents that this reader is keyed by `state.channel_id` (delivery channel) so the bridge-reused-watcher CROSS-channel case (owner ≠ delivery; frontier file keyed by `watcher_owner_channel_id`) is a known coverage gap — a missed repost, never a mis-repost — pending owner-channel persistence on the inflight row. No change to the read/write callsite map or outbound delivery semantics).
 >
@@ -39,20 +39,6 @@
 > Last refreshed: 2026-06-29 (#3872 — long-message split paths removed visible `[n/m]` continuation markers while preserving ordered chunk delivery and existing rollback/delivery-confirmation semantics. No v3 outbound API shape, attachment policy, or direct-send inventory category changed).
 >
 > Last refreshed: 2026-06-29 (#3809 — idle-recap relay diagnostics add a READ-ONLY current-generation delivered-frontier report path in `outbound/delivery_frontier_probe.rs`. `outbound/delivery_record.rs` only widens existing internal read primitives (`delivery_record_path`, `read_record_at`, generation guard, generation mtime) so the probe can reuse the same trusted durable frontier without adding a writer, retry, cleanup, delivery API, or direct-send callsite. The production callsite coverage map is unchanged).
->
-> Last refreshed: 2026-07-01 (#3794 — turn-output controller rollout closeout. All six owner cutovers (A2b sink, A3 standby, A4 watcher, A5 turn_bridge, A6a recovery, A6b tui_prompt_relay) were wired behind `AGENTDESK_*_CONTROLLER` flags and release forced all six `=1` so the controller path was effective on every release node. The additive per-node rollout health surface from #3794 was later retired with the flags in #3998 S1-f2).
->
-> Last refreshed: 2026-07-03 (#3998 S1-d — A4 watcher anchored full-body long chunks and A5 turn_bridge anchored long chunks now route through the turn-output controller behind their existing owner flags. `OutputPlan::SendNewChunks` gained `delete_anchor`; controller transport sends rollback-aware chunks first, then best-effort deletes the active anchor, and returns chunk metadata for owner cleanup/durable-anchor records. The retained turn-output exclusions are now exactly five: empty body, `NoRange` deliver-without-advance (#4048), headless enqueue (no direct Discord POST), watcher no-placeholder new-message fresh-send (`placeholder_msg_id == None`; anchor-less fresh-send is not yet a controller verb, same class as A6a's `None`-placeholder fresh-send and re-evaluated with the #3998 legacy-retirement phase), and TUI completion gate (#4047). This preceded the #3998 S1-f1 default flip).
->
-> Last refreshed: 2026-07-03 (#3998 S1-e — the remaining A2b/A3/A6a retained exclusions are enumerated in §8.1.1 with code conditions, rationale, blockers, and pin tests. Together with #4053's A4/A5 inventory and #4054's A6a D1 idempotency fix, the Phase-B excluded-arm GO condition is satisfied as "all arms represented or explicitly retained with linked blockers". No code/default/flip changed).
->
-> Last refreshed: 2026-07-03 (#3998 S1-f1 — the six turn-output controller owner getters now compile default ON. Unset, `=1`, and `=true` enable the controller; `=0` and `=false` are the explicit per-owner rollback opt-outs. Release had already run env-ON since #3794, so that soak transfers to compiled-default ON. The release `~/.adk/release/config/launchd.env` entries forcing all six `=1` are now redundant; removing them is an operations cleanup, not part of this PR. Legacy-arm deletion remains a follow-up slice).
->
-> Last refreshed: 2026-07-03 (#3998 S1-f2 — the six turn-output controller rollout flags are retired. The controller path is unconditional for structurally eligible arms; the deleted rollback lever is replaced by git revert. The A6b `tui_prompt_relay_controller_cutover.rs` module and read-only `turn_output_controller_rollout` health surface were removed. Retained legacy exclusions in §8.1.1 are unchanged).
->
-> Last refreshed: 2026-07-04 (#4081 — `outbound/delivery_record.rs` gains a bounded recent-content fingerprint ring (BLAKE3, 16 entries / 15 min TTL, keyed channel + RAW pre-format body + watcher generation) recorded by the existing `record_delivered_frontier_with_body` writer, plus the read predicate `recent_delivered_content_matches`. The canonical fingerprint representation is the RAW pre-format extractor body at ALL record sites; the last formatted-representation holdout — the cancel/stop terminal replace in `turn_bridge/mod.rs`, which recorded the `format_for_discord_*` + `[Stopped]` display text — now records the raw `remaining_response` via the `terminal_delivery::record_stopped_turn_terminal_replace_delivery` helper. The duplicate-relay refusal itself lives in `tmux_watcher/turn_identity.rs` (3-signal conjunction: degenerate legacy lease key AND byte-identical recent RAW body AND no fresh in-range assistant output) and returns before the commit path. No new durable writer, retry, cleanup, delivery API shape, or direct-send callsite; the production callsite coverage map is unchanged).
->
-> Last refreshed: 2026-07-05 (#4049 S4-b — direct reaction/queue-marker call remnants are removed in favor of the turn_view_reconciler single path: the dead `TurnGateway::add_reaction`/`remove_reaction` trait surface and `discord_io` raw add_reaction wrapper are deleted, `outbound/turn_output_controller.rs` sheds its direct reaction call-sites (no controller verb change, delivery arms untouched), and queue ➕/🔄 add/remove plus the three queue-exit-feedback sites route through the reconciler with an untracked best-effort remove fallback for pre-migration reactions. No delivery API shape change; the production callsite coverage map for turn-output delivery is unchanged).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
@@ -86,29 +72,15 @@ HTTP path.
 | **v3 delivery** `deliver_outbound<C>(...)` | `outbound/delivery.rs:46` | active | Executes the v3 message/policy/decision/result contract. Accepts an optional `CancelToken`; split delivery records ordered chunk metadata and duplicate replay preserves it. Success paths record the reservation; terminal skip/permanent-failure paths explicitly release it before returning. |
 | `DiscordOutboundClient`, `HttpOutboundClient`, `OutboundDeduper` | `outbound/transport.rs` | active | Transport trait, HTTP client, fingerprint helper, and in-memory dedup store with atomic `reserve` / in-flight wait semantics over the lookup -> send -> record/release window. v3 stores serialized `Vec<DeliveredMessage>`. |
 | `shared_outbound_deduper()` | `outbound/mod.rs` | active | Process-wide in-memory deduper shared by migrated producers once they have built a structured outbound delivery key. This is only the final in-process duplicate-send guard; durable SQL outbox uniqueness still belongs to the `message_outbox` enqueue/claim path. |
-| **turn-output controller** `deliver_turn_output<G, L>(...)` | `outbound/turn_output_controller.rs` | **all six owners structurally routed; rollout flags retired in #3998 S1-f2; rollback is git revert** | The single delivery entry point routes the turn-output surfaces through the controller (sink / standby / watcher / turn_bridge / recovery / tui_prompt_relay) whenever each owner’s structural conditions are satisfied. A4/A5 route anchored short-replace and anchored long-chunk-with-delete terminal delivery through the controller; anchored long chunks use `SendNewChunks { delete_anchor: true }` (chunks first, best-effort anchor delete after full success, delete failure records cleanup but stays Delivered). The watcher no-placeholder new-message direct fallback remains legacy because anchor-less fresh-send is not yet a controller verb. The retained exclusions are empty body, `NoRange` deliver-without-advance, headless enqueue, watcher no-placeholder new-message fresh-send, and the TUI completion gate (see §8.1.1). A2b (`session_relay_sink` short-replace) owns lease `commit`+advance inline before any post-send await (I1), never advances on ambiguous/partial transport (I2), maps `ReplaceLongMessageOutcome::PartialContinuationFailure` to non-advance, and drives the live placeholder card to its terminal state via `PlaceholderController.transition` with the explicit `EditFailPlaceholderPolicy` (#2757) fence. The held lease is RAII-released on future cancel/panic via the internal `ControllerLeaseGuard` (review-fix H1 r2), matching legacy `SinkDeliveryLeaseGuard::Drop`; the guard now keys acquire/renew/commit/release on `DeliveryLeaseKey` instead of `TurnKey`, preserving non-zero turn identity while disambiguating id-0 rows with inflight `started_at` + `turn_start_offset` when both are present and otherwise using the explicit degenerate legacy fallback. If no `lease_key` is supplied, the controller uses the existing markerless path and never commits/releases a lease. The `DeliveryLease` trait abstracts the frozen #3041 `DeliveryLeaseCell` so the controller's commit invariants are mutation-tested. |
-
-`DeliveryOutcome::Delivered` replace metadata is additive: `FreshFallbackAfterEditFailure` carries the fallback replacement anchor when Discord returns one, so A6a recovery can re-record D1 idempotency while non-recovery owners continue to ignore the extra field.
+| **turn-output controller** `deliver_turn_output<G, L>(...)` | `outbound/turn_output_controller.rs` | **first live owner wired: `session_relay_sink` short-replace, flag-gated (#3089 A2b)** | The single delivery entry point Phase A will route all seven turn-output surfaces through (sink / standby / watcher / turn_bridge / recovery / tui_prompt_relay). A2b cuts the FIRST owner over: `session_relay_sink`'s short-replace branch behind `AGENTDESK_SINK_SHORT_REPLACE_CONTROLLER` (default OFF → byte-identical legacy; the other six owners stay legacy). Owns lease `commit`+advance inline before any post-send await (I1), never advances on ambiguous/partial transport (I2), maps `ReplaceLongMessageOutcome::PartialContinuationFailure` to non-advance, and drives the live placeholder card to its terminal state via `PlaceholderController.transition` with the explicit `EditFailPlaceholderPolicy` (#2757) fence. The held lease is now RAII-released on future cancel/panic via the internal `ControllerLeaseGuard` (review-fix H1 r2), matching legacy `SinkDeliveryLeaseGuard::Drop`. The `DeliveryLease` trait abstracts the frozen #3041 `DeliveryLeaseCell` so the controller's commit invariants are mutation-tested. |
 
 `outbound/mod.rs` re-exports the v3 message/policy/result and shared
 transport primitives. New production callsites should import
 `outbound::delivery::deliver_outbound` explicitly.
 
 The turn-output controller (`outbound/turn_output_controller.rs`, #3089) now has
-**all six owner cutovers structurally routed** (A2b sink, A3 standby, A4 watcher,
-A5 turn_bridge, A6a recovery, A6b tui_prompt_relay). #3998 S1-f2 retired the six
-rollout env flags and deleted their read sites; rollback is now git revert. A4/A5
-move the anchored short-replace arms and anchored long-chunk-with-delete arms off
-legacy. The A4 watcher no-placeholder
-new-message path still stays legacy: with a real ordered range and a non-empty
-non-TUI body, `placeholder_msg_id == None` fails the watcher `has_placeholder`
-gate and takes the raw fresh-send branch because anchor-less fresh-send is not
-yet a controller verb. The retained exclusions are empty body, `NoRange`,
-headless enqueue, watcher no-placeholder new-message fresh-send, and the TUI
-completion gate; §8.1.1 records the remaining A2b/A3/A6a owner-specific arms
-beside the #4053 A4/A5 inventory, so the legacy branches are intentional rather
-than untracked. The former read-only `turn_output_controller_rollout` health block
-was deleted with the rollout flags.
+its FIRST live owner: the `session_relay_sink` short-replace branch, flag-gated
+(A2b, default OFF). The remaining owners cut over in §3 (A3–A6b).
 
 ---
 
@@ -137,8 +109,6 @@ order-preserving multi-message stream continuation (see §4 exclusions).
 `OutboundTarget::DmUser(UserId)` and the v3 transport resolves the DM channel.
 Oversize `/api/discord/send` and `/api/discord/send-dm` payloads still call the existing
 attachment/chunk helpers until v3 grows attachment-capable transport.
-#3874 only removed the dead `Option<&Db>` parameter threading from this manual
-send API path; it did not change these coverage states.
 
 ---
 
@@ -430,99 +400,3 @@ Expected counts as of the #1457 refresh:
   placeholder sends/edits).
 - legacy-facade production callsites and explicit compatibility shims still
   remain; migrate them in the order above.
-
----
-
-## 8. Turn-output controller rollout flag retirement — decision record (#3998 S1-f2)
-
-> Last refreshed: 2026-07-03 (#3998 S1-f2 — rollout flag retirement TAKEN.
-> Code + tests + docs only; retained legacy-arm deletion is still blocked by
-> the §8.1.1 structural exclusions.)
-
-**Scope.** #3998 S1-f2 retires the six owner rollout flags after the compiled
-default was ON since #3998 S1-f1 / #4057 and production soak stayed clean. The
-controller path is now unconditional for structurally eligible arms. #3998 S1-d
-migrated A4/A5 anchored long chunks, and #3998 S1-e / #4053 / #4054 / #4056
-closed the retained-exclusion GO criteria by either migrating arms or explicitly
-retaining them with blockers. S1-f2 does **not** delete retained legacy arms.
-
-**What "retirement" means precisely.** The six getter functions, their OnceLock
-caches, the shared env parser, the A6b cutover module, and the read-only rollout
-health surface were deleted. Routing decisions now depend only on structural
-conditions such as non-empty body, ordered range, placeholder anchor, direct
-transport availability, and the TUI completion gate. The rollback lever is git
-revert.
-
-### 8.1 Current state (post-#3998 S1-f2)
-
-- Six owner flag getters are deleted; the retired env names are no longer read:
-  `AGENTDESK_SINK_SHORT_REPLACE_CONTROLLER`,
-  `AGENTDESK_STANDBY_RELAY_CONTROLLER`,
-  `AGENTDESK_WATCHER_TERMINAL_CONTROLLER`,
-  `AGENTDESK_TURN_BRIDGE_TERMINAL_CONTROLLER`,
-  `AGENTDESK_RECOVERY_RELAY_CONTROLLER`, and
-  `AGENTDESK_TUI_PROMPT_RELAY_CONTROLLER`.
-- The read-only health key `turn_output_controller_rollout` and
-  `outbound/turn_output_controller_rollout_health.rs` are deleted.
-- A6b has no independent transport; `tui_prompt_relay_controller_cutover.rs` is
-  deleted and the bridge site-5 route is the A5 structural decision alone.
-- Anchored A4/A5 long-chunk terminal delivery is controller-routed when its
-  structural conditions are satisfied (#3998 S1-d).
-- Retained exclusions remain legacy by design:
-  - empty body: controller `Skipped` would not match A2b/A3 empty-body parity.
-  - `NoRange` deliver-without-advance: no advance authority until #4048.
-  - headless enqueue: no direct Discord POST for the controller transport.
-  - watcher no-placeholder new-message fresh-send: `placeholder_msg_id == None`
-    fails the A4 `has_placeholder` gate even with a real ordered range and
-    non-empty non-TUI body; anchor-less fresh-send is not yet a controller verb.
-    This matches A6a's `None`-placeholder fresh-send class and must be
-    re-evaluated with the #3998 legacy-retirement follow-up.
-  - TUI completion gate: lifecycle pause/commit semantics retire with #4047.
-
-#### 8.1.1 Retained-exclusion inventory (#3998 S1-e)
-
-#4053 already documents the A4/A5 retained arms. The remaining controller-owner
-arms are explicitly retained here so the Phase-B inventory is closed without
-changing runtime behavior.
-
-| owner / arm | code condition | decision / rationale | blocker / re-eval | pin test |
-|---|---|---|---|---|
-| A2b sink `NoRange` / `cutover_range == None` short-replace | `src/services/discord/session_relay_sink.rs:884-895` requires `cutover_range.is_some()` before controller routing; the legacy replace arm starts at `session_relay_sink.rs:990`. | **RETAIN.** This is the no-advance class: without a real ordered `[start,end)` range, the controller has no offset authority to commit. | #4048 advance-authority work / #3998 legacy-retirement follow-up. | `structural_exclusion_gate_keeps_no_range_and_empty_body_on_legacy_path` |
-| A2b sink empty body | `src/services/discord/session_relay_sink.rs:891-895` requires `!relay_text.is_empty()` before controller routing. | **RETAIN.** Legacy zero-chunk replace is committed/advanced; the controller returns `Skipped`, so migrating would flip Skipped-vs-advance semantics. | #4047 / #4048 semantics re-eval. | `controller_skips_empty_body_so_cutover_gate_keeps_it_legacy`; `structural_exclusion_gate_keeps_no_range_and_empty_body_on_legacy_path` |
-| A3 standby empty body | `src/services/discord/standby_relay.rs:77-79` gates short-replace on `!formatted.is_empty()`; legacy replace starts at `standby_relay.rs:814`. | **RETAIN.** Same empty-body parity class as A2b/A4/A5: controller `Skipped` would not match legacy committed replace. | #4047 / #4048 semantics re-eval. | `standby_short_replace_should_cutover_pins_both_conditions` |
-| A3 standby transport-only `NoLease` | `src/services/discord/standby_relay.rs:672-725` uses `toc::NoLease`, `lease_key: None`, `advance: None`, and `heartbeat: None`. | **RETAIN.** Standby has no lease, no offset authority, and no heartbeat to unify; this is intentionally transport-only instead of inventing a lease. | #3998 legacy-retirement follow-up. | `edited_original_returns_true_and_does_not_delete_original`; `fallback_after_edit_failure_returns_true_and_preserves_original` |
-| A3 standby `placeholder_msg_id == None` new-message send | `src/services/discord/standby_relay.rs:893-895` calls legacy `formatting::send_long_message_raw`. | **RETAIN.** Anchor-less fresh-send is not a controller verb yet, same class as watcher no-placeholder (#4053) and A6a `None`-placeholder fresh-send. | #3998 legacy-retirement follow-up after an anchor-less fresh-send verb exists. | `none_placeholder_new_message_stays_legacy` |
-| A6a recovery empty body | `src/services/discord/recovery_paths/controller_cutover.rs:112-117` requires `has_placeholder && !body.is_empty()`. | **RETAIN.** Same empty-body parity class: legacy anchored replace delivers, while the controller would `Skipped` → non-delivered. | #4047 / #4048 semantics re-eval. | `should_cutover_pins_each_condition` |
-| A6a recovery `placeholder == None` fresh-send | `src/services/discord/recovery_paths/controller_cutover.rs:112-117` requires `has_placeholder`; caller legacy branch is `src/services/discord/recovery_engine.rs:463-470` via `relay_no_anchor_terminal_text`. | **RETAIN.** Anchor-less fresh-send is not a controller verb yet. #4054 already made this path idempotent through `RecoveryDeliveryContext`, so the residual risk is transport-uniformity, not correctness. The #3297 gone-channel probe remains represented in the anchored controller adapter and must stay. | #3998 legacy-retirement follow-up after an anchor-less fresh-send verb exists. | `should_cutover_pins_each_condition`; `controller_fallback_records_replacement_anchor`; `non_delivered_gone_probe_escalates_permanent` |
-
-### 8.2 Flag retirement evaluation
-
-| retired owner flag | retirement rationale | rollback | decision |
-|---|---|---|---|
-| A2b `sink_short_replace` / A3 `standby_relay` | Excluded empty-body / `None`-range / `None`-placeholder arms are explicitly retained with blockers; the controller path has soaked with flags ON and then compiled default ON. | Git revert. | **TAKEN in S1-f2 (2026-07-03)** |
-| A4 `watcher_terminal` / A5 `turn_bridge_terminal` | Anchored long chunks migrated in #3998 S1-d; retained exclusions (`NoRange`, headless/no direct POST, empty body, watcher no-placeholder new-message fresh-send, TUI-gate) are documented per #4053/#4056. | Git revert. | **TAKEN in S1-f2 (2026-07-03)** |
-| A6a `recovery_relay` | #4054 preserves D1 idempotency and the #3297 probe mapping; `None`-placeholder fresh-send remains an explicit retained legacy arm. | Git revert. | **TAKEN in S1-f2 (2026-07-03)** |
-| A6b `tui_prompt_relay` | Reuses the A5 site-5 route; no independent transport cutover remains. With A5 origin-agnostic and unconditional, the A6b OR-in collapses to the A5 structural decision alone. | Git revert. | **TAKEN in S1-f2 (2026-07-03)** |
-
-### 8.3 Why TAKE Retirement
-
-- **GO conditions satisfied.** #4053/#4054/#4056 and §8.1.1 account for the
-  remaining arms: migrated where represented, retained where the controller does
-  not yet have the needed verb or authority.
-- **Release soak transfers.** Release ran all six owners env-ON since #3794, then
-  compiled default ON since #3998 S1-f1 / #4057. S1-f2 removes the operator flag
-  read layer without changing the controller path.
-- **Rollback is source control.** The rollout flags are no longer a runtime
-  rollback API; reverting this slice restores the old levers if needed.
-- **Legacy deletion is separate.** S1-f2 retires rollout flags only. Removing retained
-  legacy branches belongs to the follow-up legacy-retirement slice after the
-  remaining blockers are resolved.
-
-### 8.4 Follow-Up
-
-1. **Ops cleanup:** remove any stale release config entries for the retired env
-   names in a separate operations change. This is not part of S1-f2.
-2. **Legacy retirement:** delete retained legacy arms only in a follow-up slice,
-   after the blockers called out in §8.1.1 are resolved.
-
-> Last refreshed: 2026-07-05 (#4130 — delivery_record.rs gains a cfg(test)-only shadow_test_seam override; no production callsite/coverage change.)

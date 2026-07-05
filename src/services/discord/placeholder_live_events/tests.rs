@@ -280,10 +280,8 @@ fn status_panel_recent_compacts_raw_command_details() {
     );
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    // #3983 item 5a: the footer no longer echoes the compact 🖥️ Recent block; the
-    // activity label shows the tool class, never the raw command detail.
-    assert!(rendered.contains("🔧 도구 실행 중"));
-    assert!(!rendered.contains("🖥️ Recent"));
+    assert!(rendered.contains("🖥️ Recent"));
+    assert!(rendered.contains("• [Bash] 실행"));
     assert!(!rendered.contains("```text"));
     assert!(
         !rendered.contains(raw_command),
@@ -354,13 +352,7 @@ fn status_panel_turn_completed_renders_foreground_completion() {
         channel_id,
         status_events_from_tool_use("Bash", &json!({"command": "cargo test"}).to_string()),
     );
-    events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background: false,
-            background_agent_pending: false,
-        },
-    );
+    events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: false });
 
     assert_eq!(
         status_for(&events, channel_id),
@@ -369,47 +361,47 @@ fn status_panel_turn_completed_renders_foreground_completion() {
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 완료"));
+    assert!(rendered.starts_with("✅ **응답 완료** — claude"));
     assert!(!rendered.contains("🟢 진행 중"));
 }
 
 #[test]
-fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
-    // #3983 items 2 + B: the separate 신뢰도 line is retired; the freshness class is
-    // absorbed into the line-1 activity emoji, and line 2 carries the time line.
+fn status_panel_turn_completed_drops_recent_live_block() {
     let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38120);
-
-    // Running turn → 🟢 activity + `마지막 업데이트`/`턴 시작` time line, no 신뢰도.
+    let channel_id = ChannelId::new(174);
     events.push_status_events(
         channel_id,
-        status_events_from_tool_use("Bash", &json!({"command": "cargo test"}).to_string()),
+        status_events_from_tool_use(
+            "Bash",
+            &json!({"command": "printf E2E_TOOL_OK"}).to_string(),
+        ),
     );
-    let live = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(
-        live.contains("🔧 도구 실행 중"),
-        "running activity: {live:?}"
-    );
-    assert!(
-        live.contains("마지막 업데이트 : <t:") && live.contains("턴 시작 : <t:"),
-        "time line must render: {live:?}"
-    );
-    assert!(
-        !live.contains("신뢰도"),
-        "confidence line is retired: {live:?}"
+    events.push_event(
+        channel_id,
+        RecentPlaceholderEvent::tool_use(
+            "Bash",
+            &json!({"command": "printf E2E_TOOL_OK"}).to_string(),
+        )
+        .unwrap(),
     );
 
-    // Completion → `✅ 완료` (final absorbed into the emoji).
-    events.push_status_event(
+    let active = events.render_status_panel_with_heartbeat(
         channel_id,
-        StatusEvent::TurnCompleted {
-            background: false,
-            background_agent_pending: false,
-        },
+        &ProviderKind::Claude,
+        1_700_000_000,
+        1_700_000_005,
     );
-    let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(done.starts_with("✅ 완료"), "final activity: {done:?}");
-    assert!(!done.contains("신뢰도"));
+    assert!(active.contains("🖥️ Recent"));
+    assert!(active.contains("[Bash]"));
+    assert!(!active.contains("계속 처리 중"));
+
+    events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: false });
+
+    let completed = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(completed.starts_with("✅ **응답 완료** — claude"));
+    assert!(!completed.contains("🖥️ Recent"));
+    assert!(!completed.contains("[Bash]"));
+    assert!(!completed.contains("계속 처리 중"));
 }
 
 #[test]
@@ -440,9 +432,8 @@ fn status_panel_codex_active_omits_processing_tail_after_recent_block() {
     );
 
     assert!(rendered.contains("🔧 도구 실행 중"));
+    assert!(rendered.contains("🖥️ Recent"));
     assert!(rendered.contains("[Bash]"));
-    // #3983 item 5a: the 🖥️ Recent echo is retired from the footer.
-    assert!(!rendered.contains("🖥️ Recent"));
     assert!(!rendered.contains("계속 처리 중"));
 }
 
@@ -483,13 +474,7 @@ fn status_panel_turn_completed_after_monitor_wait_renders_background_completion(
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(172);
     events.push_status_event(channel_id, StatusEvent::MonitorWait);
-    events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background: true,
-            background_agent_pending: false,
-        },
-    );
+    events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: true });
 
     assert_eq!(
         status_for(&events, channel_id),
@@ -498,7 +483,7 @@ fn status_panel_turn_completed_after_monitor_wait_renders_background_completion(
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 백그라운드 완료"));
+    assert!(rendered.starts_with("✅ **백그라운드 완료** — claude"));
     assert!(!rendered.contains("💤 monitor 대기"));
 }
 
@@ -514,13 +499,7 @@ fn status_panel_turn_completed_after_aborted_tool_renders_terminal_completion() 
         channel_id,
         status_events_from_tool_result(Some("Task"), true),
     );
-    events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background: false,
-            background_agent_pending: false,
-        },
-    );
+    events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: false });
 
     assert_eq!(
         status_for(&events, channel_id),
@@ -529,7 +508,7 @@ fn status_panel_turn_completed_after_aborted_tool_renders_terminal_completion() 
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 완료"));
+    assert!(rendered.starts_with("✅ **응답 완료** — claude"));
     assert!(!rendered.contains("🟢 진행 중"));
 }
 
@@ -547,24 +526,11 @@ fn status_panel_renders_session_resumed_line_from_lifecycle_details() {
         }),
     ));
 
-    // #3983 item4: the session line is NO LONGER in the every-tick footer.
-    let footer = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(!footer.contains("기존 세션 복원"));
-
-    // It is emitted once, at the top, via the one-shot banner claim.
-    let banner = events
-        .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-        .expect("first claim yields the one-shot session banner");
-    assert!(banner.contains("기존 세션 복원"));
-    assert!(banner.contains("provider session claude#8f21abcd…"));
-    assert!(banner.contains("tmux kept"));
-    assert!(!banner.contains("📋 세션 복원"));
-    // Dedup: a second claim for the same session yields nothing.
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(rendered.contains("기존 세션 복원"));
+    assert!(rendered.contains("provider session claude#8f21abcd…"));
+    assert!(rendered.contains("tmux kept"));
+    assert!(!rendered.contains("📋 세션 복원"));
 }
 
 /// #3087 — when a new session INSTANCE begins (a new tmux spawn → new
@@ -1280,18 +1246,10 @@ fn status_panel_renders_session_fresh_and_fallback_distinctly() {
         }),
     );
 
-    // #3983 item4: session identity surfaces via the one-shot banner, not the footer.
-    let fresh = events
-        .claim_session_banner_line(fresh_channel_id, &ProviderKind::Codex)
-        .expect("fresh session yields a one-shot banner");
+    let fresh = events.render_status_panel(fresh_channel_id, &ProviderKind::Codex, 1_700_000_000);
     assert!(fresh.contains("🆕 새 세션 시작"));
     assert!(fresh.contains("provider session codex#fresh-se…"));
     assert!(fresh.contains("tmux new"));
-    assert!(
-        !events
-            .render_status_panel(fresh_channel_id, &ProviderKind::Codex, 1_700_000_000)
-            .contains("🆕 새 세션 시작")
-    );
 
     let fallback_channel_id = ChannelId::new(179);
     events.set_session_panel_lifecycle_event(
@@ -1305,9 +1263,8 @@ fn status_panel_renders_session_fresh_and_fallback_distinctly() {
         }),
     );
 
-    let fallback = events
-        .claim_session_banner_line(fallback_channel_id, &ProviderKind::Claude)
-        .expect("fallback session yields a one-shot banner");
+    let fallback =
+        events.render_status_panel(fallback_channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(fallback.contains("Lifecycle fallback"));
     assert!(fallback.contains("provider session claude#fallback…"));
     assert!(fallback.contains("tmux kept"));
@@ -1327,12 +1284,9 @@ fn status_panel_appends_recovery_message_count_line_when_present() {
         }),
     ));
 
-    // #3983 item4: the recovery-count line rides on the one-shot banner.
-    let banner = events
-        .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-        .expect("fresh session yields a one-shot banner");
-    assert!(banner.contains("🆕 새 세션 시작"));
-    assert!(banner.contains("(최근 대화 7개를 읽어들였습니다)"));
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(rendered.contains("🆕 새 세션 시작"));
+    assert!(rendered.contains("(최근 대화 7개를 읽어들였습니다)"));
 }
 
 /// #3055 — a watcher-direct turn that has no session lifecycle event of its own
@@ -1356,29 +1310,14 @@ fn status_panel_clears_stale_session_line_for_watcher_turn_without_lifecycle() {
             "recoveryMessageCount": 33,
         }),
     ));
-    // Turn A: the one-shot banner renders the fresh-session/recovery line once;
-    // the every-tick footer never carries it (#3983 item4).
-    let turn_a = events
-        .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-        .expect("fresh session yields a one-shot banner");
+    let turn_a = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(turn_a.contains("🆕 새 세션 시작"));
     assert!(turn_a.contains("(최근 대화 33개를 읽어들였습니다)"));
-    assert!(
-        !events
-            .render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000)
-            .contains("🆕 새 세션 시작")
-    );
 
     // Turn B (watcher-direct, no lifecycle row): the completion path clears the
-    // session panel. The cleared snapshot has no session to banner, so a
-    // subsequent claim yields nothing — the stale new-session/recovery line can
-    // never re-post.
+    // session panel before rendering. The cleared snapshot must drop the stale
+    // new-session/recovery line.
     assert!(events.clear_session_panel(channel_id));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
     let turn_b = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(!turn_b.contains("🆕 새 세션 시작"));
     assert!(!turn_b.contains("최근 대화"));
@@ -1401,12 +1340,9 @@ fn status_panel_omits_recovery_line_when_count_is_zero_or_missing() {
         }),
     ));
 
-    // #3983 item4: assert on the one-shot banner (the session line left the footer).
-    let banner = events
-        .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-        .expect("fresh session yields a one-shot banner");
-    assert!(banner.contains("🆕 새 세션 시작"));
-    assert!(!banner.contains("최근 대화"));
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(rendered.contains("🆕 새 세션 시작"));
+    assert!(!rendered.contains("최근 대화"));
 
     let other_channel = ChannelId::new(1783);
     assert!(events.set_session_panel_lifecycle_event(
@@ -1415,10 +1351,8 @@ fn status_panel_omits_recovery_line_when_count_is_zero_or_missing() {
         "session_fresh",
         &json!({ "reason": "first_turn" }),
     ));
-    let banner = events
-        .claim_session_banner_line(other_channel, &ProviderKind::Claude)
-        .expect("fresh session yields a one-shot banner");
-    assert!(!banner.contains("최근 대화"));
+    let rendered = events.render_status_panel(other_channel, &ProviderKind::Claude, 1_700_000_000);
+    assert!(!rendered.contains("최근 대화"));
 }
 
 #[test]
@@ -1434,219 +1368,23 @@ fn status_panel_omits_session_line_when_lifecycle_details_are_absent() {
             "recoveryMessageCount": 25,
         }),
     ));
-    // #3983 item4: the fresh session yields a one-shot banner (not a footer line).
     assert!(
         events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .expect("fresh session yields a one-shot banner")
+            .render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000)
             .contains("🆕 새 세션 시작")
     );
 
-    // Empty lifecycle details drop the session snapshot, so there is nothing to
-    // banner and nothing in the footer.
     assert!(events.set_session_panel_lifecycle_event(
         channel_id,
         None,
         "session_resumed",
         &json!({}),
     ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
 
-    let footer = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(!footer.contains("Lifecycle "));
-    assert!(!footer.contains("새 세션 시작"));
-    assert!(!footer.contains("최근 대화"));
-}
-
-/// #3983 item4 — dual-path de-dup, SINK arrives first. The session-panel snapshot
-/// is refreshed from both the bridge (sink) and the tmux watcher. Modelling the
-/// sink reaching the atomic claim first: it wins the one-shot banner and the
-/// watcher's subsequent claim (same session) observes the recorded key and skips.
-#[test]
-fn session_banner_claimed_exactly_once_sink_first() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(39831);
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39831#100"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-A", "tmux_reused": false }),
-    ));
-
-    // Sink path claims first → gets the banner.
-    let sink = events.claim_session_banner_line(channel_id, &ProviderKind::Claude);
-    assert!(
-        sink.as_deref()
-            .is_some_and(|line| line.contains("🆕 새 세션 시작")),
-        "the first (sink) claim yields the one-shot banner"
-    );
-    // Watcher path claims second for the SAME session → nothing.
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none(),
-        "the second (watcher) claim for the same session must not double-post"
-    );
-}
-
-/// #3983 item4 — dual-path de-dup, WATCHER arrives first. Symmetric to the
-/// sink-first case: whichever refresh path reaches the atomic claim first emits
-/// the banner, proving the claim is order-independent (no double post, no
-/// omission) when the two paths race.
-#[test]
-fn session_banner_claimed_exactly_once_watcher_first() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(39832);
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39832#100"),
-        "session_resumed",
-        &json!({ "provider_session_id": "session-A", "tmux_reused": true }),
-    ));
-
-    // Watcher path claims first → gets the banner.
-    let watcher = events.claim_session_banner_line(channel_id, &ProviderKind::Claude);
-    assert!(
-        watcher
-            .as_deref()
-            .is_some_and(|line| line.contains("기존 세션 복원")),
-        "the first (watcher) claim yields the one-shot banner"
-    );
-    // Sink path claims second for the SAME session → nothing.
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none(),
-        "the second (sink) claim for the same session must not double-post"
-    );
-}
-
-/// #3983 item4 — a genuine new-session boundary (new spawn nonce → new
-/// `session_instance_key`) re-arms the claim, so the NEXT session gets its own
-/// one-shot banner exactly once, while unrelated field churn within the same
-/// session never re-posts.
-#[test]
-fn session_banner_reemits_once_on_new_session_boundary() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(39833);
-
-    // Session A → one banner, then deduped.
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39833#100"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-A", "tmux_reused": false }),
-    ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_some()
-    );
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
-
-    // Session B (new spawn nonce) → a fresh one-shot banner.
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39833#200"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-B", "tmux_reused": false }),
-    ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_some(),
-        "a new session INSTANCE re-arms the one-shot banner"
-    );
-    // Field churn within session B (same instance key + provider id) → no re-post.
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39833#200"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-B", "tmux_reused": true }),
-    ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none(),
-        "unrelated field churn within the same session must not re-post the banner"
-    );
-}
-
-/// #3983 item4 — with no live tmux marker (`session_instance_key == None`) the
-/// dedup falls back to the provider session id, so a headless session still
-/// banners exactly once and a genuinely different provider session re-arms it.
-#[test]
-fn session_banner_dedup_falls_back_to_provider_session_id() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(39834);
-
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        None, // no instance key → provider-session-id fallback
-        "session_resumed",
-        &json!({ "provider_session_id": "prov-A", "tmux_reused": true }),
-    ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_some()
-    );
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
-
-    // A genuinely different provider session (still no instance key) re-arms.
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        None,
-        "session_resumed",
-        &json!({ "provider_session_id": "prov-B", "tmux_reused": true }),
-    ));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_some(),
-        "a different provider session re-arms the one-shot banner"
-    );
-}
-
-/// #3983 item4 — a channel with no session snapshot (or a cleared one) yields no
-/// banner, so the emit path never posts a spurious top message.
-#[test]
-fn session_banner_none_without_session_snapshot() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(39835);
-
-    // Never set → nothing to claim.
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
-
-    // Set then clear → nothing to claim.
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch39835#100"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-A", "tmux_reused": false }),
-    ));
-    assert!(events.clear_session_panel(channel_id));
-    assert!(
-        events
-            .claim_session_banner_line(channel_id, &ProviderKind::Claude)
-            .is_none()
-    );
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(!rendered.contains("Lifecycle "));
+    assert!(!rendered.contains("새 세션 시작"));
+    assert!(!rendered.contains("최근 대화"));
 }
 
 #[test]
@@ -1657,6 +1395,66 @@ fn status_panel_omits_context_line_when_token_data_is_absent() {
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
 
     assert!(!rendered.contains("Context   "));
+}
+
+#[test]
+fn recent_header_prefers_dispatch_owner_over_local_node() {
+    let snapshot = TaskPanelSnapshot {
+        dispatch_id: "dsp_55".to_string(),
+        card_id: None,
+        dispatch_type: None,
+        owner_instance_id: Some("mac-book-release".to_string()),
+        card_title: None,
+        dispatch_title: None,
+        github_issue_number: None,
+    };
+    assert_eq!(
+        render_recent_section_header(Some(&snapshot), true, Some("mac-mini-release")),
+        "🖥️ Recent (mac-book-release)"
+    );
+}
+
+#[test]
+fn recent_header_falls_back_to_local_node_when_no_dispatch_owner() {
+    assert_eq!(
+        render_recent_section_header(None, true, Some("mac-mini-release")),
+        "🖥️ Recent (mac-mini-release)"
+    );
+    let snapshot_without_owner = TaskPanelSnapshot {
+        dispatch_id: "dsp_99".to_string(),
+        card_id: None,
+        dispatch_type: None,
+        owner_instance_id: None,
+        card_title: None,
+        dispatch_title: None,
+        github_issue_number: None,
+    };
+    assert_eq!(
+        render_recent_section_header(
+            Some(&snapshot_without_owner),
+            true,
+            Some("mac-mini-release")
+        ),
+        "🖥️ Recent (mac-mini-release)"
+    );
+}
+
+#[test]
+fn recent_header_omits_node_when_cluster_disabled_or_unknown() {
+    let snapshot = TaskPanelSnapshot {
+        dispatch_id: "dsp_55".to_string(),
+        card_id: None,
+        dispatch_type: None,
+        owner_instance_id: Some("mac-book-release".to_string()),
+        card_title: None,
+        dispatch_title: None,
+        github_issue_number: None,
+    };
+    assert_eq!(
+        render_recent_section_header(Some(&snapshot), false, Some("mac-mini-release")),
+        "🖥️ Recent"
+    );
+    assert_eq!(render_recent_section_header(None, true, None), "🖥️ Recent");
 }
 
 #[test]
@@ -1818,33 +1616,6 @@ fn completion_footer_context_only_has_no_spinner_and_stops_scheduling() {
     assert!(block.contains("Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%"));
     assert!(!block.contains('⠸'));
     assert!(!rendered.has_unfinished_entries);
-}
-
-#[test]
-fn completion_footer_keeps_background_agent_pending_payload_open() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(1901);
-    events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background: false,
-            background_agent_pending: true,
-        },
-    );
-
-    assert_eq!(
-        status_for(&events, channel_id),
-        DerivedStatus::Completed {
-            kind: CompletedKind::Foreground
-        },
-        "the turn still finalizes even when background agents remain pending"
-    );
-    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = rendered.block.expect("pending background agent line");
-
-    assert!(rendered.has_unfinished_entries);
-    assert!(block.contains("Background agents"));
-    assert!(block.contains("Waiting for background agents ⠸"));
 }
 
 #[test]
@@ -3891,141 +3662,6 @@ fn status_events_json_async_launch_ack_does_not_close_background_subagent() {
     );
 }
 
-// #3920: a modern async `Agent` launch carries NO `run_in_background` in the
-// tool INPUT — its async-ness is known only from the launch-ack `toolUseResult`
-// (`isAsync`/`status: async_launched`). The slot therefore starts foreground
-// (`background: false`); before #3920 it was dropped at the very next turn
-// boundary, so a long-running background Agent subagent spawned in a prior turn
-// never showed on the status panel (only Bash `run_in_background` tasks did).
-// The launch-ack must PROMOTE the slot to a background subagent so it SURVIVES
-// turn-boundary resets and stays observable for parallel-work monitoring.
-#[test]
-fn status_panel_async_agent_subagent_survives_turn_boundary_after_launch_ack() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(3_920_001);
-
-    // Spawning turn: Agent tool_use WITHOUT `run_in_background` → foreground slot.
-    events.push_status_events(
-        channel_id,
-        status_events_from_tool_use_with_id(
-            "Agent",
-            &json!({
-                "subagent_type": "general-purpose",
-                "description": "Implement #3897 r4"
-            })
-            .to_string(),
-            Some("toolu_agent_3897"),
-        ),
-    );
-
-    // The async launch-ack (record-level `isAsync`/`async_launched`, no
-    // accounting) arrives as a `user` record on the watcher/json path.
-    events.push_status_events(
-        channel_id,
-        status_events_from_json(&json!({
-            "type": "user",
-            "message": {
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_agent_3897",
-                    "is_error": false
-                }]
-            },
-            "toolUseResult": {
-                "isAsync": true,
-                "status": "async_launched",
-                "agentId": "aee5241a0000000",
-                "description": "Implement #3897 r4",
-                "prompt": "...",
-                "outputFile": "...",
-                "canReadOutputFile": true
-            }
-        })),
-    );
-
-    let spawning = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(spawning.contains("Subagents"));
-    assert!(
-        spawning.contains("general-purpose Implement #3897 r4"),
-        "async Agent subagent should render during the spawning turn: {spawning}"
-    );
-
-    // Turn boundary: the next turn resets per-turn content, preserving only
-    // unfinished BACKGROUND residuals (#3386). The promoted slot must survive.
-    events.clear_channel_preserving_footer_residuals(channel_id);
-
-    let next_turn = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_300);
-    let line = next_turn
-        .lines()
-        .find(|line| line.contains("general-purpose Implement #3897 r4"))
-        .unwrap_or_else(|| {
-            panic!("background Agent subagent must survive the turn boundary: {next_turn}")
-        });
-    assert!(
-        next_turn.contains("Subagents"),
-        "the carried background subagent must still render under Subagents: {next_turn}"
-    );
-    assert!(
-        !line.contains('✓') && !line.contains('✗') && !line.contains("Done ("),
-        "the carried background subagent is still running (no terminal marker): {line}"
-    );
-}
-
-// #3920: surfacing the carried background subagent must NOT introduce
-// per-render nondeterminism — the panel text stays byte-identical across
-// heartbeat ticks when no status change occurred (#3477/#3812 invariant).
-#[test]
-fn status_panel_carried_background_subagent_is_heartbeat_stable() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(3_920_002);
-
-    events.push_status_events(
-        channel_id,
-        status_events_from_tool_use_with_id(
-            "Agent",
-            &json!({ "subagent_type": "Explore", "description": "Audit #3864" }).to_string(),
-            Some("toolu_agent_3864"),
-        ),
-    );
-    events.push_status_events(
-        channel_id,
-        status_events_from_json(&json!({
-            "type": "user",
-            "message": {
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_agent_3864",
-                    "is_error": false
-                }]
-            },
-            "toolUseResult": { "isAsync": true, "status": "async_launched", "agentId": "a106f023" }
-        })),
-    );
-    events.clear_channel_preserving_footer_residuals(channel_id);
-
-    let first = events.render_status_panel_with_heartbeat(
-        channel_id,
-        &ProviderKind::Claude,
-        1_700_000_000,
-        1_700_000_005,
-    );
-    let second = events.render_status_panel_with_heartbeat(
-        channel_id,
-        &ProviderKind::Claude,
-        1_700_000_000,
-        1_700_000_090,
-    );
-
-    assert!(
-        first.contains("Explore Audit #3864"),
-        "carried background subagent should render: {first}"
-    );
-    assert_eq!(
-        first, second,
-        "panel text must be byte-identical across heartbeat ticks with no status change"
-    );
-}
-
 #[test]
 fn status_panel_async_completion_with_accounting_still_finalizes_subagent() {
     let events = PlaceholderLiveEvents::default();
@@ -5197,18 +4833,19 @@ fn status_events_toolsearch_pretty_json_args_summary_not_bare_brace() {
 // ---------------------------------------------------------------------------
 // #3393: user-record `<task-notification>` XML → live panel terminal StatusEvents.
 //
-// Subagent completions reach the transcript ONLY as this XML (never the
-// stream-json `system` record the panel's `system_status_events` parses).
-// These tests drive the FULL ingestion: real-shape XML text (incl. the
+// Background-task / subagent completions reach the transcript ONLY as this XML
+// (never the stream-json `system` record the panel's `system_status_events`
+// parses). These tests drive the FULL ingestion: real-shape XML text (incl. the
 // hyphenated `<tool-use-id>` from the live transcript) → bridge parse → push →
-// `render_completion_footer` shows ✓/✗. #4097 keeps that bridge for matching
-// background Bash slots, but suppresses the duplicate notify-card surface.
+// `render_completion_footer` shows ✓. State-machine-only proof is explicitly
+// forbidden by the issue, so every assertion goes through the panel render.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn task_notification_xml_background_flips_matching_slot_but_suppresses_card() {
+fn task_notification_xml_background_bash_flips_footer_slot_to_done() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_393_001);
+    // A running background Bash slot keyed by the launch tool-use id.
     events.push_status_events(
         channel_id,
         status_events_from_tool_use_with_id_for_footer_mode(
@@ -5223,85 +4860,43 @@ fn task_notification_xml_background_flips_matching_slot_but_suppresses_card() {
             true,
         ),
     );
-    let raw_background = "<task-notification>\n\
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running
+        .block
+        .expect("running background Bash should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Bash Wait until PR 3392 CI settles ⠸"));
+    assert!(!running_block.contains('✓'));
+
+    // Real-shape XML user-record text (background Bash variant, hyphenated
+    // `<tool-use-id>` child tag, status `completed`) — copied from a live
+    // transcript notification.
+    let raw = "<task-notification>\n\
         <task-id>b5gr0v9xj</task-id>\n\
         <tool-use-id>toolu_01Ls2svfdnzcn9uGwA7aHjHW</tool-use-id>\n\
         <output-file>/private/tmp/claude-501/sess/tasks/b5gr0v9xj.output</output-file>\n\
-        <status>killed</status>\n\
-        <summary>Background command \"Wait until PR 3392 CI settles\" killed</summary>\n\
+        <status>completed</status>\n\
+        <summary>Background command \"Wait until PR 3392 CI settles\" completed (exit code 0)</summary>\n\
         </task-notification>";
-
-    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw_background, true);
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
     assert!(
         bridged
             .iter()
-            .any(|event| matches!(event, StatusEvent::BackgroundTaskEnd { success: false, .. })),
-        "matching kind=background XML must still bridge terminal slot events: {bridged:?}"
+            .any(|e| matches!(e, StatusEvent::BackgroundTaskEnd { .. })),
+        "background XML must bridge to BackgroundTaskEnd: {bridged:?}"
     );
-    assert!(
-        events.task_notification_completion_visible_in_footer_for_mode(
-            channel_id,
-            raw_background,
-            true,
-        ),
-        "background lifecycle XML should be consumed quietly instead of posting a notify card"
-    );
-    assert!(
-        events.task_notification_completion_visible_in_footer_for_mode(
-            channel_id,
-            raw_background,
-            false,
-        ),
-        "background lifecycle XML should stay quiet even when footer mode is off"
-    );
-    events.bridge_task_notification_xml(channel_id, raw_background);
+    events.push_status_events(channel_id, bridged);
 
-    let failed = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
-    let failed_block = failed
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done
         .block
-        .expect("finished background Bash should remain visible");
-    assert!(!failed.has_unfinished_entries);
+        .expect("finished background Bash should stay visible");
+    assert!(!done.has_unfinished_entries);
     assert!(
-        failed_block.contains("Bash Wait until PR 3392 CI settles ✗"),
-        "background XML must flip the matching slot to failure: {failed_block}"
+        done_block.contains("Bash Wait until PR 3392 CI settles ✓"),
+        "matching XML notification must flip ✓: {done_block}"
     );
-    assert!(!failed_block.contains('⠼'));
-
-    events.push_status_events(
-        channel_id,
-        status_events_from_tool_use_with_id(
-            "Task",
-            &json!({
-                "subagent_type": "scout",
-                "description": "Scout issues #3275 #3276"
-            })
-            .to_string(),
-            Some("toolu_user_facing_subagent"),
-        ),
-    );
-    let raw_subagent = "<task-notification>\n\
-        <task-id>a09e45d12a68015a5</task-id>\n\
-        <tool-use-id>toolu_user_facing_subagent</tool-use-id>\n\
-        <status>completed</status>\n\
-        <summary>Agent \"Scout issues #3275 #3276\" completed</summary>\n\
-        <result>Done.</result>\n\
-        </task-notification>";
-    let subagent_events =
-        status_events_from_task_notification_xml_for_footer_mode(raw_subagent, true);
-    assert!(
-        subagent_events
-            .iter()
-            .any(|e| matches!(e, StatusEvent::SubagentEnd { .. })),
-        "user-facing subagent XML must still bridge: {subagent_events:?}"
-    );
-    events.push_status_events(channel_id, subagent_events);
-
-    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let done_block = done.block.expect("subagent completion should render");
-    assert!(
-        done_block.contains("Scout issues #3275 #3276") && done_block.contains('✓'),
-        "user-facing XML notification must still flip ✓: {done_block}"
-    );
+    assert!(!done_block.contains('⠼'));
 }
 
 #[test]
@@ -5462,7 +5057,7 @@ fn task_notification_xml_bridge_inert_when_footer_mode_off() {
 }
 
 #[test]
-fn task_completion_card_suppression_quiets_background_xml_lifecycle() {
+fn task_completion_card_suppression_requires_footer_mode_and_matching_background_slot() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_654_001);
     events.push_status_events(
@@ -5486,36 +5081,28 @@ fn task_completion_card_suppression_quiets_background_xml_lifecycle() {
     assert!(
         events
             .task_notification_completion_visible_in_footer_for_mode(channel_id, completed, true,),
-        "background completion XML should suppress the notify card"
+        "footer-on matching background completion should suppress the notify card"
     );
     assert!(
-        events
+        !events
             .task_notification_completion_visible_in_footer_for_mode(channel_id, completed, false,),
-        "background completion XML should stay quiet even when footer mode is off"
+        "footer-off/legacy mode must keep the notify card"
     );
 
     let unknown = "<task-notification><task-id>bg2</task-id>\
         <tool-use-id>toolu_bg_unknown</tool-use-id><status>completed</status>\
         <summary>Background command \"Other\" completed (exit code 0)</summary></task-notification>";
     assert!(
-        events.task_notification_completion_visible_in_footer_for_mode(channel_id, unknown, true),
-        "background lifecycle XML should be quiet even without a matching slot"
+        !events.task_notification_completion_visible_in_footer_for_mode(channel_id, unknown, true),
+        "unknown tool-use-id has no footer completion surface, so the card must remain"
     );
 
     let failed = "<task-notification><task-id>bg3</task-id>\
         <tool-use-id>toolu_bg_match</tool-use-id><status>failed</status>\
         <summary>Background command \"Watch CI\" failed (exit code 1)</summary></task-notification>";
     assert!(
-        events.task_notification_completion_visible_in_footer_for_mode(channel_id, failed, true),
-        "background failure XML should be consumed quietly"
-    );
-
-    let killed = "<task-notification><task-id>bg4</task-id>\
-        <tool-use-id>toolu_bg_match</tool-use-id><status>killed</status>\
-        <summary>Background command \"Watch CI\" killed</summary></task-notification>";
-    assert!(
-        events.task_notification_completion_visible_in_footer_for_mode(channel_id, killed, true),
-        "background killed XML should be consumed quietly"
+        !events.task_notification_completion_visible_in_footer_for_mode(channel_id, failed, true),
+        "failure/error notifications keep their card for details instead of being footer-suppressed"
     );
 }
 
@@ -6348,6 +5935,112 @@ fn compaction_log_gate_fires_on_change_only() {
 // #3477 / #3473 — live panel terminal block reorder/blank/multiline + TTL.
 // ===========================================================================
 
+// #3477 item 4: the 🖥️ Recent/terminal block renders BEFORE the Tasks and
+// Subagents sections (it is the most useful at-a-glance signal and, ahead of the
+// bulky sections, is also protected from trailing-section budget drops).
+#[test]
+fn status_panel_recent_block_renders_before_tasks_and_subagents() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_477_001);
+    // A running background task (Tasks section) and a running subagent.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::BackgroundTaskStart {
+            name: "Bash".to_string(),
+            summary: "long build".to_string(),
+            tool_use_id: "bg-1".to_string(),
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("Explore".to_string()),
+            desc: Some("scan repo".to_string()),
+            tool_use_id: Some("sa-1".to_string()),
+            background: false,
+        },
+    );
+    // A live Recent event.
+    events.push_event(
+        channel_id,
+        RecentPlaceholderEvent::tool_use("Read", &json!({"file_path": "/tmp/x.rs"}).to_string())
+            .unwrap(),
+    );
+
+    let rendered = events.render_status_panel_with_heartbeat(
+        channel_id,
+        &ProviderKind::Claude,
+        1_700_000_000,
+        1_700_000_005,
+    );
+    let recent_at = rendered.find("🖥️ Recent").expect("recent present");
+    let tasks_at = rendered.find("Tasks").expect("tasks present");
+    let subagents_at = rendered.find("Subagents").expect("subagents present");
+    assert!(
+        recent_at < tasks_at,
+        "Recent must precede Tasks: {rendered}"
+    );
+    assert!(
+        recent_at < subagents_at,
+        "Recent must precede Subagents: {rendered}"
+    );
+}
+
+// #3477 item 3: a live output batch that lands AFTER TurnCompleted keeps the
+// 🖥️ Recent block visible (the late batch is not blanked), while a genuinely idle
+// completed turn (no fresh content) still drops its stale block.
+#[test]
+fn status_panel_late_batch_after_completion_keeps_recent_block() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_477_002);
+
+    // Stale pre-completion content, then completion: must be suppressed.
+    events.push_event(
+        channel_id,
+        RecentPlaceholderEvent::tool_use("Bash", &json!({"command": "echo stale"}).to_string())
+            .unwrap(),
+    );
+    events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: false });
+    let idle_completed = events.render_status_panel_with_heartbeat(
+        channel_id,
+        &ProviderKind::Claude,
+        1_700_000_000,
+        1_700_000_010,
+    );
+    assert!(
+        !idle_completed.contains("🖥️ Recent"),
+        "stale block on a genuinely idle completed turn must be dropped: {idle_completed}"
+    );
+
+    // A late output batch arrives AFTER completion: must keep showing Recent.
+    events.push_event(
+        channel_id,
+        RecentPlaceholderEvent::tool_use(
+            "Bash",
+            &json!({"command": "echo LATE_BATCH"}).to_string(),
+        )
+        .unwrap(),
+    );
+    let late = events.render_status_panel_with_heartbeat(
+        channel_id,
+        &ProviderKind::Claude,
+        1_700_000_000,
+        1_700_000_011,
+    );
+    assert!(
+        late.contains("🖥️ Recent"),
+        "a fresh late batch racing TurnCompleted must not be blanked: {late}"
+    );
+    assert!(
+        late.contains("• [Bash] 실행"),
+        "late compact activity must render without raw command text: {late}"
+    );
+    assert!(
+        !late.contains("LATE_BATCH"),
+        "raw late command leaked: {late}"
+    );
+}
+
 // #3477 item 1: multi-line tool output stays readable in the Recent/terminal
 // block (multiple lines preserved) instead of collapsing to one run-on line.
 #[test]
@@ -6543,242 +6236,5 @@ fn stuck_background_task_slot_dropped_on_turn_boundary_reconciliation() {
             .any(|slot| slot.tool_use_id.as_deref() == Some("fresh-2")),
         "fresh background slot must survive as a residual: {:?}",
         guard.tasks
-    );
-}
-
-// ===========================================================================
-// #3811: deterministic turn anchors on result/status surfaces.
-//
-// The pure `render_request_anchor_line` gating (real-id/guild → link;
-// headless/synthetic/voice/0 → no link) is unit-tested inline in
-// `turn_anchor.rs`. These tests cover the two render surfaces (target tags now
-// on the completion footer, 요청 line prepended first + surviving overflow) and
-// the snapshot lifecycle (preserve-across-turn-reset, clear-on-TUI-direct,
-// clear-on-session-reset). The store-level `render_*` wrappers read the guild id
-// from `load_graceful()`, which is config-dependent in tests, so the request
-// LINK rendering is asserted via the free renderers with an explicit anchor line.
-// ===========================================================================
-
-// A real Discord snowflake (well below the 8e18 synthetic floor).
-const ANCHOR_TEST_USER_MSG_ID: u64 = 1_520_312_799_245_504_542;
-
-#[test]
-fn completion_footer_renders_target_tags_for_dispatch_linked_turn() {
-    // #3811: the result/final surface previously carried NEITHER the request link
-    // NOR the target tags. It must now render the 대상 tags from the existing task
-    // snapshot even with no Tasks/Subagents content.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(3811);
-    assert!(events.set_task_panel_info(
-        channel_id,
-        TaskPanelInfo {
-            dispatch_id: "bddc480d-43d1-4f1f-b3fd-e0d96b3b3d82",
-            dispatch_type: Some("review"),
-            card_title: Some("Fix CI inventory drift"),
-            github_issue_number: Some(3805),
-            ..Default::default()
-        },
-    ));
-
-    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = rendered
-        .block
-        .expect("dispatch-linked footer should render the target tags");
-    assert!(block.contains("gh#3805"), "missing issue tag: {block:?}");
-    assert!(
-        block.contains("dsp #bddc480d"),
-        "missing dispatch tag: {block:?}"
-    );
-}
-
-#[test]
-fn completion_footer_free_renderer_prepends_request_anchor_and_target() {
-    // Anchor leads, then the 대상 target tags — both on the result surface. The
-    // snapshot is built through the store (its fields are module-private) and
-    // cloned out so the free renderer can be exercised with an explicit anchor.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38114);
-    assert!(events.set_task_panel_info(
-        channel_id,
-        TaskPanelInfo {
-            dispatch_id: "d_abc12345",
-            dispatch_type: Some("review"),
-            card_title: Some("Fix CI inventory drift"),
-            github_issue_number: Some(3805),
-            ..Default::default()
-        },
-    ));
-    let snapshot = events
-        .status_by_channel
-        .get(&channel_id)
-        .expect("status panel state")
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let render = super::completion_footer::render_completion_footer(
-        snapshot,
-        &ProviderKind::Claude,
-        "⠸",
-        Some("턴 트리거: https://discord.com/channels/1/2/3".to_string()),
-    );
-    let block = render
-        .block
-        .expect("anchor + target should render on the result surface");
-    assert!(
-        block.starts_with("턴 트리거: https://discord.com/channels/1/2/3"),
-        "request anchor must lead the footer: {block:?}"
-    );
-    assert!(
-        block.contains("gh#3805"),
-        "missing target issue tag: {block:?}"
-    );
-    assert!(
-        block.contains("dsp #d"),
-        "missing target dispatch tag: {block:?}"
-    );
-}
-
-#[test]
-fn completion_footer_free_renderer_omits_anchor_and_target_when_absent() {
-    // Missing metadata → no block at all (omitted fields, not placeholder noise).
-    let render = super::completion_footer::render_completion_footer(
-        StatusPanelState::default(),
-        &ProviderKind::Claude,
-        "⠸",
-        None,
-    );
-    assert!(
-        render.block.is_none(),
-        "absent anchor/target/content must yield no footer noise: {:?}",
-        render.block
-    );
-}
-
-#[test]
-fn status_panel_free_renderer_leads_with_activity_and_time_lines() {
-    // #3983: the panel opens with the activity label (line 1) then the time line
-    // (line 2); the 턴 트리거 deeplink trails as the last section.
-    let out = super::status_panel::render_status_panel(
-        StatusPanelState::default(),
-        &ProviderKind::Claude,
-        "마지막 업데이트 : <t:1700000000:R> / 턴 시작 : <t:1700000000:R>".to_string(),
-        Some("턴 트리거: https://discord.com/channels/1/2/3".to_string()),
-    );
-    let mut sections = out.split("\n\n");
-    assert_eq!(
-        sections.next(),
-        Some("🟢 진행 중"),
-        "line 1 = activity: {out:?}"
-    );
-    assert_eq!(
-        sections.next(),
-        Some("마지막 업데이트 : <t:1700000000:R> / 턴 시작 : <t:1700000000:R>"),
-        "line 2 = time line: {out:?}"
-    );
-    assert!(
-        out.trim_end()
-            .ends_with("턴 트리거: https://discord.com/channels/1/2/3"),
-        "턴 트리거 must be the last footer line: {out:?}"
-    );
-    assert!(
-        out.chars().count() <= STATUS_PANEL_MAX_CHARS,
-        "panel must respect the size cap"
-    );
-}
-
-#[test]
-fn turn_request_anchor_survives_turn_reset() {
-    // #3811 lifecycle: an intake-set anchor must survive the bridge's same-turn
-    // reset (no footer residuals), otherwise the entry+anchor would be dropped
-    // before the turn renders its request link.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38111);
-    events.set_turn_request_anchor(channel_id, Some(ANCHOR_TEST_USER_MSG_ID));
-    events.clear_channel_preserving_footer_residuals(channel_id);
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        Some(ANCHOR_TEST_USER_MSG_ID),
-        "anchor must be preserved across the turn-content reset"
-    );
-}
-
-#[test]
-fn turn_request_anchor_not_bled_by_queued_message_before_promotion() {
-    // #3811 P1 regression (codex review): the intake setter is gated on
-    // `started == true` (the mailbox claim was WON). A message that merely QUEUES
-    // behind an active turn issues NO setter call, so it cannot overwrite the
-    // active turn's deeplink; it records its own anchor only when later
-    // dequeued/promoted (re-entering intake with `started == true`). This pins the
-    // store-side contract that gating relies on: the anchor changes ONLY on an
-    // explicit setter call, and survives the active turn's same-turn bridge reset.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38115);
-    let turn_a_msg = 1_520_000_000_000_000_001u64;
-    let turn_b_msg = 1_520_000_000_000_000_777u64;
-
-    // Turn A wins the claim (started == true) and records its anchor; the bridge
-    // then runs A's same-turn reset, which preserves it.
-    events.set_turn_request_anchor(channel_id, Some(turn_a_msg));
-    events.clear_channel_preserving_footer_residuals(channel_id);
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        Some(turn_a_msg)
-    );
-
-    // Message B arrives while A is active and only QUEUES (started == false):
-    // intake issues NO setter call, so A's anchor stays put (no cross-turn bleed).
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        Some(turn_a_msg),
-        "a queued message must not bleed the active turn's anchor"
-    );
-
-    // B is later dequeued/promoted (started == true) and records its own anchor.
-    events.set_turn_request_anchor(channel_id, Some(turn_b_msg));
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        Some(turn_b_msg),
-        "promotion updates the anchor to the now-active turn"
-    );
-}
-
-#[test]
-fn turn_request_anchor_cleared_on_tui_direct() {
-    // The TUI-direct path passes `None` so a prior interactive link can never leak
-    // onto a later id-0 synthetic turn.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38112);
-    events.set_turn_request_anchor(channel_id, Some(ANCHOR_TEST_USER_MSG_ID));
-    events.set_turn_request_anchor(channel_id, None);
-    assert_eq!(events.request_user_msg_id_for_test(channel_id), None);
-}
-
-#[test]
-fn turn_request_anchor_cleared_on_session_reset() {
-    // A genuine provider-session boundary is a new request context → drop the
-    // prior turn's anchor.
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(38113);
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch38113#100"),
-        "session_resumed",
-        &json!({ "provider_session_id": "session-A", "tmux_reused": true }),
-    ));
-    events.set_turn_request_anchor(channel_id, Some(ANCHOR_TEST_USER_MSG_ID));
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        Some(ANCHOR_TEST_USER_MSG_ID)
-    );
-    assert!(events.set_session_panel_lifecycle_event(
-        channel_id,
-        Some("AgentDesk-claude-ch38113#200"),
-        "session_fresh",
-        &json!({ "provider_session_id": "session-B", "tmux_reused": false }),
-    ));
-    assert_eq!(
-        events.request_user_msg_id_for_test(channel_id),
-        None,
-        "anchor must be cleared on the session boundary"
     );
 }

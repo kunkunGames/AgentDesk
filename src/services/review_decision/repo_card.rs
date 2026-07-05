@@ -35,6 +35,10 @@ pub(super) async fn transition_status_pg_first(
     .await
 }
 
+pub(super) fn review_state_db(_state: &AppState) -> Option<&crate::db::Db> {
+    None
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ActiveAcceptFollowups {
     pub(super) review: i64,

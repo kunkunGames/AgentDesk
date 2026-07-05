@@ -12,7 +12,6 @@ mod background_task_events;
 mod common;
 mod completion_footer;
 mod context_panel;
-mod freshness;
 mod recent_events;
 mod session_panel;
 mod slot_rehydration;
@@ -21,7 +20,6 @@ mod status_panel;
 mod subagent_rollout;
 mod subagent_summary;
 mod task_panel;
-mod turn_anchor;
 mod workflow_panel;
 
 #[cfg(test)]
@@ -35,9 +33,7 @@ use recent_events::render_compact_events;
 #[cfg(test)]
 use recent_events::render_events;
 use session_panel::SessionPanelSnapshot;
-#[cfg(test)]
-use status_panel::{CompletedKind, DerivedStatus};
-use status_panel::{StatusPanelState, render_status_panel};
+use status_panel::{CompletedKind, DerivedStatus, StatusPanelState, render_status_panel};
 pub(in crate::services::discord) use task_panel::TaskPanelInfo;
 use task_panel::{TaskPanelSnapshot, clean_task_panel_value};
 
@@ -47,7 +43,7 @@ use common::{
     STATUS_PANEL_WORKFLOW_LIMIT, STATUS_PANEL_WORKFLOW_PHASE_LIMIT,
 };
 #[cfg(test)]
-use status_panel::truncate_status_panel_sections;
+use status_panel::{render_recent_section_header, truncate_status_panel_sections};
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
@@ -78,12 +74,6 @@ pub(in crate::services::discord) struct PlaceholderLiveEvents {
     // block visible (the completion suppression only hides STALE pre-completion
     // content, never a fresh late batch).
     last_recent_event_at: dashmap::DashMap<ChannelId, Instant>,
-    // #3812: wall-clock unix stamp of the most recent live-content arrival per
-    // channel, set once when the content lands (never recomputed at render). The
-    // status panel's live/stale confidence line anchors its `<t:UNIX:R>` relative
-    // age here, so the rendered text stays byte-identical across heartbeat ticks
-    // (no needless re-edit) while Discord shows the localized live age client-side.
-    last_recent_event_unix: dashmap::DashMap<ChannelId, i64>,
     // #3404 (codex r1): last logged live-panel compaction counts per channel —
     // the INFO line fires on count CHANGE only, not every render tick, so the
     // log stays usable as a compaction event counter for the relay scan.
@@ -97,13 +87,19 @@ pub(in crate::services::discord) struct LiveContextPanelSnapshot {
     pub(in crate::services::discord) context_window_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum TerminalUiObligationPanelStatus {
+    Pending,
+    Completed,
+    Deadline,
+}
+
 impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn clear_channel(&self, channel_id: ChannelId) {
         self.by_channel.remove(&channel_id);
         self.status_by_channel.remove(&channel_id);
         self.compaction_log_counts.remove(&channel_id);
         self.last_recent_event_at.remove(&channel_id);
-        self.last_recent_event_unix.remove(&channel_id); // #3812: drop the freshness anchor too.
     }
 
     pub(in crate::services::discord) fn clear_channel_preserving_footer_residuals(
@@ -114,26 +110,19 @@ impl PlaceholderLiveEvents {
         // #3477 item 3: the recent-event ring is gone, so its freshness stamp is
         // stale — drop it with the ring so the next turn starts un-fresh.
         self.last_recent_event_at.remove(&channel_id);
-        self.last_recent_event_unix.remove(&channel_id); // #3812: reset the freshness anchor.
         // #3404 (codex r2): a turn reset starts a new compaction episode — re-arm
         // the count-change log gate even when footer residuals survive.
         self.compaction_log_counts.remove(&channel_id);
-        let keep_entry = self
+        let has_residuals = self
             .status_by_channel
             .get(&channel_id)
             .is_some_and(|entry| {
-                let mut guard = entry
+                entry
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let has_residuals =
-                    guard.reset_turn_content_preserving_unfinished_footer_residuals();
-                // #3811: the reset preserves an intake-set 요청 anchor; keep the
-                // entry alive when it carries one even with no footer residuals,
-                // otherwise the whole entry (and the anchor) would be dropped here
-                // before the turn renders its request link.
-                has_residuals || guard.request_user_msg_id.is_some()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reset_turn_content_preserving_unfinished_footer_residuals()
             });
-        if !keep_entry {
+        if !has_residuals {
             self.status_by_channel.remove(&channel_id);
         }
     }
@@ -159,10 +148,6 @@ impl PlaceholderLiveEvents {
         // `TurnCompleted` can tell a fresh late batch (keep 🖥️ Recent) from a
         // stale pre-completion block (suppress on a genuinely idle completed turn).
         self.last_recent_event_at.insert(channel_id, Instant::now());
-        // #3812: stamp the wall-clock arrival so the confidence line's `<t:UNIX:R>`
-        // age anchors to a stable point set here, not recomputed per render tick.
-        self.last_recent_event_unix
-            .insert(channel_id, chrono::Utc::now().timestamp());
     }
 
     pub(in crate::services::discord) fn push_many<I>(&self, channel_id: ChannelId, events: I)
@@ -272,9 +257,6 @@ impl PlaceholderLiveEvents {
         raw: &str,
         footer_mode_enabled: bool,
     ) -> bool {
-        if status_events::is_background_task_notification_xml_status_transition(raw) {
-            return true;
-        }
         if !footer_mode_enabled {
             return false;
         }
@@ -310,28 +292,6 @@ impl PlaceholderLiveEvents {
 
     pub(in crate::services::discord) fn clear_session_panel(&self, channel_id: ChannelId) -> bool {
         self.set_session_panel_snapshot(channel_id, None)
-    }
-
-    /// #3983 item4: atomically claim the one-shot top session banner for this
-    /// channel's CURRENT session snapshot, returning the rendered session line
-    /// EXACTLY ONCE per session. Both the sink and tmux-watcher refresh paths
-    /// call this after (re)setting the snapshot; the per-channel mutex makes the
-    /// claim a single atomic compare-and-record, so whichever path arrives first
-    /// for a given session emits the banner and the other observes the recorded
-    /// key and returns `None` (dual-path de-dup, no double post / no omission).
-    /// `None` when the channel has no session snapshot or its banner was already
-    /// claimed. See `StatusPanelState::claim_session_banner` for the identity
-    /// keying (session_instance_key → provider_session_id → rendered line).
-    pub(in crate::services::discord) fn claim_session_banner_line(
-        &self,
-        channel_id: ChannelId,
-        provider: &ProviderKind,
-    ) -> Option<String> {
-        let entry = self.status_by_channel.get(&channel_id)?;
-        let mut guard = entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.claim_session_banner(provider)
     }
 
     fn set_session_panel_snapshot(
@@ -544,6 +504,41 @@ impl PlaceholderLiveEvents {
         )
     }
 
+    pub(in crate::services::discord) fn render_terminal_ui_obligation_panel(
+        &self,
+        channel_id: ChannelId,
+        provider: &ProviderKind,
+        started_at_unix: i64,
+        status: TerminalUiObligationPanelStatus,
+    ) -> String {
+        let mut snapshot = self
+            .status_by_channel
+            .get(&channel_id)
+            .map(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .unwrap_or_default();
+        snapshot.status = match status {
+            TerminalUiObligationPanelStatus::Pending => DerivedStatus::TerminalDeliveryPending,
+            TerminalUiObligationPanelStatus::Completed => DerivedStatus::Completed {
+                kind: CompletedKind::Foreground,
+            },
+            TerminalUiObligationPanelStatus::Deadline => DerivedStatus::TerminalDeliveryUnconfirmed,
+        };
+        let completed = matches!(status, TerminalUiObligationPanelStatus::Completed);
+        render_status_panel(
+            snapshot,
+            self.render_block(channel_id),
+            provider,
+            started_at_unix,
+            chrono::Utc::now().timestamp(),
+            !completed,
+        )
+    }
+
     // True when the live-panel compaction counts for this channel differ from
     // the last logged pair. Zero counts re-arm the gate (the next compaction
     // episode logs again) and never log themselves.
@@ -566,9 +561,7 @@ impl PlaceholderLiveEvents {
         channel_id: ChannelId,
         provider: &ProviderKind,
         started_at_unix: i64,
-        // #3983: retained for call-site parity (the footer time line anchors to the
-        // stable stored last-activity stamp, not this render-time heartbeat).
-        _heartbeat_at_unix: i64,
+        heartbeat_at_unix: i64,
     ) -> String {
         let snapshot = self
             .status_by_channel
@@ -595,9 +588,24 @@ impl PlaceholderLiveEvents {
                 "#3404: compacted delivered terminal slots from the live status panel"
             );
         }
-        let turn_trigger_line = self.request_anchor_line(channel_id, &snapshot);
-        let time_line = self.panel_time_line(channel_id, started_at_unix);
-        render_status_panel(snapshot, provider, time_line, turn_trigger_line)
+        // #3477 item 3: a live batch counts as "fresh" when it arrived strictly
+        // after the turn's completion instant. `None` completed_at means the turn
+        // never completed (still running), so any present live content is fresh.
+        let live_content_fresh = match snapshot.completed_at {
+            Some(completed_at) => self
+                .last_recent_event_at
+                .get(&channel_id)
+                .is_some_and(|stamp| *stamp.value() > completed_at),
+            None => true,
+        };
+        render_status_panel(
+            snapshot,
+            self.render_block(channel_id),
+            provider,
+            started_at_unix,
+            heartbeat_at_unix,
+            live_content_fresh,
+        )
     }
 
     pub(in crate::services::discord) fn render_completion_footer(
@@ -616,8 +624,7 @@ impl PlaceholderLiveEvents {
                     .clone()
             })
             .unwrap_or_default();
-        let request_anchor_line = self.request_anchor_line(channel_id, &snapshot);
-        render_completion_footer(snapshot, provider, indicator, request_anchor_line)
+        render_completion_footer(snapshot, provider, indicator)
     }
 }
 

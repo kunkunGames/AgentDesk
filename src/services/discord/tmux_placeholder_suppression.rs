@@ -180,23 +180,6 @@ fn strip_placeholder_indicators_for_preserve(text: &str, provider: &ProviderKind
         .to_string()
 }
 
-pub(super) fn placeholder_real_body_exposure_evidence(
-    provider: &ProviderKind,
-    response_sent_offset: usize,
-    last_edit_text: &str,
-) -> Option<&'static str> {
-    if response_sent_offset > 0 {
-        return Some("response_sent_offset");
-    }
-    let stripped_body =
-        discord::single_message_panel::strip_placeholder_terminal_status(last_edit_text, provider);
-    if stripped_body.trim().is_empty() {
-        None
-    } else {
-        Some("last_edit_text_body")
-    }
-}
-
 pub(super) fn decide_placeholder_suppression(
     ctx: &PlaceholderSuppressContext<'_>,
 ) -> PlaceholderSuppressDecision {
@@ -241,11 +224,8 @@ pub(super) fn decide_placeholder_suppression(
             ) {
                 SuppressedPlaceholderAction::None => PlaceholderSuppressDecision::None,
                 SuppressedPlaceholderAction::Delete => PlaceholderSuppressDecision::Delete,
-                SuppressedPlaceholderAction::Edit(_) if footer_only_was_exposed => {
-                    // The active bridge route may still edit `inflight.current_msg_id`,
-                    // and the restored watcher seed can point at that same id. Leave
-                    // footer-only chrome untouched for the bridge overwrite.
-                    PlaceholderSuppressDecision::None
+                SuppressedPlaceholderAction::Edit(content) if footer_only_was_exposed => {
+                    PlaceholderSuppressDecision::Edit(content)
                 }
                 // #3533: this duplicate-relay guard fires because a bridge turn
                 // already owns delivery, so an exposed body was/will be delivered by
@@ -261,18 +241,20 @@ pub(super) fn decide_placeholder_suppression(
             }
         }
         PlaceholderSuppressOrigin::TaskNotificationTerminal => {
-            // #1708/#4144: production suppression currently reaches this origin
-            // only with Some(kind); the None arm is a defensive guard, not a known
-            // watcher-restart path. Preserve exposed body unless a future
-            // task-notification kind explicitly opts into destructive stamping.
-            let (preserves_body, preserve_reason) = match ctx.task_notification_kind {
-                None => (true, "unclassified-task-notification-kind"),
+            // #1708: Background, Subagent, and MonitorAutoTurn task notifications
+            // are all auto-fired by tooling, not by the user. If the main turn is
+            // streaming user-facing body when one of them terminates, we must
+            // preserve that body — otherwise the SUPPRESSED_INTERNAL_LABEL edit
+            // overwrites the actual response (Monitor stream-end was the trigger
+            // observed in the 2026-05-04 adk-cc incident).
+            let preserves_body = matches!(
+                ctx.task_notification_kind,
                 Some(
                     TaskNotificationKind::Background
-                    | TaskNotificationKind::Subagent
-                    | TaskNotificationKind::MonitorAutoTurn,
-                ) => (true, "auto-task-notification-kind"),
-            };
+                        | TaskNotificationKind::Subagent
+                        | TaskNotificationKind::MonitorAutoTurn
+                )
+            );
             match suppressed_placeholder_action(
                 ctx.placeholder_msg_id.is_some(),
                 ctx.provider,
@@ -283,7 +265,7 @@ pub(super) fn decide_placeholder_suppression(
                 SuppressedPlaceholderAction::Delete => PlaceholderSuppressDecision::Delete,
                 SuppressedPlaceholderAction::Edit(_) if preserves_body => {
                     PlaceholderSuppressDecision::Preserve {
-                        reason: preserve_reason,
+                        reason: "auto-task-notification-kind",
                         cleaned_body: strip_placeholder_indicators_for_preserve(
                             ctx.last_edit_text,
                             ctx.provider,
@@ -291,9 +273,6 @@ pub(super) fn decide_placeholder_suppression(
                     }
                 }
                 SuppressedPlaceholderAction::Edit(content) => {
-                    // Defensive only: every current task-notification kind plus
-                    // unclassified None preserves exposed bodies. Reaching this
-                    // requires a future kind to explicitly opt out above.
                     PlaceholderSuppressDecision::Edit(content)
                 }
             }
@@ -312,7 +291,6 @@ pub(super) async fn apply_placeholder_suppression(
     decision: PlaceholderSuppressDecision,
     detail: Option<&str>,
 ) {
-    let detail_suffix = detail.map(|d| format!(" — {d}")).unwrap_or_default();
     match decision {
         PlaceholderSuppressDecision::None => {}
         PlaceholderSuppressDecision::Preserve {
@@ -320,6 +298,7 @@ pub(super) async fn apply_placeholder_suppression(
             cleaned_body,
         } => {
             let ts = chrono::Local::now().format("%H:%M:%S");
+            let detail_suffix = detail.map(|d| format!(" — {d}")).unwrap_or_default();
             tracing::info!(
                 "  [{ts}] 👁 {} preserved placeholder ({reason}){detail_suffix}",
                 origin.log_scope()
@@ -353,7 +332,7 @@ pub(super) async fn apply_placeholder_suppression(
         }
         PlaceholderSuppressDecision::Delete => {
             if let Some(msg_id) = placeholder_msg_id {
-                let outcome = delete_terminal_placeholder(
+                delete_terminal_placeholder(
                     http,
                     channel_id,
                     shared,
@@ -363,24 +342,11 @@ pub(super) async fn apply_placeholder_suppression(
                     origin.log_scope(),
                 )
                 .await;
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    message_id = msg_id.get(),
-                    outcome = ?outcome,
-                    "  [{ts}] 👁 {} delete placeholder result{detail_suffix}",
-                    origin.log_scope()
-                );
-            } else {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 👁 {} delete placeholder skipped (no placeholder_msg_id){detail_suffix}",
-                    origin.log_scope()
-                );
             }
         }
         PlaceholderSuppressDecision::Edit(content) => {
             if let Some(msg_id) = placeholder_msg_id {
-                let outcome = edit_terminal_placeholder(
+                edit_terminal_placeholder(
                     http,
                     channel_id,
                     shared,
@@ -391,19 +357,6 @@ pub(super) async fn apply_placeholder_suppression(
                     origin.log_scope(),
                 )
                 .await;
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    message_id = msg_id.get(),
-                    outcome = ?outcome,
-                    "  [{ts}] 👁 {} edit placeholder result{detail_suffix}",
-                    origin.log_scope()
-                );
-            } else {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 👁 {} edit placeholder skipped (no placeholder_msg_id){detail_suffix}",
-                    origin.log_scope()
-                );
             }
         }
     }
@@ -484,61 +437,6 @@ pub(super) async fn delete_nonterminal_placeholder(
         source,
     )
     .await
-}
-
-/// #3871: which streamed rollover-prefix message ids the watcher MUST delete
-/// after a terminal delivery so the frozen prefixes don't duplicate the body.
-///
-/// When a `>DISCORD_MSG_LIMIT` answer rolls over mid-stream, the prefix
-/// placeholder is FROZEN as a standalone permanent message and a fresh
-/// placeholder is opened for the remainder. The terminal full-body fallback
-/// (`session_bound_fallback_uses_full_body`) re-posts the WHOLE body as ordered
-/// chunks, so every frozen prefix is now a duplicate copy of bytes already in
-/// the replay → delete them all (watcher parity with the sink's
-/// `terminal_full_replay_cleanup_msg_ids`). On the remainder-only path
-/// (`false`) the frozen prefixes carry the legit, already-delivered
-/// `[0..response_sent_offset]` prose and MUST be preserved — return nothing.
-pub(super) fn watcher_rollover_prefixes_to_delete_on_terminal(
-    session_bound_fallback_uses_full_body: bool,
-    frozen_rollover_msg_ids: &[MessageId],
-) -> Vec<MessageId> {
-    if session_bound_fallback_uses_full_body {
-        frozen_rollover_msg_ids.to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-/// #3871: delete the streamed rollover-prefix messages the watcher froze during
-/// streaming, after a terminal full-body replay re-posted their bytes. Mirrors
-/// the sink's drain-and-delete of `terminal_full_replay_cleanup_msg_ids`; each
-/// id is a non-terminal streamed prefix so `DeleteNonterminal` is used. No-op on
-/// the remainder-only path (see [`watcher_rollover_prefixes_to_delete_on_terminal`]).
-pub(super) async fn delete_watcher_rollover_frozen_prefixes(
-    http: &Arc<serenity::Http>,
-    channel_id: ChannelId,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    session_bound_fallback_uses_full_body: bool,
-    frozen_rollover_msg_ids: Vec<MessageId>,
-) {
-    for frozen_prefix in watcher_rollover_prefixes_to_delete_on_terminal(
-        session_bound_fallback_uses_full_body,
-        &frozen_rollover_msg_ids,
-    ) {
-        rate_limit_wait(shared, channel_id).await;
-        let _ = delete_nonterminal_placeholder(
-            http,
-            channel_id,
-            shared,
-            provider,
-            tmux_session_name,
-            frozen_prefix,
-            "watcher_terminal_rollover_prefix_dedup_3871",
-        )
-        .await;
-    }
 }
 
 async fn delete_placeholder_with_operation(
@@ -672,10 +570,13 @@ fn suppressed_placeholder_action(
         return SuppressedPlaceholderAction::None;
     }
 
-    let real_body_was_exposed =
-        placeholder_real_body_exposure_evidence(provider, response_sent_offset, last_edit_text)
-            .is_some();
-    let placeholder_was_exposed = real_body_was_exposed
+    let placeholder_was_exposed = response_sent_offset > 0
+        || !discord::single_message_panel::strip_placeholder_terminal_status(
+            last_edit_text,
+            provider,
+        )
+        .trim()
+        .is_empty()
         || discord::single_message_panel::streaming_footer_only_surface_was_exposed(
             last_edit_text,
             provider,
@@ -855,36 +756,6 @@ mod placeholder_suppression_tests {
     }
 
     #[test]
-    fn no_response_cleanup_preserves_real_body_exposure_evidence() {
-        let placeholder = body_with_footer("visible assistant body");
-
-        assert_eq!(
-            placeholder_real_body_exposure_evidence(&ProviderKind::Claude, 0, &placeholder),
-            Some("last_edit_text_body")
-        );
-        assert_eq!(
-            placeholder_real_body_exposure_evidence(&ProviderKind::Claude, 1, ""),
-            Some("response_sent_offset")
-        );
-    }
-
-    #[test]
-    fn no_response_cleanup_deletes_footer_only_chrome() {
-        let placeholder = footer_only_placeholder();
-
-        assert_eq!(
-            placeholder_real_body_exposure_evidence(&ProviderKind::Claude, 0, &placeholder),
-            None
-        );
-        assert!(
-            discord::single_message_panel::streaming_footer_only_surface_was_exposed(
-                &placeholder,
-                &ProviderKind::Claude
-            )
-        );
-    }
-
-    #[test]
     fn orphan_restart_status_only_placeholder_deletes() {
         let (_lock, _tempdir, _env) = scoped_runtime_root_for_test();
         let state = orphan_state("", 0);
@@ -983,25 +854,6 @@ No response requested.\n\
         }
     }
 
-    fn task_notification_terminal_ctx<'a>(
-        placeholder: &'a str,
-        response_sent_offset: usize,
-        task_notification_kind: Option<TaskNotificationKind>,
-    ) -> PlaceholderSuppressContext<'a> {
-        PlaceholderSuppressContext {
-            origin: PlaceholderSuppressOrigin::TaskNotificationTerminal,
-            provider: &ProviderKind::Claude,
-            placeholder_msg_id: Some(MessageId::new(1)),
-            response_sent_offset,
-            last_edit_text: placeholder,
-            inflight_state: None,
-            has_active_turn: false,
-            tmux_session_name: TEST_SESSION,
-            task_notification_kind,
-            reattach_offset_match: false,
-        }
-    }
-
     #[test]
     fn active_bridge_exposed_body_preserves_instead_of_internal_label() {
         // #3533: a duplicate-relay guard on an already-exposed body (e.g. the
@@ -1035,222 +887,16 @@ No response requested.\n\
     }
 
     #[test]
-    fn active_bridge_footer_only_placeholder_preserves_bridge_target_without_label() {
+    fn active_bridge_footer_only_placeholder_edits_to_preserve_target() {
         // No body and no sent offset still carries a visible single-message
-        // footer. Keep the Discord message id untouched so the bridge-owned
+        // footer. Keep the Discord message id alive so the bridge-owned
         // completion footer can edit the same target instead of hitting 404.
         let placeholder = footer_only_placeholder();
         let ctx = active_bridge_ctx(&placeholder, 0, false);
-
-        assert_eq!(
-            decide_placeholder_suppression(&ctx),
-            PlaceholderSuppressDecision::None
-        );
-    }
-
-    #[test]
-    fn task_notification_none_kind_exposed_body_preserves() {
-        // #4144 defensive guard: terminal suppression is currently gated by
-        // task_notification_kind.is_some(), so None should not be reached in
-        // production. If a future caller reaches it, still preserve exposed body.
-        let placeholder = body_with_footer("visible assistant body");
-        let ctx = task_notification_terminal_ctx(&placeholder, 0, None);
-
-        let PlaceholderSuppressDecision::Preserve {
-            reason,
-            cleaned_body,
-        } = decide_placeholder_suppression(&ctx)
+        let PlaceholderSuppressDecision::Edit(content) = decide_placeholder_suppression(&ctx)
         else {
-            panic!("unclassified task notification with exposed body should preserve");
+            panic!("footer-only active bridge placeholder should edit, not delete");
         };
-        assert_eq!(reason, "unclassified-task-notification-kind");
-        assert_eq!(cleaned_body, "visible assistant body");
-        assert!(!cleaned_body.contains(SUPPRESSED_INTERNAL_LABEL));
-        assert!(!cleaned_body.contains("진행 중 — Claude"));
-    }
-
-    #[test]
-    fn task_notification_none_kind_unexposed_placeholder_deletes() {
-        let ctx = task_notification_terminal_ctx("⠋ 계속 처리 중", 0, None);
-
-        assert_eq!(
-            decide_placeholder_suppression(&ctx),
-            PlaceholderSuppressDecision::Delete
-        );
-    }
-
-    #[test]
-    fn task_notification_subagent_kind_exposed_body_preserves() {
-        let placeholder = body_with_footer("visible assistant body");
-        let ctx =
-            task_notification_terminal_ctx(&placeholder, 0, Some(TaskNotificationKind::Subagent));
-
-        let PlaceholderSuppressDecision::Preserve {
-            reason,
-            cleaned_body,
-        } = decide_placeholder_suppression(&ctx)
-        else {
-            panic!("subagent task notification with exposed body should preserve");
-        };
-        assert_eq!(reason, "auto-task-notification-kind");
-        assert_eq!(cleaned_body, "visible assistant body");
-        assert!(!cleaned_body.contains(SUPPRESSED_INTERNAL_LABEL));
-        assert!(!cleaned_body.contains("진행 중 — Claude"));
-    }
-
-    #[test]
-    fn task_notification_subagent_kind_unexposed_placeholder_deletes() {
-        let ctx = task_notification_terminal_ctx(
-            "⠋ 계속 처리 중",
-            0,
-            Some(TaskNotificationKind::Subagent),
-        );
-
-        assert_eq!(
-            decide_placeholder_suppression(&ctx),
-            PlaceholderSuppressDecision::Delete
-        );
-    }
-
-    #[test]
-    fn task_notification_background_kind_exposed_body_preserves() {
-        let placeholder = body_with_footer("visible assistant body");
-        let ctx =
-            task_notification_terminal_ctx(&placeholder, 0, Some(TaskNotificationKind::Background));
-
-        let PlaceholderSuppressDecision::Preserve {
-            reason,
-            cleaned_body,
-        } = decide_placeholder_suppression(&ctx)
-        else {
-            panic!("background task notification with exposed body should preserve");
-        };
-        assert_eq!(reason, "auto-task-notification-kind");
-        assert_eq!(cleaned_body, "visible assistant body");
-        assert!(!cleaned_body.contains(SUPPRESSED_INTERNAL_LABEL));
-        assert!(!cleaned_body.contains("진행 중 — Claude"));
-    }
-
-    #[test]
-    fn task_notification_background_kind_unexposed_placeholder_deletes() {
-        let ctx = task_notification_terminal_ctx(
-            "⠋ 계속 처리 중",
-            0,
-            Some(TaskNotificationKind::Background),
-        );
-
-        assert_eq!(
-            decide_placeholder_suppression(&ctx),
-            PlaceholderSuppressDecision::Delete
-        );
-    }
-
-    #[test]
-    fn task_notification_monitor_auto_turn_kind_exposed_body_preserves() {
-        let placeholder = body_with_footer("visible assistant body");
-        let ctx = task_notification_terminal_ctx(
-            &placeholder,
-            0,
-            Some(TaskNotificationKind::MonitorAutoTurn),
-        );
-
-        let PlaceholderSuppressDecision::Preserve {
-            reason,
-            cleaned_body,
-        } = decide_placeholder_suppression(&ctx)
-        else {
-            panic!("monitor auto-turn task notification with exposed body should preserve");
-        };
-        assert_eq!(reason, "auto-task-notification-kind");
-        assert_eq!(cleaned_body, "visible assistant body");
-        assert!(!cleaned_body.contains(SUPPRESSED_INTERNAL_LABEL));
-        assert!(!cleaned_body.contains("진행 중 — Claude"));
-    }
-
-    #[test]
-    fn task_notification_monitor_auto_turn_kind_unexposed_placeholder_deletes() {
-        let ctx = task_notification_terminal_ctx(
-            "⠋ 계속 처리 중",
-            0,
-            Some(TaskNotificationKind::MonitorAutoTurn),
-        );
-
-        assert_eq!(
-            decide_placeholder_suppression(&ctx),
-            PlaceholderSuppressDecision::Delete
-        );
-    }
-
-    // #3871: a >DISCORD_MSG_LIMIT answer rolls over mid-stream (the prefix is
-    // FROZEN as a standalone message, a fresh placeholder opens for the
-    // remainder), then the terminal full-body fallback re-posts the WHOLE body
-    // as ordered chunks. Pin the dup-relay closure: the frozen prefix bytes ARE
-    // re-sent in the replay, so unless they are deleted the user sees the prose
-    // twice. Assert (a) the frozen prefix is scheduled for deletion, (b) the
-    // full body is chunked exactly once (the single delivery), and (c) the
-    // remainder-only path PRESERVES the prefix (no spurious delete / data loss).
-    #[test]
-    fn rollover_frozen_prefix_is_deleted_on_full_body_fallback_no_dup() {
-        use crate::services::discord::formatting::{plan_streaming_rollover, split_message};
-
-        // A genuinely-long answer that exceeds the 2000-byte limit and forces at
-        // least one streaming rollover (distinct paragraphs give the splitter a
-        // clean boundary).
-        let full_body = (0..40)
-            .map(|i| format!("Paragraph {i}: {}", "lorem ipsum dolor sit amet ".repeat(3)))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        assert!(
-            full_body.len() > discord::DISCORD_MSG_LIMIT,
-            "fixture must exceed DISCORD_MSG_LIMIT to trigger rollover"
-        );
-
-        // Simulate the watcher streaming rollover loop: each rollover freezes the
-        // current placeholder (a synthetic message id) and advances the offset.
-        let status_block = footer_status_block();
-        let mut response_sent_offset = 0usize;
-        let mut frozen_msg_ids: Vec<MessageId> = Vec::new();
-        let mut next_msg_id = 1u64;
-        while let Some(plan) =
-            plan_streaming_rollover(&full_body[response_sent_offset..], &status_block)
-        {
-            // The placeholder holding `current_portion[..split_at]` is frozen and
-            // becomes permanent; a new placeholder (next id) takes the remainder.
-            frozen_msg_ids.push(MessageId::new(next_msg_id));
-            next_msg_id += 1;
-            response_sent_offset += plan.split_at;
-        }
-        assert!(
-            !frozen_msg_ids.is_empty(),
-            "the >2000-byte answer must have frozen at least one rollover prefix"
-        );
-
-        // (a) Terminal FULL-BODY fallback: the re-posted body is split once into
-        // ordered chunks (the single delivery)...
-        let replay_chunks = split_message(&full_body);
-        // ...and EVERY frozen prefix is scheduled for deletion (no dup left).
-        let to_delete = watcher_rollover_prefixes_to_delete_on_terminal(true, &frozen_msg_ids);
-        assert_eq!(
-            to_delete, frozen_msg_ids,
-            "full-body fallback must delete all frozen rollover prefixes so the prose is not duplicated"
-        );
-
-        // The dup-closure: the frozen prefix bytes are genuinely re-sent in the
-        // replay, so deletion is necessary — the joined replay chunks contain the
-        // leading prefix content. (No full-body re-send is left UNDELETED.)
-        let replay_joined = replay_chunks.concat();
-        assert!(
-            replay_joined.contains(&full_body[..200.min(full_body.len())]),
-            "the full-body replay re-sends the leading prefix bytes (the duplicate source)"
-        );
-
-        // (c) Remainder-only path: the frozen prefixes carry the already-delivered
-        // `[0..offset]` prose and MUST be preserved (deleting them would lose
-        // content). The cleanup set is empty.
-        let preserved = watcher_rollover_prefixes_to_delete_on_terminal(false, &frozen_msg_ids);
-        assert!(
-            preserved.is_empty(),
-            "remainder-only delivery must preserve frozen prefixes (no spurious delete / no data loss)"
-        );
+        assert_eq!(content, SUPPRESSED_INTERNAL_LABEL);
     }
 }

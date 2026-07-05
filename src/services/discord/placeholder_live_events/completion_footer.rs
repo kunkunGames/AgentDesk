@@ -10,8 +10,8 @@ use super::common::{
 use super::context_panel::render_context_panel_line;
 use super::status_panel::{StatusPanelState, SubagentSlot, render_subagent_slot};
 use super::task_panel::{
-    TaskToolSlot, render_task_panel_line, render_task_tool_slot, task_tool_slot_identity,
-    task_tool_slot_is_terminal, task_tool_terminal_marker,
+    TaskToolSlot, render_task_tool_slot, task_tool_slot_identity, task_tool_slot_is_terminal,
+    task_tool_terminal_marker,
 };
 
 /// #3391: stable per-slot handle (NOT the rendered line). `ToolUseId`/`TaskId`
@@ -145,20 +145,8 @@ pub(super) fn render_completion_footer(
     snapshot: StatusPanelState,
     provider: &ProviderKind,
     indicator: &str,
-    // #3811: precomputed `요청:` original-request line (built in the store wrapper),
-    // or `None` when there is no real Discord user message. Prepended so the
-    // result/final surface gains the same anchor the status panel shows.
-    request_anchor_line: Option<String>,
 ) -> CompletionFooterRender {
     let mut sections: Vec<String> = Vec::new();
-    // #3811: lead the footer with the 대상 target tags so the result message is
-    // self-anchoring (it previously carried neither the link nor the tags). The
-    // 대상 tags reuse the existing `render_task_panel_line` (missing fields omitted
-    // there, no noise); the 요청 link is prepended ABOVE them below so both sit over
-    // the clamped Tasks/Subagents block and survive the section clamp + body splits.
-    if let Some(task) = snapshot.task.as_ref() {
-        sections.push(render_task_panel_line(task));
-    }
     if let Some(context_line) = snapshot
         .context
         .as_ref()
@@ -166,7 +154,6 @@ pub(super) fn render_completion_footer(
     {
         sections.push(context_line);
     }
-    super::turn_anchor::prepend_request_anchor(&mut sections, request_anchor_line);
 
     // Flat ordered list of emitted task/subagent lines (incl. section headers
     // and the blank separator) carrying each terminal slot's identity. The
@@ -175,19 +162,7 @@ pub(super) fn render_completion_footer(
     let mut emitted: Vec<EmittedLine> = Vec::new();
     let mut has_unfinished_entries = false;
 
-    if snapshot.background_agent_pending {
-        emitted.push(EmittedLine::header("Background agents"));
-        emitted.push(EmittedLine {
-            text: format!("Waiting for background agents {indicator}"),
-            terminal_id: None,
-        });
-        has_unfinished_entries = true;
-    }
-
     if !snapshot.tasks.is_empty() {
-        if !emitted.is_empty() {
-            emitted.push(EmittedLine::blank());
-        }
         emitted.push(EmittedLine::header("Tasks"));
         let mut task_unfinished = false;
         for slot in snapshot.tasks.iter().rev().take(STATUS_PANEL_TASK_LIMIT) {

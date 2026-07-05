@@ -291,7 +291,6 @@ async fn run_skill_slash_command(
             None,
             TurnKind::Foreground,
             Vec::new(),
-            None, // #3905: slash skill dispatch is not a voice announcement.
         )
         .await?;
         return Ok(());
@@ -363,7 +362,6 @@ async fn run_skill_slash_command(
         None,
         TurnKind::Foreground,
         Vec::new(),
-        None, // #3905: slash skill dispatch is not a voice announcement.
     )
     .await?;
 

@@ -1078,14 +1078,6 @@ fn classify_injected_prompt_slash_command_control() {
         classify_injected_prompt("<local-command-stdout>Compacted (12.3k tokens)"),
         InjectedPromptClass::SlashCommandControl,
     );
-    // /model command stdout line: local command output is a machine echo, not
-    // a human TUI-direct prompt that should mint a synthetic turn.
-    assert_eq!(
-        classify_injected_prompt(
-            "<local-command-stdout>Set model to Fable 5</local-command-stdout>"
-        ),
-        InjectedPromptClass::SlashCommandControl,
-    );
     let command_name_first = compact_command_name_first_stub();
     assert_eq!(command_name_first.chars().count(), 134);
     assert_eq!(
@@ -1254,45 +1246,6 @@ fn local_only_slash_prompt_preserves_loop_wakeup_lifecycle() {
     }
 }
 
-#[test]
-fn command_message_skill_wakeup_preserves_assistant_relay_lifecycle() {
-    let wakeup = "<command-message>agentdesk-issue-pipeline</command-message>\n\
-                  <command-args>issue 4041 --continue autonomous pipeline</command-args>";
-
-    assert_eq!(
-        classify_injected_prompt(wakeup),
-        InjectedPromptClass::SlashCommandControl,
-        "machine command-message wakeups should hide the raw echo without becoming human text",
-    );
-    assert_eq!(
-        slash_command_control_kind(wakeup),
-        "agentdesk-issue-pipeline",
-        "command-message-only wakeups need a stable non-fallback kind for lifecycle dedupe",
-    );
-
-    let decision = relay_observed_prompt_injected_prompt_decision(wakeup);
-    assert_eq!(
-        decision.injected_class,
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(
-        decision.slash_command_kind.as_deref(),
-        Some("agentdesk-issue-pipeline"),
-    );
-    assert!(
-        !decision.local_only_slash,
-        "a skill wakeup starts a model turn and must not take the local-only echo path",
-    );
-    assert!(
-        !decision.injected_class.suppresses_user_turn_lifecycle(),
-        "wakeup turns still need anchor/reaction/synthetic ownership",
-    );
-    assert!(
-        decision.injected_class.still_delivers_assistant_output(),
-        "wakeup assistant prose must stay relayable even when the injected echo is sanitized",
-    );
-}
-
 // #3305: non-command text, the system-continuation banner, task notifications,
 // a token-boundary near-miss, and an UNLISTED command must all be rejected so
 // the local-only skip never fires for a real turn (fail-safe = lifecycle kept).
@@ -1334,75 +1287,6 @@ fn local_only_slash_prompt_rejects_non_command_text() {
     assert!(is_local_only_slash_command_prompt(model_wrapper));
 }
 
-// #4033: `/model` writes two adjacent transcript user entries. The
-// `<command-name>` half was already local-only (#3500); the stdout half must be
-// local-only too, or the relay mints a fake synthetic inflight and queues the
-// next real user message behind it.
-#[test]
-fn local_only_slash_prompt_skips_model_two_half_transcript() {
-    let command_name_half =
-        "<command-message>x</command-message>\n<command-name>/model</command-name>";
-    let stdout_half = "<local-command-stdout>Set model to Fable 5</local-command-stdout>";
-
-    for (half, expected_kind) in [
-        (command_name_half, "/model"),
-        (stdout_half, "local-command-stdout"),
-    ] {
-        assert_eq!(
-            classify_injected_prompt(half),
-            InjectedPromptClass::SlashCommandControl,
-            "both /model transcript halves must be machine slash-control echoes",
-        );
-        assert_eq!(
-            slash_command_control_kind(half),
-            expected_kind,
-            "each /model transcript half keeps the production dedupe kind it really carries",
-        );
-        assert!(
-            is_local_only_slash_command_prompt(half),
-            "both /model transcript halves must skip the turn lifecycle",
-        );
-        assert!(
-            !classify_injected_prompt(half).is_human_active_turn(),
-            "neither /model transcript half is human TUI-direct input",
-        );
-    }
-}
-
-#[test]
-fn relay_prompt_decision_skips_model_two_half_transcript() {
-    let command_name_half =
-        "<command-message>x</command-message>\n<command-name>/model</command-name>";
-    let stdout_half = "<local-command-stdout>Set model to Fable 5</local-command-stdout>";
-
-    let command_decision = relay_observed_prompt_injected_prompt_decision(command_name_half);
-    assert_eq!(
-        command_decision.injected_class,
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(
-        command_decision.slash_command_kind.as_deref(),
-        Some("/model")
-    );
-    assert!(command_decision.local_only_slash);
-
-    let stdout_decision = relay_observed_prompt_injected_prompt_decision(stdout_half);
-    assert_eq!(
-        stdout_decision.injected_class,
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(
-        stdout_decision.slash_command_kind.as_deref(),
-        Some("local-command-stdout"),
-    );
-    assert!(stdout_decision.local_only_slash);
-
-    assert_ne!(
-        command_decision.slash_command_kind, stdout_decision.slash_command_kind,
-        "the two /model transcript halves intentionally carry different dedupe keys; lifecycle skip must not rely on dedupe",
-    );
-}
-
 // #3178: the machine slash-command control trigger now resolves to a stable
 // command KIND that BOTH the raw `/loop` echo and the expanded `<command-*>`
 // wrapper for the SAME command map to (so the #3153 double-post collapses to
@@ -1425,23 +1309,19 @@ fn slash_command_control_kind_is_stable_across_double_post_halves() {
         slash_command_control_kind("<local-command-stdout>Compacted (12.3k tokens)"),
         "/compact",
     );
-    assert_eq!(
-        slash_command_control_kind(
-            "<local-command-stdout>Compacted 12 messages</local-command-stdout>"
-        ),
-        "/compact",
-    );
 
     // A round-tripped SSH-direct envelope still resolves to the same kind.
     let wrapped_loop = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n/loop 5m /foo\n```";
     assert_eq!(slash_command_control_kind(wrapped_loop), "/loop");
 }
 
-// The note always names the command KIND + tmux session and marks the injection
-// non-active. `/loop` carries its directive body, generic stdout carries a short
-// output preview, and `/compact`/`Compacted …` stdout stays kind-only.
+// The note always names the command KIND + tmux session and marks the
+// injection non-active. `/loop` ALSO carries its directive body (operator
+// wants the recurring loop content visible). Every OTHER machine command
+// (`/compact`, the `Compacted …` stdout) stays kind-only and never leaks its
+// payload.
 #[test]
-fn slash_command_control_note_loop_and_generic_stdout_show_body() {
+fn slash_command_control_note_loop_shows_body_others_kind_only() {
     let loop_note =
         format_slash_command_control_note("sess-a", "/loop", "/loop 290s relay check directive");
     assert!(
@@ -1503,189 +1383,6 @@ fn slash_command_control_note_loop_and_generic_stdout_show_body() {
         !compact_note.contains("Compacted"),
         "note must NOT leak the compact stdout body",
     );
-
-    let stdout_note = format_slash_command_control_note(
-        "sess-a",
-        "local-command-stdout",
-        "<local-command-stdout>Set model to Fable 5</local-command-stdout>",
-    );
-    assert!(stdout_note.contains("머신 슬래시 명령"));
-    assert!(
-        stdout_note.contains("Set model to Fable 5"),
-        "generic stdout notes must include a short body preview",
-    );
-    assert!(stdout_note.contains("```text"));
-}
-
-// #4033 regression guard: broad `<local-command-stdout>...</local-command-stdout>`
-// detection must not disturb the legacy /compact stdout path. Compacted stdout
-// still resolves to `/compact`, remains local-only, and keeps the body hidden.
-#[test]
-fn local_command_stdout_compacted_path_stays_kind_only() {
-    let compact_stdout = "<local-command-stdout>Compacted 12 messages</local-command-stdout>";
-    assert_eq!(
-        classify_injected_prompt(compact_stdout),
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(slash_command_control_kind(compact_stdout), "/compact");
-    assert!(is_local_only_slash_command_prompt(compact_stdout));
-
-    let compact_note = format_slash_command_control_note("sess-a", "/compact", compact_stdout);
-    assert!(compact_note.contains("/compact"));
-    assert!(
-        !compact_note.contains("Compacted"),
-        "legacy /compact stdout note must stay kind-only",
-    );
-}
-
-#[test]
-fn wrapped_local_command_stdout_is_local_only_slash_control() {
-    let wrapped_stdout = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\
-        <local-command-stdout>Set model to Fable 5</local-command-stdout>\n```";
-
-    assert_eq!(
-        classify_injected_prompt(wrapped_stdout),
-        InjectedPromptClass::SlashCommandControl,
-        "a fence-wrapped stdout echo must classify as machine slash control",
-    );
-    assert_eq!(
-        slash_command_control_kind(wrapped_stdout),
-        "local-command-stdout",
-    );
-    assert!(is_local_only_slash_command_prompt(wrapped_stdout));
-
-    let decision = relay_observed_prompt_injected_prompt_decision(wrapped_stdout);
-    assert_eq!(
-        decision.injected_class,
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(
-        decision.slash_command_kind.as_deref(),
-        Some("local-command-stdout"),
-    );
-    assert!(
-        decision.local_only_slash,
-        "local-only stdout returns before anchor/reaction/synthetic ownership",
-    );
-    assert!(!decision.injected_class.is_human_active_turn());
-}
-
-#[test]
-fn wrapped_compacted_stdout_keeps_prefix_only_kind() {
-    let wrapped_compacted = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\
-        <local-command-stdout>Compacted 12 messages\n```";
-
-    assert_eq!(
-        classify_injected_prompt(wrapped_compacted),
-        InjectedPromptClass::SlashCommandControl,
-        "open-fenced Compacted stdout must keep the legacy prefix-only match",
-    );
-    assert_eq!(slash_command_control_kind(wrapped_compacted), "/compact");
-    assert!(is_local_only_slash_command_prompt(wrapped_compacted));
-
-    let decision = relay_observed_prompt_injected_prompt_decision(wrapped_compacted);
-    assert_eq!(decision.slash_command_kind.as_deref(), Some("/compact"));
-    assert!(decision.local_only_slash);
-}
-
-#[test]
-fn wrapped_local_command_stdout_with_appended_user_text_stays_human() {
-    let wrapped_with_user_text = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\
-        <local-command-stdout>Set model to Fable 5</local-command-stdout>\n```\n\
-        이 출력 설명해줘";
-
-    assert_eq!(
-        classify_injected_prompt(wrapped_with_user_text),
-        InjectedPromptClass::HumanTuiDirect,
-        "human text appended after the stdout echo must not be over-suppressed",
-    );
-    assert!(!is_local_only_slash_command_prompt(wrapped_with_user_text));
-
-    let decision = relay_observed_prompt_injected_prompt_decision(wrapped_with_user_text);
-    assert_eq!(decision.injected_class, InjectedPromptClass::HumanTuiDirect,);
-    assert_eq!(decision.slash_command_kind, None);
-    assert!(!decision.local_only_slash);
-}
-
-#[test]
-fn local_command_stdout_negative_cases_stay_human_direct() {
-    let trailing_text = "<local-command-stdout>x</local-command-stdout>\n이 출력 설명해줘";
-    let open_tag_only = "<local-command-stdout>Set model to Fable 5";
-    let mid_body_tag = "please explain this transcript:\n\
-                        <local-command-stdout>x</local-command-stdout>";
-
-    for (prompt, label) in [
-        (
-            trailing_text,
-            "trailing user text after the closing tag is a human prompt",
-        ),
-        (
-            open_tag_only,
-            "open-only non-Compacted stdout is incomplete scanner input",
-        ),
-        (mid_body_tag, "mid-body stdout tags are quoted human text"),
-    ] {
-        assert_eq!(
-            classify_injected_prompt(prompt),
-            InjectedPromptClass::HumanTuiDirect,
-            "{label}",
-        );
-        assert!(
-            !is_local_only_slash_command_prompt(prompt),
-            "{label}: local-only slash detection must stay start-anchored",
-        );
-        let decision = relay_observed_prompt_injected_prompt_decision(prompt);
-        assert_eq!(
-            decision.injected_class,
-            InjectedPromptClass::HumanTuiDirect,
-            "{label}: relay decision must agree with the helper classifier",
-        );
-        assert_eq!(decision.slash_command_kind, None, "{label}");
-        assert!(!decision.local_only_slash, "{label}");
-    }
-
-    let rendered = format_ssh_direct_prompt_notification("claude", "sess-mid-body", mid_body_tag);
-    assert!(
-        rendered.contains("<local-command-stdout>x</local-command-stdout>"),
-        "a mid-body stdout tag should remain part of the human prompt preview",
-    );
-}
-
-#[test]
-fn local_command_stdout_body_command_name_does_not_hijack_kind() {
-    let stdout_with_embedded_command_name = "<local-command-stdout>Set model to Fable 5\n\
-                                            <command-name>/loop</command-name>\n\
-                                            </local-command-stdout>";
-
-    assert_eq!(
-        classify_injected_prompt(stdout_with_embedded_command_name),
-        InjectedPromptClass::SlashCommandControl,
-    );
-    assert_eq!(
-        slash_command_control_kind(stdout_with_embedded_command_name),
-        "local-command-stdout",
-        "a command-name string embedded inside stdout body must not hijack the kind",
-    );
-    assert!(is_local_only_slash_command_prompt(
-        stdout_with_embedded_command_name
-    ));
-
-    let decision =
-        relay_observed_prompt_injected_prompt_decision(stdout_with_embedded_command_name);
-    assert_eq!(
-        decision.slash_command_kind.as_deref(),
-        Some("local-command-stdout"),
-    );
-    assert!(decision.local_only_slash);
-
-    let note = format_slash_command_control_note(
-        "sess-a",
-        "local-command-stdout",
-        stdout_with_embedded_command_name,
-    );
-    assert!(note.contains("머신 슬래시 명령"));
-    assert!(!note.contains("자동 점검(/loop)"));
-    assert!(note.contains("Set model to Fable 5"));
 }
 
 // #3178 CORE (codex fix): the same trigger (a /loop double-post: raw echo +
@@ -1783,18 +1480,6 @@ fn slash_command_control_kind_distinguishes_distinct_unknown_commands() {
         slash_command_control_kind(bar),
         "distinct unknown commands must NOT collapse to one kind"
     );
-
-    let skill = "<command-message>agentdesk-issue-pipeline</command-message>\n\
-                 <command-args>issue 4041</command-args>";
-    assert_eq!(
-        slash_command_control_kind(skill),
-        "agentdesk-issue-pipeline"
-    );
-    assert_ne!(
-        slash_command_control_kind(skill),
-        slash_command_control_kind("<local-command-caveat>x</local-command-caveat>"),
-        "a local-only caveat fallback must not consume a command-message wakeup dedupe key",
-    );
 }
 
 // #3153 regression guard: the compact CONTINUATION banner must STILL classify
@@ -1823,20 +1508,21 @@ fn classify_injected_prompt_continuation_wins_over_embedded_task_tag() {
     );
 }
 
-// #4082: a SystemContinuation is a provider-injected session note, not a turn.
-// It suppresses the user-turn lifecycle and the external-output bridge tail so
-// it cannot strand the mailbox behind a phantom synthetic inflight after
-// `/compact`.
+// #3099 codex re-review (P1): a SystemContinuation must suppress ONLY the
+// user-turn lifecycle (⏳ + anchor + synthetic ownership) — it must STILL
+// deliver the provider's assistant output via the bridge tail. The original
+// early-return ran before the bridge tail spawn, orphaning Claude's output.
+// This guards the contract that drives the restructured relay flow.
 #[test]
-fn system_continuation_suppresses_external_turn_lifecycle() {
+fn system_continuation_suppresses_user_turn_but_still_delivers_output() {
     let cont = InjectedPromptClass::SystemContinuation;
     assert!(
         cont.suppresses_user_turn_lifecycle(),
         "SystemContinuation must drop the ⏳/user-turn lifecycle"
     );
     assert!(
-        !cont.still_delivers_assistant_output(),
-        "SystemContinuation must not spawn a bridge tail or claim a synthetic external turn"
+        cont.still_delivers_assistant_output(),
+        "SystemContinuation must still relay Claude's assistant output (no orphaning)"
     );
     assert!(!cont.is_human_active_turn());
 
@@ -1848,8 +1534,8 @@ fn system_continuation_suppresses_external_turn_lifecycle() {
     assert!(!subagent.still_delivers_assistant_output());
     assert!(!subagent.is_human_active_turn());
 
-    // Human + task-notification turns keep their user-turn lifecycle AND deliver
-    // output.
+    // Human + task-notification turns keep their user-turn lifecycle AND
+    // deliver output.
     for active in [
         InjectedPromptClass::HumanTuiDirect,
         InjectedPromptClass::TaskNotificationEvent,
@@ -2631,9 +2317,11 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
     );
 }
 
-// #3089 A6b r2 [High]/#3998 S1-f2: the codex external-input bridge frame
-// builder emits `OutputOffset` so the bridge has a real ordered range for the
-// unconditional A5 controller route.
+// #3089 A6b r2 [High]: the codex external-input bridge frame builder moved to
+// `tui_prompt_relay_controller_cutover::codex_external_input_bridge_stream_messages`
+// (flag-gated `OutputOffset` plumbing). Its OFF (`[Text, Done]`, byte-identical
+// legacy) and ON (`[Text, OutputOffset, Done]`, reaches the controller) shapes are
+// pinned in that sibling's test module under the shared env lock.
 
 // ====================================================================
 // #3256: stream-through of operator external-input prose. These tests pin
@@ -3159,293 +2847,6 @@ fn synthetic_watcher_claim_requires_live_watcher_covering_output() {
         tmux_session_name,
         Some(&other_path),
     ));
-}
-
-/// #3876 (codex rework): the birth-site relay-owner decision for a TUI-direct /
-/// warm-followup synthetic inflight is gated on a LIVE per-session producer, NOT
-/// the global session-bound flag. `SessionBoundRelay` (sink commits) only when
-/// the watcher cannot own AND session-bound delivery is enabled AND a live
-/// producer exists; otherwise `BridgeAdapter` so the watcher-independent
-/// transcript-direct bridge tail stays the deliverer (regression guard against
-/// the producer-starve answer-loss).
-#[test]
-fn synthetic_relay_owner_gates_session_bound_on_live_producer() {
-    use super::synthetic_start::tui_direct_synthetic_relay_owner;
-
-    // (c) Live watcher owns the output → watcher relays the body (unchanged),
-    // regardless of session-bound / producer signals.
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(true, true, true),
-        ExternalInputRelayOwner::TmuxWatcher,
-    );
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(true, true, false),
-        ExternalInputRelayOwner::TmuxWatcher,
-    );
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(true, false, false),
-        ExternalInputRelayOwner::TmuxWatcher,
-    );
-    // (b) THE FIX (demoed watcher-alive-path-mismatch case): watcher cannot own +
-    // session-bound enabled + a LIVE producer exists (the sink can actually
-    // commit) → SessionBoundRelay.
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(false, true, true),
-        ExternalInputRelayOwner::SessionBoundRelay,
-    );
-    // (a) REGRESSION GUARD (watcher-detached / STALL-WATCHDOG force-clean): watcher
-    // cannot own + NO live producer → BridgeAdapter, so the watcher-independent
-    // transcript-direct bridge tail still delivers (a SessionBoundRelay stamp here
-    // would starve the sink AND stand the tail down → answer loss).
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(false, true, false),
-        ExternalInputRelayOwner::BridgeAdapter,
-    );
-    // Session-bound delivery disabled → legacy bridge-tail path regardless of producer.
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(false, false, true),
-        ExternalInputRelayOwner::BridgeAdapter,
-    );
-    assert_eq!(
-        tui_direct_synthetic_relay_owner(false, false, false),
-        ExternalInputRelayOwner::BridgeAdapter,
-    );
-}
-
-/// #3876 regression pin (terminal delivery, both directions):
-/// * producer-present: the `SessionBoundRelay` synthetic owner makes the unchanged
-///   sink ownership gate ACCEPT terminal delivery (body committed, not
-///   placeholder-only) while exactly one relayer remains (bridge tail stands down).
-/// * producer-absent: the owner falls back to `BridgeAdapter`, the sink gate would
-///   REJECT the ownerless `None` shape (the data loss), and the watcher-independent
-///   bridge tail is the SOLE relayer (`observer_should_spawn_bridge_tail` true) — so
-///   the answer is still delivered (no regression).
-#[cfg(unix)]
-#[test]
-fn synthetic_owner_delivery_path_matches_producer_presence() {
-    use super::synthetic_start::tui_direct_synthetic_relay_owner;
-    use crate::services::discord::session_relay_sink::session_bound_discord_relay_can_own_terminal_delivery;
-
-    let tmux = "AgentDesk-claude-3876-no-owner";
-    let dir = tempfile::tempdir().expect("temp dir");
-    let output_path = dir.path().join("transcript.jsonl");
-    let channel_id = ChannelId::new(940_000_000_003_876);
-    let lease = ExternalInputRelayLease::unassigned(Some(channel_id.get()));
-
-    let make_row = |owner_kind| {
-        build_tui_direct_synthetic_inflight_state(
-            ProviderKind::Claude,
-            channel_id,
-            MessageId::new(940_000_000_203_876),
-            Some(MessageId::new(940_000_000_103_876)),
-            "## 등록 결과\nfull terminal answer body",
-            tmux,
-            Some(&output_path),
-            0,
-            &lease,
-            owner_kind,
-        )
-    };
-
-    // Producer present (the demoed fix case): owner = SessionBoundRelay, the sink
-    // gate ACCEPTS the row (commits the body), and the bridge tail stands down →
-    // the sink is the SOLE committer.
-    let producer_present_owner = tui_direct_synthetic_relay_owner(false, true, true);
-    assert_eq!(
-        producer_present_owner,
-        ExternalInputRelayOwner::SessionBoundRelay
-    );
-    assert!(
-        session_bound_discord_relay_can_own_terminal_delivery(
-            Some(&make_row(RelayOwnerKind::SessionBoundRelay)),
-            tmux,
-        ),
-        "#3876: a SessionBoundRelay synthetic row MUST let the sink commit the terminal body"
-    );
-    assert!(!bridge_adapter_owns_external_turn(producer_present_owner));
-    assert!(!observer_should_spawn_bridge_tail(
-        false,
-        producer_present_owner
-    ));
-
-    // The pre-fix ownerless (None) row is REJECTED by the same sink gate — the
-    // placeholder-only data-loss shape this fix eliminates.
-    assert!(
-        !session_bound_discord_relay_can_own_terminal_delivery(
-            Some(&make_row(RelayOwnerKind::None)),
-            tmux,
-        ),
-        "#3876 regression: an ownerless (None) synthetic row is rejected by the sink gate"
-    );
-
-    // Producer ABSENT (watcher-detached / force-clean): owner = BridgeAdapter, the
-    // sink cannot deliver, so the watcher-independent bridge tail MUST be the SOLE
-    // relayer — `observer_should_spawn_bridge_tail` true → the answer still ships.
-    let producer_absent_owner = tui_direct_synthetic_relay_owner(false, true, false);
-    assert_eq!(
-        producer_absent_owner,
-        ExternalInputRelayOwner::BridgeAdapter
-    );
-    assert!(bridge_adapter_owns_external_turn(producer_absent_owner));
-    assert!(observer_should_spawn_bridge_tail(
-        false,
-        producer_absent_owner
-    ));
-}
-
-// ====================================================================
-// #4082 defect 1 — compact continuation records are neutral session notes.
-// They must render through the existing classifier but must NOT select an
-// external turn owner, start a synthetic inflight, or occupy the mailbox.
-// Genuine typed TUI input keeps the existing synthetic-inflight path.
-// ====================================================================
-
-fn external_turn_test_lease(
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-) -> ExternalInputRelayLease {
-    ExternalInputRelayLease {
-        channel_id: Some(channel_id.get()),
-        turn_id: Some(format!(
-            "external:claude:{}:{tmux_session_name}:test",
-            channel_id.get()
-        )),
-        session_key: Some(format!("session:{tmux_session_name}")),
-        relay_owner: ExternalInputRelayOwner::BridgeAdapter,
-        runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
-        generation:
-            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
-    }
-}
-
-#[tokio::test]
-async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free() {
-    let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
-    let shared = super::super::make_shared_data_for_tests();
-    let provider = ProviderKind::Claude;
-    let channel_id = ChannelId::new(940_000_000_004_082);
-    let tmux = "AgentDesk-claude-4082-compact-continuation";
-    let anchor_id = MessageId::new(940_000_000_004_182);
-    let prompt_text = "This session is being continued from a previous conversation that ran out of context.\n\
-         Summary: compacted transcript body";
-    let prompt = ObservedTuiPrompt {
-        provider: provider.as_str().to_string(),
-        tmux_session_name: tmux.to_string(),
-        prompt: prompt_text.to_string(),
-        observed_at: chrono::Utc::now(),
-    };
-    let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
-    assert_eq!(
-        decision.injected_class,
-        InjectedPromptClass::SystemContinuation
-    );
-    assert!(
-        !decision.starts_external_turn_lifecycle(),
-        "compact continuation records must be passive notes, not external turns"
-    );
-
-    let mut lease = external_turn_test_lease(channel_id, tmux);
-    let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
-        &shared,
-        provider.as_str(),
-        channel_id,
-        &prompt,
-        anchor_id,
-        &decision,
-        &mut lease,
-    )
-    .await;
-    assert!(
-        !deferred,
-        "neutral continuation must not defer or start synthetic ownership"
-    );
-    assert!(
-        super::super::inflight::load_inflight_state(&provider, channel_id.get()).is_none(),
-        "neutral continuation must not write a synthetic inflight row"
-    );
-    let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
-    assert_eq!(snapshot.active_user_message_id, None);
-    assert!(snapshot.cancel_token.is_none());
-
-    let next_message_id = MessageId::new(940_000_000_004_282);
-    assert!(
-        super::super::mailbox_try_start_turn(
-            shared.as_ref(),
-            channel_id,
-            Arc::new(CancelToken::new()),
-            serenity::UserId::new(42),
-            next_message_id,
-        )
-        .await,
-        "subsequent Discord message must start immediately because the mailbox stayed free"
-    );
-}
-
-#[tokio::test]
-async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
-    let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
-    let shared = super::super::make_shared_data_for_tests();
-    let provider = ProviderKind::Claude;
-    let channel_id = ChannelId::new(940_000_000_004_083);
-    let tmux = "AgentDesk-claude-4082-genuine-typed";
-    let anchor_id = MessageId::new(940_000_000_004_183);
-    let prompt = ObservedTuiPrompt {
-        provider: provider.as_str().to_string(),
-        tmux_session_name: tmux.to_string(),
-        prompt: "please review PR #1234".to_string(),
-        observed_at: chrono::Utc::now(),
-    };
-    let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
-    assert_eq!(decision.injected_class, InjectedPromptClass::HumanTuiDirect);
-    assert!(
-        decision.starts_external_turn_lifecycle(),
-        "real typed TUI input must keep the synthetic-start lifecycle"
-    );
-    let transcript_path = temp.path().join("claude-typed.jsonl");
-    std::fs::write(&transcript_path, "").expect("seed transcript path");
-    crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
-        tmux,
-        crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
-            runtime_kind: RuntimeHandoffKind::ClaudeTui,
-            output_path: transcript_path.display().to_string(),
-            relay_output_path: None,
-            input_fifo_path: None,
-            session_id: None,
-            last_offset: 0,
-            relay_last_offset: None,
-        },
-    );
-
-    let mut lease = external_turn_test_lease(channel_id, tmux);
-    let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
-        &shared,
-        provider.as_str(),
-        channel_id,
-        &prompt,
-        anchor_id,
-        &decision,
-        &mut lease,
-    )
-    .await;
-    assert!(
-        !deferred,
-        "no prior turn exists, so the claim should be inline"
-    );
-
-    let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
-    assert_eq!(snapshot.active_user_message_id, Some(anchor_id));
-    assert!(snapshot.cancel_token.is_some());
-    let state = super::super::inflight::load_inflight_state(&provider, channel_id.get())
-        .expect("typed TUI prompt must create synthetic inflight");
-    assert_eq!(state.turn_source, TurnSource::ExternalInput);
-    assert_eq!(state.tmux_session_name.as_deref(), Some(tmux));
-    assert_eq!(state.user_msg_id, anchor_id.get());
-    assert!(
-        !state.relay_ownership_only,
-        "human typed input must remain a full synthetic external turn"
-    );
 }
 
 #[tokio::test]

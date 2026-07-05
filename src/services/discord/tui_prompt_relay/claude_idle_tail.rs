@@ -350,11 +350,9 @@ pub(super) async fn run_claude_idle_response_tail(
                 start_offset,
                 reader_tx,
                 None,
-                crate::services::provider::SessionProbe::tmux_with_structured_output(
+                crate::services::provider::SessionProbe::tmux(
                     tmux_for_reader,
                     ProviderKind::Claude,
-                    Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
-                    transcript_string.clone(),
                 ),
             );
             let offset_result = read_result.map(|result| match result {
@@ -403,7 +401,6 @@ pub(super) async fn run_claude_idle_response_tail(
                 &ProviderKind::Claude,
                 channel_id,
                 &tmux_session_name,
-                lease.session_key.as_deref(),
                 "claude_tui_direct_tail_panicked",
             )
             .await;
@@ -428,7 +425,6 @@ pub(super) async fn run_claude_idle_response_tail(
             &ProviderKind::Claude,
             channel_id,
             &tmux_session_name,
-            lease.session_key.as_deref(),
             "claude_tui_direct_empty_response",
         )
         .await;
@@ -454,7 +450,6 @@ pub(super) async fn run_claude_idle_response_tail(
             &ProviderKind::Claude,
             channel_id,
             &tmux_session_name,
-            lease.session_key.as_deref(),
             "claude_tui_direct_delivery_failed",
         )
         .await;

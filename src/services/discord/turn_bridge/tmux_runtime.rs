@@ -12,14 +12,10 @@ use std::time::Duration;
 // moved items by their original bare names via these glob/explicit re-imports.
 mod interrupt_policy;
 mod pid_exit;
-mod process_backend_cancel;
 mod process_table;
 
 use interrupt_policy::*;
 use pid_exit::wait_for_pid_exit;
-use process_backend_cancel::{
-    hard_stop_unresponsive_process_backend_turn, interrupt_process_backend_turn,
-};
 use process_table::{
     pane_foreground_is_provider_wrapper, provider_cli_pid_in_tmux, send_sigint,
     write_line_to_wrapper_fifo,
@@ -96,12 +92,11 @@ fn tmux_ready_for_input_without_tui_pane(tmux_session_name: &str, provider: &Pro
     {
         return ready;
     }
-    crate::services::provider::tmux_session_fallback_ready_for_input(
-        tmux_session_name,
-        provider,
-        runtime_kind,
-    )
-    .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
+    if crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind) {
+        crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
+    } else {
+        false
+    }
 }
 
 pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
@@ -115,9 +110,6 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         .ok()
         .and_then(|guard| guard.clone());
     let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
-    if tmux_session.is_none() {
-        return interrupt_process_backend_turn(provider, tracked_child_pid, reason);
-    }
     let Some(tmux_session_name) = tmux_session.as_deref() else {
         tracing::error!(
             "provider turn interrupt skipped: provider={} reason={} error=cancel_token_missing_tmux_session",
@@ -639,8 +631,12 @@ async fn hard_stop_unresponsive_provider_cli_turn(
             .and_then(|guard| guard.clone())
     });
     let Some(tmux_session_name) = tmux_session_name else {
-        hard_stop_unresponsive_process_backend_turn(provider, token, interrupt_outcome, reason)
-            .await;
+        tracing::error!(
+            "provider hard-stop skipped: provider={} reason={} error=cancel_token_missing_tmux_session interrupt_missing_tmux_session={}",
+            provider.as_str(),
+            reason,
+            interrupt_outcome.missing_tmux_session
+        );
         return;
     };
 
@@ -811,18 +807,6 @@ pub(in crate::services::discord) fn cancel_active_token(
     let mut termination_recorded = false;
 
     let child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
-    let has_tmux_session = token
-        .tmux_session
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .is_some();
-    if !has_tmux_session
-        && cleanup_policy.should_cleanup_tmux()
-        && let Some(pid) = child_pid
-    {
-        crate::services::session_backend::mark_process_sessions_stopped_by_pid(pid);
-    }
     // `child_pid` is the wrapper PID — i.e. the foreground process of the
     // tmux pane. SIGKILL'ing it tears down the tmux session itself. For
     // `PreserveSession` / `PreserveSessionAndInflight` the caller has
@@ -984,14 +968,11 @@ pub(super) fn is_dcserver_restart_command(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
-    use std::time::Duration;
 
     const RAW_SUBAGENT: &str = r#"<subagent_notification>
 {"agent_path":"/tmp/private-agent","status":{"completed":"Read-only review complete.\n\n1. Check relay path."}}
 </subagent_notification>"#;
     const CHROME_RAW_SUBAGENT: &str = "No response requested.\n<subagent_notification>{\"agent_path\":\"/tmp/private-agent\",\"status\":{\"completed\":\"Read-only review complete.\"}}</subagent_notification>";
-    static SIGINT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn stale_inflight_message_hides_raw_subagent_notification() {
@@ -1033,235 +1014,5 @@ mod tests {
         assert!(handoff.contains("Subagent completed"));
         assert!(!handoff.contains("<subagent_notification>"));
         assert!(!handoff.contains("agent_path"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn issue_4112_pipe_interrupt_sends_sigint_and_marks_stopped() {
-        let _guard = SIGINT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = process_table::take_sigint_test_events();
-        let session_name = format!("pipe-cancel-{}", uuid::Uuid::new_v4());
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::services::session_backend::insert_process_session(
-            session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess { pid: 4112, alive },
-        );
-        let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(4112);
-
-        let outcome =
-            interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
-
-        assert_eq!(process_table::take_sigint_test_events(), vec![4112]);
-        assert_eq!(outcome.tmux_session, None);
-        assert_eq!(outcome.fallback_sigint_pid, Some(4112));
-        assert!(outcome.missing_tmux_session);
-        assert!(!outcome.sigint_target_missing);
-        assert!(crate::services::session_backend::process_session_was_stopped(&session_name));
-        assert!(!crate::services::session_backend::process_session_is_alive(
-            &session_name
-        ));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn issue_3169_process_backend_anonymous_teardown_is_noop() {
-        let _guard = SIGINT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = process_table::take_sigint_test_events();
-        let session_name = format!("pipe-anonymous-teardown-{}", uuid::Uuid::new_v4());
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::services::session_backend::insert_process_session(
-            session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess {
-                pid: 43169,
-                alive: alive.clone(),
-            },
-        );
-        let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(43169);
-
-        let outcome = interrupt_provider_cli_turn(
-            &ProviderKind::Claude,
-            &token,
-            ANONYMOUS_TURN_BRIDGE_TEARDOWN_REASON,
-        )
-        .await;
-
-        assert!(process_table::take_sigint_test_events().is_empty());
-        assert_eq!(outcome.tmux_session, None);
-        assert_eq!(outcome.fallback_sigint_pid, None);
-        assert!(!outcome.sigint_target_missing);
-        assert!(!crate::services::session_backend::process_session_was_stopped(&session_name));
-        assert!(crate::services::session_backend::process_session_is_alive(
-            &session_name
-        ));
-
-        if let Some(handle) =
-            crate::services::session_backend::remove_process_session(&session_name)
-        {
-            crate::services::session_backend::terminate_process_handle(handle);
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn issue_4112_process_backend_registry_miss_skips_sigint() {
-        let _guard = SIGINT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = process_table::take_sigint_test_events();
-        let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(499_112);
-
-        let outcome =
-            interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
-
-        assert!(process_table::take_sigint_test_events().is_empty());
-        assert_eq!(outcome.fallback_sigint_pid, None);
-        assert!(outcome.sigint_target_missing);
-    }
-
-    #[test]
-    fn issue_4112_preserve_session_cancel_does_not_mark_process_backend_stopped() {
-        let session_name = format!("pipe-preserve-mark-only-{}", uuid::Uuid::new_v4());
-        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::services::session_backend::insert_process_session(
-            session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess {
-                pid: 44_112,
-                alive: alive.clone(),
-            },
-        );
-        let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(44_112);
-
-        let termination_recorded =
-            cancel_active_token(&token, TmuxCleanupPolicy::PreserveSession, "auto_heal");
-
-        assert!(!termination_recorded);
-        assert!(token.cancelled.load(Ordering::Relaxed));
-        assert!(!crate::services::session_backend::process_session_was_stopped(&session_name));
-        assert!(crate::services::session_backend::process_session_is_alive(
-            &session_name
-        ));
-
-        if let Some(handle) =
-            crate::services::session_backend::remove_process_session(&session_name)
-        {
-            crate::services::session_backend::terminate_process_handle(handle);
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn issue_4112_process_backend_stop_hard_stops_sigint_ignoring_provider() {
-        let _guard = SIGINT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = process_table::take_sigint_test_events();
-        let session_name = format!("pipe-hard-stop-{}", uuid::Uuid::new_v4());
-        let pid_path =
-            std::env::temp_dir().join(format!("agentdesk-provider-pid-{}", uuid::Uuid::new_v4()));
-        let pid_path_arg = crate::services::process::shell_escape(&pid_path.display().to_string());
-        let wrapper_script = format!(
-            "bash -c 'trap \"\" INT; while :; do read -t 1 _ || true; done' & echo $! > {pid_path_arg}; wait $!"
-        );
-        let mut child = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(wrapper_script)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn process-backend wrapper fixture");
-        let wrapper_pid = child.id();
-        let child_stdin = child.stdin.take().expect("capture wrapper stdin");
-
-        let mut provider_pid = None;
-        for _ in 0..50 {
-            if let Ok(raw) = std::fs::read_to_string(&pid_path)
-                && let Ok(pid) = raw.trim().parse::<u32>()
-            {
-                provider_pid = Some(pid);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let provider_pid = provider_pid.expect("provider fixture pid should be visible");
-        process_table::set_process_backend_provider_pid_for_test(wrapper_pid, provider_pid);
-
-        crate::services::session_backend::insert_process_session(
-            session_name.clone(),
-            crate::services::session_backend::SessionHandle::Process {
-                child_stdin: std::sync::Arc::new(std::sync::Mutex::new(Some(child_stdin))),
-                child: std::sync::Arc::new(std::sync::Mutex::new(Some(child))),
-                pid: wrapper_pid,
-            },
-        );
-        let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(wrapper_pid);
-
-        let termination_recorded = stop_active_turn(
-            &ProviderKind::Claude,
-            &token,
-            TmuxCleanupPolicy::PreserveSession,
-            "explicit_stop",
-        )
-        .await;
-
-        assert!(!termination_recorded);
-        assert_eq!(process_table::take_sigint_test_events(), vec![provider_pid]);
-        assert!(crate::services::session_backend::process_session_was_stopped(&session_name));
-        assert!(wait_for_pid_exit(provider_pid, Duration::from_secs(2)).await);
-        assert!(wait_for_pid_exit(wrapper_pid, Duration::from_secs(2)).await);
-        process_table::clear_process_backend_provider_pid_for_test(wrapper_pid);
-        let _ = std::fs::remove_file(pid_path);
-    }
-
-    #[test]
-    fn issue_4112_tmux_hard_stop_policy_preserves_existing_provider_behavior() {
-        assert_eq!(
-            hard_stop_pid_for_unresponsive_provider(
-                &ProviderKind::Codex,
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                Some(41),
-                None,
-                Some(7),
-            ),
-            Some(41),
-            "non-pane provider PID remains the tmux hard-stop candidate"
-        );
-        assert_eq!(
-            hard_stop_pid_for_unresponsive_provider(
-                &ProviderKind::Codex,
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                true,
-                Some(41),
-                None,
-                Some(7),
-            ),
-            None,
-            "ready tmux panes are still not hard-killed"
-        );
-        assert_eq!(
-            hard_stop_pid_for_unresponsive_provider(
-                &ProviderKind::Claude,
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                Some(41),
-                None,
-                Some(7),
-            ),
-            None,
-            "claude preserve-session tmux turns still avoid hard-killing the CLI"
-        );
     }
 }

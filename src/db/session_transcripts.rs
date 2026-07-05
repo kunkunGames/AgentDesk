@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::db::Db;
 use crate::db::session_agent_resolution::resolve_agent_id_for_session_pg;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,14 +86,20 @@ struct PreparedSessionTranscript {
 }
 
 pub async fn persist_turn_db(
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     entry: PersistSessionTranscript<'_>,
 ) -> Result<bool> {
     let Some(pool) = pg_pool else {
-        return Err(anyhow!("postgres pool is required to persist transcript"));
+        {
+            let _ = db;
+            return Err(anyhow!(
+                "postgres pool is required; sqlite transcript backend is unavailable in production"
+            ));
+        }
     };
 
-    let prepared = prepare_persist_entry_pg(pool, &entry).await?;
+    let prepared = prepare_persist_entry_pg(pool, db, &entry).await?;
     let Some(prepared) = prepared else {
         return Ok(false);
     };
@@ -175,6 +182,7 @@ fn prepare_persist_entry_base(
 
 async fn prepare_persist_entry_pg(
     pool: &PgPool,
+    _db: Option<&Db>,
     entry: &PersistSessionTranscript<'_>,
 ) -> Result<Option<PreparedSessionTranscript>> {
     let Some(mut prepared) = prepare_persist_entry_base(entry)? else {
@@ -196,11 +204,15 @@ async fn prepare_persist_entry_pg(
 }
 
 pub fn dispatch_has_assistant_response_db(
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     dispatch_id: &str,
 ) -> Result<bool> {
     let Some(pool) = pg_pool else {
-        return Ok(false);
+        {
+            let _ = db;
+            return Ok(false);
+        }
     };
 
     let dispatch_id = dispatch_id.to_string();

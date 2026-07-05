@@ -82,8 +82,6 @@ pub(super) const WATCHER_ACTIVITY_HEARTBEAT_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(30);
 const READY_FOR_INPUT_STUCK_LABEL: &str = "stuck_at_ready";
 const READY_FOR_INPUT_STUCK_REASON: &str = "agent ended at Ready for input without commit/push";
-const BACKGROUND_AGENT_PENDING_SNIFF_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
 #[path = "tmux_kill_policy.rs"]
 mod tmux_kill_policy;
 #[allow(unused_imports)]
@@ -94,29 +92,6 @@ pub(super) use self::tmux_kill_policy::{
     recent_turn_stop_for_channel, recent_turn_stop_for_watcher_range, record_recent_turn_stop,
     tmux_output_offset,
 };
-
-pub(in crate::services::discord) async fn sniff_background_agent_pending_for_completion(
-    tmux_session_name: Option<&str>,
-) -> bool {
-    let Some(tmux_session_name) = tmux_session_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    else {
-        // No live tmux-session context exists for this completion producer.
-        return false;
-    };
-    let tmux_session_name = tmux_session_name.to_string();
-    tokio::time::timeout(
-        BACKGROUND_AGENT_PENDING_SNIFF_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            crate::services::tmux_common::sniff_background_agent_pending(&tmux_session_name)
-        }),
-    )
-    .await
-    .unwrap_or(Ok(false))
-    .unwrap_or(false)
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct WatcherLineOutcome {
     pub found_result: bool,
@@ -167,10 +142,6 @@ pub(super) struct RestoredWatcherTurn {
     /// restored inflight, carried so a watcher-owned re-acquire (after the row
     /// is cleared mid-turn) can re-pin it instead of orphaning the `⏳`.
     pub(super) injected_prompt_message_id: Option<u64>,
-    /// #3871: frozen streamed rollover-prefix message ids restored from the
-    /// persisted row so a terminal full-body fallback in a later iteration / after
-    /// a restart still deletes every accumulated prefix (no residual duplicate).
-    streaming_rollover_frozen_msg_ids: Vec<MessageId>,
 }
 
 #[derive(Debug)]
@@ -182,8 +153,6 @@ struct WatcherStreamSeed {
     last_edit_text: String,
     task_notification_kind: Option<TaskNotificationKind>,
     finish_mailbox_on_completion: bool,
-    /// #3871: see [`RestoredWatcherTurn::streaming_rollover_frozen_msg_ids`].
-    streaming_rollover_frozen_msg_ids: Vec<MessageId>,
 }
 
 fn normalize_response_sent_offset(full_response: &str, response_sent_offset: usize) -> usize {
@@ -246,12 +215,6 @@ pub(super) fn restored_watcher_turn_from_inflight(
         task_notification_kind: state.task_notification_kind,
         finish_mailbox_on_completion,
         injected_prompt_message_id: state.injected_prompt_message_id,
-        streaming_rollover_frozen_msg_ids: state
-            .streaming_rollover_frozen_msg_ids
-            .iter()
-            .copied()
-            .map(MessageId::new)
-            .collect(),
     })
 }
 
@@ -265,7 +228,6 @@ fn watcher_stream_seed(restored_turn: Option<RestoredWatcherTurn>) -> WatcherStr
             last_edit_text: restored.last_edit_text,
             task_notification_kind: restored.task_notification_kind,
             finish_mailbox_on_completion: restored.finish_mailbox_on_completion,
-            streaming_rollover_frozen_msg_ids: restored.streaming_rollover_frozen_msg_ids,
         },
         None => WatcherStreamSeed {
             placeholder_msg_id: None,
@@ -275,7 +237,6 @@ fn watcher_stream_seed(restored_turn: Option<RestoredWatcherTurn>) -> WatcherStr
             last_edit_text: String::new(),
             task_notification_kind: None,
             finish_mailbox_on_completion: false,
-            streaming_rollover_frozen_msg_ids: Vec::new(),
         },
     }
 }
@@ -415,6 +376,7 @@ async fn emit_context_compacted_lifecycle_from_watcher(
             .notification_content()
             .unwrap_or_else(|| "📦 컨텍스트 자동 압축".to_string());
         enqueue_lifecycle_notification_best_effort(
+            sqlite_runtime_db(shared.as_ref()),
             shared.pg_pool.as_ref(),
             target.as_str(),
             None,
@@ -582,6 +544,7 @@ pub(super) fn consume_monitor_auto_turn_preamble_once(injected: &mut bool) -> Op
 
 fn enqueue_monitor_auto_turn_suppressed_notification(
     pg_pool: Option<&sqlx::PgPool>,
+    db: Option<&crate::db::Db>,
     channel_id: ChannelId,
     tmux_session_name: &str,
     data_start_offset: u64,
@@ -593,6 +556,7 @@ fn enqueue_monitor_auto_turn_suppressed_notification(
     let label = monitor_auto_turn_label(tmux_session_name);
     let content = monitor_auto_turn_completion_notice(&label, event_count, entry_keys);
     enqueue_lifecycle_notification_best_effort(
+        db,
         pg_pool,
         target.as_str(),
         Some(session_key.as_str()),
@@ -603,6 +567,7 @@ fn enqueue_monitor_auto_turn_suppressed_notification(
 
 fn enqueue_monitor_auto_turn_deferred_notification(
     pg_pool: Option<&sqlx::PgPool>,
+    db: Option<&crate::db::Db>,
     channel_id: ChannelId,
     data_start_offset: u64,
 ) -> bool {
@@ -613,6 +578,7 @@ fn enqueue_monitor_auto_turn_deferred_notification(
         data_start_offset
     );
     enqueue_lifecycle_notification_best_effort(
+        db,
         pg_pool,
         target.as_str(),
         Some(session_key.as_str()),
@@ -686,15 +652,15 @@ async fn start_monitor_auto_turn_when_available(
 
         let token = Arc::new(crate::services::provider::CancelToken::new());
         // #3167 — the monitor auto-turn is a low-priority background relay; mark
-        // it with the distinct monitor kind so queued external USER intervention
-        // is not starved and synthetic stale-reclaim never preempts it.
+        // it `Background` so a queued external USER intervention is not starved
+        // behind a continuously-cycling monitor turn.
         let started = super::mailbox_try_start_turn_kinded(
             shared,
             channel_id,
             token,
             UserId::new(1),
             synthetic_message_id,
-            crate::services::turn_orchestrator::ActiveTurnKind::MonitorAutoTurn,
+            crate::services::turn_orchestrator::ActiveTurnKind::Background,
         )
         .await;
         if started {
@@ -733,6 +699,7 @@ async fn start_monitor_auto_turn_when_available(
             deferred = true;
             let _ = enqueue_monitor_auto_turn_deferred_notification(
                 shared.pg_pool.as_ref(),
+                sqlite_runtime_db(shared),
                 channel_id,
                 data_start_offset,
             );
@@ -1131,23 +1098,30 @@ fn is_terminal_finalize_stop_candidate(
     terminal_output_committed && dispatch_ok && watcher_handled_mailbox_finish
 }
 
-/// #2161/#4047 TUI completion observation — decide whether the terminal path
-/// should record pane liveness and strict completion-signal telemetry before
-/// emitting `✅ 응답 완료` / `✅ 백그라운드 완료`.
+/// #2161 TUI completion gate — decide whether the user-visible
+/// `✅ 응답 완료` / `✅ 백그라운드 완료` status event must wait for the
+/// underlying TUI pane to reach quiescence before being emitted.
 ///
 /// The CLI provider session can write a terminal `result` JSONL event before
 /// the interactive TUI has finished rendering tool output, plan presentations,
-/// or trailing assistant text into its tmux pane. S2-b makes the JSONL
-/// terminator the sole finalize truth source, so this path no longer waits for
-/// or suppresses completion based on quiescence.
+/// or trailing assistant text into its tmux pane. Without this gate the
+/// caller relays the response text, immediately marks the turn as
+/// `TurnCompleted`, and the user sees `응답 완료` on Discord while their
+/// right-side tmux pane is still actively scrolling / showing
+/// `almost done thinking`. Subsequent relay messages can then continue past
+/// the completion marker — a lifecycle bug.
 ///
 /// We currently only gate `RuntimeHandoffKind::ClaudeTui`. `LegacyTmuxWrapper`
-/// drives a non-interactive wrapper script whose `result` event coincides with
-/// the script exiting, so no extra observation is needed.
+/// drives a non-interactive wrapper script whose `result` event coincides
+/// with the script exiting, so no extra quiescence step is needed.
+/// The gate is based on structured provider JSONL state, not visible TUI
+/// composer chrome.
 ///
 /// `task_notification_kind` is accepted but intentionally does NOT skip the
-/// observation — a Background or MonitorAutoTurn that runs inside ClaudeTui
-/// still emits a visible status transition (`✅ 백그라운드 완료`).
+/// gate — a Background or MonitorAutoTurn that runs inside ClaudeTui still
+/// emits a visible status transition (`✅ 백그라운드 완료`) and the user
+/// observes the same premature-completion bug on the same pane. Codex review
+/// on #2161 flagged the original task-notification skip as the H3 finding.
 #[inline]
 pub(super) fn should_gate_completion_for_tui_quiescence(
     runtime_kind: Option<crate::services::agent_protocol::RuntimeHandoffKind>,
@@ -1156,7 +1130,8 @@ pub(super) fn should_gate_completion_for_tui_quiescence(
 ) -> bool {
     // rebind_origin inflights describe an externally-launched tmux session
     // that AgentDesk did not start — the operator (not the Discord turn)
-    // owns input cadence. Don't attach AgentDesk's pane observation to it.
+    // owns input cadence and the "응답 완료" marker is suppressed by other
+    // rebind-origin guards anyway. Don't add an additional wait.
     if rebind_origin {
         return false;
     }
@@ -1165,6 +1140,20 @@ pub(super) fn should_gate_completion_for_tui_quiescence(
         Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui)
     )
 }
+
+/// Upper bound for `should_gate_completion_for_tui_quiescence` polling.
+/// Kept short enough that a hung pane cannot stall the user-visible
+/// `응답 완료` marker for more than a few seconds — the gate is best-effort
+/// observability, not a correctness primitive.
+pub(super) const TUI_COMPLETION_QUIESCENCE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Poll interval inside the quiescence wait. Matches the existing
+/// `READY_FOR_INPUT_IDLE_PROBE_INTERVAL` cadence used elsewhere in the
+/// watcher so concurrent ticks don't fight each other on the same tmux
+/// session.
+pub(super) const TUI_COMPLETION_QUIESCENCE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 #[inline]
 fn watcher_stop_decision_after_terminal_finalize(
@@ -1254,27 +1243,6 @@ mod terminal_finalize_liveness_tests {
 mod monitor_auto_turn_signal_tests {
     use super::*;
 
-    struct EnvGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set_root(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
-
     #[tokio::test]
     async fn monitor_auto_turn_wait_wakes_on_turn_finished_signal() {
         let registry = crate::services::turn_orchestrator::ChannelMailboxRegistry::default();
@@ -1292,67 +1260,6 @@ mod monitor_auto_turn_signal_tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         signal.mark_done();
         waiter.await.expect("waiter task should not panic");
-    }
-
-    #[tokio::test]
-    async fn finish_monitor_auto_turn_if_claimed_releases_mailbox_token() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(4_019_240);
-        let synthetic_message_id = MessageId::new(4_019_340);
-        let ledger_generation = next_monitor_auto_turn_ledger_generation();
-        let token = Arc::new(crate::services::provider::CancelToken::new());
-        assert!(
-            crate::services::discord::mailbox_try_start_turn_kinded(
-                &shared,
-                channel_id,
-                token.clone(),
-                UserId::new(1),
-                synthetic_message_id,
-                crate::services::turn_orchestrator::ActiveTurnKind::MonitorAutoTurn,
-            )
-            .await
-        );
-        crate::services::discord::increment_global_active(&shared, "test_monitor_auto_turn");
-        shared.turn_finalizer.register_start(
-            crate::services::discord::turn_finalizer::TurnKey::new(
-                channel_id,
-                synthetic_message_id.get(),
-                ledger_generation,
-            ),
-            provider.clone(),
-            crate::services::discord::inflight::RelayOwnerKind::Watcher,
-            &shared,
-        );
-
-        let mut claimed = true;
-        let mut finished = false;
-        let mut claimed_message_id = Some(synthetic_message_id);
-        let mut claimed_generation = Some(ledger_generation);
-        finish_monitor_auto_turn_if_claimed(
-            &shared,
-            &provider,
-            channel_id,
-            &mut claimed,
-            &mut finished,
-            &mut claimed_message_id,
-            &mut claimed_generation,
-        )
-        .await;
-
-        assert!(!claimed);
-        assert!(finished);
-        assert_eq!(claimed_message_id, None);
-        assert_eq!(claimed_generation, None);
-        assert!(token.cancelled.load(Ordering::Relaxed));
-        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
-        let snapshot = shared.mailbox(channel_id).snapshot().await;
-        assert_eq!(snapshot.active_user_message_id, None);
     }
 }
 
@@ -1464,26 +1371,37 @@ mod tui_completion_gate_outcome_tests {
     }
 
     #[test]
-    fn busy_observed_still_emits() {
-        assert!(TuiCompletionGateOutcome::BusyObserved.should_emit_completion());
+    fn timed_out_suppresses_emit() {
+        // Codex H2: timeout MUST suppress the TurnCompleted emit;
+        // placeholder sweeper / next-turn intake reconciles later.
+        assert!(!TuiCompletionGateOutcome::TimedOut.should_emit_completion());
     }
 }
 
-/// #4047 regression coverage — the old lifecycle pause derived from
-/// `TuiCompletionGateOutcome` is gone. A busy pane observation is telemetry only
-/// and must not suppress completion or cleanup after the finalizer authority
-/// proves `Done`.
+/// #2293 regression coverage — the `lifecycle_stage_paused` boolean derived
+/// from `TuiCompletionGateOutcome` is what gates every TimedOut side-effect
+/// in `tmux_watcher.rs` (✅ reaction, transcript persist, history append,
+/// confirmed-end watermark, clear_inflight, finish_restored_watcher_active_turn,
+/// queue kickoff, terminal-finalize stop). Same pattern in `turn_bridge` and
+/// `recovery_engine`. The pure derivation lives in this module's
+/// `should_emit_completion` contract, but the consumers compute their flag
+/// inline via `matches!(outcome, TuiCompletionGateOutcome::TimedOut)` — these
+/// tests pin the matrix so a future refactor that adds another variant
+/// cannot silently widen the "proceed" set without also updating the side-
+/// effect gates.
 #[cfg(test)]
 mod lifecycle_stage_pause_matrix_tests {
     use super::TuiCompletionGateOutcome;
 
+    /// Mirrors the `matches!` predicate inlined at the watcher / bridge /
+    /// recovery side-effect gates. Keeping it as a tiny helper here makes
+    /// the gate matrix testable without re-implementing the consumers.
     fn lifecycle_stage_paused(outcome: TuiCompletionGateOutcome) -> bool {
-        let _ = outcome;
-        false
+        matches!(outcome, TuiCompletionGateOutcome::TimedOut)
     }
 
     #[test]
-    fn gate_outcomes_never_pause_lifecycle() {
+    fn paused_only_on_timed_out() {
         assert!(!lifecycle_stage_paused(TuiCompletionGateOutcome::NotGated));
         assert!(!lifecycle_stage_paused(
             TuiCompletionGateOutcome::ConfirmedIdle
@@ -1491,21 +1409,27 @@ mod lifecycle_stage_pause_matrix_tests {
         assert!(!lifecycle_stage_paused(
             TuiCompletionGateOutcome::SkippedDead
         ));
-        assert!(!lifecycle_stage_paused(
-            TuiCompletionGateOutcome::BusyObserved
-        ));
+        assert!(lifecycle_stage_paused(TuiCompletionGateOutcome::TimedOut));
     }
 
     #[test]
-    fn every_outcome_emits_completion() {
+    fn pause_matrix_is_complement_of_emit_matrix() {
+        // Every outcome where the gate DOES emit completion is also a
+        // outcome where lifecycle MUST proceed — and vice versa. If these
+        // two ever drift apart we'd either suppress the user-visible
+        // `응답 완료` while still releasing the mailbox (the original
+        // #2293 cascade) or emit completion while pausing the cleanup.
         for outcome in [
             TuiCompletionGateOutcome::NotGated,
             TuiCompletionGateOutcome::ConfirmedIdle,
             TuiCompletionGateOutcome::SkippedDead,
-            TuiCompletionGateOutcome::BusyObserved,
+            TuiCompletionGateOutcome::TimedOut,
         ] {
-            assert!(outcome.should_emit_completion(), "{outcome:?}");
-            assert!(!lifecycle_stage_paused(outcome), "{outcome:?}");
+            assert_eq!(
+                outcome.should_emit_completion(),
+                !lifecycle_stage_paused(outcome),
+                "emit/pause complementarity violated for {outcome:?}",
+            );
         }
     }
 }
@@ -1762,9 +1686,6 @@ fn persist_watcher_stream_progress(
     task_notification_kind: Option<TaskNotificationKind>,
     any_tool_used: bool,
     has_post_tool_text: bool,
-    // #3871: the frozen streamed rollover-prefix ids accumulated this invocation,
-    // persisted so a later-iteration / post-restart terminal fallback can delete them.
-    streaming_rollover_frozen_msg_ids: &[MessageId],
 ) {
     // #3558: pre-emit the in-bounds telemetry against the caller's snapshot for
     // continuity; the helper re-clamps `response_sent_offset` against the
@@ -1810,10 +1731,6 @@ fn persist_watcher_stream_progress(
             task_notification_kind,
             any_tool_used,
             has_post_tool_text,
-            streaming_rollover_frozen_msg_ids: streaming_rollover_frozen_msg_ids
-                .iter()
-                .map(|id| id.get())
-                .collect(),
         },
     );
 }
@@ -1837,7 +1754,7 @@ async fn finish_restored_watcher_active_turn(
     // `finish_mailbox_on_completion`. Restore/recovery callers that have NOT
     // confirmed a normal completion pass `false` and keep the restore-gated path.
     normal_completion: bool,
-    _kickoff_queue: bool,
+    kickoff_queue: bool,
     // #3350 codex r1-1: the caller's PRE-CLEAR row snapshot for the #3303
     // DeferredClaim marker ensure — inflight is cleared before this helper
     // (see `finalizer_turn_id`), so a row re-load cannot authenticate the
@@ -1898,7 +1815,7 @@ async fn finish_restored_watcher_active_turn(
             shared.clone(),
         )
         .await;
-    let (_mailbox_online, _has_pending) = match outcome {
+    let (mailbox_online, has_pending) = match outcome {
         super::turn_finalizer::FinalizeOutcome::Finalized {
             has_pending,
             mailbox_online,
@@ -1914,7 +1831,14 @@ async fn finish_restored_watcher_active_turn(
         super::turn_finalizer::FinalizeOutcome::AlreadyFinalized
         | super::turn_finalizer::FinalizeOutcome::Deferred => (false, false),
     };
-    let _ = stop_source;
+    if kickoff_queue && mailbox_online && has_pending {
+        super::schedule_deferred_idle_queue_kickoff(
+            shared.clone(),
+            provider.clone(),
+            channel_id,
+            stop_source,
+        );
+    }
     // Drove the finalize (reached here past the early-return gate).
     true
 }
@@ -2031,7 +1955,6 @@ mod watcher_stream_progress_tests {
             None,
             true,
             false,
-            &[],
         );
 
         let persisted = super::super::inflight::load_inflight_state(&provider, channel_id.get())
@@ -2098,119 +2021,5 @@ mod restored_turn_injected_anchor_tests {
             "the restored turn must carry the #3099 hourglass anchor so the \
              streaming-interval re-acquire can re-pin it (F3 regression)"
         );
-    }
-}
-
-#[cfg(test)]
-mod streaming_rollover_frozen_prefix_persistence_tests {
-    use super::{
-        persist_watcher_stream_progress, restored_watcher_turn_from_inflight, watcher_stream_seed,
-    };
-    use crate::services::discord::inflight::InflightTurnState;
-    use crate::services::provider::ProviderKind;
-    use poise::serenity_prelude::{ChannelId, MessageId};
-
-    // #3871: the frozen rollover-prefix ids must survive ACROSS `'watcher_loop`
-    // iterations / a watcher restart. The local accumulator is `Vec::new()`'d each
-    // iteration, so a terminal full-body fallback that runs in a LATER iteration
-    // than the rollover-freeze (idle-split where the result JSONL lags, or a
-    // watcher restart mid-turn) would — without persistence — start with an empty
-    // set and leave the earlier frozen prefix UNDELETED (residual duplicate). This
-    // pins the persist→restore round-trip + the monotonic union-merge so iteration
-    // B still deletes the prefix iteration A froze.
-    #[test]
-    fn frozen_prefix_persists_across_iteration_and_restore_for_terminal_delete() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(1_521_269_012_347_097_158);
-        let tmux_session_name = "AgentDesk-claude-adk-3871-persist";
-        let state = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            Some("claude-pipe".to_string()),
-            42,
-            7_001,
-            7_002, // current_msg_id non-zero => restorable
-            "long answer".to_string(),
-            Some("session-3871".to_string()),
-            Some(tmux_session_name.to_string()),
-            Some("/tmp/agentdesk-3871.jsonl".to_string()),
-            None,
-            0,
-        );
-        super::super::inflight::save_inflight_state(&state).expect("save inflight");
-
-        // Iteration A froze prefix F1 mid-stream and persisted progress.
-        let f1 = MessageId::new(9_001);
-        persist_watcher_stream_progress(
-            &provider,
-            channel_id,
-            tmux_session_name,
-            None,
-            Some(MessageId::new(9_100)),
-            "first chunk frozen…",
-            0,
-            None,
-            None,
-            None,
-            false,
-            false,
-            &[f1],
-        );
-
-        // Iteration B / a watcher restart re-enters with an EMPTY local vec and
-        // SEEDS from the persisted row: the frozen prefix must come back so the
-        // terminal full-body fallback can still delete it.
-        let reloaded = super::super::inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("reload row A");
-        let restored = restored_watcher_turn_from_inflight(&reloaded, tmux_session_name, false)
-            .expect("a non-rebind inflight with a real current_msg_id restores");
-        let seed = watcher_stream_seed(Some(restored));
-        assert_eq!(
-            seed.streaming_rollover_frozen_msg_ids,
-            vec![f1],
-            "iteration B / restart must restore the prefix frozen in iteration A"
-        );
-        assert_eq!(
-            super::placeholder_suppression::watcher_rollover_prefixes_to_delete_on_terminal(
-                true,
-                &seed.streaming_rollover_frozen_msg_ids,
-            ),
-            vec![f1],
-            "the restored frozen prefix is deleted on iteration B's full-body fallback (no residual dup)"
-        );
-
-        // A SECOND freeze (F2) in iteration B union-merges monotonically — F1 is
-        // never dropped and no id is duplicated.
-        let f2 = MessageId::new(9_002);
-        persist_watcher_stream_progress(
-            &provider,
-            channel_id,
-            tmux_session_name,
-            None,
-            Some(MessageId::new(9_101)),
-            "first chunk frozen…second chunk frozen…",
-            0,
-            None,
-            None,
-            None,
-            false,
-            false,
-            &[f1, f2],
-        );
-        let reloaded2 = super::super::inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("reload row B");
-        assert_eq!(
-            reloaded2.streaming_rollover_frozen_msg_ids,
-            vec![f1.get(), f2.get()],
-            "the persisted frozen-prefix set is monotonic (union, no dup)"
-        );
-
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 }

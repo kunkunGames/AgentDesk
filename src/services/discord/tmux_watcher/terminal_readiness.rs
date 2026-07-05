@@ -52,28 +52,6 @@ pub(super) fn adopt_watcher_terminal_message_ids_from_inflight(
     }
 }
 
-pub(super) fn merge_persisted_rollover_frozen_msg_ids(
-    local: &mut Vec<serenity::MessageId>,
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-) {
-    let Some(inflight) = inflight.filter(|state| {
-        state.tmux_session_name.as_deref() == Some(tmux_session_name) && !state.rebind_origin
-    }) else {
-        return;
-    };
-    for msg_id in inflight
-        .streaming_rollover_frozen_msg_ids
-        .iter()
-        .copied()
-        .map(serenity::MessageId::new)
-    {
-        if !local.contains(&msg_id) {
-            local.push(msg_id);
-        }
-    }
-}
-
 pub(super) fn watcher_inflight_represents_external_input(
     inflight: Option<&InflightTurnState>,
 ) -> bool {
@@ -117,24 +95,6 @@ pub(super) fn watcher_inflight_needs_anchor_lifecycle_cleanup(
 ) -> bool {
     watcher_inflight_represents_external_input(Some(inflight))
         && (inflight.user_msg_id == 0 || inflight.rebind_origin)
-        // #4002 (safety belt): a relay-ownership-only SystemContinuation row must
-        // never drive ANY completion reaction path. It currently keeps
-        // `user_msg_id != 0` and `!rebind_origin` so this predicate is already
-        // `false` for it; the explicit guard keeps that true if either invariant
-        // ever changes.
-        && !inflight.relay_ownership_only
-}
-
-/// #4002: gate for the watcher completion **Path B** — the `⏳ → ✅` reaction on
-/// `user_msg_id` plus the `session_transcripts` / `turn_analytics` row persistence.
-/// It applies ONLY to a real user-authored turn: a live `user_msg_id`, not a
-/// `rebind_origin` synthetic, and NOT a `relay_ownership_only` SystemContinuation
-/// (compact-resume) row — whose neutral note must never gain a `✅` or a phantom
-/// user-turn analytics/transcript row (`turn_id=discord:<channel>:note.id`). The
-/// relay-ownership adoption / bridge-tail stand-down / response finalize are all
-/// upstream of this gate and stay unaffected.
-pub(super) fn watcher_completion_lifecycle_applies(inflight: &InflightTurnState) -> bool {
-    !inflight.rebind_origin && inflight.user_msg_id != 0 && !inflight.relay_ownership_only
 }
 
 pub(super) fn watcher_direct_terminal_should_commit_session_idle(
@@ -229,12 +189,11 @@ pub(super) fn watcher_session_ready_for_input(
     ) {
         return ready;
     }
-    crate::services::provider::tmux_session_fallback_ready_for_input(
-        tmux_session_name,
-        provider,
-        runtime_kind,
-    )
-    .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
+    if crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind) {
+        crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
+    } else {
+        false
+    }
 }
 
 pub(super) fn discard_watcher_pending_buffer_after_suppressed_turn(
@@ -242,14 +201,12 @@ pub(super) fn discard_watcher_pending_buffer_after_suppressed_turn(
     all_data_start_offset: &mut u64,
     all_data_fully_mirrored_to_session_relay: &mut bool,
     all_data_session_bound_relay_ack: &mut Option<SessionBoundRelayAckTarget>,
-    all_data_first_forwarded_relay_sequence: &mut Option<u64>,
     current_offset: u64,
 ) {
     all_data.clear();
     *all_data_start_offset = current_offset;
     *all_data_fully_mirrored_to_session_relay = true;
     *all_data_session_bound_relay_ack = None;
-    *all_data_first_forwarded_relay_sequence = None;
 }
 
 #[cfg(test)]

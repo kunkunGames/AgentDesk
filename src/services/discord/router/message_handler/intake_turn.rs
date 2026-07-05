@@ -1,20 +1,22 @@
-use super::super::super::queue_marker;
-use super::super::super::turn_view_reconciler::{
-    note_intake_turn_cleared_current as tv_clear_current,
-    note_intake_turn_started_current_with_attempt as tv_start_current_with_attempt,
-};
 use super::voice_announcement_route::route_voice_transcript_announcement_once;
 use super::*;
 
-mod race_loss;
-mod turn_watchdog;
-mod voice_intake;
-
-/// Queue-marker reactions to strip when a queued turn is promoted to active.
-/// The promotion point only knows the head message id, so it clears every
-/// marker the queue gate can add (standalone, merged, and reconcile-gate).
-pub(super) const fn queue_pending_reactions_to_clear() -> [char; 3] {
-    super::super::super::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS
+/// #3182: the queue-pending reaction(s) to strip from a user message when its
+/// queued turn is dequeued and promoted to active.
+///
+/// The intake gate reacts a queued user message with `📬` (standalone queue
+/// head) or `➕` (merged into a previous head) via `queue_pending_reaction_for`.
+/// At the normal dequeue/promotion point (`handle_text_message`, `started==true`)
+/// we only know the head `user_msg_id`, not whether it carried `📬` or `➕`, so
+/// we attempt to remove BOTH candidates. Removing a reaction that was never
+/// added is a harmless no-op, and this mirrors the existing live-dispatch
+/// cleanup in `DiscordGateway::dispatch_queued_turn` (gateway.rs) and the
+/// queue-exit drain (mod.rs), both of which remove `📬` and `➕` together.
+///
+/// Returned as a fixed array so the emoji set is unit-testable without driving
+/// the full async intake path.
+pub(super) const fn queue_pending_reactions_to_clear() -> [char; 2] {
+    ['📬', '➕']
 }
 
 /// Bundle of Discord-runtime dependencies that `handle_text_message`
@@ -107,9 +109,6 @@ pub(crate) async fn execute_intake_turn_core(
         request.dm_hint,
         request.turn_kind,
         Vec::new(),
-        // Worker dispatch has no in-process gate carry-forward; it re-resolves
-        // the durable announcement row for its `user_msg_id` (#3905).
-        None,
     )
     .await
 }
@@ -130,7 +129,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
     preloaded_uploads: Vec<String>,
-    gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<(), Error> {
     let IntakeDeps {
         http,
@@ -160,19 +158,121 @@ pub(in crate::services::discord) async fn handle_text_message(
     } else {
         None
     };
-    let (voice_announcement, voice_announcement_already_accepted) =
-        voice_intake::resolve_intake_voice_announcement(
-            shared,
-            channel_id,
-            user_msg_id,
-            request_owner,
-            announce_bot_id,
-            is_readable_voice_announcement,
-            &voice_announcement_ref,
-            gate_resolved_voice_announcement,
-            stored_voice_announcement,
-        )
-        .await;
+    let mut voice_announcement_already_accepted = false;
+    let voice_announcement = if announce_bot_id == Some(request_owner.get()) {
+        if let Some((announcement, accepted_replay)) = stored_voice_announcement {
+            if let Some(pool) = shared.pg_pool.as_ref() {
+                match crate::voice::announce_meta::load_voice_announcement_durable(
+                    pool,
+                    user_msg_id,
+                )
+                .await
+                {
+                    Ok(Some(durable)) => Some(durable),
+                    Ok(None) if accepted_replay => {
+                        match crate::voice::announce_meta::load_consumed_voice_announcement_durable(
+                            pool,
+                            user_msg_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(consumed)) => {
+                                voice_announcement_already_accepted = true;
+                                Some(consumed)
+                            }
+                            Ok(None) => {
+                                tracing::info!(
+                                    channel_id = channel_id.get(),
+                                    message_id = user_msg_id.get(),
+                                    "accepted queued voice transcript announcement has no consumed durable row; refusing local replay"
+                                );
+                                None
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    channel_id = channel_id.get(),
+                                    message_id = user_msg_id.get(),
+                                    "accepted queued voice transcript announcement consumed durable metadata load failed"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            channel_id = channel_id.get(),
+                            message_id = user_msg_id.get(),
+                            "stored voice transcript announcement has no live durable row; refusing local-only consume"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            channel_id = channel_id.get(),
+                            message_id = user_msg_id.get(),
+                            "voice transcript announcement durable metadata load failed after local store hit"
+                        );
+                        None
+                    }
+                }
+            } else {
+                Some(announcement)
+            }
+        } else if is_readable_voice_announcement {
+            match shared.pg_pool.as_ref() {
+                Some(pool) => match crate::voice::announce_meta::load_voice_announcement_durable(
+                    pool,
+                    user_msg_id,
+                )
+                .await
+                {
+                    Ok(Some(announcement)) => Some(announcement),
+                    Ok(None) => {
+                        if let Some(pending_key) = voice_announcement_ref.as_deref() {
+                            match crate::voice::announce_meta::bind_pending_voice_announcement_by_key_durable(
+                                pool,
+                                pending_key,
+                                channel_id,
+                                user_msg_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(announcement)) => Some(announcement),
+                                Ok(None) => None,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        channel_id = channel_id.get(),
+                                        message_id = user_msg_id.get(),
+                                        "voice transcript announcement pending metadata bind failed"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            channel_id = channel_id.get(),
+                            message_id = user_msg_id.get(),
+                            "voice transcript announcement durable metadata load failed"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // #3464: scope unauthorized voice announcements to the owning agent — a
     // non-owning agent must not fall through to generic handling and answer
     // (multi-agent reply storm). Decision + one-shot warn live in
@@ -603,15 +703,15 @@ pub(in crate::services::discord) async fn handle_text_message(
                 }
             }
         };
-    let turn_start_attempt = if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
+    if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
         && !super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id)
     {
-        tv_start_current_with_attempt(shared, http, channel_id, user_msg_id, "intake_start")
-            .await
-            .attempt()
-    } else {
-        None
-    };
+        // Voice-originated turns use a synthetic msg id (>= 9e18) that does
+        // not correspond to a real Discord message, so add_reaction would
+        // return "Unknown Message". TTS already plays an acknowledgement
+        // for the user — the ⏳ reaction is text-intake only.
+        add_reaction(http, channel_id, user_msg_id, '⏳').await;
+    }
 
     // ── Dispatch thread auto-creation ──────────────────────────────
     // When a dispatch message arrives, create a Discord thread for
@@ -1180,7 +1280,13 @@ pub(in crate::services::discord) async fn handle_text_message(
         if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
             && !super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id)
         {
-            tv_clear_current(shared, http, channel_id, user_msg_id, "intake_goal").await;
+            super::super::super::formatting::remove_reaction_raw(
+                http,
+                channel_id,
+                user_msg_id,
+                '⏳',
+            )
+            .await;
         }
         consume_codex_goal_lifecycle_command(
             http,
@@ -1278,6 +1384,13 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     }
     let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id.get());
+    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
+    let reply_context = merge_reply_contexts(
+        reply_context,
+        session_retry_context
+            .as_ref()
+            .map(|context| context.formatted_context.clone()),
+    );
 
     // #1332: probe turn liveness BEFORE posting any placeholder so a queued
     // message renders the dedicated `📬 메시지 대기 중` card instead of the
@@ -1300,10 +1413,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     )
     .await;
 
-    // #3813 Phase 1a: intake latency span anchor (turn claimed; observation-only
-    // — see latency_spans.rs). Never `.log()`'d on the early returns below.
-    let mut intake_latency = super::latency_spans::IntakeLatencySpans::turn_claimed();
-
     if started
         && let Some(stale) =
             super::super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)
@@ -1324,8 +1433,13 @@ pub(in crate::services::discord) async fn handle_text_message(
             channel_id,
             user_msg_id,
         );
-        let emoji = super::super::super::queue_exit_feedback_emoji(stale.queue_exit_kind);
-        queue_marker::note_exit_feedback_added(shared, http, channel_id, user_msg_id, emoji).await;
+        super::super::super::formatting::add_reaction_raw(
+            http,
+            channel_id,
+            user_msg_id,
+            super::super::super::queue_exit_feedback_emoji(stale.queue_exit_kind),
+        )
+        .await;
         if finish.has_pending {
             super::super::super::schedule_deferred_idle_queue_kickoff(
                 shared.clone(),
@@ -1335,22 +1449,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
         }
         return Ok(());
-    }
-
-    // #3811: record the original-request anchor (the real Discord user_msg_id)
-    // ONLY once THIS message won the mailbox claim (`started == true`) and the
-    // stale-dispatch guard passed. A message that merely QUEUES behind an active
-    // turn (`started == false`, enqueued + returned in the `if !started` block
-    // below) must NOT touch the active turn's anchor — it records its own anchor
-    // when later dequeued/promoted and re-enters here with `started == true`.
-    // Synthetic voice ids back no real Discord message → `None` (no fake link);
-    // headless turns never reach this interactive intake path.
-    if started {
-        shared.ui.placeholder_live_events.set_turn_request_anchor(
-            channel_id,
-            (!super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id))
-                .then(|| user_msg_id.get()),
-        );
     }
 
     // #3148: relocated idle-recap clear (Window 2 fix). The clear (and the
@@ -1440,13 +1538,11 @@ pub(in crate::services::discord) async fn handle_text_message(
     // composes safely with the entrypoint drains.
     if queued_placeholder_handoff.is_some() && !turn_kind.is_background_trigger() {
         for emoji in queue_pending_reactions_to_clear() {
-            queue_marker::note_removed_current(
-                shared,
+            super::super::super::formatting::remove_reaction_raw(
                 http,
                 channel_id,
                 user_msg_id,
                 emoji,
-                "dequeue_head_queue_marker_clear",
             )
             .await;
         }
@@ -1466,27 +1562,522 @@ pub(in crate::services::discord) async fn handle_text_message(
     // path linear and lets us bail out without the post-let main flow ever
     // running on a non-active turn.
     if !started {
-        return race_loss::handle_race_loss_enqueue(
-            http,
+        let bot_owner_provider = super::super::super::resolve_discord_bot_provider(token);
+        let is_thread_routed = channel_id != original_channel_id;
+        let want_queued_card = !turn_kind.is_background_trigger() && !is_thread_routed;
+
+        // codex review round-9 P2 (#1332): enqueue the intervention BEFORE
+        // any Discord HTTP await. The previous order (POST placeholder →
+        // insert mapping → enqueue) opened a window where the still-running
+        // active turn could finalize during the POST/insert awaits. Without
+        // an entry in the mailbox queue, `finalize_turn_state` reports
+        // `has_pending == false`, and `turn_bridge` clears
+        // `dispatch_role_overrides` for this channel. Our late enqueue then
+        // lands without the override, so the queued dispatch runs under the
+        // default provider/role instead of the dispatch-role routing the
+        // request expects (e.g. a Codex-review hand-off would execute under
+        // Claude). Enqueueing first keeps the mailbox snapshot consistent
+        // with the override lifecycle: as long as our intervention is
+        // queued, the override survives.
+        //
+        // Trade-off: this inverts the round-2 invariant ("queued_placeholders
+        // mapping inserted BEFORE enqueue") — a fast dispatch could now
+        // observe the queued intervention before our placeholder mapping
+        // lands. The existing dispatch fallback (`else` branch ~line 3066 in
+        // `handle_text_message`) tolerates that case by POSTing a fresh card
+        // via `send_intake_placeholder`, restoring the pre-PR behavior of "a
+        // fresh card on dispatch when no queued mapping exists." Round-2's
+        // duplicate-card concern is mitigated below by checking
+        // `active_user_message_id == user_msg_id` immediately before the
+        // mapping insert: if the dispatch path has already promoted our
+        // intervention into an active turn (with its own fresh card), we
+        // delete our orphan POST and skip the mapping insert.
+        let enqueue_outcome = super::super::super::mailbox_enqueue_intervention(
             shared,
-            token,
-            &provider,
+            &bot_owner_provider,
             channel_id,
-            original_channel_id,
-            turn_kind,
-            original_request_owner,
-            user_msg_id,
-            user_text,
-            &reply_context,
-            has_reply_boundary,
-            merge_consecutive,
-            &pending_uploads,
-            &voice_announcement,
-            reply_to_user_message,
-            &dispatch_id_for_thread,
-            turn_start_attempt,
+            build_race_requeued_intervention(
+                // #2266: attribute the queued `Intervention` to the original
+                // Discord author (the announce bot for voice transcripts) so
+                // the downstream `handle_text_message`
+                // `announce_bot_id == Some(request_owner)` check at line
+                // ~2274 passes when the dispatch path replays the queued
+                // turn. Passing the post-rebind voice-user id here would
+                // make the queued turn look like a non-announce author and
+                // the embedded voice payload would be discarded as spoofed.
+                original_request_owner,
+                user_msg_id,
+                user_text,
+                reply_context.clone(),
+                has_reply_boundary,
+                merge_consecutive,
+                pending_uploads.clone(),
+                // #2266: keep the voice payload self-contained in the queued
+                // `Intervention` so `dispatch_queued_turn` can reinsert it
+                // before re-entering `handle_text_message`, which restores
+                // the voice-transcript framing instead of degrading the queued
+                // reply to plain text.
+                voice_announcement.clone(),
+            ),
         )
         .await;
+        let enqueued = enqueue_outcome.enqueued;
+
+        // codex review P1: cover the residual race window where the active
+        // turn finished between `mailbox_try_start_turn` and the enqueue
+        // above. In that case `mailbox_finish_turn` saw an empty queue and
+        // skipped the dequeue chain — schedule a deferred drain so the
+        // intervention we just enqueued does not strand. Cheap no-op when
+        // the active turn is still running. Round-9: this still runs first
+        // so the deferred kickoff fires even if the placeholder POST below
+        // ends up failing.
+        if enqueued && !super::super::super::mailbox_has_active_turn(shared, channel_id).await {
+            super::super::super::schedule_deferred_idle_queue_kickoff(
+                shared.clone(),
+                bot_owner_provider.clone(),
+                channel_id,
+                "race-loss enqueue idle drain",
+            );
+        }
+
+        // If the enqueue was rejected (dedup / duplicate) there is nothing
+        // for the dispatch path to pick up. Skip the placeholder POST + the
+        // mapping insert entirely — POSTing a fresh card here would orphan
+        // it. `📬` reaction is also skipped (the prior live enqueue already
+        // owns the card and emoji). Just clean up `⏳` and return.
+        if !enqueued {
+            super::super::super::formatting::remove_reaction_raw(
+                http,
+                channel_id,
+                user_msg_id,
+                '⏳',
+            )
+            .await;
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            // #2728: log which refusal branch fired so race-loss dedup
+            // incidents can be classified without re-reading code.
+            let refusal_str = enqueue_outcome
+                .refusal_reason
+                .map(|r| r.as_str())
+                .unwrap_or("unknown");
+            tracing::info!(
+                "  [{ts}] 🔁 RACE: race-lost intervention refused by mailbox (channel {}, refusal_reason={}); skipping placeholder POST",
+                channel_id,
+                refusal_str,
+            );
+            return Ok(());
+        }
+
+        // codex review round-5 P2 (finding 2 — re-queue reuse): if a queued
+        // placeholder mapping already exists for `(channel_id, user_msg_id)`
+        // — typically because the active turn finished and the queued
+        // turn was about to dispatch, but a new turn intercepted and won
+        // the mailbox race before that dispatch could run — REUSE the
+        // existing `📬` card instead of POSTing a fresh placeholder.
+        // Posting a new placeholder would orphan the prior one (its mapping
+        // would be overwritten by the new `insert_queued_placeholder`
+        // below, and the old card would stay visible with no bookkeeping
+        // path to clean it up). Background-trigger turns and thread-routed
+        // turns never write to `queued_placeholders`, so they always go
+        // through the fresh POST path.
+        let existing_queued_card = if want_queued_card {
+            shared
+                .queued
+                .queued_placeholders
+                .get(&(channel_id, user_msg_id))
+                .map(|entry| *entry.value())
+        } else {
+            None
+        };
+        let reused_existing_mapping = existing_queued_card.is_some();
+
+        let placeholder_msg_id = if let Some(existing) = existing_queued_card {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ♻ RACE: reusing existing queued placeholder (channel {}, msg {}) — re-queue without new POST",
+                channel_id,
+                existing
+            );
+            existing
+        } else {
+            let post_result = send_intake_placeholder(
+                http.clone(),
+                shared.clone(),
+                channel_id,
+                if reply_to_user_message && dispatch_id_for_thread.is_none() {
+                    Some((channel_id, user_msg_id))
+                } else {
+                    None
+                },
+                // #3082 P2-3: this message lost the start-turn race and is now
+                // QUEUED — its "📬" card is a trailing notice that must wait
+                // behind any in-flight multi-chunk answer flush.
+                true,
+            )
+            .await;
+
+            match post_result {
+                Ok(msg_id) => msg_id,
+                Err(error) => {
+                    // POST failed AFTER enqueue. Round-9 trade-off: the
+                    // intervention is already in the mailbox queue, so a
+                    // later kickoff (or the deferred idle drain scheduled
+                    // above) will dispatch it — `dispatch_queued_turn` ->
+                    // `handle_text_message` will POST its own fresh card
+                    // through the missing-mapping fallback. The user
+                    // briefly sees `⏳` only and no `📬`, but the message
+                    // WILL be processed correctly. Roll back the `⏳`
+                    // sentinel so the user knows we did not silently
+                    // accept the message.
+                    super::super::super::formatting::remove_reaction_raw(
+                        http,
+                        channel_id,
+                        user_msg_id,
+                        '⏳',
+                    )
+                    .await;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ RACE: placeholder POST failed for race-lost message AFTER enqueue (channel {}, error={}); message remains queued, dispatch will POST fresh card",
+                        channel_id,
+                        error
+                    );
+                    // #1984 (codex C — observation): the user message is
+                    // already in the mailbox queue; the dispatch path will
+                    // POST a fresh card via the missing-mapping fallback.
+                    crate::services::observability::emit_intake_placeholder_post_failed(
+                        provider.as_str(),
+                        channel_id.get(),
+                        Some(user_msg_id.get()),
+                        "race_after_enqueue",
+                        "fresh_card_via_dispatch",
+                        &error.to_string(),
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        // Insert the mapping AFTER the POST, holding the per-channel persist
+        // mutex across recheck+insert so a concurrent `dispatch_queued_turn`
+        // cannot take our entry between the recheck and the write (round-9
+        // reorder supersedes round-2's "mapping before enqueue").
+        //
+        // Dispatch-state recheck (round-10/11 codex P2): between our enqueue
+        // and here the active turn may have finished AND turn_bridge may have
+        // dequeued our intervention, started its turn, and POSTed its own fresh
+        // card (no mapping → `send_intake_placeholder`). If we then insert, our
+        // `placeholder_msg_id` is an orphan and `ensure_queued` would render
+        // `📬` on an already-running turn. Other queue-exit timelines (cancel,
+        // supersede, merged-drain of a non-head source id) likewise leave
+        // `user_msg_id` out of the queue while the active turn != us. Fix: take
+        // the persist lock FIRST, snapshot the mailbox under it, then insert —
+        // invariant "ownership check + insert + ensure_queued PATCH all run
+        // under one held guard." `remove_queued_placeholder` serializes through
+        // the same mutex (mod.rs:1151), so dispatch cannot promote us until we
+        // release. The recheck below additionally bails unless `user_msg_id` is
+        // still queued (head `message_id` or any `source_message_ids` entry).
+        // Background-trigger / thread-routed / reused-mapping turns stay out of
+        // `queued_placeholders` by design and skip this recheck entirely.
+        let persist_guard_for_render = if want_queued_card && !reused_existing_mapping {
+            // Use `lock_owned()` so the guard owns the `Arc` and can outlive
+            // the local `persist_lock` binding when we hand it off to the
+            // queued-card render branch below (round-10: single critical
+            // section spanning the dispatch-state recheck, the mapping
+            // insert, and the `ensure_queued` PATCH).
+            let persist_lock = shared.queued_placeholders_persist_lock(channel_id);
+            let persist_guard = persist_lock.lock_owned().await;
+            // Snapshot UNDER the lock so a concurrent dispatch path cannot
+            // promote our intervention to active between this read and the
+            // mapping insert below. `dispatch_queued_turn` removes the
+            // queued mapping via `remove_queued_placeholder`, which itself
+            // acquires this same per-channel persist mutex; while we hold
+            // the guard, no dispatch path can advance from "queued" to
+            // "active for our user_msg_id".
+            let snapshot = super::super::super::mailbox_snapshot(shared, channel_id).await;
+            // Round-11 codex review P2: the round-10 recheck only bailed when
+            // `active_user_message_id == user_msg_id`, but there are other
+            // states where `user_msg_id` is no longer in the queue and a
+            // `📬` mapping must NOT be inserted:
+            //   1. The intervention was cancelled / superseded between our
+            //      enqueue and our lock acquire (queue-exit drain ran).
+            //   2. The intervention was the non-head `source_message_id` of a
+            //      merged Intervention that has already been dequeued (the
+            //      merged-drain ran on dispatch).
+            // In either case `active_user_message_id` may be `None` or a
+            // different message (e.g. the merge-head), so the round-10
+            // `active == user_msg_id` check passes through and we would
+            // insert a `📬` mapping for a `user_msg_id` that no future
+            // dispatch or queue-exit cleanup will ever reference → stale
+            // card forever.
+            //
+            // Fix: in addition to the round-10 active-equals-us check, also
+            // verify `user_msg_id` is still in the queue (head
+            // `intervention.message_id` OR any `source_message_ids` entry).
+            // If neither holds, treat it as a race-loss and bail.
+            let still_queued = snapshot.intervention_queue.iter().any(|intervention| {
+                intervention.message_id == user_msg_id
+                    || intervention.source_message_ids.contains(&user_msg_id)
+            });
+            let dispatch_already_running_for_our_msg =
+                snapshot.active_user_message_id == Some(user_msg_id);
+            if dispatch_already_running_for_our_msg || !still_queued {
+                // Either dispatch already promoted us into an active turn
+                // (round-10 case) OR our entry has left the queue via
+                // cancellation / supersede / merged-drain (round-11 case).
+                // In all cases our POSTed placeholder is an orphan that no
+                // future dispatch or queue-exit cleanup will ever reference
+                // — drop the lock before the HTTP DELETE await, delete the
+                // orphan, remove the `⏳` reaction, and skip the mapping
+                // insert.
+                drop(persist_guard);
+                let _ = channel_id.delete_message(http, placeholder_msg_id).await;
+                super::super::super::formatting::remove_reaction_raw(
+                    http,
+                    channel_id,
+                    user_msg_id,
+                    '⏳',
+                )
+                .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                if dispatch_already_running_for_our_msg {
+                    tracing::info!(
+                        "  [{ts}] 🔁 RACE: dispatch already started turn for our message (channel {}, msg {}); deleting orphan placeholder POST",
+                        channel_id,
+                        user_msg_id
+                    );
+                } else {
+                    tracing::info!(
+                        "  [{ts}] 🔁 RACE: message no longer queued (cancelled/superseded/merged-drained) (channel {}, msg {}); deleting orphan placeholder POST",
+                        channel_id,
+                        user_msg_id
+                    );
+                }
+                return Ok(());
+            }
+            shared.insert_queued_placeholder_locked(channel_id, user_msg_id, placeholder_msg_id);
+            // Hand the still-held guard to the `ensure_queued` PATCH branch
+            // below so the entire ownership check + insert + PATCH critical
+            // section runs under one held lock guard (the round-10
+            // atomicity invariant).
+            Some(persist_guard)
+        } else {
+            None
+        };
+
+        // #1116 Pending-reaction emoji machine: 📬 queued → ⏳ processing →
+        // ✅ done. Round-9: enqueue already happened above; the reaction
+        // safely reflects the actual queue state.
+        //
+        // #2036 Surface 3 fix: previously, if the active turn finished
+        // between this enqueue and the `add_reaction` await below, the
+        // dequeue path's 📬 cleanup could run before our add landed and
+        // leave the icon stuck on a turn that had already started. The
+        // user-reported case (run 767447c8): dispatch message lands on a
+        // channel whose previous turn is wrapping up, so the message gets
+        // queued and reacted with 📬; the bridge then promotes it before
+        // the add_reaction await resolves, and the leftover 📬 lies about
+        // codex still being queue-pending while codex is in fact already
+        // responding to the dispatch. Round-12 fix: after the
+        // `add_reaction` await resolves, re-check whether our message is
+        // still in the queue. If the queued_placeholder mapping has been
+        // consumed (i.e. dispatch already promoted us into an active
+        // turn), strip the just-added queue-pending emoji so the visual
+        // state matches reality.
+        if !is_thread_routed && should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
+        {
+            // #1190 follow-up: merged messages get ➕ so the user can tell
+            // them apart from standalone queue head entries (📬).
+            let emoji = if enqueue_outcome.merged {
+                '➕'
+            } else {
+                '📬'
+            };
+            add_reaction(http, channel_id, user_msg_id, emoji).await;
+            // #2036 Surface 3: detect queue→start races where the
+            // dispatch path consumed our mapping before this reaction
+            // landed and proactively unstick the emoji.
+            if !shared.queued_placeholder_still_owned(channel_id, user_msg_id, placeholder_msg_id) {
+                super::super::super::formatting::remove_reaction_raw(
+                    http,
+                    channel_id,
+                    user_msg_id,
+                    emoji,
+                )
+                .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🔁 RACE: queue-pending {emoji} reacted after dequeue promotion (channel {}, msg {}); removed stale reaction",
+                    channel_id,
+                    user_msg_id
+                );
+            }
+        }
+        // #796: Background-trigger turns (notify-bot driven, info-only) must
+        // NOT have their placeholder deleted on race-loss. The placeholder is
+        // the user-visible breadcrumb of the background notification (e.g.
+        // a `Bash run_in_background` completion message).
+        //
+        // #1332: Foreground turns EDIT the bare `...` into a `📬 메시지 대기
+        // 중` card via the placeholder controller. Mapping was already
+        // inserted before enqueue (codex review P2); on edit failure we roll
+        // back the mapping AND delete the Discord message so users never see
+        // a stale `...` placeholder.
+        if turn_kind.is_background_trigger() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 🔔 RACE: background-trigger placeholder preserved (channel {}, msg {})",
+                channel_id,
+                placeholder_msg_id
+            );
+        } else if want_queued_card && !reused_existing_mapping {
+            // codex review round-3 P1 + round-5 P2 (finding 1 — atomic
+            // ownership coupling) + round-10 P2 (single critical section):
+            // between `mailbox_enqueue_intervention` and the `ensure_queued`
+            // await below, the active turn can finish and the dispatch
+            // path can already have consumed our
+            // `(channel_id, user_msg_id)` mapping — at which point the
+            // placeholder we POSTed has been promoted to the live response
+            // card. Editing it to `📬 메시지 대기 중` (or deleting it on the
+            // fallback branch) would corrupt/erase the active card. Round-4
+            // checked ownership immediately before the PATCH, but the await
+            // window between the check and the PATCH still allowed
+            // `dispatch_queued_turn` (or `queue_exit_drain_queued_placeholders`)
+            // to consume the mapping concurrently. Round-5 wraps the
+            // ownership recheck + `ensure_queued` PATCH + persistence
+            // rollback in a single critical section guarded by the
+            // per-channel async persistence mutex. Round-10 extends that
+            // critical section UPSTREAM through the dispatch-state recheck
+            // and the mapping insert: we acquire the persist lock once
+            // (above, where `dispatch_already_running_for_our_msg` is
+            // computed), and pass the SAME held guard through to this
+            // PATCH branch via `persist_guard_for_render`. Every other
+            // path that mutates `queued_placeholders` (insert / remove /
+            // merged drain / queue-exit drain) takes the same mutex, so
+            // the mapping cannot change underneath this PATCH once we
+            // hold the lock.
+            //
+            // Invariant (round-10): the dispatch-state snapshot, mapping insert,
+            // ownership recheck, and `ensure_queued` PATCH share ONE held lock
+            // guard; any alternate order reopens the round-4 or round-9 hazard.
+            let persist_guard = persist_guard_for_render
+                .expect("round-10: persist guard must be held by the matching insert branch");
+            if !shared.queued_placeholder_still_owned(channel_id, user_msg_id, placeholder_msg_id) {
+                drop(persist_guard);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🔁 RACE: queued placeholder handoff already consumed by dispatch (channel {}, msg {}); skipping render",
+                    channel_id,
+                    placeholder_msg_id
+                );
+            } else {
+                let gateway = DiscordGateway::new(
+                    http.clone(),
+                    shared.clone(),
+                    bot_owner_provider.clone(),
+                    None,
+                );
+                let key = super::super::super::placeholder_controller::PlaceholderKey {
+                    provider: bot_owner_provider.clone(),
+                    channel_id,
+                    message_id: placeholder_msg_id,
+                };
+                let queued_input =
+                    super::super::super::placeholder_controller::PlaceholderActiveInput {
+                        reason: super::super::super::formatting::MonitorHandoffReason::Queued,
+                        started_at_unix: chrono::Utc::now().timestamp(),
+                        tool_summary: None,
+                        command_summary: None,
+                        reason_detail: None,
+                        context_line: None,
+                        request_line: Some(user_text.to_string()),
+                        progress_line: None,
+                    };
+                let outcome = shared
+                    .ui
+                    .placeholder_controller
+                    .ensure_queued(&gateway, key, queued_input)
+                    .await;
+                use super::super::super::placeholder_controller::PlaceholderControllerOutcome::*;
+                match outcome {
+                    Edited | Coalesced => {
+                        drop(persist_guard);
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        tracing::info!(
+                            "  [{ts}] 📬 RACE: queued placeholder rendered (channel {}, msg {})",
+                            channel_id,
+                            placeholder_msg_id
+                        );
+                    }
+                    _ => {
+                        // Edit failed — roll back the mapping and delete the raw
+                        // `...` so dispatch never matches a missing Discord
+                        // message. The lock guarantees the mapping is unchanged
+                        // since the recheck; use `_locked` to avoid reacquiring it.
+                        let still_owned_under_lock = shared.queued_placeholder_still_owned(
+                            channel_id,
+                            user_msg_id,
+                            placeholder_msg_id,
+                        );
+                        if still_owned_under_lock {
+                            shared.remove_queued_placeholder_locked(channel_id, user_msg_id);
+                        }
+                        drop(persist_guard);
+                        if still_owned_under_lock {
+                            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] ⚠ RACE: queued placeholder render failed, deleted instead (channel {}, msg {})",
+                                channel_id,
+                                placeholder_msg_id
+                            );
+                        } else {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] 🔁 RACE: queued placeholder render failed AND handoff already consumed (channel {}, msg {}); leaving Discord state intact",
+                                channel_id,
+                                placeholder_msg_id
+                            );
+                        }
+                    }
+                }
+            }
+        } else if want_queued_card && reused_existing_mapping {
+            // codex review round-5 P2 (finding 2): the existing card
+            // already shows `📬 메시지 대기 중`. Skip the redundant
+            // `ensure_queued` PATCH (the prior race-loss already wrote it,
+            // and re-emitting the identical content would hit a
+            // `Coalesced` no-op anyway). Leaving the card untouched is
+            // correct — the user already sees it.
+            //
+            // Round-9 note: the round-6 "reused mapping + dedup-rejected
+            // enqueue" sub-branch (preserving a card owned by an earlier
+            // enqueue) is gone — this code path is only reached when
+            // `enqueued == true` because we now return early on dedup
+            // rejection (see the `if !enqueued { return Ok(()); }` block
+            // above). The earlier owner's lifecycle still owns the card,
+            // and our return runs before any placeholder POST/edit.
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ♻ RACE: re-queue reused existing 📬 card without re-render (channel {}, msg {})",
+                channel_id,
+                placeholder_msg_id
+            );
+        } else {
+            // Background-trigger turns hit the explicit branch above;
+            // remaining cases (e.g. is_thread_routed) fall here and have
+            // no queued card to render — POSTed placeholder is a bare
+            // `...` and would otherwise leak.
+            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
+        }
+        super::super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
+            .await;
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] 🔀 RACE: message queued (another turn won), channel {}",
+            channel_id
+        );
+        return Ok(());
     }
 
     let placeholder_msg_id = if let Some(existing) = queued_placeholder_handoff {
@@ -1631,16 +2222,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             }
         }
     };
-    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
-    let reply_context = merge_reply_contexts(
-        reply_context,
-        session_retry_context
-            .as_ref()
-            .map(|context| context.formatted_context.clone()),
-    );
-
-    // #3813 Phase 1a: the intake placeholder POST returned a live id.
-    intake_latency.mark_placeholder_posted();
     crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
     shared
         .turn_start_times
@@ -1850,9 +2431,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         );
     }
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
-    // #3813 Phase 1a: prompt prep complete — this mark sits INSIDE the
-    // `[prompt-prep]` window below (overlaps it; do not sum — see latency_spans.rs).
-    intake_latency.mark_prep_done();
     let memory_backend_label = memory_settings.backend.as_str();
     let provider_label = match &provider {
         ProviderKind::Claude => "claude",
@@ -1884,14 +2462,259 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Spawn turn watchdog — detects deadline expiry and hands off to cancel reconciliation.
     // The deadline is stored in cancel_token.watchdog_deadline_ms and can be
     // extended via POST /api/turns/{channel_id}/extend-timeout.
-    turn_watchdog::spawn_text_turn_watchdog(
-        &cancel_token,
-        shared,
-        http,
-        channel_id,
-        &provider,
-        provider_label,
-    );
+    {
+        let watchdog_token = cancel_token.clone();
+        let watchdog_shared = shared.clone();
+        let watchdog_http = http.clone();
+        let timeout = super::super::super::turn_watchdog_timeout();
+
+        // Set initial deadline. max_deadline tracks the farthest accepted
+        // extension for alert context; it is no longer an absolute cap.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let turn_started_ms = now_ms;
+        // #3557 (A) Codex-review fix: the per-turn hard ceiling must bind the
+        // INITIAL deadline, not only the auto-extend clamp. Previously the
+        // initial deadline was always `now + turn_watchdog_timeout()` (6h), and
+        // the auto-extend clamp could not lower it because the store is gated by
+        // `new_dl > current_dl`. So a Codex turn (4h ceiling) was still cancelled
+        // at 6h and the clamp warn never fired. Cap the initial deadline at the
+        // provider ceiling here so the tighter Codex bound is honored end to end.
+        let ceiling_deadline_ms =
+            super::super::super::turn_hard_ceiling_deadline_ms(turn_started_ms, &provider);
+        let proposed_initial_dl = now_ms + timeout.as_millis() as i64;
+        let deadline_ms = std::cmp::min(proposed_initial_dl, ceiling_deadline_ms);
+        let max_deadline_ms = deadline_ms;
+        // When the ceiling already caps the initial deadline (e.g. Codex 4h <
+        // 6h watchdog timeout) the auto-extend clamp warn below never fires
+        // (its `current_dl < ceiling_ms` guard is false once the deadline is
+        // parked at the ceiling), so surface the bound once here instead.
+        if proposed_initial_dl > ceiling_deadline_ms {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            let ceiling_min = (ceiling_deadline_ms - now_ms) / 1000 / 60;
+            tracing::warn!(
+                "  [{ts}] ⛔ WATCHDOG: hard ceiling ({ceiling_min}m) caps initial deadline for channel {} (provider={}) — turn will be reconciled at the ceiling",
+                channel_id,
+                provider_label
+            );
+        }
+        // claude-e rollout Phase 1 (counter-review round 3 with Codex):
+        // mark this token as async-managed so the per-provider sync
+        // watchdog (`enforce_watchdog_deadline` in `spawn_cancel_watchdog`)
+        // stops short-circuiting on the deadline. The async loop below
+        // owns deadline expiry at 30s cadence.
+        watchdog_token.mark_async_managed();
+        watchdog_token
+            .watchdog_deadline_ms
+            .store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
+        watchdog_token
+            .watchdog_max_deadline_ms
+            .store(max_deadline_ms, std::sync::atomic::Ordering::Relaxed);
+
+        let watchdog_channel_id_num = channel_id.get();
+        let watchdog_provider = provider.clone();
+        super::super::super::task_supervisor::spawn_observed("text_turn_watchdog", async move {
+            const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut last_deadlock_prealert_deadline_ms: Option<i64> = None;
+
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+
+                // Exit early if the turn already completed/cancelled
+                if watchdog_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    super::super::super::clear_watchdog_deadline_override(watchdog_channel_id_num)
+                        .await;
+                    return;
+                }
+
+                // Check for API-based deadline extension
+                if let Some(extension) =
+                    super::super::super::take_watchdog_deadline_override(watchdog_channel_id_num)
+                        .await
+                {
+                    let effective_deadline =
+                        apply_watchdog_deadline_extension(&watchdog_token, extension);
+                    last_deadlock_prealert_deadline_ms = None;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    let remaining_min =
+                        (effective_deadline - chrono::Utc::now().timestamp_millis()) / 1000 / 60;
+                    tracing::info!(
+                        "  [{ts}] ⏰ WATCHDOG: deadline extended for channel {} — {remaining_min}m remaining",
+                        channel_id
+                    );
+                }
+
+                // Auto-extend based on inflight updated_at: if inflight was updated recently
+                // (within last 5 min), push deadline forward by the default timeout
+                {
+                    let current_dl = watchdog_token
+                        .watchdog_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let now_ms_check = chrono::Utc::now().timestamp_millis();
+                    // Only auto-extend when close to deadline (within 2 minutes)
+                    if now_ms_check > current_dl - 120_000 {
+                        if let Some(inflight) = super::super::super::inflight::load_inflight_state(
+                            &watchdog_provider,
+                            watchdog_channel_id_num,
+                        ) {
+                            if let Ok(updated) = chrono::NaiveDateTime::parse_from_str(
+                                &inflight.updated_at,
+                                "%Y-%m-%d %H:%M:%S",
+                            ) {
+                                let updated_ms = updated.and_utc().timestamp_millis();
+                                let age_ms = now_ms_check - updated_ms;
+                                // If inflight was updated within the last 5 minutes, auto-extend
+                                if age_ms < 300_000 {
+                                    // #3557 (A): clamp the auto-extend so a turn
+                                    // that keeps inflight warm forever cannot push
+                                    // the deadline indefinitely. The hard ceiling
+                                    // is measured from turn start and is tighter
+                                    // for Codex (the 13125s outlier source).
+                                    let ceiling_ms =
+                                        super::super::super::turn_hard_ceiling_deadline_ms(
+                                            turn_started_ms,
+                                            &watchdog_provider,
+                                        );
+                                    let proposed_dl = now_ms_check + timeout.as_millis() as i64;
+                                    let (new_dl, clamped) =
+                                        super::super::super::clamp_auto_extend_deadline_ms(
+                                            proposed_dl,
+                                            ceiling_ms,
+                                        );
+                                    // Warn exactly once when the ceiling first bites:
+                                    // `current_dl < ceiling_ms` is only true before
+                                    // the deadline has been parked at the ceiling. On
+                                    // later ticks `current_dl == ceiling_ms` so this is
+                                    // false and the warn does not repeat.
+                                    if clamped && current_dl < ceiling_ms {
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        tracing::warn!(
+                                            "  [{ts}] ⛔ WATCHDOG: hard ceiling reached for channel {} — auto-extend clamped, turn will be reconciled at deadline",
+                                            channel_id
+                                        );
+                                    }
+                                    if new_dl > current_dl {
+                                        watchdog_token
+                                            .watchdog_deadline_ms
+                                            .store(new_dl, std::sync::atomic::Ordering::Relaxed);
+                                        watchdog_token.watchdog_max_deadline_ms.store(
+                                            std::cmp::max(
+                                                watchdog_token
+                                                    .watchdog_max_deadline_ms
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                                new_dl,
+                                            ),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        last_deadlock_prealert_deadline_ms = None;
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        let remaining_min = (new_dl - now_ms_check) / 1000 / 60;
+                                        tracing::info!(
+                                            "  [{ts}] ⏰ WATCHDOG: auto-extended for channel {} (inflight active) — {remaining_min}m remaining",
+                                            channel_id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let current_deadline = watchdog_token
+                    .watchdog_deadline_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let now = chrono::Utc::now().timestamp_millis();
+                if should_send_watchdog_deadlock_prealert(
+                    now,
+                    current_deadline,
+                    last_deadlock_prealert_deadline_ms,
+                ) {
+                    let is_current_token =
+                        super::super::super::mailbox_cancel_token(&watchdog_shared, channel_id)
+                            .await
+                            .is_some_and(|current| {
+                                std::sync::Arc::ptr_eq(&watchdog_token, &current)
+                            });
+                    if !is_current_token {
+                        super::super::super::clear_watchdog_deadline_override(
+                            watchdog_channel_id_num,
+                        )
+                        .await;
+                        return;
+                    }
+                    let current_max_deadline = watchdog_token
+                        .watchdog_max_deadline_ms
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if maybe_send_watchdog_deadlock_prealert(
+                        &watchdog_shared,
+                        &watchdog_provider,
+                        channel_id,
+                        now,
+                        current_deadline,
+                        turn_started_ms,
+                        current_max_deadline,
+                    )
+                    .await
+                    {
+                        last_deadlock_prealert_deadline_ms = Some(current_deadline);
+                    }
+                }
+
+                if let Some(extension) =
+                    super::super::super::take_watchdog_deadline_override(watchdog_channel_id_num)
+                        .await
+                {
+                    apply_watchdog_deadline_extension(&watchdog_token, extension);
+                    last_deadlock_prealert_deadline_ms = None;
+                }
+                let current_deadline = watchdog_token
+                    .watchdog_deadline_ms
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let now = chrono::Utc::now().timestamp_millis();
+                if now < current_deadline {
+                    continue; // Not yet — deadline may have been extended
+                }
+
+                // Deadline reached — fire watchdog through the cancel/reconcile path.
+                let disposition = reconcile_watchdog_timeout(
+                    &watchdog_shared,
+                    &watchdog_provider,
+                    channel_id,
+                    &watchdog_token,
+                )
+                .await;
+                if disposition == WatchdogTimeoutCancelDisposition::Cancelled {
+                    let elapsed_mins =
+                        (now - (current_deadline - timeout.as_millis() as i64)) / 1000 / 60;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] ⏰ WATCHDOG: turn timeout (~{elapsed_mins}m) for channel {}, reconciled via cancel path",
+                        channel_id
+                    );
+
+                    // Notify Discord
+                    let has_queued = super::super::super::mailbox_has_pending_soft_queue(
+                        &watchdog_shared,
+                        &watchdog_provider,
+                        channel_id,
+                    )
+                    .await
+                    .has_pending;
+                    let msg = if has_queued {
+                        format!(
+                            "⚠️ 턴이 {elapsed_mins}분 타임아웃으로 자동 중단되었습니다. 대기 중인 메시지로 다음 턴을 시작합니다.",
+                        )
+                    } else {
+                        format!("⚠️ 턴이 {elapsed_mins}분 타임아웃으로 자동 중단되었습니다.",)
+                    };
+                    let _ = channel_id.say(&watchdog_http, msg).await;
+                }
+                return; // Watchdog done regardless
+            }
+        });
+    }
 
     // Resolve remote profile for this channel
     let remote_profile = {
@@ -2079,16 +2902,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         );
                     }
                 }
-                // #3813 Phase 3 (§4 / AC#6): make the safe up-to-45s readiness
-                // wait visible so it doesn't look like a stalled session start.
-                // Borrow before `wait_readiness` moves into spawn_blocking below.
-                let _ = super::super::super::http::edit_channel_message(
-                    http,
-                    channel_id,
-                    placeholder_msg_id,
-                    readiness_wait_compact_status(&wait_readiness),
-                )
-                .await;
                 let wait_result =
                     tokio::task::spawn_blocking(move || {
                         match wait_readiness {
@@ -2198,12 +3011,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     #[cfg(unix)]
     if let Some(diagnostic) = tui_busy_diagnostic {
         let bot_owner_provider = super::super::super::resolve_discord_bot_provider(token);
-        let queue_kickoff_scheduled_by_release = release_mailbox_after_hosted_tui_busy_pre_submit(
-            shared,
-            &bot_owner_provider,
-            channel_id,
-        )
-        .await;
         let enqueue_outcome = enqueue_busy_tui_followup_for_retry(
             shared,
             &bot_owner_provider,
@@ -2286,27 +3093,17 @@ pub(in crate::services::discord) async fn handle_text_message(
                         } else {
                             '📬'
                         };
-                        queue_marker::note_added_current(
-                            shared,
-                            http,
-                            channel_id,
-                            user_msg_id,
-                            emoji,
-                            "tui_busy_pre_submit_queued",
-                        )
-                        .await;
+                        add_reaction(http, channel_id, user_msg_id, emoji).await;
                         if !shared.queued_placeholder_still_owned(
                             channel_id,
                             user_msg_id,
                             placeholder_msg_id,
                         ) {
-                            queue_marker::note_removed_current(
-                                shared,
+                            super::super::super::formatting::remove_reaction_raw(
                                 http,
                                 channel_id,
                                 user_msg_id,
                                 emoji,
-                                "tui_busy_pre_submit_queue_self_heal",
                             )
                             .await;
                         }
@@ -2336,18 +3133,21 @@ pub(in crate::services::discord) async fn handle_text_message(
         } else if enqueue_outcome.enqueued {
             let _ = channel_id.delete_message(http, placeholder_msg_id).await;
         } else {
-            apply_tui_busy_enqueue_refusal(
-                shared,
+            let notice = claude_tui_busy_followup_refusal_notice(enqueue_outcome.refusal_reason);
+            let _ = super::super::super::http::edit_channel_message(
                 http,
                 channel_id,
                 placeholder_msg_id,
-                session_retry_context.as_ref(),
-                enqueue_outcome.refusal_reason,
+                notice,
             )
             .await;
         }
-        let queue_kickoff_scheduled =
-            queue_kickoff_scheduled_by_release || enqueue_outcome.enqueued;
+        let queue_kickoff_scheduled = release_mailbox_after_hosted_tui_busy_pre_submit(
+            shared,
+            &bot_owner_provider,
+            channel_id,
+        )
+        .await;
         let mut diagnostic_json = diagnostic.to_json();
         if let Some(object) = diagnostic_json.as_object_mut() {
             object.insert(
@@ -2396,7 +3196,8 @@ pub(in crate::services::discord) async fn handle_text_message(
             "claude_tui_followup_busy_pre_submit",
             diagnostic_json,
         );
-        tv_clear_current(shared, http, channel_id, user_msg_id, "intake_busy_queue").await;
+        super::super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
+            .await;
         super::super::super::saturating_decrement_global_active(shared);
         shared.turn_start_times.remove(&channel_id);
         post_adk_session_status(
@@ -2431,10 +3232,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             .cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         super::super::super::clear_watchdog_deadline_override(channel_id.get()).await;
-        // #3813 Phase 1a: prep done but input deferred pre-submit (TUI busy) —
-        // emit the partial span (input/total render `-`); the retry re-enters
-        // intake and emits its own `submitted` span.
-        intake_latency.log(channel_id.get(), provider_label, "deferred_busy");
         return Ok(());
     }
     #[cfg(unix)]
@@ -2760,8 +3557,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     });
 
-    // #3813 Phase 1a: provider input is about to be handed to the turn bridge.
-    intake_latency.mark_input_written();
     spawn_turn_bridge(
         shared.clone(),
         cancel_token.clone(),
@@ -2811,9 +3606,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         },
     );
 
-    // #3813 Phase 1a: full intake span complete — emit the structured line + event.
-    intake_latency.log(channel_id.get(), provider_label, "submitted");
-
     if let Some(rx) = completion_rx {
         rx.await
             .map_err(|_| "queued turn completion wait failed".to_string())?;
@@ -2823,116 +3615,16 @@ pub(in crate::services::discord) async fn handle_text_message(
 }
 
 #[cfg(test)]
-mod recovery_context_take_order_tests {
-    fn recovery_context_take_call() -> String {
-        format!(
-            "{}{}",
-            "let session_retry_context = ",
-            "take_session_retry_context(shared, channel_id, Some(&turn_id));"
-        )
-    }
-
-    #[test]
-    fn recovery_context_survives_intake_stale_dispatch_abort() {
-        let root = tempfile::tempdir().expect("create temp runtime root");
-        let _env = crate::config::set_agentdesk_root_for_test(root.path());
-        let module_src = include_str!("intake_turn.rs");
-        let stale_guard_pos = module_src
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .expect("intake stale-dispatch guard exists");
-        let stale_return_pos = stale_guard_pos
-            + module_src[stale_guard_pos..]
-                .find("return Ok(());")
-                .expect("intake stale-dispatch abort return exists");
-        let take_call = recovery_context_take_call();
-        let take_pos = module_src
-            .find(&take_call)
-            .expect("intake recovery context take exists");
-
-        assert!(
-            stale_return_pos < take_pos,
-            "intake stale-dispatch abort must happen before the destructive recovery-context take"
-        );
-    }
-
-    #[test]
-    fn intake_real_turn_consumes_recovery_context_once_after_non_dispatch_guards() {
-        let root = tempfile::tempdir().expect("create temp runtime root");
-        let _env = crate::config::set_agentdesk_root_for_test(root.path());
-        let module_src = include_str!("intake_turn.rs");
-        let take_call = recovery_context_take_call();
-        let take_positions: Vec<_> = module_src.match_indices(&take_call).collect();
-        assert_eq!(
-            take_positions.len(),
-            1,
-            "intake turn start must have exactly one destructive recovery-context take"
-        );
-        let take_pos = take_positions[0].0;
-        let race_loss_return_pos = module_src
-            .find("return race_loss::handle_race_loss_enqueue(")
-            .expect("intake race-loss enqueue return exists");
-        let placeholder_posted_pos = module_src
-            .find("intake_latency.mark_placeholder_posted();")
-            .expect("intake placeholder-post success mark exists");
-        let prompt_use_pos = module_src
-            .find("if let Some(ref reply_ctx) = reply_context")
-            .expect("intake prompt includes reply context");
-        let manifest_use_pos = module_src
-            .find("let recovery_context_for_manifest =")
-            .expect("intake prompt manifest receives recovery context");
-
-        assert!(
-            race_loss_return_pos < take_pos,
-            "queued/race-loss intake turns must not destructively take recovery context before returning"
-        );
-        assert!(
-            take_pos < placeholder_posted_pos,
-            "active intake turn must take recovery context immediately after placeholder success"
-        );
-        assert!(
-            take_pos < prompt_use_pos,
-            "active intake turn must take recovery context before adding it to the prompt"
-        );
-        assert!(
-            take_pos < manifest_use_pos,
-            "active intake turn must take recovery context before prompt manifest capture"
-        );
-    }
-
-    #[test]
-    fn tui_busy_enqueue_refusal_puts_back_recovery_context_for_next_turn() {
-        // The refusal else-branch must route through the sibling helper, which
-        // puts the taken recovery context back BEFORE rewriting the refusal
-        // notice (put-back-then-notice ordering pinned in tui_followup.rs).
-        let module_src = include_str!("intake_turn.rs");
-        module_src
-            .find("} else {\n            apply_tui_busy_enqueue_refusal(")
-            .expect("TUI-busy enqueue refusal routes through the put-back helper");
-
-        let helper_src = include_str!("tui_followup.rs");
-        let helper_fn_pos = helper_src
-            .find("async fn apply_tui_busy_enqueue_refusal(")
-            .expect("refusal helper exists in tui_followup.rs");
-        let helper_body = &helper_src[helper_fn_pos..];
-        let put_back_pos = helper_body
-            .find("put_back_session_retry_context(")
-            .expect("refusal helper restores recovery context");
-        let notice_pos = helper_body
-            .find("claude_tui_busy_followup_refusal_notice(")
-            .expect("refusal helper renders the notice");
-        assert!(
-            put_back_pos < notice_pos,
-            "TUI-busy enqueue refusal, including dup-guard refusal, must restore recovery context before returning the notice"
-        );
-    }
-}
-
-#[cfg(test)]
 mod queue_pending_reaction_clear_tests {
     use super::*;
 
+    /// #3182: the dequeue cleanup must attempt to remove BOTH queue-pending
+    /// reactions — `📬` (standalone head) and `➕` (merged) — because the
+    /// promotion point only knows the head message id, not which emoji it
+    /// carried. This guards against a regression that drops one (which would
+    /// re-strand the other variant, as in the original bug).
     #[test]
-    fn clears_every_queue_marker_reaction() {
+    fn clears_both_standalone_and_merged_queue_reactions() {
         let emojis = queue_pending_reactions_to_clear();
         assert!(
             emojis.contains(&'📬'),
@@ -2942,14 +3634,10 @@ mod queue_pending_reaction_clear_tests {
             emojis.contains(&'➕'),
             "merged queue ➕ must be cleared on dequeue"
         );
-        assert!(
-            emojis.contains(&'🔄'),
-            "reconcile queue 🔄 must be cleared on dequeue"
-        );
         assert_eq!(
             emojis.len(),
-            crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS.len(),
-            "exactly the shared queue-pending emojis are cleared"
+            2,
+            "exactly the two intake-gate queue-pending emojis are cleared"
         );
     }
 

@@ -1089,12 +1089,7 @@ pub async fn stale_mailbox_repair_handler(
                             &provider,
                             request.channel_id,
                         );
-                    let no_unread_bytes = snapshot.unread_bytes.unwrap_or(0) == 0;
-                    // Keep the manual stale-mailbox repair's destructive idle
-                    // clear gate aligned with ReattachWatcher: unread capture bytes
-                    // are live relay evidence, so do not retire mailbox/inflight
-                    // bookkeeping while the watcher still has bytes to consume.
-                    if inflight_safe && no_unread_bytes && !unrelayed_tail {
+                    if inflight_safe && !unrelayed_tail {
                         health::clear_idle_tmux_stale_turn(
                             registry,
                             provider.as_str(),
@@ -1217,14 +1212,8 @@ pub async fn stale_mailbox_repair_handler(
         )
         .await
         .had_active_turn
-    } else if global_handle.is_some() {
-        health::stop_providerless_runtime_turn_preserving_watcher_strict_ownership(
-            state.health_registry.as_deref(),
-            request.channel_id,
-            "stale_mailbox_repair",
-        )
-        .await
-        .had_active_turn
+    } else if let Some(handle) = global_handle.as_ref() {
+        handle.hard_stop().await.removed_token.is_some()
     } else {
         false
     };
@@ -1456,10 +1445,11 @@ pub async fn send_handler(
     let body_str = String::from_utf8_lossy(&body);
     let caller_class = discord_send_caller_class(peer_addr, &headers);
     let (status_str, response_body) = if caller_class == health::SendCallerClass::LoopbackInternal {
-        health::handle_send(registry, state.pg_pool_ref(), &body_str).await
+        health::handle_send(registry, None, state.pg_pool_ref(), &body_str).await
     } else {
         crate::services::discord::outbound::send_api::handle_send_with_caller(
             registry,
+            None,
             state.pg_pool_ref(),
             &body_str,
             caller_class,
@@ -1606,6 +1596,7 @@ pub async fn send_to_agent_handler(
     let (status_str, response_body) =
         crate::services::discord::outbound::send_to_agent::handle_send_to_agent(
             registry,
+            None,
             state.pg_pool_ref(),
             &body_str,
         )

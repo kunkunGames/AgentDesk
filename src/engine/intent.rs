@@ -86,6 +86,7 @@ pub struct CreatedDispatch {
 }
 
 pub fn execute_intents_with_backends(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: Option<&crate::engine::PolicyEngine>,
     intents: Vec<Intent>,
@@ -108,7 +109,7 @@ pub fn execute_intents_with_backends(
                 let intent_span =
                     crate::logging::dispatch_span("intent_transition", None, Some(&card_id), None);
                 let _guard = intent_span.enter();
-                if let Err(e) = execute_transition(pg_pool, engine, &card_id, &from, &to) {
+                if let Err(e) = execute_transition(db, pg_pool, engine, &card_id, &from, &to) {
                     tracing::warn!(from, to, error = %e, "transition intent failed");
                     result.errors += 1;
                 } else {
@@ -130,6 +131,7 @@ pub fn execute_intents_with_backends(
                 );
                 let _guard = intent_span.enter();
                 match execute_create_dispatch(
+                    db,
                     pg_pool,
                     engine,
                     &dispatch_id,
@@ -146,7 +148,7 @@ pub fn execute_intents_with_backends(
                 }
             }
             Intent::ActivateAutoQueue { body } => {
-                match execute_activate_auto_queue(pg_pool, engine, body) {
+                match execute_activate_auto_queue(db, pg_pool, engine, body) {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(error = %e, "auto-queue activate intent failed");
@@ -155,7 +157,7 @@ pub fn execute_intents_with_backends(
                 }
             }
             Intent::ExecuteSQL { sql, params } => {
-                if let Err(e) = execute_sql(pg_pool, &sql, &params) {
+                if let Err(e) = execute_sql(db, pg_pool, &sql, &params) {
                     tracing::warn!(error = %e, sql, "execute-sql intent failed");
                     result.errors += 1;
                 }
@@ -166,7 +168,8 @@ pub fn execute_intents_with_backends(
                 bot,
                 source,
             } => {
-                if let Err(e) = execute_queue_message(engine, &target, &content, &bot, &source) {
+                if let Err(e) = execute_queue_message(db, engine, &target, &content, &bot, &source)
+                {
                     tracing::warn!(target, bot, source, error = %e, "queue-message intent failed");
                     result.errors += 1;
                 }
@@ -176,7 +179,7 @@ pub fn execute_intents_with_backends(
                 evidence,
             } => {
                 if let Err(e) =
-                    execute_emit_supervisor_signal(pg_pool, engine, &signal_name, evidence)
+                    execute_emit_supervisor_signal(db, pg_pool, engine, &signal_name, evidence)
                 {
                     tracing::warn!(
                         signal_name,
@@ -191,13 +194,13 @@ pub fn execute_intents_with_backends(
                 value,
                 ttl_seconds,
             } => {
-                if let Err(e) = execute_set_kv(pg_pool, &key, &value, ttl_seconds) {
+                if let Err(e) = execute_set_kv(db, pg_pool, &key, &value, ttl_seconds) {
                     tracing::warn!(key, ttl_seconds, error = %e, "set-kv intent failed");
                     result.errors += 1;
                 }
             }
             Intent::DeleteKV { key } => {
-                if let Err(e) = execute_delete_kv(pg_pool, &key) {
+                if let Err(e) = execute_delete_kv(db, pg_pool, &key) {
                     tracing::warn!(key, error = %e, "delete-kv intent failed");
                     result.errors += 1;
                 }
@@ -218,6 +221,7 @@ pub fn execute_intents_with_backends(
 // ── Individual intent executors ─────────────────────────────────
 
 fn execute_transition(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: Option<&crate::engine::PolicyEngine>,
     card_id: &str,
@@ -232,12 +236,14 @@ fn execute_transition(
     let result = crate::utils::async_bridge::block_on_pg_result(
         pool,
         {
+            let db = db.cloned();
             let pool = pool.clone();
             let engine = engine.clone();
             let card_id = card_id.to_string();
             let to = to.to_string();
             move |_bridge_pool| async move {
                 crate::kanban::transition_status_with_opts_pg(
+                    db.as_ref(),
                     &pool,
                     &engine,
                     &card_id,
@@ -256,6 +262,7 @@ fn execute_transition(
 }
 
 fn execute_create_dispatch(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: Option<&crate::engine::PolicyEngine>,
     pre_id: &str,
@@ -272,37 +279,58 @@ fn execute_create_dispatch(
     );
     let _guard = dispatch_span.enter();
     let context = serde_json::json!({});
-    let pg_pool = pg_pool
-        .or_else(|| engine.and_then(|value| value.pg_pool()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("postgres backend is required for create_dispatch intent")
-        })?;
-    let dispatch_id_input = pre_id.to_string();
-    let card_id_input = card_id.to_string();
-    let agent_id_input = agent_id.to_string();
-    let dispatch_type_input = dispatch_type.to_string();
-    let title_input = title.to_string();
-    let (dispatch_id, _old_status, _reused) = crate::utils::async_bridge::block_on_pg_result(
-        pg_pool,
-        move |bridge_pool| async move {
-            crate::dispatch::create_dispatch_core_with_id(
-                &bridge_pool,
-                &dispatch_id_input,
-                &card_id_input,
-                &agent_id_input,
-                &dispatch_type_input,
-                &title_input,
-                &context,
-            )
-            .await
-        },
-        |error| anyhow::anyhow!(error),
-    )?;
+    let dispatch_id = if let Some(pg_pool) =
+        pg_pool.or_else(|| engine.and_then(|value| value.pg_pool()))
+    {
+        let dispatch_id_input = pre_id.to_string();
+        let card_id_input = card_id.to_string();
+        let agent_id_input = agent_id.to_string();
+        let dispatch_type_input = dispatch_type.to_string();
+        let title_input = title.to_string();
+        let (dispatch_id, _old_status, _reused) = crate::utils::async_bridge::block_on_pg_result(
+            pg_pool,
+            move |bridge_pool| async move {
+                crate::dispatch::create_dispatch_core_with_id(
+                    &bridge_pool,
+                    &dispatch_id_input,
+                    &card_id_input,
+                    &agent_id_input,
+                    &dispatch_type_input,
+                    &title_input,
+                    &context,
+                )
+                .await
+            },
+            |error| anyhow::anyhow!(error),
+        )?;
+        dispatch_id
+    } else {
+        let Some(db) = db else {
+            anyhow::bail!("sqlite backend is unavailable for create_dispatch intent");
+        };
+        let engine =
+            engine.ok_or_else(|| anyhow::anyhow!("create_dispatch intent requires engine"))?;
+        let dispatch = crate::dispatch::create_dispatch(
+            db,
+            engine,
+            card_id,
+            agent_id,
+            dispatch_type,
+            title,
+            &context,
+        )?;
+        dispatch
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("sqlite create_dispatch did not return id"))?
+    };
 
     // #117/#158: Update card_review_state via unified entrypoint
     if dispatch_type == "review-decision" {
         crate::engine::ops::review_state_sync_with_backends(
-            Some(pg_pool),
+            db,
+            pg_pool.or_else(|| engine.and_then(|value| value.pg_pool())),
             &serde_json::json!({
                 "card_id": card_id,
                 "state": "suggestion_pending",
@@ -313,27 +341,37 @@ fn execute_create_dispatch(
     }
 
     // Get issue URL for Discord notification
-    let issue_url: Option<String> = crate::utils::async_bridge::block_on_pg_result(
-        pg_pool,
-        {
-            let card_id = card_id.to_string();
-            move |bridge_pool| async move {
-                sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT github_issue_url
+    let issue_url: Option<String> =
+        if let Some(pg_pool) = pg_pool.or_else(|| engine.and_then(|value| value.pg_pool())) {
+            crate::utils::async_bridge::block_on_pg_result(
+                pg_pool,
+                {
+                    let card_id = card_id.to_string();
+                    move |bridge_pool| async move {
+                        sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT github_issue_url
                          FROM kanban_cards
                          WHERE id = $1",
-                )
-                .bind(&card_id)
-                .fetch_optional(&bridge_pool)
-                .await
-                .map(|value| value.flatten())
-                .map_err(|error| format!("load postgres github_issue_url for {card_id}: {error}"))
+                        )
+                        .bind(&card_id)
+                        .fetch_optional(&bridge_pool)
+                        .await
+                        .map(|value| value.flatten())
+                        .map_err(|error| {
+                            format!("load postgres github_issue_url for {card_id}: {error}")
+                        })
+                    }
+                },
+                |error| error,
+            )
+            .ok()
+            .flatten()
+        } else {
+            {
+                let _ = db;
+                None
             }
-        },
-        |error| error,
-    )
-    .ok()
-    .flatten();
+        };
 
     Ok(CreatedDispatch {
         dispatch_id,
@@ -345,6 +383,7 @@ fn execute_create_dispatch(
 }
 
 fn execute_activate_auto_queue(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: Option<&crate::engine::PolicyEngine>,
     body: serde_json::Value,
@@ -358,10 +397,14 @@ fn execute_activate_auto_queue(
     let (_status, response) = crate::utils::async_bridge::block_on_pg_result(
         pool,
         {
+            let db = db.cloned();
             let engine = engine.clone();
             let body = body;
             move |_bridge_pool| async move {
-                Ok(crate::server::routes::auto_queue::activate_with_bridge_pg(engine, body).await)
+                Ok(
+                    crate::server::routes::auto_queue::activate_with_bridge_pg(db, engine, body)
+                        .await,
+                )
             }
         },
         |error| anyhow::anyhow!(error),
@@ -378,15 +421,17 @@ fn execute_activate_auto_queue(
 }
 
 fn execute_sql(
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     sql: &str,
     params: &[serde_json::Value],
 ) -> anyhow::Result<()> {
-    crate::engine::ops::execute_policy_sql(pg_pool, sql, params).map_err(anyhow::Error::msg)?;
+    crate::engine::ops::execute_policy_sql(db, pg_pool, sql, params).map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
 fn execute_queue_message(
+    db: Option<&crate::db::Db>,
     engine: Option<&crate::engine::PolicyEngine>,
     target: &str,
     content: &str,
@@ -394,6 +439,7 @@ fn execute_queue_message(
     source: &str,
 ) -> anyhow::Result<()> {
     let id = crate::engine::ops::message_ops::queue_message(
+        db,
         engine.and_then(|engine| engine.pg_pool()),
         target,
         content,
@@ -412,6 +458,7 @@ fn execute_queue_message(
 }
 
 fn execute_emit_supervisor_signal(
+    _db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     engine: Option<&crate::engine::PolicyEngine>,
     signal_name: &str,
@@ -432,6 +479,7 @@ fn execute_emit_supervisor_signal(
 }
 
 fn execute_set_kv(
+    _db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     key: &str,
     value: &str,
@@ -481,7 +529,11 @@ fn execute_set_kv(
     .map_err(anyhow::Error::msg)
 }
 
-fn execute_delete_kv(pg_pool: Option<&sqlx::PgPool>, key: &str) -> anyhow::Result<()> {
+fn execute_delete_kv(
+    _db: Option<&crate::db::Db>,
+    pg_pool: Option<&sqlx::PgPool>,
+    key: &str,
+) -> anyhow::Result<()> {
     let pool = pg_pool
         .ok_or_else(|| anyhow::anyhow!("postgres backend is required for delete_kv intent"))?;
     crate::utils::async_bridge::block_on_pg_result(
@@ -510,6 +562,7 @@ mod tests {
     #[test]
     fn emit_supervisor_signal_intent_rejects_audit_only_without_engine_lookup() {
         let err = execute_emit_supervisor_signal(
+            None,
             None,
             None,
             "StaleInflight",

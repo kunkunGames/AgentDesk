@@ -390,7 +390,6 @@ pub enum StatusEvent {
     },
     TurnCompleted {
         background: bool,
-        background_agent_pending: bool,
     },
     Heartbeat,
 }
