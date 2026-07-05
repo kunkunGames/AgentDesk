@@ -13,6 +13,13 @@ pub(super) enum SavedOutputPathDecision {
     ReResolve(&'static str),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionCacheSelectorState {
+    selector_present: bool,
+    selected_session_id: Option<String>,
+    cwd: Option<String>,
+}
+
 pub(super) fn decide_saved_output_path_for_manual_rebind(
     saved_path_present: bool,
     session_selector_present: bool,
@@ -55,21 +62,29 @@ pub(super) async fn saved_output_path_for_rebind_resolution<'a>(
     existing_session_id: Option<&str>,
     tmux_session_name: &str,
 ) -> Option<&'a str> {
-    let session_cache_selector_present =
-        session_cache_selector_present_for_rebind(shared, provider, tmux_session_name)
-            .await
-            .unwrap_or_else(|| existing_session_id.is_some_and(|id| !id.trim().is_empty()));
+    let session_cache_selector_state =
+        session_cache_selector_state_for_rebind(shared, provider, tmux_session_name).await;
+    let session_cache_selector_present = session_cache_selector_state
+        .as_ref()
+        .map(|state| state.selector_present)
+        .unwrap_or_else(|| existing_session_id.is_some_and(|id| !id.trim().is_empty()));
     saved_output_path_for_rebind_resolution_with_cache_state(
         existing_saved_output_path,
         session_cache_selector_present,
+        provider,
         tmux_session_name,
+        session_cache_selector_state.as_ref(),
+        None,
     )
 }
 
 fn saved_output_path_for_rebind_resolution_with_cache_state<'a>(
     existing_saved_output_path: Option<&'a str>,
     session_cache_selector_present: bool,
+    provider: &ProviderKind,
     tmux_session_name: &str,
+    session_cache_selector_state: Option<&SessionCacheSelectorState>,
+    claude_home: Option<&std::path::Path>,
 ) -> Option<&'a str> {
     let saved_path_present = existing_saved_output_path
         .map(str::trim)
@@ -78,7 +93,12 @@ fn saved_output_path_for_rebind_resolution_with_cache_state<'a>(
         saved_path_present,
         session_cache_selector_present,
         existing_saved_output_path.and_then(saved_output_path_activity),
-        latest_runtime_activity_age_secs(tmux_session_name),
+        latest_runtime_activity_age_secs(
+            tmux_session_name,
+            provider,
+            session_cache_selector_state,
+            claude_home,
+        ),
         crate::services::tui_turn_state::STALE_USER_SUBMITTED_RECLAIM_SECS,
     );
     match decision {
@@ -125,9 +145,18 @@ fn saved_output_path_activity(path: &str) -> Option<SavedOutputPathActivity> {
     })
 }
 
-fn latest_runtime_activity_age_secs(tmux_session_name: &str) -> Option<i64> {
-    let activity =
-        crate::services::dispatched_sessions::latest_runtime_activity_unix_nanos(tmux_session_name);
+fn latest_runtime_activity_age_secs(
+    tmux_session_name: &str,
+    provider: &ProviderKind,
+    session_cache_selector_state: Option<&SessionCacheSelectorState>,
+    claude_home: Option<&std::path::Path>,
+) -> Option<i64> {
+    let activity = latest_runtime_activity_unix_nanos_for_manual_rebind(
+        tmux_session_name,
+        provider,
+        session_cache_selector_state,
+        claude_home,
+    );
     if activity <= 0 {
         return None;
     }
@@ -138,11 +167,68 @@ fn latest_runtime_activity_age_secs(tmux_session_name: &str) -> Option<i64> {
     Some(now.saturating_sub(activity) / 1_000_000_000)
 }
 
-async fn session_cache_selector_present_for_rebind(
+fn latest_runtime_activity_unix_nanos_for_manual_rebind(
+    tmux_session_name: &str,
+    provider: &ProviderKind,
+    session_cache_selector_state: Option<&SessionCacheSelectorState>,
+    claude_home: Option<&std::path::Path>,
+) -> i64 {
+    crate::services::dispatched_sessions::latest_runtime_activity_unix_nanos(tmux_session_name).max(
+        claude_tui_selector_transcript_activity_unix_nanos(
+            provider,
+            session_cache_selector_state,
+            claude_home,
+        ),
+    )
+}
+
+fn claude_tui_selector_transcript_activity_unix_nanos(
+    provider: &ProviderKind,
+    session_cache_selector_state: Option<&SessionCacheSelectorState>,
+    claude_home: Option<&std::path::Path>,
+) -> i64 {
+    if provider != &ProviderKind::Claude {
+        return 0;
+    }
+    let Some(state) = session_cache_selector_state else {
+        return 0;
+    };
+    let Some(session_id) = state
+        .selected_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return 0;
+    };
+    let Some(cwd) = state
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return 0;
+    };
+    let Ok(path) = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+        std::path::Path::new(cwd),
+        session_id,
+        claude_home,
+    ) else {
+        return 0;
+    };
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+async fn session_cache_selector_state_for_rebind(
     shared: &SharedData,
     provider: &ProviderKind,
     tmux_session_name: &str,
-) -> Option<bool> {
+) -> Option<SessionCacheSelectorState> {
     let pool = shared.pg_pool.as_ref()?;
     for session_key in super::super::adk_session::build_session_key_candidates(
         &shared.token_hash,
@@ -156,7 +242,19 @@ async fn session_cache_selector_present_for_rebind(
         )
         .await
         {
-            Ok(Some(ids)) => return Some(provider_session_ids_have_any_selector(&ids)),
+            Ok(Some(ids)) => {
+                let selected_session_id =
+                    crate::services::dispatched_sessions::selected_provider_resume_selector_for_provider(
+                        Some(provider.as_str()),
+                        &ids,
+                    )
+                    .map(str::to_string);
+                return Some(SessionCacheSelectorState {
+                    selector_present: provider_session_ids_have_any_selector(&ids),
+                    selected_session_id,
+                    cwd: ids.cwd,
+                });
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
@@ -169,7 +267,11 @@ async fn session_cache_selector_present_for_rebind(
             }
         }
     }
-    Some(false)
+    Some(SessionCacheSelectorState {
+        selector_present: false,
+        selected_session_id: None,
+        cwd: None,
+    })
 }
 
 fn provider_session_ids_have_any_selector(
@@ -239,6 +341,66 @@ mod tests {
                 stale_after_secs,
             ),
             SavedOutputPathDecision::Keep
+        );
+    }
+
+    #[test]
+    fn claude_tui_selector_transcript_activity_re_resolves_stale_saved_path() {
+        let saved_dir = tempfile::tempdir().expect("saved output tempdir");
+        let saved_path = saved_dir.path().join("old-wrapper.jsonl");
+        std::fs::write(&saved_path, b"old wrapper\n").expect("write saved output");
+        filetime::set_file_mtime(
+            &saved_path,
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(700),
+            ),
+        )
+        .expect("stale saved mtime");
+
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let transcript_path = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+            cwd.path(),
+            &session_id,
+            Some(claude_home.path()),
+        )
+        .expect("transcript path");
+        std::fs::create_dir_all(transcript_path.parent().expect("transcript parent"))
+            .expect("create transcript parent");
+        std::fs::write(&transcript_path, b"fresh transcript\n").expect("write transcript");
+        filetime::set_file_mtime(
+            &transcript_path,
+            filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(5),
+            ),
+        )
+        .expect("fresh transcript mtime");
+        let selector_state = SessionCacheSelectorState {
+            selector_present: true,
+            selected_session_id: Some(session_id),
+            cwd: Some(cwd.path().display().to_string()),
+        };
+        let saved_path_string = saved_path.display().to_string();
+
+        assert!(
+            claude_tui_selector_transcript_activity_unix_nanos(
+                &crate::services::provider::ProviderKind::Claude,
+                Some(&selector_state),
+                Some(claude_home.path()),
+            ) > 0
+        );
+        assert_eq!(
+            saved_output_path_for_rebind_resolution_with_cache_state(
+                Some(saved_path_string.as_str()),
+                true,
+                &crate::services::provider::ProviderKind::Claude,
+                "tmux-with-no-wrapper-activity",
+                Some(&selector_state),
+                Some(claude_home.path()),
+            ),
+            None,
+            "manual rebind must ignore a stale saved wrapper path when the selected Claude transcript is fresh"
         );
     }
 }

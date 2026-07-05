@@ -1115,6 +1115,17 @@ pub(crate) fn latest_runtime_activity_unix_nanos(tmux_session_name: &str) -> i64
     {
         latest = latest.max(marker.rollout_path.to_str().map(mtime_nanos).unwrap_or(0));
     }
+    // Claude TUI direct mode relays from the provider-native transcript under
+    // ~/.claude/projects. Treat the bound transcript mtime as runtime activity
+    // so manual recovery does not keep a stale wrapper jsonl while Claude is
+    // actively appending to the real transcript.
+    if let Some(binding) =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
+        && binding.runtime_kind
+            == crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui
+    {
+        latest = latest.max(mtime_nanos(&binding.output_path));
+    }
 
     latest
 }
@@ -1127,7 +1138,7 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-fn selected_provider_resume_selector_for_provider<'a>(
+pub(crate) fn selected_provider_resume_selector_for_provider<'a>(
     provider_name: Option<&str>,
     ids: &'a dispatched_sessions_db::ProviderSessionIds,
 ) -> Option<&'a str> {
@@ -1182,6 +1193,7 @@ fn selected_provider_resume_selector_with_claude_home<'a>(
         raw,
         cached_activity,
         raw_activity,
+        ids.cache_entry_age_secs,
         crate::services::tui_turn_state::STALE_USER_SUBMITTED_RECLAIM_SECS,
     )
 }
@@ -1203,15 +1215,20 @@ fn claude_selector_file_activity(
                 exists: false,
                 len: 0,
                 mtime_age_secs: None,
+                observed_growth_since_previous_sample: false,
             },
         );
     };
     Some(
-        crate::services::session_selector_validity::SelectorFileActivity {
-            exists: true,
-            len: metadata.len(),
-            mtime_age_secs: file_mtime_age_secs(&metadata),
-        },
+        crate::services::session_selector_validity::activity_with_observed_growth(
+            selector,
+            crate::services::session_selector_validity::SelectorFileActivity {
+                exists: true,
+                len: metadata.len(),
+                mtime_age_secs: file_mtime_age_secs(&metadata),
+                observed_growth_since_previous_sample: false,
+            },
+        ),
     )
 }
 
@@ -1635,7 +1652,8 @@ fn should_skip_idle_cleanup_for_active_dispatch(
 mod kill_tmux_resume_tests {
     use super::{
         latest_runtime_activity_unix_nanos, provider_resume_selector_is_effective_with_claude_home,
-        runtime_activity_age_minutes, should_skip_idle_cleanup_for_active_dispatch,
+        runtime_activity_age_minutes, selected_provider_resume_selector_with_claude_home,
+        should_skip_idle_cleanup_for_active_dispatch,
         should_skip_idle_kill_for_live_runtime_activity,
     };
     use crate::db::dispatched_sessions::ProviderSessionIds;
@@ -1649,6 +1667,7 @@ mod kill_tmux_resume_tests {
             claude_session_id: claude_session_id.map(str::to_string),
             raw_provider_session_id: raw_provider_session_id.map(str::to_string),
             cwd: cwd.map(|path| path.display().to_string()),
+            cache_entry_age_secs: Some(3_600),
         }
     }
 
@@ -1690,6 +1709,34 @@ mod kill_tmux_resume_tests {
         assert_eq!(latest, mtime_nanos(&rollout));
         assert!(latest > mtime_nanos(&marker));
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn latest_runtime_activity_uses_claude_tui_bound_transcript() {
+        let tmux = format!("AgentDesk-claude-runtime-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("claude-transcript.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"assistant\"}\n")
+            .expect("write transcript");
+        let transcript_time = filetime::FileTime::from_unix_time(1_700_001_000, 0);
+        filetime::set_file_mtime(&transcript, transcript_time).expect("set transcript mtime");
+        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+            &tmux,
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+                output_path: transcript.display().to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+
+        let latest = latest_runtime_activity_unix_nanos(&tmux);
+
+        assert_eq!(latest, mtime_nanos(&transcript));
+        assert!(crate::services::tui_prompt_dedupe::clear_tmux_runtime_binding(&tmux));
     }
 
     #[test]
@@ -1754,6 +1801,65 @@ mod kill_tmux_resume_tests {
             None,
             "idle 24시간 초과 — 자동 정리",
         ));
+    }
+
+    #[test]
+    fn claude_selector_switches_to_raw_only_after_observed_growth() {
+        let cwd = tempfile::tempdir().expect("cwd tempdir");
+        let claude_home = tempfile::tempdir().expect("claude home tempdir");
+        let cached_session_id = uuid::Uuid::new_v4().to_string();
+        let raw_session_id = uuid::Uuid::new_v4().to_string();
+        let cached_path = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+            cwd.path(),
+            &cached_session_id,
+            Some(claude_home.path()),
+        )
+        .expect("cached transcript path");
+        let raw_path = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+            cwd.path(),
+            &raw_session_id,
+            Some(claude_home.path()),
+        )
+        .expect("raw transcript path");
+        std::fs::create_dir_all(cached_path.parent().expect("cached parent"))
+            .expect("create cached parent");
+        std::fs::create_dir_all(raw_path.parent().expect("raw parent"))
+            .expect("create raw parent");
+        std::fs::write(&cached_path, b"cached\n").expect("write cached transcript");
+        std::fs::write(&raw_path, b"raw\n").expect("write raw transcript");
+        let now = std::time::SystemTime::now();
+        filetime::set_file_mtime(
+            &cached_path,
+            filetime::FileTime::from_system_time(
+                now - std::time::Duration::from_secs(700),
+            ),
+        )
+        .expect("set cached mtime");
+        filetime::set_file_mtime(
+            &raw_path,
+            filetime::FileTime::from_system_time(now - std::time::Duration::from_secs(5)),
+        )
+        .expect("set raw mtime");
+        let ids = ids(Some(&cached_session_id), Some(&raw_session_id), Some(cwd.path()));
+
+        assert_eq!(
+            selected_provider_resume_selector_with_claude_home(&ids, Some(claude_home.path())),
+            Some(cached_session_id.as_str()),
+            "recent raw mtime alone is not growth evidence"
+        );
+
+        std::fs::write(&raw_path, b"raw\ngrown\n").expect("grow raw transcript");
+        filetime::set_file_mtime(
+            &raw_path,
+            filetime::FileTime::from_system_time(now - std::time::Duration::from_secs(4)),
+        )
+        .expect("refresh raw mtime");
+
+        assert_eq!(
+            selected_provider_resume_selector_with_claude_home(&ids, Some(claude_home.path())),
+            Some(raw_session_id.as_str()),
+            "the second raw sample with a larger length is required before flipping"
+        );
     }
 
     #[test]

@@ -944,6 +944,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_rebind_without_saved_path_uses_default_wrapper_output_path() {
+        let _guard = lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _root = EnvGuard::set_path("AGENTDESK_ROOT_DIR", tmp.path());
+        let tmux_session_name = "AgentDesk-claude-adk-cc-manual-rebind";
+
+        let result = resolve_rebind_runtime_state(
+            &ProviderKind::Claude,
+            tmux_session_name,
+            None,
+            Some("c62c2dc8-0000-4000-8000-000000000000".to_string()),
+        )
+        .expect("claude rebind without saved path should use wrapper output path");
+
+        assert_eq!(
+            result.output_path,
+            crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl")
+        );
+        assert_eq!(result.synthetic_initial_offset, 0);
+        assert!(result.input_fifo_path.is_some());
+        assert_eq!(result.runtime_kind, None);
+        assert_eq!(
+            result.session_id.as_deref(),
+            Some("c62c2dc8-0000-4000-8000-000000000000")
+        );
+        assert_eq!(result.codex_rollout_path, None);
+    }
+
+    #[test]
     fn direct_codex_tui_rebind_adopts_existing_runtime_binding_and_clamps_offset() {
         let _guard = lock_test_env();
         crate::services::tui_prompt_dedupe::reset_state_for_tests();

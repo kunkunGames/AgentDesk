@@ -893,7 +893,6 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
     let Some(state) = super::inflight::load_inflight_state(&provider, record.channel_id) else {
         return false;
     };
-    let relay_frontier = shared.committed_relay_offset(channel);
     let capture_offset = output_capture_offset(&state);
     if committed_foreign_inflight_is_finalize_clearable(&state, record) {
         let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel)
@@ -901,10 +900,12 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
             .active_user_message_id
             .map(|id| id.get());
         let probe = super::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+            shared.as_ref(),
             &state,
             mailbox_active_user_msg_id,
-            Some(relay_frontier),
+            channel,
         );
+        let relay_frontier = probe.relay_frontier;
         if !super::destructive_cancel_gate::terminal_envelope_present(&provider, &probe) {
             tracing::warn!(
                 provider = %record.provider,
@@ -914,7 +915,7 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
                 committed_user_msg_id = state.user_msg_id,
                 committed_started_at = %state.started_at,
                 committed_updated_at = %state.updated_at,
-                relay_frontier,
+                relay_frontier = ?relay_frontier,
                 capture_offset = ?capture_offset,
                 "tui_direct_pending_start: skipped committed FOREIGN finalize-clear; terminal envelope evidence missing"
             );
@@ -931,7 +932,7 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
                 committed_user_msg_id = state.user_msg_id,
                 committed_started_at = %state.started_at,
                 committed_updated_at = %state.updated_at,
-                relay_frontier,
+                relay_frontier = ?relay_frontier,
                 capture_offset = ?capture_offset,
                 "tui_direct_pending_start: cleared committed FOREIGN inflight with terminal envelope via finalizer Complete; re-evaluating before claiming (#4035)"
             );
@@ -946,10 +947,12 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
         .active_user_message_id
         .map(|id| id.get());
     let probe = super::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+        shared.as_ref(),
         &state,
         mailbox_active_user_msg_id,
-        Some(relay_frontier),
+        channel,
     );
+    let relay_frontier = probe.relay_frontier;
     let gate =
         super::destructive_cancel_gate::evaluate(shared, &provider, channel, channel, &probe).await;
     if !gate.is_allowed() {
@@ -961,7 +964,7 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
             stale_user_msg_id = state.user_msg_id,
             stale_started_at = %state.started_at,
             stale_updated_at = %state.updated_at,
-            relay_frontier,
+            relay_frontier = ?relay_frontier,
             capture_offset = ?capture_offset,
             denied_reason = gate.denied_reason().unwrap_or("unknown"),
             "tui_direct_pending_start: skipped destructive stale FOREIGN demotion; death/identity gate did not pass (#4030)"
@@ -979,7 +982,7 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
             stale_user_msg_id = state.user_msg_id,
             stale_started_at = %state.started_at,
             stale_updated_at = %state.updated_at,
-            relay_frontier,
+            relay_frontier = ?relay_frontier,
             capture_offset = ?capture_offset,
             death_evidence = gate.allowed_reason().unwrap_or("unknown"),
             min_stale_age_secs = STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS,
@@ -2568,9 +2571,10 @@ mod tests {
 
             let stale_probe =
                 crate::services::discord::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_state(
+                    &shared,
                     &stale_state,
                     Some(4_030_211),
-                    Some(shared.committed_relay_offset(channel)),
+                    channel,
                 );
             assert!(
                 !submit_stale_foreign_inflight_cancel(&shared, &provider, channel, &stale_probe).await,

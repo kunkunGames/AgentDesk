@@ -1880,6 +1880,7 @@ pub(crate) struct ProviderSessionIds {
     pub(crate) claude_session_id: Option<String>,
     pub(crate) raw_provider_session_id: Option<String>,
     pub(crate) cwd: Option<String>,
+    pub(crate) cache_entry_age_secs: Option<i64>,
 }
 
 pub(crate) struct UpdateSessionParams<'a> {
@@ -2016,7 +2017,9 @@ pub(crate) async fn load_provider_session_ids_pg(
 ) -> Result<Option<ProviderSessionIds>, String> {
     let result = if let Some(provider) = provider {
         sqlx::query(
-            "SELECT claude_session_id, raw_provider_session_id, cwd
+            "SELECT claude_session_id, raw_provider_session_id, cwd,
+                    EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat, created_at)))::BIGINT
+                        AS cache_entry_age_secs
              FROM sessions
              WHERE session_key = $1 AND provider = $2",
         )
@@ -2026,7 +2029,9 @@ pub(crate) async fn load_provider_session_ids_pg(
         .await
     } else {
         sqlx::query(
-            "SELECT claude_session_id, raw_provider_session_id, cwd
+            "SELECT claude_session_id, raw_provider_session_id, cwd,
+                    EXTRACT(EPOCH FROM (NOW() - COALESCE(last_heartbeat, created_at)))::BIGINT
+                        AS cache_entry_age_secs
              FROM sessions
              WHERE session_key = $1",
         )
@@ -2041,6 +2046,7 @@ pub(crate) async fn load_provider_session_ids_pg(
             claude_session_id: row.try_get("claude_session_id")?,
             raw_provider_session_id: row.try_get("raw_provider_session_id")?,
             cwd: row.try_get("cwd")?,
+            cache_entry_age_secs: row.try_get("cache_entry_age_secs")?,
         })
     })
     .transpose()

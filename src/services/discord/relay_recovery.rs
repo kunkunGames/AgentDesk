@@ -691,6 +691,7 @@ fn relay_recovery_destructive_cancel_pin(
 }
 
 fn relay_recovery_probe_snapshot_for_owner(
+    shared: &super::SharedData,
     provider: &ProviderKind,
     owner_channel_id: ChannelId,
     decision: &RelayRecoveryDecision,
@@ -706,9 +707,10 @@ fn relay_recovery_probe_snapshot_for_owner(
     }
     Ok(
         super::destructive_cancel_gate::DestructiveCancelProbeSnapshot::from_pinned_state(
+            shared,
             &state,
             pin,
-            Some(decision.evidence.last_relay_offset),
+            owner_channel_id,
         ),
     )
 }
@@ -1022,8 +1024,12 @@ async fn apply_relay_recovery_decision(
                 };
             }
             if let Some(owner_channel_id) = relay_frontier_dead_reattach_owner(decision) {
-                match relay_recovery_probe_snapshot_for_owner(provider, owner_channel_id, decision)
-                {
+                match relay_recovery_probe_snapshot_for_owner(
+                    shared.as_ref(),
+                    provider,
+                    owner_channel_id,
+                    decision,
+                ) {
                     Ok(probe) => {
                         let expected_watcher =
                             shared.tmux_watchers.get(&owner_channel_id).map(|watcher| {

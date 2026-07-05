@@ -1730,8 +1730,10 @@
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).
   - `src/db/postgres.rs` (1280 lines; #3651: the `FOREGROUND_RESERVE` process-global, the `background_should_yield` backpressure predicate + pure `should_yield_for_counters` helper, the `clamp_foreground_reserve` helper that keeps the background budget >= 1 for small `pool_max` configs, reserve install+clamp in `connect`, and the predicate + clamp unit tests; #3690: preferred_intake_node_labels upsert/sync + COALESCE preserve; #3692: `agent_roster_sync_enabled` leader-ownership gate on the roster sync; #3722 adds the bounded startup advisory lock wrapper plus concurrency coverage for migration/config-audit/reseed startup sections).
-  - `src/db/dispatched_sessions.rs` (1627 lines; dispatched session
-    persistence helpers. #3306: +48 for the narrow `load_session_channel_id_pg`
+  - `src/db/dispatched_sessions.rs` (1633 lines; dispatched session
+    persistence helpers. #4091 r2: +6 exposing cache-entry age on provider-session
+    rows so the selector flip-back window can prefer a recently written cached id;
+    #3306: +48 for the narrow `load_session_channel_id_pg`
     durable-truth accessor the idle-relay drift self-heal reads; #3693: +2 to
     include `cwd` in provider resume selector lookup; #3718 makes runtime
     activity heartbeat refresh monotonic via `GREATEST`; -1 from #3795 using
@@ -1763,7 +1765,9 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `src/services/auto_queue/cancel_run.rs` (1031) is also giant-file territory;
   split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (2937),
-  `src/services/dispatched_sessions.rs` (1633), and
+  `src/services/dispatched_sessions.rs` (1650; #4091 r2 adds the two-sample
+  growth-evidence selector cross-check wiring, claude_tui transcript-mtime
+  runtime-activity anchors, and the flip-back window guard), and
   `src/services/settings.rs` (1114) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)

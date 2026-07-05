@@ -22,13 +22,13 @@
 | `src/services/discord/outbound/turn_output_controller.rs` | 1148 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/placeholder_sweeper.rs` | 1014 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/recovery_engine/restore_inflight.rs` | 2335 | discord-relay | 2026-10-31 | #3834 |
-| `src/services/discord/relay_recovery.rs` | 1287 | discord-relay | 2026-08-31 | #3405 |
+| `src/services/discord/relay_recovery.rs` | 1293 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/router/intake_gate.rs` | 1607 | discord-relay | 2026-10-31 | #3838 |
 | `src/services/discord/router/message_handler/intake_turn.rs` | 2825 | discord-relay | 2026-10-31 | #3837 |
 | `src/services/discord/session_relay_sink.rs` | 1664 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/tmux.rs` | 1482 | discord-relay | 2026-10-31 | #3841 |
 | `src/services/discord/tmux_watcher.rs` | 7217 | discord-relay | 2026-10-31 | #3832 |
-| `src/services/discord/tui_direct_pending_start.rs` | 1491 | discord-relay | 2026-08-31 | #3540 |
+| `src/services/discord/tui_direct_pending_start.rs` | 1494 | discord-relay | 2026-08-31 | #3540 |
 | `src/services/discord/tui_prompt_relay/synthetic_start.rs` | 1051 | discord-relay | 2026-10-31 | #4019 |
 | `src/services/discord/tui_task_card.rs` | 1065 | discord-relay | 2026-10-31 | #3405 |
 | `src/services/discord/turn_bridge/mod.rs` | 6160 | discord-relay | 2026-08-31 | #3038 |
@@ -57,7 +57,7 @@
 | `src/config.rs` | 2705 |
 | `src/db/auto_queue/entries.rs` | 1508 |
 | `src/db/auto_queue/phase_gates.rs` | 1639 |
-| `src/db/dispatched_sessions.rs` | 1627 |
+| `src/db/dispatched_sessions.rs` | 1633 |
 | `src/db/dispatches/mod.rs` | 1028 |
 | `src/db/postgres.rs` | 1280 |
 | `src/dispatch/dispatch_context.rs` | 2817 |
@@ -94,7 +94,7 @@
 | `src/services/discord/mod.rs` | 4168 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1337 |
 | `src/services/discord_config_audit.rs` | 1288 |
-| `src/services/dispatched_sessions.rs` | 1633 |
+| `src/services/dispatched_sessions.rs` | 1650 |
 | `src/services/dispatches/discord_delivery/orchestration.rs` | 1496 |
 | `src/services/dispatches/outbox_route.rs` | 1172 |
 | `src/services/gemini.rs` | 1358 |
