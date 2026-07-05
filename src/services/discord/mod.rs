@@ -133,8 +133,8 @@ pub(crate) use meeting_orchestrator as meeting;
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
 // here in mod.rs and `catch_up_missed_messages` in runtime_bootstrap recovery).
 pub(in crate::services::discord) use catch_up::{
-    catch_up_missed_messages, catch_up_missed_messages_inner, should_trigger_catch_up_retry,
-    take_catch_up_retry_checkpoint_after_queue_drain,
+    CatchUpRetryState, catch_up_missed_messages, catch_up_missed_messages_inner,
+    should_trigger_catch_up_retry, take_catch_up_retry_checkpoint_after_queue_drain,
 };
 pub(in crate::services::discord) use recovery_engine as recovery;
 // #3038 S1: re-export the extracted cluster type so the `SharedData` field
@@ -2090,10 +2090,10 @@ pub(crate) struct SharedData {
     /// Per-channel last processed message ID — used for startup catch-up polling.
     pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
     /// Channels where catch-up stopped because the intervention queue was at
-    /// capacity. The value is the pinned `after` checkpoint for the next
-    /// in-process catch-up pass, independent of live message checkpoints that
-    /// may advance while the queued backlog drains.
-    pub(super) catch_up_retry_pending: dashmap::DashMap<ChannelId, u64>,
+    /// capacity. Carries the pinned `after` checkpoint + bounded fetch-failure
+    /// count for the next in-process pass, independent of live message
+    /// checkpoints that may advance while the queued backlog drains.
+    pub(super) catch_up_retry_pending: dashmap::DashMap<ChannelId, CatchUpRetryState>,
     /// Per-channel turn start time — used for metrics duration calculation.
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Per-channel known speakers collected lazily from incoming messages.
@@ -2701,10 +2701,15 @@ async fn mailbox_try_start_turn(
     request_owner: UserId,
     user_message_id: MessageId,
 ) -> bool {
-    shared
-        .mailbox(channel_id)
-        .try_start_turn(cancel_token, request_owner, user_message_id)
-        .await
+    mailbox_try_start_turn_kinded(
+        shared,
+        channel_id,
+        cancel_token,
+        request_owner,
+        user_message_id,
+        ActiveTurnKind::UserOrAgent,
+    )
+    .await
 }
 
 /// #3167 — kinded variant of [`mailbox_try_start_turn`]. The monitor auto-turn
@@ -2719,10 +2724,15 @@ async fn mailbox_try_start_turn_kinded(
     user_message_id: MessageId,
     turn_kind: ActiveTurnKind,
 ) -> bool {
-    shared
-        .mailbox(channel_id)
-        .try_start_turn_kinded(cancel_token, request_owner, user_message_id, turn_kind)
-        .await
+    queue_io::mailbox_try_start_turn_kinded_with_feedback(
+        shared,
+        channel_id,
+        cancel_token,
+        request_owner,
+        user_message_id,
+        turn_kind,
+    )
+    .await
 }
 
 // #3034: dormant production restore path (wraps `mailbox.restore_active_turn`,
@@ -2888,6 +2898,108 @@ fn queue_exit_card_body(kind: QueueExitKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod queue_exit_feedback_reconciler_tests {
+    use super::*;
+
+    struct ScopedRuntimeRoot {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _temp: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ScopedRuntimeRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var("AGENTDESK_ROOT_DIR", value),
+                    None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
+                }
+            }
+        }
+    }
+
+    #[must_use]
+    fn scoped_runtime_root() -> ScopedRuntimeRoot {
+        let lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let prev = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let temp = tempfile::tempdir().expect("create temp runtime dir for feedback test");
+        unsafe {
+            std::env::set_var(
+                "AGENTDESK_ROOT_DIR",
+                temp.path().to_str().expect("temp path must be valid utf-8"),
+            );
+        }
+        ScopedRuntimeRoot {
+            _lock: lock,
+            _temp: temp,
+            prev,
+        }
+    }
+
+    fn queue_exit_intervention(message_id: MessageId) -> Intervention {
+        Intervention {
+            author_id: UserId::new(7),
+            author_is_bot: false,
+            message_id,
+            queued_generation: 91,
+            source_message_ids: vec![message_id],
+            source_message_queued_generations: Vec::new(),
+            text: "queued text".to_string(),
+            mode: InterventionMode::Soft,
+            created_at: std::time::Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            pending_uploads: Vec::new(),
+            voice_announcement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_queue_exit_feedback_adds_feedback_reaction_through_reconciler() {
+        let _root = scoped_runtime_root();
+        let shared = make_shared_data_for_tests();
+        let _ = shared
+            .http
+            .cached_bot_token
+            .set("Bot test-token".to_string());
+        let channel_id = ChannelId::new(100_000_000_000_231);
+        let cases = [
+            (
+                MessageId::new(100_000_000_000_232),
+                QueueExitKind::Cancelled,
+            ),
+            (MessageId::new(100_000_000_000_233), QueueExitKind::Expired),
+            (
+                MessageId::new(100_000_000_000_234),
+                QueueExitKind::Superseded,
+            ),
+        ];
+
+        for (message_id, kind) in cases {
+            let event = QueueExitEvent {
+                intervention: queue_exit_intervention(message_id),
+                kind,
+            };
+            apply_queue_exit_feedback(&shared, channel_id, &[event]).await;
+            let emoji = queue_exit_feedback_emoji(kind);
+
+            assert!(
+                shared.turn_view_reconciler.ops().iter().any(|op| {
+                    op.target.channel_id == channel_id
+                        && op.target.message_id == message_id
+                        && op.add
+                        && op.emoji == emoji
+                }),
+                "{emoji} queue-exit feedback must route through the reconciler"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QueueExitVisibleCard {
     user_msg_id: MessageId,
@@ -3011,13 +3123,9 @@ async fn apply_queue_exit_feedback(
 
     queue_marker::drain_queue_exit_markers(shared, &http, channel_id, &queue_exit_events).await;
     for event in queue_exit_events {
-        reaction_lifecycle::note_auxiliary_reaction_added(
-            &http,
-            channel_id,
-            event.intervention.message_id,
-            queue_exit_feedback_emoji(event.kind),
-        )
-        .await;
+        let message_id = event.intervention.message_id;
+        let emoji = queue_exit_feedback_emoji(event.kind);
+        queue_marker::note_exit_feedback_added(shared, &http, channel_id, message_id, emoji).await;
     }
 }
 
@@ -3186,7 +3294,7 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
         return false;
     };
 
-    let Some(retry_checkpoint) =
+    let Some(retry_state) =
         take_catch_up_retry_checkpoint_after_queue_drain(shared, channel_id, queue_len_after)
     else {
         return false;
@@ -3195,7 +3303,7 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
     let shared = Arc::clone(shared);
     let provider = provider.clone();
     task_supervisor::spawn_observed("catch_up_retry_after_queue_drain", async move {
-        let retry_checkpoints = HashMap::from([(channel_id, retry_checkpoint)]);
+        let retry_checkpoints = HashMap::from([(channel_id, retry_state)]);
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!(
             "  [{ts}] 🔁 catch-up: retrying channel {} after queue drained to {} item(s)",

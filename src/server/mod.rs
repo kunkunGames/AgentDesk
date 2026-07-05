@@ -12,11 +12,12 @@ pub(crate) mod test_phase_runs;
 mod worker_registry;
 pub mod ws;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
+use serde::Serialize;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres, Row};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +38,7 @@ const POLICY_TICK_ADVISORY_LOCK_ID: i64 = 7_801_001;
 const GITHUB_SYNC_ADVISORY_LOCK_ID: i64 = 7_801_002;
 const POLICY_TICK_WARN_MS: u128 = 500;
 const POLICY_TICK_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Set once the rate-limit sync loop has emitted its first WARN about absent
 /// Gemini OAuth credentials. When Gemini is simply not configured, the loop runs
@@ -56,6 +58,11 @@ static POLICY_TICK_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// when the tick actor is holding onto work well past the user-visible
 /// deadline, which is the failure mode this counter was added to track.
 static POLICY_TICK_POST_TIMEOUT_COMPLETIONS: AtomicU64 = AtomicU64::new(0);
+
+fn claude_rate_limit_refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 struct PolicyTickHookGuard {
     in_flight: Arc<AtomicBool>,
@@ -992,27 +999,7 @@ async fn rate_limit_sync_loop(pg_pool: Arc<PgPool>) {
         }
         first = false;
 
-        // --- Claude rate limits ---
-        // Priority: 1) OAuth token (Claude Code subscription), 2) ANTHROPIC_API_KEY
-        let claude_result =
-            if let Some(token) = crate::services::provider_auth::claude_oauth_token() {
-                fetch_claude_oauth_usage(&token).await
-            } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                fetch_anthropic_rate_limits(&api_key).await
-            } else {
-                Err(anyhow::anyhow!("no Claude credentials found"))
-            };
-        match claude_result {
-            Ok(buckets) => {
-                let data = serde_json::json!({ "buckets": buckets }).to_string();
-                let now = chrono::Utc::now().timestamp();
-                upsert_rate_limit_cache_entry(pg_pool.as_ref(), "claude", &data, now).await;
-                tracing::info!("[rate-limit-sync] Claude: {} buckets cached", buckets.len());
-            }
-            Err(e) => {
-                tracing::warn!("[rate-limit-sync] Claude rate_limit fetch failed: {e}");
-            }
-        }
+        let _ = sync_claude_rate_limit_cache_once_serialized(pg_pool.as_ref()).await;
 
         // --- Codex rate limits ---
         // Priority: 1) ~/.codex/auth.json (Codex CLI subscription), 2) OPENAI_API_KEY
@@ -1083,7 +1070,158 @@ async fn rate_limit_sync_loop(pg_pool: Arc<PgPool>) {
         // feature: rate-limit-aware-dispatch-gate — refresh the process-wide
         // in-memory pressure + agent→provider snapshots that the auto-queue
         // dispatch gate reads O(1) off the hot path (no DB on dispatch).
-        refresh_dispatch_gate_snapshots(pg_pool.as_ref()).await;
+        refresh_dispatch_gate_snapshots_serialized(pg_pool.as_ref()).await;
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeRateLimitRefreshOutcome {
+    pub triggered: bool,
+    pub dispatch_gate_refreshed: bool,
+    pub refreshed_at: Option<i64>,
+    pub reason: Option<&'static str>,
+    pub error: Option<String>,
+}
+
+impl ClaudeRateLimitRefreshOutcome {
+    fn scheduled() -> Self {
+        Self {
+            triggered: true,
+            dispatch_gate_refreshed: false,
+            refreshed_at: None,
+            reason: Some("refresh_scheduled"),
+            error: None,
+        }
+    }
+
+    fn skipped(reason: &'static str) -> Self {
+        Self {
+            triggered: false,
+            dispatch_gate_refreshed: false,
+            refreshed_at: None,
+            reason: Some(reason),
+            error: None,
+        }
+    }
+
+    fn failed(error: anyhow::Error) -> Self {
+        Self {
+            triggered: false,
+            dispatch_gate_refreshed: false,
+            refreshed_at: None,
+            reason: Some("sync_failed"),
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+pub(crate) fn spawn_claude_rate_limit_refresh_if_leader(
+    pg_pool: PgPool,
+) -> ClaudeRateLimitRefreshOutcome {
+    if !worker_registry::rate_limit_sync_active() {
+        return ClaudeRateLimitRefreshOutcome::skipped("rate_limit_sync_not_active_on_this_node");
+    }
+
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT,
+            trigger_claude_rate_limit_refresh_if_leader(&pg_pool),
+        )
+        .await
+        {
+            Ok(outcome) if outcome.error.is_none() => {
+                tracing::info!(
+                    triggered = outcome.triggered,
+                    dispatch_gate_refreshed = outcome.dispatch_gate_refreshed,
+                    refreshed_at = ?outcome.refreshed_at,
+                    reason = ?outcome.reason,
+                    "[rate-limit-sync] dashboard-triggered Claude refresh completed"
+                );
+            }
+            Ok(outcome) => {
+                tracing::warn!(
+                    reason = ?outcome.reason,
+                    error = ?outcome.error,
+                    "[rate-limit-sync] dashboard-triggered Claude refresh failed"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT.as_secs(),
+                    "[rate-limit-sync] dashboard-triggered Claude refresh timed out"
+                );
+            }
+        }
+    });
+
+    ClaudeRateLimitRefreshOutcome::scheduled()
+}
+
+pub(crate) async fn trigger_claude_rate_limit_refresh_if_leader(
+    pg_pool: &PgPool,
+) -> ClaudeRateLimitRefreshOutcome {
+    if !worker_registry::rate_limit_sync_active() {
+        return ClaudeRateLimitRefreshOutcome::skipped("rate_limit_sync_not_active_on_this_node");
+    }
+
+    match sync_claude_rate_limit_cache_once_and_refresh_dispatch_gate_serialized(pg_pool).await {
+        Ok(_) => ClaudeRateLimitRefreshOutcome {
+            triggered: true,
+            dispatch_gate_refreshed: true,
+            refreshed_at: Some(chrono::Utc::now().timestamp()),
+            reason: None,
+            error: None,
+        },
+        Err(error) => ClaudeRateLimitRefreshOutcome::failed(error),
+    }
+}
+
+async fn sync_claude_rate_limit_cache_once_serialized(
+    pg_pool: &PgPool,
+) -> Result<usize, anyhow::Error> {
+    let _guard = claude_rate_limit_refresh_lock().lock().await;
+    sync_claude_rate_limit_cache_once(pg_pool).await
+}
+
+async fn sync_claude_rate_limit_cache_once_and_refresh_dispatch_gate_serialized(
+    pg_pool: &PgPool,
+) -> Result<usize, anyhow::Error> {
+    let _guard = claude_rate_limit_refresh_lock().lock().await;
+    let bucket_count = sync_claude_rate_limit_cache_once(pg_pool).await?;
+    refresh_dispatch_gate_snapshots(pg_pool).await;
+    Ok(bucket_count)
+}
+
+async fn refresh_dispatch_gate_snapshots_serialized(pg_pool: &PgPool) {
+    let _guard = claude_rate_limit_refresh_lock().lock().await;
+    refresh_dispatch_gate_snapshots(pg_pool).await;
+}
+
+async fn sync_claude_rate_limit_cache_once(pg_pool: &PgPool) -> Result<usize, anyhow::Error> {
+    // Priority: 1) OAuth token (Claude Code subscription), 2) ANTHROPIC_API_KEY.
+    let claude_result =
+        if let Some(token) = crate::services::provider_auth::claude_oauth_token_blocking().await {
+            fetch_claude_oauth_usage(&token).await
+        } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+            fetch_anthropic_rate_limits(&api_key).await
+        } else {
+            Err(anyhow::anyhow!("no Claude credentials found"))
+        };
+
+    match claude_result {
+        Ok(buckets) => {
+            let bucket_count = buckets.len();
+            let data = serde_json::json!({ "buckets": buckets }).to_string();
+            let now = chrono::Utc::now().timestamp();
+            upsert_rate_limit_cache_entry(pg_pool, "claude", &data, now).await;
+            tracing::info!("[rate-limit-sync] Claude: {} buckets cached", bucket_count);
+            Ok(bucket_count)
+        }
+        Err(e) => {
+            tracing::warn!("[rate-limit-sync] Claude rate_limit fetch failed: {e}");
+            Err(e)
+        }
     }
 }
 
@@ -1327,7 +1465,9 @@ mod rate_limit_header_tests {
 /// Fetch Claude usage via OAuth API (subscription-based, no API key needed).
 /// Returns utilization-based buckets (5h, 7d).
 async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT)
+        .build()?;
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("accept", "application/json")

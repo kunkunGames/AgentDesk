@@ -238,6 +238,7 @@ src/
 │   │   ├── auth.rs
 │   │   ├── auto_queue.rs
 │   │   ├── automation_candidates.rs
+│   │   ├── claude_accounts_api.rs
 │   │   ├── cluster.rs
 │   │   ├── cron_api.rs
 │   │   ├── departments.rs
@@ -344,6 +345,8 @@ src/
 │   ├── automation_candidate_materializer/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
+│   ├── claude/
+│   │   └── backend_routing.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
 │   │   ├── jsonl_parser.rs
@@ -515,11 +518,13 @@ src/
 │   │   │   └── section_dedupe.rs
 │   │   ├── recovery_engine/
 │   │   │   ├── analytics_transcript.rs
+│   │   │   ├── completion_delivery.rs
 │   │   │   ├── jsonl_extract.rs
 │   │   │   ├── manual_rebind.rs
 │   │   │   ├── output_path_detect.rs
 │   │   │   ├── phase_policy.rs
 │   │   │   ├── rebind_runtime.rs
+│   │   │   ├── restore_inflight.rs
 │   │   │   ├── routing_orphan.rs
 │   │   │   ├── runtime.rs
 │   │   │   ├── state_extractors.rs
@@ -658,6 +663,7 @@ src/
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
+│   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
 │   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
@@ -886,6 +892,8 @@ src/
 │   │   ├── mod.rs
 │   │   └── provider.rs
 │   ├── platform/
+│   │   ├── tmux/
+│   │   │   └── availability.rs
 │   │   ├── binary_resolver.rs
 │   │   ├── dump_tool.rs
 │   │   ├── mod.rs
@@ -938,6 +946,7 @@ src/
 │   ├── tui_turn_state/
 │   │   └── completion_scan.rs
 │   ├── turn_orchestrator/
+│   │   ├── active_source_dedup.rs
 │   │   ├── dispatch_reservation.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   └── registry_purge.rs
@@ -951,6 +960,7 @@ src/
 │   ├── codex.rs
 │   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs
+│   ├── cswap.rs
 │   ├── discord_config_audit.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs

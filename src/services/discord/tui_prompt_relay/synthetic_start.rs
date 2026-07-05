@@ -100,7 +100,7 @@ pub(super) async fn claim_tui_direct_synthetic_turn(
     // session; with no registered producer the bridge tail must stay the deliverer.
     let live_producer_present =
         crate::services::cluster::relay_producer_registry::global_relay_producer_registry()
-            .get_producer(tmux_session_name)
+            .get_live_producer(tmux_session_name)
             .is_some();
     let relay_owner = tui_direct_synthetic_relay_owner(
         tui_direct_watcher_can_own_output(
@@ -1303,7 +1303,7 @@ pub(super) fn tui_direct_watcher_can_own_output(
 ///   `BridgeAdapter`. CRITICAL regression guard (codex review): the session-bound
 ///   StreamRelay is a PASSIVE MPSC consumer fed ONLY by a live production
 ///   tmux watcher (`tmux_watcher::forward_chunk_to_supervisor_relay`); with no
-///   live producer registered (`relay_producer_registry::get_producer` → `None`,
+///   live producer registered (`relay_producer_registry::get_live_producer` → `None`,
 ///   e.g. a STALL-WATCHDOG force-clean detached the watcher) a `SessionBoundRelay`
 ///   stamp would STARVE the sink AND stand the bridge tail down → answer loss.
 ///   `BridgeAdapter` keeps the watcher-INDEPENDENT transcript-direct bridge tail
@@ -1346,7 +1346,7 @@ pub(super) fn tui_direct_synthetic_inflight_matches(
     })
 }
 
-pub(super) fn tui_direct_watcher_synthetic_inflight_matches(
+fn tui_direct_watcher_synthetic_inflight_shape_matches(
     state: Option<&InflightTurnState>,
     tmux_session_name: &str,
 ) -> bool {
@@ -1354,6 +1354,17 @@ pub(super) fn tui_direct_watcher_synthetic_inflight_matches(
         state.turn_source == TurnSource::ExternalInput
             && state.tmux_session_name.as_deref() == Some(tmux_session_name)
             && state.effective_relay_owner_kind() == RelayOwnerKind::Watcher
+    })
+}
+
+pub(in crate::services::discord) fn tui_direct_watcher_synthetic_inflight_matches(
+    state: Option<&InflightTurnState>,
+    tmux_session_name: &str,
+    current_offset: u64,
+) -> bool {
+    state.is_some_and(|state| {
+        tui_direct_watcher_synthetic_inflight_shape_matches(Some(state), tmux_session_name)
+            && state.turn_start_offset.unwrap_or(state.last_offset) < current_offset
     })
 }
 
@@ -1390,7 +1401,7 @@ pub(super) async fn wait_for_tui_direct_watcher_synthetic_claim(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + TUI_DIRECT_SYNTHETIC_CLAIM_WAIT;
     loop {
-        if tui_direct_watcher_synthetic_inflight_matches(
+        if tui_direct_watcher_synthetic_inflight_shape_matches(
             super::super::inflight::load_inflight_state(provider, channel_id.get()).as_ref(),
             tmux_session_name,
         ) {
