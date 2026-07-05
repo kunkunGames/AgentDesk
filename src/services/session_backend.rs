@@ -269,9 +269,10 @@ pub fn terminate_process_handle(handle: SessionHandle) {
 #[path = "session_backend/stream_line.rs"]
 mod stream_line;
 pub use stream_line::{StreamLineState, parse_assistant_extra_tool_uses, process_stream_line};
+pub(crate) use stream_line::parse_stream_message_with_state;
+#[allow(unused_imports)]
 pub(crate) use stream_line::{
     classify_task_notification_kind, emit_status_events_from_stream_json, observe_stream_context,
-    parse_stream_message_with_state,
 };
 
 /// #3405: terminal-usage adoption (#3344 provenance/magnitude gate) plus the

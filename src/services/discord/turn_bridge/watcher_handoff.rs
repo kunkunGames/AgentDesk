@@ -12,7 +12,9 @@
 //! hands the turn back to a GENUINELY-LIVE watcher, reusing the EXISTING
 //! watcher-delegation machinery.
 
+#[allow(unused_imports)]
 use super::super::inflight::RelayOwnerKind;
+#[allow(unused_imports)]
 use super::super::turn_finalizer::{CompletionSignal, TurnKey, completion_signal_from_transcript};
 use super::super::*;
 use super::output_lifecycle::BridgeOutputOwner;

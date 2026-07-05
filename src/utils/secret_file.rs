@@ -134,6 +134,7 @@ pub(crate) fn audit_or_harden_secret_file(path: &Path, label: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[cfg(unix)]

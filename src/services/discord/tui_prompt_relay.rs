@@ -124,6 +124,7 @@ use self::synthetic_start::{
     finish_tui_direct_synthetic_pre_save_failure, pending_start_abort_cleanup_fn,
 };
 #[cfg(test)]
+#[allow(unused_imports)]
 use self::synthetic_start::{
     release_stale_ownerless_tui_direct_mailbox_if_current, tui_direct_watcher_can_own_output,
 };

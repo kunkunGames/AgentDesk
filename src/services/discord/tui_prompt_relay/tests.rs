@@ -1,4 +1,5 @@
 use super::*;
+#[allow(unused_imports)]
 use crate::services::discord::gateway::TurnGateway;
 
 fn compact_command_name_first_stub() -> &'static str {

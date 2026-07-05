@@ -239,6 +239,7 @@ pub use discord_io::{
     retry_failed_dm_notifications, send_file_to_channel, send_message_to_channel,
     send_message_to_user,
 };
+#[allow(unused_imports)]
 pub(in crate::services::discord) use dispatch_policy::{
     is_allowed_turn_sender, prepend_monitor_auto_turn_origin, resolve_announce_bot_user_id,
     resolve_notify_bot_user_id, should_phase2_recover_message, stale_dispatch_turn_for_text,

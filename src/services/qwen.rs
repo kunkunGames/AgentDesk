@@ -11,14 +11,14 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
+#[allow(unused_imports)]
 use crate::services::claude;
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
 use crate::services::process::{kill_child_tree, shell_escape};
 use crate::services::provider::{
-    CancelToken, FollowupResult, ProviderKind, ReadOutputResult, SessionProbe, cancel_requested,
-    register_child_pid, tmux_followup_fallback_after_read_error,
+    CancelToken, FollowupResult, ProviderKind, ReadOutputResult, SessionProbe, cancel_requested, register_child_pid, tmux_followup_fallback_after_read_error,
 };
 use crate::services::provider_runtime::{
     LineStreamEvent, SharedAllowedToolKind, resolve_shared_allowed_tool_compat,
