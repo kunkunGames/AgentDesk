@@ -7,6 +7,7 @@ from scripts.analyze_prs import (
     has_no_change_verification_ack,
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
+    has_docs_only_verification_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -174,6 +175,23 @@ class PrAnalyzerNoChangeVerificationGuardTests(unittest.TestCase):
         body = "- no-change verification: checked using gh pr view --json files"
 
         self.assertTrue(has_no_change_verification_ack(body))
+
+
+class PrAnalyzerDocsOnlyVerificationGuardTests(unittest.TestCase):
+    def test_unchecked_template_docs_only_guard_is_not_acknowledgement(self):
+        body = "- [ ] **Docs-only verification:** If this PR is docs-only..."
+
+        self.assertFalse(has_docs_only_verification_ack(body))
+
+    def test_checked_template_docs_only_guard_is_acknowledgement(self):
+        body = "- [x] **Docs-only verification:** If this PR is docs-only..."
+
+        self.assertTrue(has_docs_only_verification_ack(body))
+
+    def test_filled_docs_only_field_is_acknowledgement(self):
+        body = "- docs-only verification: checked using cat source_file"
+
+        self.assertTrue(has_docs_only_verification_ack(body))
 
 
 class PrAnalyzerStaleBranchCleanupGuardTests(unittest.TestCase):

@@ -134,6 +134,17 @@ def has_scratch_file_cleanup_ack(body):
         ],
     )
 
+def has_docs_only_verification_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*docs-only verification:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "docs-only verification",
+            "docs only verification",
+        ],
+    )
+
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicates?|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
@@ -296,6 +307,10 @@ def main():
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
             if not has_stale_branch_cleanup_ack(body):
                 print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
+
+        if "docs-only" in title.lower() or "docs-only" in body.lower():
+            if not has_docs_only_verification_ack(body):
+                print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body lacks a completed docs-only verification acknowledgement.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
         if "no-change" in title.lower():
