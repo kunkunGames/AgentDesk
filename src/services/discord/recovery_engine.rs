@@ -83,6 +83,10 @@ mod completion_delivery;
 // leaf module. Entry points are re-exported below so external paths stay stable.
 #[path = "recovery_engine/restore_inflight.rs"]
 mod restore_inflight;
+// #4111: behavior-preserving extraction of guarded Codex rollout persist-outcome
+// handling before restart-path watcher spawn into a leaf module.
+#[path = "recovery_engine/restore_persist_outcome.rs"]
+mod restore_persist_outcome;
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::extract_response_from_output;
@@ -152,6 +156,7 @@ use self::restore_inflight::tmux_session_alive_with_retry;
 pub(in crate::services::discord) use self::restore_inflight::{
     finish_recovered_turn_mailbox, restore_inflight_turns,
 };
+use self::restore_persist_outcome::{RestorePersistOutcome, restore_codex_rollout_output_path};
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
 pub(in crate::services::discord) use self::terminal_text_idempotency::RecoveryDeliveryContext;
 // #3479: re-import the analytics + transcript helpers so root call sites stay

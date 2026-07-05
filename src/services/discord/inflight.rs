@@ -124,6 +124,8 @@ pub(super) use self::save_store::{
 };
 pub(in crate::services::discord) use self::save_store::{
     GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
+    persist_leak_recovery_response_offset_if_matches_identity_locked,
+    persist_recovery_output_path_if_matches_identity_locked,
     recovery_anchor_msg_id_if_matches_identity,
     save_existing_inflight_rebind_adoption_if_matches_identity,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
@@ -377,7 +379,9 @@ fn record_inflight_invariant_with_severity(
     )
 }
 
-fn inflight_state_allows_idle_tmux_repair_state(state: &InflightTurnState) -> bool {
+pub(in crate::services::discord) fn inflight_state_allows_idle_tmux_repair_state(
+    state: &InflightTurnState,
+) -> bool {
     state.full_response.trim().is_empty()
         && state.response_sent_offset == 0
         && state.last_watcher_relayed_offset.is_none()

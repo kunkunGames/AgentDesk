@@ -15,6 +15,7 @@ mod active_source_dedup;
 mod dispatch_reservation;
 mod pending_queue_persistence;
 pub(crate) mod registry_purge;
+mod turn_finished_signal;
 use active_source_dedup::{
     intervention_has_active_source, intervention_sources_all_match_active,
     purge_active_source_from_queue, strip_source_message_id_from_intervention,
@@ -42,6 +43,11 @@ pub(crate) use pending_queue_persistence::{
 #[cfg(test)]
 use pending_queue_persistence::{
     cleanup_stale_pending_queue_tmp_files_in_dir, cleanup_stale_pending_queue_tmp_files_under_root,
+};
+pub(crate) use turn_finished_signal::TurnFinishedSignal;
+use turn_finished_signal::{
+    GLOBAL_TURN_FINISHED_SIGNALS, mark_turn_finished_signal_done, reset_turn_finished_signal,
+    turn_finished_signal,
 };
 
 pub(crate) const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
@@ -1160,6 +1166,34 @@ impl ChannelMailboxHandle {
         self.request(
             |reply| ChannelMailboxMsg::FinishTurnIfMatches {
                 expected_user_message_id,
+                active_started_before: None,
+                persistence,
+                reply,
+            },
+            FinishTurnResult {
+                removed_token: None,
+                has_pending: false,
+                mailbox_online: false,
+                queue_exit_events: Vec::new(),
+                persistence_error: None,
+            },
+        )
+        .await
+    }
+
+    /// Identity + monotonic-start guarded finish. Used by repair code that
+    /// snapshots a candidate before clearing durable state: a fresh same-id turn
+    /// that starts after `active_started_before` must survive as a no-op.
+    pub(crate) async fn finish_turn_if_matches_started_before(
+        &self,
+        expected_user_message_id: MessageId,
+        active_started_before: Instant,
+        persistence: QueuePersistenceContext,
+    ) -> FinishTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_user_message_id,
+                active_started_before: Some(active_started_before),
                 persistence,
                 reply,
             },
@@ -1461,75 +1495,9 @@ impl RecoveryDoneSignal {
     }
 }
 
-/// #2424 — generic "active turn finished" signal per channel.
-///
-/// Same latch shape as `RecoveryDoneSignal`: a terminal mailbox transition
-/// can happen before a deferred monitor auto-turn subscribes, so late
-/// subscribers must observe the already-finished state without falling back
-/// to mailbox-state polling.
-pub(crate) struct TurnFinishedSignal {
-    notify: Notify,
-    latched: std::sync::atomic::AtomicBool,
-}
-
-impl TurnFinishedSignal {
-    fn new() -> Self {
-        Self {
-            notify: Notify::new(),
-            latched: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    pub(crate) fn mark_done(&self) {
-        self.latched.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) fn reset(&self) {
-        self.latched.store(false, Ordering::Release);
-    }
-
-    pub(crate) async fn wait(&self) {
-        if self.latched.load(Ordering::Acquire) {
-            return;
-        }
-        let notified = self.notify.notified();
-        tokio::pin!(notified);
-        if self.latched.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-}
-
 static GLOBAL_RECOVERY_DONE_SIGNALS: LazyLock<
     dashmap::DashMap<ChannelId, Arc<RecoveryDoneSignal>>,
 > = LazyLock::new(dashmap::DashMap::new);
-static GLOBAL_TURN_FINISHED_SIGNALS: LazyLock<
-    dashmap::DashMap<ChannelId, Arc<TurnFinishedSignal>>,
-> = LazyLock::new(dashmap::DashMap::new);
-
-fn turn_finished_signal(channel_id: ChannelId) -> Arc<TurnFinishedSignal> {
-    if let Some(existing) = GLOBAL_TURN_FINISHED_SIGNALS.get(&channel_id) {
-        return existing.value().clone();
-    }
-    let signal = Arc::new(TurnFinishedSignal::new());
-    match GLOBAL_TURN_FINISHED_SIGNALS.entry(channel_id) {
-        dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(signal.clone());
-            signal
-        }
-    }
-}
-
-fn reset_turn_finished_signal(channel_id: ChannelId) {
-    turn_finished_signal(channel_id).reset();
-}
-
-fn mark_turn_finished_signal_done(channel_id: ChannelId) {
-    turn_finished_signal(channel_id).mark_done();
-}
 
 #[derive(Clone, Default)]
 pub(crate) struct ChannelMailboxRegistry {
@@ -1815,6 +1783,7 @@ enum ChannelMailboxMsg {
     /// no-op that returns `removed_token = None`, leaving the live turn intact.
     FinishTurnIfMatches {
         expected_user_message_id: MessageId,
+        active_started_before: Option<Instant>,
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<FinishTurnResult>,
     },
@@ -1835,7 +1804,8 @@ enum ChannelMailboxMsg {
     ///
     /// #3029(D): when `clear_cancelled_active_anchor` is set (force purge),
     /// also release the active-turn anchor (`cancel_token` /
-    /// `active_request_owner` / `active_user_message_id` / `turn_started_at`)
+    /// `active_request_owner` / `active_user_message_id` / `turn_started_at` /
+    /// `turn_started_instant`)
     /// — but ONLY if that anchor's token is already `cancelled`. The force
     /// path cancels the token via `cancel_active_token` before purging, so the
     /// just-killed turn's anchor is cleared, while a fresh *uncancelled* turn
@@ -1988,6 +1958,9 @@ struct ChannelMailboxState {
     /// `cancel_token.is_some()` lifetime so the idle-detector freshness
     /// anchor is always source-of-truth from the mailbox actor itself.
     turn_started_at: Option<DateTime<Utc>>,
+    /// Monotonic companion to `turn_started_at`, for in-process race guards
+    /// that must distinguish a stale active claim from a fresh same-id claim.
+    turn_started_instant: Option<Instant>,
     watchdog_deadline_override: Option<WatchdogDeadlineExtension>,
     watchdog_extension_count: u32,
     watchdog_extension_total_secs: u64,
@@ -2052,6 +2025,7 @@ fn finalize_turn_state(
     state.active_turn_kind = ActiveTurnKind::default();
     state.recovery_started_at = None;
     state.turn_started_at = None;
+    state.turn_started_instant = None;
     reset_watchdog_extension_state(state);
     let previous_len = state.intervention_queue.len();
     let previous_queue = state.intervention_queue.clone();
@@ -2508,6 +2482,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         }
                         state.recovery_started_at = None;
                         state.turn_started_at = Some(Utc::now());
+                        state.turn_started_instant = Some(Instant::now());
                         reset_watchdog_extension_state(&mut state);
                         true
                     };
@@ -2534,6 +2509,9 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     if was_idle || state.turn_started_at.is_none() {
                         state.turn_started_at = Some(Utc::now());
                     }
+                    if was_idle || state.turn_started_instant.is_none() {
+                        state.turn_started_instant = Some(Instant::now());
+                    }
                     reset_watchdog_extension_state(&mut state);
                     let _ = reply.send(());
                 }
@@ -2550,9 +2528,13 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     state.active_user_message_id = user_message_id;
                     // #3167 — a recovery turn is a real (non-background) turn.
                     state.active_turn_kind = ActiveTurnKind::default();
-                    state.recovery_started_at = Some(Instant::now());
+                    let recovery_started_at = Instant::now();
+                    state.recovery_started_at = Some(recovery_started_at);
                     if activated_turn || state.turn_started_at.is_none() {
                         state.turn_started_at = Some(Utc::now());
+                    }
+                    if activated_turn || state.turn_started_instant.is_none() {
+                        state.turn_started_instant = Some(recovery_started_at);
                     }
                     reset_watchdog_extension_state(&mut state);
                     let _ = reply.send(RecoveryKickoffResult {
@@ -2868,6 +2850,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                 }
                 ChannelMailboxMsg::FinishTurnIfMatches {
                     expected_user_message_id,
+                    active_started_before,
                     persistence,
                     reply,
                 } => {
@@ -2882,7 +2865,12 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     // skips the counter decrement and trailing release.
                     let matches = state
                         .active_user_message_id
-                        .is_some_and(|active| active == expected_user_message_id);
+                        .is_some_and(|active| active == expected_user_message_id)
+                        && active_started_before.is_none_or(|started_before| {
+                            state
+                                .turn_started_instant
+                                .is_some_and(|started_at| started_at < started_before)
+                        });
                     if matches {
                         state.last_persistence = Some(persistence.clone());
                         let finished_user_message_id = state.active_user_message_id;
@@ -2960,6 +2948,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     state.active_turn_kind = ActiveTurnKind::default();
                     state.recovery_started_at = None;
                     state.turn_started_at = None;
+                    state.turn_started_instant = None;
                     reset_watchdog_extension_state(&mut state);
                     let previous_queue = state.intervention_queue.clone();
                     let queue_exit_events = state
@@ -3027,6 +3016,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         state.active_turn_kind = ActiveTurnKind::default();
                         state.recovery_started_at = None;
                         state.turn_started_at = None;
+                        state.turn_started_instant = None;
                         reset_watchdog_extension_state(&mut state);
                         true
                     } else {

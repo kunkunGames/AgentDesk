@@ -1893,43 +1893,11 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             let finish_mailbox_on_completion =
                 reregister_active_turn_from_inflight(shared, &state).await;
 
-            // #2795 — codex_tui writes its rollout transcript directly to
-            // `~/.codex/sessions/...`; the inflight's stored `output_path` is
-            // the AgentDesk-side relay JSONL which may not exist on disk yet
-            // when dcserver quick-exits mid-turn (e.g. agent ran deploy from
-            // inside its own turn). Without a falling-back lookup the
-            // `metadata` check below silently fails and recovery never spawns
-            // a watcher, leaving the live codex pane permanently un-relayed.
-            // Resolve the actual rollout via the inflight `session_id` and
-            // persist the corrected path so subsequent restarts also find it.
-            let mut output_path = output_path;
-            if std::fs::metadata(&output_path).is_err()
-                && matches!(
-                    state.runtime_kind,
-                    Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui)
-                )
+            let output_path = match restore_codex_rollout_output_path(provider, &state, output_path)
             {
-                if let Some(session_id) = state.session_id.as_deref() {
-                    if let Some(rollout) =
-                        crate::services::codex_tui::rollout_tail::find_rollout_by_session_id(
-                            session_id,
-                        )
-                    {
-                        let rollout_str = rollout.display().to_string();
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] ↻ recovery: codex rollout fallback for channel {} — {} → {}",
-                            state.channel_id,
-                            output_path,
-                            rollout_str
-                        );
-                        output_path = rollout_str.clone();
-                        let mut patched = state.clone();
-                        patched.output_path = Some(rollout_str);
-                        let _ = inflight::save_inflight_state(&patched);
-                    }
-                }
-            }
+                RestorePersistOutcome::UseOutputPath(output_path) => output_path,
+                RestorePersistOutcome::SkipWatcher => continue,
+            };
 
             // Immediately spawn watcher to avoid race condition.
             if std::fs::metadata(&output_path).is_ok() {
@@ -2330,6 +2298,98 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 is_external_input_tui_direct: false, // #3089 A6b: recovery is not external-input
                 inflight_state: state,
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::services::discord::inflight::{
+        self, GuardedSaveOutcome, InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
+    };
+    use crate::services::provider::ProviderKind;
+    use std::ffi::OsString;
+
+    struct EnvVarReset {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarReset {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarReset {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn restore_rollout_output_path_patch_preserves_concurrent_relay_fields() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+
+        let provider = ProviderKind::Codex;
+        let channel_id = 4_111_002;
+        let snapshot = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            7,
+            4_111_102,
+            4_111_202,
+            "restore fallback rollout".to_string(),
+            Some("session-4111-restore".to_string()),
+            Some("AgentDesk-codex-4111-restore".to_string()),
+            Some("/tmp/agentdesk-4111-old.jsonl".to_string()),
+            None,
+            128,
+        );
+        inflight::save_inflight_state(&snapshot).expect("seed restore snapshot row");
+        let identity = InflightTurnIdentity::from_state(&snapshot);
+
+        let mut concurrent = inflight::load_inflight_state(&provider, channel_id)
+            .expect("seeded row for concurrent update");
+        concurrent.last_watcher_relayed_offset = Some(4_096);
+        concurrent.last_watcher_relayed_generation_mtime_ns = Some(12_345);
+        concurrent.session_bound_delivered = true;
+        concurrent.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
+        inflight::save_inflight_state(&concurrent).expect("save concurrent relay fields");
+
+        let outcome = inflight::persist_recovery_output_path_if_matches_identity_locked(
+            &provider,
+            channel_id,
+            &identity,
+            "/tmp/agentdesk-4111-rollout.jsonl".to_string(),
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::Saved);
+        let persisted =
+            inflight::load_inflight_state(&provider, channel_id).expect("patched row must survive");
+        assert_eq!(
+            persisted.output_path.as_deref(),
+            Some("/tmp/agentdesk-4111-rollout.jsonl")
+        );
+        assert_eq!(persisted.last_watcher_relayed_offset, Some(4_096));
+        assert_eq!(
+            persisted.last_watcher_relayed_generation_mtime_ns,
+            Some(12_345)
+        );
+        assert!(persisted.session_bound_delivered);
+        assert_eq!(
+            persisted.effective_relay_owner_kind(),
+            RelayOwnerKind::SessionBoundRelay
         );
     }
 }
