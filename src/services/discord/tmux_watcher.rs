@@ -2578,6 +2578,47 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     .await;
                     continue;
                 }
+                let fresh_idle_effective_committed_offset = dr::effective_committed_offset(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                );
+                let fresh_idle_pending_session_bound_delivery = pinned_pre_cleanup_inflight
+                    .as_ref()
+                    .and_then(|state| {
+                        let turn_start_offset = state.turn_start_offset?;
+                        (state.tmux_session_name.as_deref() == Some(tmux_session_name.as_str())
+                            && turn_start_offset < current_offset
+                            && state.effective_relay_owner_kind()
+                                == crate::services::discord::inflight::RelayOwnerKind::SessionBoundRelay
+                            && !state.session_bound_delivered
+                            && fresh_idle_effective_committed_offset < current_offset)
+                            .then_some(turn_start_offset)
+                    });
+                if let Some(turn_start_offset) = fresh_idle_pending_session_bound_delivery {
+                    let retry_offset = turn_start_offset.max(fresh_idle_effective_committed_offset);
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        provider = watcher_provider.as_str(),
+                        channel = channel_id.get(),
+                        tmux_session = %tmux_session_name,
+                        turn_start_offset,
+                        current_offset,
+                        committed = fresh_idle_effective_committed_offset,
+                        retry_offset,
+                        "  [{ts}] 👁 watcher fresh ready-for-input idle refused finalize: session-bound terminal body is not effectively committed; preserving inflight and rewinding for retry"
+                    );
+                    current_offset = retry_offset;
+                    all_data.clear();
+                    all_data_start_offset = current_offset;
+                    all_data_fully_mirrored_to_session_relay = true;
+                    all_data_session_bound_relay_ack = None;
+                    all_data_first_forwarded_relay_sequence = None;
+                    last_observed_generation_mtime_ns =
+                        Some(read_generation_file_mtime_ns(&tmux_session_name));
+                    continue;
+                }
                 let cleanup_committed = if let Some(msg_id) = placeholder_msg_id {
                     if watcher_should_delete_suppressed_placeholder(
                         placeholder_from_restored_inflight,
@@ -4859,6 +4900,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             &watcher_lease_key,
         );
 
+        let mut retry_terminal_delivery_from_offset = false;
         let relay_ok = if session_bound_relay_owns_terminal_delivery {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -4940,7 +4982,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // `DELIVERY_LEASE_DEADLINE_MS` the sink commits+releases (→ committed>=end →
             // SkipAlreadyCommitted) or dies (→ deadline lapses → reclaim + SendFull).
             // The sole arm closing the slow-sink-in-flight duplicate (#3151).
-            false
+            let plan = watcher_partial_continuation_retry_plan();
+            retry_terminal_delivery_from_offset = plan.retry_offset;
+            plan.relay_ok
         } else if watcher_lease_b2_skip {
             // #3041 P1-1 B2 (single-holder, §5.2): a DIFFERENT watcher instance already
             // holds the delivery lease for this channel/turn/range (mid-send or not yet
@@ -4994,7 +5038,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     .map(TaskNotificationKind::as_str)
                     .unwrap_or("none")
             );
-            let mut retry_terminal_delivery_from_offset = false;
             let mut relay_ok = true;
             let mut direct_send_delivered = false;
             let mut external_input_lease_consumed_by_relay = false;
@@ -5465,40 +5508,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 }
                 clear_provider_overload_retry_state(channel_id);
             }
-            if retry_terminal_delivery_from_offset {
-                // #3041 P1-1: a SAME-holder abandon-without-commit — the partial send
-                // failed; reset the offset to retry the SAME range next loop. Leaving the
-                // lease `Leased` would make the retry's `try_acquire` lose to our own held
-                // lease (B2-skip suppresses the retry until the deadline reclaim), so
-                // abandon-release here (Leased→Unleased). The sole non-committing abandon,
-                // released on the cell directly (same-holder, no actor serialization);
-                // identity-matched no-op when not acquired (#3089 A4 cutover: the
-                // controller already released its own lease on the Unknown path).
-                if watcher_lease_acquired {
-                    watcher_lease_cell.release(
-                        watcher_lease_holder,
-                        watcher_lease_key.clone(),
-                        watcher_lease_start,
-                        watcher_lease_end,
-                    );
-                }
-                current_offset = turn_data_start_offset;
-                all_data.clear();
-                all_data_start_offset = current_offset;
-                all_data_fully_mirrored_to_session_relay = true;
-                all_data_session_bound_relay_ack = None;
-                all_data_first_forwarded_relay_sequence = None;
-                // #2840: release before the backoff sleep (timing preserved);
-                // the guard's Drop is the safety net for non-explicit exits.
-                slot_guard.release();
-                sleep_or_jsonl_event(
-                    tokio::time::Duration::from_millis(500),
-                    &jsonl_notify,
-                    &dead_marker_notify,
-                )
-                .await;
-                continue 'watcher_loop;
-            }
             relay_ok
         } else if relay_decision.suppressed {
             let monitor_event_count = tool_state.transcript_events.len();
@@ -5623,6 +5632,41 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             }
             false
         };
+        if retry_terminal_delivery_from_offset {
+            // #3041 P1-1 / #4169: a non-committing terminal delivery path
+            // (partial send failure or WaitInFlight defer) must retry the SAME range
+            // next loop. Leaving the lease `Leased` would make the retry's
+            // `try_acquire` lose to our own held lease (B2-skip suppresses the
+            // retry until the deadline reclaim), so abandon-release here
+            // (Leased→Unleased). The sole non-committing abandon,
+            // released on the cell directly (same-holder, no actor serialization);
+            // identity-matched no-op when not acquired (#3089 A4 cutover: the
+            // controller already released its own lease on the Unknown path).
+            if watcher_lease_acquired {
+                watcher_lease_cell.release(
+                    watcher_lease_holder,
+                    watcher_lease_key.clone(),
+                    watcher_lease_start,
+                    watcher_lease_end,
+                );
+            }
+            current_offset = turn_data_start_offset;
+            all_data.clear();
+            all_data_start_offset = current_offset;
+            all_data_fully_mirrored_to_session_relay = true;
+            all_data_session_bound_relay_ack = None;
+            all_data_first_forwarded_relay_sequence = None;
+            // #2840: release before the backoff sleep (timing preserved);
+            // the guard's Drop is the safety net for non-explicit exits.
+            slot_guard.release();
+            sleep_or_jsonl_event(
+                tokio::time::Duration::from_millis(500),
+                &jsonl_notify,
+                &dead_marker_notify,
+            )
+            .await;
+            continue 'watcher_loop;
+        }
         let relay_suppressed = relay_decision.suppressed;
         let terminal_output_committed = relay_ok || relay_suppressed;
         if terminal_output_committed {
