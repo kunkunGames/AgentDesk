@@ -179,6 +179,288 @@ mod tests {
             "failed bind must not mutate the offsetless id-0 row"
         );
     }
+    #[test]
+    fn id0_offsetless_identity_refresh_save_fails_closed() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Codex;
+        let mut state = id0_offsetless_state(44_007);
+        state.full_response = "durable response".to_string();
+        save_inflight_state_in_root(temp.path(), &state).expect("seed offsetless id-0 row");
+
+        let mut stale_snapshot = state.clone();
+        stale_snapshot.full_response = "stale response".to_string();
+        stale_snapshot.response_sent_offset = stale_snapshot.full_response.len();
+        let outcome = save_inflight_state_if_identity_unchanged_in_root(
+            temp.path(),
+            &stale_snapshot,
+            "test::id0_offsetless_identity_refresh_save_fails_closed",
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(persisted.full_response, "durable response");
+        assert_eq!(persisted.response_sent_offset, 0);
+    }
+
+    #[test]
+    fn existing_claude_transcript_adoption_rebase_save_persists_eof_coordinates_and_runtime() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Claude;
+        let wrapper_path = temp.path().join("wrapper.jsonl");
+        let transcript_path = temp
+            .path()
+            .join("88fdb7f3-0000-4000-8000-000000000000.jsonl");
+        std::fs::write(&wrapper_path, vec![b'w'; 128]).expect("write wrapper");
+        std::fs::write(&transcript_path, vec![b't'; 512_000]).expect("write transcript");
+        let transcript_eof = std::fs::metadata(&transcript_path).unwrap().len();
+        let transcript_session_id = "88fdb7f3-0000-4000-8000-000000000000";
+        let channel_id = 44_153_001;
+        let mut existing = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            123,
+            456,
+            789,
+            "continue".to_string(),
+            Some("old-wrapper-session".to_string()),
+            Some("AgentDesk-claude-adoption-rebase-save-44153001".to_string()),
+            Some(wrapper_path.display().to_string()),
+            Some("/tmp/wrapper.input".to_string()),
+            128,
+        );
+        existing.turn_start_offset = Some(64);
+        existing.last_watcher_relayed_offset = Some(96);
+        existing.last_watcher_relayed_generation_mtime_ns = Some(123_456);
+        save_inflight_state_in_root(temp.path(), &existing).expect("seed existing inflight");
+        let expected = InflightTurnIdentity::from_state(&existing);
+        let expected_turn_start_offset = existing.turn_start_offset;
+        let expected_last_offset = existing.last_offset;
+
+        let mut adopted = existing.clone();
+        adopted.output_path = Some(transcript_path.display().to_string());
+        adopted.input_fifo_path = None;
+        adopted.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
+        adopted.session_id = Some(transcript_session_id.to_string());
+        adopted.last_offset = transcript_eof;
+        adopted.turn_start_offset = Some(transcript_eof);
+        adopted.last_watcher_relayed_offset = None;
+        adopted.last_watcher_relayed_generation_mtime_ns = None;
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        assert_eq!(
+            save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                expected_turn_start_offset,
+                expected_last_offset,
+            ),
+            GuardedSaveOutcome::Saved,
+        );
+
+        let persisted_path = inflight_state_path(temp.path(), &provider, channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(
+            persisted.output_path,
+            Some(transcript_path.display().to_string())
+        );
+        assert_eq!(persisted.input_fifo_path, None);
+        assert_eq!(persisted.last_offset, transcript_eof);
+        assert_eq!(persisted.turn_start_offset, Some(transcript_eof));
+        assert_eq!(persisted.last_watcher_relayed_offset, None);
+        assert_eq!(persisted.last_watcher_relayed_generation_mtime_ns, None);
+        assert_eq!(
+            persisted.runtime_kind,
+            Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
+        );
+        assert_eq!(persisted.session_id.as_deref(), Some(transcript_session_id));
+        assert_eq!(
+            persisted.effective_relay_owner_kind(),
+            RelayOwnerKind::Watcher
+        );
+    }
+
+    #[test]
+    fn identity_unchanged_save_skips_after_adoption_rebased_turn_start_offset() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Claude;
+        let wrapper_path = temp.path().join("wrapper.jsonl");
+        let transcript_path = temp.path().join("adopted-transcript.jsonl");
+        std::fs::write(&wrapper_path, vec![b'w'; 128]).expect("write wrapper");
+        std::fs::write(&transcript_path, vec![b't'; 4096]).expect("write transcript");
+        let transcript_eof = std::fs::metadata(&transcript_path).unwrap().len();
+        let channel_id = 44_153_004;
+        let mut stale_snapshot = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            123,
+            456,
+            789,
+            "continue".to_string(),
+            Some("old-wrapper-session".to_string()),
+            Some("AgentDesk-claude-identity-refresh-skip-44153004".to_string()),
+            Some(wrapper_path.display().to_string()),
+            Some("/tmp/wrapper.input".to_string()),
+            128,
+        );
+        stale_snapshot.turn_start_offset = Some(64);
+        stale_snapshot.full_response = "stale response".to_string();
+        save_inflight_state_in_root(temp.path(), &stale_snapshot).expect("seed stale snapshot row");
+
+        let mut adopted = stale_snapshot.clone();
+        adopted.output_path = Some(transcript_path.display().to_string());
+        adopted.input_fifo_path = None;
+        adopted.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
+        adopted.session_id = Some("88fdb7f3-0000-4000-8000-000000000000".to_string());
+        adopted.last_offset = transcript_eof;
+        adopted.turn_start_offset = Some(transcript_eof);
+        adopted.last_watcher_relayed_offset = None;
+        adopted.last_watcher_relayed_generation_mtime_ns = None;
+        adopted.full_response = "rebased durable response".to_string();
+        save_inflight_state_in_root(temp.path(), &adopted).expect("persist adopted row");
+
+        stale_snapshot.response_sent_offset = stale_snapshot.full_response.len();
+        stale_snapshot.terminal_delivery_committed = true;
+        let outcome = save_inflight_state_if_identity_unchanged_in_root(
+            temp.path(),
+            &stale_snapshot,
+            "test::identity_unchanged_save_skips_after_adoption_rebased_turn_start_offset",
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let persisted_path = inflight_state_path(temp.path(), &provider, channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(
+            persisted.output_path,
+            Some(transcript_path.display().to_string())
+        );
+        assert_eq!(persisted.last_offset, transcript_eof);
+        assert_eq!(persisted.turn_start_offset, Some(transcript_eof));
+        assert!(!persisted.terminal_delivery_committed);
+        assert_ne!(persisted.full_response, "stale response");
+    }
+    #[test]
+    fn identity_unchanged_save_skips_after_adoption_changes_only_output_path() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Codex;
+        let old_rollout_path = temp.path().join("old-rollout.jsonl");
+        let adopted_rollout_path = temp.path().join("adopted-rollout.jsonl");
+        std::fs::write(&old_rollout_path, vec![b'o'; 256]).expect("write old rollout");
+        std::fs::write(&adopted_rollout_path, vec![b'a'; 1024]).expect("write adopted rollout");
+        let channel_id = 44_153_005;
+        let mut stale_snapshot = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            123,
+            456,
+            789,
+            "continue".to_string(),
+            Some("codex-session".to_string()),
+            Some("AgentDesk-codex-output-only-adoption-44153005".to_string()),
+            Some(old_rollout_path.display().to_string()),
+            None,
+            256,
+        );
+        stale_snapshot.turn_start_offset = Some(128);
+        stale_snapshot.full_response = "stale response".to_string();
+        save_inflight_state_in_root(temp.path(), &stale_snapshot).expect("seed stale snapshot row");
+
+        let mut adopted = stale_snapshot.clone();
+        adopted.output_path = Some(adopted_rollout_path.display().to_string());
+        adopted.full_response = "adopted durable response".to_string();
+        save_inflight_state_in_root(temp.path(), &adopted).expect("persist adopted row");
+
+        stale_snapshot.response_sent_offset = stale_snapshot.full_response.len();
+        stale_snapshot.terminal_delivery_committed = true;
+        let outcome = save_inflight_state_if_identity_unchanged_in_root(
+            temp.path(),
+            &stale_snapshot,
+            "test::identity_unchanged_save_skips_after_adoption_changes_only_output_path",
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let persisted_path = inflight_state_path(temp.path(), &provider, channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(
+            persisted.output_path,
+            Some(adopted_rollout_path.display().to_string())
+        );
+        assert_eq!(persisted.full_response, "adopted durable response");
+        assert!(!persisted.terminal_delivery_committed);
+    }
+
+    #[test]
+    fn matches_identity_save_skips_after_adoption_changes_only_output_path() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Codex;
+        let old_rollout_path = temp.path().join("old-rollout.jsonl");
+        let adopted_rollout_path = temp.path().join("adopted-rollout.jsonl");
+        std::fs::write(&old_rollout_path, vec![b'o'; 256]).expect("write old rollout");
+        std::fs::write(&adopted_rollout_path, vec![b'a'; 1024]).expect("write adopted rollout");
+        let channel_id = 44_153_006;
+        let mut stale_snapshot = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            123,
+            456,
+            789,
+            "continue".to_string(),
+            Some("codex-session".to_string()),
+            Some("AgentDesk-codex-output-only-adoption-44153006".to_string()),
+            Some(old_rollout_path.display().to_string()),
+            None,
+            256,
+        );
+        stale_snapshot.turn_start_offset = Some(128);
+        stale_snapshot.full_response = "stale response".to_string();
+        save_inflight_state_in_root(temp.path(), &stale_snapshot).expect("seed stale snapshot row");
+        let expected = InflightTurnIdentity::from_state(&stale_snapshot);
+        let expected_turn_start_offset = stale_snapshot.turn_start_offset;
+
+        let mut adopted = stale_snapshot.clone();
+        adopted.output_path = Some(adopted_rollout_path.display().to_string());
+        adopted.full_response = "adopted durable response".to_string();
+        save_inflight_state_in_root(temp.path(), &adopted).expect("persist adopted row");
+
+        stale_snapshot.response_sent_offset = stale_snapshot.full_response.len();
+        stale_snapshot.terminal_delivery_committed = true;
+        let outcome = save_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &stale_snapshot,
+            &expected,
+            expected_turn_start_offset,
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let persisted_path = inflight_state_path(temp.path(), &provider, channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(
+            persisted.output_path,
+            Some(adopted_rollout_path.display().to_string())
+        );
+        assert_eq!(persisted.full_response, "adopted durable response");
+        assert!(!persisted.terminal_delivery_committed);
+    }
 }
 
 pub(in crate::services::discord) fn save_inflight_state_create_new(
@@ -272,6 +554,137 @@ pub(super) fn save_inflight_state_in_root(
     bump_save_generation_for_write(&path, &mut updated);
     let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
     atomic_write(&path, &json)
+}
+
+pub(in crate::services::discord) fn save_inflight_state_if_identity_unchanged(
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    save_inflight_state_if_identity_unchanged_in_root(&root, state, caller)
+}
+
+pub(super) fn save_inflight_state_if_identity_unchanged_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> GuardedSaveOutcome {
+    let Some(provider) = state.provider_kind() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    let path = inflight_state_path(root, &provider, state.channel_id);
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return GuardedSaveOutcome::IoError;
+        }
+    }
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedSaveOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        tracing::debug!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?InflightTurnIdentity::from_state(state),
+            "inflight identity-refresh save skipped because durable row is missing"
+        );
+        return GuardedSaveOutcome::Missing;
+    };
+    let Ok(on_disk) = serde_json::from_str::<InflightTurnState>(&data) else {
+        tracing::debug!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?InflightTurnIdentity::from_state(state),
+            "inflight identity-refresh save skipped because durable row is malformed"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    };
+    let expected = InflightTurnIdentity::from_state(state);
+    let durable = InflightTurnIdentity::from_state(&on_disk);
+    if state.user_msg_id == 0 && state.turn_start_offset.is_none() {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?expected,
+            durable_identity = ?durable,
+            snapshot_turn_start_offset = ?state.turn_start_offset,
+            durable_turn_start_offset = ?on_disk.turn_start_offset,
+            "inflight identity-refresh save skipped because offsetless id-0 snapshot cannot safely match a durable row"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if on_disk.output_path != state.output_path {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?expected,
+            durable_identity = ?durable,
+            snapshot_output_path = ?state.output_path.as_deref(),
+            durable_output_path = ?on_disk.output_path.as_deref(),
+            durable_restart_mode = ?on_disk.restart_mode,
+            durable_rebind_origin = on_disk.rebind_origin,
+            "inflight identity-refresh save skipped because durable row output path changed"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if on_disk.restart_mode.is_some() || on_disk.rebind_origin || !expected.matches_state(&on_disk)
+    {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?expected,
+            durable_identity = ?durable,
+            durable_restart_mode = ?on_disk.restart_mode,
+            durable_rebind_origin = on_disk.rebind_origin,
+            "inflight identity-refresh save skipped because durable row authority changed"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+
+    let mut updated = state.clone();
+    updated.ensure_finalizer_turn_id();
+    if !validate_inflight_state_for_save(
+        root,
+        &path,
+        &updated,
+        "src/services/discord/inflight.rs:save_inflight_state_if_identity_unchanged_in_root",
+    ) {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            caller = caller,
+            snapshot_identity = ?expected,
+            durable_identity = ?durable,
+            "inflight identity-refresh save skipped because validation rejected the refreshed write"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    updated.updated_at = now_string();
+    bump_save_generation_for_write(&path, &mut updated);
+    let Ok(json) = serde_json::to_string_pretty(&updated) else {
+        return GuardedSaveOutcome::IoError;
+    };
+    match atomic_write(&path, &json) {
+        Ok(()) => GuardedSaveOutcome::Saved,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = state.channel_id,
+                caller = caller,
+                snapshot_identity = ?expected,
+                error = %error,
+                "inflight identity-refresh save failed; leaving durable row untouched"
+            );
+            GuardedSaveOutcome::IoError
+        }
+    }
 }
 
 pub(in crate::services::discord) fn save_inflight_delivery_rewind_if_matches_identity(
@@ -781,6 +1194,8 @@ fn save_existing_inflight_rebind_adoption_impl_in_root(
     updated.tmux_session_name = state.tmux_session_name.clone();
     updated.output_path = state.output_path.clone();
     updated.input_fifo_path = state.input_fifo_path.clone();
+    updated.runtime_kind = state.runtime_kind;
+    updated.session_id = state.session_id.clone();
     updated.set_relay_owner_kind(state.effective_relay_owner_kind());
     if expected_last_offset_for_rebase.is_some() {
         updated.last_offset = state.last_offset;
@@ -860,6 +1275,20 @@ pub(super) fn save_inflight_state_if_matches_identity_in_root(
         if on_disk.turn_start_offset != Some(expected_offset) {
             return GuardedSaveOutcome::IdentityMismatch;
         }
+    }
+    if on_disk.output_path != state.output_path {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = state.channel_id,
+            snapshot_identity = ?expected,
+            durable_identity = ?InflightTurnIdentity::from_state(&on_disk),
+            snapshot_output_path = ?state.output_path.as_deref(),
+            durable_output_path = ?on_disk.output_path.as_deref(),
+            durable_restart_mode = ?on_disk.restart_mode,
+            durable_rebind_origin = on_disk.rebind_origin,
+            "inflight identity-guarded save skipped because durable row output path changed"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
     }
     // #3089 B3: verdict observe-only here — this path already identity/offset-
     // gates above; the #3416 backward vector is the plain overwrite tails.

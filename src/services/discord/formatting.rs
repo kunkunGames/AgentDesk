@@ -25,13 +25,94 @@ const TOOL_STATUS_MAX_BYTES: usize = 300;
 /// with the same handoff header text.
 pub(super) const PLACEHOLDER_PROBE_MARKER: &str = "\u{2063}\u{2062}\u{2063}\u{2062}";
 
+fn watcher_send_failure_message(
+    class: super::replace_outcome_policy::WatcherSendFailureClass,
+    message: impl std::fmt::Display,
+) -> String {
+    super::replace_outcome_policy::watcher_send_failure_classified_message(class, message)
+}
+
 pub(super) use super::reaction_lifecycle::is_real_discord_message_id;
 #[cfg(test)]
 pub(super) use super::reaction_lifecycle::reaction_target_channel_for_shared;
 
+// This mutex serializes both the process-local rollback map and every sidecar
+// mutation for the same protocol: atomic writes, clears, empty-marker writes,
+// and claim-side empty-marker GC. Keeping the fs operation under the same lock
+// prevents a claimer from deleting a freshly-written durable debt.
 static REPLACE_CONTINUATION_ROLLBACKS: LazyLock<
     Mutex<HashMap<(u64, u64), ReplaceContinuationRollback>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES: LazyLock<Mutex<HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[path = "formatting/long_send_rollback.rs"]
+mod long_send_rollback;
+
+use self::long_send_rollback::delete_rollback_channel_message;
+pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_reference_rollback;
+pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_rollback;
+
+#[cfg(test)]
+pub(in crate::services::discord) mod rollback_transport_test_hook {
+    use super::*;
+
+    type SendHook = Box<
+        dyn Fn(ChannelId, &str, Option<(ChannelId, MessageId)>) -> Option<Result<MessageId, String>>
+            + Send
+            + Sync,
+    >;
+    type DeleteHook = Box<dyn Fn(ChannelId, MessageId) -> Option<Result<(), String>> + Send + Sync>;
+
+    static SEND_HOOK: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| Mutex::new(None));
+    static DELETE_HOOK: LazyLock<Mutex<Option<DeleteHook>>> = LazyLock::new(|| Mutex::new(None));
+
+    pub(in crate::services::discord) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *SEND_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = None;
+            *DELETE_HOOK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+
+    pub(in crate::services::discord) fn install(send: SendHook, delete: DeleteHook) -> Guard {
+        *SEND_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = Some(send);
+        *DELETE_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(delete);
+        Guard
+    }
+
+    pub(super) fn send(
+        channel_id: ChannelId,
+        content: &str,
+        reference: Option<(ChannelId, MessageId)>,
+    ) -> Option<Result<MessageId, Error>> {
+        SEND_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|hook| {
+                hook(channel_id, content, reference).map(|result| result.map_err(Into::into))
+            })
+    }
+
+    pub(super) fn delete(
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Option<Result<(), Error>> {
+        DELETE_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|hook| hook(channel_id, message_id).map(|result| result.map_err(Into::into)))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplaceContinuationRollback {
@@ -44,11 +125,43 @@ struct PersistedReplaceContinuationRollback {
     message_ids: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistReplaceContinuationRollbackOutcome {
+    Recorded,
+    Removed,
+    ClearedMarkerWritten,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplaceContinuationRollbackClaim {
     None,
     Owner(Vec<u64>),
     InProgress(Vec<u64>),
+}
+
+fn remove_replace_continuation_rollback_file(
+    key: (u64, u64),
+    path: &PathBuf,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key)
+        {
+            return Err(std::io::Error::other("forced rollback remove failure"));
+        }
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+fn force_next_replace_continuation_rollback_remove_failure(key: (u64, u64)) {
+    REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key);
 }
 
 pub(crate) fn redact_sensitive_for_placeholder(input: &str) -> String {
@@ -1966,7 +2079,7 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
             "discord send chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let chunk_reference = if i == 0 { reference } else { None };
+        let chunk_reference = if i == 0 { reference.clone() } else { None };
         let send_result =
             send_channel_message_with_optional_reference(http, channel_id, chunk, chunk_reference)
                 .await;
@@ -2009,217 +2122,6 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
     }
 
     Ok(sent_message_ids)
-}
-
-pub(super) async fn send_long_message_raw_with_rollback(
-    http: &serenity::Http,
-    channel_id: ChannelId,
-    rollback_anchor_msg_id: MessageId,
-    text: &str,
-    shared: &Arc<SharedData>,
-) -> Result<Vec<MessageId>, Error> {
-    let payload_byte_len = text.len();
-    let chunks = split_message(text);
-    let total = chunks.len();
-    let rollback_key = replace_continuation_rollback_key(channel_id, rollback_anchor_msg_id);
-
-    match claim_replace_continuation_rollback(rollback_key) {
-        ReplaceContinuationRollbackClaim::None => {}
-        ReplaceContinuationRollbackClaim::InProgress(pending_ids) => {
-            return Err(format!(
-                "previous chunk cleanup in progress for anchor {} in channel {}: {:?}",
-                rollback_anchor_msg_id.get(),
-                channel_id.get(),
-                pending_ids
-            )
-            .into());
-        }
-        ReplaceContinuationRollbackClaim::Owner(pending_ids) => {
-            let cleanup =
-                cleanup_replace_continuations_after_failure(http, channel_id, &pending_ids, shared)
-                    .await;
-            if cleanup.failed_message_ids.is_empty() {
-                if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
-                    unclaim_replace_continuation_rollback(rollback_key);
-                    return Err(format!(
-                        "previous chunk rollback state was not cleared for anchor {} in channel {}: {error}",
-                        rollback_anchor_msg_id.get(),
-                        channel_id.get()
-                    )
-                    .into());
-                }
-            } else {
-                if let Err(error) = record_replace_continuation_rollback(
-                    rollback_key,
-                    cleanup.failed_message_ids.clone(),
-                ) {
-                    record_replace_continuation_rollback_memory_only(
-                        rollback_key,
-                        cleanup.failed_message_ids,
-                    );
-                    return Err(format!(
-                        "previous chunk cleanup incomplete and rollback state was not durable for anchor {} in channel {}: {error}",
-                        rollback_anchor_msg_id.get(),
-                        channel_id.get()
-                    )
-                    .into());
-                }
-                return Err(format!(
-                    "previous chunk cleanup incomplete for anchor {} in channel {}: {:?}",
-                    rollback_anchor_msg_id.get(),
-                    channel_id.get(),
-                    cleanup.errors
-                )
-                .into());
-            }
-        }
-    }
-
-    if total == 0 {
-        return Ok(Vec::new());
-    }
-
-    // #3082 part B: same answer-flush barrier as `send_long_message_raw` so a
-    // queued-turn notice POST cannot interleave between this turn's final-answer
-    // chunks. RAII guard clears the gate on every exit path.
-    let _answer_flush_guard =
-        (total > 1).then(|| shared.answer_flush_barrier.begin_flush(channel_id));
-
-    tracing::debug!(
-        target: "discord::chunker",
-        path = "send_long_message_raw_with_rollback",
-        channel_id = channel_id.get(),
-        anchor_message_id = rollback_anchor_msg_id.get(),
-        payload_byte_len,
-        total_chunks = total,
-        "discord rollback send begin"
-    );
-
-    let mut sent_message_ids = Vec::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let is_last = i + 1 == total;
-        tracing::debug!(
-            target: "discord::chunker",
-            path = "send_long_message_raw_with_rollback",
-            channel_id = channel_id.get(),
-            anchor_message_id = rollback_anchor_msg_id.get(),
-            chunk_index = i,
-            byte_len = chunk.len(),
-            total_chunks = total,
-            is_last_chunk = is_last,
-            "discord rollback send chunk"
-        );
-        rate_limit_wait(shared, channel_id).await;
-        match super::http::send_channel_message(http, channel_id, chunk).await {
-            Ok(message) => {
-                // #3082 P1-2: chunk landed — refresh the answer-flush barrier's
-                // inactivity window so a long rollback-tracked answer never
-                // trips the queued-card wait while still progressing.
-                shared.answer_flush_barrier.note_progress(channel_id);
-                sent_message_ids.push(message.id.get());
-                if let Err(error) =
-                    record_replace_continuation_rollback(rollback_key, sent_message_ids.clone())
-                {
-                    let cleanup = cleanup_replace_continuations_after_failure(
-                        http,
-                        channel_id,
-                        &sent_message_ids,
-                        shared,
-                    )
-                    .await;
-                    let mut errors = cleanup.errors;
-                    errors.push(error.clone());
-                    if cleanup.failed_message_ids.is_empty() {
-                        if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key)
-                        {
-                            errors.push(clear_error);
-                        }
-                    } else if let Err(record_error) = record_replace_continuation_rollback(
-                        rollback_key,
-                        cleanup.failed_message_ids.clone(),
-                    ) {
-                        record_replace_continuation_rollback_memory_only(
-                            rollback_key,
-                            cleanup.failed_message_ids,
-                        );
-                        errors.push(record_error);
-                    }
-                    return Err(format!(
-                        "sent chunk but rollback state was not durable for anchor {} in channel {}: {}",
-                        rollback_anchor_msg_id.get(),
-                        channel_id.get(),
-                        errors.join("; ")
-                    )
-                    .into());
-                }
-            }
-            Err(err) => {
-                let error = err.to_string();
-                tracing::warn!(
-                    target: "discord::chunker",
-                    path = "send_long_message_raw_with_rollback",
-                    channel_id = channel_id.get(),
-                    anchor_message_id = rollback_anchor_msg_id.get(),
-                    chunk_index = i,
-                    total_chunks = total,
-                    last_chunk = is_last,
-                    outcome = "err",
-                    error = %error,
-                    "discord rollback send failed; deleting sent chunks before retry"
-                );
-                let cleanup = cleanup_replace_continuations_after_failure(
-                    http,
-                    channel_id,
-                    &sent_message_ids,
-                    shared,
-                )
-                .await;
-                if cleanup.failed_message_ids.is_empty() {
-                    if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key) {
-                        unclaim_replace_continuation_rollback(rollback_key);
-                        return Err(format!(
-                            "send chunk {i}/{total} failed for anchor {} in channel {}, and rollback state was not cleared: {error}; {clear_error}",
-                            rollback_anchor_msg_id.get(),
-                            channel_id.get()
-                        )
-                        .into());
-                    }
-                } else if let Err(record_error) = record_replace_continuation_rollback(
-                    rollback_key,
-                    cleanup.failed_message_ids.clone(),
-                ) {
-                    record_replace_continuation_rollback_memory_only(
-                        rollback_key,
-                        cleanup.failed_message_ids,
-                    );
-                    return Err(format!(
-                        "send chunk {i}/{total} failed for anchor {} in channel {}, cleanup incomplete and rollback state was not durable: {error}; {record_error}",
-                        rollback_anchor_msg_id.get(),
-                        channel_id.get()
-                    )
-                    .into());
-                }
-                return Err(format!(
-                    "send chunk {i}/{total} failed for anchor {} in channel {}; sent chunks cleaned before retry: {error}",
-                    rollback_anchor_msg_id.get(),
-                    channel_id.get()
-                )
-                .into());
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    }
-
-    if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
-        return Err(format!(
-            "delivered chunks for anchor {} in channel {}, but rollback state was not cleared: {error}",
-            rollback_anchor_msg_id.get(),
-            channel_id.get()
-        )
-        .into());
-    }
-
-    Ok(sent_message_ids.into_iter().map(MessageId::new).collect())
 }
 
 async fn send_channel_message_with_optional_reference(
@@ -2378,7 +2280,10 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                 failed_chunk_index: 0,
                 sent_continuation_message_ids: pending_ids,
                 cleanup_errors: Vec::new(),
-                error: "previous continuation cleanup in progress".to_string(),
+                error: watcher_send_failure_message(
+                    super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
+                    "previous continuation cleanup in progress",
+                ),
             });
         }
         ReplaceContinuationRollbackClaim::Owner(pending_ids) => {
@@ -2396,8 +2301,11 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         failed_chunk_index: 0,
                         sent_continuation_message_ids: pending_ids,
                         cleanup_errors,
-                        error: format!(
-                            "previous continuation rollback state was not cleared: {error}"
+                        error: watcher_send_failure_message(
+                            super::replace_outcome_policy::WatcherSendFailureClass::Transient,
+                            format!(
+                                "previous continuation rollback state was not cleared: {error}"
+                            ),
                         ),
                     });
                 }
@@ -2419,7 +2327,10 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                     failed_chunk_index: 0,
                     sent_continuation_message_ids: pending_ids,
                     cleanup_errors,
-                    error: "previous continuation cleanup incomplete".to_string(),
+                    error: watcher_send_failure_message(
+                        super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
+                        "previous continuation cleanup incomplete",
+                    ),
                 });
             }
         }
@@ -2566,13 +2477,18 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         );
                         errors.push(record_error);
                     }
+                    let class = if cleanup_errors.failed_message_ids.is_empty() {
+                        super::replace_outcome_policy::WatcherSendFailureClass::Transient
+                    } else {
+                        super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete
+                    };
                     return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
                         sent_chunks: i + 1,
                         total_chunks: total,
                         failed_chunk_index: i,
                         sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                         cleanup_errors: errors,
-                        error,
+                        error: watcher_send_failure_message(class, error),
                     });
                 }
                 if is_last {
@@ -2589,6 +2505,8 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                 }
             }
             Err(err) => {
+                let failure_class =
+                    super::replace_outcome_policy::classify_watcher_send_failure(&err);
                 let error = err.to_string();
                 tracing::warn!(
                     target: "discord::chunker",
@@ -2619,7 +2537,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                             failed_chunk_index: i,
                             sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                             cleanup_errors: errors,
-                            error,
+                            error: watcher_send_failure_message(failure_class, error),
                         });
                     }
                 } else {
@@ -2640,7 +2558,10 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         failed_chunk_index: i,
                         sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                         cleanup_errors: errors,
-                        error,
+                        error: watcher_send_failure_message(
+                            super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
+                            error,
+                        ),
                     });
                 }
                 return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
@@ -2649,7 +2570,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                     failed_chunk_index: i,
                     sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                     cleanup_errors: cleanup_errors.errors,
-                    error,
+                    error: watcher_send_failure_message(failure_class, error),
                 });
             }
         }
@@ -2659,14 +2580,15 @@ pub(super) async fn replace_long_message_raw_with_outcome(
     if !sent_continuation_message_ids.is_empty()
         && let Err(error) = clear_replace_continuation_rollback(rollback_key)
     {
-        return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
-            sent_chunks: total,
-            total_chunks: total,
-            failed_chunk_index: total.saturating_sub(1),
-            sent_continuation_message_ids,
-            cleanup_errors: vec![error.clone()],
-            error,
-        });
+        clear_replace_continuation_rollback_memory_only(rollback_key);
+        tracing::warn!(
+            target: "discord::chunker",
+            path = "replace_long_message_raw",
+            channel_id = channel_id.get(),
+            message_id = message_id.get(),
+            error = %error,
+            "discord replace delivered all chunks but rollback state cleanup failed"
+        );
     }
     // #3805 P1: fully-successful edit+continuations. When continuations were
     // sent, hand back the TAIL chunk (id + its own text) so the watcher footer
@@ -2699,7 +2621,7 @@ async fn cleanup_replace_continuations_after_failure(
     for message_id in sent_continuation_message_ids.iter().rev().copied() {
         rate_limit_wait(shared, channel_id).await;
         if let Err(error) =
-            super::http::delete_channel_message(http, channel_id, MessageId::new(message_id)).await
+            delete_rollback_channel_message(http, channel_id, MessageId::new(message_id)).await
         {
             let detail = error.to_string();
             match classify_delete_error(&detail) {
@@ -2743,47 +2665,108 @@ fn replace_continuation_rollback_path(key: (u64, u64)) -> Option<PathBuf> {
 
 fn load_persisted_replace_continuation_rollback(key: (u64, u64)) -> Option<Vec<u64>> {
     let path = replace_continuation_rollback_path(key)?;
-    let content = fs::read_to_string(path).ok()?;
-    let persisted: PersistedReplaceContinuationRollback = serde_json::from_str(&content).ok()?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            // Non-UTF8 means the sidecar content is corrupt, just like a JSON
+            // parse failure below. Remove it so a bad-content file cannot warn
+            // forever on every future claim attempt.
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to decode continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
+            );
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+        Err(error) => {
+            // Fail open WITHOUT removing the file: a read error (EIO, fd
+            // exhaustion, EACCES) is transient-environment evidence, not
+            // corruption evidence — removing here would permanently destroy
+            // valid debt that a later claim could still read. Only the parse
+            // arm below (unparseable content = a genuinely bad file) removes.
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read continuation rollback sidecar; leaving file in place and treating as no debt for this claim"
+            );
+            return None;
+        }
+    };
+    let persisted: PersistedReplaceContinuationRollback = match serde_json::from_str(&content) {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            // Fail open for corrupt sidecars: runtime_store::atomic_write uses a
+            // temp file, fsync, and same-dir rename, so torn files cannot be
+            // self-produced. Treating corrupt data as debt would reintroduce the
+            // r4 permanent send-block without a bounded probe.
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to parse continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
+            );
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+    };
+    if persisted.message_ids.is_empty() {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     (!persisted.message_ids.is_empty()).then_some(persisted.message_ids)
+}
+
+fn replace_continuation_rollback_cleared_marker() -> Result<String, String> {
+    serde_json::to_string_pretty(&PersistedReplaceContinuationRollback {
+        message_ids: Vec::new(),
+    })
+    .map_err(|error| format!("serialize cleared continuation rollback marker: {error}"))
 }
 
 fn persist_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: &[u64],
-) -> Result<(), String> {
+) -> Result<PersistReplaceContinuationRollbackOutcome, String> {
     let Some(path) = replace_continuation_rollback_path(key) else {
         return Err("runtime root unavailable for continuation rollback".to_string());
     };
     if message_ids.is_empty() {
-        match fs::remove_file(&path) {
+        match remove_replace_continuation_rollback_file(key, &path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(format!(
-                    "remove continuation rollback {}: {error}",
-                    path.display()
-                ));
+                let cleared_marker = replace_continuation_rollback_cleared_marker()?;
+                super::runtime_store::atomic_write(&path, &cleared_marker).map_err(
+                    |write_error| {
+                        format!(
+                            "remove continuation rollback {}: {error}; write cleared marker failed: {write_error}",
+                            path.display()
+                        )
+                    },
+                )?;
+                return Ok(PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten);
             }
         }
-        return Ok(());
+        return Ok(PersistReplaceContinuationRollbackOutcome::Removed);
     }
     let persisted = PersistedReplaceContinuationRollback {
         message_ids: message_ids.to_vec(),
     };
     let json = serde_json::to_string_pretty(&persisted)
         .map_err(|error| format!("serialize continuation rollback: {error}"))?;
-    super::runtime_store::atomic_write(&path, &json)
+    super::runtime_store::atomic_write(&path, &json)?;
+    Ok(PersistReplaceContinuationRollbackOutcome::Recorded)
 }
 
 fn claim_replace_continuation_rollback(key: (u64, u64)) -> ReplaceContinuationRollbackClaim {
     let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let rollback = match rollbacks
-        .get_mut(&key)
-        .filter(|entry| !entry.message_ids.is_empty())
-    {
+    let rollback = match rollbacks.get_mut(&key) {
+        Some(rollback) if rollback.message_ids.is_empty() => {
+            return ReplaceContinuationRollbackClaim::None;
+        }
         Some(rollback) => rollback,
         None => {
             let Some(message_ids) = load_persisted_replace_continuation_rollback(key) else {
@@ -2816,12 +2799,26 @@ fn record_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: Vec<u64>,
 ) -> Result<(), String> {
-    persist_replace_continuation_rollback(key, &message_ids)?;
     let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let outcome = persist_replace_continuation_rollback(key, &message_ids)?;
     if message_ids.is_empty() {
-        rollbacks.remove(&key);
+        match outcome {
+            PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
+                rollbacks.insert(
+                    key,
+                    ReplaceContinuationRollback {
+                        message_ids: Vec::new(),
+                        claimed: false,
+                    },
+                );
+            }
+            PersistReplaceContinuationRollbackOutcome::Removed
+            | PersistReplaceContinuationRollbackOutcome::Recorded => {
+                rollbacks.remove(&key);
+            }
+        }
     } else {
         rollbacks.insert(
             key,
@@ -2850,12 +2847,38 @@ fn record_replace_continuation_rollback_memory_only(key: (u64, u64), message_ids
         );
 }
 
-fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
-    persist_replace_continuation_rollback(key, &[])?;
+fn clear_replace_continuation_rollback_memory_only(key: (u64, u64)) {
     REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .remove(&key);
+        .insert(
+            key,
+            ReplaceContinuationRollback {
+                message_ids: Vec::new(),
+                claimed: false,
+            },
+        );
+}
+
+fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
+    let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match persist_replace_continuation_rollback(key, &[])? {
+        PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
+            rollbacks.insert(
+                key,
+                ReplaceContinuationRollback {
+                    message_ids: Vec::new(),
+                    claimed: false,
+                },
+            );
+        }
+        PersistReplaceContinuationRollbackOutcome::Removed
+        | PersistReplaceContinuationRollbackOutcome::Recorded => {
+            rollbacks.remove(&key);
+        }
+    }
     Ok(())
 }
 
@@ -3033,6 +3056,141 @@ mod replace_long_message_tests {
         );
 
         super::clear_replace_continuation_rollback(key).expect("clear rollback");
+    }
+
+    #[test]
+    fn continuation_rollback_memory_clear_suppresses_persisted_reload_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(33), MessageId::new(39));
+
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+        super::record_replace_continuation_rollback(key, vec![711, 712]).expect("record rollback");
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        assert!(rollback_path.exists(), "rollback sidecar must be persisted");
+
+        super::clear_replace_continuation_rollback_memory_only(key);
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            rollback_path.exists(),
+            "memory tombstone should not require disk cleanup to succeed"
+        );
+
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+    }
+
+    #[test]
+    fn continuation_rollback_clear_remove_failure_writes_cleared_marker_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(35), MessageId::new(41));
+
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+        super::record_replace_continuation_rollback(key, vec![721, 722]).expect("record rollback");
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        assert!(rollback_path.exists(), "rollback sidecar must be persisted");
+
+        super::force_next_replace_continuation_rollback_remove_failure(key);
+        super::clear_replace_continuation_rollback(key)
+            .expect("clear should write a cleared marker after remove failure");
+        let marker = std::fs::read_to_string(&rollback_path).expect("cleared marker");
+        assert!(
+            marker.contains("\"message_ids\": []"),
+            "clear marker must erase delivered rollback ids"
+        );
+
+        super::REPLACE_CONTINUATION_ROLLBACKS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&key);
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            !rollback_path.exists(),
+            "claiming a cleared marker should best-effort remove it"
+        );
+    }
+
+    #[test]
+    fn continuation_rollback_successful_clear_removes_memory_entry_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(37), MessageId::new(41));
+
+        super::record_replace_continuation_rollback(key, vec![731, 732]).expect("record rollback");
+        super::clear_replace_continuation_rollback(key).expect("clear rollback");
+
+        assert!(
+            !super::REPLACE_CONTINUATION_ROLLBACKS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&key),
+            "successful clear should leave absence, not a permanent tombstone"
+        );
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+    }
+
+    #[test]
+    fn continuation_rollback_corrupt_sidecar_warns_open_and_removes_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(39), MessageId::new(45));
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        std::fs::create_dir_all(rollback_path.parent().expect("rollback parent"))
+            .expect("create rollback parent");
+        std::fs::write(&rollback_path, "{not-json").expect("write corrupt sidecar");
+
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            !rollback_path.exists(),
+            "corrupt rollback sidecar should be removed after fail-open"
+        );
+    }
+
+    #[test]
+    fn continuation_rollback_non_utf8_sidecar_warns_open_and_removes_4154() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = RuntimeRootEnvGuard::new(tempdir.path());
+        let key = super::replace_continuation_rollback_key(ChannelId::new(40), MessageId::new(46));
+        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
+        std::fs::create_dir_all(rollback_path.parent().expect("rollback parent"))
+            .expect("create rollback parent");
+        std::fs::write(&rollback_path, [0xff, 0xfe, 0xfd]).expect("write non-UTF8 sidecar");
+
+        assert_eq!(
+            super::claim_replace_continuation_rollback(key),
+            super::ReplaceContinuationRollbackClaim::None
+        );
+        assert!(
+            !rollback_path.exists(),
+            "non-UTF8 rollback sidecar should be removed after fail-open"
+        );
     }
 
     #[test]
