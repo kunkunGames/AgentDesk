@@ -1070,9 +1070,22 @@ impl SessionBoundDiscordRelaySink {
                     Ok(SessionRelayDeliveryOutcome::Delivered)
                 }
                 Ok(ReplaceLongMessageOutcome::PartialContinuationFailure { error, .. }) => {
-                    Err(RelaySinkError::Transient(error.to_string()))
+                    Err(RelaySinkError::Transient(
+                        super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                            &error,
+                        )
+                        .to_string(),
+                    ))
                 }
-                Err(error) => Err(RelaySinkError::Transient(error.to_string())),
+                Err(error) => {
+                    let error = error.to_string();
+                    Err(RelaySinkError::Transient(
+                        super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                            &error,
+                        )
+                        .to_string(),
+                    ))
+                }
             }
         } else {
             let prompt_anchor = relay_format::ssh_direct_prompt_anchor_for_response(

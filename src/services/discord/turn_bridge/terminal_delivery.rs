@@ -203,6 +203,10 @@ pub(super) fn turn_bridge_replace_outcome_committed(
             cleanup_errors,
             error,
         }) => {
+            let display_error =
+                super::super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                    &error,
+                );
             record_turn_bridge_terminal_replace_cleanup(
                 shared,
                 provider,
@@ -210,7 +214,7 @@ pub(super) fn turn_bridge_replace_outcome_committed(
                 message_id,
                 tmux_session_name,
                 super::super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(format!(
-                    "partial continuation failure: sent_chunks={sent_chunks}, total_chunks={total_chunks}, failed_chunk_index={failed_chunk_index}, cleaned_continuations={}, cleanup_errors={}, error={error}",
+                    "partial continuation failure: sent_chunks={sent_chunks}, total_chunks={total_chunks}, failed_chunk_index={failed_chunk_index}, cleaned_continuations={}, cleanup_errors={}, error={display_error}",
                     sent_continuation_message_ids.len(),
                     cleanup_errors.len()
                 )),
