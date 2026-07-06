@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId};
 
+use super::active_source_dedup::strip_source_message_id_from_intervention;
 use super::pending_queue_persistence::{
     load_channel_pending_dispatch_marker, load_channel_pending_queue,
     remove_channel_pending_dispatch_marker,
@@ -211,12 +212,22 @@ pub(super) fn hydrate_pending_queue_into_state(
         .flat_map(intervention_dedup_ids)
         .collect();
     let mut absorbed = 0usize;
-    for item in disk_items.into_iter().rev() {
+    for mut item in disk_items.into_iter().rev() {
         let item_ids = intervention_dedup_ids(&item);
-        if item_ids.iter().all(|id| existing_ids.contains(id)) {
+        let mut stripped_existing_source = false;
+        for existing_id in item_ids
+            .iter()
+            .copied()
+            .filter(|id| existing_ids.contains(id))
+        {
+            strip_source_message_id_from_intervention(&mut item, existing_id);
+            stripped_existing_source = true;
+        }
+        if stripped_existing_source && item.source_message_ids.is_empty() {
             continue;
         }
-        existing_ids.extend(item_ids);
+        let remaining_ids = intervention_dedup_ids(&item);
+        existing_ids.extend(remaining_ids);
         state.intervention_queue.insert(0, item);
         absorbed += 1;
     }
@@ -254,9 +265,12 @@ pub(super) fn merge_pending_dispatch_marker_into_state(
 ) -> HydratePendingQueueResult {
     state.last_persistence = Some(persistence.clone());
     let marker_id = marker.message_id;
-    if queued_intervention_contains_message_id(&state.intervention_queue, marker_id)
-        || state.active_user_message_id == Some(marker_id)
-    {
+    let marker_ids = intervention_dedup_ids(&marker);
+    let marker_already_present = marker_ids.iter().all(|id| {
+        queued_intervention_contains_message_id(&state.intervention_queue, *id)
+            || state.active_user_message_id == Some(*id)
+    });
+    if marker_already_present {
         delete_pending_dispatch_marker_with_persistence(&persistence, channel_id, operation);
         clear_recently_valve_cleared_dispatch_if_matches(state, marker_id);
         return HydratePendingQueueResult {

@@ -233,6 +233,17 @@ fn split_text_segments_for_sources(
         return vec![SourceMessageTextSegment::new(source_message_ids[0], text)];
     }
 
+    if text.matches('\n').count() + 1 != source_message_ids.len() {
+        return source_message_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, message_id)| {
+                SourceMessageTextSegment::new(message_id, if index == 0 { text } else { "" })
+            })
+            .collect();
+    }
+
     let mut pieces = text.splitn(source_message_ids.len(), '\n');
     source_message_ids
         .iter()
@@ -3574,6 +3585,39 @@ mod actor_hydrate_regression_tests {
     }
 
     #[test]
+    fn legacy_multiline_merged_row_strip_keeps_body_lines_in_head_segment() {
+        let head_id = MessageId::new(4_107_214);
+        let tail_id = MessageId::new(4_107_215);
+        let legacy_text = "l1\nl2\nb";
+        let mut intervention = make_intervention_with_sources(
+            tail_id.get(),
+            &[head_id.get(), tail_id.get()],
+            legacy_text,
+            Instant::now(),
+        );
+
+        let segments = intervention.source_text_segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].message_id, head_id);
+        assert_eq!(segments[0].text.as_str(), legacy_text);
+        assert_eq!(segments[1].message_id, tail_id);
+        assert_eq!(segments[1].text.as_str(), "");
+
+        strip_source_message_id_from_intervention(&mut intervention, tail_id);
+
+        assert_eq!(intervention.source_message_ids, vec![head_id]);
+        assert_eq!(intervention.text, legacy_text);
+        assert!(
+            intervention.text.contains("l2"),
+            "legacy fallback must not drop a body line when stripping a tail source"
+        );
+        assert!(
+            intervention.text.contains("b"),
+            "ambiguous legacy text stays lossless by remaining on the head source"
+        );
+    }
+
+    #[test]
     fn remove_channel_pending_queue_files_all_tokens_only_removes_target_channel() {
         let _lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
@@ -3817,6 +3861,68 @@ mod actor_hydrate_regression_tests {
             let queue = handle.snapshot().await.intervention_queue;
             assert_eq!(queue.len(), 1, "no duplicate must be inserted");
             assert_eq!(queue[0].message_id.get(), 300);
+        });
+    }
+
+    #[test]
+    fn merge_restored_items_strips_known_source_from_partial_overlap() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+
+        run_async(async {
+            let provider = ProviderKind::Claude;
+            let token_hash = "merge-restored-partial-dedup";
+            let channel_id = ChannelId::new(3864005);
+            let source_a = MessageId::new(3864006);
+            let source_b = MessageId::new(3864007);
+            let registry = ChannelMailboxRegistry::default();
+            let handle = registry.handle(channel_id);
+            let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
+
+            handle
+                .replace_queue(
+                    vec![make_intervention(
+                        source_a.get(),
+                        "standalone-a",
+                        Instant::now(),
+                    )],
+                    persistence.clone(),
+                )
+                .await;
+
+            let result = handle
+                .merge_restored_queue_items(
+                    vec![make_intervention_with_sources(
+                        source_b.get(),
+                        &[source_a.get(), source_b.get()],
+                        "restored-a\nrestored-b",
+                        Instant::now(),
+                    )],
+                    persistence.clone(),
+                )
+                .await;
+
+            assert_eq!(result.absorbed, 1);
+            assert_eq!(result.queue_len_after, 2);
+            let queue = handle.snapshot().await.intervention_queue;
+            assert_eq!(queue.len(), 2);
+            assert_eq!(queue[0].source_message_ids, vec![source_b]);
+            assert_eq!(queue[0].message_id, source_b);
+            assert_eq!(queue[0].text, "restored-b");
+            assert!(
+                !queue[0].text.contains("restored-a"),
+                "known source A must be stripped from the restored merged item"
+            );
+            assert_eq!(queue[1].source_message_ids, vec![source_a]);
+            assert_eq!(queue[1].text, "standalone-a");
+
+            let (disk, _) = load_channel_pending_queue(&provider, token_hash, channel_id);
+            assert_eq!(disk.len(), 2);
+            assert_eq!(disk[0].source_message_ids, vec![source_b]);
+            assert_eq!(disk[0].text, "restored-b");
+            assert_eq!(disk[1].source_message_ids, vec![source_a]);
         });
     }
 
