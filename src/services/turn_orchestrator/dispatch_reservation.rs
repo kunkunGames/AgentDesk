@@ -224,7 +224,10 @@ pub(super) fn hydrate_pending_queue_into_state(
             stripped_existing_source = true;
         }
         if stripped_existing_source
-            && (item.source_message_ids.is_empty() || item.text.trim().is_empty())
+            && (item.source_message_ids.is_empty()
+                || (item.text.trim().is_empty()
+                    && item.pending_uploads.is_empty()
+                    && item.voice_announcement.is_none()))
         {
             continue;
         }
@@ -419,11 +422,27 @@ pub(super) fn reconcile_pending_dispatch_marker_before_take_next(
     if marker_recently_valve_cleared(state, marker_id) {
         return None;
     }
+    let mut stripped_existing_source = false;
     for present_id in marker_ids.iter().copied().filter(|id| {
         queued_intervention_contains_message_id(&state.intervention_queue, *id)
             || state.active_user_message_id == Some(*id)
     }) {
         strip_source_message_id_from_intervention(&mut marker, present_id);
+        stripped_existing_source = true;
+    }
+    if stripped_existing_source
+        && (marker.source_message_ids.is_empty()
+            || (marker.text.trim().is_empty()
+                && marker.pending_uploads.is_empty()
+                && marker.voice_announcement.is_none()))
+    {
+        delete_pending_dispatch_marker_with_persistence(
+            persistence,
+            channel_id,
+            "take_next_soft_stale_marker",
+        );
+        clear_recently_valve_cleared_dispatch_if_matches(state, marker_id);
+        return None;
     }
 
     let mut effective_persistence = persistence.clone();
@@ -533,6 +552,7 @@ mod tests {
 
     #[test]
     fn hydrate_skips_empty_text_after_legacy_head_source_strip() {
+        let _lock = lock_test_env();
         let provider = ProviderKind::Claude;
         let persistence =
             QueuePersistenceContext::new(&provider, "hydrate-empty-after-legacy-head-strip", None);
@@ -568,6 +588,48 @@ mod tests {
                 .all(|item| !item.text.trim().is_empty()),
             "hydrate must not insert an empty-text item after stripping a legacy head source"
         );
+    }
+
+    #[test]
+    fn hydrate_preserves_captionless_image_after_legacy_head_source_strip() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvGuard::set_root(tmp.path());
+
+        let provider = ProviderKind::Claude;
+        let token_hash = "hydrate-captionless-image-after-legacy-head-strip";
+        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
+        let channel_id = ChannelId::new(4_132_304);
+        let text_id = MessageId::new(4_132_305);
+        let image_id = MessageId::new(4_132_306);
+        let image_upload = "attachment://captionless-image.png".to_string();
+        let mut state = ChannelMailboxState::default();
+        state
+            .intervention_queue
+            .push(single_source_intervention(text_id, "already queued text"));
+        let mut legacy_merged =
+            make_intervention(image_id, &[text_id, image_id], "already queued text\n");
+        legacy_merged.pending_uploads = vec![image_upload.clone()];
+
+        let result = hydrate_pending_queue_into_state(
+            &mut state,
+            channel_id,
+            vec![legacy_merged],
+            persistence,
+            None,
+        );
+
+        assert_eq!(result.absorbed, 1);
+        assert_eq!(result.queue_len_after, 2);
+        assert!(result.persistence_error.is_none());
+        let image = state
+            .intervention_queue
+            .iter()
+            .find(|item| item.message_id == image_id)
+            .expect("captionless image source must survive hydrate stripping");
+        assert_eq!(image.source_message_ids, vec![image_id]);
+        assert!(image.text.trim().is_empty());
+        assert_eq!(image.pending_uploads, vec![image_upload]);
     }
 
     #[test]
@@ -623,6 +685,59 @@ mod tests {
             assert_eq!(marker_after.message_id, source_a);
             assert_eq!(marker_after.source_message_ids, vec![source_a]);
             assert_eq!(marker_after.text, "marker a");
+        });
+    }
+
+    #[test]
+    fn take_next_soft_does_not_dispatch_empty_legacy_partial_marker_remainder() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = EnvGuard::set_root(tmp.path());
+
+        run_async(async {
+            let provider = ProviderKind::Claude;
+            let token_hash = "take-next-empty-partial-marker-remainder";
+            let channel_id = ChannelId::new(4_132_321);
+            let source_a = MessageId::new(4_132_322);
+            let source_b = MessageId::new(4_132_323);
+            let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
+            let registry = ChannelMailboxRegistry::default();
+            let handle = registry.handle(channel_id);
+            let queued_a = single_source_intervention(source_a, "queued a");
+            handle
+                .replace_queue(vec![queued_a.clone()], persistence.clone())
+                .await;
+            let marker = make_intervention(
+                source_b,
+                &[source_a, source_b],
+                "legacy head body\nextra legacy line\nambiguous tail",
+            );
+            save_channel_pending_dispatch_marker(&provider, token_hash, channel_id, &marker, None)
+                .unwrap();
+
+            let taken = handle.take_next_soft(persistence.clone()).await;
+
+            let intervention = taken
+                .intervention
+                .expect("queued source A should dispatch after stale marker remainder is consumed");
+            assert_eq!(intervention.message_id, source_a);
+            assert_eq!(intervention.source_message_ids, vec![source_a]);
+            assert_eq!(intervention.text, "queued a");
+            assert!(
+                !intervention.text.trim().is_empty(),
+                "legacy marker remainder must not dispatch as an empty intervention"
+            );
+            assert_eq!(taken.queue_len_after, 0);
+
+            let queue = handle.snapshot().await.intervention_queue;
+            assert!(queue.is_empty());
+
+            let (marker_after, _) =
+                load_channel_pending_dispatch_marker(&provider, token_hash, channel_id)
+                    .expect("dequeued source A should write its own pending dispatch marker");
+            assert_eq!(marker_after.message_id, source_a);
+            assert_eq!(marker_after.source_message_ids, vec![source_a]);
+            assert_eq!(marker_after.text, "queued a");
         });
     }
 }
