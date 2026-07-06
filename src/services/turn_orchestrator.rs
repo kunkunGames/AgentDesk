@@ -625,6 +625,9 @@ pub(crate) struct CancelActiveTurnResult {
 pub(crate) struct PurgeQueueResult {
     /// Number of intervention-queue entries drained.
     pub(crate) drained: usize,
+    /// Number of persisted pending-queue/dispatch files removed across token
+    /// namespaces for this channel.
+    pub(crate) disk_files_removed: usize,
     /// Whether the request also released a *cancelled* active-turn anchor
     /// (only possible when `clear_cancelled_active_anchor` was requested and
     /// the anchored token was already cancelled).
@@ -3132,6 +3135,10 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         false
                     };
                     state.last_persistence = Some(persistence.clone());
+                    let disk_files_removed = remove_channel_pending_queue_files_all_tokens(
+                        &persistence.provider,
+                        channel_id,
+                    );
                     let previous_queue = state.intervention_queue.clone();
                     let drained = state.intervention_queue.drain(..).count();
                     let purge_persisted = persist_queue_or_restore(
@@ -3157,6 +3164,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     }
                     let _ = reply.send(PurgeQueueResult {
                         drained,
+                        disk_files_removed,
                         cleared_active_anchor,
                     });
                 }
