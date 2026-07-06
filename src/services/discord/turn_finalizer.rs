@@ -4180,6 +4180,70 @@ mod tests {
         let _ = std::fs::remove_file(&transcript);
     }
 
+    /// #4174 Stage-3b: a live watcher over a structurally Done transcript is
+    /// NOT terminal for the strict fast path while the relay-space produced end
+    /// is still ahead of confirmed delivery. The natural far-backstop deadline
+    /// is the bounded escape for a dead relay that never catches up.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watcher_backstop_done_requires_delivery_confirmation_until_natural_deadline() {
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let ch = ChannelId::new(5408);
+            let session = format!("4174-done-undelivered-{}", std::process::id());
+            let transcript = std::env::temp_dir().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"result\",\"result\":\"done\",\"session_id\":\"s\"}\n",
+            )
+            .unwrap();
+            let transcript_str = transcript.to_str().unwrap().to_string();
+            shared
+                .tmux_watchers
+                .insert(ch, backstop_watcher_handle(&session, &transcript_str));
+
+            let mut state = super::super::inflight::InflightTurnState::new(
+                ProviderKind::Claude,
+                ch.get(),
+                None,
+                7,
+                160,
+                161,
+                "done with undelivered tail".to_string(),
+                None,
+                Some(session.clone()),
+                Some(transcript_str.clone()),
+                None,
+                128,
+            );
+            state.turn_start_offset = Some(0);
+            super::super::inflight::save_inflight_state(&state).unwrap();
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(64, Ordering::Release);
+
+            assert!(
+                !watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict fast-path Done must defer while produced end is undelivered"
+            );
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, true),
+                "natural far-backstop deadline is the bounded escape for a dead relay"
+            );
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(128, Ordering::Release);
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict fast-path Done may finalize once delivery is confirmed"
+            );
+
+            let _ = std::fs::remove_file(&transcript);
+        })
+        .await;
+    }
+
     /// With the watcher far-backstop ARMED at `register_start`, a JSONL Done
     /// terminal still finalizes PROMPTLY (the backstop only catches turns that
     /// never terminate; it must never delay a real terminal). Exactly once.
