@@ -114,6 +114,10 @@ async fn redrive_undelivered_backlog(
         return Ok(false);
     }
 
+    if nudge_existing_watcher_for_backlog(&shared, &snapshot, channel_id) {
+        return Ok(true);
+    }
+
     let response = relay_recovery::auto_apply_relay_recovery_for_shared(
         registry,
         shared,
@@ -131,6 +135,56 @@ fn has_live_undelivered_backlog(snapshot: &WatcherStateSnapshot) -> bool {
     snapshot.unread_bytes.is_some_and(|bytes| bytes > 0)
         && snapshot.tmux_session_alive == Some(true)
         && !snapshot.inflight_terminal_delivery_committed
+}
+
+fn nudge_existing_watcher_for_backlog(
+    shared: &SharedData,
+    snapshot: &WatcherStateSnapshot,
+    channel_id: ChannelId,
+) -> bool {
+    let owner_channel_id = snapshot
+        .watcher_owner_channel_id
+        .map(ChannelId::new)
+        .unwrap_or(channel_id);
+    let Some(watcher) = shared.tmux_watchers.get(&owner_channel_id) else {
+        return false;
+    };
+    if snapshot.tmux_session.as_deref() != Some(watcher.tmux_session_name.as_str()) {
+        return false;
+    }
+    if !nudge_watcher_handle_for_backlog(snapshot, watcher.value()) {
+        return false;
+    }
+
+    tracing::warn!(
+        target: "agentdesk::discord::relay_recovery",
+        channel_id = channel_id.get(),
+        watcher_owner_channel_id = owner_channel_id.get(),
+        tmux_session = %watcher.tmux_session_name,
+        output_path = %watcher.output_path,
+        last_relay_offset = snapshot.last_relay_offset,
+        unread_bytes = ?snapshot.unread_bytes,
+        "redrive nudged existing tmux watcher to re-read undelivered backlog from confirmed frontier"
+    );
+    true
+}
+
+fn nudge_watcher_handle_for_backlog(
+    snapshot: &WatcherStateSnapshot,
+    watcher: &crate::services::discord::TmuxWatcherHandle,
+) -> bool {
+    if watcher.cancel.load(Ordering::Relaxed)
+        || watcher.heartbeat_stale()
+        || watcher.paused.load(Ordering::Relaxed)
+    {
+        return false;
+    }
+    let Ok(mut resume_offset) = watcher.resume_offset.lock() else {
+        return false;
+    };
+    *resume_offset = Some(snapshot.last_relay_offset);
+    watcher.turn_delivered.store(false, Ordering::Release);
+    true
 }
 
 async fn apply_orphan_pending_token_cleanup(

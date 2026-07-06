@@ -388,8 +388,9 @@ pub(super) fn advance_tmux_relay_confirmed_end(
     }
 
     // #964: observability timestamp — updated through the same relay-progress
-    // heartbeat used by confirmed chunk sends, so `last_relay_ts_ms` has one
-    // writer authority on the per-channel coord.
+    // heartbeat used by confirmed chunk sends. Regression recovery may benignly
+    // zero `last_relay_ts_ms` when the output watermark is reset, but positive
+    // relay progress still flows through this heartbeat path.
     relay_coord.note_relay_progress_heartbeat(chrono::Utc::now().timestamp_millis());
 
     // Pair the pre-CAS mtime with the offset only when we actually won
