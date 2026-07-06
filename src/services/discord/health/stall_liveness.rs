@@ -312,6 +312,22 @@ pub(super) fn clear_stall_watchdog_liveness_state_if_healthy(
     true
 }
 
+pub(super) fn stalled_undelivered_backlog_for_redrive(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    snapshot: &WatcherStateSnapshot,
+    now_unix_secs: i64,
+) -> bool {
+    if !live_undelivered_backlog(snapshot) {
+        return false;
+    }
+
+    let key = StallLivenessKey::from_snapshot(provider, channel_id, snapshot);
+    let relay_observation = observe_relay_offset(&key, snapshot.last_relay_offset, now_unix_secs);
+    !relay_offset_advanced_this_tick(snapshot, &relay_observation)
+        && relay_offset_unchanged_past_backlog_grace(&relay_observation)
+}
+
 pub(super) fn gc_stall_watchdog_liveness_state(now_unix_secs: i64) {
     OFFSET_OBSERVATIONS.retain(|_, observation| {
         !liveness_state_expired(observation.last_updated_unix_secs, now_unix_secs)
@@ -600,20 +616,41 @@ fn has_undelivered_backlog(
     snapshot: &WatcherStateSnapshot,
     relay_observation: &OffsetObservationResult,
 ) -> bool {
-    let live_backlog = snapshot.unread_bytes.is_some_and(|bytes| bytes > 0)
-        && snapshot.tmux_session_alive == Some(true)
-        && !snapshot.inflight_terminal_delivery_committed;
-    if !live_backlog {
+    if !live_undelivered_backlog(snapshot) {
         return false;
     }
 
-    let relay_offset_advanced_this_tick = relay_observation
+    relay_offset_advanced_this_tick(snapshot, relay_observation)
+        || relay_offset_unchanged_inside_backlog_grace(relay_observation)
+}
+
+fn live_undelivered_backlog(snapshot: &WatcherStateSnapshot) -> bool {
+    snapshot.unread_bytes.is_some_and(|bytes| bytes > 0)
+        && snapshot.tmux_session_alive == Some(true)
+        && !snapshot.inflight_terminal_delivery_committed
+}
+
+fn relay_offset_advanced_this_tick(
+    snapshot: &WatcherStateSnapshot,
+    relay_observation: &OffsetObservationResult,
+) -> bool {
+    relay_observation
         .previous_offset
-        .is_some_and(|previous| snapshot.last_relay_offset > previous);
-    relay_offset_advanced_this_tick
-        || relay_observation
-            .unchanged_age_secs
-            .is_some_and(|age| age < STALL_WATCHDOG_BACKLOG_NO_PROGRESS_GRACE_SECS)
+        .is_some_and(|previous| snapshot.last_relay_offset > previous)
+}
+
+fn relay_offset_unchanged_inside_backlog_grace(
+    relay_observation: &OffsetObservationResult,
+) -> bool {
+    relay_observation
+        .unchanged_age_secs
+        .is_some_and(|age| age < STALL_WATCHDOG_BACKLOG_NO_PROGRESS_GRACE_SECS)
+}
+
+fn relay_offset_unchanged_past_backlog_grace(relay_observation: &OffsetObservationResult) -> bool {
+    relay_observation
+        .unchanged_age_secs
+        .is_some_and(|age| age >= STALL_WATCHDOG_BACKLOG_NO_PROGRESS_GRACE_SECS)
 }
 
 fn transcript_mtime_age_secs(
@@ -863,6 +900,7 @@ mod tests {
             inflight_terminal_delivery_committed: false,
             inflight_identity: None,
             inflight_finalizer_turn_id: None,
+            inflight_output_path: Some(format!("/tmp/{tmux_session}.jsonl")),
             relay_stall_state: RelayStallState::TmuxAliveRelayDead,
             relay_health: RelayHealthSnapshot {
                 provider: ProviderKind::Codex.as_str().to_string(),
