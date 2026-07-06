@@ -15,6 +15,7 @@ Every PR must include:
 - Verification commands and results
 - Skipped checks and reasons
 - Risk and rollback notes
+- **Docs-only Changes:** If the PR is docs-only, it must explicitly state 'docs-only' and list the exact source file or command used to verify the documentation text.
 
 ## Verification Commands
 - **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`

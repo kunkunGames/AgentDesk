@@ -266,6 +266,10 @@ def main():
         if not has_non_empty_body_field(body, ["risk and rollback notes", "rollback notes", "rollback"]):
             print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
 
+        if "docs-only" in normalized_body:
+            if "source file" not in normalized_body and "command" not in normalized_body:
+                print("  [!] INVALID DOCS-ONLY VERIFICATION: Docs-only PRs must list the exact source file or command used to verify the documentation text.")
+
         # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
         is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
 
