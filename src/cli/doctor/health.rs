@@ -133,8 +133,8 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             severity: Severity::Warning,
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
-            summary: format!("pipeline override warnings count is {count}"),
-            next_step: "run config audit and inspect override report".to_string(),
+            summary: format!("{count} pipeline override warning(s) detected"),
+            next_step: "run `agentdesk config audit` to inspect the override report".to_string(),
         },
         [
             "global_active_counter_out_of_bounds",
