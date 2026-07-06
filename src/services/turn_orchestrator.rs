@@ -74,6 +74,21 @@ impl SourceMessageQueuedGeneration {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct SourceMessageTextSegment {
+    pub(crate) message_id: MessageId,
+    pub(crate) text: String,
+}
+
+impl SourceMessageTextSegment {
+    pub(crate) fn new(message_id: MessageId, text: impl Into<String>) -> Self {
+        Self {
+            message_id,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Intervention {
     pub(crate) author_id: UserId,
     pub(crate) author_is_bot: bool,
@@ -81,6 +96,7 @@ pub(crate) struct Intervention {
     pub(crate) queued_generation: u64,
     pub(crate) source_message_ids: Vec<MessageId>,
     pub(crate) source_message_queued_generations: Vec<SourceMessageQueuedGeneration>,
+    pub(crate) source_text_segments: Vec<SourceMessageTextSegment>,
     pub(crate) text: String,
     pub(crate) mode: InterventionMode,
     pub(crate) created_at: Instant,
@@ -125,6 +141,31 @@ impl Intervention {
             }
         }
         owners
+    }
+
+    pub(crate) fn source_text_segments(&self) -> Vec<SourceMessageTextSegment> {
+        let source_message_ids = if self.source_message_ids.is_empty() {
+            vec![self.message_id]
+        } else {
+            self.source_message_ids.clone()
+        };
+        if self.source_text_segments.is_empty() {
+            return split_text_segments_for_sources(&source_message_ids, &self.text);
+        }
+
+        let mut segments = Vec::new();
+        for message_id in source_message_ids {
+            if let Some(segment) = self
+                .source_text_segments
+                .iter()
+                .find(|segment| segment.message_id == message_id)
+            {
+                segments.push(segment.clone());
+            } else {
+                segments.push(SourceMessageTextSegment::new(message_id, String::new()));
+            }
+        }
+        segments
     }
 }
 
@@ -181,6 +222,45 @@ fn intervention_age_since(last: &Intervention, current: &Intervention) -> Durati
         .unwrap_or_default()
 }
 
+fn split_text_segments_for_sources(
+    source_message_ids: &[MessageId],
+    text: &str,
+) -> Vec<SourceMessageTextSegment> {
+    if source_message_ids.is_empty() {
+        return Vec::new();
+    }
+    if source_message_ids.len() == 1 {
+        return vec![SourceMessageTextSegment::new(source_message_ids[0], text)];
+    }
+
+    let mut pieces = text.splitn(source_message_ids.len(), '\n');
+    source_message_ids
+        .iter()
+        .copied()
+        .map(|message_id| {
+            SourceMessageTextSegment::new(message_id, pieces.next().unwrap_or_default())
+        })
+        .collect()
+}
+
+fn join_source_text_segments(segments: &[SourceMessageTextSegment]) -> String {
+    let mut text = String::new();
+    for segment in segments {
+        if segment.text.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&segment.text);
+    }
+    text
+}
+
+fn ensure_source_text_segments(intervention: &mut Intervention) {
+    intervention.source_text_segments = intervention.source_text_segments();
+}
+
 fn ensure_source_message_ids(intervention: &mut Intervention) {
     if intervention.source_message_ids.is_empty() {
         intervention
@@ -209,6 +289,7 @@ fn ensure_source_message_ids(intervention: &mut Intervention) {
             }
         }
     }
+    ensure_source_text_segments(intervention);
 }
 
 fn push_unique_message_ids(
@@ -230,6 +311,20 @@ fn push_unique_source_message_queued_generations(
         if !existing
             .iter()
             .any(|owner| owner.message_id == incoming.message_id)
+        {
+            existing.push(incoming);
+        }
+    }
+}
+
+fn push_unique_source_text_segments(
+    existing: &mut Vec<SourceMessageTextSegment>,
+    incoming: impl IntoIterator<Item = SourceMessageTextSegment>,
+) {
+    for incoming in incoming {
+        if !existing
+            .iter()
+            .any(|segment| segment.message_id == incoming.message_id)
         {
             existing.push(incoming);
         }
@@ -299,11 +394,9 @@ pub(crate) fn enqueue_intervention(
     }
 
     if let Some(last) = queue.last_mut() {
+        ensure_source_message_ids(last);
         if should_merge_intervention(last, &intervention) {
-            if !last.text.is_empty() && !intervention.text.is_empty() {
-                last.text.push('\n');
-            }
-            last.text.push_str(&intervention.text);
+            let incoming_text_segments = intervention.source_text_segments();
             last.message_id = intervention.message_id;
             last.queued_generation = intervention.queued_generation;
             push_unique_message_ids(
@@ -314,6 +407,11 @@ pub(crate) fn enqueue_intervention(
                 &mut last.source_message_queued_generations,
                 intervention.source_message_queued_generations.into_iter(),
             );
+            push_unique_source_text_segments(
+                &mut last.source_text_segments,
+                incoming_text_segments,
+            );
+            last.text = join_source_text_segments(&last.source_text_segments);
             last.created_at = intervention.created_at;
             // #2266: on merge, the incoming voice announcement (if any)
             // matches the new HEAD `message_id`; the dispatch path reinserts
@@ -3305,6 +3403,7 @@ mod actor_hydrate_regression_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at,
@@ -3325,6 +3424,7 @@ mod actor_hydrate_regression_tests {
         Intervention {
             source_message_ids: source_ids.iter().copied().map(MessageId::new).collect(),
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             ..make_intervention(message_id, text, created_at)
         }
     }
@@ -3457,10 +3557,19 @@ mod actor_hydrate_regression_tests {
                 "merged tail must remain queued without the active source id"
             );
             assert_eq!(snapshot.intervention_queue[0].message_id, tail_id);
+            assert_eq!(
+                snapshot.intervention_queue[0].text, "tail copy",
+                "merged tail text must not retain the active source body"
+            );
+            assert!(
+                !snapshot.intervention_queue[0].text.contains("active copy"),
+                "active source body must be stripped from the queued tail text"
+            );
 
             let (persisted, _) = load_channel_pending_queue(&provider, token_hash, channel_id);
             assert_eq!(persisted.len(), 1);
             assert_eq!(persisted[0].source_message_ids, vec![tail_id]);
+            assert_eq!(persisted[0].text, "tail copy");
         });
     }
 
@@ -4326,6 +4435,7 @@ mod active_turn_kind_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: format!("msg-{message_id}"),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -4862,6 +4972,7 @@ mod enqueue_refusal_reason_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at,
@@ -4882,6 +4993,7 @@ mod enqueue_refusal_reason_tests {
         Intervention {
             source_message_ids: source_ids.iter().copied().map(MessageId::new).collect(),
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             ..intervention(message_id, text, created_at)
         }
     }
@@ -5029,6 +5141,7 @@ mod no_ttl_evict_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: format!("msg-{message_id}"),
             mode: InterventionMode::Soft,
             created_at,
@@ -5188,6 +5301,7 @@ mod persistence_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -6201,6 +6315,7 @@ mod persistence_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![message_id],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: "DISPATCH: restore me".to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -6547,6 +6662,7 @@ mod purge_queue_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at,
@@ -6719,6 +6835,7 @@ mod finish_cancelled_turn_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
