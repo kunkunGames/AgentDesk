@@ -207,6 +207,61 @@ mod tests {
     }
 
     #[test]
+    fn save_inflight_row_guarded_saves_only_when_durable_identity_matches() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (_temp, _reset) = set_runtime_root();
+        let provider = ProviderKind::Codex;
+        let mut state = InflightTurnState::new(
+            provider.clone(),
+            44_008,
+            Some("adk-test".to_string()),
+            343_742_347_365_974_026,
+            77_001,
+            77_002,
+            "guard this".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-codex-guarded-save".to_string()),
+            Some("/tmp/guarded-save.jsonl".to_string()),
+            None,
+            256,
+        );
+        save_inflight_state(&state).expect("seed matching row");
+
+        state.full_response = "guarded refresh".to_string();
+        state.response_sent_offset = state.full_response.len();
+        assert_eq!(save_inflight_row_guarded(&state), GuardedSaveOutcome::Saved);
+        assert_eq!(
+            super::super::load_inflight_state(&provider, state.channel_id)
+                .expect("saved guarded row")
+                .full_response,
+            "guarded refresh"
+        );
+
+        let mut replacement = state.clone();
+        replacement.user_msg_id = 77_101;
+        replacement.finalizer_turn_id = 77_101;
+        replacement.started_at = "2099-01-01T00:00:00+00:00".to_string();
+        replacement.turn_start_offset = Some(512);
+        replacement.full_response = "new durable owner".to_string();
+        save_inflight_state(&replacement).expect("replace durable row");
+
+        state.full_response = "stale guarded refresh".to_string();
+        state.response_sent_offset = state.full_response.len();
+        assert_eq!(
+            save_inflight_row_guarded(&state),
+            GuardedSaveOutcome::IdentityMismatch
+        );
+        assert_eq!(
+            super::super::load_inflight_state(&provider, state.channel_id)
+                .expect("replacement row remains")
+                .full_response,
+            "new durable owner"
+        );
+    }
+
+    #[test]
     fn existing_claude_transcript_adoption_rebase_save_persists_eof_coordinates_and_runtime() {
         let temp = tempfile::TempDir::new().expect("runtime root");
         let provider = ProviderKind::Claude;
@@ -1078,6 +1133,13 @@ pub(in crate::services::discord) fn save_inflight_state_if_matches_identity(
         expected,
         expected_turn_start_offset,
     )
+}
+
+pub(in crate::services::discord) fn save_inflight_row_guarded(
+    state: &InflightTurnState,
+) -> GuardedSaveOutcome {
+    let expected = InflightTurnIdentity::from_state(state);
+    save_inflight_state_if_matches_identity(state, &expected, expected.turn_start_offset)
 }
 
 pub(in crate::services::discord) fn save_existing_inflight_rebind_adoption_if_matches_identity(
