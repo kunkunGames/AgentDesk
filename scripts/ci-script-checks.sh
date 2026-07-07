@@ -69,30 +69,41 @@ echo "=== CI runner hardening guard ==="
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch file detected in repository root: $scratch_file"
-    FAIL=1
+while IFS= read -r f; do
+  base=$(basename "$f")
+  dir=$(dirname "$f")
+  if [[ "$dir" == "." ]]; then
+    dir_is_root=1
+  else
+    dir_is_root=0
   fi
-done
-for scratch_file in scratch.sql scratchpad.sql scratch[._-]*.sql scratchpad[._-]*.sql test_scratch[._-]*.sql; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch SQL file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch shell file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
+
+  case "$base" in
+    plan.md|scratch.md|scratch.txt|scratch.sh|scratchpad.md|scratchpad.txt|scratchpad.sh|sql_test.rs|test_scratch.rs|plan.txt|pr-body.md|test.sh|test.sql)
+      echo "ERROR: Scratch file detected in repository: $f"
+      FAIL=1
+      ;;
+    scratch.sql|scratchpad.sql|scratch[._-]*.sql|scratchpad[._-]*.sql|test_scratch[._-]*.sql)
+      echo "ERROR: Scratch SQL file detected in repository: $f"
+      FAIL=1
+      ;;
+    scratch[._-]*.sh|scratchpad[._-]*.sh|test_scratch[._-]*.sh)
+      echo "ERROR: Scratch shell file detected in repository: $f"
+      FAIL=1
+      ;;
+    scratch[._-]*.md|scratchpad[._-]*.md|test_scratch[._-]*.md|scratch[._-]*.txt|scratchpad[._-]*.txt|test_scratch[._-]*.txt|scratch[._-]*.rs|scratchpad[._-]*.rs|test_scratch[._-]*.rs)
+      echo "ERROR: Scratch file detected in repository: $f"
+      FAIL=1
+      ;;
+    test_*.rs)
+      if [ "$dir_is_root" -eq 1 ]; then
+        echo "ERROR: Scratch file detected in repository root: $f"
+        FAIL=1
+      fi
+      ;;
+  esac
+done < <(git ls-files --cached --others --exclude-standard)
+
 if [ "$FAIL" -ne 0 ]; then
   exit "$FAIL"
 fi
