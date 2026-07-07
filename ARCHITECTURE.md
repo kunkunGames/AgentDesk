@@ -104,6 +104,7 @@ src/
 │   ├── meetings.rs
 │   ├── mod.rs
 │   ├── postgres.rs
+│   ├── scheduled_messages.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
 │   ├── session_status.rs
@@ -272,6 +273,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
+│   │   ├── scheduled_messages.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── skill_usage_analytics.rs
@@ -1026,6 +1028,7 @@ src/
 │   ├── remote_stub.rs
 │   ├── retrospectives.rs
 │   ├── review_decision.rs
+│   ├── scheduled_messages.rs
 │   ├── service_error.rs
 │   ├── session_activity.rs
 │   ├── session_backend.rs

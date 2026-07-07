@@ -27,6 +27,7 @@ pub use migrated::{is_migrated_launchd_script_ref, validate_migrated_launchd_act
 pub use runtime::{execute_claimed_script_run, poll_agent_turns, run_due_tick};
 pub use runtime_config::validate_routine_runtime_config;
 pub use session_control::{RoutineSessionCommand, RoutineSessionController};
+pub(crate) use store::next_due_after;
 pub use store::{
     DeleteRoutineResult, NewRoutine, RoutinePatch, RoutineStore,
     is_resume_routine_requires_next_due_at, validate_routine_schedule,
