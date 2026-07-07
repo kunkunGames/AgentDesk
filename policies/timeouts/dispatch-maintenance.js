@@ -65,18 +65,14 @@ module.exports = function attachDispatchMaintenance(timeouts, helpers) {
       var hCfg = agentdesk.pipeline.getConfig();
       var hInitial = agentdesk.pipeline.kickoffState(hCfg);
       var hInProgress = agentdesk.pipeline.nextGatedTarget(hInitial, hCfg);
-      var staleQueueEntries = agentdesk.db.query(
+      agentdesk.db.execute(
+        "DELETE FROM dispatch_queue WHERE id IN (" +
         "SELECT dq.id FROM dispatch_queue dq " +
         "JOIN kanban_cards kc ON kc.id = dq.kanban_card_id " +
-        "WHERE dq.status = 'dispatched' AND kc.status NOT IN (?, ?)",
+        "WHERE dq.status = 'dispatched' AND kc.status NOT IN (?, ?)" +
+        ")",
         [hInitial, hInProgress]
       );
-      for (var se = 0; se < staleQueueEntries.length; se++) {
-        agentdesk.db.execute(
-          "DELETE FROM dispatch_queue WHERE id = ?",
-          [staleQueueEntries[se].id]
-        );
-      }
     };
 
   timeouts._section_I0 = function() {
