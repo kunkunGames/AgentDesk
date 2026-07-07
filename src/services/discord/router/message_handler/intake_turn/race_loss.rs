@@ -630,6 +630,7 @@ mod race_loss_requeue_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -641,8 +642,12 @@ mod race_loss_requeue_tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn race_loss_requeue_suppresses_post_enqueue_idle_kick_while_holder_active() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let tmp = tempfile::tempdir().expect("temp runtime root");
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };

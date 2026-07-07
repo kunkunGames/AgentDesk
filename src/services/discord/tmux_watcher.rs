@@ -2,7 +2,14 @@ use super::*;
 use crate::services::discord::InflightTurnState;
 use crate::services::discord::http::{edit_channel_message, send_channel_message};
 use crate::services::discord::outbound::delivery_record as dr; // #3089 B2b
-use crate::services::discord::replace_outcome_policy::watcher_partial_continuation_retry_plan;
+use crate::services::discord::replace_outcome_policy::{
+    WatcherRewindAttemptDisposition, classify_watcher_send_failure,
+    watcher_rewind_attempt_disposition, watcher_send_failure_retry_plan,
+};
+
+#[path = "tmux_watcher/entry.rs"]
+mod entry;
+pub(in crate::services::discord) use self::entry::tmux_output_watcher;
 
 #[path = "tmux_watcher/liveness.rs"]
 mod liveness;
@@ -114,51 +121,75 @@ mod terminal_readiness;
 #[path = "tmux_watcher/utf8_chunk_decoder.rs"]
 mod utf8_chunk_decoder;
 
+#[path = "tmux_watcher/jsonl_rotation.rs"]
+mod jsonl_rotation;
+
 #[path = "tmux_watcher/stall_exit.rs"]
 mod stall_exit;
+
+#[path = "tmux_watcher/terminal_abort_exits.rs"]
+mod terminal_abort_exits;
 
 pub(in crate::services::discord) use self::completion_gate::{
     TuiCompletionGateOutcome, run_tui_completion_gate,
 };
 use self::completion_producer::*;
+use self::jsonl_rotation::*;
 use self::placeholder_reclaim::*;
 use self::session_bound_ack::*;
 use self::single_message_footer::*;
 use self::stall_exit::*;
 use self::supervisor_relay::*;
+use self::terminal_abort_exits::*;
 use self::terminal_readiness::*;
 use self::utf8_chunk_decoder::*;
 
-pub(in crate::services::discord) async fn tmux_output_watcher(
-    channel_id: ChannelId,
-    http: Arc<serenity::Http>,
-    shared: Arc<SharedData>,
-    output_path: String,
-    tmux_session_name: String,
-    initial_offset: u64,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    paused: Arc<std::sync::atomic::AtomicBool>,
-    resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
-    pause_epoch: Arc<std::sync::atomic::AtomicU64>,
-    turn_delivered: Arc<std::sync::atomic::AtomicBool>,
-    last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
-) {
-    tmux_output_watcher_with_restore(
-        channel_id,
-        http,
-        shared,
-        output_path,
-        tmux_session_name,
-        initial_offset,
-        cancel,
-        paused,
-        resume_offset,
-        pause_epoch,
-        turn_delivered,
-        last_heartbeat_ts_ms,
-        None,
-    )
-    .await;
+#[derive(Debug)]
+struct RestoredSeedDisposition {
+    stream_seed: WatcherStreamSeed,
+    discard_restored_seed: bool,
+    seed_reassigned_to_different_turn: bool,
+    restored_seed_undelivered_body_len: usize,
+    prompt_anchor_present: bool,
+}
+
+fn watcher_stream_seed_after_restored_seed_discard(
+    restored_turn_seed: Option<RestoredWatcherTurn>,
+    current_turn_identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
+    prompt_anchor_message_id: Option<u64>,
+) -> RestoredSeedDisposition {
+    let seed_from_rewind = restored_seed_from_rewind(restored_turn_seed.as_ref());
+    let restored_seed_undelivered_body_len = restored_turn_seed
+        .as_ref()
+        .and_then(|seed| seed.full_response.get(seed.response_sent_offset..))
+        .map(|body| body.trim().chars().count())
+        .unwrap_or(0);
+    let restored_seed_has_body = restored_seed_undelivered_body_len > 0;
+    let prompt_anchor_present = prompt_anchor_message_id.is_some();
+    let seed_reassigned_to_different_turn = restored_seed_reassigned_to_different_turn(
+        restored_turn_seed.as_ref(),
+        current_turn_identity,
+        prompt_anchor_message_id,
+    );
+    let discard_restored_seed = should_discard_restored_seed_for_idle_direct_prompt(
+        restored_turn_seed.is_some(),
+        prompt_anchor_present,
+        restored_seed_has_body,
+        seed_from_rewind,
+        seed_reassigned_to_different_turn,
+    );
+    let stream_seed = watcher_stream_seed(if discard_restored_seed {
+        None
+    } else {
+        restored_turn_seed
+    });
+    RestoredSeedDisposition {
+        stream_seed,
+        discard_restored_seed,
+        seed_reassigned_to_different_turn,
+        restored_seed_undelivered_body_len,
+        prompt_anchor_present,
+    }
 }
 
 /// Background watcher variant used by restart recovery to continue editing an
@@ -294,12 +325,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         });
     let mut watcher_turn_identity =
         matching_watcher_turn_identity(restored_inflight.as_ref(), &tmux_session_name);
+    let mut watcher_turn_nonce =
+        matching_watcher_turn_nonce(restored_inflight.as_ref(), &tmux_session_name);
     let mut last_relayed_offset: Option<u64> = restored_inflight
         .as_ref()
         .and_then(|s| s.last_watcher_relayed_offset);
     let mut last_observed_generation_mtime_ns: Option<i64> = restored_inflight
         .as_ref()
         .and_then(|s| s.last_watcher_relayed_generation_mtime_ns);
+    let mut pending_terminal_rewind_seed: Option<RestoredWatcherTurn> = None;
+    let mut terminal_rewind_attempt_key: Option<WatcherRewindAttemptKey> = None;
+    let mut terminal_rewind_attempts: u8 = 0;
     if let Ok(meta) = std::fs::metadata(&output_path) {
         let observed_output_end = meta.len();
         reset_stale_relay_watermark_if_output_regressed(
@@ -318,12 +354,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             "watcher_start",
         );
     }
-    // Rolling-size-cap rotation state. The watcher loop spins predictably
-    // (~250ms sleeps) so a mod-N gate on an iteration counter gives a
-    // regular-ish cadence for the size check without hitting the fs every
-    // spin. See issue #892.
     let mut rotation_tick: u32 = 0;
-    const ROTATION_CHECK_EVERY: u32 = 120; // ~30s at 250ms base cadence
 
     // #2441 (H1) — spawn a single `notify`-crate-backed JsonlWatcher
     // keyed on the session output path. Its `Notify` is awaited alongside
@@ -398,9 +429,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
 
         refresh_watcher_turn_identity(
             &mut watcher_turn_identity,
+            &mut watcher_turn_nonce,
             &watcher_provider,
             channel_id,
             &tmux_session_name,
+            current_offset,
         );
 
         // If paused (Discord handler is processing its own turn), keep the
@@ -451,64 +484,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             }
         }
 
-        // Periodic size-cap rotation for the session jsonl. Running this off
-        // the watcher loop keeps the wrapper child process simple while
-        // still enforcing a 20 MB soft cap (see issue #892).
         rotation_tick = rotation_tick.wrapping_add(1);
-
-        if rotation_tick % ROTATION_CHECK_EVERY == 0 {
-            let path = output_path.clone();
-            let session = tmux_session_name.clone();
-            let prev_offset = current_offset;
-            let rotation = tokio::task::spawn_blocking(move || {
-                crate::services::tmux_common::truncate_jsonl_head_safe(
-                    &path,
-                    crate::services::tmux_common::JSONL_SIZE_CAP_BYTES,
-                    crate::services::tmux_common::JSONL_TARGET_KEEP_BYTES,
-                )
-                .map_err(|e| e.to_string())
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("join error: {e}")));
-            match rotation {
-                Ok(Some(new_size)) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] ✂ rotated jsonl for {} — new size {} bytes (was beyond cap)",
-                        session,
-                        new_size
-                    );
-                    // File was rewritten from the head: reset reader offset
-                    // so the watcher doesn't seek past the new EOF. Also
-                    // reset the duplicate-relay guard.
-                    if prev_offset > new_size {
-                        current_offset = new_size;
-                        last_relayed_offset = Some(new_size);
-                        // #1270 codex P2: snapshot the current `.generation`
-                        // mtime alongside the local offset so a later regression
-                        // check has a real baseline. Without this, the local
-                        // mtime would still be `None` after a normal relay path
-                        // and any subsequent regression would misclassify
-                        // same-wrapper rotation as fresh-respawn and clear the
-                        // local offset to None — re-relaying surviving content.
-                        last_observed_generation_mtime_ns =
-                            Some(read_generation_file_mtime_ns(&tmux_session_name));
-                        reset_stale_relay_watermark_if_output_regressed(
-                            &shared,
-                            channel_id,
-                            &tmux_session_name,
-                            new_size,
-                            "jsonl_rotation",
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!("  [{ts}] ⚠ jsonl rotation failed for {}: {}", session, e);
-                }
-            }
-        }
+        (
+            current_offset,
+            last_relayed_offset,
+            last_observed_generation_mtime_ns,
+        ) = rotate_watcher_jsonl_if_due(
+            rotation_tick,
+            &output_path,
+            &tmux_session_name,
+            current_offset,
+            last_relayed_offset,
+            last_observed_generation_mtime_ns,
+            &shared,
+            channel_id,
+        )
+        .await;
 
         // Snapshot pause epoch — if this changes later, a Discord turn claimed this data
         let epoch_snapshot = pause_epoch.load(Ordering::Relaxed);
@@ -874,52 +865,50 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         }
         all_data.push_str(&decoded_data.text);
         let turn_data_start_offset = all_data_start_offset;
+        reset_rewind_attempts(
+            &mut terminal_rewind_attempt_key,
+            &mut terminal_rewind_attempts,
+            watcher_rewind_attempt_key(turn_data_start_offset, watcher_turn_identity.as_ref()),
+        );
         // #3041 P1-3 R7: reset carried ACKs after terminal/next-turn splits so later turns cannot inherit them and black-hole.
         let mut split_trailing_turn_follows = false;
         let mut state = StreamLineState::new();
-        let restored_turn_seed = restored_turn.take();
-        let restored_seed_undelivered_body_len = restored_turn_seed
-            .as_ref()
-            .and_then(|seed| seed.full_response.get(seed.response_sent_offset..))
-            .map(|body| body.trim().chars().count())
-            .unwrap_or(0);
-        let restored_seed_has_body = restored_seed_undelivered_body_len > 0;
-        let prompt_anchor_present_for_seed_discard =
+        let restored_turn_seed = take_pending_or_restored_rewind_seed(
+            &mut pending_terminal_rewind_seed,
+            &mut restored_turn,
+        );
+        let prompt_anchor_for_seed_discard =
             crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
                 watcher_provider.as_str(),
                 &tmux_session_name,
                 channel_id.get(),
-            )
-            .is_some();
-        let discard_restored_seed = should_discard_restored_seed_for_idle_direct_prompt(
-            restored_turn_seed.is_some(),
-            prompt_anchor_present_for_seed_discard,
-            restored_seed_has_body,
+            );
+        let seed_disposition = watcher_stream_seed_after_restored_seed_discard(
+            restored_turn_seed,
+            watcher_turn_identity.as_ref(),
+            prompt_anchor_for_seed_discard.map(|anchor| anchor.message_id),
         );
-        if !discard_restored_seed
-            && prompt_anchor_present_for_seed_discard
-            && restored_seed_has_body
+        if !seed_disposition.discard_restored_seed
+            && seed_disposition.prompt_anchor_present
+            && seed_disposition.restored_seed_undelivered_body_len > 0
         {
             tracing::info!(
                 channel = channel_id.get(),
-                body_len = restored_seed_undelivered_body_len,
+                body_len = seed_disposition.restored_seed_undelivered_body_len,
                 tmux_session = %tmux_session_name,
                 "watcher: preserving restored stream seed with undelivered body for idle SSH-direct prompt"
             );
         }
-        if discard_restored_seed {
+        if seed_disposition.discard_restored_seed {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
-                "  [{ts}] 👁 watcher: discarding restored stream seed for idle SSH-direct prompt on channel {} (tmux={})",
+                "  [{ts}] 👁 watcher: discarding restored stream seed for idle SSH-direct prompt on channel {} (tmux={}, cross_turn={})",
                 channel_id.get(),
-                tmux_session_name
+                tmux_session_name,
+                seed_disposition.seed_reassigned_to_different_turn
             );
         }
-        let stream_seed = watcher_stream_seed(if discard_restored_seed {
-            None
-        } else {
-            restored_turn_seed
-        });
+        let stream_seed = seed_disposition.stream_seed;
         let restored_response_seed = stream_seed.full_response.clone();
         let restored_assistant_text_seen = !restored_response_seed.trim().is_empty();
         // #3041 P1-3 (Part a, B1): the `restored_assistant_text_seen` →
@@ -1037,11 +1026,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // Process any complete lines we already have
         let initial_buffer_len = all_data.len();
         observe_qwen_user_prompts_in_buffer(&all_data, &watcher_provider, &tmux_session_name);
-        let initial_outcome = process_watcher_lines(
+        let turn_terminal_start_offset = turn_identity_for_panel
+            .as_ref()
+            .and_then(|identity| identity.turn_start_offset)
+            .unwrap_or(turn_data_start_offset);
+        let initial_outcome = process_watcher_lines_for_turn(
             &mut all_data,
             &mut state,
             &mut full_response,
             &mut tool_state,
+            Some(turn_data_start_offset),
+            Some(turn_terminal_start_offset),
+        );
+        let initial_forward_text = watcher_forward_text_after_pre_turn_skip(
+            &decoded_data.text,
+            initial_buffer_len.saturating_sub(decoded_data.text.len()),
+            initial_outcome.pre_turn_bytes_skipped,
         );
         // #3041 P1-3 (Part a, B1): DEFERRED forward of the outer-read chunk. We now
         // know — from `initial_outcome.found_result` — whether THIS chunk is the
@@ -1069,7 +1069,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // a separate non-terminal frame (no black-hole, no shared-ACK reuse).
             Some(fence) => forward_terminal_chunk_with_trailing_to_supervisor_relay(
                 &tmux_session_name,
-                &decoded_data.text,
+                initial_forward_text,
                 all_data.len(),
                 &producer_registry,
                 &mut cached_relay_producer,
@@ -1077,7 +1077,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             ),
             None => forward_chunk_to_supervisor_relay_for_turn(
                 &tmux_session_name,
-                &decoded_data.text,
+                initial_forward_text,
                 &producer_registry,
                 &mut cached_relay_producer,
                 turn_identity_for_panel.as_ref(),
@@ -1102,6 +1102,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let live_events_dirty = flush_placeholder_live_events(&shared, channel_id, &mut tool_state);
         let mut found_result = initial_outcome.found_result;
         let mut terminal_kind = initial_outcome.terminal_kind;
+        let mut terminal_evidence_offset = initial_outcome.terminal_evidence_offset;
         let mut soft_terminal_seen_at = if initial_outcome.soft_terminal_candidate {
             Some(tokio::time::Instant::now())
         } else {
@@ -1312,11 +1313,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &watcher_provider,
                             &tmux_session_name,
                         );
-                        let outcome = process_watcher_lines(
+                        let turn_terminal_start_offset = turn_identity_for_panel
+                            .as_ref()
+                            .and_then(|identity| identity.turn_start_offset)
+                            .unwrap_or(chunk_buffer_start_offset);
+                        let outcome = process_watcher_lines_for_turn(
                             &mut all_data,
                             &mut state,
                             &mut full_response,
                             &mut tool_state,
+                            Some(chunk_buffer_start_offset),
+                            Some(turn_terminal_start_offset),
+                        );
+                        let chunk_forward_text = watcher_forward_text_after_pre_turn_skip(
+                            &decoded_chunk.text,
+                            chunk_buffer_len.saturating_sub(decoded_chunk.text.len()),
+                            outcome.pre_turn_bytes_skipped,
                         );
                         // #3041 P1-3 (Part a, B1): deferred forward of THIS streaming
                         // chunk. `outcome.found_result` now tells us whether this is
@@ -1339,7 +1351,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             Some(fence) => {
                                 forward_terminal_chunk_with_trailing_to_supervisor_relay(
                                     &tmux_session_name,
-                                    &decoded_chunk.text,
+                                    chunk_forward_text,
                                     all_data.len(),
                                     &producer_registry,
                                     &mut cached_relay_producer,
@@ -1348,7 +1360,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             }
                             None => forward_chunk_to_supervisor_relay_for_turn(
                                 &tmux_session_name,
-                                &decoded_chunk.text,
+                                chunk_forward_text,
                                 &producer_registry,
                                 &mut cached_relay_producer,
                                 turn_identity_for_panel.as_ref(),
@@ -1381,6 +1393,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         found_result = found_result || outcome.found_result;
                         if outcome.found_result {
                             terminal_kind = outcome.terminal_kind.or(terminal_kind);
+                            terminal_evidence_offset = outcome
+                                .terminal_evidence_offset
+                                .or(terminal_evidence_offset);
                         }
                         if outcome.soft_terminal_candidate && soft_terminal_seen_at.is_none() {
                             soft_terminal_seen_at = Some(tokio::time::Instant::now());
@@ -1388,6 +1403,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 .terminal_kind
                                 .or(terminal_kind)
                                 .or(Some(WatcherTerminalKind::SoftStopHookSummary));
+                            terminal_evidence_offset = outcome
+                                .terminal_evidence_offset
+                                .or(terminal_evidence_offset);
                         }
                         is_prompt_too_long = is_prompt_too_long || outcome.is_prompt_too_long;
                         is_auth_error = is_auth_error || outcome.is_auth_error;
@@ -2353,15 +2371,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                             error
                                         );
                                         rate_limit_wait(&shared, channel_id).await;
-                                        let _ =
-                                            crate::services::discord::http::edit_channel_message(
-                                                &http,
-                                                channel_id,
-                                                msg_id,
-                                                &plan.display_snapshot,
-                                            )
-                                            .await;
-                                        last_edit_text = plan.display_snapshot;
+                                        if crate::services::discord::http::edit_channel_message(
+                                            &http,
+                                            channel_id,
+                                            msg_id,
+                                            &plan.display_snapshot,
+                                        )
+                                        .await
+                                        .is_ok()
+                                        {
+                                            last_edit_text = plan.display_snapshot;
+                                        }
                                         break;
                                     }
                                 }
@@ -2578,6 +2598,45 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     .await;
                     continue;
                 }
+                let fresh_idle_effective_committed_offset = dr::effective_committed_offset(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    pinned_pre_cleanup_inflight
+                        .as_ref()
+                        .and_then(|state| state.output_path.as_deref())
+                        .and_then(|path| std::fs::metadata(path).ok().map(|meta| meta.len())),
+                );
+                let fresh_idle_pending_session_bound_delivery =
+                    watcher_fresh_idle_session_bound_retry_plan(
+                        pinned_pre_cleanup_inflight.as_ref(),
+                        &tmux_session_name,
+                        current_offset,
+                        fresh_idle_effective_committed_offset,
+                    );
+                if let Some(plan) = fresh_idle_pending_session_bound_delivery {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        provider = watcher_provider.as_str(),
+                        channel = channel_id.get(),
+                        tmux_session = %tmux_session_name,
+                        turn_start_offset = plan.turn_start_offset,
+                        current_offset,
+                        committed = fresh_idle_effective_committed_offset,
+                        retry_offset = plan.retry_offset,
+                        "  [{ts}] 👁 watcher fresh ready-for-input idle refused finalize: session-bound terminal body is not effectively committed; preserving inflight and rewinding for retry"
+                    );
+                    current_offset = plan.retry_offset;
+                    all_data.clear();
+                    all_data_start_offset = current_offset;
+                    all_data_fully_mirrored_to_session_relay = true;
+                    all_data_session_bound_relay_ack = None;
+                    all_data_first_forwarded_relay_sequence = None;
+                    last_observed_generation_mtime_ns =
+                        Some(read_generation_file_mtime_ns(&tmux_session_name));
+                    continue;
+                }
                 let cleanup_committed = if let Some(msg_id) = placeholder_msg_id {
                     if watcher_should_delete_suppressed_placeholder(
                         placeholder_from_restored_inflight,
@@ -2760,27 +2819,26 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         // on-disk clear must not wipe a FOLLOW-UP turn's inflight.
                         // The earlier read→check→unconditional-clear spanned TWO
                         // locks, so a follow-up saved on another worker thread in
-                        // the gap was wiped. `clear_inflight_state_if_matches_identity`
-                        // (inflight.rs) closes the window atomically: read +
-                        // validate + unlink under ONE sidecar lock, deleting only
-                        // while the on-disk identity (`user_msg_id` + `started_at`
-                        // + `tmux_session_name`) still equals the PINNED turn's
-                        // (`pinned_pre_cleanup_inflight`, the same snapshot that
-                        // derived `user_msg_id` above) — a follow-up's identity
-                        // differs (`UserMsgMismatch`), guaranteed no-op. The
-                        // finalize-skip for a NEWER pinned turn stays a SEPARATE
-                        // decision in `watcher_fresh_idle_finalize_decision`;
-                        // finalize below runs on the PINNED id (idempotent)
-                        // regardless of the clear outcome.
+                        // the gap was wiped. The nonce-aware guarded clear closes
+                        // the window atomically: read + validate + unlink under ONE
+                        // sidecar lock, deleting only while the on-disk FULL
+                        // identity (`user_msg_id` + `started_at` + `tmux_session_name`
+                        // + `turn_start_offset`) and, when both rows carry one, the
+                        // `turn_nonce` still equal the PINNED pre-cleanup snapshot.
+                        // A nonce-distinct follow-up is a no-op; finalize still runs on the PINNED id.
                         let pinned_clear_identity = pinned_pre_cleanup_inflight.as_ref().map(
                             crate::services::discord::inflight::InflightTurnIdentity::from_state,
                         );
+                        let pinned_clear_turn_nonce = pinned_pre_cleanup_inflight
+                            .as_ref()
+                            .and_then(|state| state.turn_nonce.as_deref());
                         if let Some(pinned_clear_identity) = pinned_clear_identity.as_ref() {
                             let clear_outcome =
-                                crate::services::discord::inflight::clear_inflight_state_if_matches_identity(
+                                crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
                                     &watcher_provider,
                                     channel_id.get(),
                                     pinned_clear_identity,
+                                    pinned_clear_turn_nonce,
                                 );
                             match clear_outcome {
                                 crate::services::discord::inflight::GuardedClearOutcome::Cleared => {
@@ -2799,6 +2857,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                             "tmux_session": tmux_session_name.as_str(),
                                             "offset": current_offset,
                                         }),
+                                    );
+                                }
+                                crate::services::discord::inflight::GuardedClearOutcome::IoError => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::warn!(
+                                        clear_outcome = ?clear_outcome,
+                                        "  [{ts}] ⚠ watcher fresh ready-for-input idle for {tmux_session_name}: atomic identity-matched clear failed with IO error at offset {current_offset}; see preceding inflight guarded-clear error detail"
                                     );
                                 }
                                 other => {
@@ -3153,464 +3218,56 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             }
         }
 
-        // Discard partial data if paused while reading (even if now unpaused), or if the epoch
-        // changed (a Discord turn claimed this data even when paused is now false).
-        let paused_now = paused.load(Ordering::Relaxed);
-        let epoch_changed_now = pause_epoch.load(Ordering::Relaxed) != epoch_snapshot;
-        let deferred_monitor_ready =
-            monitor_auto_turn_claimed && monitor_auto_turn_deferred && !paused_now;
-        if (was_paused || paused_now || epoch_changed_now) && !deferred_monitor_ready {
-            // Clean up placeholder if we created one (#3610/Phase-B defer: no emit_relay_delete here — tmux_watcher.rs raw-ratchet is at ceiling)
-            if let Some(msg_id) = placeholder_msg_id {
-                if watcher_should_delete_suppressed_placeholder(placeholder_from_restored_inflight)
-                {
-                    if let Err(error) = channel_id.delete_message(&http, msg_id).await {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
-                            "  [{ts}] ⚠ watcher pause/epoch placeholder cleanup failed for channel {} msg {}: {}",
-                            channel_id.get(),
-                            msg_id.get(),
-                            error
-                        );
-                    }
-                } else {
-                    placeholder_from_restored_inflight = false;
-                    last_edit_text.clear();
-                }
-            }
-            finish_monitor_auto_turn_if_claimed(
-                &shared,
-                &watcher_provider,
+        let abort_exit_outcome = {
+            let abort_exit_context = TerminalAbortExitContext {
+                http: &http,
+                shared: &shared,
                 channel_id,
-                &mut monitor_auto_turn_claimed,
-                &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
-            )
-            .await;
-            all_data.clear();
-            all_data_start_offset = current_offset;
-            all_data_fully_mirrored_to_session_relay = true;
-            all_data_session_bound_relay_ack = None;
-            all_data_first_forwarded_relay_sequence = None;
-            continue;
-        }
-
-        // Handle prompt-too-long: kill session so next message creates a fresh one
-        if is_prompt_too_long {
-            clear_provider_overload_retry_state(channel_id);
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] 👁 Prompt too long detected in watcher for {tmux_session_name}, killing session"
-            );
-            prompt_too_long_killed = true;
-
-            let sess = tmux_session_name.clone();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || {
-                    crate::services::termination_audit::record_termination_for_tmux(
-                        &sess,
-                        None,
-                        "tmux_watcher",
-                        "prompt_too_long",
-                        Some("watcher cleanup: prompt too long"),
-                        None,
-                    );
-                    record_tmux_exit_reason(&sess, "watcher cleanup: prompt too long");
-                    crate::services::platform::tmux::kill_session(
-                        &sess,
-                        "watcher cleanup: prompt too long",
-                    );
-                }),
-            )
-            .await;
-
-            let notice = "⚠️ 컨텍스트 한도 초과로 세션을 초기화했습니다. 다음 메시지부터 새 세션으로 처리됩니다.";
-            match placeholder_msg_id {
-                Some(msg_id) => {
-                    rate_limit_wait(&shared, channel_id).await;
-                    let _ = crate::services::discord::http::edit_channel_message(
-                        &http, channel_id, msg_id, notice,
-                    )
-                    .await;
-                }
-                None => {
-                    let _ = crate::services::discord::http::send_channel_message(
-                        &http, channel_id, notice,
-                    )
-                    .await;
-                }
-            }
-            // Don't break — let the watcher exit naturally when session-alive check fails
-            finish_monitor_auto_turn_if_claimed(
-                &shared,
-                &watcher_provider,
-                channel_id,
-                &mut monitor_auto_turn_claimed,
-                &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
-            )
-            .await;
-            continue;
-        }
-
-        // Handle auth error: kill session and notify user to re-authenticate
-        if is_auth_error {
-            clear_provider_overload_retry_state(channel_id);
-            let inflight_state = crate::services::discord::inflight::load_inflight_state(
-                &watcher_provider,
-                channel_id.get(),
-            );
-            let fallback_session_id = inflight_state
-                .as_ref()
-                .and_then(|state| state.session_id.as_deref());
-            let dispatch_id =
-                resolve_watcher_dispatch_id(&shared, channel_id, inflight_state.as_ref()).await;
-            let auth_detail = auth_error_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("authentication expired");
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] 👁 Auth error detected in watcher for {tmux_session_name}: {}",
-                truncate_str(auth_detail, 300)
-            );
-            prompt_too_long_killed = true; // reuse flag to suppress duplicate "session ended" message
-
-            clear_provider_session_for_retry(
-                &shared,
-                channel_id,
-                &tmux_session_name,
-                fallback_session_id,
-            )
-            .await;
-
-            let sess = tmux_session_name.clone();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || {
-                    crate::services::termination_audit::record_termination_for_tmux(
-                        &sess,
-                        None,
-                        "tmux_watcher",
-                        "auth_error",
-                        Some("watcher cleanup: authentication failed"),
-                        None,
-                    );
-                    record_tmux_exit_reason(&sess, "watcher cleanup: authentication failed");
-                    crate::services::platform::tmux::kill_session(
-                        &sess,
-                        "watcher cleanup: authentication failed",
-                    );
-                }),
-            )
-            .await;
-
-            let notice = format!(
-                "⚠️ 인증이 만료되어 현재 dispatch를 실패 처리했습니다. 세션을 종료합니다.\n관리자가 CLI에서 재인증(`/login`)을 완료한 후 다시 디스패치해주세요.\n\n사유: {}",
-                truncate_str(auth_detail, 300)
-            );
-            let notice_ok = match placeholder_msg_id {
-                Some(msg_id) => {
-                    rate_limit_wait(&shared, channel_id).await;
-                    crate::services::discord::http::edit_channel_message(
-                        &http, channel_id, msg_id, &notice,
-                    )
-                    .await
-                    .is_ok()
-                }
-                None => {
-                    crate::services::discord::http::send_channel_message(&http, channel_id, &notice)
-                        .await
-                        .is_ok()
-                }
+                watcher_provider: &watcher_provider,
+                tmux_session_name: &tmux_session_name,
+                paused: &paused,
+                pause_epoch: &pause_epoch,
             };
-            if !notice_ok {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!(
-                    "  [{ts}] ⚠ watcher: auth error notice failed before dispatch failure — preserving inflight for retry"
-                );
-                finish_monitor_auto_turn_if_claimed(
-                    &shared,
-                    &watcher_provider,
-                    channel_id,
-                    &mut monitor_auto_turn_claimed,
-                    &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
-                )
-                .await;
-                continue;
-            }
-            // #897 round-3 Medium: skip reaction work for `rebind_origin`
-            // inflights — their `user_msg_id=0` identifies no real Discord
-            // message so issuing reactions against it just produces API
-            // errors. The synthetic state was created by
-            // `/api/inflight/rebind` to adopt a live tmux session. The same
-            // holds for any user_msg_id == 0 (e.g. a TUI-direct turn) — there
-            // is no message to react against and `MessageId::new(0)` panics.
-            if let Some(state) = inflight_state
-                .as_ref()
-                .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
-            {
-                let user_msg_id = serenity::MessageId::new(state.user_msg_id);
-                crate::services::discord::turn_view_reconciler::note_intake_turn_failed(
-                    &shared,
-                    &http,
-                    channel_id,
-                    user_msg_id,
-                    state.born_generation,
-                    "tmux_watcher_auth_expired",
-                )
-                .await;
-            }
-            finalize_pinned_watcher_exit(
-                &shared,
-                &watcher_provider,
-                channel_id,
-                inflight_state.as_ref(),
-                "watcher_auth_error_exit",
-            )
-            .await;
-            let failure_text = format!(
-                "authentication expired; re-authentication required: {}",
-                truncate_str(auth_detail, 300)
-            );
-            crate::services::discord::turn_bridge::fail_dispatch_auth_expired(
-                shared.api_port,
-                dispatch_id.as_deref(),
-                &failure_text,
-            )
-            .await;
-            finish_monitor_auto_turn_if_claimed(
-                &shared,
-                &watcher_provider,
-                channel_id,
-                &mut monitor_auto_turn_claimed,
-                &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
-            )
-            .await;
-            continue;
-        }
-
-        if is_provider_overloaded {
-            let overload_message = provider_overload_message
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("provider overload detected");
-            let inflight_state = crate::services::discord::inflight::load_inflight_state(
-                &watcher_provider,
-                channel_id.get(),
-            );
-            let retry_text = inflight_state
-                .as_ref()
-                .map(|state| state.user_text.clone())
-                .filter(|text| !text.trim().is_empty());
-            let fallback_session_id = inflight_state
-                .as_ref()
-                .and_then(|state| state.session_id.as_deref());
-            let dispatch_id =
-                resolve_watcher_dispatch_id(&shared, channel_id, inflight_state.as_ref()).await;
-
-            let decision = retry_text
-                .as_deref()
-                .map(|text| record_provider_overload_retry(channel_id, text))
-                .unwrap_or(ProviderOverloadDecision::Exhausted);
-            let retry_notice = match &decision {
-                ProviderOverloadDecision::Retry { attempt, delay, .. } => format!(
-                    "⚠️ 모델 capacity 상태를 감지해 세션을 정리했습니다. {}분 후 자동 재시도합니다. ({}/{})",
-                    delay.as_secs() / 60,
-                    attempt,
-                    PROVIDER_OVERLOAD_MAX_RETRIES
-                ),
-                ProviderOverloadDecision::Exhausted => format!(
-                    "⚠️ 모델 capacity 상태가 계속되어 자동 재시도를 중단했습니다. 잠시 후 다시 시도해 주세요.\n\n사유: {}",
-                    truncate_str(overload_message, 300)
-                ),
+            let abort_exit_locals = TerminalAbortExitLocals {
+                was_paused,
+                epoch_snapshot,
+                monitor_auto_turn_deferred,
+                placeholder_msg_id,
+                turn_data_start_offset,
+                current_offset,
+                response_sent_offset,
+                is_prompt_too_long,
+                is_auth_error,
+                auth_error_message: &auth_error_message,
+                is_provider_overloaded,
+                provider_overload_message: &provider_overload_message,
             };
-
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] 👁 Provider overload detected in watcher for {}: {}",
-                tmux_session_name,
-                overload_message
-            );
-            prompt_too_long_killed = true;
-
-            clear_provider_session_for_retry(
-                &shared,
-                channel_id,
-                &tmux_session_name,
-                fallback_session_id,
-            )
-            .await;
-
-            let sess = tmux_session_name.clone();
-            let termination_reason = match &decision {
-                ProviderOverloadDecision::Retry { .. } => "provider_overload_retry",
-                ProviderOverloadDecision::Exhausted => "provider_overload_exhausted",
+            let mut abort_exit_state = TerminalAbortExitState {
+                placeholder_from_restored_inflight: &mut placeholder_from_restored_inflight,
+                last_edit_text: &mut last_edit_text,
+                monitor_auto_turn_claimed: &mut monitor_auto_turn_claimed,
+                monitor_auto_turn_finished: &mut monitor_auto_turn_finished,
+                monitor_auto_turn_synthetic_msg_id: &mut monitor_auto_turn_synthetic_msg_id,
+                monitor_auto_turn_ledger_generation: &mut monitor_auto_turn_ledger_generation,
+                all_data: &mut all_data,
+                all_data_start_offset: &mut all_data_start_offset,
+                all_data_fully_mirrored_to_session_relay:
+                    &mut all_data_fully_mirrored_to_session_relay,
+                all_data_session_bound_relay_ack: &mut all_data_session_bound_relay_ack,
+                all_data_first_forwarded_relay_sequence:
+                    &mut all_data_first_forwarded_relay_sequence,
+                prompt_too_long_killed: &mut prompt_too_long_killed,
             };
-            let termination_detail = format!("watcher cleanup: {overload_message}");
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::task::spawn_blocking(move || {
-                    crate::services::termination_audit::record_termination_for_tmux(
-                        &sess,
-                        None,
-                        "tmux_watcher",
-                        termination_reason,
-                        Some(&termination_detail),
-                        None,
-                    );
-                    record_tmux_exit_reason(&sess, &termination_detail);
-                    crate::services::platform::tmux::kill_session(&sess, &termination_detail);
-                }),
+            handle_terminal_abort_exits(
+                &abort_exit_context,
+                abort_exit_locals,
+                &mut abort_exit_state,
             )
-            .await;
-
-            let notice_ok = match placeholder_msg_id {
-                Some(msg_id) => {
-                    rate_limit_wait(&shared, channel_id).await;
-                    crate::services::discord::http::edit_channel_message(
-                        &http,
-                        channel_id,
-                        msg_id,
-                        &retry_notice,
-                    )
-                    .await
-                    .is_ok()
-                }
-                None => crate::services::discord::http::send_channel_message(
-                    &http,
-                    channel_id,
-                    &retry_notice,
-                )
-                .await
-                .is_ok(),
-            };
-            if !notice_ok {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!(
-                    "  [{ts}] ⚠ watcher: provider overload notice failed before retry/failure handling — preserving inflight for retry"
-                );
-                finish_monitor_auto_turn_if_claimed(
-                    &shared,
-                    &watcher_provider,
-                    channel_id,
-                    &mut monitor_auto_turn_claimed,
-                    &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
-                )
-                .await;
-                continue;
-            }
-
-            // #897 round-3 Medium: skip reaction + retry scheduling for
-            // `rebind_origin` inflights — they have no real user message
-            // to react against and no real user text to re-prompt. The same
-            // holds for user_msg_id == 0 (e.g. a TUI-direct turn): no message
-            // to react against, and `MessageId::new(0)` would panic.
-            if let Some(state) = inflight_state
-                .as_ref()
-                .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
-            {
-                let user_msg_id = serenity::MessageId::new(state.user_msg_id);
-                if matches!(&decision, ProviderOverloadDecision::Exhausted) {
-                    crate::services::discord::turn_view_reconciler::note_intake_turn_failed(
-                        &shared,
-                        &http,
-                        channel_id,
-                        user_msg_id,
-                        state.born_generation,
-                        "tmux_watcher_overload_exhausted",
-                    )
-                    .await;
-                } else {
-                    crate::services::discord::turn_view_reconciler::note_intake_turn_cleared(
-                        &shared,
-                        &http,
-                        channel_id,
-                        user_msg_id,
-                        state.born_generation,
-                        "tmux_watcher_overload_retry",
-                    )
-                    .await;
-                }
-            }
-            finalize_pinned_watcher_exit(
-                &shared,
-                &watcher_provider,
-                channel_id,
-                inflight_state.as_ref(),
-                "watcher_provider_overload_exit",
-            )
-            .await;
-
-            match decision {
-                ProviderOverloadDecision::Retry {
-                    attempt,
-                    delay,
-                    fingerprint,
-                } => {
-                    if let Some(retry_text) = retry_text {
-                        // A turn with no anchored user message (rebind_origin or
-                        // user_msg_id == 0, e.g. a TUI-direct turn) has no
-                        // message to re-prompt against; clear retry state
-                        // instead of building `MessageId::new(0)` (panics).
-                        if let Some(state) = inflight_state
-                            .as_ref()
-                            .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
-                        {
-                            schedule_provider_overload_retry(
-                                shared.clone(),
-                                http.clone(),
-                                watcher_provider.clone(),
-                                channel_id,
-                                serenity::MessageId::new(state.user_msg_id),
-                                retry_text,
-                                attempt,
-                                delay,
-                                fingerprint,
-                            );
-                        } else {
-                            clear_provider_overload_retry_state(channel_id);
-                        }
-                    } else {
-                        clear_provider_overload_retry_state(channel_id);
-                    }
-                }
-                ProviderOverloadDecision::Exhausted => {
-                    let failure_text = format!(
-                        "provider overloaded after {} auto-retries: {}",
-                        PROVIDER_OVERLOAD_MAX_RETRIES,
-                        truncate_str(overload_message, 300)
-                    );
-                    crate::services::discord::turn_bridge::fail_dispatch_with_retry(
-                        shared.api_port,
-                        dispatch_id.as_deref(),
-                        &failure_text,
-                    )
-                    .await;
-                }
-            }
-            finish_monitor_auto_turn_if_claimed(
-                &shared,
-                &watcher_provider,
-                channel_id,
-                &mut monitor_auto_turn_claimed,
-                &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
-            )
-            .await;
-            continue;
+            .await
+        };
+        match abort_exit_outcome {
+            AbortExitOutcome::ContinueWatcherLoop => continue,
+            AbortExitOutcome::Fallthrough => {}
         }
 
         // Final guard: re-check epoch and turn_delivered right before relay.
@@ -3629,13 +3286,25 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             deferred_monitor_ready,
         ) {
             if let Some(msg_id) = placeholder_msg_id {
-                let _ = delete_nonterminal_placeholder(
+                let inflight_before_cleanup =
+                    crate::services::discord::inflight::load_inflight_state(
+                        &watcher_provider,
+                        channel_id.get(),
+                    );
+                let _ = delete_nonterminal_placeholder_unless_delivered(
                     &http,
                     channel_id,
                     &shared,
                     &watcher_provider,
                     &tmux_session_name,
                     msg_id,
+                    inflight_before_cleanup.as_ref(),
+                    Some((
+                        turn_data_start_offset,
+                        terminal_event_consumed_offset(current_offset, &all_data),
+                    )),
+                    response_sent_offset,
+                    &last_edit_text,
                     "watcher_late_epoch_guard_cleanup",
                 )
                 .await;
@@ -3767,13 +3436,25 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     last_relayed_offset,
                 );
                 if let Some(msg_id) = placeholder_msg_id {
-                    let _ = delete_nonterminal_placeholder(
+                    let inflight_before_cleanup =
+                        crate::services::discord::inflight::load_inflight_state(
+                            &watcher_provider,
+                            channel_id.get(),
+                        );
+                    let _ = delete_nonterminal_placeholder_unless_delivered(
                         &http,
                         channel_id,
                         &shared,
                         &watcher_provider,
                         &tmux_session_name,
                         msg_id,
+                        inflight_before_cleanup.as_ref(),
+                        Some((
+                            turn_data_start_offset,
+                            terminal_event_consumed_offset(current_offset, &all_data),
+                        )),
+                        response_sent_offset,
+                        &last_edit_text,
                         "watcher_duplicate_relay_guard_cleanup",
                     )
                     .await;
@@ -4276,12 +3957,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // the idle relay path does. The unconditional pre-relay reset below
             // at `pre_relay` is for the general path; this one guards the
             // no-inflight dedup read specifically.
-            if let Ok(meta) = std::fs::metadata(&output_path) {
+            let output_eof_for_no_inflight_dedup =
+                std::fs::metadata(&output_path).ok().map(|meta| meta.len());
+            if let Some(output_eof) = output_eof_for_no_inflight_dedup {
                 reset_stale_relay_watermark_if_output_regressed(
                     &shared,
                     channel_id,
                     &tmux_session_name,
-                    meta.len(),
+                    output_eof,
                     "no_inflight_dedup",
                 );
             }
@@ -4313,6 +3996,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &watcher_provider,
                 channel_id,
                 &tmux_session_name,
+                output_eof_for_no_inflight_dedup,
             );
             if committed >= turn_consumed_offset && turn_consumed_offset > turn_data_start_offset {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4520,11 +4204,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             &tmux_session_name,
             "watcher_terminal_resend_dedup",
         );
+        let output_eof_for_resend_dedup =
+            std::fs::metadata(&output_path).ok().map(|meta| meta.len());
         let watcher_resend_committed = dr::committed_floor_for_resend_dedup(
             &shared,
             &watcher_provider,
             channel_id,
             &tmux_session_name,
+            output_eof_for_resend_dedup,
         ); // #3089 B2b + #3593 (codex HIGH): in-memory committed ∪ flag-independent durable frontier
         let watcher_resend_reconciled = session_bound_terminal_delivery_attempted
             && watcher_direct_fallback_intended
@@ -4559,6 +4246,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &watcher_provider,
                 channel_id,
                 &tmux_session_name,
+                output_eof_for_resend_dedup,
             );
             let now_ms = crate::services::discord::lease_now_ms();
             let (action, reclaim_expired_sink) = watcher_terminal_resend_action_gated(
@@ -4859,7 +4547,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             &watcher_lease_key,
         );
 
-        let relay_ok = if session_bound_relay_owns_terminal_delivery {
+        let mut retry_terminal_delivery_from_offset = false;
+        // #4194: bound every await in the slot-held terminal relay expression.
+        // On timeout, fall into the same failed-undelivered rewind path as a
+        // transient send failure; never advance watermarks from this branch.
+        let relay_ok = match watcher_relay_emission_with_timeout(async {
+            if session_bound_relay_owns_terminal_delivery {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] 👁 Delegating terminal response to session-bound StreamRelay sink ({} chars, offset {}, task_notification_kind={})",
@@ -4916,15 +4609,56 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // Part (a) advanced the authority on the sink's confirmed POST). This is
             // the failure-mode-① case: re-sending would DUPLICATE. Treat it as a
             // completed delegated delivery (mirror the delegation-success arm): do NOT
-            // delete the placeholder and do NOT re-send. `relay_ok = true` so the
-            // lifecycle finalizes exactly as a delivered turn (the response IS on the
-            // channel, posted by the sink); the offset is already at `end`, so the
-            // inline advance below is an idempotent no-op.
+            // re-send. `relay_ok = true` so the lifecycle finalizes exactly as a
+            // delivered turn (the response IS on the channel, posted by the sink); the
+            // offset is already at `end`, so the inline advance below is an idempotent
+            // no-op.
             if has_current_response {
                 tui_direct_anchor_terminal_body_visible = true;
                 last_relayed_offset = Some(turn_data_start_offset);
                 last_observed_generation_mtime_ns =
                     Some(read_generation_file_mtime_ns(&tmux_session_name));
+            }
+            // #4158: a LIVE `placeholder_msg_id` here is NOT necessarily the message
+            // that holds the delivered body. When inflight vanished mid-turn the
+            // streaming loop POSTed a FRESH placeholder while the sink delivered the
+            // real answer through a DIFFERENT message and advanced the offset
+            // authority — that fresh placeholder is stale residue and, unless
+            // reconciled, is orphaned (never edited/deleted/finalized). Route it
+            // through the same guarded-cleanup helper the no-response arm uses: it
+            // PRESERVES the placeholder when the delivered anchor IS this message
+            // (#3593 sink-delivered-body case → `Protected`) and DELETES it only when
+            // the delivered anchor is a DIFFERENT message covering the same committed
+            // coordinate space (#4158 residue → `Found`); a body-bearing placeholder
+            // with no positive delivered-elsewhere proof is preserved fail-safe.
+            if let Some(msg_id) = placeholder_msg_id {
+                let outcome = delete_terminal_placeholder_unless_delivered(
+                    &http,
+                    channel_id,
+                    &shared,
+                    &watcher_provider,
+                    &tmux_session_name,
+                    msg_id,
+                    inflight_before_relay.as_ref(),
+                    Some((
+                        turn_data_start_offset,
+                        terminal_event_consumed_offset(current_offset, &all_data),
+                    )),
+                    response_sent_offset,
+                    &last_edit_text,
+                    // #4158: post-commit arm — the placeholder may be the sink's
+                    // PlaceholderEdit target, so require positive `Found` proof to
+                    // delete (see apply_terminal_committed_delete_proof_gate).
+                    true,
+                    "watcher_skip_already_committed_cleanup",
+                )
+                .await;
+                if outcome.is_some_and(|outcome| outcome.is_committed()) {
+                    drop_placeholder_orphan_record(&watcher_provider, &shared, channel_id, msg_id);
+                    placeholder_msg_id = None;
+                    placeholder_from_restored_inflight = false;
+                    last_edit_text.clear();
+                }
             }
             clear_provider_overload_retry_state(channel_id);
             true
@@ -4940,7 +4674,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // `DELIVERY_LEASE_DEADLINE_MS` the sink commits+releases (→ committed>=end →
             // SkipAlreadyCommitted) or dies (→ deadline lapses → reclaim + SendFull).
             // The sole arm closing the slow-sink-in-flight duplicate (#3151).
-            false
+            let plan = watcher_wait_inflight_retry_plan();
+            retry_terminal_delivery_from_offset = plan.retry_offset;
+            plan.relay_ok
         } else if watcher_lease_b2_skip {
             // #3041 P1-1 B2 (single-holder, §5.2): a DIFFERENT watcher instance already
             // holds the delivery lease for this channel/turn/range (mid-send or not yet
@@ -4994,7 +4730,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     .map(TaskNotificationKind::as_str)
                     .unwrap_or("none")
             );
-            let mut retry_terminal_delivery_from_offset = false;
             let mut relay_ok = true;
             let mut direct_send_delivered = false;
             let mut external_input_lease_consumed_by_relay = false;
@@ -5275,6 +5010,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     error,
                                 }) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
+                                    let display_error = stripped_send_error(&error);
                                     tracing::warn!(
                                         "  [{ts}] ⚠ watcher: terminal response partially delivered in channel {} msg {} (sent_chunks={}, total_chunks={}, failed_chunk_index={}, cleaned_continuations={}, cleanup_errors={}, error={}); preserving inflight for retry",
                                         channel_id.get(),
@@ -5284,7 +5020,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         failed_chunk_index,
                                         sent_continuation_message_ids.len(),
                                         cleanup_errors.len(),
-                                        error
+                                        display_error
                                     );
                                     record_placeholder_cleanup(
                                         &shared,
@@ -5294,20 +5030,39 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         &tmux_session_name,
                                         PlaceholderCleanupOperation::EditTerminal,
                                         PlaceholderCleanupOutcome::failed(format!(
-                                            "{error}; cleaned_continuations={}; cleanup_errors={}",
+                                            "{display_error}; cleaned_continuations={}; cleanup_errors={}",
                                             sent_continuation_message_ids.len(),
                                             cleanup_errors.len()
                                         )),
                                         "watcher_terminal_relay_partial_continuation_failure",
                                     );
-                                    let plan = watcher_partial_continuation_retry_plan();
+                                    let failure_class = watcher_partial_continuation_failure_class(
+                                        &error,
+                                        cleanup_errors.is_empty(),
+                                    );
+                                    let plan = watcher_send_failure_plan_warned(
+                                        failure_class,
+                                        WatcherNoRewindWarnSite::Partial,
+                                        &watcher_provider,
+                                        channel_id,
+                                        &tmux_session_name,
+                                        &error,
+                                    );
                                     relay_ok = plan.relay_ok;
                                     retry_terminal_delivery_from_offset = plan.retry_offset;
                                 }
                                 Err(e) => {
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
-                                    relay_ok = false;
+                                    info_watcher_failed_relay(e.as_ref());
+                                    let plan = watcher_send_failure_plan_warned(
+                                        classify_watcher_send_failure(e.as_ref()),
+                                        WatcherNoRewindWarnSite::EditFull,
+                                        &watcher_provider,
+                                        channel_id,
+                                        &tmux_session_name,
+                                        e.as_ref(),
+                                    );
+                                    relay_ok = plan.relay_ok;
+                                    retry_terminal_delivery_from_offset = plan.retry_offset;
                                 }
                             }
                         }
@@ -5345,9 +5100,19 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 MessageId::new(anchor.message_id),
                             )
                         });
-                        match crate::services::discord::formatting::send_long_message_raw_with_reference(
+                        let rollback_anchor_msg_id = watcher_rollback_anchor_msg_id(
+                            prompt_anchor_reference.as_ref(),
+                            watcher_lease_turn.user_msg_id,
+                            watcher_lease_start,
+                        );
+                        // The rollback sender makes chunk failure all-or-nothing
+                        // before a rewind. A timeout after Discord accepts a POST
+                        // is still inherently ambiguous, so classification and the
+                        // attempt cap below remain the backstop.
+                        match crate::services::discord::formatting::send_long_message_raw_with_reference_rollback(
                             &http,
                             channel_id,
+                            rollback_anchor_msg_id,
                             &relay_text,
                             &shared,
                             prompt_anchor_reference,
@@ -5370,9 +5135,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 );
                             }
                             Err(e) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
-                                relay_ok = false;
+                                info_watcher_failed_relay(e.as_ref());
+                                let plan = watcher_send_failure_plan_warned(
+                                    classify_watcher_send_failure(e.as_ref()),
+                                    WatcherNoRewindWarnSite::PlaceholderlessFull,
+                                    &watcher_provider,
+                                    channel_id,
+                                    &tmux_session_name,
+                                    e.as_ref(),
+                                );
+                                relay_ok = plan.relay_ok;
+                                retry_terminal_delivery_from_offset = plan.retry_offset;
                             }
                         }
                     }
@@ -5465,46 +5238,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 }
                 clear_provider_overload_retry_state(channel_id);
             }
-            if retry_terminal_delivery_from_offset {
-                // #3041 P1-1: a SAME-holder abandon-without-commit — the partial send
-                // failed; reset the offset to retry the SAME range next loop. Leaving the
-                // lease `Leased` would make the retry's `try_acquire` lose to our own held
-                // lease (B2-skip suppresses the retry until the deadline reclaim), so
-                // abandon-release here (Leased→Unleased). The sole non-committing abandon,
-                // released on the cell directly (same-holder, no actor serialization);
-                // identity-matched no-op when not acquired (#3089 A4 cutover: the
-                // controller already released its own lease on the Unknown path).
-                if watcher_lease_acquired {
-                    watcher_lease_cell.release(
-                        watcher_lease_holder,
-                        watcher_lease_key.clone(),
-                        watcher_lease_start,
-                        watcher_lease_end,
-                    );
-                }
-                current_offset = turn_data_start_offset;
-                all_data.clear();
-                all_data_start_offset = current_offset;
-                all_data_fully_mirrored_to_session_relay = true;
-                all_data_session_bound_relay_ack = None;
-                all_data_first_forwarded_relay_sequence = None;
-                // #2840: release before the backoff sleep (timing preserved);
-                // the guard's Drop is the safety net for non-explicit exits.
-                slot_guard.release();
-                sleep_or_jsonl_event(
-                    tokio::time::Duration::from_millis(500),
-                    &jsonl_notify,
-                    &dead_marker_notify,
-                )
-                .await;
-                continue 'watcher_loop;
-            }
             relay_ok
         } else if relay_decision.suppressed {
             let monitor_event_count = tool_state.transcript_events.len();
             // #1009: Snapshot the channel's MonitoringStore entry keys ONCE so
-            // both the lifecycle notify-outbox row and the suppressed-placeholder
-            // edit body share an identical summary (DRY enforcement).
+            // the lifecycle notify-outbox row uses a stable monitor summary for
+            // this suppressed terminal task-notification.
             let monitor_entry_keys: Vec<String> = if matches!(
                 task_notification_kind,
                 Some(TaskNotificationKind::MonitorAutoTurn)
@@ -5552,24 +5291,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 task_notification_kind,
                 reattach_offset_match: false,
             };
-            let mut decision = decide_placeholder_suppression(&ctx);
-            // #1009: Monitor auto-turn gets a richer suppressed-placeholder body
-            // (event count + current MonitoringStore entry keys) in place of the
-            // generic internal-suppression label.
-            if matches!(
-                task_notification_kind,
-                Some(TaskNotificationKind::MonitorAutoTurn)
-            ) {
-                if let PlaceholderSuppressDecision::Edit(_) = &decision {
-                    let body = format_monitor_suppressed_body(
-                        &last_edit_text,
-                        &watcher_provider,
-                        monitor_event_count,
-                        &monitor_entry_keys,
-                    );
-                    decision = PlaceholderSuppressDecision::Edit(body);
-                }
-            }
+            let decision = decide_placeholder_suppression(&ctx);
             apply_placeholder_suppression(
                 &http,
                 channel_id,
@@ -5595,34 +5317,106 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             false
         } else {
             if let Some(msg_id) = placeholder_msg_id {
-                if let Some(evidence) = placeholder_real_body_exposure_evidence(
+                let _ = delete_terminal_placeholder_unless_delivered(
+                    &http,
+                    channel_id,
+                    &shared,
                     &watcher_provider,
+                    &tmux_session_name,
+                    msg_id,
+                    inflight_before_relay.as_ref(),
+                    Some((
+                        turn_data_start_offset,
+                        terminal_event_consumed_offset(current_offset, &all_data),
+                    )),
                     response_sent_offset,
                     &last_edit_text,
-                ) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        message_id = msg_id.get(),
-                        evidence = %evidence,
-                        response_sent_offset = response_sent_offset,
-                        "  [{ts}] 👁 watcher_no_response_cleanup preserved exposed placeholder for {tmux_session_name}"
-                    );
-                } else {
-                    // No response text but placeholder exists — clean up
-                    let _ = delete_terminal_placeholder(
-                        &http,
-                        channel_id,
-                        &shared,
-                        &watcher_provider,
-                        &tmux_session_name,
-                        msg_id,
-                        "watcher_no_response_cleanup",
-                    )
-                    .await;
-                }
+                    // No commit on this arm → disposable chrome; keep the base table.
+                    false,
+                    "watcher_no_response_cleanup",
+                )
+                .await;
             }
             false
+            }
+        })
+        .await
+        {
+            Ok(relay_ok) => relay_ok,
+            Err(_) => {
+                let plan = watcher_relay_emission_timeout_failure_plan(
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    data_start_offset,
+                    current_offset,
+                );
+                retry_terminal_delivery_from_offset = plan.retry_offset;
+                plan.relay_ok
+            }
         };
+        if retry_terminal_delivery_from_offset {
+            // #4115: bound the terminal-delivery rewind so a persistently failing
+            // send cannot retry the SAME range forever — give up after N attempts
+            // and let the turn finalize instead of looping.
+            terminal_rewind_attempts = terminal_rewind_attempts.saturating_add(1);
+            if matches!(
+                watcher_rewind_attempt_disposition(terminal_rewind_attempts),
+                WatcherRewindAttemptDisposition::GiveUp
+            ) {
+                warn_terminal_rewind_give_up(
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    turn_data_start_offset,
+                    terminal_rewind_attempts,
+                );
+            } else {
+                pending_terminal_rewind_seed = watcher_terminal_rewind_seed_from_parts(
+                    placeholder_msg_id,
+                    status_panel_msg_id,
+                    response_sent_offset,
+                    &last_edit_text,
+                    task_notification_kind,
+                    finish_mailbox_on_completion,
+                    restored_injected_prompt_message_id,
+                    &watcher_streaming_rollover_frozen_msg_ids,
+                );
+                // #3041 P1-1 / #4169: a non-committing terminal delivery path
+                // (partial send failure or WaitInFlight defer) must retry the SAME range
+                // next loop. Leaving the lease `Leased` would make the retry's
+                // `try_acquire` lose to our own held lease (B2-skip suppresses the
+                // retry until the deadline reclaim), so abandon-release here
+                // (Leased→Unleased). The sole non-committing abandon,
+                // released on the cell directly (same-holder, no actor serialization);
+                // identity-matched no-op when not acquired (#3089 A4 cutover: the
+                // controller already released its own lease on the Unknown path).
+                if watcher_lease_acquired {
+                    watcher_lease_cell.release(
+                        watcher_lease_holder,
+                        watcher_lease_key.clone(),
+                        watcher_lease_start,
+                        watcher_lease_end,
+                    );
+                }
+                current_offset = turn_data_start_offset;
+                all_data.clear();
+                all_data_start_offset = current_offset;
+                all_data_fully_mirrored_to_session_relay = true;
+                all_data_session_bound_relay_ack = None;
+                all_data_first_forwarded_relay_sequence = None;
+                // #2840: release before the backoff sleep (timing preserved);
+                // the guard's Drop is the safety net for non-explicit exits.
+                slot_guard.release();
+                sleep_or_jsonl_event(
+                    tokio::time::Duration::from_millis(500),
+                    &jsonl_notify,
+                    &dead_marker_notify,
+                )
+                .await;
+                continue 'watcher_loop;
+            }
+        }
         let relay_suppressed = relay_decision.suppressed;
         let terminal_output_committed = relay_ok || relay_suppressed;
         if terminal_output_committed {
@@ -5720,6 +5514,15 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             terminal_delivery_committed,
         );
 
+        // #4106: whether the pre-panel early release below actually released THIS
+        // turn's mailbox slot. When it did, the late
+        // `finish_restored_watcher_active_turn` for the same pinned id is a
+        // deterministic identity-guard miss; carrying this flag routes it through
+        // the guard-miss-expected context so that EXPECTED no-op logs at debug
+        // instead of spamming the wrong-turn WARN on every normal completion.
+        let mut pre_panel_release_drove_finalize = false;
+        let mut completion_chrome_timed_out = false;
+
         if terminal_output_committed && watcher_tui_gate_outcome.should_emit_completion() {
             // #2849: watcher-completed turns never traverse the bridge
             // StatusUpdate path, so the completed panel can lack the Context
@@ -5731,10 +5534,24 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // also internally gated to context_window != 0. #3262: the same
             // turn-idle helper also injects `/compact` when live Claude usage
             // crosses the configured threshold (claude-only, once-per-cycle).
-            crate::services::discord::adk_session::backfill_completed_panel_usage_and_maybe_inject_compact(
-                &shared, channel_id, &state, &watcher_provider, &tmux_session_name,
+            if watcher_completion_chrome_with_timeout(
+                crate::services::discord::adk_session::backfill_completed_panel_usage_and_maybe_inject_compact(
+                    &shared, channel_id, &state, &watcher_provider, &tmux_session_name,
+                ),
             )
-            .await;
+            .await
+            .is_err()
+            {
+                warn_watcher_completion_chrome_timeout(
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    data_start_offset,
+                    current_offset,
+                    "completed_panel_usage_backfill_and_compact",
+                );
+                completion_chrome_timed_out = true;
+            }
             // #2427 D wire (Codex round 2 HIGH-1): the watcher loop is not
             // turn-scoped — a new turn may have rewritten on-disk inflight by now, so
             // re-reading user_msg_id and feeding it into `clear_inflight_state_if_matches`
@@ -5800,21 +5617,36 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 })
                 .map(|inflight| inflight.user_msg_id)
                 .unwrap_or(0);
-            refresh_watcher_session_panel_from_lifecycle(
-                &shared,
-                channel_id,
-                session_panel_lifecycle_user_msg_id,
-                &tmux_session_name,
-                &watcher_provider, // #3983 item4: one-shot session banner render
-            )
-            .await;
+            if !completion_chrome_timed_out
+                && watcher_completion_chrome_with_timeout(
+                    refresh_watcher_session_panel_from_lifecycle(
+                        &shared,
+                        channel_id,
+                        session_panel_lifecycle_user_msg_id,
+                        &tmux_session_name,
+                        &watcher_provider, // #3983 item4: one-shot session banner render
+                    ),
+                )
+                .await
+                .is_err()
+            {
+                warn_watcher_completion_chrome_timeout(
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    data_start_offset,
+                    current_offset,
+                    "session_panel_lifecycle_refresh",
+                );
+                completion_chrome_timed_out = true;
+            }
             // #3142: gate the EDIT/finalize + orphan-store reconciliation on
             // `!inflight_before_relay_is_stale_newer_turn`. When the pre-relay
             // snapshot is a stale NEWER turn the older committed range must NOT touch
             // that newer turn's panel (or its orphan record). The current in-range
             // turn's own panel, if any, is created via the streaming sources and is
             // unaffected (in-range => gate false => completion fires as today).
-            if !inflight_before_relay_is_stale_newer_turn {
+            if !completion_chrome_timed_out && !inflight_before_relay_is_stale_newer_turn {
                 // #3969 root invariant: read the CHOKEPOINT-FRESH inflight (this
                 // `inflight_before_relay` is re-loaded after the synthetic row exists,
                 // unlike the stale `:1017` flag) and suppress the #3089 footer for any
@@ -5836,33 +5668,83 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         status_panel_msg_id,
                         inflight_before_relay.as_ref(),
                     );
-                complete_watcher_terminal_footer_or_status_panel_with_sniffer(
-                    &http,
-                    &shared,
-                    channel_id,
-                    &watcher_provider,
-                    status_panel_started_at,
-                    single_message_panel_footer_mode,
-                    &mut completion_footer_spin_idx,
-                    completion_footer_terminal_target.clone(),
-                    placeholder_msg_id,
-                    &last_edit_text,
-                    status_panel_msg_id,
-                    &mut last_status_panel_text,
-                    task_notification_kind,
-                    Some(tmux_session_name.clone()),
-                    |tmux_session_name| async move {
-                        crate::services::discord::tmux::sniff_background_agent_pending_for_completion(
-                            tmux_session_name.as_deref(),
-                        )
-                        .await
-                    },
-                    status_panel_completion_user_msg_id,
-                    turn_is_external_input_for_session,
-                    turn_is_non_managed_tui_mirror,
-                    two_message_status_panel_generation_superseded,
+                // #4106: release the exact pinned active slot before the awaited
+                // status-panel edit. If a same-channel follow-up claims the mailbox
+                // while Discord is round-tripping the edit, the late finalizer below
+                // will identity-miss and must be an idempotent no-op decrement.
+                if !lifecycle_stage_paused {
+                    let pre_panel_inflight_state_for_finalize =
+                        crate::services::discord::inflight::load_inflight_state(
+                            &watcher_provider,
+                            channel_id.get(),
+                        );
+                    let pre_panel_completion_is_stale_for_newer_turn =
+                        committed_completion_is_stale_for_newer_turn(
+                            inflight_before_relay.as_ref(),
+                            pre_panel_inflight_state_for_finalize.as_ref(),
+                            &tmux_session_name,
+                            current_offset,
+                        );
+                    let pre_panel_restored_finalizer_turn_id = pinned_finalizer_turn_id(
+                        inflight_before_relay.as_ref(),
+                        &tmux_session_name,
+                        current_offset,
+                    );
+                    if should_submit_restored_watcher_finalize(
+                        pre_panel_completion_is_stale_for_newer_turn,
+                        pre_panel_restored_finalizer_turn_id,
+                    ) {
+                        pre_panel_release_drove_finalize =
+                            release_restored_watcher_active_turn_before_panel_edit(
+                                &shared,
+                                &watcher_provider,
+                                channel_id,
+                                pre_panel_restored_finalizer_turn_id,
+                            )
+                            .await;
+                    }
+                }
+                if watcher_completion_chrome_with_timeout(
+                    complete_watcher_terminal_footer_or_status_panel_with_sniffer(
+                        &http,
+                        &shared,
+                        channel_id,
+                        &watcher_provider,
+                        status_panel_started_at,
+                        single_message_panel_footer_mode,
+                        &mut completion_footer_spin_idx,
+                        completion_footer_terminal_target.clone(),
+                        placeholder_msg_id,
+                        &last_edit_text,
+                        status_panel_msg_id,
+                        &mut last_status_panel_text,
+                        task_notification_kind,
+                        Some(tmux_session_name.clone()),
+                        |tmux_session_name| async move {
+                            crate::services::discord::tmux::sniff_background_agent_pending_for_completion(
+                                tmux_session_name.as_deref(),
+                            )
+                            .await
+                        },
+                        status_panel_completion_user_msg_id,
+                        turn_is_external_input_for_session,
+                        turn_is_non_managed_tui_mirror,
+                        two_message_status_panel_generation_superseded,
+                    ),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    warn_watcher_completion_chrome_timeout(
+                        &watcher_provider,
+                        channel_id,
+                        &tmux_session_name,
+                        data_start_offset,
+                        current_offset,
+                        "terminal_footer_or_status_panel_completion",
+                    );
+                    completion_chrome_timed_out = true;
+                }
             } // #3142: end `if !inflight_before_relay_is_stale_newer_turn` (EDIT/finalize gate)
             // #3003 single-chokepoint reclaim safety: after completion the turn
             // frame ends and the next frame re-seeds `status_panel_msg_id`, so the
@@ -6022,6 +5904,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // block, and an already-finalized body is left untouched.
         if terminal_output_committed
             && !lifecycle_stage_paused
+            && !completion_chrome_timed_out
             && !single_message_panel_footer_mode
             && let Some(placeholder) = placeholder_msg_id
             && let Some(finalized) = finalize_watcher_streaming_footer(
@@ -6030,15 +5913,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &watcher_provider,
             )
         {
-            match crate::services::discord::http::edit_channel_message(
-                &http,
-                channel_id,
-                placeholder,
-                &finalized,
+            match watcher_completion_chrome_with_timeout(
+                crate::services::discord::http::edit_channel_message(
+                    &http,
+                    channel_id,
+                    placeholder,
+                    &finalized,
+                ),
             )
             .await
             {
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!(
                         "  [{ts}] 👁 #3104 reconciled stale '계속 처리 중' streaming footer on channel {} msg {} at idle",
@@ -6046,12 +5931,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         placeholder.get()
                     );
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!(
                         "  [{ts}] ⚠ #3104 failed to reconcile stale streaming footer on channel {} msg {}: {error}",
                         channel_id.get(),
                         placeholder.get()
+                    );
+                }
+                Err(_) => {
+                    warn_watcher_completion_chrome_timeout(
+                        &watcher_provider,
+                        channel_id,
+                        &tmux_session_name,
+                        data_start_offset,
+                        current_offset,
+                        "stale_streaming_footer_reconcile",
                     );
                 }
             }
@@ -6525,77 +6420,122 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // watcher-owned synthetic rows (suppressed task-notification
             // completions) — their `⏳ → ✅` block fires regardless, and skipping
             // here left their own-pin marker to a false TTL `⚠`.
+            let pinned_committed_clear_identity = if !completion_is_stale_for_newer_turn {
+                inflight_state
+                    .as_ref()
+                    .map(crate::services::discord::inflight::InflightTurnIdentity::from_state)
+            } else {
+                None
+            };
+            let pinned_committed_clear_turn_nonce = if !completion_is_stale_for_newer_turn {
+                watcher_turn_nonce.as_deref()
+            } else {
+                None
+            };
+
             if !completion_is_stale_for_newer_turn
                 && let Some(committed) = inflight_state.as_ref()
                 && (tui_direct_anchor_terminal_body_visible
                     || committed_row_requires_marker_tombstone(committed))
             {
-                crate::services::discord::tui_direct_abort_marker::record_commit_tombstone(
+                crate::services::discord::tui_direct_abort_marker::record_commit_tombstone_with_offsets(
                     watcher_provider.as_str(),
                     &tmux_session_name,
                     channel_id.get(),
                     committed.user_msg_id,
                     &committed.started_at,
+                    committed.turn_start_offset,
+                    terminal_evidence_offset,
                 );
                 let _ =
-                    crate::services::discord::tui_direct_abort_marker::drain_on_terminal_commit(
+                    crate::services::discord::tui_direct_abort_marker::drain_on_terminal_commit_with_offsets(
                         &shared,
                         watcher_provider.as_str(),
                         &tmux_session_name,
                         channel_id.get(),
                         committed.user_msg_id,
                         &committed.started_at,
+                        committed.turn_start_offset,
+                        terminal_evidence_offset,
                     )
                     .await;
             }
             if !completion_is_stale_for_newer_turn {
-                crate::services::discord::inflight::clear_inflight_state(
-                    &provider_kind,
-                    channel_id.get(),
-                );
-                let watcher_turn_id = inflight_state
-                    .as_ref()
-                    .filter(|s| s.user_msg_id != 0)
-                    .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
-                let watcher_session_key_owned =
-                    inflight_state.as_ref().and_then(|s| s.session_key.clone());
-                let watcher_dispatch_id_owned = resolved_did
-                    .clone()
-                    .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
-                crate::services::observability::emit_inflight_lifecycle_event(
-                    provider_kind.as_str(),
-                    channel_id.get(),
-                    watcher_dispatch_id_owned.as_deref(),
-                    watcher_session_key_owned.as_deref(),
-                    watcher_turn_id.as_deref(),
-                    "cleared_by_watcher",
-                    serde_json::json!({
-                        "dispatch_ok": dispatch_ok,
-                        "has_assistant_response": has_assistant_response,
-                        "full_response_len": full_response.len(),
-                    }),
-                );
-                // #3646 OBSERVATION-ONLY (event 3/3 — inflight_clear + invariant
-                // signal): the committed-output, non-stale watcher clear — the exact
-                // #3607 chokepoint. The clear ABOVE has already run; this only
-                // RECORDS the live lifecycle signals and fires a NON-FATAL
-                // ERROR-level invariant signal if a committed terminal was cleared
-                // with neither a visible UI completion nor a persisted obligation
-                // (#3607). Never gates cleanup. `terminal_ui_obligation_persisted` is
-                // `false` on the watcher path. S2-b removed completion-gate
-                // suppression, so a busy pane observation no longer suppresses this
-                // clear. Orchestration + the non-fatal invariant live in
-                // relay_owner_observability (non-hot file).
-                crate::services::discord::relay_owner_observability::emit_inflight_clear_with_invariant(
-                    provider_kind.as_str(),
-                    channel_id.get(),
-                    watcher_dispatch_id_owned.as_deref(),
-                    watcher_session_key_owned.as_deref(),
-                    watcher_turn_id.as_deref(),
-                    terminal_delivery_committed,
-                    terminal_output_committed && watcher_tui_gate_outcome.should_emit_completion(),
-                    false,
-                );
+                if let Some(pinned_clear_identity) = pinned_committed_clear_identity.as_ref() {
+                    let clear_outcome =
+                        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+                            &provider_kind,
+                            channel_id.get(),
+                            pinned_clear_identity,
+                            pinned_committed_clear_turn_nonce,
+                        );
+                    match clear_outcome {
+                        crate::services::discord::inflight::GuardedClearOutcome::Cleared => {
+                            let watcher_turn_id = inflight_state
+                                .as_ref()
+                                .filter(|s| s.user_msg_id != 0)
+                                .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
+                            let watcher_session_key_owned =
+                                inflight_state.as_ref().and_then(|s| s.session_key.clone());
+                            let watcher_dispatch_id_owned = resolved_did.clone().or_else(|| {
+                                inflight_state.as_ref().and_then(|s| s.dispatch_id.clone())
+                            });
+                            crate::services::observability::emit_inflight_lifecycle_event(
+                                provider_kind.as_str(),
+                                channel_id.get(),
+                                watcher_dispatch_id_owned.as_deref(),
+                                watcher_session_key_owned.as_deref(),
+                                watcher_turn_id.as_deref(),
+                                "cleared_by_watcher",
+                                serde_json::json!({
+                                    "dispatch_ok": dispatch_ok,
+                                    "has_assistant_response": has_assistant_response,
+                                    "full_response_len": full_response.len(),
+                                }),
+                            );
+                            // #3646 OBSERVATION-ONLY (event 3/3 — inflight_clear + invariant
+                            // signal): the committed-output, non-stale watcher clear — the exact
+                            // #3607 chokepoint. The clear ABOVE has already run; this only
+                            // RECORDS the live lifecycle signals and fires a NON-FATAL
+                            // ERROR-level invariant signal if a committed terminal was cleared
+                            // with neither a visible UI completion nor a persisted obligation
+                            // (#3607). Never gates cleanup. `terminal_ui_obligation_persisted` is
+                            // `false` on the watcher path. S2-b removed completion-gate
+                            // suppression, so a busy pane observation no longer suppresses this
+                            // clear. Orchestration + the non-fatal invariant live in
+                            // relay_owner_observability (non-hot file).
+                            crate::services::discord::relay_owner_observability::emit_inflight_clear_with_invariant(
+                                provider_kind.as_str(),
+                                channel_id.get(),
+                                watcher_dispatch_id_owned.as_deref(),
+                                watcher_session_key_owned.as_deref(),
+                                watcher_turn_id.as_deref(),
+                                terminal_delivery_committed,
+                                terminal_output_committed
+                                    && watcher_tui_gate_outcome.should_emit_completion(),
+                                false,
+                            );
+                        }
+                        crate::services::discord::inflight::GuardedClearOutcome::IoError => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                clear_outcome = ?clear_outcome,
+                                "  [{ts}] ⚠ watcher committed-output clear for {tmux_session_name}: atomic identity-matched clear failed with IO error at offset {current_offset}; see preceding inflight guarded-clear error detail"
+                            );
+                        }
+                        other => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] 👁 watcher committed-output clear for {tmux_session_name}: atomic identity-matched clear was a no-op (outcome={other:?}) at offset {current_offset} — on-disk inflight is no longer the pinned committed turn"
+                            );
+                        }
+                    }
+                } else {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] 👁 watcher committed-output clear for {tmux_session_name}: no pinned committed-turn identity at offset {current_offset}; skipping the on-disk clear"
+                    );
+                }
             }
             // codex P2 (#1670): cleanup (mailbox_finish_turn + cancel_token
             // release) MUST run on every relay-completed terminal even when
@@ -6635,7 +6575,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 completion_is_stale_for_newer_turn,
                 restored_finalizer_turn_id,
             ) {
-                finish_restored_watcher_active_turn(
+                finish_restored_watcher_active_turn_with_ctx(
                     &shared,
                     &provider_kind,
                     channel_id,
@@ -6657,6 +6597,18 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     inflight_before_relay.as_ref().map(
                         crate::services::discord::turn_finalizer::SyntheticClaimSnapshot::from_row,
                     ),
+                    // #4106: when the pre-panel early release already drove the
+                    // release of this pinned id, the late submit here is a
+                    // deterministic identity-guard miss; route it through the
+                    // guard-miss-expected context so the EXPECTED no-op logs at
+                    // debug instead of the wrong-turn WARN. When the early release
+                    // did NOT drive it, keep the plain watcher() context so a
+                    // genuine wrong-turn miss still WARNs.
+                    if pre_panel_release_drove_finalize {
+                        crate::services::discord::turn_finalizer::FinalizeContext::watcher_after_pre_panel_release()
+                    } else {
+                        crate::services::discord::turn_finalizer::FinalizeContext::watcher()
+                    },
                     "restored watcher completed with queued backlog",
                 )
                 .await

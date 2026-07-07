@@ -58,8 +58,10 @@ mod state_extractors;
 // cluster and unit tests) into a leaf module. `RebindOutcome` / `RebindError` stay
 // in this root module (shared with `rebind_runtime` + external callers); the entry
 // point is re-exported below so external call sites stay byte-identical.
-#[path = "recovery_engine/manual_rebind.rs"]
+#[path = "recovery_engine/manual_rebind/mod.rs"]
 mod manual_rebind;
+#[path = "recovery_engine/manual_rebind_output_path.rs"]
+mod manual_rebind_output_path;
 #[path = "recovery_engine/routing_orphan.rs"] // #3869 routing-orphan finalize
 mod routing_orphan;
 #[path = "recovery_engine/terminal_text_idempotency.rs"]
@@ -83,6 +85,10 @@ mod completion_delivery;
 // leaf module. Entry points are re-exported below so external paths stay stable.
 #[path = "recovery_engine/restore_inflight.rs"]
 mod restore_inflight;
+// #4111: behavior-preserving extraction of guarded Codex rollout persist-outcome
+// handling before restart-path watcher spawn into a leaf module.
+#[path = "recovery_engine/restore_persist_outcome.rs"]
+mod restore_persist_outcome;
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::extract_response_from_output;
@@ -118,7 +124,10 @@ use self::terminal_watcher::{
 // members (the worktree path/branch/info/git helpers, `recovery_dispatch_id`,
 // `recovery_requires_worktree_context` and `inflight_ready_for_input_without_tui_pane`)
 // stay private to the submodule.
-use self::rebind_runtime::{resolve_rebind_runtime_state, spawn_codex_tui_rebind_relay_output};
+use self::rebind_runtime::{
+    claude_rebind_transcript_path, resolve_rebind_runtime_state,
+    spawn_codex_tui_rebind_relay_output,
+};
 use self::state_extractors::{
     inflight_or_legacy_tmux_ready_for_input, interrupted_recovery_message, recovery_spawn_adk_cwd,
     recovery_tmux_session_name, restore_recovered_session_worktree,
@@ -152,6 +161,7 @@ use self::restore_inflight::tmux_session_alive_with_retry;
 pub(in crate::services::discord) use self::restore_inflight::{
     finish_recovered_turn_mailbox, restore_inflight_turns,
 };
+use self::restore_persist_outcome::{RestorePersistOutcome, restore_codex_rollout_output_path};
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
 pub(in crate::services::discord) use self::terminal_text_idempotency::RecoveryDeliveryContext;
 // #3479: re-import the analytics + transcript helpers so root call sites stay

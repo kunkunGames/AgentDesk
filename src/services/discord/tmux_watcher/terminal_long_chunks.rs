@@ -226,7 +226,12 @@ pub(in crate::services::discord) async fn apply_watcher_long_chunks_legacy(
         }
         Err(error) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!("  [{ts}] 👁 Failed to relay ordered terminal chunks: {error}");
+            let error = error.to_string();
+            let display_error =
+                crate::services::discord::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                    &error,
+                );
+            tracing::info!("  [{ts}] 👁 Failed to relay ordered terminal chunks: {display_error}");
             *locals.relay_ok = false;
         }
     }

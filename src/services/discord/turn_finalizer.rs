@@ -1108,7 +1108,8 @@ mod tests {
     /// `gateway::with_isolated_runtime_root`, `runtime_store::lock_test_env`,
     /// all of which resolve to `config::shared_test_env_lock()`) for the FULL
     /// duration of the test and point `AGENTDESK_ROOT_DIR` at a private temp
-    /// dir, then clear it on exit so nothing leaks to a concurrent test.
+    /// dir, then restore the prior value on exit so nothing leaks to a
+    /// concurrent test.
     ///
     /// The guard is a `std::sync::MutexGuard` (not `Send`), held across the
     /// test's `.await` points. That is sound because every finalizer test runs
@@ -1128,24 +1129,12 @@ mod tests {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        // Codex P3 — SAVE the prior value and RESTORE it on exit (instead of
-        // unconditionally removing) so running the suite with the variable
-        // already set does not leak a cleared env to later tests.
-        let prev = std::env::var_os("AGENTDESK_ROOT_DIR");
         let tmp = tempfile::tempdir().expect("create temp runtime dir for turn finalizer test");
-        unsafe {
-            std::env::set_var(
-                "AGENTDESK_ROOT_DIR",
-                tmp.path().to_str().expect("temp path must be valid utf-8"),
-            );
-        }
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
         f().await;
-        unsafe {
-            match prev {
-                Some(value) => std::env::set_var("AGENTDESK_ROOT_DIR", value),
-                None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
-            }
-        }
     }
 
     /// A `Complete` on a registered Pending turn finalizes exactly once and the
@@ -2169,6 +2158,7 @@ mod tests {
                         ),
                         source_message_ids: vec![MessageId::new(71)],
                         source_message_queued_generations: Vec::new(),
+                        source_text_segments: Vec::new(),
                         text: "queued follow-up".to_string(),
                         mode: InterventionMode::Soft,
                         created_at: std::time::Instant::now(),
@@ -2272,6 +2262,7 @@ mod tests {
                         ),
                         source_message_ids: vec![MessageId::new(5003)],
                         source_message_queued_generations: Vec::new(),
+                        source_text_segments: Vec::new(),
                         text: "queued behind turn-2".to_string(),
                         mode: InterventionMode::Soft,
                         created_at: std::time::Instant::now(),
@@ -4176,6 +4167,277 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&transcript);
+    }
+
+    /// #4174 Stage-3b: a live watcher over a structurally Done transcript is
+    /// NOT terminal for the strict fast path while the relay-space produced end
+    /// is still ahead of confirmed delivery. The natural far-backstop deadline
+    /// is the bounded escape for a dead relay that never catches up.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watcher_backstop_done_requires_delivery_confirmation_until_natural_deadline() {
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let ch = ChannelId::new(5408);
+            let session = format!("4174-done-undelivered-{}", std::process::id());
+            let transcript = std::env::temp_dir().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"result\",\"result\":\"done\",\"session_id\":\"s\"}\n",
+            )
+            .unwrap();
+            let transcript_str = transcript.to_str().unwrap().to_string();
+            shared
+                .tmux_watchers
+                .insert(ch, backstop_watcher_handle(&session, &transcript_str));
+
+            let mut state = super::super::inflight::InflightTurnState::new(
+                ProviderKind::Claude,
+                ch.get(),
+                None,
+                7,
+                160,
+                161,
+                "done with undelivered tail".to_string(),
+                None,
+                Some(session.clone()),
+                Some(transcript_str.clone()),
+                None,
+                128,
+            );
+            state.turn_start_offset = Some(0);
+            super::super::inflight::save_inflight_state(&state).unwrap();
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(64, Ordering::Release);
+
+            assert!(
+                !watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict fast-path Done must defer while produced end is undelivered"
+            );
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, true),
+                "natural far-backstop deadline is the bounded escape for a dead relay"
+            );
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(128, Ordering::Release);
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict fast-path Done may finalize once delivery is confirmed"
+            );
+
+            let _ = std::fs::remove_file(&transcript);
+        })
+        .await;
+    }
+
+    /// #4187 follow-up: the reconciler fast path at
+    /// `turn_finalizer/reconcile.rs:151` must run the same strict delivery gate as
+    /// the direct helper test above. A live watcher over a Done transcript with a
+    /// relay-space produced frontier ahead of `confirmed_end_offset` must NOT pull
+    /// the far deadline in; after the watcher confirmation catches up, the short
+    /// fast-path window may finalize the stuck watcher-owned turn.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watcher_backstop_fast_path_waits_for_delivery_confirmation() {
+        use serenity::model::id::{MessageId, UserId};
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            shared.restart.global_active.store(1, Ordering::Relaxed);
+            let ch = ChannelId::new(5409);
+            let active_token = Arc::new(CancelToken::new());
+            shared
+                .mailbox(ch)
+                .restore_active_turn(active_token, UserId::new(7), MessageId::new(180))
+                .await;
+
+            let session = format!("4187-fastpath-confirmation-{}", std::process::id());
+            let transcript = std::env::temp_dir().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"result\",\"result\":\"done\",\"session_id\":\"s\"}\n",
+            )
+            .unwrap();
+            let transcript_str = transcript.to_str().unwrap().to_string();
+            shared
+                .tmux_watchers
+                .insert(ch, backstop_watcher_handle(&session, &transcript_str));
+
+            let mut state = super::super::inflight::InflightTurnState::new(
+                ProviderKind::Claude,
+                ch.get(),
+                None,
+                7,
+                180,
+                181,
+                "done waiting for confirmation".to_string(),
+                None,
+                Some(session.clone()),
+                Some(transcript_str.clone()),
+                None,
+                192,
+            );
+            state.turn_start_offset = Some(0);
+            super::super::inflight::save_inflight_state(&state).unwrap();
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(64, Ordering::Release);
+
+            let fin = TurnFinalizer::spawn();
+            let k = TurnKey::new(ch, 180, 0);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher, &shared);
+
+            tokio::time::sleep(FAST_PATH_WINDOW).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                shared.restart.global_active.load(Ordering::Relaxed),
+                1,
+                "the reconciler fast path must defer while confirmed_end < produced"
+            );
+
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(192, Ordering::Release);
+            tokio::time::sleep(FAST_PATH_WINDOW).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                shared.restart.global_active.load(Ordering::Relaxed),
+                0,
+                "after confirmation catches up, the strict fast path may finalize"
+            );
+            let late = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(
+                matches!(late, FinalizeOutcome::AlreadyFinalized)
+                    || matches!(
+                        late,
+                        FinalizeOutcome::Finalized {
+                            removed_token: None,
+                            ..
+                        }
+                    ),
+                "a late terminal must not double-release after the confirmed fast path finalized"
+            );
+            let _ = std::fs::remove_file(&transcript);
+        })
+        .await;
+    }
+
+    /// #4187 follow-up: an identity-matched delivery lease is also a
+    /// relay-space produced-frontier source. Here inflight `last_offset` is
+    /// already confirmed, but the live lease end is not; strict Done must defer
+    /// until `confirmed_end_offset` reaches the lease end.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watcher_backstop_done_uses_matching_delivery_lease_end() {
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let ch = ChannelId::new(5410);
+            let session = format!("4187-lease-produced-{}", std::process::id());
+            let transcript = std::env::temp_dir().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"result\",\"result\":\"done\",\"session_id\":\"s\"}\n",
+            )
+            .unwrap();
+            let transcript_str = transcript.to_str().unwrap().to_string();
+            shared
+                .tmux_watchers
+                .insert(ch, backstop_watcher_handle(&session, &transcript_str));
+
+            let mut state = super::super::inflight::InflightTurnState::new(
+                ProviderKind::Claude,
+                ch.get(),
+                None,
+                7,
+                190,
+                191,
+                "done with lease tail".to_string(),
+                None,
+                Some(session.clone()),
+                Some(transcript_str.clone()),
+                None,
+                64,
+            );
+            state.turn_start_offset = Some(0);
+            super::super::inflight::save_inflight_state(&state).unwrap();
+            let lease_key = DeliveryLeaseKey::from_inflight_state_for_site(
+                ch,
+                shared.restart.current_generation,
+                &state,
+                "test:watcher_backstop_done_uses_matching_delivery_lease_end",
+            );
+            assert!(
+                shared.delivery_lease(ch).try_acquire(
+                    lease_key,
+                    LeaseHolder::Watcher { instance_id: 41 },
+                    64,
+                    160,
+                    1_000,
+                ),
+                "test precondition: matching watcher delivery lease is held"
+            );
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(64, Ordering::Release);
+
+            assert!(
+                !watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict Done must defer while a matching delivery lease extends the produced end"
+            );
+            shared
+                .tmux_relay_coord(ch)
+                .confirmed_end_offset
+                .store(160, Ordering::Release);
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict Done may finalize once confirmation reaches the matching lease end"
+            );
+
+            let _ = std::fs::remove_file(&transcript);
+        })
+        .await;
+    }
+
+    /// #4187 follow-up: when neither an inflight row nor a delivery lease can
+    /// produce a relay-space terminal end, the helper intentionally falls back to
+    /// the current confirmed frontier. A live watcher over Done is therefore
+    /// strict-terminal even away from the natural far-backstop deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn watcher_backstop_done_without_inflight_or_lease_is_strict_terminal() {
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None);
+            let ch = ChannelId::new(5411);
+            let session = format!("4187-no-inflight-{}", std::process::id());
+            let transcript = std::env::temp_dir().join(format!("{session}.jsonl"));
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"result\",\"result\":\"done\",\"session_id\":\"s\"}\n",
+            )
+            .unwrap();
+            let transcript_str = transcript.to_str().unwrap().to_string();
+            shared
+                .tmux_watchers
+                .insert(ch, backstop_watcher_handle(&session, &transcript_str));
+
+            assert!(
+                watcher_backstop_turn_is_terminal(&shared, ch, &ProviderKind::Claude, false),
+                "strict Done falls back to confirmed_end when no inflight row or lease exists"
+            );
+
+            let _ = std::fs::remove_file(&transcript);
+        })
+        .await;
     }
 
     /// With the watcher far-backstop ARMED at `register_start`, a JSONL Done

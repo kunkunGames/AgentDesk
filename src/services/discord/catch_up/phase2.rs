@@ -7,6 +7,7 @@ use super::super::MailboxEnqueueOutcome;
 pub(super) enum Phase2EnqueueCommit {
     Accepted,
     Duplicate,
+    LastItemDedup,
     Deferred,
 }
 
@@ -28,6 +29,14 @@ pub(super) fn classify_phase2_enqueue_commit(
         )
     {
         return Phase2EnqueueCommit::Duplicate;
+    }
+    if outcome.persistence_error.is_none()
+        && matches!(
+            outcome.refusal_reason,
+            Some(EnqueueRefusalReason::LastItemDedup)
+        )
+    {
+        return Phase2EnqueueCommit::LastItemDedup;
     }
     Phase2EnqueueCommit::Deferred
 }

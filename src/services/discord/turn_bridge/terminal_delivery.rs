@@ -203,6 +203,10 @@ pub(super) fn turn_bridge_replace_outcome_committed(
             cleanup_errors,
             error,
         }) => {
+            let display_error =
+                super::super::replace_outcome_policy::strip_watcher_send_failure_class_marker(
+                    &error,
+                );
             record_turn_bridge_terminal_replace_cleanup(
                 shared,
                 provider,
@@ -210,7 +214,7 @@ pub(super) fn turn_bridge_replace_outcome_committed(
                 message_id,
                 tmux_session_name,
                 super::super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(format!(
-                    "partial continuation failure: sent_chunks={sent_chunks}, total_chunks={total_chunks}, failed_chunk_index={failed_chunk_index}, cleaned_continuations={}, cleanup_errors={}, error={error}",
+                    "partial continuation failure: sent_chunks={sent_chunks}, total_chunks={total_chunks}, failed_chunk_index={failed_chunk_index}, cleaned_continuations={}, cleanup_errors={}, error={display_error}",
                     sent_continuation_message_ids.len(),
                     cleanup_errors.len()
                 )),
@@ -387,14 +391,11 @@ pub(super) fn advance_tmux_relay_confirmed_end(
         }
     }
 
-    // #964: observability timestamp — updated whenever the watermark advances
-    // (including the CAS-loser path, since that still proves a peer completed
-    // a relay) so `GET /api/channels/:id/watcher-state` can surface the most
-    // recent relay activity without blocking on disk state.
-    relay_coord.last_relay_ts_ms.store(
-        chrono::Utc::now().timestamp_millis(),
-        std::sync::atomic::Ordering::Release,
-    );
+    // #964: observability timestamp — updated through the same relay-progress
+    // heartbeat used by confirmed chunk sends. Regression recovery may benignly
+    // zero `last_relay_ts_ms` when the output watermark is reset, but positive
+    // relay progress still flows through this heartbeat path.
+    relay_coord.note_relay_progress_heartbeat(chrono::Utc::now().timestamp_millis());
 
     // Pair the pre-CAS mtime with the offset only when we actually won
     // the advance. Losers and no-ops leave the mtime baseline alone so
@@ -546,12 +547,11 @@ pub(super) fn bridge_epilogue_clears_inflight(
 ///
 /// This predicate gates the epilogue's `~9168` preserve-save: when the preserve
 /// is due to a Skip (`bridge_skip_holder_owns_inflight`), the save MUST be
-/// identity-guarded (`save_inflight_state_if_matches_identity`) so a
-/// holder-cleared / newer-turn row no-ops instead of resurrecting. Every other
-/// preserve site (bridge-owned cleanup retry: EditFailed, PG-cancel-fail,
-/// replace-not-committed, send/enqueue failure, TUI quiescence timeout) and the
-/// delegated-owner path have NO competing holder, so the blind save stays
-/// authoritative (this returns `false` → blind save). Pure so the
+/// identity-guarded (`save_inflight_state_if_identity_unchanged`) so a
+/// holder-cleared / newer-turn row no-ops instead of resurrecting. Bridge-owned
+/// cleanup-retry preserve sites bypass this predicate; delegated-owner preserve
+/// is guarded separately in the epilogue because it can race the watcher clear.
+/// Pure so the
 /// "a Skip never resurrects a holder-cleared inflight" contract is unit-testable
 /// without driving the whole turn loop.
 pub(super) fn bridge_epilogue_skip_save_is_identity_guarded(

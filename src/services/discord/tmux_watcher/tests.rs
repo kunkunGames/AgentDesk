@@ -1,34 +1,43 @@
 use super::{
-    FreshIdleFinalizeDecision, SessionBoundRelayAckOutcome, TuiCompletionGateOutcome,
-    WatcherTerminalKind, build_watcher_streaming_edit_text,
+    FreshIdleFinalizeDecision, RelaySlotGuard, RestoredWatcherTurn, SessionBoundRelayAckOutcome,
+    TuiCompletionGateOutcome, WATCHER_RELAY_EMISSION_TIMEOUT, WatcherTerminalKind,
+    WatcherTerminalRewindSeedInput, build_watcher_streaming_edit_text,
     committed_anchor_cleanup_is_stale_for_newer_turn,
     discard_restored_response_seed_before_no_inflight_terminal_relay,
     legacy_wrapper_prompt_candidates_from_pane, local_cmd_no_output,
     mark_watcher_terminal_delivery_committed, merge_persisted_rollover_frozen_msg_ids,
-    reacquire_watcher_inflight_for_active_stream, should_probe_tmux_liveness,
-    terminal_relay_decision, watcher_batch_contains_assistant_event,
+    reacquire_watcher_inflight_for_active_stream, refresh_watcher_turn_identity,
+    should_probe_tmux_liveness, terminal_relay_decision, watcher_batch_contains_assistant_event,
     watcher_batch_contains_relayable_response,
     watcher_fallback_edit_failure_can_delete_original_placeholder,
-    watcher_fresh_idle_finalize_decision, watcher_handle_no_dispatch_post_work_idle_body,
-    watcher_inflight_absence_is_abandonment, watcher_output_progressed_recently,
-    watcher_should_clear_stale_terminal_message_ids, watcher_should_delete_suppressed_placeholder,
+    watcher_fresh_idle_finalize_decision, watcher_fresh_idle_session_bound_retry_plan,
+    watcher_handle_no_dispatch_post_work_idle_body, watcher_inflight_absence_is_abandonment,
+    watcher_output_progressed_recently, watcher_relay_emission_timeout_failure_plan,
+    watcher_relay_emission_with_timeout, watcher_should_clear_stale_terminal_message_ids,
+    watcher_should_delete_suppressed_placeholder,
     watcher_should_direct_send_after_session_bound_ack,
     watcher_should_reclaim_orphan_turn_placeholder,
     watcher_should_suppress_streaming_after_bridge_delivery,
-    watcher_terminal_commit_side_effects_for_test, watcher_terminal_edit_consumes_placeholder,
-    watcher_terminal_response_for_direct_send,
+    watcher_stream_seed_after_restored_seed_discard, watcher_terminal_commit_side_effects_for_test,
+    watcher_terminal_edit_consumes_placeholder, watcher_terminal_response_for_direct_send,
+    watcher_terminal_rewind_seed, watcher_wait_inflight_retry_plan,
 };
 use crate::services::agent_protocol::RuntimeHandoffKind;
 use crate::services::discord::InflightTurnState;
 use crate::services::discord::formatting::ReplaceLongMessageOutcome;
-use crate::services::discord::inflight::{RelayOwnerKind, TurnSource};
+use crate::services::discord::inflight::{InflightTurnIdentity, RelayOwnerKind, TurnSource};
+use crate::services::discord::replace_outcome_policy::{
+    WatcherRewindAttemptDisposition, WatcherSendFailureClass,
+    classify_watcher_send_failure_message, watcher_full_send_failure_retry_plan,
+    watcher_rewind_attempt_disposition, watcher_send_failure_retry_plan,
+};
 use crate::services::discord::{
     mailbox_enqueue_intervention, mailbox_snapshot, mailbox_take_next_soft_intervention,
     mailbox_try_start_turn,
 };
 use crate::services::provider::{CancelToken, ProviderKind};
 use crate::services::turn_orchestrator::{Intervention, InterventionMode};
-use serenity::all::{ChannelId, MessageId, UserId};
+use serenity::all::{ChannelId, Http, MessageId, UserId};
 
 struct AgentdeskRootGuard(Option<std::ffi::OsString>);
 
@@ -509,6 +518,7 @@ async fn terminal_delivery_timeout_cleanup_releases_mailbox_and_preserves_follow
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(2001)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: "queued follow-up".to_string(),
             mode: InterventionMode::Soft,
             created_at: std::time::Instant::now(),
@@ -648,6 +658,7 @@ fn watchdog_timeout_path_releases_mailbox_via_finalizer_and_does_not_double_fina
                 queued_generation: crate::services::discord::runtime_store::load_generation(),
                 source_message_ids: vec![MessageId::new(6001)],
                 source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
                 text: "post-timeout follow-up".to_string(),
                 mode: InterventionMode::Soft,
                 created_at: std::time::Instant::now(),
@@ -935,6 +946,7 @@ fn timeout_finalize_drains_reacquired_id_zero_wedge_for_live_pinned_turn() {
                 queued_generation: crate::services::discord::runtime_store::load_generation(),
                 source_message_ids: vec![MessageId::new(3600)],
                 source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
                 text: "follow-up while A runs".to_string(),
                 mode: InterventionMode::Soft,
                 created_at: std::time::Instant::now(),
@@ -1229,6 +1241,148 @@ async fn normal_completion_finalizes_with_both_legacy_flags_false() {
     );
 }
 
+#[test]
+fn pre_panel_release_decrements_before_same_channel_followup_claims() {
+    use std::sync::atomic::Ordering;
+
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    runtime.block_on(async {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(987_4106);
+        let tmux_session_name = "AgentDesk-claude-adk-cc-9874106";
+        let turn_a = 4106_001;
+        let turn_b = 4106_002;
+
+        shared
+            .tmux_watchers
+            .insert(channel_id, test_watcher_handle(tmux_session_name));
+
+        assert!(
+            mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                std::sync::Arc::new(CancelToken::new()),
+                UserId::new(42),
+                MessageId::new(turn_a),
+            )
+            .await
+        );
+        crate::services::discord::increment_global_active(&shared, "test_turn_a_start");
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+
+        assert!(super::should_submit_restored_watcher_finalize(
+            false, turn_a
+        ));
+        // #4106 review-fix: the early release must ALSO run the finalizer's
+        // D-side channel cleanup (the late do_finalize will guarded-miss and skip
+        // it). Seed a channel role override and assert the hoist clears it.
+        shared
+            .dispatch
+            .role_overrides
+            .insert(channel_id, ChannelId::new(555_4106));
+        assert!(
+            super::release_restored_watcher_active_turn_before_panel_edit(
+                &shared, &provider, channel_id, turn_a,
+            )
+            .await,
+            "the pre-panel hoist must release and decrement turn A before the awaited edit"
+        );
+        assert_eq!(
+            shared.restart.global_active.load(Ordering::Relaxed),
+            0,
+            "turn A's global_active count is gone before the panel edit can race"
+        );
+        assert!(
+            !shared.dispatch.role_overrides.contains_key(&channel_id),
+            "the pre-panel hoist must run turn A's D-side channel cleanup (role override removed), not just the decrement"
+        );
+
+        // Test double for the awaited Discord status-panel edit: while it is
+        // suspended, a same-channel follow-up claims the mailbox slot.
+        let (panel_started_tx, panel_started_rx) = tokio::sync::oneshot::channel();
+        let (panel_done_tx, panel_done_rx) = tokio::sync::oneshot::channel();
+        let panel_edit = tokio::spawn(async move {
+            let _ = panel_started_tx.send(());
+            panel_done_rx.await.expect("panel edit released");
+        });
+        panel_started_rx.await.expect("panel edit started");
+
+        assert!(
+            mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                std::sync::Arc::new(CancelToken::new()),
+                UserId::new(43),
+                MessageId::new(turn_b),
+            )
+            .await,
+            "the follow-up should be able to claim the mailbox during the panel await"
+        );
+        crate::services::discord::increment_global_active(&shared, "test_turn_b_start");
+        assert_eq!(
+            shared.restart.global_active.load(Ordering::Relaxed),
+            1,
+            "only the follow-up turn should be counted while the panel edit is in flight"
+        );
+        panel_done_tx.send(()).expect("release panel edit");
+        panel_edit.await.expect("panel edit task");
+
+        let drove_late_a = super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            turn_a,
+            false,
+            true,
+            false,
+            None,
+            "pre_panel_release_race_late_turn_a_finalize",
+        )
+        .await;
+        assert!(drove_late_a);
+        assert_eq!(
+            shared.restart.global_active.load(Ordering::Relaxed),
+            1,
+            "turn A's late finalizer must not double-decrement turn B's active count"
+        );
+        assert!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .cancel_token
+                .is_some(),
+            "turn B remains the live active mailbox owner after turn A's late finalize"
+        );
+
+        super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            turn_b,
+            false,
+            true,
+            false,
+            None,
+            "pre_panel_release_race_turn_b_finalize",
+        )
+        .await;
+        assert_eq!(
+            shared.restart.global_active.load(Ordering::Relaxed),
+            0,
+            "after the follow-up finalizes, global_active returns to zero with no permanent leak"
+        );
+    });
+}
+
 // #3016 codex R1 (wrong-turn finalize guard). Companion to the decouple
 // test above. Exercises the SAFETY PROPERTY the Issue-1 call-site fix
 // depends on: once `normal_completion = true` finalizes UNCONDITIONALLY,
@@ -1519,6 +1673,148 @@ fn fresh_idle_done_finalizes_and_unknown_routes_by_emptiness() {
     );
 }
 
+/// #3293: the `fresh_idle_inflight` fixtures below resolve the runtime store
+/// root, so these tests pin `AGENTDESK_ROOT_DIR` to a tempdir under the shared
+/// env lock and clear it on drop like every other env-touching watcher test.
+struct RootEnvGuard;
+
+impl Drop for RootEnvGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    }
+}
+
+/// #4210: tuple fields drop in declaration order, so the guard (which removes
+/// the env var) and the tempdir MUST come before the lock — otherwise the lock
+/// releases first and the deferred `remove_var` can delete a var another test
+/// (already holding the freed lock) just set.
+fn pin_runtime_root_for_test() -> (
+    RootEnvGuard,
+    tempfile::TempDir,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = tempfile::tempdir().expect("runtime root");
+    unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+    (RootEnvGuard, root, lock)
+}
+
+#[test]
+fn fresh_idle_done_uncommitted_session_bound_tail_rewinds_before_finalize_4169() {
+    let _env = pin_runtime_root_for_test();
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-9874169";
+    let channel_id = 987_4169u64;
+    let turn_start_offset = 100u64;
+    let committed_offset = 150u64;
+    let consumed_end = 240u64;
+    let mut current_turn =
+        fresh_idle_inflight(provider, channel_id, session, 9169, turn_start_offset);
+    current_turn.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
+    current_turn.session_bound_delivered = false;
+
+    let plan = watcher_fresh_idle_session_bound_retry_plan(
+        Some(&current_turn),
+        session,
+        consumed_end,
+        committed_offset,
+    )
+    .expect("uncommitted session-bound tail must block fresh-idle finalize");
+    assert_eq!(plan.turn_start_offset, turn_start_offset);
+    assert_eq!(
+        plan.retry_offset, committed_offset,
+        "retry resumes at the committed floor, preserving the undelivered tail"
+    );
+
+    let mut all_data = b"{\"type\":\"system\",\"ready_for_input\":true}\n".to_vec();
+    let current_offset = plan.retry_offset;
+    all_data.clear();
+    let all_data_start_offset = current_offset;
+
+    assert!(
+        current_offset < consumed_end,
+        "fresh-idle guard must not advance the watcher watermark past the undelivered body"
+    );
+    assert_eq!(all_data_start_offset, committed_offset);
+    assert!(all_data.is_empty());
+    assert_eq!(
+        current_turn.effective_relay_owner_kind(),
+        RelayOwnerKind::SessionBoundRelay,
+        "the inflight row remains retry evidence instead of being identity-cleared"
+    );
+    assert!(!current_turn.session_bound_delivered);
+}
+
+#[test]
+fn fresh_idle_done_committed_session_bound_tail_finalizes_normally_4169() {
+    use crate::services::discord::turn_finalizer::CompletionSignal;
+
+    let _env = pin_runtime_root_for_test();
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-9874170";
+    let channel_id = 987_4170u64;
+    let turn_start_offset = 100u64;
+    let consumed_end = 240u64;
+    let mut current_turn =
+        fresh_idle_inflight(provider, channel_id, session, 9170, turn_start_offset);
+    current_turn.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
+    current_turn.session_bound_delivered = true;
+
+    assert_eq!(
+        watcher_fresh_idle_session_bound_retry_plan(
+            Some(&current_turn),
+            session,
+            consumed_end,
+            consumed_end,
+        ),
+        None,
+        "committed >= consumed end keeps the legit fresh-idle finalize path unchanged"
+    );
+    assert_eq!(
+        watcher_fresh_idle_finalize_decision(
+            CompletionSignal::Done,
+            false,
+            false,
+            false,
+            Some(&current_turn),
+            session,
+            consumed_end,
+        ),
+        FreshIdleFinalizeDecision::Finalize { user_msg_id: 9170 },
+        "normal delivered Done completion still finalizes with the pinned turn id"
+    );
+}
+
+#[test]
+fn wait_inflight_defer_arms_same_rewind_seed_4169() {
+    let plan = watcher_wait_inflight_retry_plan();
+    assert!(!plan.relay_ok, "WaitInFlight is not a terminal commit");
+    assert!(
+        plan.retry_offset,
+        "WaitInFlight must re-arm the #4115 same-range rewind"
+    );
+
+    let rollover_ids = vec![MessageId::new(4101), MessageId::new(4102)];
+    let seed = watcher_terminal_rewind_seed(WatcherTerminalRewindSeedInput {
+        placeholder_msg_id: Some(MessageId::new(4169)),
+        status_panel_msg_id: Some(MessageId::new(4170)),
+        response_sent_offset: 0,
+        last_edit_text: "streamed terminal body",
+        task_notification_kind: None,
+        finish_mailbox_on_completion: true,
+        injected_prompt_message_id: Some(9171),
+        streaming_rollover_frozen_msg_ids: &rollover_ids,
+    })
+    .expect("WaitInFlight retry keeps restored-turn evidence for the next pass");
+    assert!(seed.same_turn_rewind);
+    assert_eq!(seed.current_msg_id, MessageId::new(4169));
+    assert_eq!(seed.status_message_id, Some(MessageId::new(4170)));
+    assert_eq!(seed.last_edit_text, "streamed terminal body");
+    assert_eq!(seed.streaming_rollover_frozen_msg_ids, rollover_ids);
+}
+
 // #3016 phase-5b1 — Unknown (non-JSONL runtime) keeps the SAME wrong-turn-race
 // guards as Done, so prompt finalize never releases a follow-up turn:
 //   * paused_now / epoch_changed → AbortFollowupTookOver (no premature finalize);
@@ -1788,6 +2084,369 @@ fn fresh_idle_clear_gate_skips_when_late_reread_is_newer_turn() {
     assert!(
         crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
         "pinned turn's inflight is gone after the atomic clear"
+    );
+}
+
+#[test]
+fn committed_clear_with_captured_turn_nonce_preserves_id0_followup_saved_before_late_reread() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184";
+    let channel_id = 4_184_000u64;
+
+    let mut pinned_current = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    pinned_current.turn_nonce = Some("turn-4184-current".to_string());
+    let captured_turn_nonce = pinned_current.turn_nonce.clone();
+    crate::services::discord::inflight::save_inflight_state(&pinned_current)
+        .expect("save original id-0 inflight before follow-up replacement");
+
+    let mut late_followup = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 50);
+    late_followup.turn_nonce = Some("turn-4184-followup".to_string());
+    crate::services::discord::inflight::save_inflight_state(&late_followup)
+        .expect("save id-0 follow-up inflight before late re-read");
+
+    let late_reread_identity =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&late_followup);
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &late_reread_identity,
+            captured_turn_nonce.as_deref(),
+        );
+
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::UserMsgMismatch,
+        "captured nonce from the finalizing id-0 turn must not clear a newer id-0 follow-up"
+    );
+    let survived = crate::services::discord::inflight::load_inflight_state(&provider, channel_id)
+        .expect("follow-up inflight must survive");
+    assert_eq!(survived.user_msg_id, 0);
+    assert_eq!(survived.turn_start_offset, Some(50));
+    assert_eq!(survived.turn_nonce.as_deref(), Some("turn-4184-followup"));
+}
+
+#[test]
+fn loop_top_nonce_refresh_keeps_observed_nonce_for_id0_followup_at_current_offset() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184-loop-top";
+    let channel_id = 4_184_003u64;
+    let current_offset = 50;
+
+    let mut observed = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    observed.turn_nonce = Some("turn-4184-observed".to_string());
+    crate::services::discord::inflight::save_inflight_state(&observed)
+        .expect("save observed id-0 turn");
+    let mut watcher_identity =
+        Some(crate::services::discord::inflight::InflightTurnIdentity::from_state(&observed));
+    let mut captured_turn_nonce = observed.turn_nonce.clone();
+
+    let mut followup =
+        fresh_idle_inflight(provider.clone(), channel_id, session, 0, current_offset);
+    followup.turn_nonce = Some("turn-4184-followup".to_string());
+    crate::services::discord::inflight::save_inflight_state(&followup)
+        .expect("replace with id-0 follow-up before loop-top refresh");
+
+    refresh_watcher_turn_identity(
+        &mut watcher_identity,
+        &mut captured_turn_nonce,
+        &provider,
+        ChannelId::new(channel_id),
+        session,
+        current_offset,
+    );
+
+    assert_eq!(
+        captured_turn_nonce.as_deref(),
+        Some("turn-4184-observed"),
+        "follow-up row at the current consumed offset must not replace the observed turn nonce"
+    );
+
+    let followup_identity =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&followup);
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &followup_identity,
+            captured_turn_nonce.as_deref(),
+        );
+
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::UserMsgMismatch,
+        "pinned observed nonce must make the late-read follow-up identity fail the guarded clear"
+    );
+    let survived = crate::services::discord::inflight::load_inflight_state(&provider, channel_id)
+        .expect("follow-up inflight must survive");
+    assert_eq!(survived.user_msg_id, 0);
+    assert_eq!(survived.turn_start_offset, Some(current_offset));
+    assert_eq!(survived.turn_nonce.as_deref(), Some("turn-4184-followup"));
+}
+
+#[test]
+fn committed_clear_with_captured_turn_nonce_clears_legacy_row_without_nonce() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184-legacy";
+    let channel_id = 4_184_001u64;
+
+    let mut legacy = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    legacy.turn_nonce = None;
+    crate::services::discord::inflight::save_inflight_state(&legacy)
+        .expect("save legacy id-0 inflight without nonce");
+    let identity = crate::services::discord::inflight::InflightTurnIdentity::from_state(&legacy);
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &identity,
+            Some("turn-4184-current"),
+        );
+
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "legacy rows without a nonce preserve the identity-only clear contract"
+    );
+    assert!(
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
+        "legacy matching row should be cleared"
+    );
+}
+
+#[test]
+fn committed_clear_with_expected_none_clears_row_with_nonce() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184-expected-none";
+    let channel_id = 4_184_004u64;
+
+    let mut current = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    current.turn_nonce = Some("turn-4184-on-disk".to_string());
+    crate::services::discord::inflight::save_inflight_state(&current)
+        .expect("save id-0 inflight with nonce");
+    let identity = crate::services::discord::inflight::InflightTurnIdentity::from_state(&current);
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider, channel_id, &identity, None,
+        );
+
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "expected None preserves legacy identity-only clear semantics even when the row has a nonce"
+    );
+    assert!(
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
+        "matching row should be cleared when expected nonce is absent"
+    );
+}
+
+#[test]
+fn committed_clear_filters_empty_string_turn_nonce_values() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184-empty-nonce";
+    let channel_id = 4_184_005u64;
+
+    let mut empty_on_disk = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    empty_on_disk.turn_nonce = Some(String::new());
+    crate::services::discord::inflight::save_inflight_state(&empty_on_disk)
+        .expect("save id-0 inflight with empty on-disk nonce");
+    let empty_on_disk_identity =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&empty_on_disk);
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &empty_on_disk_identity,
+            Some("turn-4184-expected"),
+        );
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "empty on-disk nonce is filtered to legacy identity-only matching"
+    );
+
+    let mut empty_expected = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 20);
+    empty_expected.turn_nonce = Some("turn-4184-on-disk".to_string());
+    crate::services::discord::inflight::save_inflight_state(&empty_expected)
+        .expect("save id-0 inflight for empty expected nonce case");
+    let empty_expected_identity =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&empty_expected);
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &empty_expected_identity,
+            Some(""),
+        );
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "empty expected nonce is filtered to legacy identity-only matching"
+    );
+    assert!(
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
+        "matching row should be cleared after empty nonce filtering"
+    );
+}
+
+#[test]
+fn committed_clear_with_captured_turn_nonce_clears_matching_same_turn_row() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4184-current";
+    let channel_id = 4_184_002u64;
+
+    let mut current = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 10);
+    current.turn_nonce = Some("turn-4184-current".to_string());
+    crate::services::discord::inflight::save_inflight_state(&current)
+        .expect("save current id-0 inflight with nonce");
+    let identity = crate::services::discord::inflight::InflightTurnIdentity::from_state(&current);
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &identity,
+            current.turn_nonce.as_deref(),
+        );
+
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "matching nonce should clear the same turn normally"
+    );
+    assert!(
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
+        "matching current row should be cleared"
+    );
+}
+
+#[test]
+fn fresh_idle_clear_uses_pinned_nonce_to_preserve_id0_full_identity_alias_followup() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+        "AGENTDESK_ROOT_DIR",
+        tmp.path(),
+    );
+
+    let provider = ProviderKind::Claude;
+    let session = "AgentDesk-claude-adk-cc-4273-fresh-idle";
+    let channel_id = 4_273_000u64;
+
+    let mut pinned_current = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 50);
+    pinned_current.started_at = "2026-07-08 01:33:00".to_string();
+    pinned_current.turn_nonce = Some("turn-4273-pinned".to_string());
+    crate::services::discord::inflight::save_inflight_state(&pinned_current)
+        .expect("save pinned pre-cleanup id-0 inflight");
+
+    let pinned_pre_cleanup_inflight =
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id)
+            .expect("load pinned pre-cleanup snapshot");
+    let pinned_clear_identity = InflightTurnIdentity::from_state(&pinned_pre_cleanup_inflight);
+    let pinned_clear_turn_nonce = pinned_pre_cleanup_inflight.turn_nonce.as_deref();
+
+    let mut alias_followup = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 50);
+    alias_followup.started_at = pinned_pre_cleanup_inflight.started_at.clone();
+    alias_followup.turn_nonce = Some("turn-4273-followup".to_string());
+    assert!(
+        pinned_clear_identity.matches_state(&alias_followup),
+        "test fixture must alias the pinned full identity"
+    );
+    assert_ne!(
+        pinned_clear_turn_nonce,
+        alias_followup.turn_nonce.as_deref(),
+        "only the observed-turn nonce distinguishes the follow-up"
+    );
+    crate::services::discord::inflight::save_inflight_state(&alias_followup)
+        .expect("save id-0 full-identity-alias follow-up");
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &pinned_clear_identity,
+            pinned_clear_turn_nonce,
+        );
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::UserMsgMismatch,
+        "fresh-idle clear must not delete an id-0 full-identity alias with a different nonce"
+    );
+    let survived = crate::services::discord::inflight::load_inflight_state(&provider, channel_id)
+        .expect("different-nonce follow-up must survive");
+    assert_eq!(survived.user_msg_id, 0);
+    assert_eq!(survived.started_at, pinned_pre_cleanup_inflight.started_at);
+    assert_eq!(survived.turn_start_offset, Some(50));
+    assert_eq!(survived.turn_nonce.as_deref(), Some("turn-4273-followup"));
+
+    let mut same_nonce_row = fresh_idle_inflight(provider.clone(), channel_id, session, 0, 50);
+    same_nonce_row.started_at = pinned_current.started_at.clone();
+    same_nonce_row.turn_nonce = Some("turn-4273-pinned".to_string());
+    assert!(
+        pinned_clear_identity.matches_state(&same_nonce_row),
+        "same-nonce fixture must still match the pinned full identity"
+    );
+    crate::services::discord::inflight::save_inflight_state(&same_nonce_row)
+        .expect("save id-0 full-identity row with matching nonce");
+
+    let outcome =
+        crate::services::discord::inflight::clear_inflight_state_if_matches_identity_turn_nonce(
+            &provider,
+            channel_id,
+            &pinned_clear_identity,
+            pinned_clear_turn_nonce,
+        );
+    assert_eq!(
+        outcome,
+        crate::services::discord::inflight::GuardedClearOutcome::Cleared,
+        "fresh-idle clear should still delete the same id-0 row when the nonce matches"
+    );
+    assert!(
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id).is_none(),
+        "same-nonce matching row should be cleared"
     );
 }
 
@@ -2176,6 +2835,553 @@ fn no_inflight_user_boundary_without_fresh_text_preserves_body_bearing_seed_for_
         watcher_terminal_response_for_direct_send(&full_response, response_sent_offset, false),
         restored
     );
+}
+
+#[test]
+fn placeholderless_full_send_failure_rewinds_then_retries_body_once_4115() {
+    struct FailOnceSender {
+        attempts: usize,
+        delivered: Vec<String>,
+    }
+
+    impl FailOnceSender {
+        fn send(&mut self, body: &str) -> Result<(), &'static str> {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                Err("discord 5xx")
+            } else {
+                self.delivered.push(body.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    let turn_data_start_offset = 128;
+    let turn_end_offset = 384;
+    let body = "placeholder-less terminal body";
+    let mut next_read_offset = turn_data_start_offset;
+    let mut sender = FailOnceSender {
+        attempts: 0,
+        delivered: Vec::new(),
+    };
+
+    for _ in 0..2 {
+        let mut current_offset = turn_end_offset;
+        let mut all_data = b"{\"type\":\"result\",\"result\":\"body\"}\n".to_vec();
+        let mut all_data_start_offset = next_read_offset;
+        assert_eq!(
+            all_data_start_offset, turn_data_start_offset,
+            "retry pass must re-read the same turn body"
+        );
+        assert_eq!(current_offset, turn_end_offset);
+        assert!(!all_data.is_empty());
+
+        if sender.send(body).is_ok() {
+            break;
+        }
+
+        let plan = watcher_full_send_failure_retry_plan();
+        assert!(!plan.relay_ok);
+        assert!(plan.retry_offset);
+        current_offset = turn_data_start_offset;
+        all_data.clear();
+        assert!(all_data.is_empty());
+        all_data_start_offset = current_offset;
+        next_read_offset = all_data_start_offset;
+    }
+
+    assert_eq!(sender.attempts, 2);
+    assert_eq!(sender.delivered, vec![body.to_string()]);
+}
+
+#[test]
+fn placeholderless_rollback_sender_cleans_prefix_before_rewind_4154() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    runtime.block_on(async {
+        let http = Http::new("test-token");
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(9_154_154);
+        let anchor_id = MessageId::new(41_540);
+        let active_messages: Arc<Mutex<Vec<(MessageId, String)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let delete_calls = Arc::new(AtomicUsize::new(0));
+        let next_message_id = Arc::new(AtomicU64::new(1000));
+
+        let send_active = Arc::clone(&active_messages);
+        let send_count = Arc::clone(&send_calls);
+        let send_next_id = Arc::clone(&next_message_id);
+        let delete_active = Arc::clone(&active_messages);
+        let delete_count = Arc::clone(&delete_calls);
+        let _hook = crate::services::discord::formatting::rollback_transport_test_hook::install(
+            Box::new(move |seen_channel, content, _reference| {
+                if seen_channel != channel_id {
+                    return None;
+                }
+                let call = send_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 2 {
+                    return Some(Err("Error while sending HTTP request.".to_string()));
+                }
+                let id = MessageId::new(send_next_id.fetch_add(1, Ordering::SeqCst));
+                send_active
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push((id, content.to_string()));
+                Some(Ok(id))
+            }),
+            Box::new(move |seen_channel, message_id| {
+                if seen_channel != channel_id {
+                    return None;
+                }
+                delete_count.fetch_add(1, Ordering::SeqCst);
+                let mut active = delete_active
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                active.retain(|(id, _)| *id != message_id);
+                Some(Ok(()))
+            }),
+        );
+
+        let body = "x".repeat(crate::services::discord::DISCORD_MSG_LIMIT + 32);
+        assert!(
+            body.len() > crate::services::discord::DISCORD_MSG_LIMIT,
+            "test body must force multi-chunk send"
+        );
+
+        let first =
+            crate::services::discord::formatting::send_long_message_raw_with_reference_rollback(
+                &http, channel_id, anchor_id, &body, &shared, None,
+            )
+            .await;
+        let first_err = first.expect_err("first pass fails on chunk 2");
+        assert_eq!(
+            classify_watcher_send_failure_message(&first_err.to_string()),
+            WatcherSendFailureClass::Transient,
+            "rollback sender must carry the retryable class through its flattened error"
+        );
+        assert_eq!(
+            delete_calls.load(Ordering::SeqCst),
+            1,
+            "rollback deletes the already-posted prefix"
+        );
+        assert!(
+            active_messages
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "failed rollback pass must leave no delivered prefix behind"
+        );
+
+        let delivered =
+            crate::services::discord::formatting::send_long_message_raw_with_reference_rollback(
+                &http, channel_id, anchor_id, &body, &shared, None,
+            )
+            .await
+            .expect("second pass delivers");
+        assert_eq!(delivered.len(), 2, "body should split into two chunks");
+        assert_eq!(send_calls.load(Ordering::SeqCst), 4);
+
+        let active = active_messages
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(active.len(), 2);
+        let joined = active
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<String>();
+        assert_eq!(
+            joined, body,
+            "retry should deliver exactly one copy of the multi-chunk body"
+        );
+    });
+}
+
+#[test]
+fn rollback_sender_marks_serenity_5xx_html_decode_failure_transient_4154() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    runtime.block_on(async {
+        let http = Http::new("test-token");
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(9_154_155);
+        let anchor_id = MessageId::new(41_541);
+        let _hook = crate::services::discord::formatting::rollback_transport_test_hook::install(
+            Box::new(move |seen_channel, _content, _reference| {
+                if seen_channel != channel_id {
+                    return None;
+                }
+                Some(Err(
+                    "[Serenity] Could not decode json when receiving error response from discord:"
+                        .to_string(),
+                ))
+            }),
+            Box::new(move |_seen_channel, _message_id| Some(Ok(()))),
+        );
+
+        let err =
+            crate::services::discord::formatting::send_long_message_raw_with_reference_rollback(
+                &http, channel_id, anchor_id, "body", &shared, None,
+            )
+            .await
+            .expect_err("5xx HTML decode failure should fail the pass");
+        let class = classify_watcher_send_failure_message(&err.to_string());
+        assert_eq!(class, WatcherSendFailureClass::Transient);
+        let plan = watcher_send_failure_retry_plan(class);
+        assert!(
+            plan.retry_offset,
+            "structured transient class should rewind"
+        );
+    });
+}
+
+#[test]
+fn watcher_full_send_permanent_error_does_not_rewind_4154() {
+    let class = classify_watcher_send_failure_message("403 Forbidden (Missing Access)");
+    assert_eq!(class, WatcherSendFailureClass::Permanent);
+    let plan = watcher_send_failure_retry_plan(class);
+    assert!(!plan.relay_ok);
+    assert!(
+        !plan.retry_offset,
+        "permanent Discord errors fall through without rewind"
+    );
+}
+
+#[test]
+fn watcher_full_send_rewind_cap_degrades_after_three_attempts_4154() {
+    for attempts in [1, 2, 3] {
+        assert_eq!(
+            watcher_rewind_attempt_disposition(attempts),
+            WatcherRewindAttemptDisposition::Retry
+        );
+    }
+    assert_eq!(
+        watcher_rewind_attempt_disposition(4),
+        WatcherRewindAttemptDisposition::GiveUp
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn relay_emission_timeout_rewinds_and_releases_slot_4194() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let slot = Arc::new(AtomicU64::new(4_194));
+    let slot_for_task = slot.clone();
+    let timeout_task = tokio::spawn(async move {
+        let mut slot_guard = RelaySlotGuard::new(slot_for_task);
+        let result = watcher_relay_emission_with_timeout(std::future::pending::<()>()).await;
+        assert!(
+            result.is_err(),
+            "never-resolving emission must trip the watchdog timeout"
+        );
+
+        let plan = watcher_relay_emission_timeout_failure_plan(
+            &ProviderKind::Claude,
+            ChannelId::new(4_194),
+            "AgentDesk-claude-adk-cc",
+            128,
+            256,
+        );
+        assert!(!plan.relay_ok, "timeout is never treated as delivered");
+        assert!(
+            plan.retry_offset,
+            "timeout must enter the rewind retry path"
+        );
+
+        let placeholder = MessageId::new(41_940);
+        let status_panel = MessageId::new(41_941);
+        let seed = watcher_terminal_rewind_seed(WatcherTerminalRewindSeedInput {
+            placeholder_msg_id: Some(placeholder),
+            status_panel_msg_id: Some(status_panel),
+            response_sent_offset: 64,
+            last_edit_text: "streamed prefix before hung emission",
+            task_notification_kind: None,
+            finish_mailbox_on_completion: true,
+            injected_prompt_message_id: Some(7),
+            streaming_rollover_frozen_msg_ids: &[MessageId::new(41_942)],
+        })
+        .expect("timeout retry must preserve the original delivery row context");
+        assert_eq!(seed.current_msg_id, placeholder);
+        assert_eq!(seed.status_message_id, Some(status_panel));
+        assert_eq!(seed.response_sent_offset, 64);
+        assert_eq!(seed.last_edit_text, "streamed prefix before hung emission");
+        assert!(
+            seed.same_turn_rewind,
+            "timeout retry evidence must survive restored-seed guards"
+        );
+
+        slot_guard.release();
+        plan
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        slot.load(Ordering::Acquire),
+        4_194,
+        "slot stays held while the emission future is hung"
+    );
+
+    tokio::time::advance(WATCHER_RELAY_EMISSION_TIMEOUT + std::time::Duration::from_millis(1))
+        .await;
+    tokio::task::yield_now().await;
+    let plan = timeout_task.await.expect("timeout task joins");
+    assert_eq!(
+        plan,
+        watcher_send_failure_retry_plan(WatcherSendFailureClass::Transient),
+        "timeout must use the existing transient send-failure retry disposition"
+    );
+    assert_eq!(
+        slot.load(Ordering::Acquire),
+        0,
+        "timeout retry branch releases the relay slot"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn relay_emission_timeout_fast_future_is_unchanged_4194() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let slot = Arc::new(AtomicU64::new(99));
+    let mut slot_guard = RelaySlotGuard::new(slot.clone());
+    let result = watcher_relay_emission_with_timeout(async { "delivered" })
+        .await
+        .expect("fast emission should not timeout");
+
+    assert_eq!(result, "delivered");
+    assert_eq!(
+        slot.load(Ordering::Acquire),
+        99,
+        "fast success path leaves existing slot-release timing unchanged"
+    );
+    slot_guard.release();
+    assert_eq!(slot.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn relay_emission_timeout_wiring_source_assertion_4194() {
+    let module_src = include_str!("../tmux_watcher.rs");
+    const BODY_WRAPPER_ANCHOR: &str =
+        "let relay_ok = match watcher_relay_emission_with_timeout(async {";
+    const BODY_TIMEOUT_RETRY_ANCHOR: &str = r#"Err(_) => {
+                let plan = watcher_relay_emission_timeout_failure_plan(
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    data_start_offset,
+                    current_offset,
+                );
+                retry_terminal_delivery_from_offset = plan.retry_offset;
+                plan.relay_ok
+            }"#;
+
+    assert!(
+        module_src.contains(BODY_WRAPPER_ANCHOR),
+        "terminal relay expression must remain enclosed by watcher_relay_emission_with_timeout"
+    );
+    assert!(
+        module_src.contains(BODY_TIMEOUT_RETRY_ANCHOR),
+        "body timeout Err arm must keep failed-undelivered rewind semantics"
+    );
+}
+
+#[test]
+fn completion_chrome_timeout_wiring_source_assertion_4194() {
+    let module_src = include_str!("../tmux_watcher.rs");
+    let helper_src = include_str!("session_bound_ack.rs");
+    const COMPLETION_TIMEOUT_CONST_ANCHOR: &str =
+        "pub(super) const WATCHER_RELAY_COMPLETION_CHROME_TIMEOUT: std::time::Duration";
+    const COMPLETION_TIMEOUT_HELPER_ANCHOR: &str =
+        "pub(super) async fn watcher_completion_chrome_with_timeout<T>";
+    const COMPLETION_TIMEOUT_WARN_ANCHOR: &str = "watcher: completion chrome step timed out after terminal body commit; skipping remaining chrome without rewind";
+
+    assert!(helper_src.contains(COMPLETION_TIMEOUT_CONST_ANCHOR));
+    assert!(helper_src.contains(COMPLETION_TIMEOUT_HELPER_ANCHOR));
+    assert!(helper_src.contains(COMPLETION_TIMEOUT_WARN_ANCHOR));
+
+    let completion_start = module_src
+        .find("let mut completion_chrome_timed_out = false;")
+        .expect("completion chrome skip flag must exist");
+    let release_rel = module_src[completion_start..]
+        .find("// Release the emission slot regardless of success.")
+        .expect("completion source slice must reach the slot release comment");
+    let completion_src = &module_src[completion_start..completion_start + release_rel];
+
+    assert!(
+        !completion_src.contains("retry_terminal_delivery_from_offset"),
+        "completion chrome timeouts must not request terminal-delivery rewind"
+    );
+    assert!(
+        completion_src.contains("if !completion_chrome_timed_out"),
+        "completion chrome timeout must skip remaining chrome steps before slot release"
+    );
+    assert_completion_chrome_wrap(
+        completion_src,
+        "completed_panel_usage_backfill_and_compact",
+        "backfill_completed_panel_usage_and_maybe_inject_compact",
+    );
+    assert_completion_chrome_wrap(
+        completion_src,
+        "session_panel_lifecycle_refresh",
+        "refresh_watcher_session_panel_from_lifecycle",
+    );
+    assert_completion_chrome_wrap(
+        completion_src,
+        "terminal_footer_or_status_panel_completion",
+        "complete_watcher_terminal_footer_or_status_panel_with_sniffer",
+    );
+    assert_completion_chrome_wrap(
+        completion_src,
+        "stale_streaming_footer_reconcile",
+        "crate::services::discord::http::edit_channel_message",
+    );
+}
+
+fn assert_completion_chrome_wrap(source: &str, step_anchor: &str, call_anchor: &str) {
+    let step_idx = source
+        .find(step_anchor)
+        .unwrap_or_else(|| panic!("missing completion timeout step anchor: {step_anchor}"));
+    let prefix = &source[..step_idx];
+    let call_idx = prefix
+        .rfind(call_anchor)
+        .unwrap_or_else(|| panic!("missing completion call anchor: {call_anchor}"));
+    let wrapper_idx = prefix
+        .rfind("watcher_completion_chrome_with_timeout(")
+        .unwrap_or_else(|| panic!("missing completion timeout wrapper for: {step_anchor}"));
+    assert!(
+        wrapper_idx < call_idx,
+        "timeout wrapper must enclose call anchor for {step_anchor}"
+    );
+    assert!(
+        step_idx - wrapper_idx < 3_000,
+        "timeout warning anchor drifted too far from wrapper for {step_anchor}"
+    );
+}
+
+#[test]
+fn edit_arm_rewind_seed_preserves_placeholder_context_4154() {
+    let placeholder = MessageId::new(5154);
+    let status_panel = MessageId::new(5155);
+    let frozen = vec![MessageId::new(1), MessageId::new(2)];
+    let seed = watcher_terminal_rewind_seed(WatcherTerminalRewindSeedInput {
+        placeholder_msg_id: Some(placeholder),
+        status_panel_msg_id: Some(status_panel),
+        response_sent_offset: 128,
+        last_edit_text: "streamed prefix",
+        task_notification_kind: None,
+        finish_mailbox_on_completion: true,
+        injected_prompt_message_id: Some(99),
+        streaming_rollover_frozen_msg_ids: &frozen,
+    })
+    .expect("placeholder context should seed retry");
+
+    assert_eq!(seed.current_msg_id, placeholder);
+    assert_eq!(seed.status_message_id, Some(status_panel));
+    assert_eq!(seed.response_sent_offset, 128);
+    assert!(
+        seed.full_response.is_empty(),
+        "retry re-reads JSONL bytes; carrying parsed response would double-append"
+    );
+    assert!(
+        seed.same_turn_rewind,
+        "rewind seeds bypass restart stale-seed discard"
+    );
+    assert_eq!(seed.last_edit_text, "streamed prefix");
+    assert_eq!(seed.streaming_rollover_frozen_msg_ids, frozen);
+}
+
+#[test]
+fn tui_direct_rewind_seed_with_prompt_anchor_reuses_placeholder_4115() {
+    let placeholder = MessageId::new(6_115);
+    let seed = watcher_terminal_rewind_seed(WatcherTerminalRewindSeedInput {
+        placeholder_msg_id: Some(placeholder),
+        status_panel_msg_id: None,
+        response_sent_offset: 64,
+        last_edit_text: "streamed prefix",
+        task_notification_kind: None,
+        finish_mailbox_on_completion: false,
+        injected_prompt_message_id: Some(6_114),
+        streaming_rollover_frozen_msg_ids: &[],
+    })
+    .expect("placeholder context should seed retry");
+
+    let discard = super::super::should_discard_restored_seed_for_idle_direct_prompt(
+        true,
+        true,
+        false,
+        seed.same_turn_rewind,
+        false,
+    );
+    assert!(
+        !discard,
+        "same-turn rewind seed must survive the idle direct-prompt anchor guard"
+    );
+
+    let stream_seed = super::super::watcher_stream_seed(Some(seed));
+    assert_eq!(
+        stream_seed.placeholder_msg_id,
+        Some(placeholder),
+        "retry pass edits the original placeholder instead of POSTing a second one"
+    );
+}
+
+#[test]
+fn cross_turn_watcher_reuse_discards_restored_seed_through_watcher_wiring_4105() {
+    let seed_identity = InflightTurnIdentity {
+        user_msg_id: 0,
+        started_at: "2026-07-07T01:00:00Z".to_string(),
+        tmux_session_name: Some("AgentDesk-claude-adk".to_string()),
+        turn_start_offset: Some(100),
+    };
+    let current_identity = InflightTurnIdentity {
+        started_at: "2026-07-07T01:00:10Z".to_string(),
+        turn_start_offset: Some(240),
+        ..seed_identity.clone()
+    };
+    let restored = RestoredWatcherTurn {
+        current_msg_id: MessageId::new(4105),
+        status_message_id: None,
+        response_sent_offset: 0,
+        full_response: "WARMUP".to_string(),
+        last_edit_text: String::new(),
+        task_notification_kind: None,
+        finish_mailbox_on_completion: false,
+        injected_prompt_message_id: Some(9001),
+        turn_identity: Some(seed_identity),
+        streaming_rollover_frozen_msg_ids: Vec::new(),
+        same_turn_rewind: false,
+    };
+
+    let disposition = watcher_stream_seed_after_restored_seed_discard(
+        Some(restored),
+        Some(&current_identity),
+        Some(9001),
+    );
+
+    assert!(disposition.seed_reassigned_to_different_turn);
+    assert!(disposition.discard_restored_seed);
+    assert!(disposition.stream_seed.full_response.is_empty());
+    assert_eq!(disposition.stream_seed.response_sent_offset, 0);
 }
 
 #[test]
@@ -2851,8 +4057,8 @@ mod watcher_short_replace_controller {
         deliver_long_chunks_via_controller,
     };
     use super::super::terminal_send::{
-        WatcherShortReplaceResult, deliver_short_replace_via_controller,
-        watcher_terminal_lease_range,
+        WatcherShortReplaceLocals, WatcherShortReplaceResult, apply_watcher_short_replace_result,
+        deliver_short_replace_via_controller, watcher_terminal_lease_range,
     };
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::gateway::{GatewayFuture, TurnGateway};
@@ -2860,6 +4066,9 @@ mod watcher_short_replace_controller {
     use crate::services::discord::outbound::turn_output_controller as toc;
     use crate::services::discord::placeholder_controller::{
         PlaceholderController, PlaceholderKey, PlaceholderLifecycle,
+    };
+    use crate::services::discord::replace_outcome_policy::{
+        WatcherSendFailureClass, watcher_send_failure_classified_message,
     };
     use crate::services::discord::turn_finalizer::TurnKey;
     use crate::services::discord::{
@@ -2877,6 +4086,7 @@ mod watcher_short_replace_controller {
     struct ShortReplaceFakeGateway {
         outcome: ReplaceLongMessageOutcome,
         ok: bool,
+        failure_class: WatcherSendFailureClass,
         replace_calls: AtomicUsize,
     }
 
@@ -2892,7 +4102,10 @@ mod watcher_short_replace_controller {
                 if self.ok {
                     Ok(self.outcome.clone())
                 } else {
-                    Err("fake transport failure".to_string())
+                    Err(watcher_send_failure_classified_message(
+                        self.failure_class,
+                        "fake transport failure",
+                    ))
                 }
             })
         }
@@ -3069,9 +4282,18 @@ mod watcher_short_replace_controller {
         }
     }
     fn gateway(outcome: ReplaceLongMessageOutcome, ok: bool) -> ShortReplaceFakeGateway {
+        gateway_with_failure_class(outcome, ok, WatcherSendFailureClass::Transient)
+    }
+
+    fn gateway_with_failure_class(
+        outcome: ReplaceLongMessageOutcome,
+        ok: bool,
+        failure_class: WatcherSendFailureClass,
+    ) -> ShortReplaceFakeGateway {
         ShortReplaceFakeGateway {
             outcome,
             ok,
+            failure_class,
             replace_calls: AtomicUsize::new(0),
         }
     }
@@ -3517,6 +4739,121 @@ mod watcher_short_replace_controller {
                 "I2: a partial/ambiguous result NEVER advances the offset"
             );
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_short_replace_transport_failure_requests_offset_retry_4115() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = gateway(ReplaceLongMessageOutcome::EditedOriginal, false);
+        let result = run(&gw, &shared, &cell).await;
+        assert_eq!(
+            result,
+            WatcherShortReplaceResult::PartialFailureRetry,
+            "transport failure means no confirmed body; watcher must retry the same range"
+        );
+        assert_eq!(gw.replace_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.committed_relay_offset(ch()), 0);
+
+        let mut relay_ok = true;
+        let mut direct_send_delivered = false;
+        let mut tui_direct_anchor_terminal_body_visible = false;
+        let mut external_input_lease_consumed_by_relay = false;
+        let mut placeholder_msg_id = Some(MessageId::new(MSG));
+        let mut placeholder_from_restored_inflight = true;
+        let mut last_edit_text = "streamed body".to_string();
+        let mut completion_footer_terminal_target = None;
+        let mut retry_terminal_delivery_from_offset = false;
+        apply_watcher_short_replace_result(
+            result,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            "answer",
+            false,
+            None,
+            WatcherShortReplaceLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct_send_delivered,
+                tui_direct_anchor_terminal_body_visible:
+                    &mut tui_direct_anchor_terminal_body_visible,
+                external_input_lease_consumed_by_relay: &mut external_input_lease_consumed_by_relay,
+                placeholder_msg_id: &mut placeholder_msg_id,
+                placeholder_from_restored_inflight: &mut placeholder_from_restored_inflight,
+                last_edit_text: &mut last_edit_text,
+                completion_footer_terminal_target: &mut completion_footer_terminal_target,
+                retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+            },
+        );
+        assert!(!relay_ok);
+        assert!(retry_terminal_delivery_from_offset);
+        assert!(!direct_send_delivered);
+        assert_eq!(placeholder_msg_id, Some(MessageId::new(MSG)));
+        assert!(placeholder_from_restored_inflight);
+        assert_eq!(last_edit_text, "streamed body");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_short_replace_permanent_transport_failure_does_not_rewind_4154() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+        let gw = gateway_with_failure_class(
+            ReplaceLongMessageOutcome::EditedOriginal,
+            false,
+            WatcherSendFailureClass::Permanent,
+        );
+        let result = run(&gw, &shared, &cell).await;
+        assert_eq!(
+            result,
+            WatcherShortReplaceResult::Skipped,
+            "permanent controller transport failure must be non-retry"
+        );
+        assert_eq!(gw.replace_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.committed_relay_offset(ch()), 0);
+
+        let mut relay_ok = true;
+        let mut direct_send_delivered = false;
+        let mut tui_direct_anchor_terminal_body_visible = false;
+        let mut external_input_lease_consumed_by_relay = false;
+        let mut placeholder_msg_id = Some(MessageId::new(MSG));
+        let mut placeholder_from_restored_inflight = true;
+        let mut last_edit_text = "streamed body".to_string();
+        let mut completion_footer_terminal_target = None;
+        let mut retry_terminal_delivery_from_offset = false;
+        apply_watcher_short_replace_result(
+            result,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            "answer",
+            false,
+            None,
+            WatcherShortReplaceLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct_send_delivered,
+                tui_direct_anchor_terminal_body_visible:
+                    &mut tui_direct_anchor_terminal_body_visible,
+                external_input_lease_consumed_by_relay: &mut external_input_lease_consumed_by_relay,
+                placeholder_msg_id: &mut placeholder_msg_id,
+                placeholder_from_restored_inflight: &mut placeholder_from_restored_inflight,
+                last_edit_text: &mut last_edit_text,
+                completion_footer_terminal_target: &mut completion_footer_terminal_target,
+                retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+            },
+        );
+        assert!(!relay_ok);
+        assert!(
+            !retry_terminal_delivery_from_offset,
+            "permanent controller failure must not request rewind"
+        );
+        assert!(!direct_send_delivered);
+        assert_eq!(placeholder_msg_id, Some(MessageId::new(MSG)));
+        assert!(placeholder_from_restored_inflight);
+        assert_eq!(last_edit_text, "streamed body");
     }
 
     #[test]

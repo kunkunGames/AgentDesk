@@ -85,6 +85,7 @@ pub(super) async fn do_finalize(
     //     terminal post-finalize/ledger-GC must not release the NEWER turn's
     //     token or decrement `global_active`. Ambiguous id-0 (recovery/orphan)
     //     keeps the channel-scoped finish (ledger gate + id-0 no-op bound it).
+    let owned_role_override = super::cleanup::snapshot_role_override(shared, channel_id);
     let finish = if key.user_msg_id != 0 {
         crate::services::discord::mailbox_finish_turn_if_matches(
             shared,
@@ -118,7 +119,19 @@ pub(super) async fn do_finalize(
     //     is what guarantees no underflow even under a transitional
     //     double-call.
     if finish.removed_token.is_some() {
-        crate::services::discord::saturating_decrement_global_active(shared);
+        let decremented = crate::services::discord::saturating_decrement_global_active(shared);
+        let global_active = shared
+            .restart
+            .global_active
+            .load(std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            target: "agentdesk::global_active",
+            channel_id = channel_id.get(),
+            user_msg_id = key.user_msg_id,
+            global_active,
+            decremented,
+            "global_active decrement"
+        );
     }
     // The CHANNEL-SCOPED trailing side-effects (D)/(E) below mutate per-channel
     // routing/watchdog state that belongs to whatever turn is CURRENTLY active
@@ -185,14 +198,10 @@ pub(super) async fn do_finalize(
         // (D) trailing terminal side-effects that today follow
         //     `mailbox_finish_turn` inline at the bridge/watcher call-sites.
         //     Moved here so they cannot diverge between the routed paths.
-        crate::services::discord::clear_watchdog_deadline_override(channel_id.get()).await;
-        let thread_parent_kickoffs =
-            super::cleanup::collect_and_clear_thread_parents(shared, channel_id);
-        super::cleanup::kickoff_thread_parents_after_finalize(
-            shared,
-            &provider,
-            thread_parent_kickoffs,
-        );
+        super::cleanup::clear_watchdog_and_kick_thread_parents_after_turn_release(
+            shared, &provider, channel_id,
+        )
+        .await;
 
         let voice_deferred_enqueued = if ctx.drain_voice {
             shared
@@ -204,7 +213,7 @@ pub(super) async fn do_finalize(
         };
         let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
         if !has_pending_after_voice {
-            shared.dispatch.role_overrides.remove(&channel_id);
+            super::cleanup::remove_owned_role_override(shared, channel_id, owned_role_override);
         }
 
         // (E) Queue kickoff is owned by the #4048 completion-event listener. The

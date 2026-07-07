@@ -48,7 +48,7 @@ use super::{
     SharedData, TmuxWatcherHandle, TmuxWatcherRegistry, lock_tmux_watcher_registry, rate_limit_wait,
 };
 // Extracted lifecycle code stays a tmux child module until its callers split out.
-#[path = "tmux_placeholder_suppression.rs"]
+#[path = "tmux_placeholder_suppression/mod.rs"]
 mod placeholder_suppression;
 #[path = "tmux_reattach_offsets.rs"]
 mod tmux_reattach_offsets;
@@ -121,6 +121,8 @@ pub(in crate::services::discord) async fn sniff_background_agent_pending_for_com
 pub(super) struct WatcherLineOutcome {
     pub found_result: bool,
     pub terminal_kind: Option<WatcherTerminalKind>,
+    pub terminal_evidence_offset: Option<u64>,
+    pub pre_turn_bytes_skipped: usize,
     pub soft_terminal_candidate: bool,
     pub is_prompt_too_long: bool,
     pub is_auth_error: bool,
@@ -167,10 +169,18 @@ pub(super) struct RestoredWatcherTurn {
     /// restored inflight, carried so a watcher-owned re-acquire (after the row
     /// is cleared mid-turn) can re-pin it instead of orphaning the `⏳`.
     pub(super) injected_prompt_message_id: Option<u64>,
+    /// Identity of the inflight row that seeded this restore. A long-lived watcher
+    /// may consume the seed only after a later direct-input turn starts; compare
+    /// this to the current row before carrying response text forward.
+    turn_identity: Option<super::inflight::InflightTurnIdentity>,
     /// #3871: frozen streamed rollover-prefix message ids restored from the
     /// persisted row so a terminal full-body fallback in a later iteration / after
     /// a restart still deletes every accumulated prefix (no residual duplicate).
     streaming_rollover_frozen_msg_ids: Vec<MessageId>,
+    /// Same-process retry seed produced by watcher send-failure rewind. Unlike a
+    /// restart-restored seed, this is the current turn and must not be discarded by
+    /// idle direct-prompt stale-seed cleanup.
+    same_turn_rewind: bool,
 }
 
 #[derive(Debug)]
@@ -246,12 +256,14 @@ pub(super) fn restored_watcher_turn_from_inflight(
         task_notification_kind: state.task_notification_kind,
         finish_mailbox_on_completion,
         injected_prompt_message_id: state.injected_prompt_message_id,
+        turn_identity: Some(super::inflight::InflightTurnIdentity::from_state(state)),
         streaming_rollover_frozen_msg_ids: state
             .streaming_rollover_frozen_msg_ids
             .iter()
             .copied()
             .map(MessageId::new)
             .collect(),
+        same_turn_rewind: false,
     })
 }
 
@@ -284,41 +296,130 @@ fn should_discard_restored_seed_for_idle_direct_prompt(
     restored_turn_present: bool,
     prompt_anchor_present: bool,
     seed_has_undelivered_body: bool,
+    same_turn_rewind_seed: bool,
+    seed_reassigned_to_different_turn: bool,
 ) -> bool {
-    restored_turn_present && prompt_anchor_present && !seed_has_undelivered_body
+    restored_turn_present
+        && !same_turn_rewind_seed
+        && ((prompt_anchor_present && !seed_has_undelivered_body)
+            || seed_reassigned_to_different_turn)
+}
+
+fn restored_seed_reassigned_to_different_turn(
+    restored_turn: Option<&RestoredWatcherTurn>,
+    current_turn_identity: Option<&super::inflight::InflightTurnIdentity>,
+    prompt_anchor_message_id: Option<u64>,
+) -> bool {
+    let Some(restored) = restored_turn else {
+        return false;
+    };
+    if restored.same_turn_rewind {
+        return false;
+    }
+    if let (Some(seed_anchor), Some(current_anchor)) = (
+        restored.injected_prompt_message_id,
+        prompt_anchor_message_id,
+    ) && seed_anchor != current_anchor
+    {
+        return true;
+    }
+    if let (Some(seed_identity), Some(current_identity)) =
+        (restored.turn_identity.as_ref(), current_turn_identity)
+    {
+        return seed_identity != current_identity;
+    }
+    false
 }
 #[cfg(test)]
 mod restored_seed_discard_tests {
-    use super::should_discard_restored_seed_for_idle_direct_prompt;
+    use super::{
+        RestoredWatcherTurn, restored_seed_reassigned_to_different_turn,
+        should_discard_restored_seed_for_idle_direct_prompt, watcher_stream_seed,
+    };
+    use crate::services::discord::inflight::InflightTurnIdentity;
+    use poise::serenity_prelude::MessageId;
 
     #[test]
     fn idle_direct_prompt_preserves_restored_seed_with_undelivered_body() {
         assert!(!should_discard_restored_seed_for_idle_direct_prompt(
-            true, true, true,
+            true, true, true, false, false,
         ));
     }
 
     #[test]
     fn idle_direct_prompt_still_discards_empty_restored_seed_with_anchor() {
         assert!(should_discard_restored_seed_for_idle_direct_prompt(
-            true, true, false,
+            true, true, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn idle_direct_prompt_preserves_same_turn_rewind_seed_with_anchor() {
+        assert!(!should_discard_restored_seed_for_idle_direct_prompt(
+            true, true, false, true, true,
         ));
     }
 
     #[test]
     fn idle_direct_prompt_discard_still_requires_restored_turn_and_anchor() {
         assert!(!should_discard_restored_seed_for_idle_direct_prompt(
-            true, false, false,
+            true, false, false, false, false,
         ));
         assert!(!should_discard_restored_seed_for_idle_direct_prompt(
-            true, false, true,
+            true, false, true, false, false,
         ));
         assert!(!should_discard_restored_seed_for_idle_direct_prompt(
-            false, true, false,
+            false, true, false, false, false,
         ));
         assert!(!should_discard_restored_seed_for_idle_direct_prompt(
-            false, true, true,
+            false, true, true, false, false,
         ));
+    }
+
+    #[test]
+    fn cross_turn_watcher_reuse_discards_restored_seed_before_terminal_commit() {
+        let seed_identity = InflightTurnIdentity {
+            user_msg_id: 0,
+            started_at: "2026-07-07T01:00:00Z".to_string(),
+            tmux_session_name: Some("AgentDesk-claude-adk".to_string()),
+            turn_start_offset: Some(100),
+        };
+        let current_identity = InflightTurnIdentity {
+            started_at: "2026-07-07T01:00:10Z".to_string(),
+            turn_start_offset: Some(240),
+            ..seed_identity.clone()
+        };
+        let restored = RestoredWatcherTurn {
+            current_msg_id: MessageId::new(4105),
+            status_message_id: None,
+            response_sent_offset: 0,
+            full_response: "WARMUP".to_string(),
+            last_edit_text: String::new(),
+            task_notification_kind: None,
+            finish_mailbox_on_completion: false,
+            injected_prompt_message_id: Some(9001),
+            turn_identity: Some(seed_identity),
+            streaming_rollover_frozen_msg_ids: Vec::new(),
+            same_turn_rewind: false,
+        };
+
+        let seed_reassigned_to_different_turn = restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            Some(&current_identity),
+            Some(9002),
+        );
+        assert!(seed_reassigned_to_different_turn);
+        assert!(should_discard_restored_seed_for_idle_direct_prompt(
+            true,
+            true,
+            true,
+            restored.same_turn_rewind,
+            seed_reassigned_to_different_turn,
+        ));
+
+        let stream_seed = watcher_stream_seed(None);
+        assert!(stream_seed.full_response.is_empty());
+        assert_eq!(stream_seed.response_sent_offset, 0);
     }
 }
 
@@ -528,13 +629,11 @@ fn monitor_auto_turn_completion_notice(
     format!("{summary} · 대상: {label}")
 }
 
-/// #1009: Shared formatter for the monitor auto-turn suppressed-placeholder
+/// #1009: Shared formatter for the monitor auto-turn suppressed-notification
 /// summary line. Produces:
 ///   - `🔔 Monitor n회 처리 · 다음 모니터: {key1, key2, ...}` when entries > 0
 ///   - `🔔 Monitor n회 처리 · (등록된 모니터 없음)` when entries == 0
-/// Entry keys are emitted in the order the store returns them. Called from
-/// both `suppressed_placeholder_action` (via the monitor-aware wrapper) and
-/// the lifecycle-notice path so both channels use identical copy.
+/// Entry keys are emitted in the order the store returns them.
 pub(super) fn format_monitor_suppressed_label(event_count: usize, entry_keys: &[String]) -> String {
     if entry_keys.is_empty() {
         format!("🔔 Monitor {}회 처리 · (등록된 모니터 없음)", event_count)
@@ -545,21 +644,6 @@ pub(super) fn format_monitor_suppressed_label(event_count: usize, entry_keys: &[
             entry_keys.join(", ")
         )
     }
-}
-
-/// #1009: Compose the full suppressed-placeholder body for monitor auto-turn.
-/// Rebuilds the existing `last_edit_text`-preserve + label-append behaviour
-/// from `rewrite_placeholder_as_terminal_suppressed` but with the dynamic
-/// `format_monitor_suppressed_label` text. Length-guarded against
-/// `DISCORD_MSG_LIMIT` by the underlying rewrite helper.
-pub(super) fn format_monitor_suppressed_body(
-    last_edit_text: &str,
-    provider: &ProviderKind,
-    event_count: usize,
-    entry_keys: &[String],
-) -> String {
-    let label = format_monitor_suppressed_label(event_count, entry_keys);
-    rewrite_placeholder_as_terminal_suppressed(last_edit_text, &label, provider)
 }
 
 /// #1009: System-level hint injected once per monitor auto-turn entry so the
@@ -1766,6 +1850,18 @@ fn persist_watcher_stream_progress(
     // persisted so a later-iteration / post-restart terminal fallback can delete them.
     streaming_rollover_frozen_msg_ids: &[MessageId],
 ) {
+    if full_response.len() < response_sent_offset {
+        tracing::debug!(
+            provider = %provider.as_str(),
+            channel = channel_id.get(),
+            tmux_session = %tmux_session_name,
+            response_sent_offset,
+            full_response_len = full_response.len(),
+            "watcher: skipping stream-progress persistence until parsed body catches up"
+        );
+        return;
+    }
+
     // #3558: pre-emit the in-bounds telemetry against the caller's snapshot for
     // continuity; the helper re-clamps `response_sent_offset` against the
     // freshly reloaded `full_response` under the lock, so the persisted value is
@@ -1845,6 +1941,41 @@ async fn finish_restored_watcher_active_turn(
     claim_snapshot: Option<super::turn_finalizer::SyntheticClaimSnapshot>,
     stop_source: &'static str,
 ) -> bool {
+    // Default context for every caller EXCEPT the #4106 post-early-release site,
+    // which routes through `finish_restored_watcher_active_turn_with_ctx` directly
+    // to downgrade its EXPECTED identity-guard miss from WARN to debug.
+    finish_restored_watcher_active_turn_with_ctx(
+        shared,
+        provider,
+        channel_id,
+        finalizer_turn_id,
+        finish_mailbox_on_completion,
+        normal_completion,
+        _kickoff_queue,
+        claim_snapshot,
+        super::turn_finalizer::FinalizeContext::watcher(),
+        stop_source,
+    )
+    .await
+}
+
+/// #4106: inner finalize that accepts an explicit `FinalizeContext`. The thin
+/// wrapper above pins `FinalizeContext::watcher()` for all legacy callers; the
+/// post-early-release watcher site passes `watcher_after_pre_panel_release()` so
+/// its deterministic (already-released) identity-guard miss logs at debug.
+#[allow(clippy::too_many_arguments)]
+async fn finish_restored_watcher_active_turn_with_ctx(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finalizer_turn_id: u64,
+    finish_mailbox_on_completion: bool,
+    normal_completion: bool,
+    _kickoff_queue: bool,
+    claim_snapshot: Option<super::turn_finalizer::SyntheticClaimSnapshot>,
+    finalize_ctx: super::turn_finalizer::FinalizeContext,
+    stop_source: &'static str,
+) -> bool {
     // The mailbox is cleared now when EITHER gate holds:
     //   * `normal_completion` → confirmed terminal output committed / pane idle
     //     (#3016 option A). The canonical post-phase-5b1 finalize trigger.
@@ -1893,7 +2024,7 @@ async fn finish_restored_watcher_active_turn(
             ),
             provider.clone(),
             super::turn_finalizer::TerminalEvent::Complete,
-            super::turn_finalizer::FinalizeContext::watcher(),
+            finalize_ctx,
             claim_snapshot,
             shared.clone(),
         )
@@ -1919,6 +2050,64 @@ async fn finish_restored_watcher_active_turn(
     true
 }
 
+async fn release_restored_watcher_active_turn_before_panel_edit(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finalizer_turn_id: u64,
+) -> bool {
+    if finalizer_turn_id == 0 {
+        return false;
+    }
+
+    // #4106 review-fix (codex): snapshot the channel role override THIS turn owns
+    // BEFORE any await. The removal below runs after awaits (mailbox finish +
+    // clear_watchdog_deadline_override), during which a fresh same-channel
+    // counter-model follow-up can insert its OWN override (intake_turn.rs) even
+    // before it claims the slot. A bare channel-keyed remove would clobber that;
+    // remove_owned_role_override only drops the value we still own.
+    let pre_release_role_override =
+        super::turn_finalizer::cleanup::snapshot_role_override(shared, channel_id);
+
+    let finish = super::mailbox_finish_turn_if_matches(
+        shared,
+        provider,
+        channel_id,
+        MessageId::new(finalizer_turn_id),
+    )
+    .await;
+    let Some(token) = finish.removed_token.as_ref() else {
+        return false;
+    };
+
+    // #4106 review-fix: cancel the removed token, decrement the counter, AND run
+    // the finalizer's D-side channel cleanup here. Hoisting the release ahead of
+    // the awaited panel edit makes the LATE do_finalize see removed_token=None
+    // and take the guarded-miss SKIP branch (finalize.rs), so without this the
+    // cleanup would be dropped on every normal completion. Running it here is
+    // safe: we release turn A into a still-idle channel (no newer turn has
+    // claimed yet, since a follow-up needs cancel_token.is_none() which this
+    // release just produced), so it cannot clobber a follow-up's channel state.
+    // Mirrors the finalizer non-miss branch (finalize.rs D-section) and the
+    // recovery release bundle (health/recovery.rs); voice drain is omitted
+    // because the watcher finalize path sets drain_voice=false.
+    token.cancelled.store(true, Ordering::Relaxed);
+    super::saturating_decrement_global_active(shared);
+
+    super::turn_finalizer::cleanup::clear_watchdog_and_kick_thread_parents_after_turn_release(
+        shared, provider, channel_id,
+    )
+    .await;
+    if !finish.has_pending {
+        super::turn_finalizer::cleanup::remove_owned_role_override(
+            shared,
+            channel_id,
+            pre_release_role_override,
+        );
+    }
+    true
+}
+
 /// Background watcher that continuously tails a tmux output file.
 /// When Claude produces output from terminal input (not Discord), relay it to Discord.
 #[path = "tmux_watcher.rs"]
@@ -1931,7 +2120,7 @@ pub(super) use self::tmux_watcher::{
 mod tmux_output_stream;
 pub(in crate::services::discord) use self::tmux_output_stream::{
     WatcherToolState, build_watcher_placeholder_status_block, flush_placeholder_live_events,
-    force_next_watcher_status_update, process_watcher_lines,
+    force_next_watcher_status_update, process_watcher_lines, process_watcher_lines_for_turn,
 };
 
 #[cfg(test)]
@@ -2053,6 +2242,59 @@ mod watcher_stream_progress_tests {
             persisted.last_offset, 777,
             "streaming progress must preserve the non-owned last_offset watermark"
         );
+
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    }
+
+    #[test]
+    fn persist_watcher_stream_progress_skips_rewind_seed_before_body_catches_up_4115() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(1509350490461180415);
+        let tmux_session_name = "AgentDesk-claude-adk-issue-4115-rewind-progress";
+        let mut state = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            Some("claude-pipe".to_string()),
+            4154,
+            9_415,
+            9_416,
+            "prompt".to_string(),
+            Some("session-4115".to_string()),
+            Some(tmux_session_name.to_string()),
+            Some("/tmp/agentdesk-4115.jsonl".to_string()),
+            None,
+            128,
+        );
+        state.full_response = "already persisted prefix".to_string();
+        state.response_sent_offset = state.full_response.len();
+        super::super::inflight::save_inflight_state(&state).expect("save inflight");
+
+        persist_watcher_stream_progress(
+            &provider,
+            channel_id,
+            tmux_session_name,
+            None,
+            Some(MessageId::new(9_416)),
+            "",
+            128,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &[],
+        );
+
+        let reloaded = super::super::inflight::load_inflight_state(&provider, channel_id.get())
+            .expect("reload row");
+        assert_eq!(reloaded.full_response, "already persisted prefix");
+        assert_eq!(reloaded.response_sent_offset, state.response_sent_offset);
 
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }

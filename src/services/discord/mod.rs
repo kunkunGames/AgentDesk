@@ -25,6 +25,7 @@ mod inflight;
 mod inflight_heartbeat_sweeper;
 pub(crate) mod internal_api;
 mod jsonl_watcher;
+mod mailbox_finish;
 mod mcp_credential_watcher;
 pub(crate) mod meeting_artifact_store;
 pub(crate) mod meeting_orchestrator;
@@ -135,6 +136,10 @@ pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use catch_up::{
     CatchUpRetryState, catch_up_missed_messages, catch_up_missed_messages_inner,
     should_trigger_catch_up_retry, take_catch_up_retry_checkpoint_after_queue_drain,
+};
+pub(in crate::services::discord) use mailbox_finish::{
+    mailbox_finish_turn, mailbox_finish_turn_if_matches,
+    mailbox_finish_turn_if_matches_started_before,
 };
 pub(in crate::services::discord) use recovery_engine as recovery;
 // #3038 S1: re-export the extracted cluster type so the `SharedData` field
@@ -314,14 +319,125 @@ pub(in crate::services::discord) fn advance_last_message_checkpoint(
     message_id: MessageId,
 ) -> u64 {
     let message_id = message_id.get();
-    let checkpoint = shared
+    let checkpoint = *shared
         .last_message_ids
-        .get(&channel_id)
-        .map(|current| (*current).max(message_id))
-        .unwrap_or(message_id);
-    shared.last_message_ids.insert(channel_id, checkpoint);
+        .entry(channel_id)
+        .and_modify(|current| *current = (*current).max(message_id))
+        .or_insert(message_id);
     runtime_store::save_last_message_id(provider.as_str(), channel_id.get(), checkpoint);
     checkpoint
+}
+
+#[cfg(test)]
+mod last_message_checkpoint_tests {
+    use super::*;
+
+    struct ScopedRuntimeRoot {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        temp: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedRuntimeRoot {
+        fn path(&self) -> &std::path::Path {
+            self.temp.path()
+        }
+    }
+
+    impl Drop for ScopedRuntimeRoot {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("AGENTDESK_ROOT_DIR", value),
+                    None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
+                }
+            }
+        }
+    }
+
+    fn scoped_runtime_root() -> ScopedRuntimeRoot {
+        let lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let temp = tempfile::tempdir().expect("last-message runtime root");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        ScopedRuntimeRoot {
+            _lock: lock,
+            temp,
+            previous,
+        }
+    }
+
+    fn last_message_path(
+        root: &std::path::Path,
+        provider: &ProviderKind,
+        channel_id: ChannelId,
+    ) -> std::path::PathBuf {
+        root.join("runtime")
+            .join("last_message")
+            .join(provider.as_str())
+            .join(format!("{}.txt", channel_id.get()))
+    }
+
+    #[test]
+    fn advance_last_message_checkpoint_interleaved_advances_keep_max() {
+        let root = scoped_runtime_root();
+        let shared = make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_162_000);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let low_shared = std::sync::Arc::clone(&shared);
+        let low_barrier = std::sync::Arc::clone(&barrier);
+        let low = std::thread::spawn(move || {
+            low_barrier.wait();
+            advance_last_message_checkpoint(
+                &low_shared,
+                &ProviderKind::Claude,
+                channel_id,
+                MessageId::new(90_001),
+            )
+        });
+
+        let high_shared = std::sync::Arc::clone(&shared);
+        let high_barrier = std::sync::Arc::clone(&barrier);
+        let high = std::thread::spawn(move || {
+            high_barrier.wait();
+            advance_last_message_checkpoint(
+                &high_shared,
+                &ProviderKind::Claude,
+                channel_id,
+                MessageId::new(90_002),
+            )
+        });
+
+        barrier.wait();
+        let _ = low.join().expect("low checkpoint thread");
+        let _ = high.join().expect("high checkpoint thread");
+
+        assert_eq!(
+            shared.last_message_ids.get(&channel_id).map(|entry| *entry),
+            Some(90_002)
+        );
+        let path = last_message_path(root.path(), &provider, channel_id);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("checkpoint file")
+                .trim(),
+            "90002"
+        );
+
+        let mut stale_snapshot = std::collections::HashMap::new();
+        stale_snapshot.insert(channel_id.get(), 90_001);
+        runtime_store::save_all_last_message_ids(provider.as_str(), &stale_snapshot);
+        assert_eq!(
+            std::fs::read_to_string(path)
+                .expect("checkpoint file after stale full-map save")
+                .trim(),
+            "90002"
+        );
+    }
 }
 
 pub(in crate::services::discord) use queue_io::{
@@ -1418,6 +1534,27 @@ impl TmuxRelayCoord {
             delivery_lease: Arc::new(DeliveryLeaseCell::new(channel_id)),
         }
     }
+
+    pub(super) fn note_relay_progress_heartbeat(&self, now_ms: i64) {
+        self.last_relay_ts_ms.store(now_ms, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod relay_coord_tests {
+    use super::*;
+
+    #[test]
+    fn relay_progress_heartbeat_stamps_each_confirmed_chunk() {
+        let coord = TmuxRelayCoord::new(ChannelId::new(4_178));
+
+        coord.note_relay_progress_heartbeat(1_000);
+        assert_eq!(coord.last_relay_ts_ms.load(Ordering::Acquire), 1_000);
+
+        coord.note_relay_progress_heartbeat(1_500);
+        assert_eq!(coord.last_relay_ts_ms.load(Ordering::Acquire), 1_500);
+        assert_eq!(coord.confirmed_end_offset.load(Ordering::Acquire), 0);
+    }
 }
 
 // ===========================================================================
@@ -2253,6 +2390,20 @@ impl SharedData {
             .load(Ordering::Acquire)
     }
 
+    /// #4181: `true` while some watcher is actively emitting a relay for this
+    /// channel — the `relay_slot` holds the in-progress emission's
+    /// `data_start_offset` (non-zero). A single relay POST can be in-flight for
+    /// longer than the stall grace under extreme rate-limiting, freezing the
+    /// committed offset without the turn being stalled. Redrive consults this so
+    /// it does not re-drive an already-in-flight emission (a duplicate, not a
+    /// loss).
+    pub(super) fn relay_emission_in_flight(&self, channel_id: ChannelId) -> bool {
+        self.tmux_relay_coord(channel_id)
+            .relay_slot
+            .load(Ordering::Acquire)
+            != 0
+    }
+
     /// Record a recovery/reattach watcher spawn and purge the channel footer so the
     /// dead prior generation's task/subagent slots don't linger as zombies (#3436, #964).
     pub(super) fn record_tmux_watcher_reconnect(&self, channel_id: ChannelId) {
@@ -2947,6 +3098,7 @@ mod queue_exit_feedback_reconciler_tests {
             queued_generation: 91,
             source_message_ids: vec![message_id],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: "queued text".to_string(),
             mode: InterventionMode::Soft,
             created_at: std::time::Instant::now(),
@@ -3233,6 +3385,7 @@ pub(in crate::services::discord) async fn enqueue_internal_followup(
             queued_generation: shared.restart.current_generation,
             source_message_ids: vec![reply_message_id],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.into(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -3540,6 +3693,7 @@ pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_
         queued_generation: shared.restart.current_generation,
         source_message_ids: vec![message_id],
         source_message_queued_generations: Vec::new(),
+        source_text_segments: Vec::new(),
         text: inflight_state.user_text.clone(),
         mode: crate::services::turn_orchestrator::InterventionMode::Soft,
         created_at: std::time::Instant::now(),
@@ -3707,62 +3861,6 @@ async fn mailbox_cancel_soft_intervention(
         .await;
     apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
     result.removed
-}
-
-async fn mailbox_finish_turn(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-) -> FinishTurnResult {
-    let result = shared
-        .mailbox(channel_id)
-        .finish_turn(queue_persistence_context(shared, provider, channel_id))
-        .await;
-    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-    // #2443 — finish_turn is the success-path exit for the recovery engine
-    // (recovery_engine.rs L648). Marking `recovery_done` here covers the
-    // "recovery completed normally" branch so the watcher waiting on
-    // `recovery_done.wait()` can proceed without waiting for the 60s timeout
-    // that the legacy heuristic depended on. The latch is idempotent — if
-    // `mailbox_clear_recovery_marker` already ran, this is a no-op.
-    shared.mailboxes.recovery_done(channel_id).mark_done();
-    turn_completion_events::publish_mailbox_release_completion_event(shared, channel_id, &result);
-    result
-}
-
-/// #3016 — identity-guarded variant of [`mailbox_finish_turn`]. Finalizes the
-/// channel's active turn ONLY when the mailbox's current
-/// `active_user_message_id` still matches `expected_user_message_id`. Used by
-/// the `TurnFinalizer` when the terminal carries a real `user_msg_id` so a
-/// stale / channel-only terminal arriving in the narrow window between one
-/// turn finalizing and the next turn's `try_start_turn` (or after ledger GC)
-/// cannot release the WRONG (newer) turn's token or decrement `global_active`.
-/// On mismatch it returns `removed_token = None`, exactly like an idempotent
-/// second `mailbox_finish_turn`, so the finalizer's counter-decrement gate is
-/// a no-op.
-async fn mailbox_finish_turn_if_matches(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    expected_user_message_id: serenity::model::id::MessageId,
-) -> FinishTurnResult {
-    let result = shared
-        .mailbox(channel_id)
-        .finish_turn_if_matches(
-            expected_user_message_id,
-            queue_persistence_context(shared, provider, channel_id),
-        )
-        .await;
-    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-    // Mirror `mailbox_finish_turn`: a successful guarded finish is also a
-    // recovery-engine success exit. Only mark `recovery_done` when this call
-    // actually finalized (removed a token); a mismatch no-op must not free a
-    // watcher waiting on a turn that is still live.
-    if result.removed_token.is_some() {
-        shared.mailboxes.recovery_done(channel_id).mark_done();
-    }
-    turn_completion_events::publish_mailbox_release_completion_event(shared, channel_id, &result);
-    result
 }
 
 async fn mailbox_finish_cancelled_turn(
@@ -4803,6 +4901,7 @@ mod idle_queue_background_supersede_tests {
             queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
+            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
