@@ -1875,6 +1875,41 @@ async fn finish_restored_watcher_active_turn(
     claim_snapshot: Option<super::turn_finalizer::SyntheticClaimSnapshot>,
     stop_source: &'static str,
 ) -> bool {
+    // Default context for every caller EXCEPT the #4106 post-early-release site,
+    // which routes through `finish_restored_watcher_active_turn_with_ctx` directly
+    // to downgrade its EXPECTED identity-guard miss from WARN to debug.
+    finish_restored_watcher_active_turn_with_ctx(
+        shared,
+        provider,
+        channel_id,
+        finalizer_turn_id,
+        finish_mailbox_on_completion,
+        normal_completion,
+        _kickoff_queue,
+        claim_snapshot,
+        super::turn_finalizer::FinalizeContext::watcher(),
+        stop_source,
+    )
+    .await
+}
+
+/// #4106: inner finalize that accepts an explicit `FinalizeContext`. The thin
+/// wrapper above pins `FinalizeContext::watcher()` for all legacy callers; the
+/// post-early-release watcher site passes `watcher_after_pre_panel_release()` so
+/// its deterministic (already-released) identity-guard miss logs at debug.
+#[allow(clippy::too_many_arguments)]
+async fn finish_restored_watcher_active_turn_with_ctx(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finalizer_turn_id: u64,
+    finish_mailbox_on_completion: bool,
+    normal_completion: bool,
+    _kickoff_queue: bool,
+    claim_snapshot: Option<super::turn_finalizer::SyntheticClaimSnapshot>,
+    finalize_ctx: super::turn_finalizer::FinalizeContext,
+    stop_source: &'static str,
+) -> bool {
     // The mailbox is cleared now when EITHER gate holds:
     //   * `normal_completion` → confirmed terminal output committed / pane idle
     //     (#3016 option A). The canonical post-phase-5b1 finalize trigger.
@@ -1923,7 +1958,7 @@ async fn finish_restored_watcher_active_turn(
             ),
             provider.clone(),
             super::turn_finalizer::TerminalEvent::Complete,
-            super::turn_finalizer::FinalizeContext::watcher(),
+            finalize_ctx,
             claim_snapshot,
             shared.clone(),
         )
@@ -1946,6 +1981,72 @@ async fn finish_restored_watcher_active_turn(
     };
     let _ = stop_source;
     // Drove the finalize (reached here past the early-return gate).
+    true
+}
+
+async fn release_restored_watcher_active_turn_before_panel_edit(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finalizer_turn_id: u64,
+) -> bool {
+    if finalizer_turn_id == 0 {
+        return false;
+    }
+
+    // #4106 review-fix (codex): snapshot the channel role override THIS turn owns
+    // BEFORE any await. The removal below runs after awaits (mailbox finish +
+    // clear_watchdog_deadline_override), during which a fresh same-channel
+    // counter-model follow-up can insert its OWN override (intake_turn.rs) even
+    // before it claims the slot. A bare channel-keyed remove would clobber that;
+    // remove_if only drops the value we still own.
+    let pre_release_role_override = shared
+        .dispatch
+        .role_overrides
+        .get(&channel_id)
+        .map(|entry| *entry.value());
+
+    let finish = super::mailbox_finish_turn_if_matches(
+        shared,
+        provider,
+        channel_id,
+        MessageId::new(finalizer_turn_id),
+    )
+    .await;
+    let Some(token) = finish.removed_token.as_ref() else {
+        return false;
+    };
+
+    // #4106 review-fix: cancel the removed token, decrement the counter, AND run
+    // the finalizer's D-side channel cleanup here. Hoisting the release ahead of
+    // the awaited panel edit makes the LATE do_finalize see removed_token=None
+    // and take the guarded-miss SKIP branch (finalize.rs), so without this the
+    // cleanup would be dropped on every normal completion. Running it here is
+    // safe: we release turn A into a still-idle channel (no newer turn has
+    // claimed yet, since a follow-up needs cancel_token.is_none() which this
+    // release just produced), so it cannot clobber a follow-up's channel state.
+    // Mirrors the finalizer non-miss branch (finalize.rs D-section) and the
+    // recovery release bundle (health/recovery.rs); voice drain is omitted
+    // because the watcher finalize path sets drain_voice=false.
+    token.cancelled.store(true, Ordering::Relaxed);
+    super::saturating_decrement_global_active(shared);
+
+    super::clear_watchdog_deadline_override(channel_id.get()).await;
+    let thread_parent_kickoffs =
+        super::turn_finalizer::cleanup::collect_and_clear_thread_parents(shared, channel_id);
+    super::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
+        shared,
+        provider,
+        thread_parent_kickoffs,
+    );
+    if !finish.has_pending
+        && let Some(owned) = pre_release_role_override
+    {
+        shared
+            .dispatch
+            .role_overrides
+            .remove_if(&channel_id, |_, current| *current == owned);
+    }
     true
 }
 
