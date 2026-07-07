@@ -5,76 +5,32 @@ fn state_for_matched_session(
     tmux_session_name: &str,
     output_path: &str,
 ) -> crate::services::discord::inflight::InflightTurnState {
-    let mut state: crate::services::discord::inflight::InflightTurnState =
-        serde_json::from_value(serde_json::json!({
-            "version": 9,
-            "provider": provider.as_str(),
-            "channel_id": 42,
-            "channel_name": "relay-test",
-            "watcher_owner_channel_id": 42,
-            "logical_channel_id": 42,
-            "request_owner_user_id": 7,
-            "user_msg_id": 9001,
-            "finalizer_turn_id": 9001,
-            "current_msg_id": 9002,
-            "current_msg_len": 0,
-            "user_text": "typed over ssh",
-            "source": "text",
-            "session_id": "session-1",
-            "tmux_session_name": tmux_session_name,
-            "output_path": output_path,
-            "input_fifo_path": "/tmp/input.fifo",
-            "runtime_kind": "legacy_tmux_wrapper",
-            "last_offset": 0,
-            "turn_start_offset": 0,
-            "full_response": "",
-            "response_sent_offset": 0,
-            "started_at": "2026-07-02 00:00:00",
-            "updated_at": "2026-07-02 00:00:00",
-            "born_generation": 0
-        }))
-        .expect("deserialize test inflight");
-    state.turn_source = crate::services::discord::inflight::TurnSource::ExternalInput;
-    state.runtime_kind = Some(match provider {
-        ProviderKind::Claude => crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
-        ProviderKind::Codex => crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
-        _ => crate::services::agent_protocol::RuntimeHandoffKind::ProcessBackend,
-    });
-    state
-}
-
-fn write_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
-    let file = tempfile::NamedTempFile::new().expect("temp jsonl");
-    std::fs::write(file.path(), lines.join("\n")).expect("write jsonl");
-    file
-}
-
-fn write_jsonl_strings(lines: &[String]) -> tempfile::NamedTempFile {
-    let file = tempfile::NamedTempFile::new().expect("temp jsonl");
-    std::fs::write(file.path(), lines.join("\n")).expect("write jsonl");
-    file
-}
-
-fn matched_gate_signal_for_file(
-    provider: ProviderKind,
-    runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind,
-    file: &std::path::Path,
-    fixture_name: &str,
-) -> crate::services::discord::turn_finalizer::CompletionSignal {
-    let tmux_session_name = format!("AgentDesk-{}-{fixture_name}", provider.as_str());
-    let mut state = state_for_matched_session(
-        provider.clone(),
-        &tmux_session_name,
-        &file.display().to_string(),
+    let mut state = crate::services::discord::inflight::InflightTurnState::new(
+        provider,
+        42,
+        Some("relay-test".to_string()),
+        7,
+        9001,
+        9002,
+        "typed over ssh".to_string(),
+        Some("session-1".to_string()),
+        Some(tmux_session_name.to_string()),
+        Some(output_path.to_string()),
+        Some("/tmp/input.fifo".to_string()),
+        0,
     );
-    state.runtime_kind = Some(runtime_kind);
-    matched_session_completion_signal(&provider, Some(&state), &tmux_session_name)
-        .expect("matched session should produce a signal")
+    state.turn_source = crate::services::discord::inflight::TurnSource::ExternalInput;
+    state
 }
 
 #[test]
 fn matched_session_terminal_jsonl_confirms_idle_without_turn_source_branch() {
-    let file = write_jsonl(&[r#"{"type":"result","result":"done","session_id":"s"}"#]);
+    let file = tempfile::NamedTempFile::new().expect("temp jsonl");
+    std::fs::write(
+        file.path(),
+        r#"{"type":"result","result":"done","session_id":"s"}"#,
+    )
+    .expect("write jsonl");
     let tmux_session_name = "AgentDesk-claude-relay-test";
     let state = state_for_matched_session(
         ProviderKind::Claude,
@@ -83,14 +39,19 @@ fn matched_session_terminal_jsonl_confirms_idle_without_turn_source_branch() {
     );
 
     assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::Done)
+        matched_session_jsonl_turn_state(&ProviderKind::Claude, Some(&state), tmux_session_name),
+        Some(crate::services::tui_turn_state::TuiTurnState::Idle)
     );
 }
 
 #[test]
 fn turn_source_does_not_affect_jsonl_completion_probe() {
-    let file = write_jsonl(&[r#"{"type":"result","result":"done","session_id":"s"}"#]);
+    let file = tempfile::NamedTempFile::new().expect("temp jsonl");
+    std::fs::write(
+        file.path(),
+        r#"{"type":"result","result":"done","session_id":"s"}"#,
+    )
+    .expect("write jsonl");
     let tmux_session_name = "AgentDesk-claude-relay-test";
     let mut state = state_for_matched_session(
         ProviderKind::Claude,
@@ -100,241 +61,8 @@ fn turn_source_does_not_affect_jsonl_completion_probe() {
     state.turn_source = crate::services::discord::inflight::TurnSource::Managed;
 
     assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::Done)
-    );
-}
-
-#[test]
-fn finalize_authority_acceptance_matrix_is_the_gate_matrix() {
-    use crate::services::agent_protocol::RuntimeHandoffKind;
-    use crate::services::discord::turn_finalizer::{
-        CompletionSignal, completion_signal_from_transcript,
-    };
-
-    let cases = [
-        (
-            "claude_partial_tail_after_result",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[
-                r#"{"type":"result","result":"done","session_id":"s"}"#,
-                r#"{"ty"#,
-            ][..],
-            false,
-        ),
-        (
-            "claude_system_init",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[r#"{"type":"system","subtype":"init","session_id":"s"}"#][..],
-            false,
-        ),
-        (
-            "codex_session_meta",
-            ProviderKind::Codex,
-            RuntimeHandoffKind::CodexTui,
-            &[r#"{"type":"session_meta","payload":{"id":"s","cwd":"/repo"}}"#][..],
-            false,
-        ),
-        (
-            "codex_thread_started",
-            ProviderKind::Codex,
-            RuntimeHandoffKind::CodexTui,
-            &[r#"{"type":"thread.started","thread_id":"t"}"#][..],
-            false,
-        ),
-        (
-            "codex_task_complete_payload",
-            ProviderKind::Codex,
-            RuntimeHandoffKind::CodexTui,
-            &[r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#][..],
-            false,
-        ),
-        (
-            "codex_completed_agent_message",
-            ProviderKind::Codex,
-            RuntimeHandoffKind::CodexTui,
-            &[r#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#][..],
-            false,
-        ),
-        (
-            "claude_result",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[r#"{"type":"result","result":"done","session_id":"s"}"#][..],
-            true,
-        ),
-        (
-            "claude_turn_duration",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[r#"{"type":"system","subtype":"turn_duration","session_id":"s"}"#][..],
-            true,
-        ),
-        (
-            "claude_stop_hook_summary",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[r#"{"type":"system","subtype":"stop_hook_summary","session_id":"s"}"#][..],
-            true,
-        ),
-        (
-            "claude_interrupt_marker",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#][..],
-            true,
-        ),
-        (
-            "codex_turn_completed",
-            ProviderKind::Codex,
-            RuntimeHandoffKind::CodexTui,
-            &[r#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":3}}"#][..],
-            true,
-        ),
-        (
-            "claude_permission_mode_after_result",
-            ProviderKind::Claude,
-            RuntimeHandoffKind::ClaudeTui,
-            &[
-                r#"{"type":"result","result":"done","session_id":"s"}"#,
-                r#"{"type":"permission-mode","mode":"bypassPermissions"}"#,
-            ][..],
-            true,
-        ),
-    ];
-
-    for (name, provider, runtime_kind, lines, finalize_confirms) in cases {
-        let file = write_jsonl(lines);
-        let gate_signal =
-            matched_gate_signal_for_file(provider.clone(), runtime_kind, file.path(), name);
-        let finalizer_signal =
-            completion_signal_from_transcript(&provider, Some(runtime_kind), file.path());
-
-        assert_eq!(
-            gate_signal == CompletionSignal::Done,
-            finalize_confirms,
-            "{name}: matched gate signal must use FinalizeAuthority"
-        );
-        assert_eq!(
-            finalizer_signal == CompletionSignal::Done,
-            finalize_confirms,
-            "{name}: FinalizeAuthority drifted"
-        );
-    }
-}
-
-#[test]
-fn completion_gate_uses_widened_finalize_authority_scan() {
-    use crate::services::agent_protocol::RuntimeHandoffKind;
-    use crate::services::discord::turn_finalizer::{
-        CompletionSignal, completion_signal_from_transcript,
-    };
-
-    let mut lines = vec![r#"{"type":"result","result":"done","session_id":"s"}"#.to_string()];
-    let filler = r#"{"type":"pr-link","url":"https://example.com/pr/very-long-path-padding-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-    let mut bytes = 0usize;
-    while bytes < (64 * 1024) + 4096 {
-        lines.push(filler.to_string());
-        bytes += filler.len() + 1;
-    }
-    let file = write_jsonl_strings(&lines);
-
-    let gate_signal = matched_gate_signal_for_file(
-        ProviderKind::Claude,
-        RuntimeHandoffKind::ClaudeTui,
-        file.path(),
-        "claude_terminator_beyond_64kb",
-    );
-    let finalizer_signal = completion_signal_from_transcript(
-        &ProviderKind::Claude,
-        Some(RuntimeHandoffKind::ClaudeTui),
-        file.path(),
-    );
-
-    assert_eq!(gate_signal, CompletionSignal::Done);
-    assert_eq!(
-        finalizer_signal,
-        CompletionSignal::Done,
-        "FinalizeAuthority keeps the S2-a widened scan"
-    );
-}
-
-#[test]
-fn terminator_done_emits_even_when_legacy_quiescence_is_busy() {
-    let file = write_jsonl(&[r#"{"type":"result","result":"done","session_id":"s"}"#]);
-    let tmux_session_name = "AgentDesk-claude-busy-pane";
-    let state = state_for_matched_session(
-        ProviderKind::Claude,
-        tmux_session_name,
-        &file.path().display().to_string(),
-    );
-
-    assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::Done)
-    );
-    assert!(
-        TuiCompletionGateOutcome::BusyObserved.should_emit_completion(),
-        "legacy scrape/quiescence observation must not suppress a strict terminator Done"
-    );
-}
-
-#[test]
-fn issue_3268_handoff_done_signal_is_not_suppressed_by_busy_observation() {
-    let file = write_jsonl(&[r#"{"type":"result","result":"done","session_id":"s"}"#]);
-    let tmux_session_name = "AgentDesk-claude-stale-handoff-3268";
-    let mut state = state_for_matched_session(
-        ProviderKind::Claude,
-        tmux_session_name,
-        &file.path().display().to_string(),
-    );
-    state.current_msg_id = state.user_msg_id + 1;
-    state.status_message_id = Some(state.current_msg_id + 1);
-    state.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-
-    assert!(
-        jsonl_terminal_can_confirm_completion(Some(&state)),
-        "watcher-owned handoff shape is allowed to observe the strict JSONL terminator"
-    );
-    assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::Done)
-    );
-    assert!(
-        TuiCompletionGateOutcome::BusyObserved.should_emit_completion(),
-        "#3268: a busy/stale handoff observation must not strand a completed turn"
-    );
-}
-
-#[test]
-fn issue_3540_rotation_misdetect_cannot_suppress_strict_done_completion() {
-    let file = write_jsonl(&[r#"{"type":"result","result":"done","session_id":"s"}"#]);
-    let tmux_session_name = "AgentDesk-claude-rotation-3540";
-    let mut state = state_for_matched_session(
-        ProviderKind::Claude,
-        tmux_session_name,
-        &file.path().display().to_string(),
-    );
-    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
-    state.current_msg_id = state.user_msg_id + 1;
-    state.status_message_id = Some(state.current_msg_id + 1);
-    state.turn_start_offset = Some(8192);
-    state.last_offset = 8192;
-
-    assert!(
-        !jsonl_terminal_can_confirm_completion(Some(&state)),
-        "the local gate observation may still be unable to prove the rotated/racy offset shape"
-    );
-    assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::Done),
-        "FinalizeAuthority reads the provider terminator directly"
-    );
-    assert!(
-        TuiCompletionGateOutcome::BusyObserved.should_emit_completion(),
-        "#3540: rotated/racy scrape state is observability only after strict Done"
+        matched_session_jsonl_turn_state(&ProviderKind::Claude, Some(&state), tmux_session_name),
+        Some(crate::services::tui_turn_state::TuiTurnState::Idle)
     );
 }
 
@@ -376,40 +104,6 @@ fn jsonl_terminal_completion_accepts_session_bound_watcher_owned_placeholder() {
     assert!(
         jsonl_terminal_can_confirm_completion(Some(&state)),
         "session-bound watcher-owned terminal envelopes should finish cleanup even with a placeholder/status panel"
-    );
-}
-
-#[test]
-fn relay_ownership_only_turn_cannot_confirm_idle_via_tui_completion_gate() {
-    let file = tempfile::NamedTempFile::new().expect("temp jsonl");
-    std::fs::write(
-        file.path(),
-        r#"{"type":"result","result":"done","session_id":"s"}"#,
-    )
-    .expect("write jsonl");
-    let tmux_session_name = "AgentDesk-claude-relay-only";
-    let mut state = state_for_matched_session(
-        ProviderKind::Claude,
-        tmux_session_name,
-        &file.path().display().to_string(),
-    );
-    state.channel_id = 4_018_001;
-    state.current_msg_id = state.user_msg_id + 1;
-    state.status_message_id = Some(state.current_msg_id + 1);
-    state.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-    state.relay_ownership_only = true;
-
-    assert!(
-        inflight_skips_tui_completion_observation(Some(&state)),
-        "relay-only synthetic rows skip the observation path owned by bridge/sink relay"
-    );
-    assert!(
-        !jsonl_terminal_can_confirm_completion(Some(&state)),
-        "relay-only synthetic rows must not use matched JSONL idle as terminal completion evidence"
-    );
-    assert!(
-        TuiCompletionGateOutcome::NotGated.should_emit_completion(),
-        "relay-only synthetic rows must not create completion suppression"
     );
 }
 
@@ -881,21 +575,6 @@ async fn split_terminal_forward_signals_trailing_turn_and_keeps_terminal_ack() {
             .and_then(|ack| ack.turn_start_offset),
         Some(100),
         "the kept ack is bound to turn A's pinned offset"
-    );
-    let terminal_sequence = split_forward
-        .ack_target
-        .as_ref()
-        .map(|ack| ack.sequence)
-        .expect("split terminal forward has terminal sequence");
-    assert_eq!(
-        split_forward.first_forwarded_sequence,
-        Some(terminal_sequence),
-        "the current turn keeps the terminal frame as its first forwarded sequence"
-    );
-    assert_eq!(
-        split_forward.trailing_first_forwarded_sequence,
-        Some(terminal_sequence + 1),
-        "the later turn tail carries its own first forwarded sequence"
     );
 
     // A single complete turn (no trailing tail) must NOT raise the signal.
@@ -1580,155 +1259,6 @@ fn split_decoded_chunk_isolates_terminal_turn_from_trailing_tail() {
     assert_eq!(format!("{head}{tail}"), multibyte, "no bytes dropped");
 }
 
-fn unprocessed_tail_after_first_terminal(batch: &str) -> String {
-    let mut buffer = batch.to_string();
-    let mut state = StreamLineState::new();
-    let mut full_response = String::new();
-    let mut tool_state = WatcherToolState::new();
-    let outcome =
-        process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
-    assert!(
-        outcome.found_result,
-        "fixture must contain a terminal event"
-    );
-    buffer
-}
-
-fn assert_suppression_arm_uses_confirmed_end_helper(reason: &str) {
-    let module_src = include_str!("../tmux_watcher.rs");
-    let reason_idx = module_src
-        .find(reason)
-        .unwrap_or_else(|| panic!("missing suppression reason {reason}"));
-    let call_start = module_src[..reason_idx]
-        .rfind("advance_watcher_confirmed_end(")
-        .unwrap_or_else(|| panic!("missing advance call for {reason}"));
-    let call_src = &module_src[call_start..reason_idx];
-    assert!(
-        call_src.contains("suppressed_terminal_confirmed_end(current_offset, &all_data)"),
-        "suppression arm {reason} must advance only to the consumed terminal end"
-    );
-}
-
-#[test]
-fn silent_turn_suppression_watermark_stops_before_co_read_followup_turn() {
-    let silent_turn = "{\"type\":\"result\",\"result\":\"silent A done\"}\n";
-    let followup_turn = concat!(
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"visible B\"}]}}\n",
-        "{\"type\":\"result\",\"result\":\"visible B\"}\n",
-    );
-    let batch_start = 10_000u64;
-    let current_offset = batch_start + (silent_turn.len() + followup_turn.len()) as u64;
-    let followup_start = batch_start + silent_turn.len() as u64;
-    let all_data = unprocessed_tail_after_first_terminal(&format!("{silent_turn}{followup_turn}"));
-    assert_eq!(all_data, followup_turn);
-
-    let confirmed_end = suppressed_terminal_confirmed_end(current_offset, &all_data);
-    assert_eq!(
-        confirmed_end, followup_start,
-        "silent-turn suppression must consume only turn A and leave turn B's tail uncommitted"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(confirmed_end, followup_start, current_offset),
-        WatcherTerminalResendAction::SendFull,
-        "turn B remains uncovered and is sent normally on its pass"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(current_offset, followup_start, current_offset),
-        WatcherTerminalResendAction::SkipAlreadyCommitted,
-        "document the regression: advancing to raw batch end would falsely skip turn B"
-    );
-}
-
-#[test]
-fn recent_stop_suppression_watermark_stops_before_co_read_followup_turn() {
-    let stopped_turn = "{\"type\":\"result\",\"result\":\"stopped A done\"}\n";
-    let followup_turn = concat!(
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"visible B\"}]}}\n",
-        "{\"type\":\"result\",\"result\":\"visible B\"}\n",
-    );
-    let batch_start = 20_000u64;
-    let current_offset = batch_start + (stopped_turn.len() + followup_turn.len()) as u64;
-    let followup_start = batch_start + stopped_turn.len() as u64;
-    let all_data = unprocessed_tail_after_first_terminal(&format!("{stopped_turn}{followup_turn}"));
-    assert_eq!(all_data, followup_turn);
-
-    let confirmed_end = suppressed_terminal_confirmed_end(current_offset, &all_data);
-    assert_eq!(
-        confirmed_end, followup_start,
-        "recent-stop suppression must consume only turn A and leave turn B's tail uncommitted"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(confirmed_end, followup_start, current_offset),
-        WatcherTerminalResendAction::SendFull,
-        "turn B remains uncovered and is sent normally on its pass"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(current_offset, followup_start, current_offset),
-        WatcherTerminalResendAction::SkipAlreadyCommitted,
-        "document the regression: advancing to raw batch end would falsely skip turn B"
-    );
-}
-
-#[test]
-fn post_terminal_suppression_watermark_stops_before_co_read_followup_turn() {
-    let suppressed_turn = "{\"type\":\"result\",\"result\":\"ghost A done\"}\n";
-    let followup_turn = concat!(
-        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"visible B\"}]}}\n",
-        "{\"type\":\"result\",\"result\":\"visible B\"}\n",
-    );
-    let batch_start = 30_000u64;
-    let current_offset = batch_start + (suppressed_turn.len() + followup_turn.len()) as u64;
-    let followup_start = batch_start + suppressed_turn.len() as u64;
-    let all_data =
-        unprocessed_tail_after_first_terminal(&format!("{suppressed_turn}{followup_turn}"));
-    assert_eq!(all_data, followup_turn);
-
-    let confirmed_end = suppressed_terminal_confirmed_end(current_offset, &all_data);
-    assert_eq!(
-        confirmed_end, followup_start,
-        "post-terminal suppression must consume only turn A and leave turn B's tail uncommitted"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(confirmed_end, followup_start, current_offset),
-        WatcherTerminalResendAction::SendFull,
-        "turn B remains uncovered and is sent normally on its pass"
-    );
-    assert!(
-        watcher_batch_contains_assistant_event(all_data.as_bytes()),
-        "leftover turn B must count as assistant continuation even when no new disk bytes arrive"
-    );
-    assert!(
-        !should_suppress_post_terminal_output_without_inflight(
-            true,
-            true,
-            false,
-            false,
-            watcher_batch_contains_assistant_event(all_data.as_bytes()),
-            false,
-            false,
-        ),
-        "the post-terminal no-inflight arm must not suppress leftover assistant continuation"
-    );
-    assert_eq!(
-        watcher_terminal_resend_action(current_offset, followup_start, current_offset),
-        WatcherTerminalResendAction::SkipAlreadyCommitted,
-        "document the regression: advancing to raw batch end would falsely skip turn B"
-    );
-}
-
-#[test]
-fn suppression_arms_are_wired_to_consumed_end_helper() {
-    assert_suppression_arm_uses_confirmed_end_helper(
-        "src/services/discord/tmux.rs:post_terminal_no_inflight_suppressed_output",
-    );
-    assert_suppression_arm_uses_confirmed_end_helper(
-        "src/services/discord/tmux.rs:silent_turn_suppressed_terminal_output",
-    );
-    assert_suppression_arm_uses_confirmed_end_helper(
-        "src/services/discord/tmux.rs:cancel_tombstone_suppressed_terminal_output",
-    );
-}
-
 #[test]
 fn watcher_terminal_resend_degenerate_range_defers_to_full() {
     // A zero/inverted range manufactures NO skip — it defers to the existing
@@ -1744,7 +1274,7 @@ fn watcher_terminal_resend_degenerate_range_defers_to_full() {
 }
 
 #[test]
-fn missing_structured_matched_session_jsonl_is_paused_live_for_existing_inflight() {
+fn missing_matched_session_jsonl_is_unknown_for_existing_inflight() {
     let missing_path = std::env::temp_dir().join(format!(
         "agentdesk-missing-external-jsonl-{}-{}.jsonl",
         std::process::id(),
@@ -1752,15 +1282,14 @@ fn missing_structured_matched_session_jsonl_is_paused_live_for_existing_inflight
     ));
     let _ = std::fs::remove_file(&missing_path);
     let tmux_session_name = "AgentDesk-claude-relay-test";
-    let mut state = state_for_matched_session(
+    let state = state_for_matched_session(
         ProviderKind::Claude,
         tmux_session_name,
         &missing_path.display().to_string(),
     );
-    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
 
     assert_eq!(
-        matched_session_completion_signal(&ProviderKind::Claude, Some(&state), tmux_session_name),
-        Some(crate::services::discord::turn_finalizer::CompletionSignal::PausedLive)
+        matched_session_jsonl_turn_state(&ProviderKind::Claude, Some(&state), tmux_session_name),
+        Some(crate::services::tui_turn_state::TuiTurnState::Unknown)
     );
 }

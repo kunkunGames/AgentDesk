@@ -25,10 +25,6 @@ pub(super) struct ProcessLifecycleCounters {
 pub(super) struct UiFeatureFlags {
     pub(super) placeholder_live_events_enabled: bool,
     pub(super) status_panel_v2_enabled: bool,
-    /// #3805 P2: two-message panel rollout gate (default OFF). Scaffolding —
-    /// copied into shared UI state alongside `status_panel_v2_enabled` but not
-    /// read by any path in PR-A.
-    pub(super) two_message_panel_enabled: bool,
 }
 
 /// #3479 Item 3: session state restored from persisted bot settings. Borrowed
@@ -47,7 +43,7 @@ pub(super) struct RestoredSessionState<'a> {
 /// Build all owned `SharedData` fields and wrap in an `Arc`. Side-effecting
 /// initializers (`TurnFinalizer::spawn`,
 /// `runtime_store::load_generation`, `load_queue_exit_placeholder_clears`,
-/// the `inflight_signals` and `turn_completion_events` broadcast channels) run here in the exact same order
+/// the `inflight_signals` broadcast channel) run here in the exact same order
 /// as the original inline struct literal. `bot_settings`, `services.initial_skills`,
 /// `counters.global_active`, `counters.global_finalizing`, `services.pg_pool`, and
 /// `services.engine` are consumed by move; the `restored.*` slices are borrowed
@@ -79,7 +75,6 @@ pub(super) fn run_bot_build_shared_data(
     let UiFeatureFlags {
         placeholder_live_events_enabled,
         status_panel_v2_enabled,
-        two_message_panel_enabled,
     } = flags;
     let RestoredSessionState {
         model_overrides: restored_model_overrides,
@@ -116,7 +111,6 @@ pub(super) fn run_bot_build_shared_data(
             ),
             placeholder_live_events_enabled,
             status_panel_v2_enabled,
-            two_message_panel_enabled,
         },
         // #3038 S1: wrapped verbatim at the first-member position (evaluation-order preserved).
         queued: QueuedPlaceholderState {
@@ -155,7 +149,6 @@ pub(super) fn run_bot_build_shared_data(
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
-            deferred_hook_channels: dashmap::DashMap::new(),
             recovery_started_at: std::time::Instant::now(),
             recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
             global_active,
@@ -248,11 +241,5 @@ pub(super) fn run_bot_build_shared_data(
         // before a slow listener triggers `RecvError::Lagged`. The standby
         // relay subscriber falls back to file polling on lag.
         inflight_signals: tokio::sync::broadcast::channel(256).0,
-        turn_completion_events: tokio::sync::broadcast::channel(
-            crate::services::discord::turn_completion_events::TURN_COMPLETION_EVENT_BUS_CAPACITY,
-        )
-        .0,
-        turn_view_reconciler:
-            crate::services::discord::turn_view_reconciler::TurnViewReconciler::default(),
     })
 }

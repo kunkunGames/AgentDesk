@@ -97,6 +97,7 @@ pub async fn request_generate(
     let (status_str, response_body) =
         crate::services::discord::outbound::send_to_agent::handle_send_to_agent(
             registry,
+            None,
             state.pg_pool_ref(),
             &send_body,
         )

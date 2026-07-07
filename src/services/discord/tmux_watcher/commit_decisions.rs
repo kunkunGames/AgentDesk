@@ -6,8 +6,7 @@ pub(super) fn watcher_tui_gate_blocks_lifecycle(
     gate_outcome: TuiCompletionGateOutcome,
     terminal_delivery_committed: bool,
 ) -> bool {
-    let _ = (gate_outcome, terminal_delivery_committed);
-    false
+    matches!(gate_outcome, TuiCompletionGateOutcome::TimedOut) && !terminal_delivery_committed
 }
 
 pub(super) fn watcher_commit_should_advance_runtime_binding(
@@ -75,15 +74,7 @@ pub(super) fn mark_watcher_terminal_delivery_committed(
         },
     );
     match outcome {
-        crate::services::discord::inflight::WatcherTerminalCommitOutcome::Committed => {
-            crate::services::discord::outbound::delivery_record::record_delivered_content_fingerprint(
-                provider,
-                channel_id,
-                tmux_session_name,
-                full_response,
-            );
-            true
-        }
+        crate::services::discord::inflight::WatcherTerminalCommitOutcome::Committed => true,
         crate::services::discord::inflight::WatcherTerminalCommitOutcome::Skipped => false,
         crate::services::discord::inflight::WatcherTerminalCommitOutcome::IoError => {
             tracing::warn!(
@@ -195,27 +186,27 @@ mod runtime_binding_offset_tests {
     }
 
     #[test]
-    fn busy_observation_without_delivery_still_advances_runtime_binding() {
-        assert!(watcher_commit_should_advance_runtime_binding(
+    fn tui_timeout_without_delivery_keeps_previous_runtime_binding() {
+        assert!(!watcher_commit_should_advance_runtime_binding(
             true,
-            TuiCompletionGateOutcome::BusyObserved,
+            TuiCompletionGateOutcome::TimedOut,
             false,
         ));
     }
 
     #[test]
-    fn busy_observation_without_terminal_delivery_allows_cleanup() {
+    fn tui_completion_gate_timeout_without_terminal_delivery_preserves_cleanup_for_retry() {
         let side_effects = watcher_terminal_commit_side_effects_for_test(
             true,
-            TuiCompletionGateOutcome::BusyObserved,
+            TuiCompletionGateOutcome::TimedOut,
             false,
         );
 
-        assert!(side_effects.advance_runtime_binding);
-        assert!(side_effects.advance_confirmed_end);
-        assert!(side_effects.clear_inflight);
-        assert!(side_effects.finish_restored_turn);
-        assert!(!side_effects.late_output_retry_possible);
+        assert!(!side_effects.advance_runtime_binding);
+        assert!(!side_effects.advance_confirmed_end);
+        assert!(!side_effects.clear_inflight);
+        assert!(!side_effects.finish_restored_turn);
+        assert!(side_effects.late_output_retry_possible);
 
         let confirmed = watcher_terminal_commit_side_effects_for_test(
             true,
@@ -230,10 +221,10 @@ mod runtime_binding_offset_tests {
     }
 
     #[test]
-    fn tui_completion_gate_busy_observation_after_terminal_delivery_allows_lifecycle_cleanup() {
+    fn tui_completion_gate_timeout_after_terminal_delivery_allows_lifecycle_cleanup() {
         let side_effects = watcher_terminal_commit_side_effects_for_test(
             true,
-            TuiCompletionGateOutcome::BusyObserved,
+            TuiCompletionGateOutcome::TimedOut,
             true,
         );
 

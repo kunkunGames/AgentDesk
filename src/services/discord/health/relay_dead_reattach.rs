@@ -25,7 +25,6 @@ fn should_reattach_relay_dead_watcher(
     if !recovery::stall_watchdog_should_force_clean(
         snapshot.attached,
         true,
-        false,
         snapshot.inflight_terminal_delivery_committed,
         snapshot.inflight_started_at.as_deref(),
         now_unix_secs,
@@ -135,9 +134,6 @@ mod tests {
             has_pending_queue: false,
             mailbox_active_user_msg_id: Some(1),
             inflight_terminal_delivery_committed: false,
-            inflight_identity: None,
-            inflight_finalizer_turn_id: None,
-            inflight_output_path: Some("/tmp/AgentDesk-codex-test.jsonl".to_string()),
             relay_stall_state: RelayStallState::TmuxAliveRelayDead,
             relay_health: RelayHealthSnapshot {
                 provider: "codex".to_string(),

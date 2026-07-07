@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::PolicyEngine;
+use crate::{db::Db, engine::PolicyEngine};
 
 /// Hard cutoff for "stale inflight" detection in the periodic reconcile.
 /// Anything older than this with no live tmux pane is considered abandoned.
@@ -362,6 +362,7 @@ pub(crate) async fn reconcile_boot_db_pg(
 }
 
 pub(crate) async fn reconcile_boot_runtime(
+    db: Option<&Db>,
     engine: &PolicyEngine,
     pg_pool: Option<&PgPool>,
     current_instance_id: &str,
@@ -375,12 +376,12 @@ pub(crate) async fn reconcile_boot_runtime(
     };
 
     stats.missing_review_dispatches_refired = if let Some(pool) = pg_pool {
-        refire_missing_review_dispatches_pg(pool, engine).await?
+        refire_missing_review_dispatches_pg(pool, db, engine).await?
     } else {
         0
     };
     stats.completed_queue_review_drift_recovered = if let Some(pool) = pg_pool {
-        reconcile_completed_queue_review_drift_pg(pool, engine).await?
+        reconcile_completed_queue_review_drift_pg(pool, db, engine).await?
     } else {
         0
     };
@@ -404,10 +405,11 @@ pub(crate) async fn reconcile_boot_runtime(
 
 pub(crate) async fn reconcile_completed_queue_review_drift_pg(
     pool: &PgPool,
+    db: Option<&Db>,
     engine: &PolicyEngine,
 ) -> Result<usize> {
     let drift_candidates = completed_queue_review_drift_candidates_pg(pool).await?;
-    recover_completed_queue_review_drift_pg(pool, engine, drift_candidates).await
+    recover_completed_queue_review_drift_pg(pool, db, engine, drift_candidates).await
 }
 
 pub(crate) async fn reconcile_dispatch_delivery_events_pg(
@@ -1381,6 +1383,7 @@ async fn requeue_auto_queue_pending_delivery_orphan_notify_pg(
 
 async fn refire_missing_review_dispatches_pg(
     pool: &PgPool,
+    db: Option<&Db>,
     engine: &PolicyEngine,
 ) -> Result<usize> {
     crate::pipeline::ensure_loaded();
@@ -1433,7 +1436,7 @@ async fn refire_missing_review_dispatches_pg(
             );
             continue;
         }
-        crate::kanban::drain_hook_side_effects_with_backends(engine);
+        crate::kanban::drain_hook_side_effects_with_backends(db, engine);
 
         let has_review_dispatch = active_review_dispatch_exists_pg(pool, &card_id).await?;
         if has_review_dispatch {
@@ -1451,6 +1454,7 @@ async fn refire_missing_review_dispatches_pg(
 
 async fn recover_completed_queue_review_drift_pg(
     pool: &PgPool,
+    db: Option<&Db>,
     engine: &PolicyEngine,
     drift_candidates: Vec<String>,
 ) -> Result<usize> {
@@ -1462,6 +1466,7 @@ async fn recover_completed_queue_review_drift_pg(
         }
 
         match crate::kanban::transition_status_with_opts_pg(
+            db,
             pool,
             engine,
             &card_id,
@@ -1472,7 +1477,7 @@ async fn recover_completed_queue_review_drift_pg(
         .await
         {
             Ok(_) => {
-                crate::kanban::drain_hook_side_effects_with_backends(engine);
+                crate::kanban::drain_hook_side_effects_with_backends(db, engine);
             }
             Err(error) => {
                 tracing::warn!(
@@ -1637,44 +1642,6 @@ pub(crate) fn sweep_stale_inflight_files() -> usize {
     sweep_stale_inflight_files_at(&root, STALE_INFLIGHT_MAX_AGE)
 }
 
-fn inflight_remove_log_channel_id(path: &std::path::Path) -> u64 {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
-fn inflight_remove_log_user_msg_id(path: &std::path::Path) -> u64 {
-    #[derive(serde::Deserialize)]
-    struct InflightRemoveLogFields {
-        #[serde(default)]
-        user_msg_id: u64,
-    }
-
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<InflightRemoveLogFields>(&body).ok())
-        .map(|fields| fields.user_msg_id)
-        .unwrap_or(0)
-}
-
-fn log_stale_inflight_remove(path: &std::path::Path) {
-    let provider = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown");
-    tracing::warn!(
-        target: "agentdesk::inflight_remove",
-        provider = %provider,
-        channel_id = inflight_remove_log_channel_id(path),
-        user_msg_id = inflight_remove_log_user_msg_id(path),
-        reason = "sweep_stale_inflight_files",
-        path = %path.display(),
-        "discord inflight state row removal"
-    );
-}
-
 pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Duration) -> usize {
     use std::fs;
     use std::time::SystemTime;
@@ -1748,7 +1715,6 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
             if is_managed_lifecycle {
                 continue;
             }
-            log_stale_inflight_remove(&fpath);
             if fs::remove_file(&fpath).is_ok() {
                 removed += 1;
                 tracing::info!(

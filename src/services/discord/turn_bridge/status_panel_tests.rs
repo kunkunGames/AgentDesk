@@ -1,4 +1,3 @@
-use super::super::complete_bridge_terminal_footer_or_status_panel_with_sniffer;
 use super::{
     ChannelId, InflightTurnState, MessageId, ProviderKind, StatusPanelCompletionAction,
     bridge_epilogue_identity_guards_inflight_clear, complete_status_panel_v2,
@@ -10,9 +9,8 @@ use super::{
 use crate::services::discord::formatting::ReplaceLongMessageOutcome;
 use crate::services::discord::gateway::TurnGateway;
 use crate::services::discord::inflight::{
-    GuardedClearOutcome, InflightTurnIdentity, clear_inflight_state,
-    clear_inflight_state_if_matches, clear_inflight_state_if_matches_zero_owned,
-    load_inflight_state, save_inflight_state,
+    GuardedClearOutcome, clear_inflight_state, clear_inflight_state_if_matches,
+    clear_inflight_state_if_matches_zero_owned, load_inflight_state, save_inflight_state,
 };
 use crate::services::git::GitCommand;
 use std::fs;
@@ -103,6 +101,24 @@ impl TurnGateway for StatusPanelFallbackGateway {
         _content: &'a str,
     ) -> TestGatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
         Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
     }
 
     fn schedule_retry_with_history<'a>(
@@ -589,7 +605,6 @@ async fn status_panel_fallback_completion_is_blocked_until_body_visible() {
             1_700_000_000,
             &mut last_status_panel_text,
             false,
-            false,
             "test_completion_before_body",
             1510319194921504929,
         )
@@ -615,7 +630,6 @@ async fn status_panel_fallback_completion_is_blocked_until_body_visible() {
             1_700_000_000,
             &mut last_status_panel_text,
             false,
-            false,
             "test_completion_after_body",
             1510319194921504929,
         )
@@ -629,106 +643,7 @@ async fn status_panel_fallback_completion_is_blocked_until_body_visible() {
         .expect("sent messages lock")
         .clone();
     assert_eq!(sent_messages.len(), 1);
-    assert!(sent_messages[0].contains("완료"));
-}
-
-#[tokio::test]
-async fn bridge_status_panel_completion_emits_background_agent_pending_payload() {
-    let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
-    let shared = make_status_panel_v2_shared_for_tests();
-    let gateway = StatusPanelFallbackGateway::default();
-    let provider = ProviderKind::Claude;
-    let channel_id = ChannelId::new(4_047_401);
-    let mut last_status_panel_text = String::new();
-
-    let committed = complete_status_panel_v2(
-        shared.as_ref(),
-        &gateway,
-        channel_id,
-        None,
-        &provider,
-        1_700_000_000,
-        &mut last_status_panel_text,
-        false,
-        true,
-        "test_bridge_background_agent_pending_payload",
-        4_047_402,
-    )
-    .await;
-
-    assert!(committed);
-    let rendered = shared
-        .ui
-        .placeholder_live_events
-        .render_completion_footer(channel_id, &provider, "⠸");
-    let block = rendered.block.expect("background-agent pending footer");
-
-    assert!(rendered.has_unfinished_entries);
-    assert!(block.contains("Background agents"));
-    assert!(block.contains("Waiting for background agents ⠸"));
-}
-
-#[tokio::test]
-async fn bridge_status_panel_completion_producer_threads_sniffed_background_agent_pending() {
-    for (pending, channel_raw) in [(true, 4_047_411), (false, 4_047_412)] {
-        let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
-        let shared = make_status_panel_v2_shared_for_tests();
-        let gateway = StatusPanelFallbackGateway::default();
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(channel_raw);
-        let mut last_status_panel_text = String::new();
-        let observed_tmux_session = Arc::new(Mutex::new(Vec::new()));
-        let sniffer_observed_tmux_session = observed_tmux_session.clone();
-
-        let committed = complete_bridge_terminal_footer_or_status_panel_with_sniffer(
-            shared.as_ref(),
-            &gateway,
-            channel_id,
-            MessageId::new(channel_raw + 1),
-            Some(MessageId::new(channel_raw + 2)),
-            None,
-            &provider,
-            1_700_000_000,
-            &mut last_status_panel_text,
-            false,
-            false,
-            Some("Final answer"),
-            "⠸",
-            0,
-            Some("AgentDesk-claude-status-panel-background-test".to_string()),
-            move |tmux_session_name| async move {
-                sniffer_observed_tmux_session
-                    .lock()
-                    .expect("observed tmux session lock")
-                    .push(tmux_session_name);
-                pending
-            },
-        )
-        .await;
-
-        assert!(committed);
-        assert_eq!(
-            observed_tmux_session
-                .lock()
-                .expect("observed tmux session lock")
-                .as_slice(),
-            &[Some(
-                "AgentDesk-claude-status-panel-background-test".to_string()
-            )]
-        );
-
-        let rendered = shared
-            .ui
-            .placeholder_live_events
-            .render_completion_footer(channel_id, &provider, "⠸");
-        let block_has_background_agents = rendered
-            .block
-            .as_deref()
-            .is_some_and(|block| block.contains("Background agents"));
-
-        assert_eq!(rendered.has_unfinished_entries, pending);
-        assert_eq!(block_has_background_agents, pending);
-    }
+    assert!(sent_messages[0].contains("응답 완료"));
 }
 
 #[tokio::test]
@@ -748,7 +663,6 @@ async fn status_panel_completion_fallback_posts_when_message_id_is_synthetic() {
         &provider,
         1_700_000_000,
         &mut last_status_panel_text,
-        false,
         false,
         "test_synthetic_status_panel_id",
         1510319194921504929,
@@ -770,7 +684,7 @@ async fn status_panel_completion_fallback_posts_when_message_id_is_synthetic() {
         .expect("sent messages lock")
         .clone();
     assert_eq!(sent_messages.len(), 1);
-    assert!(sent_messages[0].contains("완료"));
+    assert!(sent_messages[0].contains("응답 완료"));
     assert_eq!(last_status_panel_text, sent_messages[0]);
 
     let committed = complete_status_panel_v2(
@@ -781,7 +695,6 @@ async fn status_panel_completion_fallback_posts_when_message_id_is_synthetic() {
         &provider,
         1_700_000_000,
         &mut last_status_panel_text,
-        false,
         false,
         "test_synthetic_status_panel_id_retry",
         1510319194921504929,
@@ -832,7 +745,6 @@ async fn status_panel_completion_sends_wip_warning_before_completion_surface() {
         1_700_000_000,
         &mut last_status_panel_text,
         false,
-        false,
         "test_wip_warning_order",
         user_msg_id,
     )
@@ -848,7 +760,7 @@ async fn status_panel_completion_sends_wip_warning_before_completion_surface() {
     assert!(sent_messages[0].contains("WIP uncommitted files detected"));
     assert!(sent_messages[0].contains(&format!("Workspace: `{}`", worktree.path().display())));
     assert!(sent_messages[0].contains("Counts: 0 staged, 0 unstaged, 1 untracked."));
-    assert!(sent_messages[1].contains("완료"));
+    assert!(sent_messages[1].contains("응답 완료"));
 
     let committed_retry = complete_status_panel_v2(
         shared.as_ref(),
@@ -858,7 +770,6 @@ async fn status_panel_completion_sends_wip_warning_before_completion_surface() {
         &provider,
         1_700_000_000,
         &mut last_status_panel_text,
-        false,
         false,
         "test_wip_warning_order_retry",
         user_msg_id,
@@ -930,7 +841,6 @@ async fn status_panel_completion_fallback_posts_after_unknown_message_edit() {
         1_700_000_000,
         &mut last_status_panel_text,
         false,
-        false,
         "test_unknown_status_panel_id",
         1510319194921504929,
     )
@@ -951,75 +861,8 @@ async fn status_panel_completion_fallback_posts_after_unknown_message_edit() {
         .expect("sent messages lock")
         .clone();
     assert_eq!(sent_messages.len(), 1);
-    assert!(sent_messages[0].contains("완료"));
+    assert!(sent_messages[0].contains("응답 완료"));
     assert_eq!(last_status_panel_text, sent_messages[0]);
-}
-
-#[tokio::test]
-async fn status_panel_completion_purges_pending_bind_for_final_panel() {
-    let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
-    let shared = make_status_panel_v2_shared_for_tests();
-    let gateway = StatusPanelFallbackGateway::default();
-    let provider = ProviderKind::Claude;
-    let channel_id = ChannelId::new(3_805_401);
-    let user_msg_id = 3_805_402;
-    let panel = MessageId::new(1_500_000_000_380_540);
-    let mut state = test_inflight_state();
-    state.provider = provider.as_str().to_string();
-    state.channel_id = channel_id.get();
-    state.user_msg_id = user_msg_id;
-    state.request_owner_user_id = user_msg_id;
-    state.current_msg_id = user_msg_id + 1;
-    state.status_message_id = Some(panel.get());
-    save_inflight_state(&state).expect("save inflight state");
-    crate::services::discord::status_panel_orphan_store::enqueue_pending_bind(
-        &provider,
-        &shared.token_hash,
-        channel_id.get(),
-        panel.get(),
-        Some(InflightTurnIdentity::from_state(&state)),
-    );
-    assert_eq!(
-        crate::services::discord::status_panel_orphan_store::load_pending(
-            &provider,
-            &shared.token_hash,
-        ),
-        vec![(channel_id.get(), panel.get())]
-    );
-
-    let mut last_status_panel_text = String::new();
-    let committed = complete_status_panel_v2(
-        shared.as_ref(),
-        &gateway,
-        channel_id,
-        Some(panel),
-        &provider,
-        1_700_000_000,
-        &mut last_status_panel_text,
-        false,
-        false,
-        "test_pending_bind_completion_purge",
-        user_msg_id,
-    )
-    .await;
-
-    assert!(committed);
-    assert_eq!(
-        gateway
-            .edited_message_ids
-            .lock()
-            .expect("edited ids lock")
-            .as_slice(),
-        &[panel]
-    );
-    assert!(
-        crate::services::discord::status_panel_orphan_store::load_pending(
-            &provider,
-            &shared.token_hash,
-        )
-        .is_empty(),
-        "completion success must purge a crash-window pending_bind for the final live panel"
-    );
 }
 
 fn inflight_row_owned_by(

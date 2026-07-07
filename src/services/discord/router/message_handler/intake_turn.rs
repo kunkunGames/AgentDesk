@@ -1,8 +1,3 @@
-use super::super::super::queue_marker;
-use super::super::super::turn_view_reconciler::{
-    note_intake_turn_cleared_current as tv_clear_current,
-    note_intake_turn_started_current_with_attempt as tv_start_current_with_attempt,
-};
 use super::voice_announcement_route::route_voice_transcript_announcement_once;
 use super::*;
 
@@ -10,11 +5,22 @@ mod race_loss;
 mod turn_watchdog;
 mod voice_intake;
 
-/// Queue-marker reactions to strip when a queued turn is promoted to active.
-/// The promotion point only knows the head message id, so it clears every
-/// marker the queue gate can add (standalone, merged, and reconcile-gate).
-pub(super) const fn queue_pending_reactions_to_clear() -> [char; 3] {
-    super::super::super::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS
+/// #3182: the queue-pending reaction(s) to strip from a user message when its
+/// queued turn is dequeued and promoted to active.
+///
+/// The intake gate reacts a queued user message with `📬` (standalone queue
+/// head) or `➕` (merged into a previous head) via `queue_pending_reaction_for`.
+/// At the normal dequeue/promotion point (`handle_text_message`, `started==true`)
+/// we only know the head `user_msg_id`, not whether it carried `📬` or `➕`, so
+/// we attempt to remove BOTH candidates. Removing a reaction that was never
+/// added is a harmless no-op, and this mirrors the existing live-dispatch
+/// cleanup in `DiscordGateway::dispatch_queued_turn` (gateway.rs) and the
+/// queue-exit drain (mod.rs), both of which remove `📬` and `➕` together.
+///
+/// Returned as a fixed array so the emoji set is unit-testable without driving
+/// the full async intake path.
+pub(super) const fn queue_pending_reactions_to_clear() -> [char; 2] {
+    ['📬', '➕']
 }
 
 /// Bundle of Discord-runtime dependencies that `handle_text_message`
@@ -603,15 +609,15 @@ pub(in crate::services::discord) async fn handle_text_message(
                 }
             }
         };
-    let turn_start_attempt = if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
+    if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
         && !super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id)
     {
-        tv_start_current_with_attempt(shared, http, channel_id, user_msg_id, "intake_start")
-            .await
-            .attempt()
-    } else {
-        None
-    };
+        // Voice-originated turns use a synthetic msg id (>= 9e18) that does
+        // not correspond to a real Discord message, so add_reaction would
+        // return "Unknown Message". TTS already plays an acknowledgement
+        // for the user — the ⏳ reaction is text-intake only.
+        add_reaction(http, channel_id, user_msg_id, '⏳').await;
+    }
 
     // ── Dispatch thread auto-creation ──────────────────────────────
     // When a dispatch message arrives, create a Discord thread for
@@ -1180,7 +1186,13 @@ pub(in crate::services::discord) async fn handle_text_message(
         if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref())
             && !super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id)
         {
-            tv_clear_current(shared, http, channel_id, user_msg_id, "intake_goal").await;
+            super::super::super::formatting::remove_reaction_raw(
+                http,
+                channel_id,
+                user_msg_id,
+                '⏳',
+            )
+            .await;
         }
         consume_codex_goal_lifecycle_command(
             http,
@@ -1278,6 +1290,13 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     }
     let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id.get());
+    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
+    let reply_context = merge_reply_contexts(
+        reply_context,
+        session_retry_context
+            .as_ref()
+            .map(|context| context.formatted_context.clone()),
+    );
 
     // #1332: probe turn liveness BEFORE posting any placeholder so a queued
     // message renders the dedicated `📬 메시지 대기 중` card instead of the
@@ -1300,10 +1319,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     )
     .await;
 
-    // #3813 Phase 1a: intake latency span anchor (turn claimed; observation-only
-    // — see latency_spans.rs). Never `.log()`'d on the early returns below.
-    let mut intake_latency = super::latency_spans::IntakeLatencySpans::turn_claimed();
-
     if started
         && let Some(stale) =
             super::super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)
@@ -1324,8 +1339,13 @@ pub(in crate::services::discord) async fn handle_text_message(
             channel_id,
             user_msg_id,
         );
-        let emoji = super::super::super::queue_exit_feedback_emoji(stale.queue_exit_kind);
-        queue_marker::note_exit_feedback_added(shared, http, channel_id, user_msg_id, emoji).await;
+        super::super::super::formatting::add_reaction_raw(
+            http,
+            channel_id,
+            user_msg_id,
+            super::super::super::queue_exit_feedback_emoji(stale.queue_exit_kind),
+        )
+        .await;
         if finish.has_pending {
             super::super::super::schedule_deferred_idle_queue_kickoff(
                 shared.clone(),
@@ -1440,13 +1460,11 @@ pub(in crate::services::discord) async fn handle_text_message(
     // composes safely with the entrypoint drains.
     if queued_placeholder_handoff.is_some() && !turn_kind.is_background_trigger() {
         for emoji in queue_pending_reactions_to_clear() {
-            queue_marker::note_removed_current(
-                shared,
+            super::super::super::formatting::remove_reaction_raw(
                 http,
                 channel_id,
                 user_msg_id,
                 emoji,
-                "dequeue_head_queue_marker_clear",
             )
             .await;
         }
@@ -1484,7 +1502,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             &voice_announcement,
             reply_to_user_message,
             &dispatch_id_for_thread,
-            turn_start_attempt,
         )
         .await;
     }
@@ -1631,16 +1648,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             }
         }
     };
-    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
-    let reply_context = merge_reply_contexts(
-        reply_context,
-        session_retry_context
-            .as_ref()
-            .map(|context| context.formatted_context.clone()),
-    );
-
-    // #3813 Phase 1a: the intake placeholder POST returned a live id.
-    intake_latency.mark_placeholder_posted();
     crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
     shared
         .turn_start_times
@@ -1850,9 +1857,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         );
     }
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
-    // #3813 Phase 1a: prompt prep complete — this mark sits INSIDE the
-    // `[prompt-prep]` window below (overlaps it; do not sum — see latency_spans.rs).
-    intake_latency.mark_prep_done();
     let memory_backend_label = memory_settings.backend.as_str();
     let provider_label = match &provider {
         ProviderKind::Claude => "claude",
@@ -2079,16 +2083,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         );
                     }
                 }
-                // #3813 Phase 3 (§4 / AC#6): make the safe up-to-45s readiness
-                // wait visible so it doesn't look like a stalled session start.
-                // Borrow before `wait_readiness` moves into spawn_blocking below.
-                let _ = super::super::super::http::edit_channel_message(
-                    http,
-                    channel_id,
-                    placeholder_msg_id,
-                    readiness_wait_compact_status(&wait_readiness),
-                )
-                .await;
                 let wait_result =
                     tokio::task::spawn_blocking(move || {
                         match wait_readiness {
@@ -2198,12 +2192,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     #[cfg(unix)]
     if let Some(diagnostic) = tui_busy_diagnostic {
         let bot_owner_provider = super::super::super::resolve_discord_bot_provider(token);
-        let queue_kickoff_scheduled_by_release = release_mailbox_after_hosted_tui_busy_pre_submit(
-            shared,
-            &bot_owner_provider,
-            channel_id,
-        )
-        .await;
         let enqueue_outcome = enqueue_busy_tui_followup_for_retry(
             shared,
             &bot_owner_provider,
@@ -2286,27 +2274,17 @@ pub(in crate::services::discord) async fn handle_text_message(
                         } else {
                             '📬'
                         };
-                        queue_marker::note_added_current(
-                            shared,
-                            http,
-                            channel_id,
-                            user_msg_id,
-                            emoji,
-                            "tui_busy_pre_submit_queued",
-                        )
-                        .await;
+                        add_reaction(http, channel_id, user_msg_id, emoji).await;
                         if !shared.queued_placeholder_still_owned(
                             channel_id,
                             user_msg_id,
                             placeholder_msg_id,
                         ) {
-                            queue_marker::note_removed_current(
-                                shared,
+                            super::super::super::formatting::remove_reaction_raw(
                                 http,
                                 channel_id,
                                 user_msg_id,
                                 emoji,
-                                "tui_busy_pre_submit_queue_self_heal",
                             )
                             .await;
                         }
@@ -2336,18 +2314,21 @@ pub(in crate::services::discord) async fn handle_text_message(
         } else if enqueue_outcome.enqueued {
             let _ = channel_id.delete_message(http, placeholder_msg_id).await;
         } else {
-            apply_tui_busy_enqueue_refusal(
-                shared,
+            let notice = claude_tui_busy_followup_refusal_notice(enqueue_outcome.refusal_reason);
+            let _ = super::super::super::http::edit_channel_message(
                 http,
                 channel_id,
                 placeholder_msg_id,
-                session_retry_context.as_ref(),
-                enqueue_outcome.refusal_reason,
+                notice,
             )
             .await;
         }
-        let queue_kickoff_scheduled =
-            queue_kickoff_scheduled_by_release || enqueue_outcome.enqueued;
+        let queue_kickoff_scheduled = release_mailbox_after_hosted_tui_busy_pre_submit(
+            shared,
+            &bot_owner_provider,
+            channel_id,
+        )
+        .await;
         let mut diagnostic_json = diagnostic.to_json();
         if let Some(object) = diagnostic_json.as_object_mut() {
             object.insert(
@@ -2396,7 +2377,8 @@ pub(in crate::services::discord) async fn handle_text_message(
             "claude_tui_followup_busy_pre_submit",
             diagnostic_json,
         );
-        tv_clear_current(shared, http, channel_id, user_msg_id, "intake_busy_queue").await;
+        super::super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
+            .await;
         super::super::super::saturating_decrement_global_active(shared);
         shared.turn_start_times.remove(&channel_id);
         post_adk_session_status(
@@ -2431,10 +2413,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             .cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         super::super::super::clear_watchdog_deadline_override(channel_id.get()).await;
-        // #3813 Phase 1a: prep done but input deferred pre-submit (TUI busy) —
-        // emit the partial span (input/total render `-`); the retry re-enters
-        // intake and emits its own `submitted` span.
-        intake_latency.log(channel_id.get(), provider_label, "deferred_busy");
         return Ok(());
     }
     #[cfg(unix)]
@@ -2760,8 +2738,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     });
 
-    // #3813 Phase 1a: provider input is about to be handed to the turn bridge.
-    intake_latency.mark_input_written();
     spawn_turn_bridge(
         shared.clone(),
         cancel_token.clone(),
@@ -2811,9 +2787,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         },
     );
 
-    // #3813 Phase 1a: full intake span complete — emit the structured line + event.
-    intake_latency.log(channel_id.get(), provider_label, "submitted");
-
     if let Some(rx) = completion_rx {
         rx.await
             .map_err(|_| "queued turn completion wait failed".to_string())?;
@@ -2823,116 +2796,16 @@ pub(in crate::services::discord) async fn handle_text_message(
 }
 
 #[cfg(test)]
-mod recovery_context_take_order_tests {
-    fn recovery_context_take_call() -> String {
-        format!(
-            "{}{}",
-            "let session_retry_context = ",
-            "take_session_retry_context(shared, channel_id, Some(&turn_id));"
-        )
-    }
-
-    #[test]
-    fn recovery_context_survives_intake_stale_dispatch_abort() {
-        let root = tempfile::tempdir().expect("create temp runtime root");
-        let _env = crate::config::set_agentdesk_root_for_test(root.path());
-        let module_src = include_str!("intake_turn.rs");
-        let stale_guard_pos = module_src
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .expect("intake stale-dispatch guard exists");
-        let stale_return_pos = stale_guard_pos
-            + module_src[stale_guard_pos..]
-                .find("return Ok(());")
-                .expect("intake stale-dispatch abort return exists");
-        let take_call = recovery_context_take_call();
-        let take_pos = module_src
-            .find(&take_call)
-            .expect("intake recovery context take exists");
-
-        assert!(
-            stale_return_pos < take_pos,
-            "intake stale-dispatch abort must happen before the destructive recovery-context take"
-        );
-    }
-
-    #[test]
-    fn intake_real_turn_consumes_recovery_context_once_after_non_dispatch_guards() {
-        let root = tempfile::tempdir().expect("create temp runtime root");
-        let _env = crate::config::set_agentdesk_root_for_test(root.path());
-        let module_src = include_str!("intake_turn.rs");
-        let take_call = recovery_context_take_call();
-        let take_positions: Vec<_> = module_src.match_indices(&take_call).collect();
-        assert_eq!(
-            take_positions.len(),
-            1,
-            "intake turn start must have exactly one destructive recovery-context take"
-        );
-        let take_pos = take_positions[0].0;
-        let race_loss_return_pos = module_src
-            .find("return race_loss::handle_race_loss_enqueue(")
-            .expect("intake race-loss enqueue return exists");
-        let placeholder_posted_pos = module_src
-            .find("intake_latency.mark_placeholder_posted();")
-            .expect("intake placeholder-post success mark exists");
-        let prompt_use_pos = module_src
-            .find("if let Some(ref reply_ctx) = reply_context")
-            .expect("intake prompt includes reply context");
-        let manifest_use_pos = module_src
-            .find("let recovery_context_for_manifest =")
-            .expect("intake prompt manifest receives recovery context");
-
-        assert!(
-            race_loss_return_pos < take_pos,
-            "queued/race-loss intake turns must not destructively take recovery context before returning"
-        );
-        assert!(
-            take_pos < placeholder_posted_pos,
-            "active intake turn must take recovery context immediately after placeholder success"
-        );
-        assert!(
-            take_pos < prompt_use_pos,
-            "active intake turn must take recovery context before adding it to the prompt"
-        );
-        assert!(
-            take_pos < manifest_use_pos,
-            "active intake turn must take recovery context before prompt manifest capture"
-        );
-    }
-
-    #[test]
-    fn tui_busy_enqueue_refusal_puts_back_recovery_context_for_next_turn() {
-        // The refusal else-branch must route through the sibling helper, which
-        // puts the taken recovery context back BEFORE rewriting the refusal
-        // notice (put-back-then-notice ordering pinned in tui_followup.rs).
-        let module_src = include_str!("intake_turn.rs");
-        module_src
-            .find("} else {\n            apply_tui_busy_enqueue_refusal(")
-            .expect("TUI-busy enqueue refusal routes through the put-back helper");
-
-        let helper_src = include_str!("tui_followup.rs");
-        let helper_fn_pos = helper_src
-            .find("async fn apply_tui_busy_enqueue_refusal(")
-            .expect("refusal helper exists in tui_followup.rs");
-        let helper_body = &helper_src[helper_fn_pos..];
-        let put_back_pos = helper_body
-            .find("put_back_session_retry_context(")
-            .expect("refusal helper restores recovery context");
-        let notice_pos = helper_body
-            .find("claude_tui_busy_followup_refusal_notice(")
-            .expect("refusal helper renders the notice");
-        assert!(
-            put_back_pos < notice_pos,
-            "TUI-busy enqueue refusal, including dup-guard refusal, must restore recovery context before returning the notice"
-        );
-    }
-}
-
-#[cfg(test)]
 mod queue_pending_reaction_clear_tests {
     use super::*;
 
+    /// #3182: the dequeue cleanup must attempt to remove BOTH queue-pending
+    /// reactions — `📬` (standalone head) and `➕` (merged) — because the
+    /// promotion point only knows the head message id, not which emoji it
+    /// carried. This guards against a regression that drops one (which would
+    /// re-strand the other variant, as in the original bug).
     #[test]
-    fn clears_every_queue_marker_reaction() {
+    fn clears_both_standalone_and_merged_queue_reactions() {
         let emojis = queue_pending_reactions_to_clear();
         assert!(
             emojis.contains(&'📬'),
@@ -2942,14 +2815,10 @@ mod queue_pending_reaction_clear_tests {
             emojis.contains(&'➕'),
             "merged queue ➕ must be cleared on dequeue"
         );
-        assert!(
-            emojis.contains(&'🔄'),
-            "reconcile queue 🔄 must be cleared on dequeue"
-        );
         assert_eq!(
             emojis.len(),
-            crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS.len(),
-            "exactly the shared queue-pending emojis are cleared"
+            2,
+            "exactly the two intake-gate queue-pending emojis are cleared"
         );
     }
 

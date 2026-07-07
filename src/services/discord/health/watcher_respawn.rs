@@ -22,8 +22,8 @@
 //! `recovery_engine`/`relay_recovery` deliberately step aside with
 //! `observe_only` when they see "live turn evidence", because their contract
 //! is to never disturb a healthy turn. The STALL-WATCHDOG, by contrast, has
-//! ALREADY adjudicated this turn dead (it passed the force-clean predicate after
-//! the liveness gate allowed cleanup). Once force-clean commits, the
+//! ALREADY adjudicated this turn dead (it passed the force-clean predicate AND
+//! exhausted the positive-liveness deferral cap). Once force-clean commits, the
 //! cleanup is authoritative and therefore OWNS the recovery: it must release
 //! the stale mailbox ownership AND respawn the watcher so the still-alive tmux
 //! session keeps relaying. That is the resolution of the observe_only/cleanup
@@ -42,7 +42,6 @@
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use poise::serenity_prelude::ChannelId;
 
@@ -71,7 +70,6 @@ struct WatcherAbsenceKey {
 struct WatcherAbsenceState {
     first_seen_unix_secs: i64,
     escalated: bool,
-    minimum_initial_offset: Option<u64>,
 }
 
 static WATCHER_ABSENCE: LazyLock<dashmap::DashMap<WatcherAbsenceKey, WatcherAbsenceState>> =
@@ -93,45 +91,6 @@ pub(super) fn force_clean_should_respawn_watcher(snapshot: &WatcherStateSnapshot
         && is_agentdesk_tmux_session(snapshot.tmux_session.as_deref())
 }
 
-pub(super) fn force_clean_respawn_offset_floor(
-    snapshot: &WatcherStateSnapshot,
-    committed_frontier_for_current_generation: Option<u64>,
-) -> Option<u64> {
-    // `snapshot.last_relay_offset` is health telemetry sourced from the raw
-    // in-memory relay coord. It is not generation-fenced, so after a wrapper
-    // restart it can name the old coordinate space even when the new file has
-    // grown past that byte count. Respawn floors must only use the same-generation
-    // frontier from `committed_frontier_for_current_generation`.
-    let _unfenced_snapshot_frontier = snapshot.last_relay_offset;
-    committed_frontier_for_current_generation.filter(|offset| *offset > 0)
-}
-
-#[cfg(unix)]
-fn generation_fenced_respawn_frontier(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    snapshot: &WatcherStateSnapshot,
-) -> Option<u64> {
-    let tmux_session = snapshot.tmux_session.as_deref()?;
-    crate::services::discord::tmux::committed_frontier_for_current_generation(
-        shared,
-        channel_id,
-        tmux_session,
-    )
-}
-
-// `discord::tmux` (and the on-disk generation fence it reads) is unix-only;
-// without it there is no provable same-generation frontier, so respawn floors
-// stay disabled rather than falling back to the unfenced snapshot value.
-#[cfg(not(unix))]
-fn generation_fenced_respawn_frontier(
-    _shared: &SharedData,
-    _channel_id: ChannelId,
-    _snapshot: &WatcherStateSnapshot,
-) -> Option<u64> {
-    None
-}
-
 fn is_agentdesk_tmux_session(tmux_session: Option<&str>) -> bool {
     tmux_session.is_some_and(|session| session.starts_with("AgentDesk-"))
 }
@@ -148,29 +107,22 @@ pub(super) async fn complete_force_clean_watcher_recovery(
     channel_id: ChannelId,
     snapshot: &WatcherStateSnapshot,
     now_unix_secs: i64,
-    repair_started_at: Instant,
 ) {
     release_stale_mailbox_ownership_after_force_clean(
         shared,
         provider,
         channel_id,
         snapshot.mailbox_active_user_msg_id,
-        repair_started_at,
     )
     .await;
     if !force_clean_should_respawn_watcher(snapshot) {
         return;
     }
-    let minimum_initial_offset = force_clean_respawn_offset_floor(
-        snapshot,
-        generation_fenced_respawn_frontier(shared.as_ref(), channel_id, snapshot),
-    );
-    let watcher_spawned = respawn_watcher_after_force_clean(
+    respawn_watcher_after_force_clean(
         registry,
         provider,
         channel_id,
         snapshot.tmux_session.as_deref(),
-        minimum_initial_offset,
     )
     .await;
     // Dead-man switch: if the respawn did not (re)establish a watcher for a
@@ -183,9 +135,6 @@ pub(super) async fn complete_force_clean_watcher_recovery(
         shared.tmux_watchers.contains_key(&channel_id),
         now_unix_secs,
     );
-    if !watcher_spawned {
-        remember_watcher_absence_offset_floor(provider, channel_id, minimum_initial_offset);
-    }
 }
 
 /// Re-attempt a respawn once per watchdog tick for every channel still tracked
@@ -232,16 +181,16 @@ fn runtime_owning_watcher<'a>(
 /// and the ownership leaks, jamming every subsequent synthetic inflight.
 ///
 /// Gated on the caller having already committed force-clean (the snapshot
-/// passed the desynced + stall predicate after the liveness gate allowed cleanup), so
+/// passed the desynced + stall predicate AND the liveness deferral cap), so
 /// this never steals a genuinely live turn. `stale_user_msg_id` is the mailbox
 /// owner captured AT the stall-confirmation snapshot; the release is
-/// identity- and start-guarded (`mailbox_finish_turn_if_matches_started_before`)
-/// so that if a NEW turn claimed the mailbox in the await-gap between the old
-/// `ClearOrphanPendingToken` path (`relay_recovery.rs`) and this call, we no-op
-/// rather than cancel the new turn's token + wrongly decrement `global_active`
-/// — including a retry that reuses the same user message id. Reuses that
-/// finalizer's token-cancel / `global_active`-decrement invariants so every
-/// turn-end path stays consistent.
+/// identity-guarded (`mailbox_finish_turn_if_matches`) so that if a NEW turn
+/// claimed the mailbox in the await-gap between the old `ClearOrphanPendingToken`
+/// path (`relay_recovery.rs`) and this call, we no-op rather than cancel the
+/// new turn's token + wrongly decrement `global_active` — the same wrong-turn
+/// class the #3016 identity-guarded finalizer (`turn_finalizer/cleanup.rs`)
+/// avoids. Reuses that finalizer's token-cancel / `global_active`-decrement
+/// invariants so every turn-end path stays consistent.
 ///
 /// `None` (no owner at the snapshot) means there is nothing stale to release —
 /// any token present now is a NEW turn, so we leave it alone.
@@ -252,20 +201,13 @@ pub(super) async fn release_stale_mailbox_ownership_after_force_clean(
     provider: &ProviderKind,
     channel_id: ChannelId,
     stale_user_msg_id: Option<u64>,
-    repair_started_at: Instant,
 ) -> bool {
     let Some(stale_user_msg_id) = stale_user_msg_id else {
         return false;
     };
     let expected = poise::serenity_prelude::MessageId::new(stale_user_msg_id);
-    let finish = discord::mailbox_finish_turn_if_matches_started_before(
-        shared,
-        provider,
-        channel_id,
-        expected,
-        repair_started_at,
-    )
-    .await;
+    let finish =
+        discord::mailbox_finish_turn_if_matches(shared, provider, channel_id, expected).await;
     let Some(token) = finish.removed_token.as_ref() else {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!(
@@ -273,7 +215,7 @@ pub(super) async fn release_stale_mailbox_ownership_after_force_clean(
             provider = provider.as_str(),
             stale_user_msg_id,
             reason = FORCE_CLEAN_FINALIZER_REASON,
-            "  [{ts}] ℹ STALL-WATCHDOG: skipped stale mailbox release for channel {channel_id} — a new turn already owns the mailbox (identity/start mismatch), leaving it untouched",
+            "  [{ts}] ℹ STALL-WATCHDOG: skipped stale mailbox release for channel {channel_id} — a new turn already owns the mailbox (identity mismatch), leaving it untouched",
         );
         return false;
     };
@@ -302,16 +244,10 @@ pub(super) async fn respawn_watcher_after_force_clean(
     provider: &ProviderKind,
     channel_id: ChannelId,
     tmux_session: Option<&str>,
-    minimum_initial_offset: Option<u64>,
 ) -> bool {
     let ts = chrono::Local::now().format("%H:%M:%S");
     match registry
-        .rebind_inflight_after_force_clean(
-            provider,
-            channel_id.get(),
-            tmux_session.map(str::to_string),
-            minimum_initial_offset,
-        )
+        .rebind_inflight(provider, channel_id.get(), tmux_session.map(str::to_string))
         .await
     {
         Some(Ok(outcome)) => {
@@ -320,7 +256,6 @@ pub(super) async fn respawn_watcher_after_force_clean(
                 provider = provider.as_str(),
                 tmux_session = outcome.tmux_session,
                 initial_offset = outcome.initial_offset,
-                minimum_initial_offset = minimum_initial_offset.unwrap_or(0),
                 watcher_spawned = outcome.watcher_spawned,
                 watcher_replaced = outcome.watcher_replaced,
                 reason = FORCE_CLEAN_FINALIZER_REASON,
@@ -382,7 +317,6 @@ pub(super) fn detect_and_escalate_watcher_absence(
     let mut entry = WATCHER_ABSENCE.entry(key).or_insert(WatcherAbsenceState {
         first_seen_unix_secs: now_unix_secs,
         escalated: false,
-        minimum_initial_offset: None,
     });
     let absence_secs = saturating_age_secs(entry.first_seen_unix_secs, now_unix_secs);
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -424,53 +358,6 @@ fn watcher_ownership_expected(snapshot: &WatcherStateSnapshot) -> bool {
 
 pub(super) fn clear_watcher_absence(provider: &ProviderKind, channel_id: ChannelId) {
     WATCHER_ABSENCE.remove(&WatcherAbsenceKey::new(provider, channel_id));
-}
-
-fn remember_watcher_absence_offset_floor(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    minimum_initial_offset: Option<u64>,
-) {
-    let Some(offset) = minimum_initial_offset else {
-        return;
-    };
-    let key = WatcherAbsenceKey::new(provider, channel_id);
-    if let Some(mut state) = WATCHER_ABSENCE.get_mut(&key) {
-        state.minimum_initial_offset = Some(state.minimum_initial_offset.unwrap_or(0).max(offset));
-    }
-}
-
-fn remembered_watcher_absence_offset_floor(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-) -> Option<u64> {
-    WATCHER_ABSENCE
-        .get(&WatcherAbsenceKey::new(provider, channel_id))
-        .and_then(|state| state.minimum_initial_offset)
-}
-
-fn max_offset_floor(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn retry_minimum_initial_offset_floor(
-    remembered_floor: Option<u64>,
-    snapshot_floor: Option<u64>,
-    snapshot_available: bool,
-) -> Option<u64> {
-    // If a current snapshot exists but its committed frontier fails the
-    // generation fence, any remembered floor is also unproven in the current
-    // coordinate space. Snapshotless retries keep the remembered floor because
-    // there is no current-generation evidence to evaluate yet.
-    if snapshot_available && snapshot_floor.is_none() {
-        return None;
-    }
-    max_offset_floor(remembered_floor, snapshot_floor)
 }
 
 /// Channels currently tracked as watcher-absent for `provider`. The absence
@@ -529,8 +416,7 @@ async fn retry_pending_watcher_respawn(
     // No owner: snapshot from any runtime to read the provider+channel-global
     // inflight/tmux liveness. A `None` snapshot does NOT clear the absence — it
     // is "not yet resolvable", and the channel-aware respawn below still runs.
-    let snapshot_runtime = runtimes.first().cloned();
-    let snapshot = match snapshot_runtime.as_ref() {
+    let snapshot = match runtimes.first() {
         Some(snapshot_runtime) => {
             registry
                 .snapshot_watcher_state_for_shared(
@@ -565,21 +451,6 @@ async fn retry_pending_watcher_respawn(
     // entry for the next tick (never stranded). The tmux override falls back to
     // the persisted inflight state inside `rebind_inflight` when the snapshot is
     // `None`.
-    let snapshot_floor = match (snapshot_runtime.as_ref(), snapshot.as_ref()) {
-        (Some(snapshot_runtime), Some(snapshot)) => force_clean_respawn_offset_floor(
-            snapshot,
-            generation_fenced_respawn_frontier(snapshot_runtime.as_ref(), channel_id, snapshot),
-        ),
-        _ => None,
-    };
-    // Remembered retry floors are replayed only as `minimum_initial_offset`; the
-    // manual rebind path ignores that value when a forced initial offset resets
-    // coordinates (for example Codex-TUI truncate rebuilds).
-    let minimum_initial_offset = retry_minimum_initial_offset_floor(
-        remembered_watcher_absence_offset_floor(provider, channel_id),
-        snapshot_floor,
-        snapshot.is_some(),
-    );
     respawn_watcher_after_force_clean(
         registry,
         provider,
@@ -587,7 +458,6 @@ async fn retry_pending_watcher_respawn(
         snapshot
             .as_ref()
             .and_then(|snap| snap.tmux_session.as_deref()),
-        minimum_initial_offset,
     )
     .await;
     // Re-resolve registry-wide presence after the respawn attempt. If a snapshot
@@ -667,9 +537,6 @@ mod tests {
             has_pending_queue: false,
             mailbox_active_user_msg_id: mailbox_active,
             inflight_terminal_delivery_committed: false,
-            inflight_identity: None,
-            inflight_finalizer_turn_id: None,
-            inflight_output_path: tmux_session.map(|tmux| format!("/tmp/{tmux}.jsonl")),
             relay_stall_state: RelayStallState::TmuxAliveRelayDead,
             relay_health: RelayHealthSnapshot {
                 provider: ProviderKind::Codex.as_str().to_string(),
@@ -728,213 +595,69 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn force_clean_respawn_offset_floor_uses_generation_fenced_frontier() {
-        let mut snap = snapshot(
-            4,
-            Some("AgentDesk-claude-adk-cc"),
-            Some(true),
-            true,
-            Some(9001),
-        );
-        snap.last_relay_offset = 13_400_000;
-        assert_eq!(
-            force_clean_respawn_offset_floor(&snap, Some(14_930_326)),
-            Some(14_930_326),
-            "same-generation committed frontier is the only respawn floor source"
-        );
-        assert_eq!(
-            force_clean_respawn_offset_floor(&snap, Some(0)),
-            None,
-            "offset zero is not a useful floor"
-        );
-    }
-
-    #[cfg(unix)] // exercises the unix-only `discord::tmux` generation fence
-    #[test]
-    fn force_clean_respawn_offset_floor_ignores_stale_prior_generation_frontier() {
-        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
-        let _env = EnvRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let tmp = tempfile::tempdir().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
-
+    #[tokio::test]
+    async fn release_stale_mailbox_ownership_unjams_next_synthetic_inflight() {
         let provider = ProviderKind::Codex;
-        let channel = ChannelId::new(4_140_002);
-        let tmux_session = "AgentDesk-codex-stale-generation-floor";
-        let generation_path = std::path::PathBuf::from(
-            crate::services::tmux_common::session_temp_path(tmux_session, "generation"),
-        );
-        std::fs::create_dir_all(
-            generation_path
-                .parent()
-                .expect("generation marker has a parent directory"),
-        )
-        .expect("create runtime session directory");
-        std::fs::write(&generation_path, b"new-generation").expect("write generation marker");
-        let current_generation =
-            crate::services::discord::tmux::read_generation_file_mtime_ns(tmux_session);
-        assert_ne!(current_generation, 0, "generation marker must be readable");
-
         let shared = crate::services::discord::make_shared_data_for_tests();
-        let coord = shared.tmux_relay_coord(channel);
-        coord
-            .confirmed_end_offset
-            .store(13_400_000, Ordering::Release);
-        coord
-            .confirmed_end_generation_mtime_ns
-            .store(current_generation.saturating_sub(1), Ordering::Release);
+        let channel = ChannelId::new(3_410_201);
+        let token = std::sync::Arc::new(CancelToken::new());
+        let started = crate::services::discord::mailbox_try_start_turn(
+            &shared,
+            channel,
+            token.clone(),
+            UserId::new(7),
+            MessageId::new(1_515_137_342_367_862_825),
+        )
+        .await;
+        assert!(
+            started,
+            "seed a stale mailbox owner mirroring the #3410 jam"
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
 
-        let mut snap = snapshot(
-            channel.get(),
-            Some(tmux_session),
-            Some(true),
-            true,
-            Some(9001),
-        );
-        snap.last_relay_offset = 13_400_000;
-        snap.relay_health.last_relay_offset = 13_400_000;
-        snap.last_capture_offset = Some(14_930_326);
-        snap.relay_health.last_capture_offset = Some(14_930_326);
+        // A DIFFERENT later turn id cannot claim while the stale owner holds it
+        // — this is the `skipping TUI-direct synthetic inflight` rejection.
+        let blocked = crate::services::discord::mailbox_try_start_turn(
+            &shared,
+            channel,
+            std::sync::Arc::new(CancelToken::new()),
+            UserId::new(8),
+            MessageId::new(9_999_999),
+        )
+        .await;
+        assert!(!blocked, "stale ownership must block the next turn pre-fix");
 
-        let committed_frontier =
-            generation_fenced_respawn_frontier(shared.as_ref(), channel, &snap);
-        assert_eq!(
-            committed_frontier, None,
-            "prior-generation committed offset must not survive the generation fence"
+        let released = release_stale_mailbox_ownership_after_force_clean(
+            &shared,
+            &provider,
+            channel,
+            Some(1_515_137_342_367_862_825),
+        )
+        .await;
+        assert!(
+            released,
+            "force-clean follow-through must release ownership"
         );
-        assert_eq!(
-            force_clean_respawn_offset_floor(&snap, committed_frontier),
-            None,
-            "a stale prior-generation snapshot frontier must not floor a new-generation file that already grew past it"
-        );
-        assert_eq!(
-            retry_minimum_initial_offset_floor(Some(13_400_000), committed_frontier, true),
-            None,
-            "a remembered prior-generation floor must be dropped when a current snapshot fails the generation fence"
-        );
-        clear_watcher_absence(&provider, channel);
-    }
-
-    #[test]
-    fn remembered_absence_offset_floor_survives_snapshotless_retry() {
-        let provider = ProviderKind::Codex;
-        let channel = ChannelId::new(4_140_001);
-        clear_watcher_absence(&provider, channel);
-        WATCHER_ABSENCE.insert(
-            WatcherAbsenceKey::new(&provider, channel),
-            WatcherAbsenceState {
-                first_seen_unix_secs: 1_000_000,
-                escalated: false,
-                minimum_initial_offset: Some(13_400_000),
-            },
+        assert!(token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+        assert!(
+            crate::services::discord::mailbox_snapshot(&shared, channel)
+                .await
+                .active_user_message_id
+                .is_none(),
+            "mailbox must be free for the next synthetic inflight"
         );
 
-        assert_eq!(
-            retry_minimum_initial_offset_floor(
-                remembered_watcher_absence_offset_floor(&provider, channel),
-                None,
-                false,
-            ),
-            Some(13_400_000),
-            "retry must preserve the force-clean offset floor when re-snapshot returns None"
-        );
-        clear_watcher_absence(&provider, channel);
-    }
-
-    struct EnvRootGuard(Option<std::ffi::OsString>);
-
-    impl Drop for EnvRootGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
-
-    #[test]
-    fn release_stale_mailbox_ownership_unjams_next_synthetic_inflight() {
-        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
-        let _env = EnvRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let tmp = tempfile::tempdir().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime")
-            .block_on(async {
-                let provider = ProviderKind::Codex;
-                let shared = crate::services::discord::make_shared_data_for_tests();
-                let channel = ChannelId::new(3_410_201);
-                let token = std::sync::Arc::new(CancelToken::new());
-                let started = crate::services::discord::mailbox_try_start_turn(
-                    &shared,
-                    channel,
-                    token.clone(),
-                    UserId::new(7),
-                    MessageId::new(1_515_137_342_367_862_825),
-                )
-                .await;
-                assert!(
-                    started,
-                    "seed a stale mailbox owner mirroring the #3410 jam"
-                );
-                shared.restart.global_active.store(1, Ordering::Relaxed);
-
-                // A DIFFERENT later turn id cannot claim while the stale owner holds it
-                // — this is the `skipping TUI-direct synthetic inflight` rejection.
-                let blocked = crate::services::discord::mailbox_try_start_turn(
-                    &shared,
-                    channel,
-                    std::sync::Arc::new(CancelToken::new()),
-                    UserId::new(8),
-                    MessageId::new(9_999_999),
-                )
-                .await;
-                assert!(!blocked, "stale ownership must block the next turn pre-fix");
-
-                let mut rx =
-                    crate::services::discord::turn_completion_events::subscribe_turn_completion_events(
-                        shared.as_ref(),
-                    );
-                let released = release_stale_mailbox_ownership_after_force_clean(
-                    &shared,
-                    &provider,
-                    channel,
-                    Some(1_515_137_342_367_862_825),
-                    Instant::now(),
-                )
-                .await;
-                assert!(
-                    released,
-                    "force-clean follow-through must release ownership"
-                );
-                let event = rx
-                    .try_recv()
-                    .expect("force-clean stale mailbox release must publish a completion event");
-                assert_eq!(event.channel_id, channel);
-                assert!(token.cancelled.load(Ordering::Relaxed));
-                assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
-                assert!(
-                    crate::services::discord::mailbox_snapshot(&shared, channel)
-                        .await
-                        .active_user_message_id
-                        .is_none(),
-                    "mailbox must be free for the next synthetic inflight"
-                );
-
-                // Now the next turn's synthetic inflight can claim the channel.
-                let now_allowed = crate::services::discord::mailbox_try_start_turn(
-                    &shared,
-                    channel,
-                    std::sync::Arc::new(CancelToken::new()),
-                    UserId::new(8),
-                    MessageId::new(9_999_999),
-                )
-                .await;
-                assert!(now_allowed, "next turn must be able to claim after release");
-            });
+        // Now the next turn's synthetic inflight can claim the channel.
+        let now_allowed = crate::services::discord::mailbox_try_start_turn(
+            &shared,
+            channel,
+            std::sync::Arc::new(CancelToken::new()),
+            UserId::new(8),
+            MessageId::new(9_999_999),
+        )
+        .await;
+        assert!(now_allowed, "next turn must be able to claim after release");
     }
 
     #[tokio::test]
@@ -947,7 +670,6 @@ mod tests {
             &provider,
             channel,
             Some(7_777),
-            Instant::now(),
         )
         .await;
         assert!(!released, "idle mailbox release must be a no-op");
@@ -982,7 +704,6 @@ mod tests {
             &provider,
             channel,
             Some(1_111_111),
-            Instant::now(),
         )
         .await;
         assert!(!released, "identity mismatch must skip the release");
@@ -1009,7 +730,6 @@ mod tests {
             &provider,
             channel,
             Some(2_222_222),
-            Instant::now(),
         )
         .await;
         assert!(released_match, "matching stale identity must release");
@@ -1024,14 +744,9 @@ mod tests {
         let provider = ProviderKind::Codex;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel = ChannelId::new(3_410_207);
-        let released = release_stale_mailbox_ownership_after_force_clean(
-            &shared,
-            &provider,
-            channel,
-            None,
-            Instant::now(),
-        )
-        .await;
+        let released =
+            release_stale_mailbox_ownership_after_force_clean(&shared, &provider, channel, None)
+                .await;
         assert!(!released, "no snapshot owner ⇒ nothing stale to release");
     }
 
@@ -1048,7 +763,6 @@ mod tests {
             &provider,
             channel,
             Some("AgentDesk-codex-no-runtime"),
-            None,
         )
         .await;
         assert!(!spawned, "missing runtime must not report a spawn");
@@ -1103,7 +817,6 @@ mod tests {
             WatcherAbsenceState {
                 first_seen_unix_secs: 1_000_000,
                 escalated: false,
-                minimum_initial_offset: None,
             },
         );
         let registry = HealthRegistry::new();
@@ -1208,7 +921,6 @@ mod tests {
             WatcherAbsenceState {
                 first_seen_unix_secs: now,
                 escalated: false,
-                minimum_initial_offset: None,
             },
         );
 
@@ -1279,7 +991,6 @@ mod tests {
             WatcherAbsenceState {
                 first_seen_unix_secs: now,
                 escalated: false,
-                minimum_initial_offset: None,
             },
         );
 

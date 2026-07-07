@@ -758,6 +758,7 @@ impl PolicyEngine {
 
             for (card_id, old_status, new_status) in &transitions {
                 crate::kanban::fire_transition_hooks_with_backends(
+                    None,
                     self.pg_pool(),
                     self,
                     card_id,
@@ -1145,7 +1146,7 @@ impl PolicyEngine {
         if intents.is_empty() {
             Self::empty_intent_result()
         } else {
-            intent::execute_intents_with_backends(self.pg_pool(), Some(self), intents)
+            intent::execute_intents_with_backends(None, self.pg_pool(), Some(self), intents)
         }
     }
 

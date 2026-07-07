@@ -19,20 +19,16 @@ pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     started_at_unix: i64,
     last_status_panel_text: &mut String,
     background: bool,
-    background_agent_pending: bool,
     source: &'static str,
     expected_user_msg_id: u64,
 ) -> bool {
     if !shared.ui.status_panel_v2_enabled {
         return true;
     }
-    shared.ui.placeholder_live_events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background,
-            background_agent_pending,
-        },
-    );
+    shared
+        .ui
+        .placeholder_live_events
+        .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
     let panel_text = shared.ui.placeholder_live_events.render_status_panel(
         channel_id,
         provider,
@@ -40,15 +36,7 @@ pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     );
 
     match status_panel_completion_action(status_panel_msg_id, last_status_panel_text, &panel_text) {
-        StatusPanelCompletionAction::AlreadyCommitted => {
-            purge_pending_bind_for_completed_status_panel(
-                shared,
-                provider,
-                channel_id,
-                status_panel_msg_id,
-            );
-            true
-        }
+        StatusPanelCompletionAction::AlreadyCommitted => true,
         StatusPanelCompletionAction::SendFallback => {
             let inflight =
                 crate::services::discord::turn_end_wip_warning::load_matching_inflight_state(
@@ -104,12 +92,6 @@ pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
             match edit_result {
                 Ok(()) => {
                     *last_status_panel_text = panel_text;
-                    purge_pending_bind_for_completed_status_panel(
-                        shared,
-                        provider,
-                        channel_id,
-                        status_panel_msg_id,
-                    );
                     true
                 }
                 Err(error) => {
@@ -258,7 +240,6 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
     started_at_unix: i64,
     last_status_panel_text: &mut String,
     background: bool,
-    background_agent_pending: bool,
     source: &'static str,
     expected_inflight: (Option<u64>, Option<&super::super::InflightTurnState>),
 ) -> bool {
@@ -266,13 +247,10 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
     if !shared.ui.status_panel_v2_enabled {
         return true;
     }
-    shared.ui.placeholder_live_events.push_status_event(
-        channel_id,
-        StatusEvent::TurnCompleted {
-            background,
-            background_agent_pending,
-        },
-    );
+    shared
+        .ui
+        .placeholder_live_events
+        .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
     let panel_text = shared.ui.placeholder_live_events.render_status_panel(
         channel_id,
         provider,
@@ -280,15 +258,7 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
     );
 
     match status_panel_completion_action(status_panel_msg_id, last_status_panel_text, &panel_text) {
-        StatusPanelCompletionAction::AlreadyCommitted => {
-            purge_pending_bind_for_completed_status_panel(
-                shared.as_ref(),
-                provider,
-                channel_id,
-                status_panel_msg_id,
-            );
-            true
-        }
+        StatusPanelCompletionAction::AlreadyCommitted => true,
         StatusPanelCompletionAction::SendFallback => {
             let inflight = status_panel_wip_inflight_for_completion(
                 inflight_snapshot,
@@ -335,12 +305,6 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
             {
                 Ok(_) => {
                     *last_status_panel_text = panel_text;
-                    purge_pending_bind_for_completed_status_panel(
-                        shared.as_ref(),
-                        provider,
-                        channel_id,
-                        status_panel_msg_id,
-                    );
                     true
                 }
                 Err(error) => {
@@ -402,23 +366,6 @@ async fn complete_status_panel_v2_fallback_with_http(
             false
         }
     }
-}
-
-fn purge_pending_bind_for_completed_status_panel(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    status_panel_msg_id: Option<MessageId>,
-) {
-    let Some(message_id) = normalize_status_panel_message_id(status_panel_msg_id) else {
-        return;
-    };
-    crate::services::discord::status_panel_orphan_store::remove_pending_bind(
-        provider,
-        &shared.token_hash,
-        channel_id.get(),
-        message_id.get(),
-    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,7 +483,7 @@ fn persist_status_panel_completion_fallback_message_id(
         ..Default::default()
     };
     match super::inflight::bind_status_panel(provider, channel_id.get(), message_id.get(), &guard) {
-        super::inflight::StatusPanelBindOutcome::Bound { .. }
+        super::inflight::StatusPanelBindOutcome::Bound
         | super::inflight::StatusPanelBindOutcome::AlreadyBound
         | super::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet(_) => {}
         super::inflight::StatusPanelBindOutcome::Missing => {}
@@ -666,19 +613,3 @@ pub(super) async fn migrate_separate_status_panel_to_footer<G: TurnGateway + ?Si
 #[cfg(test)]
 #[path = "status_panel_tests.rs"]
 mod status_panel_v2_rework_tests;
-
-pub(super) fn record_status_panel_events(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    events: Vec<StatusEvent>,
-) -> bool {
-    if shared.ui.status_panel_v2_enabled && !events.is_empty() {
-        shared
-            .ui
-            .placeholder_live_events
-            .push_status_events(channel_id, events);
-        true
-    } else {
-        false
-    }
-}

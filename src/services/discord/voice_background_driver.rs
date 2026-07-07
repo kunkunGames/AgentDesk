@@ -154,6 +154,7 @@ impl VoiceBackgroundTurnDriver for AnnounceBotTranscriptDriver {
             });
             let (status, body) = super::health::send_message_with_backends_and_delivery_id(
                 &registry,
+                None::<&crate::db::Db>,
                 request.shared.pg_pool.as_ref(),
                 &target,
                 request.message_content,

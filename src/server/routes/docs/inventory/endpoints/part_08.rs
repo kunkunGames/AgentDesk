@@ -60,17 +60,13 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/turns/{channel_id}/extend-timeout",
             "queue",
-            "Extend live turn timeout",
-        )
-        .with_example(
-            json!({"path": {"channel_id": "1473922824350601297"}, "body": {"extend_secs": 1800}}),
-            json!({"ok": true, "channel_id": "1473922824350601297", "requested_extend_secs": 1800, "applied_extend_secs": 1800, "remaining_minutes": 30}),
+            "Extend live turn timeout // TODO: example",
         ),
         ep(
             "POST",
             "/api/channels/{channel_id}/monitoring",
             "monitoring",
-            "Create or update a channel monitoring status entry",
+            "Create or update a channel monitoring status entry // TODO: example",
         )
         .with_params([
             ("channel_id", path_param("Discord channel ID")),
@@ -79,37 +75,25 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 "description",
                 body_param("string", true, "Human-readable status description"),
             ),
-        ])
-        .with_example(
-            json!({"path": {"channel_id": "1473922824350601297"}, "body": {"key": "relay", "description": "Relay queue is healthy"}}),
-            json!({"status": "ok", "active_count": 1}),
-        ),
+        ]),
         ep(
             "GET",
             "/api/channels/{channel_id}/monitoring",
             "monitoring",
-            "List channel monitoring status entries",
+            "List channel monitoring status entries // TODO: example",
         )
-        .with_params([("channel_id", path_param("Discord channel ID"))])
-        .with_example(
-            json!({"path": {"channel_id": "1473922824350601297"}}),
-            json!({"status": "ok", "active_count": 1, "entries": [{"key": "relay", "description": "Relay queue is healthy"}]}),
-        ),
+        .with_params([("channel_id", path_param("Discord channel ID"))]),
         ep(
             "DELETE",
             "/api/channels/{channel_id}/monitoring/{key}",
             "monitoring",
-            "Remove a channel monitoring status entry",
+            "Remove a channel monitoring status entry // TODO: example",
         )
         .with_params([
             ("channel_id", path_param("Discord channel ID")),
             ("key", path_param("Monitoring entry key")),
-        ])
-        .with_example(
-            json!({"path": {"channel_id": "1473922824350601297", "key": "relay"}}),
-            json!({"status": "ok", "active_count": 0}),
-        ),
-        ep("GET", "/api/analytics", "analytics", "Observability counters and structured events")
+        ]),
+        ep("GET", "/api/analytics", "analytics", "Observability counters and structured events // TODO: example")
             .with_params([
                 (
                     "provider",
@@ -127,11 +111,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                     "limit",
                     query_param("integer", false, "Maximum recent events to return").with_default(100),
                 ),
-            ])
-            .with_example(
-                json!({"query": {"provider": "codex", "channelId": "1473922824350601297", "eventType": "turn_started", "limit": 25}}),
-                json!({"counters": [{"provider": "codex", "channel_id": "1473922824350601297", "turns_total": 12}], "recent_events": [{"event_type": "turn_started", "provider": "codex"}]}),
-            ),
+            ]),
         ep(
             "GET",
             "/api/analytics/invariants",
@@ -191,7 +171,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/quality/events",
             "analytics",
-            "Agent quality raw event stream",
+            "Agent quality raw event stream // TODO: example",
         )
         .with_params([
             (
@@ -206,38 +186,34 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 "limit",
                 query_param("integer", false, "Maximum recent events to return").with_default(200),
             ),
-        ])
-        .with_example(
-            json!({"query": {"agent_id": "project-agentdesk", "days": 7, "limit": 50}}),
-            json!({"events": [{"agent_id": "project-agentdesk", "event_type": "turn_completed", "quality_score": 0.95}]}),
-        ),
-        ep("GET", "/api/streaks", "analytics", "Agent activity streaks"),
-        ep("GET", "/api/achievements", "analytics", "Agent achievements"),
+        ]),
+        ep("GET", "/api/streaks", "analytics", "Agent activity streaks // TODO: example"),
+        ep("GET", "/api/achievements", "analytics", "Agent achievements // TODO: example"),
         ep(
             "GET",
             "/api/activity-heatmap",
             "analytics",
-            "Activity heatmap by hour",
+            "Activity heatmap by hour // TODO: example",
         ),
-        ep("GET", "/api/audit-logs", "analytics", "Audit logs"),
+        ep("GET", "/api/audit-logs", "analytics", "Audit logs // TODO: example"),
         ep(
             "GET",
             "/api/machine-status",
             "analytics",
-            "Machine online status",
+            "Machine online status // TODO: example",
         ),
         ep(
             "GET",
             "/api/rate-limits",
             "analytics",
-            "Cached rate limits per provider",
+            "Cached rate limits per provider // TODO: example",
         ),
-        ep("GET", "/api/receipt", "analytics", "Latest usage receipt snapshot"),
+        ep("GET", "/api/receipt", "analytics", "Latest usage receipt snapshot // TODO: example"),
         ep(
             "GET",
             "/api/token-analytics",
             "analytics",
-            "Token dashboard analytics with daily trend, heatmap, and usage breakdowns",
+            "Token dashboard analytics with daily trend, heatmap, and usage breakdowns // TODO: example",
         )
         .with_params([(
             "period",
@@ -251,11 +227,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             }
             .with_enum(&["7d", "30d", "90d"])
             .with_default("30d"),
-        )])
-        .with_example(
-            json!({"query": {"period": "30d", "fresh": "1"}}),
-            json!({"period": "30d", "summary": {"total_tokens": 12000, "total_cost": 1.23}, "daily": [], "heatmap": []}),
-        ),
+        )]),
         ep(
             "GET",
             "/api/home/kpi-trends",
@@ -289,11 +261,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/skills-trend",
             "analytics",
-            "Skill usage trend by day",
-        )
-        .with_example(
-            json!({"query": {"days": 30}}),
-            json!({"days": 30, "trend": [{"date": "2026-07-08", "skill_name": "memory-read", "calls": 4}]}),
+            "Skill usage trend by day // TODO: example",
         ),
         ep(
             "GET",
@@ -426,7 +394,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/reviews/tuning/aggregate",
             "reviews",
-            "Aggregate review-tuning outcomes",
+            "Aggregate review-tuning outcomes // TODO: example",
         ),
         ep(
             "POST",
@@ -572,57 +540,6 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "analytics",
             "Policy hook timeout and execution counters.",
         ),
-        ep(
-            "POST",
-            "/api/hook/reset-status",
-            "ops",
-            "Reset agents currently marked working back to idle and report rows updated.",
-        ),
-        ep(
-            "POST",
-            "/api/hook/skill-usage",
-            "skills",
-            "Record one skill usage event with optional agent, role, and session context.",
-        )
-        .with_params([
-            ("skill_id", body_param("string", true, "Skill identifier to record")),
-            ("agent_id", body_param("string", false, "Optional agent id")),
-            (
-                "role_id",
-                body_param(
-                    "string",
-                    false,
-                    "Optional role id used to resolve an agent when agent_id is absent",
-                ),
-            ),
-            (
-                "session_key",
-                body_param("string", false, "Optional session key associated with the usage event"),
-            ),
-        ]),
-        ep(
-            "DELETE",
-            "/api/hook/session/{sessionKey}",
-            "sessions",
-            "Mark the matching session disconnected by session key.",
-        )
-        .with_params([(
-            "sessionKey",
-            path_param("Session key to mark disconnected"),
-        )]),
-        ep(
-            "POST",
-            "/api/internal/escalation/emit",
-            "internal",
-            "Emit a manual-decision escalation for a card through the configured user-thread or PM Discord route.",
-        )
-        .with_params([
-            ("card_id", body_param("string", true, "Kanban card id to escalate")),
-            (
-                "reasons",
-                body_param("array<string>", true, "Non-empty escalation reasons"),
-            ),
-        ]),
         ep(
             "GET",
             "/api/github/pr-summary",

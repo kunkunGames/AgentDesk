@@ -43,23 +43,19 @@ pub(super) const WATCHER_BACKSTOP_TERMINAL_STREAK: u8 = 2;
 ///     dead/absent authority stays with the far horizon, never the fast path.
 ///   * live-but-`paused` (a Discord turn took the session over) → defer.
 ///   * else `watcher_backstop_signal_is_terminal` on the transcript: `Done`
-///     terminal only once the relay-space produced frontier is delivery-confirmed
-///     (or the natural far-backstop escape fires); `PausedLive` defers; `Unknown`
-///     (non-JSONL runtime) consults the pane-ready fallback ONLY at the natural
-///     deadline.
+///     terminal; `PausedLive` defers; `Unknown` (non-JSONL runtime) consults
+///     the pane-ready fallback ONLY at the natural deadline.
 pub(super) fn watcher_backstop_turn_is_terminal(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     provider: &ProviderKind,
     at_deadline: bool,
 ) -> bool {
-    let inflight_state =
-        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get());
-    let inflight_tmux = inflight_state
-        .as_ref()
-        .and_then(|state| state.tmux_session_name.as_deref());
+    let inflight_tmux =
+        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())
+            .and_then(|state| state.tmux_session_name);
     let (tmux_session_name, output_path, paused) = {
-        let handle = match inflight_tmux {
+        let handle = match inflight_tmux.as_deref() {
             Some(tmux) => shared.tmux_watchers.by_tmux_session.get(tmux),
             None => shared.tmux_watchers.get(&channel_id),
         };
@@ -79,112 +75,27 @@ pub(super) fn watcher_backstop_turn_is_terminal(
     if paused {
         return false;
     }
-    let runtime_binding =
-        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(&tmux_session_name);
-    let runtime_kind = runtime_binding
-        .as_ref()
-        .map(|binding| binding.runtime_kind)
-        .or_else(|| {
-            crate::services::tmux_common::resolve_tmux_runtime_kind_marker(&tmux_session_name)
-        });
-    let signal = completion_signal_from_transcript(
-        provider,
-        runtime_kind,
-        std::path::Path::new(&output_path),
-    );
-    let confirmed_end_offset = shared
-        .tmux_relay_coord(channel_id)
-        .confirmed_end_offset
-        .load(std::sync::atomic::Ordering::Acquire);
-    let produced_terminal_end = watcher_backstop_produced_terminal_end(
-        shared,
-        channel_id,
-        inflight_state.as_ref(),
-        &tmux_session_name,
-        &output_path,
-    )
-    .unwrap_or(confirmed_end_offset);
-    let delivery_confirmed = confirmed_end_offset >= produced_terminal_end;
-    // Bounded escape hatch: fast-path probes and pulled deadlines stay strict,
-    // but the natural far-backstop deadline may finalize a structurally Done
-    // turn even if the relay watermark never reaches the produced frontier. This
-    // bounds a dead relay to one full WATCHER_REGISTER_BACKSTOP horizon while
-    // still preventing the seconds-long fast path from clearing an undelivered
-    // produced tail.
-    let delivery_confirmed_or_natural_deadline_escape = delivery_confirmed || at_deadline;
-    if matches!(signal, CompletionSignal::Done) && !delivery_confirmed {
-        tracing::warn!(
-            channel = channel_id.get(),
-            provider = %provider.as_str(),
-            tmux_session = %tmux_session_name,
-            confirmed_end_offset,
-            produced_terminal_end,
-            at_deadline,
-            natural_deadline_escape = delivery_confirmed_or_natural_deadline_escape,
-            "watcher backstop observed Done before delivery confirmation"
-        );
-    }
+    let runtime_kind =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(&tmux_session_name)
+            .map(|binding| binding.runtime_kind)
+            .or_else(|| {
+                crate::services::tmux_common::resolve_tmux_runtime_kind_marker(&tmux_session_name)
+            });
     watcher_backstop_signal_is_terminal(
-        signal,
+        completion_signal_from_transcript(
+            provider,
+            runtime_kind,
+            std::path::Path::new(&output_path),
+        ),
         at_deadline,
-        delivery_confirmed_or_natural_deadline_escape,
         || {
-            crate::services::provider::tmux_session_fallback_ready_for_input(
-                &tmux_session_name,
-                provider,
-                runtime_kind,
-            )
-            .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
+            crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind)
+                && crate::services::provider::tmux_session_ready_for_input(
+                    &tmux_session_name,
+                    provider,
+                )
         },
     )
-}
-
-fn watcher_backstop_produced_terminal_end(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    inflight_state: Option<&crate::services::discord::inflight::InflightTurnState>,
-    tmux_session_name: &str,
-    output_path: &str,
-) -> Option<u64> {
-    let mut end = inflight_state
-        .filter(|state| {
-            state.tmux_session_name.as_deref() == Some(tmux_session_name)
-                && state.output_path.as_deref() == Some(output_path)
-        })
-        .map(|state| state.last_offset);
-
-    if let Some(state) = inflight_state {
-        let expected_key = DeliveryLeaseKey::from_inflight_state_for_site(
-            channel_id,
-            shared.restart.current_generation,
-            state,
-            "watcher_backstop_produced_terminal_end",
-        );
-        let lease_end = match shared.delivery_lease(channel_id).read() {
-            crate::services::discord::LeaseSnapshot::Leased { key, end, .. }
-            | crate::services::discord::LeaseSnapshot::Committed { key, end, .. }
-                if key == expected_key =>
-            {
-                Some(end)
-            }
-            _ => None,
-        };
-        if let Some(lease_end) = lease_end {
-            end = Some(end.unwrap_or(0).max(lease_end));
-        }
-    }
-
-    // REVIEW-ME (#4174): there is no durable "produced terminal end" field on
-    // the finalizer ledger. The defensible relay-space sources in this caller
-    // are the matching inflight row's `last_offset` (the same offset family used
-    // as delivery-lease target/end by bridge handoff paths) and any currently
-    // identity-matched delivery-lease range. We intentionally do NOT fall back
-    // to `output_path` metadata: for CodexTui the watcher path can be the
-    // provider rollout transcript, not the relay cursor, and empty/silent turns
-    // would over-defer because transcript terminator bytes are not delivered
-    // output. If neither source is present, the caller falls back to the
-    // confirmed frontier so no unknown non-output range is invented.
-    end
 }
 
 /// #3277 verify-3 — the verdict over the transcript completion signal. The
@@ -198,12 +109,11 @@ fn watcher_backstop_produced_terminal_end(
 pub(super) fn watcher_backstop_signal_is_terminal(
     signal: CompletionSignal,
     allow_pane_probe: bool,
-    delivery_confirmed: bool,
     pane_ready: impl FnOnce() -> bool,
 ) -> bool {
     match signal {
         CompletionSignal::PausedLive => false,
-        CompletionSignal::Done => delivery_confirmed,
+        CompletionSignal::Done => true,
         CompletionSignal::Unknown => allow_pane_probe && pane_ready(),
     }
 }
@@ -225,7 +135,6 @@ mod tests {
         assert!(!watcher_backstop_signal_is_terminal(
             CompletionSignal::Unknown,
             false,
-            false,
             || {
                 captured.set(true);
                 true
@@ -239,33 +148,23 @@ mod tests {
         assert!(watcher_backstop_signal_is_terminal(
             CompletionSignal::Unknown,
             true,
-            false,
             || true
         ));
         assert!(!watcher_backstop_signal_is_terminal(
             CompletionSignal::Unknown,
             true,
-            false,
             || false
         ));
-        // Done: terminal only after delivery confirmation, in both probe modes.
+        // Done / PausedLive: identical in both modes, pane never consulted.
         for probe in [false, true] {
             assert!(watcher_backstop_signal_is_terminal(
                 CompletionSignal::Done,
                 probe,
-                true,
-                || unreachable!("Done must not consult the pane")
-            ));
-            assert!(!watcher_backstop_signal_is_terminal(
-                CompletionSignal::Done,
-                probe,
-                false,
                 || unreachable!("Done must not consult the pane")
             ));
             assert!(!watcher_backstop_signal_is_terminal(
                 CompletionSignal::PausedLive,
                 probe,
-                true,
                 || unreachable!("PausedLive must not consult the pane")
             ));
         }

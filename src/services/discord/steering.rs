@@ -7,7 +7,7 @@
 //! in the parent `discord` module, reachable here via `super::` because
 //! `steering` is a child module.
 
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 
 use poise::serenity_prelude::{self as serenity, ChannelId, MessageId, UserId};
 
@@ -165,10 +165,7 @@ fn build_steer_intervention(request: &SteeringRequest) -> Intervention {
         author_id: request.author_id,
         author_is_bot: false,
         message_id: request.source_id,
-        queued_generation: crate::services::discord::runtime_store::load_generation(),
         source_message_ids: vec![request.source_id],
-        source_message_queued_generations: Vec::new(),
-        source_text_segments: Vec::new(),
         text: request.instruction.clone(),
         mode: InterventionMode::Soft,
         created_at: Instant::now(),
@@ -208,18 +205,19 @@ fn classify_enqueue_result(
 /// runs with `Data.provider` — would clear a different file than the enqueue
 /// wrote, resurrecting a cancelled steer on restart.
 pub(in crate::services::discord) async fn enqueue_steering(
-    shared: &Arc<SharedData>,
+    shared: &SharedData,
     persist_provider: &ProviderKind,
     request: SteeringRequest,
 ) -> SteeringOutcome {
     if !provider_supports_steering(&request.provider) {
         return SteeringOutcome::Unsupported;
     }
-    // Gate BEFORE enqueue so a steer targets an observed live session. This is a
+    // Gate BEFORE enqueue so a steer never starts a fresh turn. This is a
     // best-effort read (one actor hop before the enqueue): if the live turn
-    // finishes in that window, the generic enqueue helper performs the #4048
-    // enqueue-then-snapshot kick so the steer does not strand behind an already
-    // fired completion event.
+    // happens to finish in that window, the steer is left on the queue and the
+    // normal idle-kickoff path may later dispatch it as an ordinary queued
+    // message — the same benign degradation any queued intervention has. The
+    // enqueue itself never starts a turn.
     if !mailbox_has_active_turn(shared, request.channel_id).await {
         return SteeringOutcome::NoLiveSession;
     }
@@ -379,7 +377,6 @@ mod tests {
     fn enqueue_result_classification_covers_queued_and_refusals() {
         assert_eq!(classify_enqueue_result(true, None), SteeringOutcome::Queued);
         for reason in [
-            EnqueueRefusalReason::AlreadyActiveTurn,
             EnqueueRefusalReason::SourceIdAlreadyQueued,
             EnqueueRefusalReason::LastItemDedup,
             EnqueueRefusalReason::ActorUnreachable,

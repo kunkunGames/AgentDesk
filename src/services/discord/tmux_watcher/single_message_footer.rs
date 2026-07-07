@@ -5,8 +5,8 @@ use super::*;
 pub(super) fn make_owner(
     identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
     started_at_unix: i64,
-) -> crate::services::discord::footer_view_reconciler::CompletionFooterOwner {
-    crate::services::discord::footer_view_reconciler::CompletionFooterOwner::new(
+) -> crate::services::discord::single_message_panel::CompletionFooterOwner {
+    crate::services::discord::single_message_panel::CompletionFooterOwner::new(
         identity.map(|identity| identity.user_msg_id).unwrap_or(0),
         started_at_unix,
     )
@@ -16,7 +16,7 @@ pub(super) fn make_owner_now(
     identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
 ) -> (
     i64,
-    crate::services::discord::footer_view_reconciler::CompletionFooterOwner,
+    crate::services::discord::single_message_panel::CompletionFooterOwner,
 ) {
     let started_at_unix = chrono::Utc::now().timestamp();
     (started_at_unix, make_owner(identity, started_at_unix))
@@ -197,7 +197,7 @@ pub(super) async fn refresh_watcher_completion_footer_if_due(
     state: &mut WatcherCompletionFooterIdleState,
 ) {
     let has_target =
-        crate::services::discord::footer_view_reconciler::completion_footer_has_registered_target(
+        crate::services::discord::single_message_panel::completion_footer_has_registered_target(
             channel_id,
         );
     if !watcher_single_message_panel_footer_enabled(status_panel_v2_enabled)
@@ -235,15 +235,32 @@ async fn complete_watcher_single_message_terminal_no_footer(
     let Some(msg_id) = terminal_msg_id else {
         return true;
     };
-    crate::services::discord::footer_view_reconciler::note_footer_suppressed_for_tui_mirror(
-        crate::services::discord::footer_view_reconciler::FooterViewWriter::watcher(shared, http),
+    crate::services::discord::single_message_panel::completion_footer_forget_registered_target_if_message(
         channel_id,
-        Some(msg_id),
-        provider,
-        terminal_text,
-        "tmux_watcher_tui_mirror",
-    )
-    .await
+        msg_id,
+    );
+    let Some(finalized) =
+        crate::services::discord::single_message_panel::finalize_streaming_footer_with_completion(
+            terminal_text,
+            provider,
+            None,
+        )
+    else {
+        return true; // already clean prose (short-replace) — nothing to edit.
+    };
+    rate_limit_wait(shared, channel_id).await;
+    if let Err(error) =
+        crate::services::discord::http::edit_channel_message(http, channel_id, msg_id, &finalized)
+            .await
+    {
+        tracing::warn!(
+            "  ⚠ watcher: #3964 TUI-mirror footer strip failed for channel {} msg {}: {error}",
+            channel_id.get(),
+            msg_id.get()
+        );
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -252,42 +269,147 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     terminal_msg_id: Option<serenity::MessageId>,
-    owner: crate::services::discord::footer_view_reconciler::CompletionFooterOwner,
+    owner: crate::services::discord::single_message_panel::CompletionFooterOwner,
     provider: &ProviderKind,
     _started_at_unix: i64,
     terminal_text: &str,
     indicator: &str,
     background: bool,
-    background_agent_pending: bool,
 ) -> bool {
-    crate::services::discord::footer_view_reconciler::note_turn_completed_footer(
-        crate::services::discord::footer_view_reconciler::FooterViewWriter::watcher(shared, http),
+    shared.ui.placeholder_live_events.push_status_event(
         channel_id,
-        terminal_msg_id,
-        owner,
+        crate::services::agent_protocol::StatusEvent::TurnCompleted { background },
+    );
+    let rendered = shared
+        .ui
+        .placeholder_live_events
+        .render_completion_footer(channel_id, provider, indicator);
+    let Some(msg_id) = terminal_msg_id else {
+        return true;
+    };
+    if let Some(edit) =
+        crate::services::discord::single_message_panel::register_completion_footer_target_for_owner(
+            channel_id,
+            msg_id,
+            owner,
+            provider,
+            chrono::Utc::now().timestamp(),
+            terminal_text,
+            rendered.block.as_deref(),
+            rendered.has_unfinished_entries,
+        )
+    {
+        rate_limit_wait(shared, channel_id).await;
+        if let Err(error) = crate::services::discord::http::edit_channel_message(
+            http,
+            channel_id,
+            edit.message_id,
+            &edit.text,
+        )
+        .await
+        {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ watcher: completion footer supersede failed for channel {} msg {}: {error}",
+                channel_id.get(),
+                edit.message_id.get()
+            );
+        }
+    }
+    let Some(finalized) =
+        crate::services::discord::single_message_panel::finalize_streaming_footer_with_completion(
+            terminal_text,
+            provider,
+            rendered.block.as_deref(),
+        )
+    else {
+        return true;
+    };
+    let inflight = crate::services::discord::turn_end_wip_warning::load_matching_inflight_state(
         provider,
-        terminal_text,
-        indicator,
-        background,
-        background_agent_pending,
+        channel_id,
+        Some(owner.user_msg_id),
+    );
+    let _ = crate::services::discord::turn_end_wip_warning::warn_turn_end_wip_with_http(
+        http,
+        channel_id,
+        inflight.as_ref(),
         "tmux_watcher_single_message_footer",
     )
+    .await;
+    rate_limit_wait(shared, channel_id).await;
+    let edited = match crate::services::discord::http::edit_channel_message(
+        http, channel_id, msg_id, &finalized,
+    )
     .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ watcher: completion footer edit failed for channel {} msg {}: {error}",
+                channel_id.get(),
+                msg_id.get()
+            );
+            false
+        }
+    };
+    let recorded =
+        crate::services::discord::single_message_panel::completion_footer_record_committed_text_result_for_owner(
+        channel_id,
+        msg_id,
+        owner,
+        !rendered.has_unfinished_entries,
+        edited,
+        &finalized,
+        rendered.block.as_deref(),
+    );
+    // #3391: the finalize edit delivered this render's terminal marks once;
+    // evict those slot identities so subsequent footer renders (incl. #3386
+    // migration) drop the completed task AND subagent entries.
+    if edited && recorded {
+        shared
+            .ui
+            .placeholder_live_events
+            .evict_delivered_terminal_footer_tasks(channel_id, &rendered.delivered_terminal_ids);
+    }
+    edited
 }
 
 pub(super) async fn supersede_watcher_footer(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-    owner: crate::services::discord::footer_view_reconciler::CompletionFooterOwner,
+    owner: crate::services::discord::single_message_panel::CompletionFooterOwner,
 ) -> bool {
-    crate::services::discord::footer_view_reconciler::note_footer_superseded(
-        crate::services::discord::footer_view_reconciler::FooterViewWriter::watcher(shared, http),
+    let Some(edit) =
+        crate::services::discord::single_message_panel::completion_footer_supersede_registered_target_for_owner(
+            channel_id,
+            Some(owner),
+        )
+    else {
+        return false;
+    };
+    rate_limit_wait(shared, channel_id).await;
+    match crate::services::discord::http::edit_channel_message(
+        http,
         channel_id,
-        owner,
-        "tmux_watcher_supersede",
+        edit.message_id,
+        &edit.text,
     )
     .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ watcher: completion footer supersede failed for channel {} msg {}: {error}",
+                channel_id.get(),
+                edit.message_id.get()
+            );
+            false
+        }
+    }
 }
 
 pub(super) async fn refresh_watcher_registered_completion_footer(
@@ -296,14 +418,47 @@ pub(super) async fn refresh_watcher_registered_completion_footer(
     channel_id: ChannelId,
     indicator: &str,
 ) -> bool {
-    crate::services::discord::footer_view_reconciler::note_background_refresh_due(
-        crate::services::discord::footer_view_reconciler::FooterViewWriter::watcher(shared, http),
+    let Some(edit) =
+        crate::services::discord::single_message_panel::completion_footer_edit_for_registered_target(
+            shared.as_ref(),
+            channel_id,
+            indicator,
+        )
+    else {
+        return false;
+    };
+    rate_limit_wait(shared, channel_id).await;
+    if !crate::services::discord::single_message_panel::completion_footer_edit_still_registered(
+        channel_id, &edit,
+    ) {
+        return false;
+    }
+    let edited = match crate::services::discord::http::edit_channel_message(
+        http,
         channel_id,
-        None,
-        indicator,
-        "tmux_watcher_refresh",
+        edit.message_id,
+        &edit.text,
     )
     .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ watcher: completion footer refresh failed for channel {} msg {}: {error}",
+                channel_id.get(),
+                edit.message_id.get()
+            );
+            false
+        }
+    };
+    crate::services::discord::single_message_panel::completion_footer_record_edit_result_for_edit(
+        shared.as_ref(),
+        channel_id,
+        &edit,
+        edited,
+    );
+    edited
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,7 +476,6 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
     status_panel_msg_id: Option<serenity::MessageId>,
     last_status_panel_text: &mut String,
     completion_background: bool,
-    background_agent_pending: bool,
     status_panel_completion_user_msg_id: Option<u64>,
     turn_is_external_input_for_session: bool,
     // #3969 root invariant: chokepoint-fresh "this turn is a non-Managed TUI
@@ -329,14 +483,8 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
     // /loop self-paced (ExternalInput) class the stale `turn_is_external_input_for_session`
     // flag misses; never set for a Discord-origin Managed turn.
     turn_is_non_managed_tui_mirror: bool,
-    // #3805 P2 (PR-C): a newer panel epoch superseded this stale status-panel
-    // completion for the SAME owned panel (computed by the caller against the
-    // on-disk row via the shared generation staleness predicate). Only skips the
-    // status-panel branch, mirroring the sink completion guard. Inert on the
-    // default-OFF path (always false).
-    two_message_status_panel_generation_superseded: bool,
 ) {
-    if single_message_panel_footer_mode {
+    let committed = if single_message_panel_footer_mode {
         let fallback_target =
             placeholder_msg_id.map(|msg_id| WatcherCompletionFooterTerminalTarget {
                 msg_id,
@@ -363,13 +511,12 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
                 provider,
                 target_text,
             )
-            .await;
+            .await
         } else {
-            let owner =
-                crate::services::discord::footer_view_reconciler::CompletionFooterOwner::new(
-                    status_panel_completion_user_msg_id.unwrap_or(0),
-                    started_at_unix,
-                );
+            let owner = crate::services::discord::single_message_panel::CompletionFooterOwner::new(
+                status_panel_completion_user_msg_id.unwrap_or(0),
+                started_at_unix,
+            );
             let indicator =
                 crate::services::discord::single_message_panel::single_message_panel_spinner_frame(
                     *spin_idx,
@@ -386,35 +533,45 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
                 target_text,
                 indicator,
                 completion_background,
-                background_agent_pending,
             )
-            .await;
+            .await
         }
-        // Footer mode never owns a separate status panel (`status_panel_msg_id`
-        // is None here), so the panel orphan reconcile below is a no-op for it —
-        // the prior shared tail returned early via its `let Some(panel_msg_id) =
-        // status_panel_msg_id else { return }` guard. Done.
+    } else {
+        complete_watcher_status_panel_v2(
+            http,
+            shared,
+            channel_id,
+            status_panel_msg_id,
+            provider,
+            started_at_unix,
+            last_status_panel_text,
+            completion_background,
+            status_panel_completion_user_msg_id,
+        )
+        .await
+    };
+    if !turn_is_external_input_for_session {
         return;
     }
-    // #3805 P2 (PR-C): panel mode — the generation guard (skip a superseded stale
-    // edit), the status-panel completion, and the durable orphan reconcile all
-    // live in the sibling so the P2 logic stays out of this 700-capped file and
-    // shares the sink's staleness predicate (parity).
-    complete_watcher_status_panel_v2_with_generation_guard(
-        http,
-        shared,
-        channel_id,
-        provider,
-        started_at_unix,
-        status_panel_msg_id,
-        last_status_panel_text,
-        completion_background,
-        background_agent_pending,
-        status_panel_completion_user_msg_id,
-        turn_is_external_input_for_session,
-        two_message_status_panel_generation_superseded,
-    )
-    .await;
+    let Some(panel_msg_id) = status_panel_msg_id else {
+        return;
+    };
+    if committed {
+        crate::services::discord::status_panel_orphan_store::remove(
+            provider,
+            &shared.token_hash,
+            channel_id.get(),
+            panel_msg_id.get(),
+        );
+    } else {
+        enqueue_watcher_status_panel_orphan(shared.as_ref(), provider, channel_id, panel_msg_id);
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ watcher: status panel completion failed for channel {} msg {}; queued durable orphan cleanup",
+            channel_id.get(),
+            panel_msg_id.get()
+        );
+    }
 }
 
 #[cfg(test)]

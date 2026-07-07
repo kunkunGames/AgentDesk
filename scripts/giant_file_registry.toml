@@ -101,12 +101,7 @@ grandfathered_baseline_paths = [
   # land as a full [[entry]] (owner + deadline + decompose_issue) or fail the
   # generation gate.
   "src/services/discord/health/recovery.rs",
-  # inflight.rs was decomposed in #3835 (store-side CAS save/clear clusters +
-  # shared persist/lock/validate primitives moved to inflight/{save_store,
-  # clear_store,store}.rs; module root 2339 -> 914 prod LoC). No longer a
-  # prod-giant, so it is removed from the frozen baseline as well as the
-  # [[entry]] below (win-locked: a re-expanded inflight cannot be
-  # re-grandfathered — it would have to land as a full [[entry]] or shrink).
+  "src/services/discord/inflight.rs",
   "src/services/discord/meeting_orchestrator.rs",
   "src/services/discord/mod.rs",
   "src/services/discord/recovery_engine.rs",
@@ -281,13 +276,20 @@ deadline = "2026-10-31"
 decompose_issue = "#3832"
 
 [[entry]]
-# #3834 r2: restart-path scan moved out of the recovery_engine root, but the
-# verbatim `restore_inflight_turns` body remains a tracked giant until follow-up
-# slices can split the scan/session-retry internals without behavior changes.
-file = "src/services/discord/recovery_engine/restore_inflight.rs"
+# #3721 first-batch promotion: restart/runtime/manual-rebind recovery paths
+# remain in one high-risk recovery engine root.
+file = "src/services/discord/recovery_engine.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#3834"
+
+[[entry]]
+# #3721 first-batch promotion: canonical inflight JSON lifecycle and
+# identity-guarded owner APIs for relay/session/recovery paths.
+file = "src/services/discord/inflight.rs"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#3835"
 
 [[entry]]
 # #3721 first-batch promotion: Discord message intake execution mixes request
@@ -373,17 +375,6 @@ deadline = "2026-08-31"
 decompose_issue = "#3405"
 
 [[entry]]
-# Crossed the 1000-prod-LoC threshold in #3998 E13 when the turn-output
-# controller lease guard moved from `TurnKey` to `DeliveryLeaseKey` so id-0
-# delivery leases can use inflight disambiguators. Keep future controller growth
-# in narrower outbound/controller helper modules once the lease-key rollout
-# stabilizes.
-file = "src/services/discord/outbound/turn_output_controller.rs"
-owner = "discord-relay"
-deadline = "2026-08-31"
-decompose_issue = "#3405"
-
-[[entry]]
 # Crossed the 1000-prod-LoC threshold in #3635: the dead-watcher rebind-origin
 # reap added a second reap branch to the rebind-origin arm of the sweep loop
 # (the watcher-owned #897 orphan the #3581 None-owner predicate can never touch).
@@ -402,17 +393,6 @@ decompose_issue = "#3405"
 # #3779 extracted auto-heal attempt accounting into a sibling module, dropping
 # the root below the prod-giant threshold. Its entry and ratchet baseline are
 # removed to avoid a ghost registration.
-
-[[entry]]
-# Re-crossed the 1000-prod-LoC threshold in #4030: watcher-cancel recovery now
-# routes the owning turn through the finalizer Cancel path, and the paired
-# FOREIGN-inflight stale cutoff is covered from the pending-start backstop. Keep
-# future relay recovery orchestration growth honest; split action apply/finalizer
-# glue into child modules once this P0 wedge recovery path stabilizes.
-file = "src/services/discord/relay_recovery.rs"
-owner = "discord-relay"
-deadline = "2026-08-31"
-decompose_issue = "#3405"
 
 [[entry]]
 # Crossed the 1000-prod-LoC threshold in #3739: worker-local LoopOwned Tokio
@@ -436,16 +416,6 @@ file = "src/services/discord/turn_finalizer.rs"
 owner = "discord-finalizer"
 deadline = "2026-08-31"
 decompose_issue = "#3016"
-
-[[entry]]
-# Crossed the 1000-prod-LoC threshold in #4049 S4-a1: the notification-only
-# turn lifecycle reaction reconciler now owns per-target serialization plus
-# durable adder-identity sidecar state. Split persistence/test-heavy support
-# into narrower modules in slice a2 once the reconciler contract is stable.
-file = "src/services/discord/turn_view_reconciler.rs"
-owner = "discord-relay"
-deadline = "2026-08-31"
-decompose_issue = "#4049"
 
 # NOTE: src/services/discord/idle_recap.rs previously had an [[entry]] here; #3479
 # extracted the scrollback-capture/Haiku-summarizer and token-context-display
@@ -501,28 +471,6 @@ deadline = "2026-08-31"
 decompose_issue = "#3540"
 
 [[entry]]
-# Crossed the 1000-prod-LoC giant threshold in #4081 when the durable delivery
-# record sidecar gained bounded content fingerprints for degenerate watcher
-# lease-key duplicate suppression. Decomposition should split the lease,
-# delivered-frontier, owner-context, and recent-content fingerprint stores into
-# narrower outbound/delivery_record siblings.
-file = "src/services/discord/outbound/delivery_record.rs"
-owner = "discord-relay"
-deadline = "2026-10-31"
-decompose_issue = "#3405"
-
-[[entry]]
-# Crossed the 1000-prod-LoC giant threshold in #4019 R2: synthetic TUI-direct
-# claim/adoption and idle-tail cleanup now route releases through finalizer
-# authority with identity/session-key guards and preserve the global_active 1:1
-# mailbox-activation invariant. Decomposition would lift claim/adoption,
-# finalizer cleanup, and pending-start glue into narrower siblings.
-file = "src/services/discord/tui_prompt_relay/synthetic_start.rs"
-owner = "discord-relay"
-deadline = "2026-10-31"
-decompose_issue = "#4019"
-
-[[entry]]
 # Crossed the 1000-prod-LoC giant threshold in #3909: the leader-only voice
 # TTS cache/temp sweep (`ProgressTtsCacheSweepJob`) added the 15th MaintenanceJob
 # to the static registry. The file was already a razor-thin near-giant (~976
@@ -551,22 +499,3 @@ file = "src/services/tmux_common.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#3924"
-
-[[entry]]
-# Crossed the 1000-prod-LoC giant threshold in #4032 when task completion cards
-# gained Discord-limit hard clamps, fence-aware Markdown preview handling, and
-# regression coverage around result-card readability. Decomposition should lift
-# preview rendering/budgeting and card-store state into narrower siblings.
-file = "src/services/discord/tui_task_card.rs"
-owner = "discord-relay"
-deadline = "2026-10-31"
-decompose_issue = "#3405"
-
-[[entry]]
-# Crossed the 1000-prod-LoC giant threshold while catch-up phase1/phase2
-# admission semantics were aligned for #4107. Decomposition should split the
-# scan/admission commit paths from durable cleanup and checkpoint bookkeeping.
-file = "src/services/discord/catch_up.rs"
-owner = "discord-relay"
-deadline = "2026-10-31"
-decompose_issue = "#3405"

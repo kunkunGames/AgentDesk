@@ -95,11 +95,11 @@ pub(super) fn headless_terminal_delivery_should_stay_on_bridge(
 /// #3268 FIX 1 (codex blocker): true ONLY for a GENUINELY-LIVE watcher = a
 /// handle is present AND it is neither cancelled NOR heartbeat-stale.
 ///
-/// The handoff MUST gate on relay liveness (`tmux_session_live_for_relay(name)
-/// == Some(true)`), NOT on handle-presence alone. A STALE handle (heartbeat dead
-/// but not yet cancelled by the sweeper, and deliberately kept by watcher
-/// cleanup) or a cancelled handle has no real authority to finalize: handing off
-/// to it re-strands the turn (the bridge suppresses its own finalize while the
+/// The handoff MUST gate on real liveness (`tmux_session_is_stale(name) ==
+/// Some(false)`), NOT on handle-presence + `!cancel` alone. A STALE handle
+/// (heartbeat dead but not yet cancelled by the sweeper, and deliberately kept
+/// by watcher cleanup) has no real authority to finalize: handing off to it
+/// re-strands the turn (the bridge suppresses its own finalize while the
 /// far-backstop also treats the lingering paused handle as live). When the
 /// watcher is stale / cancelled / absent this returns `false` so the bridge
 /// finalizes exactly as before — never a handoff to a dead watcher.
@@ -110,7 +110,7 @@ pub(super) fn genuinely_live_watcher_for_relay(
     tmux_watchers
         .channel_binding(&owner_channel_id)
         .map(|binding| {
-            tmux_watchers.tmux_session_live_for_relay(&binding.tmux_session_name) == Some(true)
+            tmux_watchers.tmux_session_is_stale(&binding.tmux_session_name) == Some(false)
         })
         .unwrap_or(false)
 }
@@ -424,10 +424,7 @@ pub(super) fn maybe_hand_off_busy_turn_to_watcher(
             let delivered_len = inflight_state.full_response.len();
             inflight_state.response_sent_offset = delivered_len;
             inflight_state.terminal_delivery_committed = true;
-            let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                inflight_state,
-                "turn_bridge::watcher_handoff::proven_delivered",
-            );
+            let _ = save_inflight_state(inflight_state);
             return;
         }
         emit_post_gate_handoff_pending_response_visibility(
@@ -451,10 +448,7 @@ pub(super) fn maybe_hand_off_busy_turn_to_watcher(
         // Persist watcher ownership so a later recovery rehydrates with the
         // correct relay owner (mirrors the watcher-unpause sites).
         inflight_state.set_relay_owner_kind(RelayOwnerKind::Watcher);
-        let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-            inflight_state,
-            "turn_bridge::watcher_handoff::watcher_ownership",
-        );
+        let _ = save_inflight_state(inflight_state);
         // Register the turn as watcher-owned in the single-authority ledger
         // BEFORE unpausing (the modern replacement for the legacy
         // `mailbox_finalize_owed` publish, phase-5b2): (a) makes the delegated

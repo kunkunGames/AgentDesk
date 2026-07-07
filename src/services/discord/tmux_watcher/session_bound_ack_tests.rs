@@ -49,85 +49,6 @@ fn relay_slot_guard_release_is_idempotent_and_does_not_clobber_reacquire() {
     );
 }
 
-#[test]
-fn resolve_time_drop_span_degrades_delivered_terminal_ownership() {
-    let metrics =
-        std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-    let target = SessionBoundRelayAckTarget {
-        metrics: metrics.clone(),
-        sequence: 12,
-        turn_start_offset: Some(100),
-    };
-    metrics.record_terminal_committed_sequence_for_test(12);
-
-    let mut turn_fully_mirrored = true;
-    let ack_outcome = session_bound_ack_outcome_after_resolve_time_mirror_check(
-        SessionBoundRelayAckOutcome::Delivered,
-        &mut turn_fully_mirrored,
-        Some(&target),
-        Some(9),
-    );
-    assert_eq!(ack_outcome, SessionBoundRelayAckOutcome::Delivered);
-    assert!(turn_fully_mirrored);
-    assert!(
-        turn_fully_mirrored && matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered),
-        "no drop in the forwarded span leaves the terminal-owning decision unchanged"
-    );
-
-    // Model the ACK-wait window: the sink has already recorded this terminal
-    // frame as Delivered, but a later enqueue evicted an earlier frame from the
-    // same turn before the watcher resolves ownership.
-    metrics.record_dropped_sequence_for_test(10);
-    let mut turn_fully_mirrored = true;
-    let ack_outcome = session_bound_ack_outcome_after_resolve_time_mirror_check(
-        SessionBoundRelayAckOutcome::Delivered,
-        &mut turn_fully_mirrored,
-        Some(&target),
-        Some(9),
-    );
-    assert_eq!(
-        ack_outcome,
-        SessionBoundRelayAckOutcome::Dropped,
-        "a delivered terminal ACK is forced through fallback when the turn span lost a frame"
-    );
-    assert!(
-        !turn_fully_mirrored,
-        "resolve-time span drop degrades fully_mirrored before final ownership"
-    );
-    assert!(
-        !(turn_fully_mirrored && matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered)),
-        "the session-bound relay must not own terminal delivery after span eviction"
-    );
-}
-
-#[test]
-fn resolve_time_drop_span_ignores_prior_turn_drops() {
-    let metrics =
-        std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-    let target = SessionBoundRelayAckTarget {
-        metrics: metrics.clone(),
-        sequence: 12,
-        turn_start_offset: Some(100),
-    };
-    metrics.record_terminal_committed_sequence_for_test(12);
-    metrics.record_dropped_sequence_for_test(8);
-
-    let mut turn_fully_mirrored = true;
-    let ack_outcome = session_bound_ack_outcome_after_resolve_time_mirror_check(
-        SessionBoundRelayAckOutcome::Delivered,
-        &mut turn_fully_mirrored,
-        Some(&target),
-        Some(9),
-    );
-
-    assert_eq!(ack_outcome, SessionBoundRelayAckOutcome::Delivered);
-    assert!(turn_fully_mirrored);
-    assert!(
-        turn_fully_mirrored && matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered),
-        "a drop before this turn's first forwarded sequence leaves ownership unchanged"
-    );
-}
-
 /// #3579: the `NotAttempted` vs `MissingTarget` sentinel split. `NotAttempted`
 /// is the watcher-owned NON-attempt (the ack-wait block was skipped); it must
 /// stay DISTINCT from the genuine `MissingTarget` failure (the ack-wait ran but
@@ -208,7 +129,7 @@ mod inflight_sink_marker_gate {
     };
     use crate::services::discord::turn_finalizer::TurnKey;
     use crate::services::discord::{
-        DeliveryLeaseCell, DeliveryLeaseKey, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
+        DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
     };
     use serenity::model::id::ChannelId;
 
@@ -218,8 +139,8 @@ mod inflight_sink_marker_gate {
     const COMMITTED_BELOW_END: u64 = 100;
     const NOW: u64 = 50_000;
 
-    fn turn() -> DeliveryLeaseKey {
-        DeliveryLeaseKey::from_turn_key(TurnKey::new(ChannelId::new(7201), 9, 0))
+    fn turn() -> TurnKey {
+        TurnKey::new(ChannelId::new(7201), 9, 0)
     }
 
     /// Unleased → behaves EXACTLY as the ungated reconciliation (SendFull when
@@ -248,7 +169,7 @@ mod inflight_sink_marker_gate {
     fn leased_sink_fresh_waits_in_flight() {
         let snap = LeaseSnapshot::Leased {
             holder: LeaseHolder::Sink,
-            key: turn(),
+            turn: turn(),
             deadline_ms: NOW + 5_000, // fresh: deadline strictly in the future
             start: START,
             end: END,
@@ -265,7 +186,7 @@ mod inflight_sink_marker_gate {
     fn leased_sink_expired_reclaims_and_sends_full() {
         let snap = LeaseSnapshot::Leased {
             holder: LeaseHolder::Sink,
-            key: turn(),
+            turn: turn(),
             deadline_ms: NOW, // expired: now >= deadline
             start: START,
             end: END,
@@ -287,7 +208,7 @@ mod inflight_sink_marker_gate {
     fn committed_sink_delivered_covered_skips() {
         let snap = LeaseSnapshot::Committed {
             holder: LeaseHolder::Sink,
-            key: turn(),
+            turn: turn(),
             start: START,
             end: END,
             outcome: LeaseOutcome::Delivered,
@@ -306,7 +227,7 @@ mod inflight_sink_marker_gate {
     fn committed_sink_not_delivered_sends_full() {
         let snap = LeaseSnapshot::Committed {
             holder: LeaseHolder::Sink,
-            key: turn(),
+            turn: turn(),
             start: START,
             end: END,
             outcome: LeaseOutcome::NotDelivered,
@@ -329,7 +250,7 @@ mod inflight_sink_marker_gate {
     fn committed_sink_below_end_sends_full_regardless_of_label() {
         let snap = LeaseSnapshot::Committed {
             holder: LeaseHolder::Sink,
-            key: turn(),
+            turn: turn(),
             start: START,
             end: END,
             outcome: LeaseOutcome::Delivered,
@@ -346,7 +267,7 @@ mod inflight_sink_marker_gate {
     fn leased_by_watcher_defers_to_reconciliation() {
         let snap = LeaseSnapshot::Leased {
             holder: LeaseHolder::Watcher { instance_id: 1 },
-            key: turn(),
+            turn: turn(),
             deadline_ms: NOW + 5_000,
             start: START,
             end: END,
@@ -367,7 +288,7 @@ mod inflight_sink_marker_gate {
     fn committed_covered_skips_for_non_sink() {
         let snap = LeaseSnapshot::Leased {
             holder: LeaseHolder::Bridge,
-            key: turn(),
+            turn: turn(),
             deadline_ms: NOW + 1,
             start: START,
             end: END,
@@ -385,11 +306,11 @@ mod inflight_sink_marker_gate {
     fn dead_sink_marker_reclaimed_then_resent_no_blackhole() {
         let ch = ChannelId::new(7202);
         let cell = DeliveryLeaseCell::new(ch);
-        let sink_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, 9, 0));
+        let sink_turn = TurnKey::new(ch, 9, 0);
         let now = lease_now_ms();
         let deadline = now.saturating_add(10);
         // Sink set the marker then "died" (no heartbeat renews it).
-        assert!(cell.try_acquire(sink_turn.clone(), LeaseHolder::Sink, START, END, deadline));
+        assert!(cell.try_acquire(sink_turn, LeaseHolder::Sink, START, END, deadline));
 
         // The gate, observed at a time PAST the deadline, decides reclaim+SendFull.
         let past = deadline.saturating_add(1);
@@ -403,7 +324,7 @@ mod inflight_sink_marker_gate {
         // replacement watcher re-acquires and re-delivers (no black-hole).
         assert!(cell.reclaim_if_expired(past));
         assert!(matches!(cell.read(), LeaseSnapshot::Unleased));
-        let watcher_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, 9, 0));
+        let watcher_turn = TurnKey::new(ch, 9, 0);
         assert!(
             cell.try_acquire(
                 watcher_turn,
@@ -424,17 +345,17 @@ mod inflight_sink_marker_gate {
     fn reclaim_then_late_sink_commit_cannot_corrupt_lease() {
         let ch = ChannelId::new(7203);
         let cell = DeliveryLeaseCell::new(ch);
-        let sink_turn = DeliveryLeaseKey::from_turn_key(TurnKey::new(ch, 9, 0));
+        let sink_turn = TurnKey::new(ch, 9, 0);
         let now = lease_now_ms();
         let deadline = now.saturating_add(10);
-        assert!(cell.try_acquire(sink_turn.clone(), LeaseHolder::Sink, START, END, deadline));
+        assert!(cell.try_acquire(sink_turn, LeaseHolder::Sink, START, END, deadline));
 
         // Watcher reclaims the expired sink marker and re-acquires the SAME range.
         let past = deadline.saturating_add(1);
         assert!(cell.reclaim_if_expired(past));
         let watcher_holder = LeaseHolder::Watcher { instance_id: 1 };
         assert!(cell.try_acquire(
-            sink_turn.clone(),
+            sink_turn,
             watcher_holder,
             START,
             END,
@@ -446,7 +367,7 @@ mod inflight_sink_marker_gate {
         assert!(
             !cell.commit(
                 LeaseHolder::Sink,
-                sink_turn.clone(),
+                sink_turn,
                 START,
                 END,
                 LeaseOutcome::Delivered
@@ -454,7 +375,7 @@ mod inflight_sink_marker_gate {
             "a late sink commit must NOT act on the watcher's lease"
         );
         assert!(
-            !cell.release(LeaseHolder::Sink, sink_turn.clone(), START, END),
+            !cell.release(LeaseHolder::Sink, sink_turn, START, END),
             "a late sink release must NOT free the watcher's lease"
         );
         // The watcher's lease is intact and committable by its true holder.

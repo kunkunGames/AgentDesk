@@ -836,6 +836,7 @@ pub(crate) trait DispatchTransport: Send + Sync {
 
     fn send_dispatch(
         &self,
+        db: Option<crate::db::Db>,
         agent_id: String,
         title: String,
         card_id: String,
@@ -844,6 +845,7 @@ pub(crate) trait DispatchTransport: Send + Sync {
 
     fn send_review_followup(
         &self,
+        db: Option<crate::db::Db>,
         review_dispatch_id: String,
         card_id: String,
         channel_id_num: u64,

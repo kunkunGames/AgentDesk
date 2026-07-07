@@ -13,7 +13,7 @@ use super::session_panel::{SessionPanelSnapshot, render_session_panel_line};
 use super::status_events::{is_schedule_wakeup_tool, parse_eta_secs};
 use super::subagent_summary::render_subagent_done_summary;
 use super::task_panel::{
-    STUCK_BACKGROUND_TASK_TTL, TaskPanelSnapshot, TaskToolSlot, finish_background_task_tool_slot,
+    TaskPanelSnapshot, TaskToolSlot, finish_background_task_tool_slot,
     force_abort_stuck_background_task_slots, render_task_panel_line, render_task_tool_slot,
     take_slot_ordinal, task_tool_slot_is_unfinished_background, upsert_background_task_tool_slot,
     upsert_task_tool_slot,
@@ -32,7 +32,6 @@ pub(super) struct SubagentSlot {
     /// #3084: Task tool-use id that opened this slot, so `SubagentEnd` closes the
     /// exact slot among parallels instead of the first unfinished one.
     pub(super) tool_use_id: Option<String>,
-    agent_id: Option<String>,
     /// #3086: TUI-parity accounting from the finishing `SubagentEnd`; drives the
     /// `Done (N tools · M tokens · Xs)` summary on the render line.
     summary: Option<SubagentSummary>,
@@ -42,9 +41,6 @@ pub(super) struct SubagentSlot {
     /// #3391: monotonic, never-reused per-entry slot id (mirrors
     /// `TaskToolSlot::ordinal`) backing slot-identity subagent eviction.
     ordinal: u64,
-    /// #4177: monotonic creation instant. Turn-boundary reconciliation force-aborts
-    /// a stuck background subagent older than `STUCK_BACKGROUND_TASK_TTL`.
-    pub(super) started_at: std::time::Instant,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) enum DerivedStatus {
@@ -52,6 +48,8 @@ pub(super) enum DerivedStatus {
     Running,
     MonitorWait,
     ScheduleWakeup(Option<u64>),
+    TerminalDeliveryPending,
+    TerminalDeliveryUnconfirmed,
     Completed {
         kind: CompletedKind,
     },
@@ -97,21 +95,9 @@ pub(super) struct StatusPanelState {
     // #3477 item 3: instant the turn entered `Completed` (None until then); vs the
     // store's `last_recent_event_at` it gates the late-batch 🖥️ Recent freshness.
     pub(super) completed_at: Option<std::time::Instant>,
-    pub(super) background_agent_pending: bool,
     // #3811: intake-set original-request user_msg_id; drives the `요청:` deeplink
     // (`None` for headless/synthetic/voice/id-0 — no real Discord message).
     pub(super) request_user_msg_id: Option<u64>,
-    // #3983 item4: dedup token for the one-shot session banner. Holds the
-    // identity (session_instance_key, falling back to provider_session_id, then
-    // the rendered line) of the session whose banner was already emitted, so the
-    // dual-path refresh (sink + watcher) posts the top banner EXACTLY ONCE per
-    // session. `None` until the first banner for this channel is claimed; a new
-    // session identity (new spawn nonce / provider session) makes the stored key
-    // stale and re-arms the claim for the next session boundary. This is
-    // bookkeeping only and is intentionally excluded from the `session ==
-    // snapshot` boundary compare in `set_session_panel_snapshot` (which compares
-    // the `session` field alone).
-    session_banner_emitted_key: Option<String>,
 }
 
 impl StatusPanelState {
@@ -125,47 +111,14 @@ impl StatusPanelState {
         self.subagents.clear();
         self.workflows.clear();
         self.completed_at = None; // #3477 item 3: drop the stale freshness gate.
-        self.background_agent_pending = false;
         self.request_user_msg_id = None; // #3811: new session = new request context.
-    }
-
-    /// #3983 item4: atomically claim the one-shot session banner for the CURRENT
-    /// session snapshot, returning the rendered session line EXACTLY ONCE per
-    /// session identity. The identity is the stable `session_instance_key` (the
-    /// per-spawn nonce marker), falling back to the provider session id, then the
-    /// rendered line itself when neither id is available. A repeat call for the
-    /// same identity — the sibling refresh path arriving second, or a later
-    /// status tick — returns `None`; a NEW session identity (new spawn / provider
-    /// session) makes the stored key stale so the next boundary re-emits. `None`
-    /// when there is no session snapshot to banner.
-    ///
-    /// Callers hold the per-channel `StatusPanelState` mutex across this call, so
-    /// the read-current-identity + compare-and-record is a single atomic step:
-    /// whichever of the sink/watcher refresh paths reaches it FIRST for a given
-    /// session wins the banner, and the other observes the recorded key and skips
-    /// (no double emit, no omission).
-    pub(super) fn claim_session_banner(&mut self, provider: &ProviderKind) -> Option<String> {
-        let session = self.session.as_ref()?;
-        let line = render_session_panel_line(session, provider);
-        let key = session
-            .session_instance_key()
-            .map(str::to_owned)
-            .or_else(|| session.provider_session_id().map(str::to_owned))
-            .unwrap_or_else(|| line.clone());
-        if self.session_banner_emitted_key.as_deref() == Some(key.as_str()) {
-            return None;
-        }
-        self.session_banner_emitted_key = Some(key);
-        Some(line)
     }
 
     pub(super) fn reset_turn_content_preserving_unfinished_footer_residuals(&mut self) -> bool {
         // #3473: turn-boundary reconciliation — force a TTL-expired stuck
         // background task to `aborted` BEFORE the retain filter so it is dropped
         // here instead of sitting ⏳ forever.
-        let now = std::time::Instant::now();
-        force_abort_stuck_background_task_slots(&mut self.tasks, now);
-        force_abort_stuck_subagent_slots(&mut self.subagents, now);
+        force_abort_stuck_background_task_slots(&mut self.tasks, std::time::Instant::now());
         let tasks = self
             .tasks
             .iter()
@@ -182,7 +135,6 @@ impl StatusPanelState {
         *self = StatusPanelState {
             tasks,
             subagents,
-            background_agent_pending: self.background_agent_pending,
             // #3391: carry the counter so a residual ordinal is never reissued.
             next_slot_ordinal: self.next_slot_ordinal,
             request_user_msg_id: self.request_user_msg_id, // #3811: survive turn reset
@@ -210,7 +162,6 @@ impl StatusPanelState {
             StatusEvent::SubagentStart {
                 subagent_type,
                 desc,
-                agent_id,
                 tool_use_id,
                 background,
             } => {
@@ -220,7 +171,6 @@ impl StatusPanelState {
                 // description with the `subagent`/`Task` placeholders.
                 let provided_desc = desc.filter(|value| !value.trim().is_empty());
                 let provided_type = subagent_type.filter(|value| !value.trim().is_empty());
-                let provided_agent_id = agent_id.filter(|value| !value.trim().is_empty());
                 // A background `SubagentStart` re-affirms (and #3920: PROMOTES) the
                 // still-running slot for this tool-use id. Matching ANY unfinished
                 // slot — not only an already-background one — lets an async/
@@ -242,9 +192,6 @@ impl StatusPanelState {
                     if let Some(desc) = provided_desc {
                         slot.desc = desc;
                     }
-                    if let Some(agent_id) = provided_agent_id {
-                        slot.agent_id = Some(agent_id);
-                    }
                     let running_desc = slot.desc.clone();
                     self.status = DerivedStatus::SubagentRunning { desc: running_desc };
                     return;
@@ -259,10 +206,8 @@ impl StatusPanelState {
                     finished: None,
                     tool_use_id,
                     summary: None,
-                    agent_id: provided_agent_id,
                     background,
                     ordinal,
-                    started_at: std::time::Instant::now(),
                 });
                 self.status = DerivedStatus::SubagentRunning { desc };
                 trim_subagents(&mut self.subagents);
@@ -286,40 +231,29 @@ impl StatusPanelState {
             } => self.set_subagent_activity(tool_use_id, summary),
             StatusEvent::SubagentEnd {
                 success,
-                agent_id,
-                desc,
                 tool_use_id,
                 summary,
                 ack_only,
             } => {
-                // #3084/#4177: real subagent lifecycle records pair start->finish by
-                // exact Task `tool_use_id`; if an id-bearing completion misses, do
-                // not guess another unfinished slot.
+                // #3084: close the id-matching slot (pairs a long-running subagent
+                // to its own result among parallels); else first-unfinished.
                 let id = tool_use_id.as_deref();
                 let matched = id.and_then(|id| {
                     self.subagents.iter().rposition(|slot| {
                         slot.finished.is_none() && slot.tool_use_id.as_deref() == Some(id)
                     })
                 });
-                // #3086 P1 / #3359: ack-only id-bearing ends are safe only
-                // on an exact id match; genuine id-bearing completions may use
-                // a unique agent-id/description fallback (#4177).
-                let fallback = (!ack_only && id.is_some())
-                    .then(|| {
-                        match_subagent_end_fallback(
-                            &self.subagents,
-                            agent_id.as_deref(),
-                            desc.as_deref(),
-                        )
-                    })
-                    .flatten();
+                // #3086 P1 / #3359: a summary/id-bearing ack-only end is safe only
+                // on an exact id match; id-less legacy acks close only id-less slots.
+                let has_summary = summary.as_ref().is_some_and(|s| !s.is_empty());
                 let target = match matched {
                     Some(index) => Some(index),
-                    None if id.is_some() => fallback,
+                    None if id.is_some() => None,
                     None if ack_only => self
                         .subagents
                         .iter()
                         .rposition(|slot| slot.finished.is_none() && slot.tool_use_id.is_none()),
+                    None if has_summary && id.is_some() => None,
                     None => self
                         .subagents
                         .iter()
@@ -468,15 +402,12 @@ impl StatusPanelState {
                     self.status = DerivedStatus::Running;
                 }
             }
-            StatusEvent::TurnCompleted {
-                background,
-                background_agent_pending,
-            } => {
+            StatusEvent::TurnCompleted { background } => {
                 self.status = DerivedStatus::Completed {
                     kind: CompletedKind::from_background(background),
                 };
-                self.background_agent_pending = background_agent_pending;
-                self.completed_at = Some(std::time::Instant::now()); // #3477 item 3
+                // #3477 item 3: stamp the late-batch freshness gate.
+                self.completed_at = Some(std::time::Instant::now());
             }
             StatusEvent::Heartbeat => {
                 if matches!(self.status, DerivedStatus::Running) {
@@ -527,12 +458,15 @@ impl StatusPanelState {
 
 pub(super) fn render_status_panel(
     snapshot: StatusPanelState,
+    live_block: Option<String>,
     provider: &ProviderKind,
-    // #3983 item 2: precomputed `마지막 업데이트 : … / 턴 시작 : …` time line (line 2).
-    time_line: String,
-    // #3983 item 3: precomputed `턴 트리거:` deeplink, appended as the LAST footer
-    // line (or `None` for headless/synthetic/id-0 turns with no real user message).
-    turn_trigger_line: Option<String>,
+    started_at_unix: i64,
+    _heartbeat_at_unix: i64,
+    // #3477 item 3: live batch arrived AFTER `completed_at` → a Completed turn
+    // keeps 🖥️ Recent (late batch not blanked; stale idle block still dropped).
+    live_content_fresh: bool,
+    request_anchor_line: Option<String>, // #3811: precomputed `요청:` line, or `None`
+    confidence_line: Option<String>,     // #3812: precomputed live/stale confidence line
 ) -> String {
     let header_status = if matches!(provider, ProviderKind::Codex)
         && matches!(snapshot.status, DerivedStatus::SubagentRunning { .. })
@@ -541,23 +475,19 @@ pub(super) fn render_status_panel(
     } else {
         snapshot.status.clone()
     };
-    // #3983: line 1 = derived-status ACTIVITY label, line 2 = relative TIME line
-    // (both built in the colocated `freshness` module — status_panel.rs is at the
-    // namespace cap). The pre-#3983 confidence line + `진행 중 — provider` header is
-    // retired (item 2); the request anchor no longer prepends here (item 3, see the
-    // trailing `턴 트리거:` push below).
-    let mut sections = vec![
-        super::freshness::render_activity_line(&header_status),
-        time_line,
-    ];
+    // #3812: header + freshness confidence line built in the colocated `freshness`
+    // module (status_panel.rs is at the namespace cap — keep it to the call site).
+    let mut sections = vec![super::freshness::render_status_header(
+        &header_status,
+        provider,
+        started_at_unix,
+        confidence_line.as_deref(),
+    )];
+    super::turn_anchor::prepend_request_anchor(&mut sections, request_anchor_line); // #3811
 
-    // #3983 item4: the session line is NO LONGER rendered in the every-tick
-    // footer. It is emitted once, at the top, per session boundary via
-    // `StatusPanelState::claim_session_banner` (see `session_banner.rs`), so the
-    // repeated per-tick footer echo of `🆕 새 세션 시작 · provider session … · tmux …`
-    // is retired. `render_session_panel_line` is now used only by that one-shot
-    // banner claim. Track A's 3-line header (activity / time / 턴 트리거) is
-    // unaffected.
+    if let Some(session) = snapshot.session.as_ref() {
+        sections.push(render_session_panel_line(session, provider));
+    }
 
     if let Some(task) = snapshot.task.as_ref() {
         sections.push(render_task_panel_line(task));
@@ -588,8 +518,23 @@ pub(super) fn render_status_panel(
         sections.push(format!("Plan\n{}", lines.join("\n")));
     }
 
-    // #3983 item 5a: the compact 🖥️ Recent + host block is removed from the footer
-    // (the terminal echo is retired from the status panel entirely).
+    // #3477 item 4: 🖥️ Recent renders BEFORE Tasks/Subagents/Workflow (top
+    // signal + shielded from the trailing-section footer-budget drop — item 3).
+    let cluster_config = &crate::config::load_graceful().cluster;
+    let recent_header = render_recent_section_header(
+        snapshot.task.as_ref(),
+        cluster_config.enabled,
+        cluster_config.instance_id.as_deref(),
+    );
+    // #3394 self-contained fenced section (overflow drops it whole). #3477 item 3:
+    // a Completed turn suppresses it only when stale; a fresh late batch shows.
+    let completed = matches!(header_status, DerivedStatus::Completed { .. });
+    if (!completed || live_content_fresh)
+        && let Some(block) = live_block.filter(|block| !block.trim().is_empty())
+    {
+        sections.push(format!("{recent_header}\n{block}"));
+    }
+
     if !snapshot.tasks.is_empty() {
         let lines = snapshot
             .tasks
@@ -627,13 +572,6 @@ pub(super) fn render_status_panel(
         }
     }
 
-    // #3983 item 3: the `턴 트리거:` original-request deeplink is the LAST footer
-    // line (it previously prepended above the header). Absent for headless /
-    // synthetic / id-0 turns that carry no real Discord user message.
-    if let Some(trigger) = turn_trigger_line.filter(|line| !line.trim().is_empty()) {
-        sections.push(trigger);
-    }
-
     truncate_status_panel_sections(sections)
 }
 
@@ -657,6 +595,29 @@ pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> Strin
         return repair_fence_parity(&joined);
     }
     repair_fence_parity(&truncate_chars(&joined, STATUS_PANEL_MAX_CHARS))
+}
+
+pub(super) fn render_recent_section_header(
+    task: Option<&TaskPanelSnapshot>,
+    cluster_enabled: bool,
+    local_instance_id: Option<&str>,
+) -> String {
+    if !cluster_enabled {
+        return "🖥️ Recent".to_string();
+    }
+    let dispatch_owner = task
+        .and_then(|task| task.owner_instance_id.as_deref())
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty());
+    let owner = dispatch_owner.or_else(|| {
+        local_instance_id
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+    });
+    match owner {
+        Some(owner) => format!("🖥️ Recent ({})", escape_status_panel_markdown(owner)),
+        None => "🖥️ Recent".to_string(),
+    }
 }
 
 pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {
@@ -715,80 +676,13 @@ impl SubagentSlot {
     }
 }
 
-/// #4177: at a turn boundary, force any background subagent slot that is still
-/// unfinished AND older than `STUCK_BACKGROUND_TASK_TTL` to terminal failed. Its
-/// terminal notification never arrived, so it would otherwise survive every
-/// residual-preserving reset as a ghost running entry. Returns the number swept.
-pub(super) fn force_abort_stuck_subagent_slots(
-    slots: &mut [SubagentSlot],
-    now: std::time::Instant,
-) -> usize {
-    let mut swept = 0usize;
-    for slot in slots.iter_mut() {
-        if slot.is_unfinished_background()
-            && now.saturating_duration_since(slot.started_at) >= STUCK_BACKGROUND_TASK_TTL
-        {
-            slot.finished = Some(false);
-            swept += 1;
-        }
-    }
-    if swept != 0 {
-        tracing::info!(
-            target: "agentdesk::discord::live_panel",
-            swept_subagents = swept,
-            ttl_secs = STUCK_BACKGROUND_TASK_TTL.as_secs(),
-            "#4177: swept stuck background subagent slots"
-        );
-    }
-    swept
-}
-
-fn match_subagent_end_fallback(
-    slots: &[SubagentSlot],
-    agent_id: Option<&str>,
-    desc: Option<&str>,
-) -> Option<usize> {
-    if let Some(agent_id) = clean_match_key(agent_id) {
-        match unique_unfinished_subagent(slots, |slot| slot.agent_id.as_deref() == Some(agent_id)) {
-            Ok(Some(index)) => return Some(index),
-            Err(()) => return None,
-            Ok(None) => {}
-        }
-    }
-    let desc = clean_match_key(desc)?;
-    unique_unfinished_subagent(slots, |slot| slot.desc == desc).ok()?
-}
-
-fn unique_unfinished_subagent(
-    slots: &[SubagentSlot],
-    mut matches: impl FnMut(&SubagentSlot) -> bool,
-) -> Result<Option<usize>, ()> {
-    let mut found = None;
-    for (index, slot) in slots.iter().enumerate().rev() {
-        if slot.finished.is_none() && matches(slot) {
-            if found.is_some() {
-                return Err(());
-            }
-            found = Some(index);
-        }
-    }
-    Ok(found)
-}
-
-fn clean_match_key(raw: Option<&str>) -> Option<&str> {
-    raw.map(str::trim).filter(|value| !value.is_empty())
-}
-
 fn sanitize_label(raw: &str) -> String {
     sanitized_tool_name(raw).unwrap_or_else(|| "Task".to_string())
 }
 
 fn trim_subagents(slots: &mut Vec<SubagentSlot>) {
-    while slots.len() > STATUS_PANEL_SUBAGENT_LIMIT {
-        let remove_index = slots
-            .iter()
-            .position(|slot| slot.finished.is_some())
-            .unwrap_or(0);
-        slots.remove(remove_index);
+    if slots.len() > STATUS_PANEL_SUBAGENT_LIMIT {
+        let excess = slots.len() - STATUS_PANEL_SUBAGENT_LIMIT;
+        slots.drain(0..excess);
     }
 }

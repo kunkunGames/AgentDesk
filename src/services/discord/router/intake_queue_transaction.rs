@@ -114,10 +114,7 @@ impl SoftInterventionSpec {
             author_id: self.author_id,
             author_is_bot: self.author_is_bot,
             message_id: self.message_id,
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![self.message_id],
-            source_message_queued_generations: Vec::new(),
-            source_text_segments: Vec::new(),
             text: self.text,
             mode: InterventionMode::Soft,
             created_at: Instant::now(),
@@ -299,11 +296,7 @@ pub(super) trait IntakeQueueCommitEffects {
 }
 
 pub(super) fn queue_pending_reaction_for(outcome: &MailboxEnqueueOutcome) -> char {
-    if outcome.merged {
-        super::super::queue_reactions::QUEUE_MERGED_PENDING_REACTION
-    } else {
-        super::super::queue_reactions::QUEUE_STANDALONE_PENDING_REACTION
-    }
+    if outcome.merged { '➕' } else { '📬' }
 }
 
 pub(super) async fn commit_soft_intervention_transaction<E>(
@@ -620,9 +613,7 @@ mod tests {
             ..FakeEffects::default()
         };
         let mut options = IntakeQueueCommitOptions::default();
-        options.pending_reaction = IntakeQueuePendingReactionPolicy::Static(
-            super::super::super::queue_reactions::QUEUE_RECONCILE_PENDING_REACTION,
-        );
+        options.pending_reaction = IntakeQueuePendingReactionPolicy::Static('🔄');
 
         let outcome = commit_soft_intervention_transaction(&mut effects, request(options)).await;
 

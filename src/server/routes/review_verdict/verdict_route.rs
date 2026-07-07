@@ -131,7 +131,15 @@ fn review_dispatch_allows_late_failed_verdict(dispatch: &serde_json::Value) -> b
 }
 
 fn review_state_sync_pg_first(state: &AppState, payload: &serde_json::Value) -> String {
-    crate::engine::ops::review_state_sync_with_backends(state.pg_pool_ref(), &payload.to_string())
+    crate::engine::ops::review_state_sync_with_backends(
+        review_verdict_db(state),
+        state.pg_pool_ref(),
+        &payload.to_string(),
+    )
+}
+
+fn review_verdict_db(_state: &AppState) -> Option<&crate::db::Db> {
+    None
 }
 
 async fn enforce_session_reset_dilemma_fallback(
@@ -271,6 +279,7 @@ pub async fn submit_verdict(
     }
 
     let dispatch = match crate::dispatch::load_dispatch_row_with_backends(
+        review_verdict_db(&state),
         state.pg_pool_ref(),
         &body.dispatch_id,
     ) {
@@ -465,6 +474,7 @@ pub async fn submit_verdict(
         &["pending", "dispatched"][..]
     };
     let updated = match crate::dispatch::set_dispatch_status_with_backends(
+        review_verdict_db(&state),
         state.pg_pool_ref(),
         &body.dispatch_id,
         "completed",
@@ -484,6 +494,7 @@ pub async fn submit_verdict(
 
     if updated == 0 {
         let current_status = crate::dispatch::load_dispatch_row_with_backends(
+            review_verdict_db(&state),
             state.pg_pool_ref(),
             &body.dispatch_id,
         )
@@ -505,16 +516,19 @@ pub async fn submit_verdict(
     }
 
     // Find associated card
-    let card_id =
-        crate::dispatch::load_dispatch_row_with_backends(state.pg_pool_ref(), &body.dispatch_id)
-            .ok()
-            .flatten()
-            .and_then(|dispatch| {
-                dispatch
-                    .get("kanban_card_id")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-            });
+    let card_id = crate::dispatch::load_dispatch_row_with_backends(
+        review_verdict_db(&state),
+        state.pg_pool_ref(),
+        &body.dispatch_id,
+    )
+    .ok()
+    .flatten()
+    .and_then(|dispatch| {
+        dispatch
+            .get("kanban_card_id")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+    });
 
     // #100: stamp release marker AFTER dispatch update confirmed, BEFORE hooks.
     // This ensures: (1) stale/duplicate submissions don't write markers (updated==0 already returned),
@@ -523,6 +537,7 @@ pub async fn submit_verdict(
         if let Err(e) = stamp_review_passed_marker(effective_commit.as_deref()) {
             // Roll back the dispatch status since we can't complete the pass flow
             let _ = crate::dispatch::set_dispatch_status_with_backends(
+                review_verdict_db(&state),
                 state.pg_pool_ref(),
                 &body.dispatch_id,
                 "dispatched",
@@ -544,6 +559,7 @@ pub async fn submit_verdict(
     // Fire event hooks for review verdict (#134 — pipeline-defined events)
     if let Some(ref cid) = card_id {
         crate::kanban::fire_event_hooks_with_backends(
+            None,
             &state.engine,
             "on_review_verdict",
             "OnReviewVerdict",
@@ -566,6 +582,7 @@ pub async fn submit_verdict(
             }
             for (t_card_id, old_s, new_s) in &transitions {
                 crate::kanban::fire_transition_hooks_with_backends(
+                    None,
                     state.pg_pool_ref(),
                     &state.engine,
                     t_card_id,

@@ -61,10 +61,11 @@ async fn schedule_post_cancel_queue_drain(
 /// specifically to clear stale drafts so the next dispatch is not blocked
 /// by a 45s `wait_for_prompt_ready` timeout.
 ///
-/// A force cancel must still work when the live session row is already gone.
-/// With a live mailbox actor, disk cleanup is serialized inside
-/// `PurgeQueue`; without one, remove the persisted queue file for this
-/// channel directly across the provider's token namespaces.
+/// A force cancel must still work when the live session row is already gone
+/// and no `session_key` can be resolved. In that case we use a deterministic
+/// fallback persistence namespace for the actor call, and separately remove
+/// any persisted queue file for this channel across the provider's token
+/// namespaces.
 async fn force_purge_channel_mailbox(
     health_registry: Option<&Arc<HealthRegistry>>,
     target: &TurnLifecycleTarget,
@@ -72,13 +73,17 @@ async fn force_purge_channel_mailbox(
 ) -> Option<usize> {
     let provider = target.provider.as_ref()?;
     let channel_id = target.channel_id?;
+    let disk_files_removed =
+        crate::services::turn_orchestrator::remove_channel_pending_queue_files_all_tokens(
+            provider, channel_id,
+        );
+    let token_hash = session_key
+        .and_then(SessionIdentity::parse)
+        .and_then(|identity| identity.token_hash)
+        .unwrap_or_else(|| format!("force-purge-channel-{}", channel_id.get()));
     let Some(handle) =
         crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel_id)
     else {
-        let disk_files_removed =
-            crate::services::turn_orchestrator::remove_channel_pending_queue_files_all_tokens(
-                provider, channel_id,
-            );
         tracing::info!(
             provider = provider.as_str(),
             channel_id = channel_id.get(),
@@ -87,10 +92,6 @@ async fn force_purge_channel_mailbox(
         );
         return Some(0);
     };
-    let token_hash = session_key
-        .and_then(SessionIdentity::parse)
-        .and_then(|identity| identity.token_hash)
-        .unwrap_or_default();
     let persistence = crate::services::turn_orchestrator::QueuePersistenceContext::new(
         provider,
         &token_hash,
@@ -107,7 +108,7 @@ async fn force_purge_channel_mailbox(
         provider = provider.as_str(),
         channel_id = channel_id.get(),
         purged,
-        disk_files_removed = purge.disk_files_removed,
+        disk_files_removed,
         cleared_active_anchor = purge.cleared_active_anchor,
         session_key,
         "force purged channel mailbox queue"
@@ -900,10 +901,7 @@ mod tests {
             author_id: UserId::new(1),
             author_is_bot: false,
             message_id: MessageId::new(message_id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
-            source_message_queued_generations: Vec::new(),
-            source_text_segments: Vec::new(),
             text: text.to_string(),
             mode: InterventionMode::Soft,
             created_at: Instant::now(),

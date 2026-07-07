@@ -36,27 +36,6 @@ pub(in crate::services::discord) fn bridge_streaming_rollover_should_skip(
     )
 }
 
-/// #3813 Phase 1b: should the streaming status-edit gate open on this loop pass?
-///
-/// The default gate opens only once every `status_interval` (default 5s), which
-/// forces the very first assistant answer to wait up to that interval before it
-/// reaches Discord. This predicate adds a single-shot fast lane: when the FIRST
-/// non-empty assistant text portion is observed (`!first_answer_relayed &&
-/// !current_portion_empty`), the gate opens immediately regardless of the
-/// interval, so the opening answer is relayed without the 5s delay.
-///
-/// After that first non-empty edit the caller flips `first_answer_relayed`, so
-/// every subsequent pass falls back to the pure `elapsed_ge_interval` throttle —
-/// the fast lane never fires twice and status/tool-only passes (empty portion)
-/// never consume it.
-pub(in crate::services::discord) fn bridge_streaming_edit_gate_open(
-    elapsed_ge_interval: bool,
-    first_answer_relayed: bool,
-    current_portion_empty: bool,
-) -> bool {
-    elapsed_ge_interval || (!first_answer_relayed && !current_portion_empty)
-}
-
 fn build_provider_streaming_placeholder_text(
     current_portion: &str,
     status_block: &str,
@@ -128,9 +107,10 @@ pub(in crate::services::discord) fn bridge_claude_tui_followup_requeue_prompt_er
 /// drives already delivers the response, so a requeue re-injects a second copy →
 /// duplicate prose relay.
 ///
-/// The first cut of #3885 gated this on a CHANNEL-SCOPED busy probe: suppress
-/// whenever the pane was busy. That probe has ZERO correlation to *which* turn
-/// is streaming, so it conflated two cases:
+/// The first cut of #3885 gated this on a CHANNEL-SCOPED busy probe
+/// (`idle_queue_blocked_by_hosted_tui_busy_pane`): suppress whenever the pane was
+/// busy. That probe has ZERO correlation to *which* turn is streaming, so it
+/// conflated two cases:
 ///   - (A) the SAME input is the streaming/just-completed turn → requeue dups
 ///     (must suppress), and
 ///   - (B) a DIFFERENT prior turn occupies the pane while a genuinely-unsubmitted
@@ -145,9 +125,9 @@ pub(in crate::services::discord) fn bridge_claude_tui_followup_requeue_prompt_er
 /// [`claude_tui_followup_same_input_occupies_pane`]): the same input already
 /// landed (streaming or just-completed) so the response is covered. A
 /// different/absent anchor means the follow-up is genuinely unsubmitted, so it
-/// STILL requeues and stays preserved in the mailbox. Dispatch remains blocked
-/// by the active-turn snapshot guard until finalization publishes the completion
-/// event that kicks the drain. This preserves the original dup-prevention for
+/// STILL requeues — the deferred idle-queue kickoff is itself gated on pane-busy,
+/// so a case-(B) follow-up is DEFERRED behind the occupying turn (preserved in
+/// the mailbox), not dropped. This preserves the original dup-prevention for
 /// case (A) without the case-(B) drop or the already-completed dup.
 ///
 /// `requeue_candidate` is the base decision (feature enabled + readiness-timeout
@@ -320,41 +300,6 @@ mod streaming_edit_text_tests {
 
         assert_eq!(rendered, "⠙ 계속 처리 중");
     }
-
-    // ---- #3813 Phase 1b: first-output fast-lane status-edit gate ----
-    //
-    // Truth table over (elapsed_ge_interval, first_answer_relayed,
-    // current_portion_empty): the fast lane opens the gate exactly once — for the
-    // first non-empty assistant text before the interval elapses — and otherwise
-    // defers to the pure interval throttle.
-    #[test]
-    fn fast_lane_opens_for_first_non_empty_answer_before_interval() {
-        // First non-empty assistant text, interval not yet reached → fast lane
-        // opens the gate so the opening answer is not delayed up to 5s.
-        assert!(bridge_streaming_edit_gate_open(false, false, false));
-    }
-
-    #[test]
-    fn fast_lane_stays_closed_for_status_only_before_interval() {
-        // No assistant body yet (status/tool-only change), interval not reached →
-        // gate stays closed so status-only passes never consume the fast lane.
-        assert!(!bridge_streaming_edit_gate_open(false, false, true));
-    }
-
-    #[test]
-    fn fast_lane_not_reused_after_first_answer_before_interval() {
-        // First answer already relayed, interval not reached → gate closed, i.e.
-        // subsequent streaming edits return to the normal throttle.
-        assert!(!bridge_streaming_edit_gate_open(false, true, false));
-    }
-
-    #[test]
-    fn interval_elapsed_always_opens_gate_preserving_legacy_behavior() {
-        // Once the interval has elapsed the gate always opens, regardless of the
-        // fast-lane inputs — the pre-existing throttle behavior is preserved.
-        assert!(bridge_streaming_edit_gate_open(true, true, false));
-        assert!(bridge_streaming_edit_gate_open(true, false, true));
-    }
 }
 
 #[cfg(test)]
@@ -488,9 +433,9 @@ mod pre_submission_tui_prompt_error_tests {
     fn different_or_absent_pane_input_still_requeues_so_followup_is_deferred_not_dropped() {
         // (1a): a DIFFERENT prior turn occupies the pane (or it is quiescent) and
         // this follow-up's prompt never reached the TUI. The candidate must stay
-        // true so the follow-up is requeued, preserved behind the live turn, and
-        // kicked by the completion event instead of letting the suppressed path
-        // finalize it as a transport-error drop.
+        // true so the follow-up is requeued — the deferred idle-queue kickoff
+        // (gated on pane-busy) defers it behind the occupying turn rather than
+        // letting the suppressed path finalize it as a transport-error drop.
         assert!(claude_tui_followup_requeue_streaming_aware(true, false));
     }
 

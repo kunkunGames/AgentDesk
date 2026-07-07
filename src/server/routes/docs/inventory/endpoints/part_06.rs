@@ -9,81 +9,49 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "DELETE",
             "/api/dispatched-sessions/gc-threads",
             "dispatched-sessions",
-            "Garbage-collect orphaned thread sessions",
-        )
-        .with_example(
-            json!({}),
-            json!({"ok": true, "gc_threads": 2}),
+            "Garbage-collect orphaned thread sessions // TODO: example",
         ),
         ep(
             "PATCH",
             "/api/dispatched-sessions/{id}",
             "dispatched-sessions",
-            "Update dispatched session",
-        )
-        .with_example(
-            json!({"path": {"id": 42}, "body": {"status": "working", "active_dispatch_id": "dispatch-1", "model": "gpt-5", "tokens": 1024}}),
-            json!({"ok": true}),
+            "Update dispatched session // TODO: example",
         ),
         ep(
             "POST",
             "/api/dispatched-sessions/webhook",
             "dispatched-sessions",
-            "Session webhook",
-        )
-        .with_example(
-            json!({"body": {"session_key": "mac-mini:AgentDesk-codex-adk-cdx", "agent_id": "project-agentdesk", "status": "working", "provider": "codex", "dispatch_id": "dispatch-1"}}),
-            json!({"ok": true, "session_key": "mac-mini:AgentDesk-codex-adk-cdx"}),
+            "Session webhook // TODO: example",
         ),
         ep(
             "DELETE",
             "/api/dispatched-sessions/webhook",
             "dispatched-sessions",
-            "Delete session webhook state",
-        )
-        .with_example(
-            json!({"query": {"session_key": "mac-mini:AgentDesk-codex-adk-cdx", "provider": "codex"}}),
-            json!({"ok": true, "deleted": true}),
+            "Delete session webhook state // TODO: example",
         ),
         ep(
             "GET",
             "/api/dispatched-sessions/claude-session-id",
             "dispatched-sessions",
-            "Resolve Claude session id by session key",
-        )
-        .with_example(
-            json!({"query": {"session_key": "mac-mini:AgentDesk-claude-adk-cc", "provider": "claude"}}),
-            json!({"claude_session_id": "claude-session-1", "session_id": "claude-session-1", "raw_provider_session_id": "claude-session-1"}),
+            "Resolve Claude session id by session key // TODO: example",
         ),
         ep(
             "POST",
             "/api/dispatched-sessions/clear-stale-session-id",
             "dispatched-sessions",
-            "Clear stale Claude session id",
-        )
-        .with_example(
-            json!({"body": {"session_id": "claude-session-1"}}),
-            json!({"cleared": 1}),
+            "Clear stale Claude session id // TODO: example",
         ),
         ep(
             "POST",
             "/api/dispatched-sessions/clear-session-id",
             "dispatched-sessions",
-            "Clear Claude session id by session key",
-        )
-        .with_example(
-            json!({"body": {"session_key": "mac-mini:AgentDesk-claude-adk-cc"}}),
-            json!({"cleared": 1}),
+            "Clear Claude session id by session key // TODO: example",
         ),
         ep(
             "POST",
             "/api/sessions/{session_key}/force-kill",
             "sessions",
-            "Force-kill session and optionally retry",
-        )
-        .with_example(
-            json!({"path": {"session_key": "claude/hash123/mac-mini:AgentDesk-claude-adk-cc"}, "body": {"retry": true, "reason": "stalled turn"}}),
-            json!({"ok": true, "session_key": "claude/hash123/mac-mini:AgentDesk-claude-adk-cc", "killed": true, "retry_created": true}),
+            "Force-kill session and optionally retry // TODO: example",
         ),
         ep(
             "POST",
@@ -202,19 +170,13 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 }]
             }),
         ),
-        ep("GET", "/api/messages", "messages", "List messages").with_example(
-            json!({"query": {"receiverId": "project-agentdesk", "receiverType": "agent", "limit": 20}}),
-            json!({"messages": [{"id": 1, "sender_type": "ceo", "receiver_id": "project-agentdesk", "content": "status?", "message_type": "chat"}]}),
-        ),
-        ep("POST", "/api/messages", "messages", "Create message").with_example(
-            json!({"body": {"sender_type": "ceo", "sender_id": "operator", "receiver_type": "agent", "receiver_id": "project-agentdesk", "content": "Please review the docs", "message_type": "chat"}}),
-            json!({"id": 1, "sender_type": "ceo", "receiver_type": "agent", "receiver_id": "project-agentdesk", "content": "Please review the docs", "message_type": "chat"}),
-        ),
+        ep("GET", "/api/messages", "messages", "List messages // TODO: example"),
+        ep("POST", "/api/messages", "messages", "Create message // TODO: example"),
         ep(
             "GET",
             "/api/discord/bindings",
             "discord",
-            "List Discord bindings",
+            "List Discord bindings // TODO: example",
         ),
         ep(
             "GET",
@@ -260,118 +222,81 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/discord/channels/{id}",
             "discord",
-            "Get channel or thread info",
+            "Get channel or thread info // TODO: example",
         ),
         ep(
             "POST",
             "/api/dm-reply/register",
             "discord",
-            "Register DM reply handler",
-        )
-        .with_example(
-            json!({"body": {"source_agent": "family-counsel", "user_id": "123456789012345678", "channel_id": "1473922824350601297", "ttl_seconds": 3600, "context": {"topic": "followup"}}}),
-            json!({"ok": true, "id": 42}),
+            "Register DM reply handler // TODO: example",
         ),
         ep(
             "GET",
             "/api/round-table-meetings",
             "meetings",
-            "List meetings",
+            "List meetings // TODO: example",
         ),
         ep(
             "POST",
             "/api/round-table-meetings",
             "meetings",
-            "Create or update meeting",
-        )
-        .with_example(
-            json!({"body": {"id": "meeting-1", "channel_id": "1473922824350601297", "agenda": "API docs review", "status": "completed", "summary": "Decided to add examples", "participant_names": ["PM", "Reviewer"], "total_rounds": 2}}),
-            json!({"ok": true, "meeting": {"id": "meeting-1", "status": "completed", "agenda": "API docs review"}}),
+            "Create or update meeting // TODO: example",
         ),
         ep(
             "POST",
             "/api/round-table-meetings/start",
             "meetings",
-            "Start meeting",
-        )
-        .with_example(
-            json!({"body": {"channel_id": "1473922824350601297", "agenda": "Plan docs sweep", "primary_provider": "codex", "reviewer_provider": "claude", "fixed_participants": ["project-agentdesk"]}}),
-            json!({"ok": true, "message": "Meeting start scheduled"}),
+            "Start meeting // TODO: example",
         ),
         ep(
             "GET",
             "/api/round-table-meetings/{id}",
             "meetings",
-            "Get meeting by ID",
+            "Get meeting by ID // TODO: example",
         ),
         ep(
             "DELETE",
             "/api/round-table-meetings/{id}",
             "meetings",
-            "Delete meeting",
-        )
-        .with_example(
-            json!({"path": {"id": "meeting-1"}}),
-            json!({"ok": true}),
+            "Delete meeting // TODO: example",
         ),
         ep(
             "PATCH",
             "/api/round-table-meetings/{id}/issue-repo",
             "meetings",
-            "Update meeting issue repository",
-        )
-        .with_example(
-            json!({"path": {"id": "meeting-1"}, "body": {"repo": "itismyfield/AgentDesk"}}),
-            json!({"ok": true, "meeting": {"id": "meeting-1", "issue_repo": "itismyfield/AgentDesk"}}),
+            "Update meeting issue repository // TODO: example",
         ),
         ep(
             "POST",
             "/api/round-table-meetings/{id}/issues",
             "meetings",
-            "Create meeting issues",
-        )
-        .with_example(
-            json!({"path": {"id": "meeting-1"}, "body": {"repo": "itismyfield/AgentDesk"}}),
-            json!({"ok": true, "results": [{"key": "item-0", "ok": true, "issue_number": 4227}], "summary": {"total": 1, "created": 1, "failed": 0, "discarded": 0, "pending": 0}}),
+            "Create meeting issues // TODO: example",
         ),
         ep(
             "POST",
             "/api/round-table-meetings/{id}/issues/discard",
             "meetings",
-            "Discard one meeting issue",
-        )
-        .with_example(
-            json!({"path": {"id": "meeting-1"}, "body": {"key": "item-0"}}),
-            json!({"ok": true, "summary": {"discarded": 1, "pending": 0}}),
+            "Discard one meeting issue // TODO: example",
         ),
         ep(
             "POST",
             "/api/round-table-meetings/{id}/issues/discard-all",
             "meetings",
-            "Discard all meeting issues",
-        )
-        .with_example(
-            json!({"path": {"id": "meeting-1"}}),
-            json!({"ok": true, "results": [], "summary": {"discarded": 3, "pending": 0, "all_resolved": true}}),
+            "Discard all meeting issues // TODO: example",
         ),
-        ep("GET", "/api/skills/catalog", "skills", "List skill catalog")
-            .with_params([(
-                "include_stale",
-                query_param(
-                    "boolean",
-                    false,
-                    "Include stale skill entries that no longer exist on disk",
-                ),
-            )])
-            .with_example(
-                json!({"query": {"include_stale": true}}),
-                json!({"catalog": [{"name": "memory-read", "total_calls": 12, "disk_present": true}], "include_stale": true}),
+        ep("GET", "/api/skills/catalog", "skills", "List skill catalog // TODO: example").with_params([(
+            "include_stale",
+            query_param(
+                "boolean",
+                false,
+                "Include stale skill entries that no longer exist on disk",
             ),
+        )]),
         ep(
             "GET",
             "/api/skills/ranking",
             "skills",
-            "Skill usage ranking",
+            "Skill usage ranking // TODO: example",
         )
         .with_params([
             (
@@ -390,12 +315,8 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                     "Include stale skill entries that no longer exist on disk",
                 ),
             ),
-        ])
-        .with_example(
-            json!({"query": {"window": "7d", "limit": 10}}),
-            json!({"window": "7d", "include_stale": false, "overall": [{"skill_name": "memory-read", "calls": 12}], "byAgent": [{"agent_role_id": "project-agentdesk", "skill_name": "memory-read", "calls": 4}]}),
-        ),
-        ep("POST", "/api/skills/prune", "skills", "Preview or prune stale skill metadata")
+        ]),
+        ep("POST", "/api/skills/prune", "skills", "Preview or prune stale skill metadata // TODO: example")
             .with_params([(
                 "dry_run",
                 query_param(
@@ -403,12 +324,8 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                     false,
                     "When true, report stale skill ids without deleting skills rows",
                 ),
-            )])
-            .with_example(
-                json!({"query": {"dry_run": true}}),
-                json!({"ok": true, "dry_run": true, "stale_skill_ids": ["old-skill"], "stale_count": 1, "soft_deleted_from_skills": 0, "skill_usage_policy": "preserved"}),
-            ),
-        ep("GET", "/api/cron-jobs", "cron", "List cron jobs"),
+            )]),
+        ep("GET", "/api/cron-jobs", "cron", "List cron jobs // TODO: example"),
         ep(
             "GET",
             "/api/routines",
@@ -569,27 +486,6 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 body_param("integer|null", false, "Per-routine agent timeout in seconds or null for config default"),
             ),
         ]),
-        ep(
-            "DELETE",
-            "/api/routines/{id}",
-            "routines",
-            "Hard-delete a detached routine and its routine_runs history. Returns 403 when an owned routine's caller agent scope is absent, unresolved, or different; returns 409 when the routine is not detached or has an in-flight run.",
-        )
-        .with_params([
-            ("id", path_param("Routine id")),
-            (
-                "x-agent-id",
-                header_param("string", false, "Self-asserted caller agent scope; required to match the owner for owned routines"),
-            ),
-            (
-                "x-channel-id",
-                header_param("string", false, "Self-asserted caller channel scope resolved to an agent id; required for owned routines when x-agent-id is absent"),
-            ),
-        ])
-        .with_example(
-            json!({"path": {"id": "routine-1"}, "headers": {"x-agent-id": "codex"}}),
-            json!({"ok": true, "routine_id": "routine-1", "run_history_deleted": 3}),
-        ),
         ep(
             "GET",
             "/api/routines/{id}/runs",

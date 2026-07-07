@@ -47,7 +47,6 @@ async fn run_backstop_finalize(
             pane_quiescent: Some(true),
         },
         FinalizeContext::gate_backstop(),
-        None,
         shared,
     ))
     .catch_unwind()

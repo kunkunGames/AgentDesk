@@ -1032,7 +1032,7 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "DB/Dashboard Health",
             "health payload unavailable",
-            "The dcserver health detail endpoint must be reachable to summarize DB/dashboard status.",
+            "dcserver health detail endpoint에 접근할 수 있어야 DB/dashboard 상태를 요약할 수 있습니다.",
         )
         .with_subsystem("health")
         .with_fix_safety(FixSafety::NotFixable)
@@ -1109,7 +1109,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Dispatch Outbox",
             "health payload unavailable",
-            "Cannot read dispatch outbox health.",
+            "dispatch outbox health를 읽을 수 없습니다.",
         )
         .with_subsystem("dispatch_outbox")
         .with_fix_safety(FixSafety::NotFixable);
@@ -1192,7 +1192,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             "health payload unavailable",
-            "Cannot read config audit report.",
+            "config audit report를 읽을 수 없습니다.",
         )
         .with_subsystem("config_audit")
         .with_fix_safety(FixSafety::NotFixable);

@@ -65,8 +65,7 @@ pub use recovery::{
     handle_rebind_inflight, handle_relay_recovery, hard_stop_runtime_turn,
     provider_channel_mailbox_state, resolve_tmux_session_for_cancel,
     schedule_pending_queue_drain_after_cancel, snapshot_pending_queue_state, spawn_stall_watchdog,
-    spawn_watchdog, stop_providerless_runtime_turn_preserving_watcher_strict_ownership,
-    stop_runtime_turn_preserving_watcher,
+    spawn_watchdog, stop_runtime_turn_preserving_watcher,
 };
 pub use runtime_resolve::{fetch_channel_name, resolve_bot_http};
 use runtime_resolve::{resolve_direct_meeting_runtime, resolve_direct_meeting_shared};
@@ -400,31 +399,6 @@ impl HealthRegistry {
                 provider,
                 channel_id,
                 tmux_override,
-            )
-            .await,
-        )
-    }
-
-    pub(crate) async fn rebind_inflight_after_force_clean(
-        &self,
-        provider: &crate::services::provider::ProviderKind,
-        channel_id: u64,
-        tmux_override: Option<String>,
-        minimum_initial_offset: Option<u64>,
-    ) -> Option<Result<super::recovery_engine::RebindOutcome, super::recovery_engine::RebindError>>
-    {
-        let (http, shared) =
-            resolve_direct_meeting_runtime(self, ChannelId::new(channel_id), provider)
-                .await
-                .ok()?;
-        Some(
-            super::recovery_engine::rebind_inflight_for_channel_with_minimum_start_offset(
-                &http,
-                &shared,
-                provider,
-                channel_id,
-                tmux_override,
-                minimum_initial_offset,
             )
             .await,
         )

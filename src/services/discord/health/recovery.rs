@@ -1,13 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use poise::serenity_prelude as serenity;
+use poise::serenity_prelude::{ChannelId, MessageId};
 use serde::Serialize;
-use serenity::{ChannelId, MessageId};
 
 use crate::services::discord::session_identity::tmux_name_from_session_key;
-use crate::services::discord::turn_view_reconciler::note_intake_turn_cleared_via_shared as tv_clear;
 use crate::services::discord::{self as discord, SharedData};
 use crate::services::provider::{CancelToken, ProviderKind};
 
@@ -50,14 +47,6 @@ pub struct IdleTmuxStaleTurnRepairResult {
     pub runtime_session_cleared: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct IdleTmuxStaleTurnInflightPin {
-    identity: discord::inflight::InflightTurnIdentity,
-    finalizer_turn_id: u64,
-    updated_at: String,
-    save_generation: u64,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderMailboxState {
     pub channel_id: u64,
@@ -80,140 +69,30 @@ async fn shared_for_provider(
         .await
 }
 
-async fn owning_runtime_http_for_channel(
-    registry: &HealthRegistry,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-) -> Option<Arc<serenity::http::Http>> {
-    shared_for_provider(registry, provider, channel_id)
-        .await
-        .and_then(|shared| shared.serenity_http_or_token_fallback())
-}
-
 fn idle_tmux_repair_ready_for_input(
     provider: &ProviderKind,
     channel_id: u64,
     tmux_session: &str,
 ) -> bool {
-    super::super::relay_recovery::idle_tmux_repair_ready_for_input(
-        provider,
-        channel_id,
-        tmux_session,
-    )
-}
-
-#[cfg(test)]
-type IdleTmuxStaleTurnInflightCandidateHook =
-    Arc<dyn Fn(&discord::inflight::InflightTurnState) + Send + Sync>;
-
-#[cfg(test)]
-type IdleTmuxStaleTurnPostClearHook =
-    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-
-#[cfg(test)]
-type StallWatchdogForceCleanPostCleanupHook =
-    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-
-#[cfg(test)]
-fn idle_tmux_stale_turn_inflight_candidate_hook()
--> &'static std::sync::Mutex<Option<IdleTmuxStaleTurnInflightCandidateHook>> {
-    static HOOK: std::sync::OnceLock<
-        std::sync::Mutex<Option<IdleTmuxStaleTurnInflightCandidateHook>>,
-    > = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn idle_tmux_stale_turn_post_clear_hook()
--> &'static std::sync::Mutex<Option<IdleTmuxStaleTurnPostClearHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<IdleTmuxStaleTurnPostClearHook>>> =
-        std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-#[cfg(test)]
-fn stall_watchdog_force_clean_post_cleanup_hook()
--> &'static std::sync::Mutex<Option<StallWatchdogForceCleanPostCleanupHook>> {
-    static HOOK: std::sync::OnceLock<
-        std::sync::Mutex<Option<StallWatchdogForceCleanPostCleanupHook>>,
-    > = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-fn load_idle_tmux_stale_turn_inflight_clear_candidate(
-    provider: &ProviderKind,
-    channel_id: u64,
-) -> Option<discord::inflight::InflightTurnState> {
-    let state = discord::inflight::load_inflight_state(provider, channel_id)?;
-    if !discord::inflight::inflight_state_allows_idle_tmux_repair_state(&state) {
-        return None;
-    }
-    #[cfg(test)]
-    if let Some(hook) = idle_tmux_stale_turn_inflight_candidate_hook()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone()
-    {
-        hook(&state);
-    }
-    Some(state)
-}
-
-fn capture_idle_tmux_stale_turn_inflight_pin(
-    state: &discord::inflight::InflightTurnState,
-) -> Option<IdleTmuxStaleTurnInflightPin> {
-    let finalizer_turn_id = state.effective_finalizer_turn_id();
-    (finalizer_turn_id != 0).then(|| IdleTmuxStaleTurnInflightPin {
-        identity: discord::inflight::InflightTurnIdentity::from_state(state),
-        finalizer_turn_id,
-        updated_at: state.updated_at.clone(),
-        save_generation: state.save_generation,
-    })
-}
-
-fn clear_idle_tmux_stale_turn_inflight_if_pinned(
-    provider: &ProviderKind,
-    channel_id: u64,
-    pin: Option<&IdleTmuxStaleTurnInflightPin>,
-) -> discord::inflight::GuardedClearOutcome {
-    let Some(pin) = pin else {
-        return discord::inflight::GuardedClearOutcome::Missing;
-    };
-    let outcome = discord::inflight::clear_inflight_state_if_matches_identity_generation(
-        provider,
-        channel_id,
-        &pin.identity,
-        pin.finalizer_turn_id,
-        &pin.updated_at,
-        pin.save_generation,
-    );
-    match outcome {
-        discord::inflight::GuardedClearOutcome::Cleared => {}
-        other => {
-            let current = discord::inflight::load_inflight_state(provider, channel_id);
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel_id,
-                clear_outcome = ?other,
-                expected_user_msg_id = pin.identity.user_msg_id,
-                expected_finalizer_turn_id = pin.finalizer_turn_id,
-                expected_updated_at = %pin.updated_at,
-                expected_save_generation = pin.save_generation,
-                current_user_msg_id = current.as_ref().map(|state| state.user_msg_id).unwrap_or(0),
-                current_finalizer_turn_id = current
-                    .as_ref()
-                    .map(|state| state.effective_finalizer_turn_id())
-                    .unwrap_or(0),
-                current_updated_at = %current
-                    .as_ref()
-                    .map(|state| state.updated_at.as_str())
-                    .unwrap_or("<missing>"),
-                current_save_generation = current.as_ref().map(|state| state.save_generation).unwrap_or(0),
-                "idle tmux stale-turn repair skipped persistent inflight clear because the readiness-time pin was not cleared"
-            );
-        }
-    }
-    outcome
+    let structured_ready = super::super::inflight::load_inflight_state(provider, channel_id)
+        .and_then(|state| {
+            let output_path = state
+                .output_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())?;
+            crate::services::tui_turn_state::jsonl_ready_for_input(
+                provider,
+                state.runtime_kind,
+                std::path::Path::new(output_path),
+                Some(state.last_offset),
+            )
+        });
+    structured_ready
+        .map(crate::services::tui_turn_state::TuiReadyState::is_ready)
+        .unwrap_or_else(|| {
+            crate::services::provider::tmux_session_ready_for_input(tmux_session, provider)
+        })
 }
 
 fn preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
@@ -349,8 +228,6 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
         }
     }
 
-    let owned_role_override =
-        discord::turn_finalizer::cleanup::snapshot_role_override(&shared, channel_id);
     let finish = discord::mailbox_finish_turn(&shared, &provider, channel_id).await;
     let mut termination_recorded = false;
     if let Some(token) = finish.removed_token.as_ref() {
@@ -380,7 +257,6 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
         &provider,
         channel_id,
         &finish,
-        owned_role_override,
         "runtime_stop_fallback",
         cleanup_requested,
     )
@@ -666,40 +542,11 @@ struct RuntimeChannelMatch {
     channel_id: ChannelId,
 }
 
-#[derive(Clone, Copy)]
-enum RuntimeChannelOwnershipMode {
-    AllowProcessGlobalMailboxFallback,
-    StrictPerRuntime,
-}
-
-async fn has_local_mailbox_ownership_evidence(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    ownership_mode: RuntimeChannelOwnershipMode,
-) -> bool {
-    let Some(handle) = shared.mailbox_peek(channel_id) else {
-        return false;
-    };
-
-    if matches!(
-        ownership_mode,
-        RuntimeChannelOwnershipMode::AllowProcessGlobalMailboxFallback
-    ) {
-        return true;
-    }
-
-    let snapshot = handle.snapshot().await;
-    // Snapshot/observation paths can materialize empty per-runtime mailboxes as
-    // a side effect, so bare local-handle existence is not ownership evidence.
-    snapshot.cancel_token.is_some() || !snapshot.intervention_queue.is_empty()
-}
-
 async fn find_runtime_channel_match(
     registry: &HealthRegistry,
     provider_name: Option<&str>,
     channel_id: Option<ChannelId>,
     tmux_name: Option<&str>,
-    ownership_mode: RuntimeChannelOwnershipMode,
 ) -> Option<RuntimeChannelMatch> {
     let preferred_provider = provider_name.and_then(ProviderKind::from_str);
     let providers: Vec<_> = registry
@@ -725,14 +572,7 @@ async fn find_runtime_channel_match(
                 let data = shared.core.lock().await;
                 data.sessions.contains_key(&channel_id)
             };
-            let has_local_mailbox =
-                has_local_mailbox_ownership_evidence(&shared, channel_id, ownership_mode).await;
-            let has_process_global_mailbox =
-                matches!(
-                    ownership_mode,
-                    RuntimeChannelOwnershipMode::AllowProcessGlobalMailboxFallback
-                ) && discord::ChannelMailboxRegistry::global_handle(channel_id).is_some();
-            if has_session || has_local_mailbox || has_process_global_mailbox {
+            if has_session || discord::ChannelMailboxRegistry::global_handle(channel_id).is_some() {
                 return Some(RuntimeChannelMatch {
                     provider,
                     shared,
@@ -773,7 +613,6 @@ async fn apply_runtime_hard_stop_cleanup(
     provider: &ProviderKind,
     channel_id: ChannelId,
     finish: &discord::FinishTurnResult,
-    owned_role_override: Option<ChannelId>,
     stop_source: &'static str,
     stop_watcher: bool,
 ) -> bool {
@@ -782,19 +621,16 @@ async fn apply_runtime_hard_stop_cleanup(
         discord::saturating_decrement_global_active(shared);
     }
 
-    discord::turn_finalizer::cleanup::clear_watchdog_and_kick_thread_parents_after_turn_release(
-        shared, provider, channel_id,
-    )
-    .await;
+    discord::clear_watchdog_deadline_override(channel_id.get()).await;
+    shared
+        .dispatch
+        .thread_parents
+        .retain(|_, thread| *thread != channel_id);
     shared.restart.recovering_channels.remove(&channel_id);
     shared.turn_start_times.remove(&channel_id);
 
     if !finish.has_pending {
-        discord::turn_finalizer::cleanup::remove_owned_role_override(
-            shared,
-            channel_id,
-            owned_role_override,
-        );
+        shared.dispatch.role_overrides.remove(&channel_id);
     }
 
     if stop_watcher && let Some((_, watcher)) = shared.tmux_watchers.remove(&channel_id) {
@@ -823,162 +659,6 @@ async fn apply_runtime_hard_stop_cleanup(
     runtime_session_cleared
 }
 
-async fn apply_runtime_hard_stop_finalizer_cleanup_pre_release(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    has_pending: bool,
-    owned_role_override: Option<ChannelId>,
-    pinned_tmux_session_name: Option<&str>,
-    stop_watcher: bool,
-) -> bool {
-    discord::turn_finalizer::cleanup::clear_watchdog_and_kick_thread_parents_after_turn_release(
-        shared, provider, channel_id,
-    )
-    .await;
-    shared.restart.recovering_channels.remove(&channel_id);
-    shared.turn_start_times.remove(&channel_id);
-
-    if !has_pending {
-        discord::turn_finalizer::cleanup::remove_owned_role_override(
-            shared,
-            channel_id,
-            owned_role_override,
-        );
-    }
-
-    if stop_watcher {
-        stop_hard_stop_cleanup_watcher_if_current(shared, channel_id, pinned_tmux_session_name);
-    }
-
-    {
-        let mut data = shared.core.lock().await;
-        if let Some(session) = data.sessions.get_mut(&channel_id) {
-            session.clear_provider_session();
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn stop_hard_stop_cleanup_watcher_if_current(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    pinned_tmux_session_name: Option<&str>,
-) -> bool {
-    let Some(pinned_tmux_session_name) = pinned_tmux_session_name else {
-        tracing::info!(
-            channel_id = channel_id.get(),
-            "STALL-WATCHDOG: skipped hard-stop watcher cleanup because pinned tmux session is missing"
-        );
-        return false;
-    };
-
-    let guard = discord::lock_tmux_watcher_registry();
-    let current_tmux_session_name = shared
-        .tmux_watchers
-        .channel_binding(&channel_id)
-        .map(|binding| binding.tmux_session_name);
-    if current_tmux_session_name.as_deref() != Some(pinned_tmux_session_name) {
-        tracing::info!(
-            channel_id = channel_id.get(),
-            pinned_tmux_session = pinned_tmux_session_name,
-            current_tmux_session = current_tmux_session_name.as_deref(),
-            "STALL-WATCHDOG: skipped hard-stop watcher cleanup because channel watcher identity changed"
-        );
-        return false;
-    }
-    let Some((_, watcher)) = shared.tmux_watchers.remove_locked(&guard, &channel_id) else {
-        return false;
-    };
-    watcher.cancel.store(true, Ordering::Relaxed);
-    true
-}
-
-async fn cleanup_then_submit_explicit_background_watchdog_cancel<Submit, SubmitFuture>(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    revalidated: &ExplicitBackgroundWatchdogClear,
-    pinned_tmux_session_name: Option<&str>,
-    submit_terminal: Submit,
-) -> bool
-where
-    Submit: FnOnce() -> SubmitFuture,
-    SubmitFuture: std::future::Future<Output = discord::turn_finalizer::FinalizeOutcome>,
-{
-    debug_assert_eq!(
-        revalidated.clear_outcome,
-        discord::inflight::GuardedClearOutcome::Cleared
-    );
-    let owned_role_override =
-        discord::turn_finalizer::cleanup::snapshot_role_override(shared, channel_id);
-    let pre_release_has_pending = !shared
-        .mailbox(channel_id)
-        .snapshot()
-        .await
-        .intervention_queue
-        .is_empty();
-    let _runtime_session_cleared = apply_runtime_hard_stop_finalizer_cleanup_pre_release(
-        shared,
-        provider,
-        channel_id,
-        pre_release_has_pending,
-        owned_role_override,
-        pinned_tmux_session_name,
-        true,
-    )
-    .await;
-    let outcome = submit_terminal().await;
-    match outcome {
-        discord::turn_finalizer::FinalizeOutcome::Finalized { has_pending, .. } => has_pending,
-        discord::turn_finalizer::FinalizeOutcome::AlreadyFinalized
-        | discord::turn_finalizer::FinalizeOutcome::Deferred => pre_release_has_pending,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExplicitBackgroundWatchdogClear {
-    clear_outcome: discord::inflight::GuardedClearOutcome,
-    pending_hourglass_user_msg_id: Option<u64>,
-    finalizer_turn_id: u64,
-}
-
-fn revalidate_and_clear_explicit_background_inflight(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    snapshot_identity: Option<&discord::inflight::InflightTurnIdentity>,
-    snapshot_finalizer_turn_id: Option<u64>,
-) -> ExplicitBackgroundWatchdogClear {
-    let Some(snapshot_identity) = snapshot_identity else {
-        return ExplicitBackgroundWatchdogClear {
-            clear_outcome: discord::inflight::GuardedClearOutcome::Missing,
-            pending_hourglass_user_msg_id: None,
-            finalizer_turn_id: 0,
-        };
-    };
-    let finalizer_turn_id = snapshot_finalizer_turn_id.unwrap_or(snapshot_identity.user_msg_id);
-    if finalizer_turn_id == 0 {
-        return ExplicitBackgroundWatchdogClear {
-            clear_outcome: discord::inflight::GuardedClearOutcome::UserMsgMismatch,
-            pending_hourglass_user_msg_id: None,
-            finalizer_turn_id,
-        };
-    }
-    let clear_outcome = discord::inflight::clear_inflight_state_if_matches_identity(
-        provider,
-        channel_id.get(),
-        snapshot_identity,
-    );
-    ExplicitBackgroundWatchdogClear {
-        clear_outcome,
-        pending_hourglass_user_msg_id: (snapshot_identity.user_msg_id != 0)
-            .then_some(snapshot_identity.user_msg_id),
-        finalizer_turn_id,
-    }
-}
-
 pub async fn hard_stop_runtime_turn(
     registry: Option<&HealthRegistry>,
     provider_name: Option<&str>,
@@ -993,7 +673,6 @@ pub async fn hard_stop_runtime_turn(
         tmux_name,
         stop_source,
         true,
-        RuntimeChannelOwnershipMode::AllowProcessGlobalMailboxFallback,
     )
     .await
 }
@@ -1005,103 +684,29 @@ pub async fn clear_idle_tmux_stale_turn(
     tmux_session: &str,
     stop_source: &'static str,
 ) -> Option<IdleTmuxStaleTurnRepairResult> {
-    let repair_started_at = Instant::now();
     let provider = ProviderKind::from_str(provider_name)?;
-    let inflight_clear_state =
-        load_idle_tmux_stale_turn_inflight_clear_candidate(&provider, channel_id)?;
-    if !crate::services::discord::relay_recovery::idle_tmux_repair_state_ready_for_input(
-        &provider,
-        channel_id,
-        tmux_session,
-        &inflight_clear_state,
-    ) {
+    if !idle_tmux_repair_ready_for_input(&provider, channel_id, tmux_session) {
         return None;
     }
-    if crate::services::discord::relay_recovery::idle_tmux_repair_has_unrelayed_tail_answer(
-        &inflight_clear_state,
-    ) {
-        tracing::warn!(
-            provider = %provider.as_str(),
-            channel_id,
-            tmux_session,
-            "idle tmux stale-turn repair skipped mailbox/runtime teardown because helper-load found an unrelayed tail answer"
-        );
-        return None;
-    }
-    let inflight_pin = capture_idle_tmux_stale_turn_inflight_pin(&inflight_clear_state);
 
     let channel_id = ChannelId::new(channel_id);
     let shared = shared_for_provider(registry, &provider, channel_id).await?;
-    let inflight_clear_outcome = clear_idle_tmux_stale_turn_inflight_if_pinned(
+    let finish = discord::mailbox_finish_turn(&shared, &provider, channel_id).await;
+    let runtime_session_cleared = apply_runtime_hard_stop_cleanup(
+        &shared,
         &provider,
-        channel_id.get(),
-        inflight_pin.as_ref(),
-    );
-    if inflight_clear_outcome != discord::inflight::GuardedClearOutcome::Cleared {
-        tracing::warn!(
-            provider = %provider.as_str(),
-            channel_id = channel_id.get(),
-            clear_outcome = ?inflight_clear_outcome,
-            "idle tmux stale-turn repair skipped mailbox/runtime teardown because guarded persistent inflight clear did not succeed"
-        );
-        return None;
-    }
-    let owned_role_override =
-        discord::turn_finalizer::cleanup::snapshot_role_override(&shared, channel_id);
-    #[cfg(test)]
-    {
-        // Bind the cloned hook first so the mutex guard (a non-Send temporary
-        // in an `if let` scrutinee would live across the await) drops here.
-        let hook = idle_tmux_stale_turn_post_clear_hook()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        if let Some(hook) = hook {
-            hook().await;
-        }
-    }
-    let expected_user_msg_id = inflight_pin
-        .as_ref()
-        .map(|pin| pin.identity.user_msg_id)
-        .unwrap_or(0);
-    let finish = if expected_user_msg_id != 0 {
-        discord::mailbox_finish_turn_if_matches_started_before(
-            &shared,
-            &provider,
-            channel_id,
-            MessageId::new(expected_user_msg_id),
-            repair_started_at,
-        )
-        .await
-    } else {
-        let snapshot = discord::mailbox_snapshot(&shared, channel_id).await;
-        discord::FinishTurnResult {
-            removed_token: None,
-            has_pending: !snapshot.intervention_queue.is_empty(),
-            mailbox_online: shared.mailbox_peek(channel_id).is_some(),
-            queue_exit_events: Vec::new(),
-            persistence_error: None,
-        }
-    };
-    let runtime_session_cleared = if finish.removed_token.is_some() {
-        apply_runtime_hard_stop_cleanup(
-            &shared,
-            &provider,
-            channel_id,
-            &finish,
-            owned_role_override,
-            stop_source,
-            false,
-        )
-        .await
-    } else {
-        false
-    };
+        channel_id,
+        &finish,
+        stop_source,
+        false,
+    )
+    .await;
+    let persistent_inflight_cleared = discord::clear_inflight_state(&provider, channel_id.get());
 
     Some(IdleTmuxStaleTurnRepairResult {
         had_active_turn: finish.removed_token.is_some(),
         has_pending_queue: finish.has_pending,
-        persistent_inflight_cleared: true,
+        persistent_inflight_cleared,
         runtime_session_cleared,
     })
 }
@@ -1133,24 +738,6 @@ pub async fn stop_runtime_turn_preserving_watcher(
         tmux_name,
         stop_source,
         false,
-        RuntimeChannelOwnershipMode::AllowProcessGlobalMailboxFallback,
-    )
-    .await
-}
-
-pub async fn stop_providerless_runtime_turn_preserving_watcher_strict_ownership(
-    registry: Option<&HealthRegistry>,
-    channel_id: u64,
-    stop_source: &'static str,
-) -> HardStopRuntimeResult {
-    runtime_turn_cleanup_by_lookup(
-        registry,
-        None,
-        Some(channel_id),
-        None,
-        stop_source,
-        false,
-        RuntimeChannelOwnershipMode::StrictPerRuntime,
     )
     .await
 }
@@ -1167,21 +754,13 @@ pub async fn finish_cancelled_provider_channel_mailbox(
     let Some(channel_id) = channel_id.map(ChannelId::new) else {
         return FinishCancelledMailboxResult::default();
     };
-    let Some(runtime) = find_runtime_channel_match(
-        registry,
-        provider_name,
-        Some(channel_id),
-        None,
-        RuntimeChannelOwnershipMode::AllowProcessGlobalMailboxFallback,
-    )
-    .await
+    let Some(runtime) =
+        find_runtime_channel_match(registry, provider_name, Some(channel_id), None).await
     else {
         return FinishCancelledMailboxResult::default();
     };
 
     let before = runtime.shared.restart.global_active.load(Ordering::Acquire);
-    let owned_role_override =
-        discord::turn_finalizer::cleanup::snapshot_role_override(&runtime.shared, channel_id);
     let finish = discord::mailbox_finish_cancelled_turn(&runtime.shared, channel_id).await;
     if finish.removed_token.is_none() {
         return FinishCancelledMailboxResult {
@@ -1197,7 +776,6 @@ pub async fn finish_cancelled_provider_channel_mailbox(
         &runtime.provider,
         channel_id,
         &finish,
-        owned_role_override,
         stop_source,
         true,
     )
@@ -1229,24 +807,13 @@ async fn runtime_turn_cleanup_by_lookup(
     tmux_name: Option<&str>,
     stop_source: &'static str,
     stop_watcher: bool,
-    ownership_mode: RuntimeChannelOwnershipMode,
 ) -> HardStopRuntimeResult {
     let channel_id = channel_id.map(ChannelId::new);
 
     if let Some(registry) = registry
-        && let Some(runtime) = find_runtime_channel_match(
-            registry,
-            provider_name,
-            channel_id,
-            tmux_name,
-            ownership_mode,
-        )
-        .await
+        && let Some(runtime) =
+            find_runtime_channel_match(registry, provider_name, channel_id, tmux_name).await
     {
-        let owned_role_override = discord::turn_finalizer::cleanup::snapshot_role_override(
-            &runtime.shared,
-            runtime.channel_id,
-        );
         let finish =
             discord::mailbox_finish_turn(&runtime.shared, &runtime.provider, runtime.channel_id)
                 .await;
@@ -1255,7 +822,6 @@ async fn runtime_turn_cleanup_by_lookup(
             &runtime.provider,
             runtime.channel_id,
             &finish,
-            owned_role_override,
             stop_source,
             stop_watcher,
         )
@@ -1276,13 +842,6 @@ async fn runtime_turn_cleanup_by_lookup(
         && let Some(handle) = discord::ChannelMailboxRegistry::global_handle(channel_id)
     {
         let finish = handle.hard_stop().await;
-        if finish.has_pending {
-            discord::turn_completion_events::warn_unresolvable_hard_stop_pending_backlog(
-                channel_id,
-                finish.has_pending,
-                stop_source,
-            );
-        }
         discord::clear_watchdog_deadline_override(channel_id.get()).await;
         return HardStopRuntimeResult {
             cleanup_path: if finish.mailbox_online {
@@ -1764,7 +1323,6 @@ pub(crate) async fn run_stall_watchdog_pass(
     for (channel_id, shared) in candidate_channels {
         // Use the selected runtime so same-provider multi-bot snapshots target
         // the bot that owns this watcher.
-        let repair_started_at = Instant::now();
         let snapshot = match registry
             .snapshot_watcher_state_for_shared(provider, shared.clone(), channel_id.get())
             .await
@@ -1787,11 +1345,10 @@ pub(crate) async fn run_stall_watchdog_pass(
         }
         // #3668 F2: if JSONL still holds an unrelayed final answer after
         // `last_offset`, skip destructive watchdog branches this tick.
-        if let Some(state) = discord::inflight::load_inflight_state(provider, channel_id.get())
-            && crate::services::discord::relay_recovery::idle_tmux_repair_has_unrelayed_tail_answer(
-                &state,
-            )
-        {
+        if crate::services::discord::relay_recovery::idle_tmux_repair_has_unrelayed_tail_answer(
+            provider,
+            channel_id.get(),
+        ) {
             continue;
         }
         // #2965: a ready-for-input TUI can still look "desynced" when the
@@ -1824,8 +1381,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                 channel_id.get(),
             )
             .unwrap_or(false)
-        {
-            let Some(result) = clear_idle_tmux_stale_turn(
+            && let Some(result) = clear_idle_tmux_stale_turn(
                 registry,
                 provider.as_str(),
                 channel_id.get(),
@@ -1833,9 +1389,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                 "2965_stale_idle_foreground_queue_watchdog",
             )
             .await
-            else {
-                continue;
-            };
+        {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::warn!(
                 "  [{ts}] ⚡ STALL-WATCHDOG: cleared idle foreground TUI turn for channel {} (provider={}, pending_queue={}, inflight_cleared={})",
@@ -1867,50 +1421,22 @@ pub(crate) async fn run_stall_watchdog_pass(
                 "  [{ts}] ⚡ STALL-WATCHDOG: forced cleanup for orphan explicit background work in channel {}",
                 channel_id
             );
-            let revalidated = revalidate_and_clear_explicit_background_inflight(
-                provider,
-                channel_id,
-                snapshot.inflight_identity.as_ref(),
-                snapshot.inflight_finalizer_turn_id,
-            );
-            if revalidated.clear_outcome != discord::inflight::GuardedClearOutcome::Cleared {
-                tracing::info!(
-                    provider = %provider.as_str(),
-                    channel_id = channel_id.get(),
-                    clear_outcome = ?revalidated.clear_outcome,
-                    "STALL-WATCHDOG: skipped orphan explicit background cleanup because inflight identity changed before the destructive clear"
-                );
-                continue;
-            }
-            let finalizer_turn_id = revalidated.finalizer_turn_id;
-            let generation = shared.restart.current_generation;
-            let shared_for_submit = shared.clone();
-            let provider_for_submit = provider.clone();
-            let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
+            let pending_hourglass_user_msg_id =
+                discord::inflight::load_inflight_state(provider, channel_id.get())
+                    .filter(|state| state.user_msg_id != 0)
+                    .map(|state| state.user_msg_id);
+            discord::inflight::delete_inflight_state_file(provider, channel_id.get());
+            let finish = discord::mailbox_finish_turn(&shared, provider, channel_id).await;
+            apply_runtime_hard_stop_cleanup(
                 &shared,
                 provider,
                 channel_id,
-                &revalidated,
-                snapshot.tmux_session.as_deref(),
-                move || async move {
-                    shared_for_submit
-                        .turn_finalizer
-                        .submit_terminal(
-                            discord::turn_finalizer::TurnKey::new(
-                                channel_id,
-                                finalizer_turn_id,
-                                generation,
-                            ),
-                            provider_for_submit,
-                            discord::turn_finalizer::TerminalEvent::Cancel,
-                            discord::turn_finalizer::FinalizeContext::monitor(),
-                            shared_for_submit.clone(),
-                        )
-                        .await
-                },
+                &finish,
+                "2967_orphan_explicit_background_watchdog",
+                true,
             )
             .await;
-            if !has_pending {
+            if !finish.has_pending {
                 let hydrate = hydrate_pending_queue_from_disk(&shared, provider, channel_id).await;
                 if hydrate.queue_len_after > 0 && hydrate.persistence_error.is_none() {
                     discord::schedule_deferred_idle_queue_kickoff(
@@ -1921,29 +1447,14 @@ pub(crate) async fn run_stall_watchdog_pass(
                     );
                 }
             }
-            crate::services::observability::emit_inflight_lifecycle_event(
-                provider.as_str(),
-                channel_id.get(),
-                None,
-                None,
-                Some(&format!(
-                    "discord:{}:{}",
-                    channel_id.get(),
-                    revalidated.finalizer_turn_id
-                )),
-                "cleared_by_explicit_background_watchdog",
-                serde_json::json!({
-                    "clear_outcome": format!("{:?}", revalidated.clear_outcome),
-                    "finalizer_turn_id": revalidated.finalizer_turn_id,
-                }),
-            );
-            if let Some(user_msg_id) = revalidated.pending_hourglass_user_msg_id {
-                tv_clear(
-                    &shared,
+            if let Some(user_msg_id) = pending_hourglass_user_msg_id
+                && let Ok(http) = super::resolve_bot_http(registry, provider.as_str()).await
+            {
+                discord::formatting::remove_reaction_raw(
+                    &http,
                     channel_id,
                     user_msg_id.into(),
-                    generation,
-                    "health_watchdog",
+                    '⏳',
                 )
                 .await;
             }
@@ -1951,16 +1462,9 @@ pub(crate) async fn run_stall_watchdog_pass(
             continue;
         }
 
-        let capture_advancing = stall_liveness::stall_watchdog_capture_offset_advancing(
-            provider,
-            channel_id,
-            &snapshot,
-            now_unix_secs,
-        );
         let should_clean = stall_watchdog_should_force_clean(
             snapshot.attached,
             snapshot.desynced,
-            capture_advancing,
             snapshot.inflight_terminal_delivery_committed,
             snapshot.inflight_started_at.as_deref(),
             now_unix_secs,
@@ -2166,10 +1670,6 @@ pub(crate) async fn run_stall_watchdog_pass(
             .as_ref()
             .filter(|state| state.user_msg_id != 0)
             .map(|state| state.user_msg_id);
-        let pending_hourglass_generation = force_clean_inflight
-            .as_ref()
-            .map(|state| state.born_generation)
-            .unwrap_or(shared.restart.current_generation);
         // #3041 B: before we tear the turn down, decide whether the next turn
         // should `--resume` this provider session or cold-start. A force-clean
         // that fires on a still-healthy session (watcher desync, post-restart
@@ -2193,19 +1693,6 @@ pub(crate) async fn run_stall_watchdog_pass(
             channel_id,
         )
         .await;
-        #[cfg(test)]
-        {
-            // Bind the cloned hook first so the mutex guard does not cross the
-            // await. This hook models a retry claiming the mailbox in the gap
-            // after force-clean committed and before stale ownership release.
-            let hook = stall_watchdog_force_clean_post_cleanup_hook()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone();
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
         // #3410: the cleanup above cancelled the watcher and (on the
         // tmux_alive_relay_dead branch) skipped relay recovery — release the
         // stale mailbox ownership it left and respawn the watcher on the still-
@@ -2217,25 +1704,17 @@ pub(crate) async fn run_stall_watchdog_pass(
             channel_id,
             &snapshot,
             now_unix_secs,
-            repair_started_at,
         )
         .await;
-        let thread_parent_kickoffs =
-            discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(&shared, channel_id);
-        discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
-            &shared,
-            provider,
-            thread_parent_kickoffs,
-        );
-        if let Some(user_msg_id) = pending_hourglass_user_msg_id {
-            tv_clear(
-                &shared,
-                channel_id,
-                user_msg_id.into(),
-                pending_hourglass_generation,
-                "health_force_clean",
-            )
-            .await;
+        shared
+            .dispatch
+            .thread_parents
+            .retain(|_, thread_id| *thread_id != channel_id);
+        if let Some(user_msg_id) = pending_hourglass_user_msg_id
+            && let Ok(http) = super::resolve_bot_http(registry, provider.as_str()).await
+        {
+            discord::formatting::remove_reaction_raw(&http, channel_id, user_msg_id.into(), '⏳')
+                .await;
         }
         stall_liveness::clear_stall_watchdog_liveness_state(
             provider,
@@ -2360,8 +1839,9 @@ async fn maybe_recover_completed_stale_leak(
     let mut confirmed_chunks =
         leak_recovery_confirmed_prefix_from_ledger(&ledger_identity).unwrap_or(0);
 
-    let Some(http) = owning_runtime_http_for_channel(registry, provider, channel_id).await else {
-        return false;
+    let http = match super::resolve_bot_http(registry, provider.as_str()).await {
+        Ok(http) => http,
+        Err(_) => return false,
     };
 
     let current_msg_id = MessageId::new(state.current_msg_id);
@@ -2606,22 +2086,18 @@ async fn maybe_recover_completed_stale_leak(
     // restart) treats this tail as delivered and never re-sends it. Re-load and
     // re-check identity first so we never clobber a concurrently-updated row, and
     // skip if another path already advanced past `end`.
-    let offset_save_outcome =
-        discord::inflight::persist_leak_recovery_response_offset_if_matches_identity_locked(
-            provider,
-            channel_id.get(),
-            &discord::inflight::InflightTurnIdentity::from_state(&state),
-            state.current_msg_id,
-            end,
-        );
-    if matches!(
-        offset_save_outcome,
-        discord::inflight::GuardedSaveOutcome::IoError
-    ) {
-        tracing::warn!(
-            "[leak-recover] delivered answer on channel {} but failed to persist offset",
-            channel_id
-        );
+    if let Some(mut fresh) = discord::inflight::load_inflight_state(provider, channel_id.get())
+        && fresh.user_msg_id == state.user_msg_id
+        && fresh.current_msg_id == state.current_msg_id
+        && fresh.response_sent_offset < end
+    {
+        fresh.response_sent_offset = end;
+        if let Err(error) = discord::inflight::save_inflight_state(&fresh) {
+            tracing::warn!(
+                "[leak-recover] delivered answer on channel {} but failed to persist offset: {error}",
+                channel_id
+            );
+        }
     }
     if let Err(error) = leak_recovery_clear_chunk_ledger(&ledger_identity) {
         tracing::warn!(
@@ -2915,26 +2391,17 @@ mod stall_watchdog_pure_tests {
         leak_recovery_confirmed_prefix_from_ledger, leak_recovery_record_confirmed_chunk,
         leak_recovery_unrelayed_range, render_leak_recovery_delivery,
     };
+    use super::preserve_cancel_should_skip_provider_interrupt_for_idle_tui;
     use super::watchdog_decisions::{
         STALL_WATCHDOG_THRESHOLD_SECS, completed_stale_no_answer_orphan_should_clean,
         force_clean_should_preserve_resume_selector, inflight_completed_stale_leak_detected,
         stale_idle_foreground_queue_detected, stall_watchdog_should_force_clean,
         stall_watchdog_should_force_clean_orphan_explicit_background_work,
     };
-    use super::{
-        capture_idle_tmux_stale_turn_inflight_pin, clear_idle_tmux_stale_turn_inflight_if_pinned,
-        preserve_cancel_should_skip_provider_interrupt_for_idle_tui,
-        revalidate_and_clear_explicit_background_inflight,
-    };
-    use crate::services::discord::inflight::{
-        self, GuardedClearOutcome, GuardedSaveOutcome, InflightTurnIdentity, InflightTurnState,
-        RelayOwnerKind,
-    };
     use crate::services::discord::relay_health::{RelayActiveTurn, RelayStallState};
     use crate::services::discord::{InflightRestartMode, TmuxCleanupPolicy};
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
-    use poise::serenity_prelude::ChannelId;
     use std::ffi::OsString;
 
     struct EnvVarReset {
@@ -3265,66 +2732,6 @@ mod stall_watchdog_pure_tests {
         );
     }
 
-    #[test]
-    fn leak_recovery_offset_patch_preserves_concurrent_relay_watermark_update() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-
-        let provider = ProviderKind::Codex;
-        let channel_id = ChannelId::new(4_111_001);
-        let mut snapshot = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            Some("adk-cc".to_string()),
-            7,
-            4_111_101,
-            4_111_201,
-            "recover leaked answer".to_string(),
-            Some("session-4111-leak".to_string()),
-            Some("AgentDesk-codex-4111-leak".to_string()),
-            Some("/tmp/agentdesk-4111-leak.jsonl".to_string()),
-            None,
-            10,
-        );
-        snapshot.full_response = "already relayed plus recovered tail".to_string();
-        snapshot.response_sent_offset = 7;
-        inflight::save_inflight_state(&snapshot).expect("seed leak snapshot row");
-        let identity = InflightTurnIdentity::from_state(&snapshot);
-        let delivered_offset = snapshot.full_response.len();
-
-        let mut concurrent = inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("seeded row for concurrent update");
-        concurrent.last_watcher_relayed_offset = Some(2_048);
-        concurrent.last_watcher_relayed_generation_mtime_ns = Some(9_999);
-        concurrent.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
-        inflight::save_inflight_state(&concurrent).expect("save concurrent watermark update");
-
-        let outcome = inflight::persist_leak_recovery_response_offset_if_matches_identity_locked(
-            &provider,
-            channel_id.get(),
-            &identity,
-            snapshot.current_msg_id,
-            delivered_offset,
-        );
-
-        assert_eq!(outcome, GuardedSaveOutcome::Saved);
-        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("patched row must survive");
-        assert_eq!(persisted.response_sent_offset, delivered_offset);
-        assert_eq!(persisted.last_watcher_relayed_offset, Some(2_048));
-        assert_eq!(
-            persisted.last_watcher_relayed_generation_mtime_ns,
-            Some(9_999)
-        );
-        assert_eq!(
-            persisted.effective_relay_owner_kind(),
-            RelayOwnerKind::SessionBoundRelay
-        );
-    }
-
     fn local_string(unix: i64) -> String {
         chrono::Local
             .timestamp_opt(unix, 0)
@@ -3332,117 +2739,6 @@ mod stall_watchdog_pure_tests {
             .expect("valid local time")
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()
-    }
-
-    #[test]
-    fn explicit_background_watchdog_abort_preserves_new_identity_after_snapshot() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(4_019_230_001);
-        let mut old = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            None,
-            1,
-            4_019_230_101,
-            4_019_230_101,
-            "old explicit background".to_string(),
-            Some("old-session".to_string()),
-            Some("AgentDesk-claude-r2-watchdog".to_string()),
-            Some("/tmp/r2-watchdog-old.jsonl".to_string()),
-            None,
-            10,
-        );
-        old.turn_start_offset = Some(10);
-        inflight::save_inflight_state(&old).expect("save old row");
-        let old_identity = InflightTurnIdentity::from_state(&old);
-        let old_finalizer_turn_id = old.effective_finalizer_turn_id();
-
-        let mut newer_same_message = old.clone();
-        newer_same_message.started_at = "2099-01-01 00:00:00".to_string();
-        newer_same_message.turn_start_offset = Some(99);
-        newer_same_message.session_id = Some("new-session".to_string());
-        inflight::save_inflight_state(&newer_same_message).expect("replace row");
-
-        let outcome = revalidate_and_clear_explicit_background_inflight(
-            &provider,
-            channel_id,
-            Some(&old_identity),
-            Some(old_finalizer_turn_id),
-        );
-
-        assert_eq!(outcome.clear_outcome, GuardedClearOutcome::UserMsgMismatch);
-        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("newer row must survive mismatch");
-        assert_eq!(persisted.started_at, "2099-01-01 00:00:00");
-        assert_eq!(persisted.turn_start_offset, Some(99));
-    }
-
-    #[test]
-    fn idle_tmux_stale_turn_clear_preserves_fresh_inflight_after_finish_window() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(4_030_601);
-        let tmux_session = "AgentDesk-claude-stale-mailbox-toctou";
-        let mut stale = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            None,
-            1,
-            4_030_601_101,
-            4_030_601_102,
-            "stale idle turn".to_string(),
-            Some("stale-session".to_string()),
-            Some(tmux_session.to_string()),
-            Some("/tmp/agentdesk-stale-mailbox-toctou-t1.jsonl".to_string()),
-            None,
-            10,
-        );
-        stale.turn_start_offset = Some(10);
-        inflight::save_inflight_state(&stale).expect("save stale row");
-
-        let pin = capture_idle_tmux_stale_turn_inflight_pin(&stale).expect("readiness-time pin");
-        assert_eq!(pin.identity.user_msg_id, 4_030_601_101);
-
-        let mut fresh = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            None,
-            1,
-            4_030_601_201,
-            4_030_601_202,
-            "fresh follow-up turn".to_string(),
-            Some("fresh-session".to_string()),
-            Some(tmux_session.to_string()),
-            Some("/tmp/agentdesk-stale-mailbox-toctou-t2.jsonl".to_string()),
-            None,
-            20,
-        );
-        fresh.turn_start_offset = Some(20);
-        inflight::save_inflight_state(&fresh).expect("save fresh row in finish-to-clear window");
-
-        assert_eq!(
-            clear_idle_tmux_stale_turn_inflight_if_pinned(&provider, channel_id.get(), Some(&pin),),
-            GuardedClearOutcome::UserMsgMismatch
-        );
-        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
-            .expect("fresh row must survive guarded stale clear");
-        assert_eq!(persisted.user_msg_id, 4_030_601_201);
-        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
-        assert!(
-            persisted.save_generation > pin.save_generation,
-            "fresh row write must advance save_generation past the stale pin"
-        );
     }
 
     /// #3629: a completed-stale, no-unrelayed-answer row is cleaned ONLY when it
@@ -3947,7 +3243,6 @@ mod stall_watchdog_pure_tests {
             true,
             true,
             false,
-            false,
             Some(stale_str.as_str()),
             now_unix,
             STALL_WATCHDOG_THRESHOLD_SECS,
@@ -3959,7 +3254,6 @@ mod stall_watchdog_pure_tests {
             false,
             true,
             false,
-            false,
             Some(stale_str.as_str()),
             now_unix,
             STALL_WATCHDOG_THRESHOLD_SECS,
@@ -3969,7 +3263,6 @@ mod stall_watchdog_pure_tests {
         // synced → no clean.
         assert!(!stall_watchdog_should_force_clean(
             true,
-            false,
             false,
             false,
             Some(stale_str.as_str()),
@@ -3983,7 +3276,6 @@ mod stall_watchdog_pure_tests {
             true,
             true,
             false,
-            false,
             Some(fresh_str.as_str()),
             now_unix,
             STALL_WATCHDOG_THRESHOLD_SECS,
@@ -3995,7 +3287,6 @@ mod stall_watchdog_pure_tests {
             true,
             true,
             false,
-            false,
             None,
             now_unix,
             STALL_WATCHDOG_THRESHOLD_SECS,
@@ -4006,7 +3297,6 @@ mod stall_watchdog_pure_tests {
         assert!(!stall_watchdog_should_force_clean(
             true,
             true,
-            false,
             false,
             Some("not-a-real-timestamp"),
             now_unix,
@@ -4023,7 +3313,6 @@ mod stall_watchdog_pure_tests {
                 true,
                 true,
                 false,
-                false,
                 Some(stale_str.as_str()),
                 now_unix,
                 STALL_WATCHDOG_THRESHOLD_SECS,
@@ -4038,60 +3327,10 @@ mod stall_watchdog_pure_tests {
             true,
             true,
             false,
-            false,
             Some(stale_str.as_str()),
             now_unix,
             STALL_WATCHDOG_THRESHOLD_SECS,
             /* boot_unix_secs */ now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1,
-        ));
-    }
-
-    #[test]
-    fn stall_watchdog_capture_advancing_blocks_force_clean() {
-        let now_unix = chrono::Utc::now().timestamp();
-        let stale_unix = now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1;
-        let stale_str = chrono::Local
-            .timestamp_opt(stale_unix, 0)
-            .single()
-            .expect("valid local time")
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        assert!(
-            !stall_watchdog_should_force_clean(
-                true,
-                true,
-                /* capture_advancing */ true,
-                /* inflight_terminal_delivery_committed */ false,
-                Some(stale_str.as_str()),
-                now_unix,
-                STALL_WATCHDOG_THRESHOLD_SECS,
-                stale_unix - 100,
-            ),
-            "#4178: advancing capture offset means the tmux turn is alive, so the watchdog must not force-clean"
-        );
-    }
-
-    #[test]
-    fn stall_watchdog_capture_stopped_preserves_1446_force_clean() {
-        let now_unix = chrono::Utc::now().timestamp();
-        let stale_unix = now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1;
-        let stale_str = chrono::Local
-            .timestamp_opt(stale_unix, 0)
-            .single()
-            .expect("valid local time")
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        assert!(stall_watchdog_should_force_clean(
-            true,
-            true,
-            /* capture_advancing */ false,
-            /* inflight_terminal_delivery_committed */ false,
-            Some(stale_str.as_str()),
-            now_unix,
-            STALL_WATCHDOG_THRESHOLD_SECS,
-            stale_unix - 100,
         ));
     }
 
@@ -4114,7 +3353,6 @@ mod stall_watchdog_pure_tests {
             !stall_watchdog_should_force_clean(
                 true,
                 true,
-                false,
                 false,
                 Some(fresh_started.as_str()),
                 now_unix,
@@ -4151,7 +3389,6 @@ mod stall_watchdog_pure_tests {
             !stall_watchdog_should_force_clean(
                 true,
                 true,
-                /* capture_advancing */ false,
                 /* inflight_terminal_delivery_committed */ true,
                 Some(stale_str.as_str()),
                 now_unix,
@@ -4166,7 +3403,6 @@ mod stall_watchdog_pure_tests {
         assert!(stall_watchdog_should_force_clean(
             true,
             true,
-            /* capture_advancing */ false,
             /* inflight_terminal_delivery_committed */ false,
             Some(stale_str.as_str()),
             now_unix,
@@ -4309,605 +3545,12 @@ mod stall_watchdog_auto_heal_tests {
     use super::super::HealthRegistry;
     use crate::services::provider::{CancelToken, ProviderKind};
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
-    use std::ffi::OsString;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
-    struct EnvVarReset {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarReset {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarReset {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    struct IdleTmuxCandidateHookGuard {
-        previous: Option<super::IdleTmuxStaleTurnInflightCandidateHook>,
-    }
-
-    impl Drop for IdleTmuxCandidateHookGuard {
-        fn drop(&mut self) {
-            *super::idle_tmux_stale_turn_inflight_candidate_hook()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = self.previous.take();
-        }
-    }
-
-    struct IdleTmuxPostClearHookGuard {
-        previous: Option<super::IdleTmuxStaleTurnPostClearHook>,
-    }
-
-    struct ForceCleanPostCleanupHookGuard {
-        previous: Option<super::StallWatchdogForceCleanPostCleanupHook>,
-    }
-
-    impl Drop for IdleTmuxPostClearHookGuard {
-        fn drop(&mut self) {
-            *super::idle_tmux_stale_turn_post_clear_hook()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = self.previous.take();
-        }
-    }
-
-    impl Drop for ForceCleanPostCleanupHookGuard {
-        fn drop(&mut self) {
-            *super::stall_watchdog_force_clean_post_cleanup_hook()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = self.previous.take();
-        }
-    }
-
-    fn set_idle_tmux_post_clear_hook(
-        hook: super::IdleTmuxStaleTurnPostClearHook,
-    ) -> IdleTmuxPostClearHookGuard {
-        let mut slot = super::idle_tmux_stale_turn_post_clear_hook()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        IdleTmuxPostClearHookGuard {
-            previous: slot.replace(hook),
-        }
-    }
-
-    fn set_idle_tmux_candidate_hook(
-        hook: super::IdleTmuxStaleTurnInflightCandidateHook,
-    ) -> IdleTmuxCandidateHookGuard {
-        let mut slot = super::idle_tmux_stale_turn_inflight_candidate_hook()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        IdleTmuxCandidateHookGuard {
-            previous: slot.replace(hook),
-        }
-    }
-
-    fn set_force_clean_post_cleanup_hook(
-        hook: super::StallWatchdogForceCleanPostCleanupHook,
-    ) -> ForceCleanPostCleanupHookGuard {
-        let mut slot = super::stall_watchdog_force_clean_post_cleanup_hook()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        ForceCleanPostCleanupHookGuard {
-            previous: slot.replace(hook),
-        }
-    }
-
-    fn result_line(text: &str) -> String {
-        format!("{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"{text}\"}}\n")
-    }
-
-    fn watcher_handle(
-        tmux_session_name: &str,
-        output_path: &std::path::Path,
-        cancel: Arc<AtomicBool>,
-    ) -> crate::services::discord::TmuxWatcherHandle {
-        crate::services::discord::TmuxWatcherHandle {
-            tmux_session_name: tmux_session_name.to_string(),
-            output_path: output_path.to_string_lossy().to_string(),
-            paused: Arc::new(AtomicBool::new(false)),
-            resume_offset: Arc::new(std::sync::Mutex::new(None)),
-            cancel,
-            pause_epoch: Arc::new(AtomicU64::new(0)),
-            turn_delivered: Arc::new(AtomicBool::new(false)),
-            last_heartbeat_ts_ms: Arc::new(AtomicI64::new(0)),
-        }
-    }
-
-    fn seed_idle_inflight(
-        provider: &ProviderKind,
-        channel: ChannelId,
-        user_msg_id: u64,
-        tmux: &str,
-        output_path: &std::path::Path,
-        last_offset: u64,
-        session_id: &str,
-    ) -> crate::services::discord::inflight::InflightTurnState {
-        let mut state = crate::services::discord::inflight::InflightTurnState::new(
-            provider.clone(),
-            channel.get(),
-            None,
-            1,
-            user_msg_id,
-            user_msg_id + 1,
-            "idle tmux stale repair".to_string(),
-            Some(session_id.to_string()),
-            Some(tmux.to_string()),
-            Some(output_path.to_string_lossy().to_string()),
-            None,
-            last_offset,
-        );
-        state.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-        crate::services::discord::inflight::save_inflight_state(&state)
-            .expect("seed idle inflight row");
-        state
-    }
-
-    async fn seed_active_mailbox_and_session(
-        shared: &Arc<crate::services::discord::SharedData>,
-        channel: ChannelId,
-        user_msg: MessageId,
-    ) -> Arc<CancelToken> {
-        let token = Arc::new(CancelToken::new());
-        assert!(
-            super::super::super::mailbox_try_start_turn(
-                shared,
-                channel,
-                token.clone(),
-                UserId::new(7),
-                user_msg,
-            )
-            .await
-        );
-        shared.restart.global_active.store(1, Ordering::Relaxed);
-        shared.core.lock().await.sessions.insert(
-            channel,
-            super::super::super::DiscordSession {
-                session_id: Some("runtime-provider-session".to_string()),
-                memento_context_loaded: true,
-                memento_reflected: false,
-                current_path: None,
-                history: Vec::new(),
-                pending_uploads: Vec::new(),
-                cleared: false,
-                remote_profile_name: None,
-                channel_id: Some(channel.get()),
-                channel_name: None,
-                category_name: None,
-                last_active: tokio::time::Instant::now(),
-                worktree: None,
-                born_generation: crate::services::discord::runtime_store::load_generation(),
-            },
-        );
-        token
-    }
-
-    async fn assert_mailbox_and_session_preserved(
-        shared: &Arc<crate::services::discord::SharedData>,
-        channel: ChannelId,
-        user_msg: MessageId,
-        token: &Arc<CancelToken>,
-    ) {
-        let snapshot = super::super::super::mailbox_snapshot(shared, channel).await;
-        assert_eq!(snapshot.active_user_message_id, Some(user_msg));
-        assert!(!token.cancelled.load(Ordering::Relaxed));
-        let session_id = shared
-            .core
-            .lock()
-            .await
-            .sessions
-            .get(&channel)
-            .and_then(|session| session.session_id.clone());
-        assert_eq!(session_id.as_deref(), Some("runtime-provider-session"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn idle_tmux_stale_turn_clear_refusal_preserves_mailbox_and_session() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let shared = super::super::super::make_shared_data_for_tests();
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(4_111_401);
-        let stale_msg = MessageId::new(4_111_501);
-        let tmux = "AgentDesk-codex-4111-health-clear-refused";
-        let output_path = tempdir.path().join("health-clear-refused.jsonl");
-        std::fs::write(&output_path, result_line("")).expect("write ready output fixture");
-        let token = seed_active_mailbox_and_session(&shared, channel, stale_msg).await;
-        seed_idle_inflight(
-            &provider,
-            channel,
-            stale_msg.get(),
-            tmux,
-            &output_path,
-            0,
-            "stale-session",
-        );
-
-        let hook_provider = provider.clone();
-        let hook_output = output_path.clone();
-        let _hook = set_idle_tmux_candidate_hook(Arc::new(move |_candidate| {
-            seed_idle_inflight(
-                &hook_provider,
-                channel,
-                4_111_601,
-                tmux,
-                &hook_output,
-                0,
-                "fresh-session",
-            );
-        }));
-
-        let result = super::clear_idle_tmux_stale_turn(
-            &registry,
-            provider.as_str(),
-            channel.get(),
-            tmux,
-            "health_clear_refused_test",
-        )
-        .await;
-
-        assert!(result.is_none());
-        assert_mailbox_and_session_preserved(&shared, channel, stale_msg, &token).await;
-        let persisted =
-            crate::services::discord::inflight::load_inflight_state(&provider, channel.get())
-                .expect("fresh row must survive refused clear");
-        assert_eq!(persisted.user_msg_id, 4_111_601);
-        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn idle_tmux_stale_turn_guarded_finish_preserves_new_mailbox_claim() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let shared = super::super::super::make_shared_data_for_tests();
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(4_111_403);
-        let stale_msg = MessageId::new(4_111_503);
-        let fresh_msg = MessageId::new(4_111_603);
-        let tmux = "AgentDesk-codex-4111-health-guarded-finish";
-        let output_path = tempdir.path().join("health-guarded-finish.jsonl");
-        std::fs::write(&output_path, result_line("")).expect("write ready output fixture");
-        seed_idle_inflight(
-            &provider,
-            channel,
-            stale_msg.get(),
-            tmux,
-            &output_path,
-            0,
-            "stale-session",
-        );
-
-        let fresh_token = Arc::new(std::sync::Mutex::new(None::<Arc<CancelToken>>));
-        let hook_token = fresh_token.clone();
-        let hook_shared = shared.clone();
-        let hook_provider = provider.clone();
-        let hook_output = output_path.clone();
-        let _hook = set_idle_tmux_post_clear_hook(Arc::new(move || {
-            let shared = hook_shared.clone();
-            let provider = hook_provider.clone();
-            let output_path = hook_output.clone();
-            let token_slot = hook_token.clone();
-            Box::pin(async move {
-                let token = seed_active_mailbox_and_session(&shared, channel, fresh_msg).await;
-                seed_idle_inflight(
-                    &provider,
-                    channel,
-                    fresh_msg.get(),
-                    tmux,
-                    &output_path,
-                    0,
-                    "fresh-session",
-                );
-                *token_slot
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(token);
-            })
-        }));
-
-        let result = super::clear_idle_tmux_stale_turn(
-            &registry,
-            provider.as_str(),
-            channel.get(),
-            tmux,
-            "health_guarded_finish_test",
-        )
-        .await
-        .expect("stale inflight clear should complete");
-
-        assert!(!result.had_active_turn);
-        assert!(!result.runtime_session_cleared);
-        let fresh_token = fresh_token
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-            .expect("fresh turn token should be seeded in the post-clear gap");
-        assert_mailbox_and_session_preserved(&shared, channel, fresh_msg, &fresh_token).await;
-        let persisted =
-            crate::services::discord::inflight::load_inflight_state(&provider, channel.get())
-                .expect("fresh row must survive guarded finish mismatch");
-        assert_eq!(persisted.user_msg_id, fresh_msg.get());
-        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn idle_tmux_stale_turn_guarded_finish_preserves_new_same_id_mailbox_claim() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let shared = super::super::super::make_shared_data_for_tests();
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(4_111_404);
-        let user_msg = MessageId::new(4_111_504);
-        let tmux = "AgentDesk-codex-4111-health-guarded-finish-same-id";
-        let output_path = tempdir.path().join("health-guarded-finish-same-id.jsonl");
-        std::fs::write(&output_path, result_line("")).expect("write ready output fixture");
-        seed_idle_inflight(
-            &provider,
-            channel,
-            user_msg.get(),
-            tmux,
-            &output_path,
-            0,
-            "stale-session",
-        );
-
-        let fresh_token = Arc::new(std::sync::Mutex::new(None::<Arc<CancelToken>>));
-        let hook_token = fresh_token.clone();
-        let hook_shared = shared.clone();
-        let hook_provider = provider.clone();
-        let hook_output = output_path.clone();
-        let _hook = set_idle_tmux_post_clear_hook(Arc::new(move || {
-            let shared = hook_shared.clone();
-            let provider = hook_provider.clone();
-            let output_path = hook_output.clone();
-            let token_slot = hook_token.clone();
-            Box::pin(async move {
-                let token = seed_active_mailbox_and_session(&shared, channel, user_msg).await;
-                seed_idle_inflight(
-                    &provider,
-                    channel,
-                    user_msg.get(),
-                    tmux,
-                    &output_path,
-                    0,
-                    "fresh-session",
-                );
-                *token_slot
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(token);
-            })
-        }));
-
-        let result = super::clear_idle_tmux_stale_turn(
-            &registry,
-            provider.as_str(),
-            channel.get(),
-            tmux,
-            "health_guarded_finish_same_id_test",
-        )
-        .await
-        .expect("stale inflight clear should complete");
-
-        assert!(!result.had_active_turn);
-        assert!(!result.runtime_session_cleared);
-        let fresh_token = fresh_token
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-            .expect("fresh same-id turn token should be seeded in the post-clear gap");
-        assert_mailbox_and_session_preserved(&shared, channel, user_msg, &fresh_token).await;
-        let persisted =
-            crate::services::discord::inflight::load_inflight_state(&provider, channel.get())
-                .expect("fresh same-id row must survive guarded finish");
-        assert_eq!(persisted.user_msg_id, user_msg.get());
-        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn idle_tmux_stale_turn_tail_recheck_preserves_mailbox_after_precheck_passed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let shared = super::super::super::make_shared_data_for_tests();
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(4_111_402);
-        let user_msg = MessageId::new(4_111_502);
-        let tmux = "AgentDesk-codex-4111-health-tail-recheck";
-        let output_path = tempdir.path().join("health-tail-recheck.jsonl");
-        let pre = result_line("");
-        std::fs::write(&output_path, &pre).expect("write pre-check output fixture");
-        let token = seed_active_mailbox_and_session(&shared, channel, user_msg).await;
-        seed_idle_inflight(
-            &provider,
-            channel,
-            user_msg.get(),
-            tmux,
-            &output_path,
-            pre.len() as u64,
-            "tail-session",
-        );
-        assert!(
-            !crate::services::discord::relay_recovery::channel_has_unrelayed_idle_tmux_tail_answer(
-                &provider,
-                channel.get(),
-            ),
-            "caller pre-check fixture must pass before the tail answer is appended"
-        );
-        std::fs::write(
-            &output_path,
-            format!("{pre}{}", result_line("FINAL ANSWER")),
-        )
-        .expect("append tail answer fixture");
-
-        let result = super::clear_idle_tmux_stale_turn(
-            &registry,
-            provider.as_str(),
-            channel.get(),
-            tmux,
-            "health_tail_recheck_test",
-        )
-        .await;
-
-        assert!(result.is_none());
-        assert_mailbox_and_session_preserved(&shared, channel, user_msg, &token).await;
-        assert!(
-            crate::services::discord::inflight::load_inflight_state(&provider, channel.get())
-                .is_some(),
-            "tail-answer skip must preserve inflight for normal relay"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn force_clean_guarded_finish_preserves_new_same_id_mailbox_claim() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Codex;
-        let mut registry = HealthRegistry::new();
-        registry.started_at_unix =
-            chrono::Utc::now().timestamp() - super::STALL_WATCHDOG_THRESHOLD_SECS as i64 - 60;
-        let shared = super::super::super::make_shared_data_for_tests();
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(4_111_405);
-        let user_msg = MessageId::new(4_111_505);
-        let stale_tmux = "AgentDesk-codex-4111-force-clean-stale";
-        let fresh_tmux = "AgentDesk-codex-4111-force-clean-fresh";
-        let stale_output = tempdir.path().join("force-clean-stale.jsonl");
-        let fresh_output = tempdir.path().join("force-clean-fresh.jsonl");
-        std::fs::write(&stale_output, "partial stale output\n")
-            .expect("write stale output fixture");
-        std::fs::write(&fresh_output, "fresh retry output\n").expect("write fresh output fixture");
-        let _stale_token = seed_active_mailbox_and_session(&shared, channel, user_msg).await;
-        let mut stale_state = seed_idle_inflight(
-            &provider,
-            channel,
-            user_msg.get(),
-            stale_tmux,
-            &stale_output,
-            0,
-            "stale-session",
-        );
-        let stale_at = (chrono::Local::now() - chrono::Duration::hours(5))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        stale_state.started_at = stale_at.clone();
-        stale_state.updated_at = stale_at;
-        crate::services::discord::inflight::save_inflight_state(&stale_state)
-            .expect("save stale inflight timestamps");
-        shared.tmux_watchers.insert(
-            channel,
-            watcher_handle(stale_tmux, &stale_output, Arc::new(AtomicBool::new(false))),
-        );
-
-        let fresh_token = Arc::new(std::sync::Mutex::new(None::<Arc<CancelToken>>));
-        let hook_token = fresh_token.clone();
-        let hook_shared = shared.clone();
-        let hook_provider = provider.clone();
-        let hook_fresh_output = fresh_output.clone();
-        let _hook = set_force_clean_post_cleanup_hook(Arc::new(move || {
-            let shared = hook_shared.clone();
-            let provider = hook_provider.clone();
-            let fresh_output = hook_fresh_output.clone();
-            let token_slot = hook_token.clone();
-            Box::pin(async move {
-                let finish = super::super::super::mailbox_finish_turn_if_matches_started_before(
-                    &shared,
-                    &provider,
-                    channel,
-                    user_msg,
-                    std::time::Instant::now(),
-                )
-                .await;
-                if let Some(token) = finish.removed_token {
-                    token.cancelled.store(true, Ordering::Relaxed);
-                    super::super::super::saturating_decrement_global_active(&shared);
-                }
-                let token = seed_active_mailbox_and_session(&shared, channel, user_msg).await;
-                seed_idle_inflight(
-                    &provider,
-                    channel,
-                    user_msg.get(),
-                    fresh_tmux,
-                    &fresh_output,
-                    0,
-                    "fresh-session",
-                );
-                shared.tmux_watchers.insert(
-                    channel,
-                    watcher_handle(fresh_tmux, &fresh_output, Arc::new(AtomicBool::new(false))),
-                );
-                *token_slot
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = Some(token);
-            })
-        }));
-
-        let cleaned = super::run_stall_watchdog_pass(&registry, &provider).await;
-
-        assert_eq!(cleaned, 1);
-        let fresh_token = fresh_token
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone()
-            .expect("fresh same-id turn token should be seeded in the force-clean gap");
-        assert_mailbox_and_session_preserved(&shared, channel, user_msg, &fresh_token).await;
-        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
-        let persisted =
-            crate::services::discord::inflight::load_inflight_state(&provider, channel.get())
-                .expect("fresh same-id row must survive force-clean release");
-        assert_eq!(persisted.user_msg_id, user_msg.get());
-        assert_eq!(persisted.session_id.as_deref(), Some("fresh-session"));
-    }
-
     #[tokio::test]
     async fn stall_watchdog_cleanup_releases_residual_orphan_pending_token() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
         let provider = ProviderKind::Codex;
         let registry = HealthRegistry::new();
         let shared = super::super::super::make_shared_data_for_tests();
@@ -4964,631 +3607,5 @@ mod stall_watchdog_auto_heal_tests {
         );
         assert!(token.cancelled.load(Ordering::Relaxed));
         assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
-    }
-}
-
-#[cfg(test)]
-mod hard_stop_completion_event_tests {
-    use std::future::Future;
-    use std::io::{self, Write};
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    use super::super::HealthRegistry;
-    use crate::services::provider::{CancelToken, ProviderKind};
-    use crate::services::turn_orchestrator::{Intervention, InterventionMode};
-
-    struct EnvVarReset {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarReset {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let lock = crate::config::shared_test_env_lock()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                _lock: lock,
-                key,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvVarReset {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer
-                .lock()
-                .expect("log buffer lock")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    async fn capture_warns_async<F, Fut, T>(f: F) -> (T, String)
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = T>,
-    {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = CapturingWriter {
-            buffer: buffer.clone(),
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(writer)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let result = f().await;
-        drop(guard);
-        (
-            result,
-            String::from_utf8_lossy(&buffer.lock().expect("log buffer lock").clone()).into_owned(),
-        )
-    }
-
-    fn intervention(id: u64, text: &str) -> Intervention {
-        Intervention {
-            author_id: UserId::new(id),
-            author_is_bot: false,
-            message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
-            source_message_ids: vec![MessageId::new(id)],
-            source_message_queued_generations: Vec::new(),
-            source_text_segments: Vec::new(),
-            text: text.to_string(),
-            mode: InterventionMode::Soft,
-            created_at: std::time::Instant::now(),
-            reply_context: None,
-            has_reply_boundary: false,
-            merge_consecutive: false,
-            pending_uploads: Vec::new(),
-            voice_announcement: None,
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn providerless_hard_stop_with_runtime_publishes_completion_event_for_pending_queue() {
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let shared = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_048_230);
-        shared
-            .mailbox(channel)
-            .replace_queue(
-                vec![intervention(4_048_231, "pending after hard stop")],
-                super::super::super::queue_persistence_context(&shared, &provider, channel),
-            )
-            .await;
-        assert!(
-            super::super::super::mailbox_try_start_turn(
-                &shared,
-                channel,
-                Arc::new(CancelToken::new()),
-                UserId::new(4_048_232),
-                MessageId::new(4_048_232),
-            )
-            .await
-        );
-        registry
-            .register(provider.as_str().to_string(), shared.clone())
-            .await;
-        let mut rx =
-            super::super::super::turn_completion_events::subscribe_turn_completion_events(&shared);
-
-        let result = super::stop_runtime_turn_preserving_watcher(
-            Some(&registry),
-            None,
-            Some(channel.get()),
-            None,
-            "hard_stop_completion_event_test",
-        )
-        .await;
-
-        assert!(result.had_active_turn);
-        assert!(result.has_pending_queue);
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("completion event receive should not time out")
-            .expect("completion event bus should remain open");
-        assert_eq!(event.channel_id, channel);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn providerless_stale_repair_uses_strict_per_runtime_mailbox_ownership() {
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let first = super::super::super::make_shared_data_for_tests();
-        let second = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_048_250);
-        let token = Arc::new(CancelToken::new());
-
-        assert!(
-            first.mailbox_peek(channel).is_none(),
-            "first registered runtime must not own the test channel"
-        );
-        second
-            .mailbox(channel)
-            .replace_queue(
-                vec![intervention(4_048_251, "pending on owning runtime")],
-                super::super::super::queue_persistence_context(&second, &provider, channel),
-            )
-            .await;
-        assert!(
-            super::super::super::mailbox_try_start_turn(
-                &second,
-                channel,
-                token.clone(),
-                UserId::new(4_048_252),
-                MessageId::new(4_048_252),
-            )
-            .await
-        );
-        let global_before =
-            crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel)
-                .expect("owning runtime should publish global handle");
-        assert_eq!(
-            global_before.snapshot().await.intervention_queue.len(),
-            1,
-            "test setup must leave a queued item on the owning runtime"
-        );
-
-        registry
-            .register(provider.as_str().to_string(), first.clone())
-            .await;
-        registry
-            .register(provider.as_str().to_string(), second.clone())
-            .await;
-        let mut first_rx =
-            super::super::super::turn_completion_events::subscribe_turn_completion_events(&first);
-        let mut second_rx =
-            super::super::super::turn_completion_events::subscribe_turn_completion_events(&second);
-
-        let result = super::stop_providerless_runtime_turn_preserving_watcher_strict_ownership(
-            Some(&registry),
-            channel.get(),
-            "stale_mailbox_repair",
-        )
-        .await;
-
-        assert!(result.had_active_turn);
-        assert!(result.has_pending_queue);
-        assert!(
-            token.cancelled.load(Ordering::Relaxed),
-            "owning runtime's active token should be cancelled by hard-stop cleanup"
-        );
-        let event = tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
-            .await
-            .expect("completion event on owning runtime should not time out")
-            .expect("owning runtime completion bus should remain open");
-        assert_eq!(event.channel_id, channel);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), first_rx.recv())
-                .await
-                .is_err(),
-            "non-owning first runtime must not publish a completion event"
-        );
-        assert!(
-            first.mailbox_peek(channel).is_none(),
-            "strict provider-less repair must not create a mailbox on the first runtime"
-        );
-
-        let second_snapshot = second
-            .mailbox_peek(channel)
-            .expect("owning runtime mailbox should remain registered")
-            .snapshot()
-            .await;
-        assert!(second_snapshot.cancel_token.is_none());
-        assert_eq!(second_snapshot.intervention_queue.len(), 1);
-        let global_after =
-            crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel)
-                .expect("global handle should still point at the owning mailbox");
-        assert_eq!(
-            global_after.snapshot().await.intervention_queue.len(),
-            1,
-            "global handle must not be overwritten by an empty first-runtime mailbox"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn providerless_strict_repair_ignores_empty_mailbox_created_by_snapshot_scan() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let first = super::super::super::make_shared_data_for_tests();
-        let second = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_048_260);
-        let token = Arc::new(CancelToken::new());
-
-        second
-            .mailbox(channel)
-            .replace_queue(
-                vec![intervention(4_048_261, "pending on second runtime")],
-                super::super::super::queue_persistence_context(&second, &provider, channel),
-            )
-            .await;
-        assert!(
-            super::super::super::mailbox_try_start_turn(
-                &second,
-                channel,
-                token.clone(),
-                UserId::new(4_048_262),
-                MessageId::new(4_048_262),
-            )
-            .await
-        );
-        assert!(
-            first.mailbox_peek(channel).is_none(),
-            "first runtime must begin without local mailbox evidence"
-        );
-
-        registry
-            .register(provider.as_str().to_string(), first.clone())
-            .await;
-        registry
-            .register(provider.as_str().to_string(), second.clone())
-            .await;
-
-        let observed = registry
-            .snapshot_watcher_state(channel.get())
-            .await
-            .expect("providerless pre-repair snapshot should find second runtime's mailbox");
-        assert!(observed.has_pending_queue);
-        // cfcdcd6135572601af287e2165afae34b3ddd464 (#4068) made health
-        // snapshots peek-only: observation must not materialize or globalize
-        // an empty first-runtime mailbox.
-        assert!(
-            first.mailbox_peek(channel).is_none(),
-            "providerless snapshot scan must leave the first runtime without local mailbox evidence"
-        );
-        let global_after_observation =
-            crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel)
-                .expect("snapshot scan should leave a process-global handle");
-        let global_snapshot = global_after_observation.snapshot().await;
-        assert!(global_snapshot.cancel_token.is_some());
-        assert!(
-            !global_snapshot.intervention_queue.is_empty(),
-            "pre-repair observation should keep the global handle on the owning second runtime"
-        );
-
-        let mut first_rx =
-            super::super::super::turn_completion_events::subscribe_turn_completion_events(&first);
-        let mut second_rx =
-            super::super::super::turn_completion_events::subscribe_turn_completion_events(&second);
-
-        let result = super::stop_providerless_runtime_turn_preserving_watcher_strict_ownership(
-            Some(&registry),
-            channel.get(),
-            "stale_mailbox_repair",
-        )
-        .await;
-
-        assert!(
-            result.had_active_turn,
-            "strict repair must select and finalize the owning second runtime"
-        );
-        assert!(result.has_pending_queue);
-        assert!(
-            token.cancelled.load(Ordering::Relaxed),
-            "second runtime's active token should be cancelled by selected repair"
-        );
-        let event = tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
-            .await
-            .expect("owning second runtime should publish completion event")
-            .expect("owning second runtime completion bus should remain open");
-        assert_eq!(event.channel_id, channel);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), first_rx.recv())
-                .await
-                .is_err(),
-            "empty first runtime must not be selected or publish completion"
-        );
-
-        let first_after = first.mailbox_peek(channel);
-        assert!(
-            first_after.is_none(),
-            "empty first runtime mailbox should not be created by observation or repair"
-        );
-        let second_after = second
-            .mailbox_peek(channel)
-            .expect("owning second runtime mailbox should remain registered")
-            .snapshot()
-            .await;
-        assert!(second_after.cancel_token.is_none());
-        assert_eq!(second_after.intervention_queue.len(), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn unresolvable_raw_hard_stop_warns_about_potentially_stranded_pending_queue() {
-        let tempdir = tempfile::tempdir().expect("runtime root tempdir");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
-        let provider = ProviderKind::Claude;
-        let shared = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_048_240);
-        shared
-            .mailbox(channel)
-            .replace_queue(
-                vec![intervention(4_048_241, "pending without runtime")],
-                super::super::super::queue_persistence_context(&shared, &provider, channel),
-            )
-            .await;
-        assert!(
-            super::super::super::mailbox_try_start_turn(
-                &shared,
-                channel,
-                Arc::new(CancelToken::new()),
-                UserId::new(4_048_242),
-                MessageId::new(4_048_242),
-            )
-            .await
-        );
-
-        let (result, logs) = capture_warns_async(|| async {
-            super::stop_runtime_turn_preserving_watcher(
-                None,
-                None,
-                Some(channel.get()),
-                None,
-                "hard_stop_unresolvable_test",
-            )
-            .await
-        })
-        .await;
-
-        assert!(result.had_active_turn);
-        assert!(result.has_pending_queue);
-        assert!(
-            logs.contains("raw hard_stop fallback could not resolve the owning runtime"),
-            "strand warning message missing from logs: {logs}"
-        );
-        assert!(
-            logs.contains(&format!("channel_id={}", channel.get())),
-            "strand warning must include channel_id: {logs}"
-        );
-        assert!(
-            logs.contains("has_pending=true"),
-            "strand warning must include has_pending=true: {logs}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod explicit_background_watchdog_cleanup_tests {
-    use super::{
-        ExplicitBackgroundWatchdogClear, cleanup_then_submit_explicit_background_watchdog_cancel,
-        stop_hard_stop_cleanup_watcher_if_current,
-    };
-    use crate::services::discord::inflight::GuardedClearOutcome;
-    use crate::services::provider::ProviderKind;
-    use poise::serenity_prelude::ChannelId;
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    fn watcher(
-        tmux_session_name: &str,
-        output_path: &str,
-        cancel: Arc<AtomicBool>,
-    ) -> super::super::super::TmuxWatcherHandle {
-        super::super::super::TmuxWatcherHandle {
-            tmux_session_name: tmux_session_name.to_string(),
-            output_path: output_path.to_string(),
-            paused: Arc::new(AtomicBool::new(false)),
-            resume_offset: Arc::new(std::sync::Mutex::new(None)),
-            cancel,
-            pause_epoch: Arc::new(AtomicU64::new(0)),
-            turn_delivered: Arc::new(AtomicBool::new(false)),
-            last_heartbeat_ts_ms: Arc::new(AtomicI64::new(0)),
-        }
-    }
-
-    #[tokio::test]
-    async fn explicit_background_cleanup_precedes_release_and_preserves_new_watcher() {
-        let shared = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_019_402_900);
-        let old_cancel = Arc::new(AtomicBool::new(false));
-        let new_cancel = Arc::new(AtomicBool::new(false));
-        shared.tmux_watchers.insert(
-            channel,
-            watcher(
-                "AgentDesk-codex-old-explicit-background",
-                "/tmp/agentdesk-old-explicit-background.jsonl",
-                old_cancel.clone(),
-            ),
-        );
-        let revalidated = ExplicitBackgroundWatchdogClear {
-            clear_outcome: GuardedClearOutcome::Cleared,
-            pending_hourglass_user_msg_id: Some(4_019_402_901),
-            finalizer_turn_id: 4_019_402_901,
-        };
-        let order = Arc::new(Mutex::new(Vec::new()));
-
-        let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
-            &shared,
-            &ProviderKind::Codex,
-            channel,
-            &revalidated,
-            Some("AgentDesk-codex-old-explicit-background"),
-            {
-                let shared = shared.clone();
-                let old_cancel = old_cancel.clone();
-                let new_cancel = new_cancel.clone();
-                let order = order.clone();
-                move || async move {
-                    assert!(
-                        old_cancel.load(Ordering::Relaxed),
-                        "old watcher must be stopped before finalizer release"
-                    );
-                    assert!(
-                        !shared.tmux_watchers.contains_key(&channel),
-                        "old watcher must be removed before finalizer release"
-                    );
-                    order
-                        .lock()
-                        .expect("order lock")
-                        .extend(["cleanup", "finalizer_release"]);
-                    shared.tmux_watchers.insert(
-                        channel,
-                        watcher(
-                            "AgentDesk-codex-new-explicit-background",
-                            "/tmp/agentdesk-new-explicit-background.jsonl",
-                            new_cancel.clone(),
-                        ),
-                    );
-                    super::super::super::turn_finalizer::FinalizeOutcome::Finalized {
-                        removed_token: None,
-                        has_pending: false,
-                        mailbox_online: true,
-                    }
-                }
-            },
-        )
-        .await;
-
-        assert!(!has_pending);
-        assert_eq!(
-            *order.lock().expect("order lock"),
-            ["cleanup", "finalizer_release"]
-        );
-        assert!(
-            shared.tmux_watchers.contains_key(&channel),
-            "watcher registered after finalizer release must survive pass completion"
-        );
-        let binding = shared
-            .tmux_watchers
-            .channel_binding(&channel)
-            .expect("new watcher binding");
-        assert_eq!(
-            binding.tmux_session_name,
-            "AgentDesk-codex-new-explicit-background"
-        );
-        assert!(!new_cancel.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn hard_stop_cleanup_watcher_stop_is_tmux_session_conditional() {
-        let shared = super::super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(4_019_402_901);
-        let cancel = Arc::new(AtomicBool::new(false));
-        shared.tmux_watchers.insert(
-            channel,
-            watcher(
-                "AgentDesk-codex-current-turn",
-                "/tmp/agentdesk-current-turn.jsonl",
-                cancel.clone(),
-            ),
-        );
-
-        assert!(!stop_hard_stop_cleanup_watcher_if_current(
-            &shared,
-            channel,
-            Some("AgentDesk-codex-stalled-turn"),
-        ));
-        assert!(
-            shared.tmux_watchers.contains_key(&channel),
-            "mismatched current watcher must remain registered"
-        );
-        assert!(!cancel.load(Ordering::Relaxed));
-
-        assert!(stop_hard_stop_cleanup_watcher_if_current(
-            &shared,
-            channel,
-            Some("AgentDesk-codex-current-turn"),
-        ));
-        assert!(!shared.tmux_watchers.contains_key(&channel));
-        assert!(cancel.load(Ordering::Relaxed));
-    }
-}
-
-#[cfg(test)]
-mod owning_runtime_http_tests {
-    use super::super::HealthRegistry;
-    use crate::services::provider::ProviderKind;
-    use poise::serenity_prelude::ChannelId;
-
-    #[tokio::test]
-    async fn owning_runtime_http_uses_channel_matched_runtime() {
-        let provider = ProviderKind::Claude;
-        let registry = HealthRegistry::new();
-        let first = super::super::super::make_shared_data_for_tests();
-        let second = super::super::super::make_shared_data_for_tests();
-        let first_channel = ChannelId::new(401_900_000_000_001);
-        let second_channel = ChannelId::new(401_900_000_000_002);
-
-        {
-            let mut settings = first.settings.write().await;
-            settings.allowed_channel_ids = vec![first_channel.get()];
-        }
-        {
-            let mut settings = second.settings.write().await;
-            settings.allowed_channel_ids = vec![second_channel.get()];
-        }
-        let _ = second
-            .http
-            .cached_bot_token
-            .set("test-owning-runtime-token".to_string());
-
-        registry
-            .register(provider.as_str().to_string(), first.clone())
-            .await;
-        registry
-            .register(provider.as_str().to_string(), second.clone())
-            .await;
-
-        assert!(
-            super::owning_runtime_http_for_channel(&registry, &provider, second_channel)
-                .await
-                .is_some(),
-            "channel-aware lookup must select the second same-provider runtime"
-        );
-        assert!(
-            super::owning_runtime_http_for_channel(&registry, &provider, first_channel)
-                .await
-                .is_none(),
-            "a first-runtime/name-only lookup would mask this missing owner HTTP"
-        );
     }
 }

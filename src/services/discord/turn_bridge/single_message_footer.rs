@@ -5,8 +5,8 @@ use super::*;
 pub(super) fn make_owner(
     user_msg_id: Option<MessageId>,
     started_at_unix: i64,
-) -> super::footer_view_reconciler::CompletionFooterOwner {
-    super::footer_view_reconciler::CompletionFooterOwner::new(
+) -> super::single_message_panel::CompletionFooterOwner {
+    super::single_message_panel::CompletionFooterOwner::new(
         user_msg_id.map(|id| id.get()).unwrap_or(0),
         started_at_unix,
     )
@@ -14,7 +14,7 @@ pub(super) fn make_owner(
 
 pub(super) fn make_owner_now(
     user_msg_id: Option<MessageId>,
-) -> (i64, super::footer_view_reconciler::CompletionFooterOwner) {
+) -> (i64, super::single_message_panel::CompletionFooterOwner) {
     let started_at_unix = chrono::Utc::now().timestamp();
     (started_at_unix, make_owner(user_msg_id, started_at_unix))
 }
@@ -41,36 +41,6 @@ pub(super) fn bridge_status_panel_dirty_should_edit_separate_panel(
         status_panel_dirty,
         single_message_panel_footer_mode,
     )
-}
-
-/// #3813 Phase 2: should the status-panel / footer edit be DEFERRED this loop
-/// pass because the turn's opening answer body has not reached Discord yet?
-///
-/// The status-panel edit and the #4006 first-output fast-lane streaming edit
-/// share the same per-channel Discord rate lane (`discord_io` 1s `min_gap`).
-/// When a v2 panel is dirty from turn start it is eligible immediately, so on
-/// the very first loop pass it can consume that lane BEFORE the fast-lane first
-/// answer, pushing the opening answer back by up to the `min_gap` and eroding
-/// the fast lane's benefit. This predicate holds the panel edit back for exactly
-/// that window — while the first answer has NOT been relayed
-/// (`!first_answer_relayed`) AND there is un-relayed answer body pending
-/// (`first_answer_text_pending`).
-///
-/// It deliberately does NOT gate on `!first_answer_relayed` ALONE. A tool-only
-/// turn (or any turn whose bridge never relays assistant body — e.g. a
-/// watcher/standby-owned relay, where `response_sent_offset` tracks the response
-/// length so nothing stays pending) leaves `first_answer_relayed` false for the
-/// whole turn; a bare gate would then suppress the live panel for the entire
-/// turn (#3477 regression). Requiring `first_answer_text_pending` too means the
-/// deferral only bites while an opening answer body is genuinely competing for
-/// the lane. The caller leaves `status_panel_dirty` set across the skip, so the
-/// panel renders on the next interval once the first answer has been relayed —
-/// coalesced by at most one interval, never dropped.
-pub(super) fn status_panel_edit_defer_for_first_answer(
-    first_answer_relayed: bool,
-    first_answer_text_pending: bool,
-) -> bool {
-    !first_answer_relayed && first_answer_text_pending
 }
 
 #[cfg(test)]
@@ -102,7 +72,6 @@ pub(super) fn bridge_should_complete_separate_status_panel(status_panel_v2_enabl
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_create_bridge_separate_status_panel_response<G: TurnGateway + ?Sized>(
-    two_message_panel_enabled: bool,
     single_message_panel_footer_mode: bool,
     status_panel_v2_enabled: bool,
     gateway: &G,
@@ -113,40 +82,12 @@ pub(super) async fn maybe_create_bridge_separate_status_panel_response<G: TurnGa
     bridge_created_response_placeholder_msg_id: &mut Option<MessageId>,
     last_edit_text: &mut String,
     inflight_state: &mut InflightTurnState,
-    status_panel_generation: &mut u64,
     response_sent_offset: usize,
     full_response: &str,
     status_panel_dirty: &mut bool,
     _shared: &Arc<SharedData>,
     _provider: &crate::services::provider::ProviderKind,
 ) {
-    // #3805 P2 (PR-B): flag ON → create the status panel as a NEW message BELOW
-    // the answer (answer-first layout). The ON path is fully mutually exclusive
-    // with the OFF panel-above swap below: it either creates the two-message
-    // panel or does nothing, so the default-OFF path stays byte-identical.
-    if two_message_panel_enabled {
-        if super::two_message_panel::bridge_should_create_two_message_status_panel(
-            two_message_panel_enabled,
-            single_message_panel_footer_mode,
-            status_panel_v2_enabled,
-            *status_panel_msg_id,
-            *current_msg_id,
-        ) {
-            super::two_message_panel::create_bridge_two_message_status_panel_below_answer(
-                gateway,
-                channel_id,
-                initial_indicator,
-                *current_msg_id,
-                status_panel_msg_id,
-                inflight_state,
-                status_panel_generation,
-                status_panel_dirty,
-            )
-            .await;
-        }
-        return;
-    }
-
     if !bridge_should_create_separate_status_panel(
         single_message_panel_footer_mode,
         status_panel_v2_enabled,
@@ -271,15 +212,46 @@ async fn complete_bridge_single_message_terminal_no_footer(
     provider: &ProviderKind,
     terminal_text: &str,
 ) -> bool {
-    super::footer_view_reconciler::note_footer_suppressed_for_tui_mirror(
-        super::footer_view_reconciler::FooterViewWriter::bridge(shared),
+    super::single_message_panel::completion_footer_forget_registered_target_if_message(
         channel_id,
-        Some(terminal_msg_id),
-        provider,
+        terminal_msg_id,
+    );
+    let Some(finalized) = super::single_message_panel::finalize_streaming_footer_with_completion(
         terminal_text,
-        "turn_bridge_tui_mirror",
-    )
-    .await
+        provider,
+        None,
+    ) else {
+        // Already clean (short-replace rewrote the message to this prose) — the
+        // mirror carries the assistant turn with no chrome, nothing to edit.
+        return true;
+    };
+    match edit_bridge_completion_footer(shared, channel_id, terminal_msg_id, &finalized).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "[turn_bridge] #3959 failed to strip TUI-direct mirror footer on message {} in channel {}: {}",
+                terminal_msg_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn edit_bridge_completion_footer(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    msg_id: MessageId,
+    text: &str,
+) -> Result<(), String> {
+    let Some(http) = shared.serenity_http_or_token_fallback() else {
+        return Err("no Discord HTTP available for completion footer edit".to_string());
+    };
+    super::http::edit_channel_message(&http, channel_id, msg_id, text)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -287,57 +259,168 @@ pub(super) async fn complete_bridge_single_message_completion_footer(
     shared: &SharedData,
     channel_id: ChannelId,
     terminal_msg_id: MessageId,
-    owner: super::footer_view_reconciler::CompletionFooterOwner,
+    owner: super::single_message_panel::CompletionFooterOwner,
     provider: &ProviderKind,
     _started_at_unix: i64,
     terminal_text: &str,
     indicator: &str,
     background: bool,
-    background_agent_pending: bool,
 ) -> bool {
-    super::footer_view_reconciler::note_turn_completed_footer(
-        super::footer_view_reconciler::FooterViewWriter::bridge(shared),
+    shared
+        .ui
+        .placeholder_live_events
+        .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
+    let rendered = shared
+        .ui
+        .placeholder_live_events
+        .render_completion_footer(channel_id, provider, indicator);
+    if let Some(edit) = super::single_message_panel::register_completion_footer_target_for_owner(
         channel_id,
-        Some(terminal_msg_id),
+        terminal_msg_id,
         owner,
         provider,
+        chrono::Utc::now().timestamp(),
         terminal_text,
-        indicator,
-        background,
-        background_agent_pending,
+        rendered.block.as_deref(),
+        rendered.has_unfinished_entries,
+    ) {
+        if let Err(error) =
+            edit_bridge_completion_footer(shared, channel_id, edit.message_id, &edit.text).await
+        {
+            tracing::warn!(
+                "[turn_bridge] failed to supersede completion footer message {} in channel {}: {}",
+                edit.message_id,
+                channel_id,
+                error
+            );
+        }
+    }
+    let Some(finalized) = super::single_message_panel::finalize_streaming_footer_with_completion(
+        terminal_text,
+        provider,
+        rendered.block.as_deref(),
+    ) else {
+        return true;
+    };
+    let inflight = crate::services::discord::turn_end_wip_warning::load_matching_inflight_state(
+        provider,
+        channel_id,
+        Some(owner.user_msg_id),
+    );
+    let _ = crate::services::discord::turn_end_wip_warning::warn_turn_end_wip_with_shared_http(
+        shared,
+        channel_id,
+        inflight.as_ref(),
         "turn_bridge_single_message_footer",
     )
+    .await;
+    let edited = match edit_bridge_completion_footer(
+        shared,
+        channel_id,
+        terminal_msg_id,
+        &finalized,
+    )
     .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "[turn_bridge] failed to edit completion footer message {} in channel {}: {}",
+                terminal_msg_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    };
+    let recorded =
+        super::single_message_panel::completion_footer_record_committed_text_result_for_owner(
+            channel_id,
+            terminal_msg_id,
+            owner,
+            !rendered.has_unfinished_entries,
+            edited,
+            &finalized,
+            rendered.block.as_deref(),
+        );
+    // #3391: the finalize edit delivered this render's terminal marks once;
+    // evict those slot identities so subsequent footer renders (incl. #3386
+    // migration) drop the completed task AND subagent entries.
+    if edited && recorded {
+        shared
+            .ui
+            .placeholder_live_events
+            .evict_delivered_terminal_footer_tasks(channel_id, &rendered.delivered_terminal_ids);
+    }
+    edited
 }
 
 pub(super) async fn supersede_bridge_footer(
     shared: &SharedData,
     channel_id: ChannelId,
-    owner: super::footer_view_reconciler::CompletionFooterOwner,
+    owner: super::single_message_panel::CompletionFooterOwner,
 ) -> bool {
-    super::footer_view_reconciler::note_footer_superseded(
-        super::footer_view_reconciler::FooterViewWriter::bridge(shared),
-        channel_id,
-        owner,
-        "turn_bridge_supersede",
-    )
-    .await
+    let Some(edit) =
+        super::single_message_panel::completion_footer_supersede_registered_target_for_owner(
+            channel_id,
+            Some(owner),
+        )
+    else {
+        return false;
+    };
+    match edit_bridge_completion_footer(shared, channel_id, edit.message_id, &edit.text).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "[turn_bridge] failed to supersede completion footer message {} in channel {}: {}",
+                edit.message_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    }
 }
 
 pub(super) async fn refresh_bridge_footer(
     shared: &SharedData,
     channel_id: ChannelId,
-    owner: super::footer_view_reconciler::CompletionFooterOwner,
+    owner: super::single_message_panel::CompletionFooterOwner,
     indicator: &str,
 ) -> bool {
-    super::footer_view_reconciler::note_background_refresh_due(
-        super::footer_view_reconciler::FooterViewWriter::bridge(shared),
+    let Some(edit) =
+        super::single_message_panel::completion_footer_edit_for_registered_target_for_owner(
+            shared, channel_id, owner, indicator,
+        )
+    else {
+        return false;
+    };
+    if !super::single_message_panel::completion_footer_edit_still_registered(channel_id, &edit) {
+        return false;
+    }
+    let edited = match edit_bridge_completion_footer(
+        shared,
         channel_id,
-        Some(owner),
-        indicator,
-        "turn_bridge_refresh",
+        edit.message_id,
+        &edit.text,
     )
     .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "[turn_bridge] failed to refresh completion footer message {} in channel {}: {}",
+                edit.message_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    };
+    super::single_message_panel::completion_footer_record_edit_result_for_edit(
+        shared, channel_id, &edit, edited,
+    );
+    edited
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -355,96 +438,19 @@ pub(super) async fn complete_bridge_terminal_footer_or_status_panel<G: TurnGatew
     is_external_input_tui_direct: bool,
     terminal_text: Option<&str>,
     indicator: &str,
-    this_turn_status_panel_generation: u64,
-    tmux_session_name: Option<&str>,
 ) -> bool {
-    complete_bridge_terminal_footer_or_status_panel_with_sniffer(
-        shared,
-        gateway,
-        channel_id,
-        current_msg_id,
-        user_msg_id,
-        status_panel_msg_id,
-        provider,
-        started_at_unix,
-        last_status_panel_text,
-        single_message_panel_footer_mode,
-        is_external_input_tui_direct,
-        terminal_text,
-        indicator,
-        this_turn_status_panel_generation,
-        tmux_session_name.map(str::to_string),
-        |tmux_session_name| async move {
-            super::super::tmux::sniff_background_agent_pending_for_completion(
-                tmux_session_name.as_deref(),
-            )
-            .await
-        },
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn complete_bridge_terminal_footer_or_status_panel_with_sniffer<
-    G,
-    S,
-    SniffFuture,
->(
-    shared: &SharedData,
-    gateway: &G,
-    channel_id: ChannelId,
-    current_msg_id: MessageId,
-    user_msg_id: Option<MessageId>,
-    status_panel_msg_id: Option<MessageId>,
-    provider: &ProviderKind,
-    started_at_unix: i64,
-    last_status_panel_text: &mut String,
-    single_message_panel_footer_mode: bool,
-    is_external_input_tui_direct: bool,
-    terminal_text: Option<&str>,
-    indicator: &str,
-    this_turn_status_panel_generation: u64,
-    tmux_session_name: Option<String>,
-    sniff_background_agent_pending: S,
-) -> bool
-where
-    G: TurnGateway + ?Sized,
-    S: FnOnce(Option<String>) -> SniffFuture,
-    SniffFuture: std::future::Future<Output = bool>,
-{
     let this_turn_user_msg_id = user_msg_id.map(|id| id.get()).unwrap_or(0);
-    // #3805 P2: a completion edit is skipped when EITHER a different real turn
-    // now owns this panel (identity aliasing, unchanged) OR — under the
-    // two-message path — a NEWER panel epoch has superseded this stale edit for
-    // the SAME owned panel. On the default-OFF path every generation is 0, so
-    // the generation term is inert and this stays byte-identical.
-    let (aliases_newer_turn, generation_superseded) =
-        match super::inflight::load_inflight_state(provider, channel_id.get()) {
-            Some(on_disk) => {
-                let identity_alias =
-                    super::status_panel::status_panel_completion_edit_aliases_newer_turn(
-                        this_turn_user_msg_id,
-                        status_panel_msg_id,
-                        on_disk.user_msg_id,
-                        on_disk.status_message_id,
-                    );
-                let panel_owned_on_disk = match status_panel_msg_id {
-                    Some(id) if !is_synthetic_headless_message_id(id) => {
-                        on_disk.status_message_id == Some(id.get())
-                    }
-                    _ => false,
-                };
-                let generation_superseded =
-                    super::two_message_panel::two_message_status_edit_generation_is_stale(
-                        this_turn_status_panel_generation,
-                        panel_owned_on_disk,
-                        on_disk.status_panel_generation,
-                    );
-                (identity_alias, generation_superseded)
-            }
-            None => (false, false),
-        };
-    if (aliases_newer_turn || generation_superseded) && !single_message_panel_footer_mode {
+    let aliases_newer_turn = match super::inflight::load_inflight_state(provider, channel_id.get())
+    {
+        Some(on_disk) => super::status_panel::status_panel_completion_edit_aliases_newer_turn(
+            this_turn_user_msg_id,
+            status_panel_msg_id,
+            on_disk.user_msg_id,
+            on_disk.status_message_id,
+        ),
+        None => false,
+    };
+    if aliases_newer_turn && !single_message_panel_footer_mode {
         tracing::debug!(
             "[turn_bridge] skipping status-panel-v2 completion edit of msg {:?} in channel {}: a newer turn now owns the panel (this turn user_msg_id {})",
             status_panel_msg_id,
@@ -453,9 +459,8 @@ where
         );
         return true;
     }
-    let background_agent_pending = sniff_background_agent_pending(tmux_session_name).await;
     if single_message_panel_footer_mode {
-        let owner = super::footer_view_reconciler::CompletionFooterOwner::new(
+        let owner = super::single_message_panel::CompletionFooterOwner::new(
             this_turn_user_msg_id,
             started_at_unix,
         );
@@ -485,7 +490,6 @@ where
                         text,
                         indicator,
                         false,
-                        background_agent_pending,
                     )
                     .await
                 }
@@ -502,7 +506,6 @@ where
         started_at_unix,
         last_status_panel_text,
         false,
-        background_agent_pending,
         "turn_terminal_delivery",
         this_turn_user_msg_id,
     )
@@ -515,40 +518,6 @@ mod tests {
     use crate::services::discord::DISCORD_MSG_LIMIT;
 
     const PANEL: &str = "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nSubagents\n└ review inspect";
-
-    struct RuntimeRootGuard {
-        previous: Option<std::ffi::OsString>,
-        _root: tempfile::TempDir,
-    }
-
-    impl RuntimeRootGuard {
-        fn new() -> Self {
-            let root = tempfile::tempdir().expect("runtime root");
-            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
-            Self {
-                previous,
-                _root: root,
-            }
-        }
-    }
-
-    impl Drop for RuntimeRootGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
-
-    fn isolate_agentdesk_runtime_root() -> (std::sync::MutexGuard<'static, ()>, RuntimeRootGuard) {
-        let lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let root = RuntimeRootGuard::new();
-        (lock, root)
-    }
 
     #[test]
     fn bridge_footer_mode_requires_both_flags() {
@@ -594,101 +563,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bridge_single_message_completion_footer_emits_background_agent_pending_payload() {
-        let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
-        let shared = super::super::make_shared_data_for_tests();
-        let channel_id = ChannelId::new(4_047_201);
-        let provider = ProviderKind::Claude;
-        let owner =
-            super::footer_view_reconciler::CompletionFooterOwner::new(4_047_202, 1_700_000_000);
-
-        let _ = complete_bridge_single_message_completion_footer(
-            shared.as_ref(),
-            channel_id,
-            MessageId::new(4_047_203),
-            owner,
-            &provider,
-            1_700_000_000,
-            "Final answer",
-            "⠸",
-            false,
-            true,
-        )
-        .await;
-
-        let rendered = shared
-            .ui
-            .placeholder_live_events
-            .render_completion_footer(channel_id, &provider, "⠸");
-        let block = rendered.block.expect("background-agent pending footer");
-
-        assert!(rendered.has_unfinished_entries);
-        assert!(block.contains("Background agents"));
-        assert!(block.contains("Waiting for background agents ⠸"));
-    }
-
-    #[tokio::test]
-    async fn bridge_single_message_completion_footer_producer_threads_sniffed_background_agent_pending()
-     {
-        let (_env_lock, _runtime_root) = isolate_agentdesk_runtime_root();
-        for (pending, channel_raw) in [(true, 4_047_211), (false, 4_047_212)] {
-            let shared = super::super::make_shared_data_for_tests();
-            let gateway = crate::services::discord::gateway::HeadlessGateway;
-            let channel_id = ChannelId::new(channel_raw);
-            let provider = ProviderKind::Claude;
-            let observed_tmux_session = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sniffer_observed_tmux_session = observed_tmux_session.clone();
-            let mut last_status_panel_text = String::new();
-
-            let _committed = complete_bridge_terminal_footer_or_status_panel_with_sniffer(
-                shared.as_ref(),
-                &gateway,
-                channel_id,
-                MessageId::new(channel_raw + 1),
-                Some(MessageId::new(channel_raw + 2)),
-                None,
-                &provider,
-                1_700_000_000,
-                &mut last_status_panel_text,
-                true,
-                false,
-                Some("Final answer"),
-                "⠸",
-                0,
-                Some("AgentDesk-claude-background-test".to_string()),
-                move |tmux_session_name| async move {
-                    sniffer_observed_tmux_session
-                        .lock()
-                        .expect("observed tmux session lock")
-                        .push(tmux_session_name);
-                    pending
-                },
-            )
-            .await;
-
-            assert_eq!(
-                observed_tmux_session
-                    .lock()
-                    .expect("observed tmux session lock")
-                    .as_slice(),
-                &[Some("AgentDesk-claude-background-test".to_string())]
-            );
-
-            let rendered = shared
-                .ui
-                .placeholder_live_events
-                .render_completion_footer(channel_id, &provider, "⠸");
-            let block_has_background_agents = rendered
-                .block
-                .as_deref()
-                .is_some_and(|block| block.contains("Background agents"));
-
-            assert_eq!(rendered.has_unfinished_entries, pending);
-            assert_eq!(block_has_background_agents, pending);
-        }
-    }
-
     #[test]
     fn bridge_terminal_footer_strips_panel_block() {
         let rendered = format!(
@@ -711,21 +585,6 @@ mod tests {
         assert!(bridge_status_panel_dirty_should_edit_separate_panel(
             true, false,
         ));
-    }
-
-    #[test]
-    fn status_panel_defers_only_while_first_answer_body_pending() {
-        // First answer body pending and not yet relayed → defer the panel edit
-        // so the #4006 fast lane wins the shared rate lane.
-        assert!(status_panel_edit_defer_for_first_answer(false, true));
-        // No answer body pending (tool-only turn / watcher-owned relay where the
-        // response offset already tracks the length) → never defer. This is the
-        // #3477 live-panel guard: `!first_answer_relayed` alone must NOT suppress.
-        assert!(!status_panel_edit_defer_for_first_answer(false, false));
-        // First answer already relayed → never defer; the normal interval
-        // throttle resumes for the rest of the turn.
-        assert!(!status_panel_edit_defer_for_first_answer(true, true));
-        assert!(!status_panel_edit_defer_for_first_answer(true, false));
     }
 
     #[test]

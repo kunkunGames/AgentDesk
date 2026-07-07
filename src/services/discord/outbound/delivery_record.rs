@@ -74,8 +74,6 @@ use crate::services::provider::ProviderKind;
 /// target); the isolation proof test asserts this segment differs.
 const DELIVERY_RECORDS_DIR: &str = "discord_delivery_records";
 const DELIVERY_OWNER_CONTEXT_DIR: &str = "discord_delivery_owner_context";
-const RECENT_DELIVERED_CONTENT_LIMIT: usize = 16;
-const RECENT_DELIVERED_CONTENT_WINDOW_MS: u64 = 15 * 60 * 1000;
 
 /// Durable per-turn delivery record (design §4.3). Two **independent** durable
 /// fields, deliberately not folded into one state machine: the lease is the
@@ -92,9 +90,6 @@ pub(in crate::services::discord) struct DeliveryRecord {
     /// restart in B3 (no 0-reset).
     #[serde(default)]
     pub delivered_frontier: Option<DeliveredCommit>,
-    /// Bounded byte-content fingerprints for degenerate lease fallback dedup.
-    #[serde(default)]
-    pub recent_delivered_contents: Vec<DeliveredContentFingerprint>,
 }
 
 /// The offset-authority channel for a delivery channel and tmux generation.
@@ -148,15 +143,6 @@ pub(in crate::services::discord) struct DeliveredCommit {
     /// watcher) set this to their single channel; null = no anchor recorded.
     #[serde(default)]
     pub panel_channel_id: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::services::discord) struct DeliveredContentFingerprint {
-    pub channel_id: u64,
-    pub content_hash: String,
-    pub content_len: u64,
-    pub generation_mtime_ns: i64,
-    pub delivered_at_epoch_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -475,10 +461,6 @@ pub(in crate::services::discord) fn delete_record(
 /// default OFF). Telemetry ONLY when enabled (the default-OFF first eval has no
 /// observable side effect — deploy no-op), mirroring the A-phase flag idiom.
 pub(in crate::services::discord) fn delivery_record_shadow_enabled() -> bool {
-    #[cfg(test)]
-    if let Some(forced) = shadow_test_seam::current_override() {
-        return forced;
-    }
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         let on = std::env::var("AGENTDESK_DELIVERY_RECORD_SHADOW")
@@ -492,54 +474,12 @@ pub(in crate::services::discord) fn delivery_record_shadow_enabled() -> bool {
     })
 }
 
-/// #4130 test seam: a per-thread override of
-/// `delivery_record_shadow_enabled()` so default-OFF tests stay deterministic
-/// even when the developer shell exports `AGENTDESK_DELIVERY_RECORD_SHADOW=1`.
-#[cfg(test)]
-pub(in crate::services::discord) mod shadow_test_seam {
-    use std::cell::Cell;
-
-    thread_local! {
-        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    pub(in crate::services::discord) fn current_override() -> Option<bool> {
-        OVERRIDE.with(Cell::get)
-    }
-
-    #[must_use]
-    pub(in crate::services::discord) fn force(value: bool) -> Guard {
-        Guard {
-            previous: OVERRIDE.with(|cell| cell.replace(Some(value))),
-        }
-    }
-
-    pub(in crate::services::discord) struct Guard {
-        previous: Option<bool>,
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            OVERRIDE.with(|cell| cell.set(self.previous));
-        }
-    }
-}
-
 /// #3089 B2b read-authority flag (`AGENTDESK_DELIVERY_RECORD_AUTHORITY`, OnceLock,
 /// default OFF). When OFF (default) the dedup gates read the legacy in-memory
 /// `committed_relay_offset` verbatim → byte-identical, deploy no-op. When ON the
 /// gates consult the durable `delivered_frontier` (fused with in-memory) so the
 /// "already-relayed → skip" decision survives a restart / cross-actor boundary.
 pub(in crate::services::discord) fn delivery_record_authority_enabled() -> bool {
-    // #3933: a per-thread test override (see `authority_test_seam`) lets a unit
-    // test drive the authority-ON enforce path (the release config) through the
-    // real save path WITHOUT poisoning the env-global `OnceLock` cache for
-    // sibling tests that assume the compiled-default OFF. Production strips this
-    // branch entirely (`cfg(test)`), so the flag stays byte-identical at runtime.
-    #[cfg(test)]
-    if let Some(forced) = authority_test_seam::current_override() {
-        return forced;
-    }
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         let on = std::env::var("AGENTDESK_DELIVERY_RECORD_AUTHORITY")
@@ -551,48 +491,6 @@ pub(in crate::services::discord) fn delivery_record_authority_enabled() -> bool 
         }
         on
     })
-}
-
-/// #3933 test seam: a per-thread override of `delivery_record_authority_enabled()`
-/// so a unit test can drive the authority-ON enforce path (the release config)
-/// deterministically. Housed in a `#[cfg(test)] mod` (not inline `#[cfg(test)]`
-/// items) so the seam counts as test — not production — review surface.
-#[cfg(test)]
-pub(in crate::services::discord) mod authority_test_seam {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// When `Some`, forces the flag on THIS thread only; `None` (default)
-        /// falls through to the env-cached `OnceLock`.
-        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    pub(in crate::services::discord) fn current_override() -> Option<bool> {
-        OVERRIDE.with(Cell::get)
-    }
-
-    /// RAII: force `delivery_record_authority_enabled()` to `value` on the
-    /// current thread until the returned guard drops (then restore the prior
-    /// override). The env-cached `OnceLock` cannot be re-set once initialized,
-    /// and mutating the process-global env would race sibling tests, so a
-    /// thread-local + RAII keeps the authority-ON honor path order-independent
-    /// and leak-free.
-    #[must_use]
-    pub(in crate::services::discord) fn force(value: bool) -> Guard {
-        Guard {
-            previous: OVERRIDE.with(|cell| cell.replace(Some(value))),
-        }
-    }
-
-    pub(in crate::services::discord) struct Guard {
-        previous: Option<bool>,
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            OVERRIDE.with(|cell| cell.set(self.previous));
-        }
-    }
 }
 
 pub(super) fn delivery_record_rollout_health_json() -> serde_json::Value {
@@ -645,32 +543,19 @@ fn delivery_record_rollout_health_json_for_flags(
     })
 }
 
-/// #3089 B3 / #3416 / #3933 (pure, testable): the same-turn monotonic guard's
-/// enforce decision. Returns `true` (block the backward inflight write) ONLY when
-/// the durable delivered-frontier authority is ON, a same-turn offset moved
-/// backward (`response_sent_offset` or `last_offset`), **and** the backward move
-/// is NOT a legitimate full reset. Authority OFF (default) → always `false` → the
-/// guard stays observe-only and the write proceeds byte-identically (deploy
-/// no-op). Gated by the SAME flag as the read-authority flip so the single offset
-/// authority + its enforcement cut over atomically.
-///
-/// #3933: `is_legitimate_full_reset` carves the legitimate Gemini/Qwen
-/// `RetryBoundary` rewind (turn_bridge/retry_state.rs clears `full_response` and
-/// rewinds `response_sent_offset`→0 for the SAME turn identity to re-stream) out
-/// of the coarse backward-write skip. The release runs
-/// `AGENTDESK_DELIVERY_RECORD_AUTHORITY=1`, so before this carve-out the enforce
-/// branch dropped the re-streamed body (live data loss). A genuine stale-snapshot
-/// backward regression carries a NON-EMPTY body, so it never matches the reset
-/// signature and stays blocked.
+/// #3089 B3 / #3416 (pure, testable): the same-turn monotonic guard's enforce
+/// decision. Returns `true` (block the backward inflight write) ONLY when the
+/// durable delivered-frontier authority is ON **and** a same-turn offset moved
+/// backward (`response_sent_offset` or `last_offset`). Authority OFF (default) →
+/// always `false` → the guard stays observe-only and the write proceeds
+/// byte-identically (deploy no-op). Gated by the SAME flag as the read-authority
+/// flip so the single offset authority + its enforcement cut over atomically.
 pub(in crate::services::discord) fn authority_blocks_backward_inflight_write(
     authority_enabled: bool,
     response_sent_offset_monotonic: bool,
     last_offset_monotonic: bool,
-    is_legitimate_full_reset: bool,
 ) -> bool {
-    authority_enabled
-        && (!response_sent_offset_monotonic || !last_offset_monotonic)
-        && !is_legitimate_full_reset
+    authority_enabled && (!response_sent_offset_monotonic || !last_offset_monotonic)
 }
 
 /// Pure fusion (testable): the effective committed offset under the flip. The
@@ -704,61 +589,19 @@ pub(in crate::services::discord) fn durable_frontier_generation_current(
     current_gen_mtime != 0 && durable_mtime == current_gen_mtime
 }
 
-/// Path-based core (pure-ish, testable): the durable `delivered_frontier`, but
-/// ONLY when it was written by the CURRENT wrapper generation (#1270 guard, via
-/// [`durable_frontier_generation_current`]) AND its END is physically inside the
-/// current transcript byte length (#4188 EOF guard). `None` when the record is
-/// absent/malformed (I3 conservative), from a PRIOR generation (stale-high →
-/// distrust), or when the current transcript EOF is unavailable (cannot
-/// bound-check → distrust). `current_gen_mtime == 0` (no/unreadable
-/// `.generation` file) → the guard distrusts everything → `None`.
-pub(in crate::services::discord::outbound) fn current_generation_durable_frontier_at(
-    path: &Path,
-    current_gen_mtime: i64,
-    current_transcript_eof: Option<u64>,
-) -> Option<DeliveredCommit> {
-    let frontier = read_record_at(path).and_then(|r| r.delivered_frontier)?;
-    if !durable_frontier_generation_current(frontier.generation_mtime_ns, current_gen_mtime) {
-        return None;
-    }
-
-    let Some(current_transcript_eof) = current_transcript_eof else {
-        tracing::debug!(
-            delivery_record_path = %path.display(),
-            frontier_end = frontier.range.1,
-            frontier_generation_mtime_ns = frontier.generation_mtime_ns,
-            current_gen_mtime,
-            "durable delivered_frontier current transcript EOF unavailable — distrusting unbounded frontier"
-        );
-        return None;
-    };
-
-    if frontier.range.1 > current_transcript_eof {
-        tracing::warn!(
-            delivery_record_path = %path.display(),
-            frontier_end = frontier.range.1,
-            current_transcript_eof,
-            frontier_generation_mtime_ns = frontier.generation_mtime_ns,
-            current_gen_mtime,
-            "durable delivered_frontier end exceeds current transcript EOF — distrusting stale-length frontier (compaction/rotation)"
-        );
-        return None;
-    }
-
-    Some(frontier)
-}
-
-/// Path-based core (pure-ish, testable): the durable `delivered_frontier` END.
-/// This is the SINGLE durable frontier END reader; the env-resolved
-/// [`delivered_frontier_end_current_generation`] and the flag-gated
-/// [`effective_committed_offset`] both funnel through it so the generation and
-/// EOF-bounds gating logic exists in exactly one place.
-fn current_generation_durable_frontier_end_at(
-    path: &Path,
-    current_gen_mtime: i64,
-    current_transcript_eof: Option<u64>,
-) -> Option<u64> {
-    current_generation_durable_frontier_at(path, current_gen_mtime, current_transcript_eof)
+/// Path-based core (pure-ish, testable): the durable `delivered_frontier` END,
+/// but ONLY when it was written by the CURRENT wrapper generation (#1270 guard,
+/// via [`durable_frontier_generation_current`]). `None` when the record is
+/// absent/malformed (I3 conservative) OR its frontier is from a PRIOR generation
+/// (stale-high → distrust). `current_gen_mtime == 0` (no/unreadable `.generation`
+/// file) → the guard distrusts everything → `None`. This is the SINGLE durable
+/// frontier reader; the env-resolved [`delivered_frontier_end_current_generation`]
+/// and the flag-gated [`effective_committed_offset`] both funnel through it so the
+/// generation-gating logic exists in exactly one place.
+fn current_generation_durable_frontier_end_at(path: &Path, current_gen_mtime: i64) -> Option<u64> {
+    read_record_at(path)
+        .and_then(|r| r.delivered_frontier)
+        .filter(|f| durable_frontier_generation_current(f.generation_mtime_ns, current_gen_mtime))
         .map(|f| f.range.1)
 }
 
@@ -779,9 +622,8 @@ pub(in crate::services::discord) fn current_generation_mtime_ns(tmux_session_nam
 }
 
 /// #3593 (flag-INDEPENDENT): the CURRENT-generation durable `delivered_frontier`
-/// END, or `0` when there is none to trust (absent/malformed record, a stale
-/// prior-generation frontier per the #1270 guard, missing transcript EOF, or a
-/// frontier END beyond the current EOF). UNLIKE
+/// END, or `0` when there is none to trust (absent/malformed record, or a stale
+/// prior-generation frontier per the #1270 guard). UNLIKE
 /// [`effective_committed_offset`], this NEVER consults
 /// `AGENTDESK_DELIVERY_RECORD_AUTHORITY` — it is the durable frontier the legacy
 /// #3520 new-message floor read, surfaced so the synthetic-resume dedup gate can
@@ -793,14 +635,12 @@ pub(in crate::services::discord) fn delivered_frontier_end_current_generation(
     provider: &ProviderKind,
     channel: ChannelId,
     tmux_session_name: &str,
-    current_transcript_eof: Option<u64>,
 ) -> u64 {
     let Some(path) = delivery_record_path(provider, channel.get()) else {
         return 0;
     };
     let current_gen = current_generation_mtime_ns(tmux_session_name);
-    current_generation_durable_frontier_end_at(&path, current_gen, current_transcript_eof)
-        .unwrap_or(0)
+    current_generation_durable_frontier_end_at(&path, current_gen).unwrap_or(0)
 }
 
 /// #3089 B2b: the effective "already-committed" offset the dedup/skip gates read.
@@ -809,17 +649,14 @@ pub(in crate::services::discord) fn delivered_frontier_end_current_generation(
 /// in_memory)` (I3: missing/malformed record → in-memory only, never assume
 /// delivered), but ONLY when the durable frontier is from the CURRENT wrapper
 /// generation (#1270 guard — a stale prior-generation frontier is treated as
-/// `None`) and physically within the current transcript EOF (#4188 guard). The
-/// in-memory authority is the relay coord's `confirmed_end_offset` for
-/// `channel`; the durable record is keyed by `(provider, channel)`;
-/// `tmux_session_name` resolves the current generation watermark, while
-/// `current_transcript_eof` bounds the durable offset space.
+/// `None`). The in-memory authority is the relay coord's `confirmed_end_offset`
+/// for `channel`; the durable record is keyed by `(provider, channel)`;
+/// `tmux_session_name` resolves the current generation watermark.
 pub(in crate::services::discord) fn effective_committed_offset(
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
     channel: ChannelId,
     tmux_session_name: &str,
-    current_transcript_eof: Option<u64>,
 ) -> u64 {
     let in_memory = shared.committed_relay_offset(channel);
     if !delivery_record_authority_enabled() {
@@ -829,7 +666,6 @@ pub(in crate::services::discord) fn effective_committed_offset(
         current_generation_durable_frontier_end_at(
             &path,
             current_generation_mtime_ns(tmux_session_name),
-            current_transcript_eof,
         )
     });
     fuse_committed_offset(durable_end, in_memory)
@@ -859,21 +695,10 @@ pub(in crate::services::discord) fn committed_floor_for_resend_dedup(
     provider: &ProviderKind,
     channel: ChannelId,
     tmux_session_name: &str,
-    current_transcript_eof: Option<u64>,
 ) -> u64 {
-    effective_committed_offset(
-        shared,
-        provider,
-        channel,
-        tmux_session_name,
-        current_transcript_eof,
+    effective_committed_offset(shared, provider, channel, tmux_session_name).max(
+        delivered_frontier_end_current_generation(provider, channel, tmux_session_name),
     )
-    .max(delivered_frontier_end_current_generation(
-        provider,
-        channel,
-        tmux_session_name,
-        current_transcript_eof,
-    ))
 }
 
 /// #3593 JSONL-space monotonic dedup predicate (pure, testable). `range_end` is the
@@ -898,173 +723,6 @@ pub(in crate::services::discord) fn range_already_committed(
     committed: u64,
 ) -> bool {
     range_end > 0 && range_end <= committed
-}
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn delivered_content_hash(channel_id: u64, body: &str) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&channel_id.to_le_bytes());
-    hasher.update(body.as_bytes());
-    hasher.finalize().to_hex().to_string()
-}
-
-fn delivered_content_fingerprint(
-    channel_id: u64,
-    body: &str,
-    generation_mtime_ns: i64,
-    delivered_at_epoch_ms: u64,
-) -> Option<DeliveredContentFingerprint> {
-    (!body.trim().is_empty()).then(|| DeliveredContentFingerprint {
-        channel_id,
-        content_hash: delivered_content_hash(channel_id, body),
-        content_len: body.len() as u64,
-        generation_mtime_ns,
-        delivered_at_epoch_ms,
-    })
-}
-
-fn recent_content_fingerprint_matches(
-    record: &DeliveryRecord,
-    fingerprint: &DeliveredContentFingerprint,
-    now_ms: u64,
-) -> bool {
-    record.recent_delivered_contents.iter().any(|recent| {
-        recent.channel_id == fingerprint.channel_id
-            && recent.content_len == fingerprint.content_len
-            && recent.content_hash == fingerprint.content_hash
-            && recent.generation_mtime_ns == fingerprint.generation_mtime_ns
-            && now_ms.saturating_sub(recent.delivered_at_epoch_ms)
-                <= RECENT_DELIVERED_CONTENT_WINDOW_MS
-    })
-}
-
-fn prune_recent_content_fingerprints(entries: &mut Vec<DeliveredContentFingerprint>, now_ms: u64) {
-    entries.retain(|entry| {
-        now_ms.saturating_sub(entry.delivered_at_epoch_ms) <= RECENT_DELIVERED_CONTENT_WINDOW_MS
-    });
-    if entries.len() > RECENT_DELIVERED_CONTENT_LIMIT {
-        entries.drain(0..entries.len() - RECENT_DELIVERED_CONTENT_LIMIT);
-    }
-}
-
-fn record_delivered_content_fingerprint_at(
-    path: &Path,
-    channel_id: u64,
-    body: &str,
-    generation_mtime_ns: i64,
-    delivered_at_epoch_ms: u64,
-) -> Result<(), String> {
-    let Some(fingerprint) =
-        delivered_content_fingerprint(channel_id, body, generation_mtime_ns, delivered_at_epoch_ms)
-    else {
-        return Ok(());
-    };
-    mutate_record_at(path, |record| {
-        prune_recent_content_fingerprints(
-            &mut record.recent_delivered_contents,
-            delivered_at_epoch_ms,
-        );
-        record.recent_delivered_contents.retain(|recent| {
-            !(recent.channel_id == fingerprint.channel_id
-                && recent.content_len == fingerprint.content_len
-                && recent.content_hash == fingerprint.content_hash
-                && recent.generation_mtime_ns == fingerprint.generation_mtime_ns)
-        });
-        record.recent_delivered_contents.push(fingerprint);
-        prune_recent_content_fingerprints(
-            &mut record.recent_delivered_contents,
-            delivered_at_epoch_ms,
-        );
-    })
-}
-
-fn recent_delivered_content_matches_at(
-    path: &Path,
-    channel_id: u64,
-    body: &str,
-    generation_mtime_ns: i64,
-    now_ms: u64,
-) -> bool {
-    let Some(fingerprint) =
-        delivered_content_fingerprint(channel_id, body, generation_mtime_ns, now_ms)
-    else {
-        return false;
-    };
-    read_record_at(path)
-        .as_ref()
-        .is_some_and(|record| recent_content_fingerprint_matches(record, &fingerprint, now_ms))
-}
-
-fn record_delivered_content_fingerprint_for_generation(
-    provider: &ProviderKind,
-    channel_id: u64,
-    body: &str,
-    generation_mtime_ns: i64,
-) {
-    let path = match record_path_or_err(provider, channel_id) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(
-                provider = provider.as_str(),
-                channel = channel_id,
-                error = %error,
-                "delivery content fingerprint path unavailable"
-            );
-            return;
-        }
-    };
-    if let Err(error) = record_delivered_content_fingerprint_at(
-        &path,
-        channel_id,
-        body,
-        generation_mtime_ns,
-        now_epoch_ms(),
-    ) {
-        tracing::warn!(
-            provider = provider.as_str(),
-            channel = channel_id,
-            error = %error,
-            "delivery content fingerprint write failed"
-        );
-    }
-}
-
-pub(in crate::services::discord) fn record_delivered_content_fingerprint(
-    provider: &ProviderKind,
-    channel: ChannelId,
-    tmux_session_name: &str,
-    body: &str,
-) {
-    record_delivered_content_fingerprint_for_generation(
-        provider,
-        channel.get(),
-        body,
-        current_generation_mtime_ns(tmux_session_name),
-    );
-}
-
-pub(in crate::services::discord) fn recent_delivered_content_matches(
-    provider: &ProviderKind,
-    channel: ChannelId,
-    tmux_session_name: &str,
-    body: &str,
-) -> bool {
-    let Some(path) = delivery_record_path(provider, channel.get()) else {
-        return false;
-    };
-    recent_delivered_content_matches_at(
-        &path,
-        channel.get(),
-        body,
-        current_generation_mtime_ns(tmux_session_name),
-        now_epoch_ms(),
-    )
 }
 
 /// I2 outcome map (pure, testable): the shadow-write fires ONLY for a confirmed
@@ -1209,25 +867,16 @@ pub(in crate::services::discord) fn shadow_mirror_delivered_frontier(
     is_delivered: bool,
     terminal_anchor_msg_id: Option<u64>,
     terminal_anchor_channel_id: Option<u64>,
-    delivered_body: Option<&str>,
 ) {
-    let channel_id = channel.get();
-    let coord = shared.tmux_relay_coord(channel);
-    let generation_mtime_ns = coord
-        .confirmed_end_generation_mtime_ns
-        .load(Ordering::Acquire);
-    if is_delivered && let Some(body) = delivered_body {
-        record_delivered_content_fingerprint_for_generation(
-            provider,
-            channel_id,
-            body,
-            generation_mtime_ns,
-        );
-    }
     if !should_shadow_mirror(is_delivered, delivery_record_shadow_enabled()) {
         return;
     }
+    let channel_id = channel.get();
+    let coord = shared.tmux_relay_coord(channel);
     let in_memory_confirmed_end = coord.confirmed_end_offset.load(Ordering::Acquire);
+    let generation_mtime_ns = coord
+        .confirmed_end_generation_mtime_ns
+        .load(Ordering::Acquire);
     let fresh = crate::services::discord::inflight::load_inflight_state(provider, channel_id);
     let attempts = fresh
         .as_ref()
@@ -1242,48 +891,6 @@ pub(in crate::services::discord) fn shadow_mirror_delivered_frontier(
         terminal_anchor_msg_id,
         terminal_anchor_channel_id,
         in_memory_confirmed_end,
-    );
-}
-
-pub(in crate::services::discord) fn record_delivered_frontier_with_body(
-    shared: &crate::services::discord::SharedData,
-    provider: &ProviderKind,
-    channel: ChannelId,
-    range: (u64, u64),
-    terminal_anchor_msg_id: u64,
-    terminal_anchor_channel_id: u64,
-    body: &str,
-) {
-    shadow_mirror_delivered_frontier(
-        shared,
-        provider,
-        channel,
-        range,
-        true,
-        Some(terminal_anchor_msg_id),
-        Some(terminal_anchor_channel_id),
-        Some(body),
-    );
-}
-
-pub(in crate::services::discord) fn shadow_mirror_same_channel_frontier_with_body(
-    shared: &crate::services::discord::SharedData,
-    provider: &ProviderKind,
-    channel: ChannelId,
-    range: (u64, u64),
-    is_delivered: bool,
-    terminal_anchor_msg_id: u64,
-    body: &str,
-) {
-    shadow_mirror_delivered_frontier(
-        shared,
-        provider,
-        channel,
-        range,
-        is_delivered,
-        Some(terminal_anchor_msg_id),
-        Some(channel.get()),
-        Some(body),
     );
 }
 
@@ -1315,10 +922,7 @@ pub(in crate::services::discord) fn shadow_mirror_same_channel_frontier_with_bod
 /// delivery lease acquired/committed (offset-space consistent — never mix spaces).
 /// `last_chunk_anchor_msg_id = None` (empty chunk Vec — impossible on the `Ok`
 /// path, but type-honest) records the range with a null anchor, identical to the
-/// absent-status-panel case. The delivered-frontier mirror still obeys the shadow
-/// flag, while the #4081 recent-content fingerprint is recorded for confirmed
-/// deliveries so degenerate-key phantom re-relays can be refused even before the
-/// durable frontier authority is enabled.
+/// absent-status-panel case. Shadow flag OFF (default) → no-op.
 pub(in crate::services::discord) fn record_long_chunk_terminal_delivery(
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
@@ -1326,7 +930,6 @@ pub(in crate::services::discord) fn record_long_chunk_terminal_delivery(
     delivery_channel_id: ChannelId,
     range: (u64, u64),
     last_chunk_anchor_msg_id: Option<u64>,
-    delivered_body: &str,
 ) {
     shadow_mirror_delivered_frontier(
         shared,
@@ -1336,7 +939,6 @@ pub(in crate::services::discord) fn record_long_chunk_terminal_delivery(
         true,
         last_chunk_anchor_msg_id,
         Some(delivery_channel_id.get()),
-        Some(delivered_body),
     );
 }
 
@@ -1372,7 +974,6 @@ mod tests {
         let record = DeliveryRecord {
             delivery_lease: Some(sample_lease()),
             delivered_frontier: Some(sample_frontier()),
-            recent_delivered_contents: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&record).unwrap();
         let back: DeliveryRecord = serde_json::from_str(&json).unwrap();
@@ -1394,108 +995,9 @@ mod tests {
         let record = DeliveryRecord {
             delivery_lease: Some(sample_lease()),
             delivered_frontier: Some(sample_frontier()),
-            recent_delivered_contents: Vec::new(),
         };
         write_record_at(&path, &record).unwrap();
         assert_eq!(read_record_at(&path), Some(record));
-    }
-
-    #[test]
-    fn degenerate_content_guard_matches_byte_identical_recent_delivery_4081() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4081);
-        let generation = 44_081_i64;
-        let now = 1_700_000_000_000_u64;
-
-        record_delivered_content_fingerprint_at(&path, 4081, "prior body", generation, now)
-            .unwrap();
-
-        assert!(recent_delivered_content_matches_at(
-            &path,
-            4081,
-            "prior body",
-            generation,
-            now + 1,
-        ));
-        assert!(!recent_delivered_content_matches_at(
-            &path,
-            4081,
-            "different body",
-            generation,
-            now + 1,
-        ));
-        assert!(!recent_delivered_content_matches_at(
-            &path,
-            4082,
-            "prior body",
-            generation,
-            now + 1,
-        ));
-        assert!(!recent_delivered_content_matches_at(
-            &path,
-            4081,
-            "prior body",
-            generation + 1,
-            now + 1,
-        ));
-    }
-
-    #[test]
-    fn recent_delivered_content_ring_is_bounded_4081() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4082);
-        let generation = 44_082_i64;
-        let now = 1_700_000_000_000_u64;
-
-        for idx in 0..(RECENT_DELIVERED_CONTENT_LIMIT + 4) {
-            record_delivered_content_fingerprint_at(
-                &path,
-                4082,
-                &format!("body-{idx}"),
-                generation,
-                now + idx as u64,
-            )
-            .unwrap();
-        }
-
-        let record = read_record_at(&path).unwrap();
-        assert_eq!(
-            record.recent_delivered_contents.len(),
-            RECENT_DELIVERED_CONTENT_LIMIT
-        );
-        assert!(!recent_delivered_content_matches_at(
-            &path,
-            4082,
-            "body-0",
-            generation,
-            now + 100,
-        ));
-        assert!(recent_delivered_content_matches_at(
-            &path,
-            4082,
-            "body-19",
-            generation,
-            now + 100,
-        ));
-    }
-
-    #[test]
-    fn recent_delivered_content_window_expires_4081() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4083);
-        let generation = 44_083_i64;
-        let now = 1_700_000_000_000_u64;
-
-        record_delivered_content_fingerprint_at(&path, 4083, "prior body", generation, now)
-            .unwrap();
-
-        assert!(!recent_delivered_content_matches_at(
-            &path,
-            4083,
-            "prior body",
-            generation,
-            now + RECENT_DELIVERED_CONTENT_WINDOW_MS + 1,
-        ));
     }
 
     #[test]
@@ -1665,7 +1167,6 @@ mod tests {
         assert!(outcome_is_shadow_delivered(&DeliveryOutcome::Delivered {
             committed_to: 5,
             replace_kind: None,
-            new_chunks: None,
         }));
         assert!(!outcome_is_shadow_delivered(
             &DeliveryOutcome::NotDelivered { committed_from: 5 }
@@ -1693,51 +1194,17 @@ mod tests {
     fn authority_blocks_backward_inflight_write_truth_table() {
         // #3416 (#3089 B3): ENFORCE only when authority is ON AND a same-turn
         // offset moved backward. OFF → never blocks (observe-only, no-op deploy).
-        // authority OFF → false regardless of the monotonic flags. The 4th arg
-        // (#3933 is_legitimate_full_reset) is `false` for every genuine-regression
-        // row here — it only ever RELAXES, never tightens.
+        // authority OFF → false regardless of the monotonic flags.
         assert!(!authority_blocks_backward_inflight_write(
-            false, false, false, false
+            false, false, false
         ));
-        assert!(!authority_blocks_backward_inflight_write(
-            false, true, true, false
-        ));
+        assert!(!authority_blocks_backward_inflight_write(false, true, true));
         // authority ON, both monotonic OK → permit the write.
-        assert!(!authority_blocks_backward_inflight_write(
-            true, true, true, false
-        ));
+        assert!(!authority_blocks_backward_inflight_write(true, true, true));
         // authority ON, a backward move on EITHER offset → block (pins the OR).
-        assert!(authority_blocks_backward_inflight_write(
-            true, false, true, false
-        ));
-        assert!(authority_blocks_backward_inflight_write(
-            true, true, false, false
-        ));
-        assert!(authority_blocks_backward_inflight_write(
-            true, false, false, false
-        ));
-
-        // #3933: a legitimate full reset (empty body + rso→0, same turn) must be
-        // PERMITTED even under authority-ON with a backward move — otherwise the
-        // Gemini/Qwen retry re-stream is dropped. The carve-out only fires for a
-        // backward move; a fully-monotonic forward write is unaffected either way.
-        assert!(!authority_blocks_backward_inflight_write(
-            true, false, true, true
-        ));
-        assert!(!authority_blocks_backward_inflight_write(
-            true, true, false, true
-        ));
-        assert!(!authority_blocks_backward_inflight_write(
-            true, false, false, true
-        ));
-        // The reset flag never turns a permitted write into a block.
-        assert!(!authority_blocks_backward_inflight_write(
-            true, true, true, true
-        ));
-        // Authority OFF stays a no-op regardless of the reset flag.
-        assert!(!authority_blocks_backward_inflight_write(
-            false, false, false, true
-        ));
+        assert!(authority_blocks_backward_inflight_write(true, false, true));
+        assert!(authority_blocks_backward_inflight_write(true, true, false));
+        assert!(authority_blocks_backward_inflight_write(true, false, false));
     }
 
     #[test]
@@ -2000,7 +1467,7 @@ mod tests {
         )
         .unwrap();
         // Current generation matches the frontier's → trust the durable END.
-        let durable_end = current_generation_durable_frontier_end_at(&path, gen_ns, Some(443_154));
+        let durable_end = current_generation_durable_frontier_end_at(&path, gen_ns);
         assert_eq!(durable_end, Some(443_154));
         // In-memory committed reset to 0 (the AUTHORITY-OFF restart hazard); the
         // fused floor rises to the durable value → the synthetic-resume range is
@@ -2031,9 +1498,8 @@ mod tests {
             },
         )
         .unwrap();
-        let fused = 0_u64.max(
-            current_generation_durable_frontier_end_at(&path, gen_ns, Some(443_154)).unwrap_or(0),
-        );
+        let fused =
+            0_u64.max(current_generation_durable_frontier_end_at(&path, gen_ns).unwrap_or(0));
         // A new answer produced AFTER the durable high watermark.
         assert!(!range_already_committed(443_200, fused));
     }
@@ -2058,55 +1524,13 @@ mod tests {
         )
         .unwrap();
         // Current generation differs → distrust → None.
-        assert_eq!(
-            current_generation_durable_frontier_end_at(&path, 999, Some(443_154)),
-            None
-        );
+        assert_eq!(current_generation_durable_frontier_end_at(&path, 999), None);
         // `current_gen == 0` (no .generation file) → also distrust.
-        assert_eq!(
-            current_generation_durable_frontier_end_at(&path, 0, Some(443_154)),
-            None
-        );
+        assert_eq!(current_generation_durable_frontier_end_at(&path, 0), None);
         // Fused floor stays at in-memory (here 0) → a real range above 0 is NOT
         // suppressed (the new generation's fresh output is relayed).
-        let fused = 0_u64.max(
-            current_generation_durable_frontier_end_at(&path, 999, Some(443_154)).unwrap_or(0),
-        );
+        let fused = 0_u64.max(current_generation_durable_frontier_end_at(&path, 999).unwrap_or(0));
         assert!(!range_already_committed(422_855, fused));
-    }
-
-    /// #4188: `/compact` can shrink the transcript without changing the wrapper
-    /// `.generation` file. Even with a CURRENT generation, a durable END beyond
-    /// the current EOF is physically stale and must not raise the committed floor.
-    #[test]
-    fn current_gen_durable_frontier_distrusts_end_beyond_current_eof_4188() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4188);
-        let gen_ns = 700_000_000_i64;
-        write_delivered_frontier_at(
-            &path,
-            DeliveredCommit {
-                range: (0, 20_536_793),
-                generation_mtime_ns: gen_ns,
-                attempts: 1,
-                panel_msg_id: None,
-                panel_channel_id: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            current_generation_durable_frontier_end_at(&path, gen_ns, Some(16_545_127)),
-            None
-        );
-        assert_eq!(
-            current_generation_durable_frontier_end_at(&path, gen_ns, Some(20_536_793)),
-            Some(20_536_793)
-        );
-        assert_eq!(
-            current_generation_durable_frontier_end_at(&path, gen_ns, None),
-            None
-        );
     }
 
     /// I3 conservatism: an absent or malformed record yields no durable floor
@@ -2117,7 +1541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = delivery_record_path_in_root(dir.path(), &ProviderKind::Codex, 35932);
         assert_eq!(
-            current_generation_durable_frontier_end_at(&missing, 5, Some(0)),
+            current_generation_durable_frontier_end_at(&missing, 5),
             None
         );
 
@@ -2125,7 +1549,7 @@ mod tests {
         fs::create_dir_all(malformed.parent().unwrap()).unwrap();
         fs::write(&malformed, "{ not json").unwrap();
         assert_eq!(
-            current_generation_durable_frontier_end_at(&malformed, 5, Some(0)),
+            current_generation_durable_frontier_end_at(&malformed, 5),
             None
         );
     }
@@ -2154,7 +1578,7 @@ mod tests {
         .unwrap();
         // Matching generation + fully-populated anchor → Some.
         assert_eq!(
-            current_generation_delivered_anchor_at(&path, 700, Some(443_154)),
+            current_generation_delivered_anchor_at(&path, 700),
             Some(CurrentGenerationAnchor {
                 panel_msg_id: 555,
                 panel_channel_id: 777,
@@ -2179,15 +1603,9 @@ mod tests {
         )
         .unwrap();
         // Current generation differs → distrust → None (no repost of a stale turn).
-        assert_eq!(
-            current_generation_delivered_anchor_at(&path, 999, Some(100)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&path, 999), None);
         // No `.generation` file (current_gen == 0) → also distrust.
-        assert_eq!(
-            current_generation_delivered_anchor_at(&path, 0, Some(100)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&path, 0), None);
     }
 
     #[test]
@@ -2206,10 +1624,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            current_generation_delivered_anchor_at(&zero_msg, 700, Some(42)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&zero_msg, 700), None);
 
         // panel_channel_id == 0 → None.
         let zero_ch = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 36104);
@@ -2224,10 +1639,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            current_generation_delivered_anchor_at(&zero_ch, 700, Some(42)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&zero_ch, 700), None);
 
         // Absent anchor pair (legacy short-replace frontier w/o anchor) → None.
         let no_anchor = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 36105);
@@ -2243,7 +1655,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            current_generation_delivered_anchor_at(&no_anchor, 700, Some(42)),
+            current_generation_delivered_anchor_at(&no_anchor, 700),
             None
         );
     }
@@ -2252,18 +1664,12 @@ mod tests {
     fn current_gen_anchor_missing_or_malformed_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let missing = delivery_record_path_in_root(dir.path(), &ProviderKind::Codex, 36106);
-        assert_eq!(
-            current_generation_delivered_anchor_at(&missing, 5, Some(0)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&missing, 5), None);
 
         let malformed = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 36107);
         fs::create_dir_all(malformed.parent().unwrap()).unwrap();
         fs::write(&malformed, "{ not json").unwrap();
-        assert_eq!(
-            current_generation_delivered_anchor_at(&malformed, 5, Some(0)),
-            None
-        );
+        assert_eq!(current_generation_delivered_anchor_at(&malformed, 5), None);
     }
 
     // ---- #3610 (Phase B PR-1 / PR-1b) terminal-anchor recording ----------------
@@ -2412,10 +1818,8 @@ mod tests {
         .unwrap();
 
         // Same durable frontier END read out regardless of anchor.
-        let end_with =
-            current_generation_durable_frontier_end_at(&path_with_anchor, gen_ns, Some(443_154));
-        let end_null =
-            current_generation_durable_frontier_end_at(&path_null_anchor, gen_ns, Some(443_154));
+        let end_with = current_generation_durable_frontier_end_at(&path_with_anchor, gen_ns);
+        let end_null = current_generation_durable_frontier_end_at(&path_null_anchor, gen_ns);
         assert_eq!(end_with, end_null);
         assert_eq!(end_with, Some(443_154));
 
@@ -2567,7 +1971,6 @@ mod tests {
             ChannelId::new(900_800_700), // delivery (anchor home)
             (0, 4096),
             Some(912_345_678),
-            "",
         );
         // No durable record was created for either channel under the test root.
         assert!(read_record(&ProviderKind::Claude, 100_200_300).is_none());
@@ -2625,275 +2028,5 @@ mod tests {
         // OFF is a full no-op. Same gate the shared helper enforces.
         assert!(!should_shadow_mirror(false, true)); // not-advanced/partial → no record (M4/I2)
         assert!(!should_shadow_mirror(true, false)); // flag OFF → no record (deploy no-op)
-    }
-
-    // ---- #3933 item 1: read-authority (authority-ON) end-to-end wiring --------
-    // The pure helpers above (fuse / #1270 generation gate / range_already_committed)
-    // are covered, but no test drove the ENV-RESOLVED public gates
-    // (`effective_committed_offset` / `committed_floor_for_resend_dedup`) with the
-    // flag FORCED ON — the release config (AGENTDESK_DELIVERY_RECORD_AUTHORITY=1)
-    // the compiled default (OFF) never exercises. These tests force it ON via the
-    // #3993 per-thread seam and verify the whole wiring end-to-end (not by
-    // hand-computing the fusion): the dedup floor is `max(durable, in_memory)` so it
-    // never over-suppresses, the #1270 gate distrusts a stale generation, and the
-    // #3871 / #3885 duplicate-relay scenarios are correctly suppressed. This closes
-    // #3933 prerequisite #2 (independent read-authority verification).
-
-    /// RAII: point `AGENTDESK_ROOT_DIR` at an isolated tempdir for a test
-    /// (restoring the prior value on drop) while holding the process-global env
-    /// lock. BOTH the delivery-record path and the tmux `.generation` marker path
-    /// resolve through this root, so the whole read-authority wiring runs against a
-    /// throw-away tree with zero cross-test interference.
-    struct IsolatedRoot {
-        _dir: tempfile::TempDir,
-        previous: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl IsolatedRoot {
-        fn new() -> Self {
-            let lock = crate::config::shared_test_env_lock()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let dir = tempfile::tempdir().expect("isolated runtime root");
-            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", dir.path()) };
-            Self {
-                _dir: dir,
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for IsolatedRoot {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
-
-    /// Seed a CURRENT-generation durable frontier for `(provider, channel)` under
-    /// the isolated root plus its matching `.generation` marker, and return the
-    /// generation mtime the record was stamped with. The record's
-    /// `generation_mtime_ns` is set to the marker's REAL on-disk mtime so the #1270
-    /// generation gate TRUSTS it — mirroring the production write/read parity.
-    fn seed_current_generation_frontier(
-        provider: &ProviderKind,
-        channel: ChannelId,
-        tmux_session_name: &str,
-        durable_end: u64,
-    ) -> i64 {
-        let gen_path =
-            crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
-        if let Some(parent) = Path::new(&gen_path).parent() {
-            fs::create_dir_all(parent).expect("create sessions dir");
-        }
-        fs::write(&gen_path, b"1").expect("write generation marker");
-        let gen_ns = current_generation_mtime_ns(tmux_session_name);
-        assert_ne!(
-            gen_ns, 0,
-            "seeded .generation marker must have a readable mtime"
-        );
-        let record_path =
-            delivery_record_path(provider, channel.get()).expect("env-resolved record path");
-        write_delivered_frontier_at(
-            &record_path,
-            DeliveredCommit {
-                range: (0, durable_end),
-                generation_mtime_ns: gen_ns,
-                attempts: 1,
-                panel_msg_id: Some(1),
-                panel_channel_id: None,
-            },
-        )
-        .expect("seed durable frontier");
-        gen_ns
-    }
-
-    fn shared_with_committed(
-        channel: ChannelId,
-        in_memory: u64,
-    ) -> std::sync::Arc<crate::services::discord::SharedData> {
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        shared
-            .tmux_relay_coord(channel)
-            .confirmed_end_offset
-            .store(in_memory, Ordering::Release);
-        shared
-    }
-
-    /// authority-ON fuses the CURRENT-generation durable frontier into the dedup
-    /// floor (`max(durable, in_memory)`) through the ENV-RESOLVED public reader,
-    /// while authority-OFF returns the in-memory value verbatim (deploy no-op).
-    /// This proves the flag actually gates the wiring — not just the pure `fuse`
-    /// arithmetic already covered above.
-    #[test]
-    fn effective_committed_offset_authority_on_fuses_durable_3933() {
-        let _root = IsolatedRoot::new();
-        let provider = ProviderKind::Claude;
-        let channel = ChannelId::new(39_330_401);
-        let tmux = "AgentDesk-claude-3933fuse";
-        let durable_end = 443_154_u64;
-        let in_memory = 100_u64;
-        seed_current_generation_frontier(&provider, channel, tmux, durable_end);
-        let shared = shared_with_committed(channel, in_memory);
-
-        {
-            // authority ON → durable frontier RAISES the floor above in-memory.
-            let _authority = authority_test_seam::force(true);
-            assert_eq!(
-                effective_committed_offset(
-                    shared.as_ref(),
-                    &provider,
-                    channel,
-                    tmux,
-                    Some(u64::MAX)
-                ),
-                durable_end.max(in_memory),
-            );
-            // `committed_floor_for_resend_dedup` = effective.max(flag-independent
-            // durable) → the same fused value (floor never drops below in-memory).
-            assert_eq!(
-                committed_floor_for_resend_dedup(
-                    shared.as_ref(),
-                    &provider,
-                    channel,
-                    tmux,
-                    Some(u64::MAX)
-                ),
-                durable_end.max(in_memory),
-            );
-        }
-        {
-            // authority OFF (forced) → in-memory verbatim; the durable frontier is
-            // hidden by the flag. Pins the flag-gated branch.
-            let _authority = authority_test_seam::force(false);
-            assert_eq!(
-                effective_committed_offset(
-                    shared.as_ref(),
-                    &provider,
-                    channel,
-                    tmux,
-                    Some(u64::MAX)
-                ),
-                in_memory,
-            );
-        }
-    }
-
-    /// #3871 (rollover dup relay): after a JSONL rollover a re-observing pass would
-    /// re-relay the frozen PREFIX range (ends BELOW the durable committed floor →
-    /// already delivered → suppressed), while a genuinely-NEW tail produced after
-    /// the rollover ends ABOVE the floor → NOT suppressed → relayed. The floor is
-    /// `max(durable, in_memory)`, so raising it to the known-delivered watermark
-    /// never over-suppresses fresh output. Rides the in-memory=0 restart hazard.
-    #[test]
-    fn committed_floor_authority_on_does_not_oversuppress_rollover_resend_3871() {
-        let _root = IsolatedRoot::new();
-        let provider = ProviderKind::Claude;
-        let channel = ChannelId::new(39_330_402);
-        let tmux = "AgentDesk-claude-3871";
-        let durable_end = 443_154_u64;
-        seed_current_generation_frontier(&provider, channel, tmux, durable_end);
-        // In-memory reset to 0 (the restart / synthetic-resume hazard #3871 rides).
-        let shared = shared_with_committed(channel, 0);
-
-        let _authority = authority_test_seam::force(true);
-        let floor = committed_floor_for_resend_dedup(
-            shared.as_ref(),
-            &provider,
-            channel,
-            tmux,
-            Some(u64::MAX),
-        );
-        assert_eq!(
-            floor, durable_end,
-            "durable frontier must lift the reset in-memory floor"
-        );
-        // Frozen prefix already delivered → suppressed (no dup relay).
-        assert!(range_already_committed(422_855, floor));
-        // New tail past the durable high watermark → relayed (no over-suppression).
-        assert!(!range_already_committed(443_500, floor));
-    }
-
-    /// #3885 (no-response watchdog re-relay): the streaming-aware watchdog can
-    /// trigger a re-observing pass over an ALREADY-delivered range. Under
-    /// authority-ON the durable frontier makes the committed floor recognize that
-    /// range as delivered (`range_already_committed == true`) → the watchdog
-    /// re-relay is suppressed (no duplicate) even though the in-memory offset was
-    /// reset. The boundary (range_end == floor) is inclusive.
-    #[test]
-    fn committed_floor_authority_on_suppresses_watchdog_rerelay_3885() {
-        let _root = IsolatedRoot::new();
-        let provider = ProviderKind::Codex;
-        let channel = ChannelId::new(39_330_403);
-        let tmux = "AgentDesk-codex-3885";
-        let durable_end = 512_000_u64;
-        seed_current_generation_frontier(&provider, channel, tmux, durable_end);
-        let shared = shared_with_committed(channel, 0); // watchdog fires post in-memory reset
-
-        let _authority = authority_test_seam::force(true);
-        let floor = committed_floor_for_resend_dedup(
-            shared.as_ref(),
-            &provider,
-            channel,
-            tmux,
-            Some(u64::MAX),
-        );
-        assert_eq!(floor, durable_end);
-        // Watchdog re-relay of the delivered body → suppressed (dup guard).
-        assert!(range_already_committed(500_000, floor));
-        assert!(range_already_committed(durable_end, floor)); // inclusive boundary
-    }
-
-    /// Even with authority ON, a STALE prior-generation durable frontier is
-    /// distrusted (#1270 gate) → it does NOT raise the floor → a genuinely-new
-    /// answer after a pane reset / same-named respawn is never over-suppressed.
-    /// Proves the generation gate is honored through the ENV-RESOLVED wiring, not
-    /// only in the pure helper.
-    #[test]
-    fn effective_committed_offset_authority_on_distrusts_stale_generation_3933() {
-        let _root = IsolatedRoot::new();
-        let provider = ProviderKind::Claude;
-        let channel = ChannelId::new(39_330_404);
-        let tmux = "AgentDesk-claude-3933stale";
-        // Seed marker + a current-gen frontier, then OVERWRITE the record with a
-        // PRIOR-generation stamp (mtime 1 ≠ the marker's real nanosecond mtime).
-        seed_current_generation_frontier(&provider, channel, tmux, 443_154);
-        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
-        write_delivered_frontier_at(
-            &record_path,
-            DeliveredCommit {
-                range: (0, 443_154),
-                generation_mtime_ns: 1, // PRIOR generation → distrusted
-                attempts: 1,
-                panel_msg_id: None,
-                panel_channel_id: None,
-            },
-        )
-        .unwrap();
-        let shared = shared_with_committed(channel, 0);
-
-        let _authority = authority_test_seam::force(true);
-        // Stale frontier distrusted → floor stays at the in-memory value (0).
-        assert_eq!(
-            effective_committed_offset(shared.as_ref(), &provider, channel, tmux, Some(u64::MAX)),
-            0,
-        );
-        assert_eq!(
-            committed_floor_for_resend_dedup(
-                shared.as_ref(),
-                &provider,
-                channel,
-                tmux,
-                Some(u64::MAX)
-            ),
-            0,
-        );
-        // A fresh answer above 0 is NOT over-suppressed.
-        assert!(!range_already_committed(422_855, 0));
     }
 }

@@ -168,6 +168,7 @@ pub(super) fn take_session_retry_context(
     turn_id: Option<&str>,
 ) -> Option<FormattedSessionRetryContext> {
     let context = super::super::turn_bridge::take_session_retry_context_for_turn_with_audit(
+        None::<&crate::db::Db>,
         shared.pg_pool.as_ref(),
         channel_id.get(),
         turn_id,
@@ -179,31 +180,6 @@ pub(super) fn take_session_retry_context(
         formatted_context,
         audit_record: context.audit_record,
     })
-}
-
-pub(super) fn put_back_session_retry_context(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    context: Option<&FormattedSessionRetryContext>,
-    reason: Option<&str>,
-) {
-    let Some(context) = context else {
-        return;
-    };
-    if let Err(error) =
-        super::super::turn_bridge::recovery_text::restore_session_retry_context_after_take(
-            shared.pg_pool.as_ref(),
-            channel_id.get(),
-            &context.raw_context,
-        )
-    {
-        tracing::warn!(
-            channel_id = channel_id.get(),
-            reason = reason.unwrap_or("unknown"),
-            error = %error,
-            "failed to put back recovery context after TUI-busy enqueue refusal"
-        );
-    }
 }
 
 pub(super) async fn emit_session_strategy_lifecycle(

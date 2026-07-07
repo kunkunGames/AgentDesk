@@ -15,6 +15,7 @@ use super::send_target::{
     SendTargetResolutionError, resolve_send_target_channel_id_with_backends,
     routine_thread_parent_hint,
 };
+use crate::db::Db;
 use crate::services::discord::health::{HealthRegistry, resolve_bot_http};
 use crate::services::discord::outbound::shared_outbound_deduper;
 use crate::services::provider::ProviderKind;
@@ -26,6 +27,7 @@ use crate::services::provider::ProviderKind;
 /// length-truncated primary send.
 pub(crate) async fn send_message_with_backends(
     registry: &HealthRegistry,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     target: &str,
     content: &str,
@@ -34,13 +36,14 @@ pub(crate) async fn send_message_with_backends(
     summary: Option<&str>,
 ) -> (&'static str, String) {
     send_message_with_backends_and_delivery_id(
-        registry, pg_pool, target, content, source, bot, summary, None,
+        registry, db, pg_pool, target, content, source, bot, summary, None,
     )
     .await
 }
 
 pub(crate) async fn send_message_with_backends_and_delivery_id(
     registry: &HealthRegistry,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     target: &str,
     content: &str,
@@ -51,6 +54,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
 ) -> (&'static str, String) {
     send_message_with_backends_and_delivery_options_for_caller(
         registry,
+        db,
         pg_pool,
         target,
         content,
@@ -66,6 +70,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
 
 pub(crate) async fn send_message_with_backends_and_delivery_id_for_caller(
     registry: &HealthRegistry,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     target: &str,
     content: &str,
@@ -77,6 +82,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id_for_caller(
 ) -> (&'static str, String) {
     send_message_with_backends_and_delivery_options_for_caller(
         registry,
+        db,
         pg_pool,
         target,
         content,
@@ -117,6 +123,7 @@ pub(crate) struct ManualOutboundOptions {
 
 pub(crate) async fn send_message_with_backends_and_delivery_options(
     registry: &HealthRegistry,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     target: &str,
     content: &str,
@@ -128,6 +135,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_options(
 ) -> (&'static str, String) {
     send_message_with_backends_and_delivery_options_for_caller(
         registry,
+        db,
         pg_pool,
         target,
         content,
@@ -143,6 +151,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_options(
 
 async fn send_message_with_backends_and_delivery_options_for_caller(
     registry: &HealthRegistry,
+    db: Option<&Db>,
     pg_pool: Option<&PgPool>,
     target: &str,
     content: &str,
@@ -160,27 +169,28 @@ async fn send_message_with_backends_and_delivery_options_for_caller(
         );
     }
 
-    let channel_id_raw = match resolve_send_target_channel_id_with_backends(pg_pool, target).await {
-        Ok(id) => id,
-        Err(SendTargetResolutionError::BadRequest(message)) => {
-            return (
-                "400 Bad Request",
-                serde_json::json!({"ok": false, "error": message}).to_string(),
-            );
-        }
-        Err(SendTargetResolutionError::NotFound(message)) => {
-            return (
-                "404 Not Found",
-                serde_json::json!({"ok": false, "error": message}).to_string(),
-            );
-        }
-        Err(SendTargetResolutionError::Internal(message)) => {
-            return (
-                "500 Internal Server Error",
-                serde_json::json!({"ok": false, "error": message}).to_string(),
-            );
-        }
-    };
+    let channel_id_raw =
+        match resolve_send_target_channel_id_with_backends(db, pg_pool, target).await {
+            Ok(id) => id,
+            Err(SendTargetResolutionError::BadRequest(message)) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"ok": false, "error": message}).to_string(),
+                );
+            }
+            Err(SendTargetResolutionError::NotFound(message)) => {
+                return (
+                    "404 Not Found",
+                    serde_json::json!({"ok": false, "error": message}).to_string(),
+                );
+            }
+            Err(SendTargetResolutionError::Internal(message)) => {
+                return (
+                    "500 Internal Server Error",
+                    serde_json::json!({"ok": false, "error": message}).to_string(),
+                );
+            }
+        };
 
     let channel_id = ChannelId::new(channel_id_raw);
 

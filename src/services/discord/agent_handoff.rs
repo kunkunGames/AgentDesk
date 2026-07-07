@@ -277,6 +277,7 @@ pub(crate) async fn send_agent_handoff(
     let target = format!("channel:{channel_id}");
     let (status, response_body) = health::send_message_with_backends(
         registry,
+        None,
         Some(pg_pool),
         &target,
         &content,

@@ -467,7 +467,13 @@ async fn broadcast_credential_change(
             continue;
         }
         let target = format!("channel:{}", channel_id.get());
+        let sqlite_runtime_db = if shared.pg_pool.is_some() {
+            None
+        } else {
+            None::<&crate::db::Db>
+        };
         crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
+            sqlite_runtime_db,
             shared.pg_pool.as_ref(),
             &target,
             None,

@@ -1,10 +1,15 @@
-//! #3089 A4 watcher terminal cutover to the unified turn-output controller.
+//! #3089 A4 watcher terminal short-replace cutover to the unified
+//! turn-output controller (flag-gated, default OFF).
 //!
-//! This sibling keeps the A4 controller helpers out of the frozen
-//! `tmux_watcher.rs` root. Long-chunk helpers live in `terminal_long_chunks.rs`;
-//! the shared heartbeat adapter lives in `controller_heartbeat.rs`.
+//! This sibling module (mirroring `tmux_watcher/{liveness,commit_decisions,..}.rs`)
+//! holds the A4 cutover surface so the FROZEN `tmux_watcher.rs` giant-file ratchet
+//! (8223) absorbs only the small gate `if` + `DiscordGateway::new` construction +
+//! the `mod terminal_send;` line. The flag helper, the `WatcherPostHeartbeat`
+//! adapter, the gateway-generic `deliver_short_replace_via_controller`, and the
+//! pure `watcher_terminal_lease_range` gate all live here.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use super::*;
 
@@ -14,40 +19,96 @@ use crate::services::discord::outbound::delivery_record as dr;
 use crate::services::discord::outbound::turn_output_controller as toc;
 use crate::services::discord::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
 use crate::services::discord::turn_finalizer::TurnKey;
-use crate::services::discord::{DeliveryLeaseCell, LeaseHolder, SharedData, lease_now_ms};
+use crate::services::discord::{
+    DeliveryLeaseCell, DeliveryLeaseHeartbeat, LeaseHolder, SharedData, lease_now_ms,
+};
 use crate::services::provider::ProviderKind;
 
-use super::controller_heartbeat::WatcherPostHeartbeat;
+/// #3089 A4: flag gating ONLY the watcher's short-replace terminal delivery branch
+/// (`replace_long_message_raw_with_outcome`) onto the unified
+/// [`toc::deliver_turn_output`]. Default OFF → the legacy short-replace arm runs
+/// byte-identically; ON → the controller drives acquire→POST→commit→advance→release
+/// on the SAME `(channel, turn, [start,end))` lease as `LeaseHolder::Watcher`.
+/// OnceLock+env, mirroring `sink_short_replace_controller_enabled` (A2b) /
+/// `standby_relay_controller_enabled` (A3).
+pub(in crate::services::discord) fn watcher_terminal_controller_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = std::env::var("AGENTDESK_WATCHER_TERMINAL_CONTROLLER")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .is_some_and(|v| v == "1" || v == "true");
+        // Telemetry ONLY when ENABLED — the default-OFF first evaluation must have
+        // NO observable side effect (byte-identical / deploy no-op), matching A2b/A3.
+        if on {
+            tracing::info!("  ✓ watcher_terminal_controller: enabled");
+        }
+        on
+    })
+}
 
-/// #3089 A4/#3998 S1-d: watcher terminal controller cut-over decision.
-/// Computed at the lease acquire site so the watcher's own acquire/heartbeat/
-/// commit/advance/release can be gated behind `!cutover`.
+/// #3089 A4: the watcher short-replace cut-over decision. Computed at the lease
+/// acquire site (tmux_watcher.rs ~5944) so the watcher's own acquire/heartbeat/
+/// commit/advance/release can be gated behind `!cutover` (the controller owns the
+/// single lease when cut over — no double-acquire).
 ///
-/// Structural exclusions stay legacy: no direct send, no ordered range, no
-/// placeholder anchor, empty formatted body, or TUI completion gate. Long bodies
-/// still use the controller through `SendNewChunks { delete_anchor: true }` when
-/// the same structural conditions hold.
+/// The flag is checked FIRST so OFF short-circuits before any work (the `formatted`
+/// body is only computed by the caller's flag-gated closure) — byte-identical /
+/// deploy no-op on the default-OFF path.
+///
+/// Terms (mirroring the legacy short-replace branch arm at tmux_watcher.rs:6153-6394):
+/// - `will_direct_send` — the watcher will run the direct-send arm
+///   (`watcher_direct_fallback_after_session_bound_ack && has_direct_terminal_response`,
+///   tmux_watcher.rs:5942/6155).
+/// - `ordered_range` — `watcher_lease_end > watcher_lease_start` (a real `[start,end)`).
+/// - `has_placeholder` — `placeholder_msg_id.is_some()` (the `Some(msg_id)` arm, :6154).
+/// - `should_send_ordered_new_chunks` —
+///   `watcher_should_send_ordered_new_chunks_for_terminal_fallback(..)` (:6156). The
+///   long-chunk fallback branch (send-new-chunks + placeholder delete) is NOT
+///   expressible via the controller's `SendNewChunks` (it does not delete the anchor),
+///   so it stays legacy → EXCLUDED.
+/// - `formatted_is_empty` — the POST-format body is empty. Legacy
+///   `replace_long_message_raw_with_outcome` treats a zero-chunk body as
+///   `EditedOriginal` (delivered/advance) but the controller short-circuits an empty
+///   body to `Skipped` (no-advance), so empty bodies MUST stay legacy (A2b M2 parity).
+/// - `tui_completion_gate_required` —
+///   `watcher_terminal_kind_requires_tui_completion_gate(terminal_kind)` (:6726). TUI-
+///   gated turns' `Delivered`-vs-`Unknown` commit depends on the POST-send
+///   `lifecycle_stage_paused` which the controller's inline-commit cannot express, so
+///   they are EXCLUDED (stay legacy). Excluding them is ALSO what makes
+///   `lifecycle_stage_paused` always-false for the cut-over set (NotGated →
+///   `watcher_tui_gate_blocks_lifecycle == false`), so the advance callback returns
+///   `true` on confirmed transport.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) fn watcher_short_replace_cutover(
+    controller_enabled: bool,
     will_direct_send: bool,
     ordered_range: bool,
     has_placeholder: bool,
-    _should_send_ordered_new_chunks: bool,
+    should_send_ordered_new_chunks: bool,
     formatted_is_empty: bool,
     tui_completion_gate_required: bool,
 ) -> bool {
-    will_direct_send
+    controller_enabled
+        && will_direct_send
         && ordered_range
         && has_placeholder
+        && !should_send_ordered_new_chunks
         && !formatted_is_empty
         && !tui_completion_gate_required
 }
 
-/// #3089 A4: full cut-over decision at the watcher lease-acquire site. Formats
-/// the body exactly as the send arm, then applies
-/// [`watcher_short_replace_cutover`].
+/// #3089 A4: the full short-replace cut-over decision at the watcher lease-acquire
+/// site. The flag is checked FIRST so OFF short-circuits before formatting the body
+/// — byte-identical / deploy no-op. When ON it formats the body EXACTLY as the send
+/// arm (tmux_watcher.rs:6173-6187: `format_for_discord_with[_status_panel]` then the
+/// optional `prepend_monitor_auto_turn_origin`) so the `should_send_ordered_new_chunks`
+/// (length) and `formatted_is_empty` terms match what the send arm sees, then applies
+/// [`watcher_short_replace_cutover`]. Kept here (not inlined) so the frozen
+/// `tmux_watcher.rs` call site stays a single line.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) fn watcher_short_replace_cutover_decision(
+    controller_enabled: bool,
     status_panel_v2_enabled: bool,
     should_tag_monitor_origin: bool,
     provider: &ProviderKind,
@@ -58,6 +119,9 @@ pub(in crate::services::discord) fn watcher_short_replace_cutover_decision(
     session_bound_fallback_uses_full_body: bool,
     tui_completion_gate_required: bool,
 ) -> bool {
+    if !controller_enabled {
+        return false;
+    }
     let formatted = if status_panel_v2_enabled {
         crate::services::discord::formatting::format_for_discord_with_status_panel(
             direct_terminal_response,
@@ -75,6 +139,7 @@ pub(in crate::services::discord) fn watcher_short_replace_cutover_decision(
         formatted
     };
     watcher_short_replace_cutover(
+        controller_enabled,
         will_direct_send,
         ordered_range,
         has_placeholder,
@@ -101,6 +166,30 @@ pub(in crate::services::discord) fn watcher_terminal_lease_range(
 ) -> Option<(u64, u64)> {
     cutover_range.filter(|_| !cutover_short_replace)
 }
+
+/// #3089 A4: adapts the watcher's `DeliveryLeaseHeartbeat` to [`toc::PostHeartbeat`].
+/// Holds the `Arc` (the controller drives the lease behind a borrowed `&cell`) and
+/// spawns the SAME `DeliveryLeaseHeartbeat::spawn` the legacy watcher used
+/// (tmux_watcher.rs:6015, #3041 §3 / #3151 — identical renew cadence); the guard
+/// Drop aborts the renew task BEFORE the inline commit (#3151 ordering). Mirrors
+/// A2b's `SinkPostHeartbeat`.
+pub(in crate::services::discord) struct WatcherPostHeartbeat {
+    pub(in crate::services::discord) cell: Arc<DeliveryLeaseCell>,
+}
+
+impl toc::PostHeartbeat for WatcherPostHeartbeat {
+    fn start(&self, holder: LeaseHolder, turn: TurnKey) -> Box<dyn toc::PostHeartbeatGuard> {
+        Box::new(WatcherPostHeartbeatGuard {
+            _heartbeat: DeliveryLeaseHeartbeat::spawn(self.cell.clone(), holder, turn),
+        })
+    }
+}
+
+struct WatcherPostHeartbeatGuard {
+    _heartbeat: DeliveryLeaseHeartbeat,
+}
+
+impl toc::PostHeartbeatGuard for WatcherPostHeartbeatGuard {}
 
 /// #3089 A4: watcher short-replace via the turn-output controller, behaviourally
 /// equal to the legacy `replace_long_message_raw_with_outcome` arm — SAME transport,
@@ -145,11 +234,10 @@ pub(in crate::services::discord) fn watcher_terminal_lease_range(
 ///   in-place edit → `Delivered` (`relay_ok = true`, `direct_send_delivered = true`).
 ///   The lease outcome only steered the watcher's own re-send gate, which the
 ///   controller already committed.
-/// - `Delivered { FreshFallbackAfterEditFailure { edit_error, .. } }` → confirmed
-///   POST via a FRESH fallback send after the in-place edit failed →
-///   `DeliveredFallback` (#3089 A4 r2). Still delivered/advanced, but the write-back
-///   mirrors the legacy fallback arm (NO footer target, `Failed(edit_error)` cleanup,
-///   original preserved).
+/// - `Delivered { FreshFallbackAfterEditFailure { edit_error } }` → confirmed POST via
+///   a FRESH fallback send after the in-place edit failed → `DeliveredFallback`
+///   (#3089 A4 r2). Still delivered/advanced, but the write-back mirrors the legacy
+///   fallback arm (NO footer target, `Failed(edit_error)` cleanup, original preserved).
 /// - `Transient` → lost acquire (another holder owns the range). The legacy watcher
 ///   would have lost its OWN acquire at :5944 and taken the `watcher_lease_b2_skip` arm
 ///   (:6103), which returns `relay_ok = false` with NO transport (the live holder commits
@@ -160,8 +248,7 @@ pub(in crate::services::discord) fn watcher_terminal_lease_range(
 ///   advanced. Reproduce the legacy partial-failure handling: `relay_ok = false` + the
 ///   caller resets `retry_terminal_delivery_from_offset` / `current_offset` / `all_data`
 ///   and abandon-releases (tmux_watcher.rs:6384-6386 / 6546-6579).
-/// - `Skipped` → no-op/no-retry (empty body, or a permanent watcher transport
-///   failure classified by the controller).
+/// - `Skipped` → empty body (excluded by the cut-over gate); unreachable in prod.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
     G: TurnGateway + ?Sized,
@@ -173,10 +260,8 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
     tmux_session_name: &str,
     msg_id: MessageId,
     relay_text: &str,
-    delivered_body: &str,
     cell: &Arc<DeliveryLeaseCell>,
     turn: TurnKey,
-    lease_key: Option<crate::services::discord::DeliveryLeaseKey>,
     instance_id: u64,
     start: u64,
     end: u64,
@@ -209,7 +294,6 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
         gateway,
         toc::TurnOutputCtx {
             turn,
-            lease_key,
             owner: RelayOwnerKind::Watcher,
             holder,
             lease: &**cell,
@@ -244,10 +328,7 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
     )
     .await;
 
-    // #3089 B2a: shadow-mirror durable delivered frontier — flag-gated,
-    // observe-only, Delivered-only (I2). #4081 still records confirmed body
-    // fingerprints when the frontier mirror is OFF. Extends B1's sink coverage to
-    // the watcher (A4) before B2b's authority flip.
+    // #3089 B2a: shadow-mirror durable delivered frontier — flag-gated, observe-only, Delivered-only (I2), OFF=no-op. Extends B1's sink coverage to the watcher (A4) before B2b's authority flip.
     // #3610 PR-1: anchor = `msg_id` — the controller active-slot `current_msg_id`
     // (the assistant response message terminal-replace edits in place), NOT
     // `status_message_id`. Records the true terminal anchor for PR-2.
@@ -261,7 +342,6 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
         dr::outcome_is_shadow_delivered(&outcome),
         Some(msg_id.get()),
         Some(channel_id.get()),
-        Some(delivered_body),
     );
 
     match outcome {
@@ -275,7 +355,7 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
         // case from the cut-over set, so this is the conservative legacy default).
         toc::DeliveryOutcome::Delivered {
             replace_kind:
-                Some(toc::ReplaceDeliveryKind::FreshFallbackAfterEditFailure { edit_error, .. }),
+                Some(toc::ReplaceDeliveryKind::FreshFallbackAfterEditFailure { edit_error }),
             ..
         } => WatcherShortReplaceResult::DeliveredFallback { edit_error },
         toc::DeliveryOutcome::Delivered { .. } | toc::DeliveryOutcome::NotDelivered { .. } => {
@@ -294,7 +374,7 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
         // false for it (a fallback send commits → Delivered, never reaching this
         // arm) — byte-identical: the watcher ignores the field.
         toc::DeliveryOutcome::Unknown { .. } => WatcherShortReplaceResult::PartialFailureRetry,
-        // No-op/no-retry: empty body, or permanent watcher transport failure.
+        // Empty body — excluded by the cut-over gate, so this is unreachable in prod.
         toc::DeliveryOutcome::Skipped => WatcherShortReplaceResult::Skipped,
     }
 }
@@ -338,10 +418,8 @@ pub(in crate::services::discord) async fn apply_watcher_short_replace_controller
     tmux_session_name: &str,
     msg_id: MessageId,
     relay_text: &str,
-    delivered_body: &str,
     cell: &Arc<DeliveryLeaseCell>,
     turn: TurnKey,
-    lease_key: Option<crate::services::discord::DeliveryLeaseKey>,
     instance_id: u64,
     range: (u64, u64),
     single_message_panel_footer_mode: bool,
@@ -363,10 +441,8 @@ pub(in crate::services::discord) async fn apply_watcher_short_replace_controller
         tmux_session_name,
         msg_id,
         relay_text,
-        delivered_body,
         cell,
         turn,
-        lease_key,
         instance_id,
         range.0,
         range.1,
@@ -499,9 +575,11 @@ pub(in crate::services::discord) fn apply_watcher_short_replace_result(
 /// `watcher_should_send_ordered_new_chunks_for_terminal_fallback` branch:
 /// `send_long_message_raw_with_rollback` send-new-chunks + placeholder delete).
 /// This arm is the watcher-owned counterpart of the bridge long-chunk arm PR-1c
-/// instrumented. S1-d routes the flag-ON long-chunk path through the controller;
-/// this helper remains the shared durable-anchor record point for the controller
-/// path and the flag-OFF legacy path.
+/// instrumented; it is EXCLUDED from the #3089 A4 short-replace controller cutover
+/// (`watcher_short_replace_cutover` requires `!should_send_ordered_new_chunks`), so
+/// it never reached the cutover's `shadow_mirror_delivered_frontier` site and a LONG
+/// (`len > DISCORD_MSG_LIMIT`) watcher-owned terminal answer recorded NO anchor —
+/// the production-majority (`relay_owner_kind = watcher`) gap PR-1c did not cover.
 ///
 /// The caller (the FROZEN giant `tmux_watcher.rs`) invokes this with a SINGLE line,
 /// ONLY when BOTH gates hold (matching PR-1c's M4 discipline at the bridge):
@@ -522,16 +600,14 @@ pub(in crate::services::discord) fn apply_watcher_short_replace_result(
 /// is `(watcher_lease_start, watcher_lease_end)` — the SAME offset range the lease
 /// committed and `confirmed_end_offset` advanced to (never mix offset spaces).
 /// Delegates to the shared `dr::record_long_chunk_terminal_delivery` (PR-1c) with
-/// `watcher_owner_channel_id == delivery_channel_id == channel_id`; the delivered
-/// frontier still obeys the shadow flag, while #4081 records the confirmed body
-/// fingerprint for degenerate-key duplicate refusal.
+/// `watcher_owner_channel_id == delivery_channel_id == channel_id`; the shadow flag
+/// being OFF (default) makes the whole thing a no-op (deploy-safe).
 pub(in crate::services::discord) fn record_watcher_long_chunk_terminal_delivery(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
     range: (u64, u64),
     last_chunk_anchor_msg_id: Option<u64>,
-    delivered_body: &str,
 ) {
     dr::record_long_chunk_terminal_delivery(
         shared,
@@ -540,7 +616,6 @@ pub(in crate::services::discord) fn record_watcher_long_chunk_terminal_delivery(
         channel_id,
         range,
         last_chunk_anchor_msg_id,
-        delivered_body,
     );
 }
 
@@ -573,8 +648,7 @@ pub(in crate::services::discord) enum WatcherShortReplaceResult {
     /// Partial / ambiguous failure (I2, no advance). `relay_ok = false` and the
     /// caller resets the retry offset (tmux_watcher.rs:6546-6579).
     PartialFailureRetry,
-    /// No-op/no-retry: empty body (cut-over gate excludes it) or permanent
-    /// watcher transport failure from the controller.
+    /// Empty body (cut-over gate excludes it). Unreachable in prod; mapped to a no-op.
     Skipped,
 }
 
@@ -592,9 +666,6 @@ mod tests {
     /// `record_long_chunk_terminal_delivery_off_is_noop_3610c`.
     #[test]
     fn watcher_long_chunk_delivery_off_is_noop_3610d() {
-        let temp = tempfile::TempDir::new().expect("temp runtime root");
-        let _root_guard = crate::config::set_agentdesk_root_for_test(temp.path());
-        let _shadow = dr::shadow_test_seam::force(false);
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel = ChannelId::new(556_677_889);
         // Does not panic; OFF → writes nothing.
@@ -604,7 +675,6 @@ mod tests {
             channel,
             (0, 8192),
             Some(912_345_678),
-            "",
         );
         // No durable record was created under the test root for this channel.
         assert!(dr::read_record(&ProviderKind::Claude, channel.get()).is_none());
@@ -616,9 +686,6 @@ mod tests {
     /// input to the watcher wrapper (range-only record when the flag is ON).
     #[test]
     fn watcher_long_chunk_delivery_none_anchor_is_noop_3610d() {
-        let temp = tempfile::TempDir::new().expect("temp runtime root");
-        let _root_guard = crate::config::set_agentdesk_root_for_test(temp.path());
-        let _shadow = dr::shadow_test_seam::force(false);
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel = ChannelId::new(112_233_445);
         record_watcher_long_chunk_terminal_delivery(
@@ -627,7 +694,6 @@ mod tests {
             channel,
             (0, 2048),
             None,
-            "",
         );
         assert!(dr::read_record(&ProviderKind::Claude, channel.get()).is_none());
     }

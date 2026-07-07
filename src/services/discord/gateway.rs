@@ -18,29 +18,14 @@ use super::router;
 use super::router::handle_text_message;
 use super::turn_bridge::{auto_retry_with_history, release_retry_pending};
 use super::{
-    Intervention, SharedData, formatting, queue_marker, rate_limit_wait,
-    resolve_discord_bot_provider, validate_live_channel_routing,
+    Intervention, SharedData, formatting, rate_limit_wait, resolve_discord_bot_provider,
+    validate_live_channel_routing,
 };
 use crate::services::provider::ProviderKind;
 use formatting::ReplaceLongMessageOutcome;
 
 pub(super) type GatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-fn watcher_classified_failure_message(
-    class: super::replace_outcome_policy::WatcherSendFailureClass,
-    message: impl std::fmt::Display,
-) -> String {
-    super::replace_outcome_policy::watcher_send_failure_classified_message(class, message)
-}
-
-fn watcher_classified_error_string(error: &(dyn std::error::Error + 'static)) -> String {
-    watcher_classified_failure_message(
-        super::replace_outcome_policy::classify_watcher_send_failure(error),
-        error,
-    )
-}
-
-#[allow(dead_code)]
 pub(super) trait TurnGateway: Send + Sync {
     fn send_message<'a>(
         &'a self,
@@ -65,10 +50,6 @@ pub(super) trait TurnGateway: Send + Sync {
                 match TurnGateway::send_message(self, channel_id, chunk).await {
                     Ok(message_id) => sent_message_ids.push(message_id),
                     Err(error) => {
-                        let failure_class =
-                            super::replace_outcome_policy::classify_watcher_send_failure_message(
-                                &error,
-                            );
                         let mut rollback_errors = Vec::new();
                         for message_id in sent_message_ids.iter().rev() {
                             if let Err(rollback_error) =
@@ -85,21 +66,15 @@ pub(super) trait TurnGateway: Send + Sync {
                         let total = chunks.len();
                         let anchor = rollback_anchor_msg_id.get();
                         if rollback_errors.is_empty() {
-                            return Err(watcher_classified_failure_message(
-                                failure_class,
-                                format!(
-                                    "send chunk {attempted}/{total} failed for anchor {anchor} in channel {}; sent chunks cleaned before retry: {error}",
-                                    channel_id.get()
-                                ),
+                            return Err(format!(
+                                "send chunk {attempted}/{total} failed for anchor {anchor} in channel {}; sent chunks cleaned before retry: {error}",
+                                channel_id.get()
                             ));
                         }
-                        return Err(watcher_classified_failure_message(
-                            super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
-                            format!(
-                                "send chunk {attempted}/{total} failed for anchor {anchor} in channel {}; cleanup incomplete after error {error}: {}",
-                                channel_id.get(),
-                                rollback_errors.join("; ")
-                            ),
+                        return Err(format!(
+                            "send chunk {attempted}/{total} failed for anchor {anchor} in channel {}; cleanup incomplete after error {error}: {}",
+                            channel_id.get(),
+                            rollback_errors.join("; ")
                         ));
                     }
                 }
@@ -130,6 +105,20 @@ pub(super) trait TurnGateway: Send + Sync {
         message_id: MessageId,
         content: &'a str,
     ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>>;
+
+    fn add_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()>;
+
+    fn remove_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()>;
 
     fn schedule_retry_with_history<'a>(
         &'a self,
@@ -637,12 +626,9 @@ impl TurnGateway for DiscordGateway {
                 message_id,
                 content,
                 &self.shared,
-                // #3805 P1: gateway trait returns the outcome only; the last-chunk
-                // footer anchor is consumed exclusively by the tmux watcher.
-                &mut None,
             )
             .await
-            .map_err(|error| watcher_classified_error_string(error.as_ref()))
+            .map_err(|e| e.to_string())
         })
     }
 
@@ -657,6 +643,28 @@ impl TurnGateway for DiscordGateway {
                 .delete_message(&self.http, message_id)
                 .await
                 .map_err(|e| e.to_string())
+        })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            formatting::add_reaction_raw(&self.http, channel_id, message_id, emoji).await;
+        })
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            formatting::remove_reaction_raw(&self.http, channel_id, message_id, emoji).await;
         })
     }
 
@@ -718,15 +726,13 @@ impl TurnGateway for DiscordGateway {
                 return Err("missing live Discord context".to_string());
             };
 
-            let source_message_generations = intervention.source_message_queued_generations();
-            queue_marker::drain_dispatched_queue_markers(
-                &self.shared,
-                &self.http,
-                channel_id,
-                intervention.message_id,
-                &source_message_generations,
-            )
-            .await;
+            for message_id in &intervention.source_message_ids {
+                // Both the standalone-queue (📬) and merged-queue (➕) reactions
+                // must be cleaned up — `source_message_ids` collects every
+                // message that contributed to this intervention.
+                formatting::remove_reaction_raw(&self.http, channel_id, *message_id, '📬').await;
+                formatting::remove_reaction_raw(&self.http, channel_id, *message_id, '➕').await;
+            }
 
             // codex review P2 (#1332 follow-up): merged interventions can carry
             // several `source_message_ids`, each of which had registered its own
@@ -914,6 +920,24 @@ impl TurnGateway for HeadlessGateway {
         Box::pin(async move { Ok(()) })
     }
 
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {})
+    }
+
     fn schedule_retry_with_history<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -1020,6 +1044,24 @@ mod tests {
             _content: &'a str,
         ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
             Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+        }
+
+        fn add_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> GatewayFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn remove_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> GatewayFuture<'a, ()> {
+            Box::pin(async {})
         }
 
         fn schedule_retry_with_history<'a>(

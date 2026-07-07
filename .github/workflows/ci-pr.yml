@@ -279,17 +279,13 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
-      # compiled rustc output, and caching multi-GB `target/` directories
-      # starves the 10GB GHA cache quota, evicting sccache shards (observed
-      # Rust hit-rate collapse: 99.80% → 0.00% within hours of merges). See
-      # docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -304,27 +300,6 @@ jobs:
 
       - name: just check
         run: just check
-        env:
-          # Cold `cargo test --all-targets` on the 16GB ubuntu runner peaks over
-          # RAM during codegen+link (SIGTERM/143). Two step-scoped levers keep
-          # peak RSS under the ceiling; test semantics are unchanged (neither
-          # affects which tests run or their results). Step-scoped so no other
-          # Rust job's resource envelope is touched.
-          #   1. Cap parallel compile jobs at 2 (default = 4 vCPU) to bound
-          #      concurrent rustc/link.
-          CARGO_BUILD_JOBS: "2"
-          #   2. Drop debuginfo for the dev/test profiles. Linking many
-          #      `--all-targets` test binaries with full debuginfo is the
-          #      dominant peak-memory source; `-j2` alone still OOM'd on the
-          #      link phase, so strip it here. CI test failures still report
-          #      panics/asserts; only source-line debug data is omitted.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-
-      - name: sccache stats
-        if: always()
-        shell: bash
-        run: sccache --show-stats || true
 
   # Cross-OS Rust compile lanes: macOS + Windows. Gated on the narrower
   # rust_compile filter so docs-only, dashboard-only, JS-policy-only,
@@ -410,8 +385,6 @@ jobs:
           cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
           cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
 
       - name: sccache stats

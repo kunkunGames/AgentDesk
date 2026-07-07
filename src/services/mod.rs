@@ -16,7 +16,6 @@ pub mod codex_remote_policy;
 #[cfg(unix)]
 pub mod codex_tmux_wrapper;
 pub mod codex_tui;
-pub mod cswap;
 pub mod discord;
 pub mod discord_config_audit;
 // #1693: `discord_delivery` moved to `dispatches::discord_delivery`. The
@@ -58,7 +57,6 @@ pub mod monitoring_store;
 pub mod observability;
 pub mod onboarding;
 pub mod opencode;
-pub(crate) mod pane_readiness;
 // #3034: 1 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during operator_connectors dead-code cleanup.
 #[allow(dead_code)]
@@ -97,7 +95,6 @@ pub mod review_decision;
 pub mod routines;
 pub mod service_error;
 pub mod session_activity;
-pub(crate) mod session_selector_validity;
 // #3034: 1 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during session_backend dead-code cleanup.
 #[allow(dead_code)]

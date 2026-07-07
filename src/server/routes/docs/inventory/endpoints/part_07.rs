@@ -579,11 +579,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/channels/{id}/queue",
             "queue",
-            "List queue entries for a Discord channel",
-        )
-        .with_example(
-            json!({"path": {"id": "1473922824350601297"}}),
-            json!({"channel_id": "1473922824350601297", "dispatches": [{"dispatch_id": "dispatch-1", "status": "pending", "title": "Implement feature"}]}),
+            "List queue entries for a Discord channel // TODO: example",
         ),
         ep(
             "GET",
@@ -628,11 +624,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/dispatches/pending",
             "queue",
-            "List pending dispatches",
-        )
-        .with_example(
-            json!({}),
-            json!({"dispatches": [{"id": "dispatch-1", "kanban_card_id": "card-1", "to_agent_id": "project-agentdesk", "status": "pending"}], "count": 1}),
+            "List pending dispatches // TODO: example",
         ),
         ep(
             "POST",
@@ -661,11 +653,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/dispatches/cancel-all",
             "queue",
-            "Cancel all queued dispatches",
-        )
-        .with_example(
-            json!({"body": {"kanban_card_id": "card-1", "agent_id": "project-agentdesk"}}),
-            json!({"ok": true, "cancelled": 2, "filters": {"kanban_card_id": "card-1", "agent_id": "project-agentdesk"}}),
+            "Cancel all queued dispatches // TODO: example",
         )
     ]
 }

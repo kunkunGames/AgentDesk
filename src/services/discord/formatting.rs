@@ -12,11 +12,12 @@ use super::{
     rate_limit_wait,
     response_sanitizer::subagent_notification_card,
 };
-use crate::utils::format::tail_with_ellipsis;
+use crate::utils::format::tail_with_ellipsis_bytes;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, super::Data, Error>;
 const STREAMING_PLACEHOLDER_MARGIN: usize = 10;
+const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
 const THINKING_STATUS_MAX_BYTES: usize = 600;
 const TOOL_STATUS_MAX_BYTES: usize = 300;
 /// Invisible marker appended to newly-rendered placeholder cards so probes can
@@ -24,94 +25,9 @@ const TOOL_STATUS_MAX_BYTES: usize = 300;
 /// with the same handoff header text.
 pub(super) const PLACEHOLDER_PROBE_MARKER: &str = "\u{2063}\u{2062}\u{2063}\u{2062}";
 
-fn watcher_send_failure_message(
-    class: super::replace_outcome_policy::WatcherSendFailureClass,
-    message: impl std::fmt::Display,
-) -> String {
-    super::replace_outcome_policy::watcher_send_failure_classified_message(class, message)
-}
-
-pub(super) use super::reaction_lifecycle::is_real_discord_message_id;
-#[cfg(test)]
-pub(super) use super::reaction_lifecycle::reaction_target_channel_for_shared;
-
-// This mutex serializes both the process-local rollback map and every sidecar
-// mutation for the same protocol: atomic writes, clears, empty-marker writes,
-// and claim-side empty-marker GC. Keeping the fs operation under the same lock
-// prevents a claimer from deleting a freshly-written durable debt.
 static REPLACE_CONTINUATION_ROLLBACKS: LazyLock<
     Mutex<HashMap<(u64, u64), ReplaceContinuationRollback>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-static REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES: LazyLock<Mutex<HashSet<(u64, u64)>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-#[path = "formatting/long_send_rollback.rs"]
-mod long_send_rollback;
-
-use self::long_send_rollback::delete_rollback_channel_message;
-pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_reference_rollback;
-pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_rollback;
-
-#[cfg(test)]
-pub(in crate::services::discord) mod rollback_transport_test_hook {
-    use super::*;
-
-    type SendHook = Box<
-        dyn Fn(ChannelId, &str, Option<(ChannelId, MessageId)>) -> Option<Result<MessageId, String>>
-            + Send
-            + Sync,
-    >;
-    type DeleteHook = Box<dyn Fn(ChannelId, MessageId) -> Option<Result<(), String>> + Send + Sync>;
-
-    static SEND_HOOK: LazyLock<Mutex<Option<SendHook>>> = LazyLock::new(|| Mutex::new(None));
-    static DELETE_HOOK: LazyLock<Mutex<Option<DeleteHook>>> = LazyLock::new(|| Mutex::new(None));
-
-    pub(in crate::services::discord) struct Guard;
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            *SEND_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = None;
-            *DELETE_HOOK
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
-        }
-    }
-
-    pub(in crate::services::discord) fn install(send: SendHook, delete: DeleteHook) -> Guard {
-        *SEND_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = Some(send);
-        *DELETE_HOOK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(delete);
-        Guard
-    }
-
-    pub(super) fn send(
-        channel_id: ChannelId,
-        content: &str,
-        reference: Option<(ChannelId, MessageId)>,
-    ) -> Option<Result<MessageId, Error>> {
-        SEND_HOOK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .and_then(|hook| {
-                hook(channel_id, content, reference).map(|result| result.map_err(Into::into))
-            })
-    }
-
-    pub(super) fn delete(
-        channel_id: ChannelId,
-        message_id: MessageId,
-    ) -> Option<Result<(), Error>> {
-        DELETE_HOOK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .and_then(|hook| hook(channel_id, message_id).map(|result| result.map_err(Into::into)))
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplaceContinuationRollback {
@@ -124,43 +40,11 @@ struct PersistedReplaceContinuationRollback {
     message_ids: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PersistReplaceContinuationRollbackOutcome {
-    Recorded,
-    Removed,
-    ClearedMarkerWritten,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplaceContinuationRollbackClaim {
     None,
     Owner(Vec<u64>),
     InProgress(Vec<u64>),
-}
-
-fn remove_replace_continuation_rollback_file(
-    key: (u64, u64),
-    path: &PathBuf,
-) -> std::io::Result<()> {
-    #[cfg(test)]
-    {
-        if REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&key)
-        {
-            return Err(std::io::Error::other("forced rollback remove failure"));
-        }
-    }
-    fs::remove_file(path)
-}
-
-#[cfg(test)]
-fn force_next_replace_continuation_rollback_remove_failure(key: (u64, u64)) {
-    REPLACE_CONTINUATION_ROLLBACK_FORCED_REMOVE_FAILURES
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(key);
 }
 
 pub(crate) fn redact_sensitive_for_placeholder(input: &str) -> String {
@@ -396,27 +280,12 @@ pub(super) fn floor_char_boundary(s: &str, index: usize) -> usize {
     }
 }
 
-fn char_count(s: &str) -> usize {
-    s.chars().count()
-}
-
-fn byte_index_at_char_limit(s: &str, max_chars: usize) -> usize {
-    if max_chars == 0 {
-        0
-    } else {
-        s.char_indices()
-            .nth(max_chars)
-            .map(|(idx, _)| idx)
-            .unwrap_or(s.len())
-    }
-}
-
 pub(super) fn streaming_split_boundary(text: &str, max_len: usize) -> Option<usize> {
-    if max_len == 0 || char_count(text) <= max_len {
+    if max_len == 0 || text.len() <= max_len {
         return None;
     }
 
-    let safe_end = byte_index_at_char_limit(text, max_len);
+    let safe_end = floor_char_boundary(text, max_len);
     if safe_end == 0 {
         return None;
     }
@@ -435,8 +304,7 @@ pub(super) fn streaming_split_boundary(text: &str, max_len: usize) -> Option<usi
         .or_else(|| super::semantic_boundaries::semantic_sentence_split_boundary(window))
         .or(whitespace_split)
         .unwrap_or(safe_end);
-    let preferred_chars = char_count(&text[..preferred]);
-    let split_at = if preferred_chars < max_len / 2 {
+    let split_at = if preferred < safe_end / 2 {
         safe_end
     } else {
         preferred
@@ -456,10 +324,11 @@ fn build_streaming_placeholder_snapshot(current_portion: &str, status_block: &st
     let status_block = clamp_placeholder_status_block(status_block);
     let footer = format!("\n\n{status_block}");
     let body_budget = DISCORD_MSG_LIMIT
-        .saturating_sub(char_count(&footer) + STREAMING_PLACEHOLDER_MARGIN)
+        .saturating_sub(footer.len() + STREAMING_PLACEHOLDER_MARGIN)
+        .saturating_add(UTF8_ELLIPSIS_EXTRA_BYTES)
         .max(1);
     let normalized = normalize_empty_lines(current_portion);
-    let body = tail_with_ellipsis(&normalized, body_budget);
+    let body = tail_with_ellipsis_bytes(&normalized, body_budget);
     format!("{}{}", body, footer)
 }
 
@@ -474,7 +343,7 @@ pub(super) fn plan_streaming_rollover(
     let status_block = clamp_placeholder_status_block(status_block);
     let footer = format!("\n\n{status_block}");
     let body_budget = DISCORD_MSG_LIMIT
-        .saturating_sub(char_count(&footer) + STREAMING_PLACEHOLDER_MARGIN)
+        .saturating_sub(footer.len() + STREAMING_PLACEHOLDER_MARGIN)
         .max(1);
     let split_at = streaming_split_boundary(current_portion, body_budget)?;
 
@@ -993,14 +862,14 @@ mod status_panel_v2_formatter_tests {
     fn plan_streaming_rollover_strips_liveness_footer_from_frozen_chunk_s0() {
         let footer = format!("\n\n{LIVENESS_FOOTER}");
         let body_budget = super::DISCORD_MSG_LIMIT
-            .saturating_sub(super::char_count(&footer) + super::STREAMING_PLACEHOLDER_MARGIN)
+            .saturating_sub(footer.len() + super::STREAMING_PLACEHOLDER_MARGIN)
             .max(1);
         let current_portion = "x".repeat(body_budget + 64);
 
         let plan = plan_streaming_rollover(&current_portion, LIVENESS_FOOTER)
             .expect("current portion should roll over once footer budget is reserved");
 
-        assert_eq!(super::char_count(&plan.frozen_chunk), body_budget);
+        assert_eq!(plan.frozen_chunk.len(), body_budget);
         assert_eq!(plan.frozen_chunk, &current_portion[..plan.split_at]);
         assert!(!plan.frozen_chunk.contains(LIVENESS_FOOTER));
         assert!(plan.display_snapshot.ends_with(&footer));
@@ -1014,19 +883,19 @@ mod status_panel_v2_formatter_tests {
     }
 
     #[test]
-    fn plan_streaming_rollover_reserves_footer_length_before_2000_char_limit_s0() {
+    fn plan_streaming_rollover_reserves_footer_length_before_2000_byte_limit_s0() {
         let footer = format!("\n\n{LIVENESS_FOOTER}");
         let body_budget = super::DISCORD_MSG_LIMIT
-            .saturating_sub(super::char_count(&footer) + super::STREAMING_PLACEHOLDER_MARGIN)
+            .saturating_sub(footer.len() + super::STREAMING_PLACEHOLDER_MARGIN)
             .max(1);
         let current_portion = "x".repeat(body_budget + 1);
-        assert!(super::char_count(&current_portion) < super::DISCORD_MSG_LIMIT);
+        assert!(current_portion.len() < super::DISCORD_MSG_LIMIT);
 
         let plan = plan_streaming_rollover(&current_portion, LIVENESS_FOOTER)
             .expect("body fits raw Discord limit but not the reserved footer budget");
 
         assert_eq!(plan.split_at, body_budget);
-        assert!(super::char_count(&plan.display_snapshot) <= super::DISCORD_MSG_LIMIT);
+        assert!(plan.display_snapshot.len() <= super::DISCORD_MSG_LIMIT);
         assert!(plan.display_snapshot.ends_with(&footer));
     }
 
@@ -1037,7 +906,7 @@ mod status_panel_v2_formatter_tests {
 
         assert!(plan_streaming_rollover(current_portion, LIVENESS_FOOTER).is_none());
         assert_eq!(rendered, format!("{current_portion}\n\n{LIVENESS_FOOTER}"));
-        assert!(super::char_count(&rendered) < super::DISCORD_MSG_LIMIT);
+        assert!(rendered.len() < super::DISCORD_MSG_LIMIT);
     }
 
     #[test]
@@ -1046,7 +915,7 @@ mod status_panel_v2_formatter_tests {
         let rendered = build_streaming_placeholder_text("", &oversized_footer);
 
         assert!(plan_streaming_rollover("", &oversized_footer).is_none());
-        assert!(super::char_count(&rendered) <= super::DISCORD_MSG_LIMIT);
+        assert!(rendered.len() <= super::DISCORD_MSG_LIMIT);
         assert!(rendered.starts_with('⠸'));
         assert!(!rendered.contains("\n\n"));
     }
@@ -1402,7 +1271,7 @@ No response requested.\n\
     // #3089 A0 — characterization of the chunker + streaming-rollover splitter
     // (design §5 A0 item 1: split_message chunk boundaries; item 4: streaming
     // rollover split algorithm). Value-exact pins so any change to chunk
-    // boundaries/ordering, the Discord limit cliff, or the rollover
+    // boundaries/ordering, the `len > DISCORD_MSG_LIMIT` cliff, or the rollover
     // split point fails BEFORE the #3089 controller cutover. Nested inside this
     // `#[cfg(test)] mod` block => ZERO production LoC under the ratchet
     // (formatting.rs baseline 2802 stays unchanged).
@@ -1411,8 +1280,8 @@ No response requested.\n\
             message_split_boundary, semantic_sentence_split_boundary,
         };
         use super::super::{
-            DISCORD_MSG_LIMIT, char_count, long_message_reply_builders, plan_streaming_rollover,
-            split_message, streaming_split_boundary,
+            DISCORD_MSG_LIMIT, long_message_reply_builders, plan_streaming_rollover, split_message,
+            streaming_split_boundary,
         };
 
         // -------------------------------------------------------------------
@@ -1437,7 +1306,7 @@ No response requested.\n\
             assert_eq!(
                 chunks.len(),
                 1,
-                "a body of exactly effective_limit chars stays a single chunk"
+                "a body of exactly effective_limit bytes stays a single chunk"
             );
 
             let one_over = "a".repeat(effective_limit + 1);
@@ -1445,56 +1314,7 @@ No response requested.\n\
             assert_eq!(
                 chunks.len(),
                 2,
-                "one char over the effective limit splits into two chunks"
-            );
-        }
-
-        #[test]
-        fn a0_split_message_keeps_700_korean_chars_as_one_chunk_issue_4214() {
-            let body = "가".repeat(700);
-            assert!(
-                body.len() > DISCORD_MSG_LIMIT,
-                "UTF-8 byte length reproduces the old premature split condition"
-            );
-            assert_eq!(char_count(&body), 700);
-
-            let chunks = split_message(&body);
-            assert_eq!(chunks.len(), 1, "700 Korean chars fit one Discord message");
-            assert_eq!(chunks[0], body);
-
-            let replies = long_message_reply_builders(&body);
-            assert_eq!(
-                replies.len(),
-                1,
-                "reply builders must not enter the delayed multi-chunk path"
-            );
-            assert_eq!(
-                replies[0].content.as_deref(),
-                Some(body.as_str()),
-                "single reply preserves the original Korean body"
-            );
-        }
-
-        #[test]
-        fn a0_split_message_bounds_long_korean_chunks_by_character_count_issue_4214() {
-            let body = "한".repeat(DISCORD_MSG_LIMIT + 25);
-            let chunks = split_message(&body);
-
-            assert!(chunks.len() >= 2, "over-limit Korean body splits");
-            assert!(
-                chunks.iter().all(|chunk| !chunk.is_empty()),
-                "no empty chunk may be emitted for Korean splits"
-            );
-            assert!(
-                chunks
-                    .iter()
-                    .all(|chunk| char_count(chunk) <= DISCORD_MSG_LIMIT),
-                "every emitted chunk must fit Discord's character limit"
-            );
-            assert_eq!(
-                chunks.concat(),
-                body,
-                "Korean chunks reassemble without losing or corrupting code points"
+                "one byte over the effective limit splits into two chunks"
             );
         }
 
@@ -1503,12 +1323,8 @@ No response requested.\n\
             let body = "a".repeat(2500);
             let chunks = split_message(&body);
             assert_eq!(chunks.len(), 2);
-            assert_eq!(
-                char_count(&chunks[0]),
-                1990,
-                "hard split at effective_limit"
-            );
-            assert_eq!(char_count(&chunks[1]), 2500 - 1990, "remainder length");
+            assert_eq!(chunks[0].len(), 1990, "hard split at effective_limit");
+            assert_eq!(chunks[1].len(), 2500 - 1990, "remainder length");
             // Order + completeness: concatenation reproduces the input.
             assert_eq!(format!("{}{}", chunks[0], chunks[1]), body);
         }
@@ -1587,8 +1403,8 @@ No response requested.\n\
             // the relay must not prepend chunk-index prefixes.
             assert!(!first.starts_with('['));
             assert!(!second.starts_with('['));
-            assert!(char_count(first) <= DISCORD_MSG_LIMIT);
-            assert!(char_count(second) <= DISCORD_MSG_LIMIT);
+            assert!(first.len() <= DISCORD_MSG_LIMIT);
+            assert!(second.len() <= DISCORD_MSG_LIMIT);
         }
 
         // -------------------------------------------------------------------
@@ -1750,7 +1566,7 @@ No response requested.\n\
 
         #[test]
         fn a0_plan_streaming_rollover_reserves_footer_and_margin_before_the_2000_cliff() {
-            // body_budget = 2000 - ((2 + char_count(status)) + 10). For "STATUS":
+            // body_budget = 2000 - ((2 + status.len()) + 10). For "STATUS" (6B):
             // footer "\n\nSTATUS" = 8; body_budget = 2000 - 18 = 1982.
             let status = "STATUS";
             let body = "Z".repeat(2500);
@@ -1764,7 +1580,7 @@ No response requested.\n\
                 "Z".repeat(1982),
                 "frozen chunk is body[..split_at]"
             );
-            assert_eq!(char_count(&plan.frozen_chunk), plan.split_at);
+            assert_eq!(plan.frozen_chunk.len(), plan.split_at);
         }
 
         #[test]
@@ -1961,7 +1777,7 @@ pub(super) fn format_for_discord(s: &str) -> String {
 
 /// Send a message using poise Context, splitting if necessary
 pub(super) async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Result<(), Error> {
-    if char_count(text) <= DISCORD_MSG_LIMIT {
+    if text.len() <= DISCORD_MSG_LIMIT {
         tracing::debug!(
             target: "discord::chunker",
             path = "send_long_message_ctx",
@@ -1999,7 +1815,7 @@ pub(super) async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Resul
 pub(in crate::services::discord) fn long_message_reply_builders(
     text: &str,
 ) -> Vec<poise::CreateReply> {
-    if char_count(text) <= DISCORD_MSG_LIMIT {
+    if text.len() <= DISCORD_MSG_LIMIT {
         return vec![poise::CreateReply::default().content(text.to_string())];
     }
 
@@ -2059,23 +1875,8 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference(
     shared: &Arc<SharedData>,
     reference: Option<(ChannelId, MessageId)>,
 ) -> Result<(), Error> {
-    send_long_message_raw_with_reference_returning_message_ids(
-        http, channel_id, text, shared, reference,
-    )
-    .await
-    .map(|_| ())
-}
-
-/// Send a long message using raw HTTP and return every created Discord message id.
-pub(in crate::services::discord) async fn send_long_message_raw_with_reference_returning_message_ids(
-    http: &serenity::Http,
-    channel_id: ChannelId,
-    text: &str,
-    shared: &Arc<SharedData>,
-    reference: Option<(ChannelId, MessageId)>,
-) -> Result<Vec<MessageId>, Error> {
     let payload_byte_len = text.len();
-    if char_count(text) <= DISCORD_MSG_LIMIT {
+    if payload_byte_len <= DISCORD_MSG_LIMIT {
         tracing::debug!(
             target: "discord::chunker",
             path = "send_long_message_raw",
@@ -2089,7 +1890,7 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
         rate_limit_wait(shared, channel_id).await;
         match send_channel_message_with_optional_reference(http, channel_id, text, reference).await
         {
-            Ok(message) => {
+            Ok(_) => {
                 tracing::debug!(
                     target: "discord::chunker",
                     path = "send_long_message_raw",
@@ -2099,7 +1900,7 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
                     outcome = "ok",
                     "discord send single done"
                 );
-                return Ok(vec![message.id]);
+                return Ok(());
             }
             Err(err) => {
                 tracing::warn!(
@@ -2132,7 +1933,6 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
         total_chunks = total,
         "discord send begin"
     );
-    let mut sent_message_ids = Vec::new();
     for (i, chunk) in chunks.iter().enumerate() {
         let is_last = i + 1 == total;
         tracing::debug!(
@@ -2146,20 +1946,16 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
             "discord send chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let chunk_reference = if i == 0 { reference.clone() } else { None };
+        let chunk_reference = if i == 0 { reference } else { None };
         let send_result =
             send_channel_message_with_optional_reference(http, channel_id, chunk, chunk_reference)
                 .await;
         match send_result {
-            Ok(message) => {
+            Ok(_) => {
                 // #3082 P1-2: chunk landed — keep the answer-flush barrier's
                 // inactivity window fresh so a long answer never trips the
                 // queued-card wait while it is still making progress.
                 shared.answer_flush_barrier.note_progress(channel_id);
-                shared
-                    .tmux_relay_coord(channel_id)
-                    .note_relay_progress_heartbeat(chrono::Utc::now().timestamp_millis());
-                sent_message_ids.push(message.id);
                 if is_last {
                     tracing::debug!(
                         target: "discord::chunker",
@@ -2188,9 +1984,221 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference_r
                 return Err(err.into());
             }
         }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
-    Ok(sent_message_ids)
+    Ok(())
+}
+
+pub(super) async fn send_long_message_raw_with_rollback(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    rollback_anchor_msg_id: MessageId,
+    text: &str,
+    shared: &Arc<SharedData>,
+) -> Result<Vec<MessageId>, Error> {
+    let payload_byte_len = text.len();
+    let chunks = split_message(text);
+    let total = chunks.len();
+    let rollback_key = replace_continuation_rollback_key(channel_id, rollback_anchor_msg_id);
+
+    match claim_replace_continuation_rollback(rollback_key) {
+        ReplaceContinuationRollbackClaim::None => {}
+        ReplaceContinuationRollbackClaim::InProgress(pending_ids) => {
+            return Err(format!(
+                "previous chunk cleanup in progress for anchor {} in channel {}: {:?}",
+                rollback_anchor_msg_id.get(),
+                channel_id.get(),
+                pending_ids
+            )
+            .into());
+        }
+        ReplaceContinuationRollbackClaim::Owner(pending_ids) => {
+            let cleanup =
+                cleanup_replace_continuations_after_failure(http, channel_id, &pending_ids, shared)
+                    .await;
+            if cleanup.failed_message_ids.is_empty() {
+                if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
+                    unclaim_replace_continuation_rollback(rollback_key);
+                    return Err(format!(
+                        "previous chunk rollback state was not cleared for anchor {} in channel {}: {error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+            } else {
+                if let Err(error) = record_replace_continuation_rollback(
+                    rollback_key,
+                    cleanup.failed_message_ids.clone(),
+                ) {
+                    record_replace_continuation_rollback_memory_only(
+                        rollback_key,
+                        cleanup.failed_message_ids,
+                    );
+                    return Err(format!(
+                        "previous chunk cleanup incomplete and rollback state was not durable for anchor {} in channel {}: {error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "previous chunk cleanup incomplete for anchor {} in channel {}: {:?}",
+                    rollback_anchor_msg_id.get(),
+                    channel_id.get(),
+                    cleanup.errors
+                )
+                .into());
+            }
+        }
+    }
+
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    // #3082 part B: same answer-flush barrier as `send_long_message_raw` so a
+    // queued-turn notice POST cannot interleave between this turn's final-answer
+    // chunks. RAII guard clears the gate on every exit path.
+    let _answer_flush_guard =
+        (total > 1).then(|| shared.answer_flush_barrier.begin_flush(channel_id));
+
+    tracing::debug!(
+        target: "discord::chunker",
+        path = "send_long_message_raw_with_rollback",
+        channel_id = channel_id.get(),
+        anchor_message_id = rollback_anchor_msg_id.get(),
+        payload_byte_len,
+        total_chunks = total,
+        "discord rollback send begin"
+    );
+
+    let mut sent_message_ids = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == total;
+        tracing::debug!(
+            target: "discord::chunker",
+            path = "send_long_message_raw_with_rollback",
+            channel_id = channel_id.get(),
+            anchor_message_id = rollback_anchor_msg_id.get(),
+            chunk_index = i,
+            byte_len = chunk.len(),
+            total_chunks = total,
+            is_last_chunk = is_last,
+            "discord rollback send chunk"
+        );
+        rate_limit_wait(shared, channel_id).await;
+        match super::http::send_channel_message(http, channel_id, chunk).await {
+            Ok(message) => {
+                // #3082 P1-2: chunk landed — refresh the answer-flush barrier's
+                // inactivity window so a long rollback-tracked answer never
+                // trips the queued-card wait while still progressing.
+                shared.answer_flush_barrier.note_progress(channel_id);
+                sent_message_ids.push(message.id.get());
+                if let Err(error) =
+                    record_replace_continuation_rollback(rollback_key, sent_message_ids.clone())
+                {
+                    let cleanup = cleanup_replace_continuations_after_failure(
+                        http,
+                        channel_id,
+                        &sent_message_ids,
+                        shared,
+                    )
+                    .await;
+                    let mut errors = cleanup.errors;
+                    errors.push(error.clone());
+                    if cleanup.failed_message_ids.is_empty() {
+                        if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key)
+                        {
+                            errors.push(clear_error);
+                        }
+                    } else if let Err(record_error) = record_replace_continuation_rollback(
+                        rollback_key,
+                        cleanup.failed_message_ids.clone(),
+                    ) {
+                        record_replace_continuation_rollback_memory_only(
+                            rollback_key,
+                            cleanup.failed_message_ids,
+                        );
+                        errors.push(record_error);
+                    }
+                    return Err(format!(
+                        "sent chunk but rollback state was not durable for anchor {} in channel {}: {}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get(),
+                        errors.join("; ")
+                    )
+                    .into());
+                }
+            }
+            Err(err) => {
+                let error = err.to_string();
+                tracing::warn!(
+                    target: "discord::chunker",
+                    path = "send_long_message_raw_with_rollback",
+                    channel_id = channel_id.get(),
+                    anchor_message_id = rollback_anchor_msg_id.get(),
+                    chunk_index = i,
+                    total_chunks = total,
+                    last_chunk = is_last,
+                    outcome = "err",
+                    error = %error,
+                    "discord rollback send failed; deleting sent chunks before retry"
+                );
+                let cleanup = cleanup_replace_continuations_after_failure(
+                    http,
+                    channel_id,
+                    &sent_message_ids,
+                    shared,
+                )
+                .await;
+                if cleanup.failed_message_ids.is_empty() {
+                    if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key) {
+                        unclaim_replace_continuation_rollback(rollback_key);
+                        return Err(format!(
+                            "send chunk {i}/{total} failed for anchor {} in channel {}, and rollback state was not cleared: {error}; {clear_error}",
+                            rollback_anchor_msg_id.get(),
+                            channel_id.get()
+                        )
+                        .into());
+                    }
+                } else if let Err(record_error) = record_replace_continuation_rollback(
+                    rollback_key,
+                    cleanup.failed_message_ids.clone(),
+                ) {
+                    record_replace_continuation_rollback_memory_only(
+                        rollback_key,
+                        cleanup.failed_message_ids,
+                    );
+                    return Err(format!(
+                        "send chunk {i}/{total} failed for anchor {} in channel {}, cleanup incomplete and rollback state was not durable: {error}; {record_error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "send chunk {i}/{total} failed for anchor {} in channel {}; sent chunks cleaned before retry: {error}",
+                    rollback_anchor_msg_id.get(),
+                    channel_id.get()
+                )
+                .into());
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
+        return Err(format!(
+            "delivered chunks for anchor {} in channel {}, but rollback state was not cleared: {error}",
+            rollback_anchor_msg_id.get(),
+            channel_id.get()
+        )
+        .into());
+    }
+
+    Ok(sent_message_ids.into_iter().map(MessageId::new).collect())
 }
 
 async fn send_channel_message_with_optional_reference(
@@ -2234,18 +2242,11 @@ pub(super) async fn replace_long_message_raw(
     shared: &Arc<SharedData>,
 ) -> Result<(), Error> {
     replace_long_message_outcome_to_result(
-        // #3805 P1: this wrapper discards the last-chunk anchor (footer re-anchor
-        // is watcher-only); pass a throwaway sink.
-        replace_long_message_raw_with_outcome(
-            http, channel_id, message_id, text, shared, &mut None,
-        )
-        .await?,
+        replace_long_message_raw_with_outcome(http, channel_id, message_id, text, shared).await?,
     )
 }
 
-pub(super) fn replace_long_message_outcome_to_result(
-    outcome: ReplaceLongMessageOutcome,
-) -> Result<(), Error> {
+fn replace_long_message_outcome_to_result(outcome: ReplaceLongMessageOutcome) -> Result<(), Error> {
     match outcome {
         ReplaceLongMessageOutcome::EditedOriginal => Ok(()),
         ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { .. } => Ok(()),
@@ -2258,8 +2259,6 @@ pub(super) enum ReplaceLongMessageOutcome {
     EditedOriginal,
     SentFallbackAfterEditFailure {
         edit_error: String,
-        /// First fallback fresh-send message; recovery records it after a stale-anchor edit miss.
-        replacement_anchor: Option<MessageId>,
     },
     PartialContinuationFailure {
         sent_chunks: usize,
@@ -2269,43 +2268,6 @@ pub(super) enum ReplaceLongMessageOutcome {
         cleanup_errors: Vec<String>,
         error: String,
     },
-}
-
-/// #3805 P1: the LAST continuation chunk produced by a fully-successful
-/// multi-chunk `replace_long_message_raw_with_outcome` (`EditedOriginal` where
-/// the body split into 2+ chunks). Carries BOTH the tail chunk's message id
-/// (the highest snowflake — #3717 latest-wins) AND its exact text so a caller
-/// that appends a completion footer can re-anchor onto the tail chunk instead of
-/// stranding the footer on the edited chunk 0. The text MUST be the tail chunk's
-/// OWN text: the footer edit rewrites the target message with `strip(text) +
-/// footer`, so registering the full body would clobber the tail chunk with the
-/// entire answer. Reported via a `&mut Option` out-param (the enum stays a unit
-/// variant — ~20 `matches!` commit/delivered sites depend on that) and left
-/// `None` for single-chunk answers, where chunk 0 already IS the tail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ReplaceLastChunkAnchor {
-    pub(super) msg_id: u64,
-    pub(super) text: String,
-}
-
-/// #3805 P1: pick the completion-footer terminal target (message id + text) for
-/// the watcher's in-place edit arm (`replace_long_message_raw_with_outcome`
-/// `EditedOriginal`). When the answer split into multiple chunks the tail
-/// continuation is the durable anchor (highest snowflake — #3717 latest-wins),
-/// and its edit text MUST be the tail chunk's OWN text: the completion edit
-/// rewrites the target with `strip(text) + footer`, so passing the full body
-/// would overwrite the tail chunk with the entire answer (§4 regression). For a
-/// single-chunk answer there is no continuation anchor, so the edited chunk-0 id
-/// plus the full relay text are the target (identical there — no regression).
-pub(super) fn watcher_completion_footer_anchor<'a>(
-    last_chunk_anchor: Option<&'a ReplaceLastChunkAnchor>,
-    edited_chunk0_msg_id: MessageId,
-    full_relay_text: &'a str,
-) -> (MessageId, &'a str) {
-    match last_chunk_anchor {
-        Some(anchor) => (MessageId::new(anchor.msg_id), anchor.text.as_str()),
-        None => (edited_chunk0_msg_id, full_relay_text),
-    }
 }
 
 /// Replace an existing Discord message and report whether the original
@@ -2319,11 +2281,6 @@ pub(super) async fn replace_long_message_raw_with_outcome(
     message_id: MessageId,
     text: &str,
     shared: &Arc<SharedData>,
-    // #3805 P1: on the fully-successful multi-chunk edit path this is set to the
-    // tail continuation chunk (id + text) so a footer-appending caller can
-    // re-anchor onto it; left untouched (caller-initialised `None`) on every
-    // other path (single-chunk, edit-failure fallback, partial failure).
-    last_chunk_anchor: &mut Option<ReplaceLastChunkAnchor>,
 ) -> Result<ReplaceLongMessageOutcome, Error> {
     let payload_byte_len = text.len();
     let chunks = split_message(text);
@@ -2349,10 +2306,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                 failed_chunk_index: 0,
                 sent_continuation_message_ids: pending_ids,
                 cleanup_errors: Vec::new(),
-                error: watcher_send_failure_message(
-                    super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
-                    "previous continuation cleanup in progress",
-                ),
+                error: "previous continuation cleanup in progress".to_string(),
             });
         }
         ReplaceContinuationRollbackClaim::Owner(pending_ids) => {
@@ -2370,11 +2324,8 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         failed_chunk_index: 0,
                         sent_continuation_message_ids: pending_ids,
                         cleanup_errors,
-                        error: watcher_send_failure_message(
-                            super::replace_outcome_policy::WatcherSendFailureClass::Transient,
-                            format!(
-                                "previous continuation rollback state was not cleared: {error}"
-                            ),
+                        error: format!(
+                            "previous continuation rollback state was not cleared: {error}"
                         ),
                     });
                 }
@@ -2396,10 +2347,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                     failed_chunk_index: 0,
                     sent_continuation_message_ids: pending_ids,
                     cleanup_errors,
-                    error: watcher_send_failure_message(
-                        super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
-                        "previous continuation cleanup incomplete",
-                    ),
+                    error: "previous continuation cleanup incomplete".to_string(),
                 });
             }
         }
@@ -2453,12 +2401,8 @@ pub(super) async fn replace_long_message_raw_with_outcome(
             "discord first-chunk edit failed; falling back to send_long_message_raw (issue #1043)"
         );
         let edit_error = e.to_string();
-        let replacement_message_ids =
-            send_long_message_raw_with_rollback(http, channel_id, message_id, text, shared).await?;
-        return Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
-            edit_error,
-            replacement_anchor: replacement_message_ids.first().copied(),
-        });
+        send_long_message_raw_with_rollback(http, channel_id, message_id, text, shared).await?;
+        return Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error });
     }
 
     // #3082 P1-2 residual: the FIRST edited chunk also delivers answer payload
@@ -2546,18 +2490,13 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         );
                         errors.push(record_error);
                     }
-                    let class = if cleanup_errors.failed_message_ids.is_empty() {
-                        super::replace_outcome_policy::WatcherSendFailureClass::Transient
-                    } else {
-                        super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete
-                    };
                     return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
                         sent_chunks: i + 1,
                         total_chunks: total,
                         failed_chunk_index: i,
                         sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                         cleanup_errors: errors,
-                        error: watcher_send_failure_message(class, error),
+                        error,
                     });
                 }
                 if is_last {
@@ -2574,8 +2513,6 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                 }
             }
             Err(err) => {
-                let failure_class =
-                    super::replace_outcome_policy::classify_watcher_send_failure(&err);
                 let error = err.to_string();
                 tracing::warn!(
                     target: "discord::chunker",
@@ -2606,7 +2543,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                             failed_chunk_index: i,
                             sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                             cleanup_errors: errors,
-                            error: watcher_send_failure_message(failure_class, error),
+                            error,
                         });
                     }
                 } else {
@@ -2627,10 +2564,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                         failed_chunk_index: i,
                         sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                         cleanup_errors: errors,
-                        error: watcher_send_failure_message(
-                            super::replace_outcome_policy::WatcherSendFailureClass::RollbackIncomplete,
-                            error,
-                        ),
+                        error,
                     });
                 }
                 return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
@@ -2639,7 +2573,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
                     failed_chunk_index: i,
                     sent_continuation_message_ids: sent_continuation_message_ids.clone(),
                     cleanup_errors: cleanup_errors.errors,
-                    error: watcher_send_failure_message(failure_class, error),
+                    error,
                 });
             }
         }
@@ -2649,28 +2583,15 @@ pub(super) async fn replace_long_message_raw_with_outcome(
     if !sent_continuation_message_ids.is_empty()
         && let Err(error) = clear_replace_continuation_rollback(rollback_key)
     {
-        clear_replace_continuation_rollback_memory_only(rollback_key);
-        tracing::warn!(
-            target: "discord::chunker",
-            path = "replace_long_message_raw",
-            channel_id = channel_id.get(),
-            message_id = message_id.get(),
-            error = %error,
-            "discord replace delivered all chunks but rollback state cleanup failed"
-        );
+        return Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
+            sent_chunks: total,
+            total_chunks: total,
+            failed_chunk_index: total.saturating_sub(1),
+            sent_continuation_message_ids,
+            cleanup_errors: vec![error.clone()],
+            error,
+        });
     }
-    // #3805 P1: fully-successful edit+continuations. When continuations were
-    // sent, hand back the TAIL chunk (id + its own text) so the watcher footer
-    // can re-anchor onto it (highest snowflake, #3717 latest-wins). Empty
-    // continuations ⇒ single-chunk answer ⇒ leave `None` (chunk 0 is the tail).
-    *last_chunk_anchor =
-        sent_continuation_message_ids
-            .last()
-            .copied()
-            .map(|msg_id| ReplaceLastChunkAnchor {
-                msg_id,
-                text: chunks.last().cloned().unwrap_or_default(),
-            });
     Ok(ReplaceLongMessageOutcome::EditedOriginal)
 }
 
@@ -2690,7 +2611,7 @@ async fn cleanup_replace_continuations_after_failure(
     for message_id in sent_continuation_message_ids.iter().rev().copied() {
         rate_limit_wait(shared, channel_id).await;
         if let Err(error) =
-            delete_rollback_channel_message(http, channel_id, MessageId::new(message_id)).await
+            super::http::delete_channel_message(http, channel_id, MessageId::new(message_id)).await
         {
             let detail = error.to_string();
             match classify_delete_error(&detail) {
@@ -2734,108 +2655,47 @@ fn replace_continuation_rollback_path(key: (u64, u64)) -> Option<PathBuf> {
 
 fn load_persisted_replace_continuation_rollback(key: (u64, u64)) -> Option<Vec<u64>> {
     let path = replace_continuation_rollback_path(key)?;
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            // Non-UTF8 means the sidecar content is corrupt, just like a JSON
-            // parse failure below. Remove it so a bad-content file cannot warn
-            // forever on every future claim attempt.
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "failed to decode continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
-            );
-            let _ = fs::remove_file(&path);
-            return None;
-        }
-        Err(error) => {
-            // Fail open WITHOUT removing the file: a read error (EIO, fd
-            // exhaustion, EACCES) is transient-environment evidence, not
-            // corruption evidence — removing here would permanently destroy
-            // valid debt that a later claim could still read. Only the parse
-            // arm below (unparseable content = a genuinely bad file) removes.
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "failed to read continuation rollback sidecar; leaving file in place and treating as no debt for this claim"
-            );
-            return None;
-        }
-    };
-    let persisted: PersistedReplaceContinuationRollback = match serde_json::from_str(&content) {
-        Ok(persisted) => persisted,
-        Err(error) => {
-            // Fail open for corrupt sidecars: runtime_store::atomic_write uses a
-            // temp file, fsync, and same-dir rename, so torn files cannot be
-            // self-produced. Treating corrupt data as debt would reintroduce the
-            // r4 permanent send-block without a bounded probe.
-            tracing::warn!(
-                path = %path.display(),
-                error = %error,
-                "failed to parse continuation rollback sidecar; removing corrupt sidecar and treating as no debt"
-            );
-            let _ = fs::remove_file(&path);
-            return None;
-        }
-    };
-    if persisted.message_ids.is_empty() {
-        let _ = fs::remove_file(&path);
-        return None;
-    }
+    let content = fs::read_to_string(path).ok()?;
+    let persisted: PersistedReplaceContinuationRollback = serde_json::from_str(&content).ok()?;
     (!persisted.message_ids.is_empty()).then_some(persisted.message_ids)
-}
-
-fn replace_continuation_rollback_cleared_marker() -> Result<String, String> {
-    serde_json::to_string_pretty(&PersistedReplaceContinuationRollback {
-        message_ids: Vec::new(),
-    })
-    .map_err(|error| format!("serialize cleared continuation rollback marker: {error}"))
 }
 
 fn persist_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: &[u64],
-) -> Result<PersistReplaceContinuationRollbackOutcome, String> {
+) -> Result<(), String> {
     let Some(path) = replace_continuation_rollback_path(key) else {
         return Err("runtime root unavailable for continuation rollback".to_string());
     };
     if message_ids.is_empty() {
-        match remove_replace_continuation_rollback_file(key, &path) {
+        match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                let cleared_marker = replace_continuation_rollback_cleared_marker()?;
-                super::runtime_store::atomic_write(&path, &cleared_marker).map_err(
-                    |write_error| {
-                        format!(
-                            "remove continuation rollback {}: {error}; write cleared marker failed: {write_error}",
-                            path.display()
-                        )
-                    },
-                )?;
-                return Ok(PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten);
+                return Err(format!(
+                    "remove continuation rollback {}: {error}",
+                    path.display()
+                ));
             }
         }
-        return Ok(PersistReplaceContinuationRollbackOutcome::Removed);
+        return Ok(());
     }
     let persisted = PersistedReplaceContinuationRollback {
         message_ids: message_ids.to_vec(),
     };
     let json = serde_json::to_string_pretty(&persisted)
         .map_err(|error| format!("serialize continuation rollback: {error}"))?;
-    super::runtime_store::atomic_write(&path, &json)?;
-    Ok(PersistReplaceContinuationRollbackOutcome::Recorded)
+    super::runtime_store::atomic_write(&path, &json)
 }
 
 fn claim_replace_continuation_rollback(key: (u64, u64)) -> ReplaceContinuationRollbackClaim {
     let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let rollback = match rollbacks.get_mut(&key) {
-        Some(rollback) if rollback.message_ids.is_empty() => {
-            return ReplaceContinuationRollbackClaim::None;
-        }
+    let rollback = match rollbacks
+        .get_mut(&key)
+        .filter(|entry| !entry.message_ids.is_empty())
+    {
         Some(rollback) => rollback,
         None => {
             let Some(message_ids) = load_persisted_replace_continuation_rollback(key) else {
@@ -2868,26 +2728,12 @@ fn record_replace_continuation_rollback(
     key: (u64, u64),
     message_ids: Vec<u64>,
 ) -> Result<(), String> {
+    persist_replace_continuation_rollback(key, &message_ids)?;
     let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let outcome = persist_replace_continuation_rollback(key, &message_ids)?;
     if message_ids.is_empty() {
-        match outcome {
-            PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
-                rollbacks.insert(
-                    key,
-                    ReplaceContinuationRollback {
-                        message_ids: Vec::new(),
-                        claimed: false,
-                    },
-                );
-            }
-            PersistReplaceContinuationRollbackOutcome::Removed
-            | PersistReplaceContinuationRollbackOutcome::Recorded => {
-                rollbacks.remove(&key);
-            }
-        }
+        rollbacks.remove(&key);
     } else {
         rollbacks.insert(
             key,
@@ -2916,38 +2762,12 @@ fn record_replace_continuation_rollback_memory_only(key: (u64, u64), message_ids
         );
 }
 
-fn clear_replace_continuation_rollback_memory_only(key: (u64, u64)) {
+fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
+    persist_replace_continuation_rollback(key, &[])?;
     REPLACE_CONTINUATION_ROLLBACKS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            key,
-            ReplaceContinuationRollback {
-                message_ids: Vec::new(),
-                claimed: false,
-            },
-        );
-}
-
-fn clear_replace_continuation_rollback(key: (u64, u64)) -> Result<(), String> {
-    let mut rollbacks = REPLACE_CONTINUATION_ROLLBACKS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    match persist_replace_continuation_rollback(key, &[])? {
-        PersistReplaceContinuationRollbackOutcome::ClearedMarkerWritten => {
-            rollbacks.insert(
-                key,
-                ReplaceContinuationRollback {
-                    message_ids: Vec::new(),
-                    claimed: false,
-                },
-            );
-        }
-        PersistReplaceContinuationRollbackOutcome::Removed
-        | PersistReplaceContinuationRollbackOutcome::Recorded => {
-            rollbacks.remove(&key);
-        }
-    }
+        .remove(&key);
     Ok(())
 }
 
@@ -2985,44 +2805,6 @@ mod replace_long_message_tests {
                 None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
             }
         }
-    }
-
-    // #3805 P1: a multi-chunk answer must re-anchor the completion footer onto the
-    // TAIL continuation chunk (highest snowflake, #3717 latest-wins) carrying the
-    // tail chunk's OWN text — NOT chunk 0, and NOT the full body (which would
-    // clobber the tail chunk once the footer edit rewrites it, §4 regression).
-    #[test]
-    fn completion_footer_anchor_reanchors_to_last_chunk_with_tail_text() {
-        let chunk0 = MessageId::new(1000);
-        let full_body = "chunk-0 body ... continuation tail body";
-        let tail = super::ReplaceLastChunkAnchor {
-            msg_id: 2000,
-            text: "continuation tail body".to_string(),
-        };
-
-        let (target_id, target_text) =
-            super::watcher_completion_footer_anchor(Some(&tail), chunk0, full_body);
-
-        // Re-anchored to the tail chunk id (2000 > 1000: never re-anchors DOWN).
-        assert_eq!(target_id, MessageId::new(2000));
-        assert!(target_id > chunk0, "must re-anchor to the higher snowflake");
-        // Registered text is the tail chunk's OWN text, never the full body.
-        assert_eq!(target_text, "continuation tail body");
-        assert_ne!(target_text, full_body);
-    }
-
-    // #3805 P1: single-chunk answers have no continuation anchor → keep chunk 0 +
-    // the full relay text (identical there); the fix is a strict no-op for them.
-    #[test]
-    fn completion_footer_anchor_single_chunk_keeps_chunk0_and_full_text() {
-        let chunk0 = MessageId::new(1000);
-        let full_body = "short single-chunk answer";
-
-        let (target_id, target_text) =
-            super::watcher_completion_footer_anchor(None, chunk0, full_body);
-
-        assert_eq!(target_id, chunk0);
-        assert_eq!(target_text, full_body);
     }
 
     #[test]
@@ -3128,141 +2910,6 @@ mod replace_long_message_tests {
     }
 
     #[test]
-    fn continuation_rollback_memory_clear_suppresses_persisted_reload_4154() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = RuntimeRootEnvGuard::new(tempdir.path());
-        let key = super::replace_continuation_rollback_key(ChannelId::new(33), MessageId::new(39));
-
-        super::clear_replace_continuation_rollback(key).expect("clear rollback");
-        super::record_replace_continuation_rollback(key, vec![711, 712]).expect("record rollback");
-        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
-        assert!(rollback_path.exists(), "rollback sidecar must be persisted");
-
-        super::clear_replace_continuation_rollback_memory_only(key);
-        assert_eq!(
-            super::claim_replace_continuation_rollback(key),
-            super::ReplaceContinuationRollbackClaim::None
-        );
-        assert!(
-            rollback_path.exists(),
-            "memory tombstone should not require disk cleanup to succeed"
-        );
-
-        super::clear_replace_continuation_rollback(key).expect("clear rollback");
-    }
-
-    #[test]
-    fn continuation_rollback_clear_remove_failure_writes_cleared_marker_4154() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = RuntimeRootEnvGuard::new(tempdir.path());
-        let key = super::replace_continuation_rollback_key(ChannelId::new(35), MessageId::new(41));
-
-        super::clear_replace_continuation_rollback(key).expect("clear rollback");
-        super::record_replace_continuation_rollback(key, vec![721, 722]).expect("record rollback");
-        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
-        assert!(rollback_path.exists(), "rollback sidecar must be persisted");
-
-        super::force_next_replace_continuation_rollback_remove_failure(key);
-        super::clear_replace_continuation_rollback(key)
-            .expect("clear should write a cleared marker after remove failure");
-        let marker = std::fs::read_to_string(&rollback_path).expect("cleared marker");
-        assert!(
-            marker.contains("\"message_ids\": []"),
-            "clear marker must erase delivered rollback ids"
-        );
-
-        super::REPLACE_CONTINUATION_ROLLBACKS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&key);
-        assert_eq!(
-            super::claim_replace_continuation_rollback(key),
-            super::ReplaceContinuationRollbackClaim::None
-        );
-        assert!(
-            !rollback_path.exists(),
-            "claiming a cleared marker should best-effort remove it"
-        );
-    }
-
-    #[test]
-    fn continuation_rollback_successful_clear_removes_memory_entry_4154() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = RuntimeRootEnvGuard::new(tempdir.path());
-        let key = super::replace_continuation_rollback_key(ChannelId::new(37), MessageId::new(41));
-
-        super::record_replace_continuation_rollback(key, vec![731, 732]).expect("record rollback");
-        super::clear_replace_continuation_rollback(key).expect("clear rollback");
-
-        assert!(
-            !super::REPLACE_CONTINUATION_ROLLBACKS
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .contains_key(&key),
-            "successful clear should leave absence, not a permanent tombstone"
-        );
-        assert_eq!(
-            super::claim_replace_continuation_rollback(key),
-            super::ReplaceContinuationRollbackClaim::None
-        );
-    }
-
-    #[test]
-    fn continuation_rollback_corrupt_sidecar_warns_open_and_removes_4154() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = RuntimeRootEnvGuard::new(tempdir.path());
-        let key = super::replace_continuation_rollback_key(ChannelId::new(39), MessageId::new(45));
-        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
-        std::fs::create_dir_all(rollback_path.parent().expect("rollback parent"))
-            .expect("create rollback parent");
-        std::fs::write(&rollback_path, "{not-json").expect("write corrupt sidecar");
-
-        assert_eq!(
-            super::claim_replace_continuation_rollback(key),
-            super::ReplaceContinuationRollbackClaim::None
-        );
-        assert!(
-            !rollback_path.exists(),
-            "corrupt rollback sidecar should be removed after fail-open"
-        );
-    }
-
-    #[test]
-    fn continuation_rollback_non_utf8_sidecar_warns_open_and_removes_4154() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = RuntimeRootEnvGuard::new(tempdir.path());
-        let key = super::replace_continuation_rollback_key(ChannelId::new(40), MessageId::new(46));
-        let rollback_path = super::replace_continuation_rollback_path(key).expect("rollback path");
-        std::fs::create_dir_all(rollback_path.parent().expect("rollback parent"))
-            .expect("create rollback parent");
-        std::fs::write(&rollback_path, [0xff, 0xfe, 0xfd]).expect("write non-UTF8 sidecar");
-
-        assert_eq!(
-            super::claim_replace_continuation_rollback(key),
-            super::ReplaceContinuationRollbackClaim::None
-        );
-        assert!(
-            !rollback_path.exists(),
-            "non-UTF8 rollback sidecar should be removed after fail-open"
-        );
-    }
-
-    #[test]
     fn continuation_rollback_unclaim_allows_retry_after_clear_failure() {
         let _guard = crate::config::shared_test_env_lock()
             .lock()
@@ -3347,7 +2994,6 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
     let total_bytes = text.len();
     let mut chunks = Vec::new();
     let mut remaining = text;
-    let mut remaining_chars = char_count(text);
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
 
@@ -3355,7 +3001,7 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
         // Reserve space for code block tags we may need to add
         let tag_overhead = if in_code_block {
             // closing ``` + opening ```lang\n
-            3 + 3 + char_count(&code_block_lang) + 1
+            3 + 3 + code_block_lang.len() + 1
         } else {
             0
         };
@@ -3363,7 +3009,7 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
             .saturating_sub(tag_overhead)
             .saturating_sub(10);
 
-        if remaining_chars <= effective_limit {
+        if remaining.len() <= effective_limit {
             let mut chunk = String::new();
             if in_code_block {
                 chunk.push_str("```");
@@ -3389,7 +3035,7 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
         // Find a safe split point.
         //
         // Issue #1043 root cause #1: when the input begins with a leading `\n`
-        // and the next ~2000 chars contain no other newline, `rfind('\n')`
+        // and the next ~2000 bytes contain no other newline, `rfind('\n')`
         // returns `Some(0)`. That made `raw_chunk` empty, the chunker emitted a
         // zero-byte chunk, and Discord's REST API rejected the send with HTTP
         // 400 ("Cannot send an empty message"). The error short-circuited
@@ -3400,7 +3046,7 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
         // Fix: if a newline split would yield a zero-byte `raw_chunk`, fall
         // back to a hard split at `safe_end` (or skip the orphan newline when
         // `safe_end` is also 0 due to a multi-byte char on the boundary).
-        let safe_end = byte_index_at_char_limit(remaining, effective_limit);
+        let safe_end = floor_char_boundary(remaining, effective_limit);
         let (mut split_at, mut boundary_kind) =
             super::semantic_boundaries::message_split_boundary(remaining, safe_end, in_code_block);
         if split_at == 0 {
@@ -3409,14 +3055,13 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
                 boundary_kind = "hard_after_leading_newline";
             } else {
                 // safe_end is also 0 (e.g. multi-byte char straddling a
-                // 0-char effective_limit). Skip one character to guarantee
+                // 0-byte effective_limit). Skip one byte to guarantee
                 // forward progress and never emit an empty chunk.
                 let step = remaining
                     .char_indices()
                     .nth(1)
                     .map(|(i, _)| i)
                     .unwrap_or(remaining.len());
-                let skipped_chars = char_count(&remaining[..step]);
                 tracing::debug!(
                     target: "discord::chunker",
                     step,
@@ -3424,14 +3069,11 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
                     "split_message advance over zero-width boundary"
                 );
                 remaining = &remaining[step..];
-                remaining_chars = remaining_chars.saturating_sub(skipped_chars);
                 continue;
             }
         }
 
         let (raw_chunk, rest) = remaining.split_at(split_at);
-        let raw_chunk_chars = char_count(raw_chunk);
-        let stripped_boundary_chars = usize::from(rest.starts_with('\n'));
 
         let mut chunk = String::new();
         if in_code_block {
@@ -3472,9 +3114,6 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
                 total_bytes,
                 "split_message would have emitted an empty chunk; skipping (issue #1043 guard)"
             );
-            remaining_chars = remaining_chars
-                .saturating_sub(raw_chunk_chars)
-                .saturating_sub(stripped_boundary_chars);
             remaining = rest.strip_prefix('\n').unwrap_or(rest);
             continue;
         }
@@ -3488,9 +3127,6 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
             total_bytes,
             "split_message emit"
         );
-        remaining_chars = remaining_chars
-            .saturating_sub(raw_chunk_chars)
-            .saturating_sub(stripped_boundary_chars);
         remaining = rest.strip_prefix('\n').unwrap_or(rest);
     }
 
@@ -3530,7 +3166,7 @@ fn build_attachment_inline(text: &str, summary: Option<&str>) -> String {
     });
 
     if let Some(summary) = trimmed_summary {
-        if char_count(summary) + char_count(&footer) <= DISCORD_MSG_LIMIT {
+        if summary.len() + footer.len() <= DISCORD_MSG_LIMIT {
             return format!("{summary}{footer}");
         }
     }
@@ -3539,6 +3175,41 @@ fn build_attachment_inline(text: &str, summary: Option<&str>) -> String {
         "📎 내용이 길어 전문을 파일로 첨부했습니다. ({} bytes)",
         text.len()
     )
+}
+
+/// Add reaction using raw HTTP reference
+pub(super) async fn add_reaction_raw(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    message_id: serenity::MessageId,
+    emoji: char,
+) {
+    let reaction = serenity::ReactionType::Unicode(emoji.to_string());
+    if let Err(e) = channel_id.create_reaction(http, message_id, reaction).await {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ Failed to add reaction '{emoji}' to msg {message_id} in channel {channel_id}: {e}"
+        );
+    }
+}
+
+/// Remove reaction using raw HTTP reference
+pub(super) async fn remove_reaction_raw(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    message_id: serenity::MessageId,
+    emoji: char,
+) {
+    let reaction = serenity::ReactionType::Unicode(emoji.to_string());
+    if let Err(e) = channel_id
+        .delete_reaction(http, message_id, None, reaction)
+        .await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ Failed to remove reaction '{emoji}' from msg {message_id} in channel {channel_id}: {e}"
+        );
+    }
 }
 
 /// Determine the raw tool status string for Discord status display.
@@ -3630,7 +3301,7 @@ pub(super) fn preserve_previous_tool_status(
 /// Convert a technical tool status line into a human-friendly label with emoji.
 pub(super) fn humanize_tool_status(tool_line: &str) -> String {
     // Thinking: show more detail than tool invocations, but keep the final
-    // placeholder edit compact even for UTF-8-heavy text.
+    // placeholder edit safely below Discord's byte limit even for UTF-8-heavy text.
     if tool_line.starts_with("💭") {
         return truncate_for_status_bytes(tool_line, THINKING_STATUS_MAX_BYTES);
     }
@@ -4079,22 +3750,6 @@ fn truncate_for_status_bytes(s: &str, max_bytes: usize) -> String {
     format!("{}{}", &s[..safe_end], ellipsis)
 }
 
-fn truncate_for_status_chars(s: &str, max_chars: usize) -> String {
-    let current_chars = char_count(s);
-    if current_chars <= max_chars {
-        return s.to_string();
-    }
-
-    let ellipsis = "…";
-    let body_budget = max_chars.saturating_sub(1);
-    if body_budget == 0 {
-        return ellipsis.to_string();
-    }
-
-    let safe_end = byte_index_at_char_limit(s, body_budget);
-    format!("{}{}", &s[..safe_end], ellipsis)
-}
-
 fn clamp_placeholder_status_block(status_block: &str) -> String {
-    truncate_for_status_chars(status_block, DISCORD_MSG_LIMIT)
+    truncate_for_status_bytes(status_block, DISCORD_MSG_LIMIT)
 }

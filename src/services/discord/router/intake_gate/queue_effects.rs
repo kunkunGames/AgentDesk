@@ -32,9 +32,9 @@ pub(in crate::services::discord::router) fn queue_pending_reaction_for(
 /// entry — for BOTH standalone and merged. The head-only rule is correct only
 /// for placeholder-card OWNERSHIP (one card per active turn); a merged source
 /// `B` that is still queued under a newer head `C` keeps a valid `➕`, so a
-/// head-only check would wrongly remove it. Reconciled queue-marker removal is
-/// best-effort (no-op when already cleared), and only the calling provider bot's
-/// own @me reaction is removed.
+/// head-only check would wrongly remove it. `remove_reaction_raw` is
+/// best-effort (no-op when already cleared), and only the calling provider
+/// bot's own @me reaction is removed.
 async fn add_queue_pending_reaction_self_healing(
     ctx: &serenity::Context,
     data: &Data,
@@ -42,15 +42,7 @@ async fn add_queue_pending_reaction_self_healing(
     user_msg_id: serenity::MessageId,
     emoji: char,
 ) {
-    crate::services::discord::queue_marker::note_added_current(
-        &data.shared,
-        &ctx.http,
-        channel_id,
-        user_msg_id,
-        emoji,
-        "intake_gate_queue_pending",
-    )
-    .await;
+    add_reaction(&ctx.http, channel_id, user_msg_id, emoji).await;
     let still_queued = {
         let snapshot = mailbox_snapshot(&data.shared, channel_id).await;
         snapshot.intervention_queue.iter().any(|intervention| {
@@ -59,13 +51,11 @@ async fn add_queue_pending_reaction_self_healing(
         })
     };
     if !still_queued {
-        crate::services::discord::queue_marker::note_removed_current(
-            &data.shared,
+        crate::services::discord::formatting::remove_reaction_raw(
             &ctx.http,
             channel_id,
             user_msg_id,
             emoji,
-            "intake_gate_queue_pending_self_heal",
         )
         .await;
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -80,19 +70,6 @@ async fn add_queue_pending_reaction_self_healing(
 pub(super) struct IntakeGateQueueEffects<'a> {
     pub(super) ctx: &'a serenity::Context,
     pub(super) data: &'a Data,
-}
-
-/// #3903/#4024 — pure verdict for whether a post-enqueue deferred idle-queue
-/// drain must run after an intervention actually landed in the mailbox queue.
-///
-/// Schedule when the enqueue was accepted and no REAL (blocking) turn currently
-/// owns the slot. A background/system-injection turn is intentionally treated as
-/// non-blocking so queued user work does not strand behind it.
-pub(in crate::services::discord::router) fn should_schedule_post_enqueue_idle_drain(
-    enqueued: bool,
-    has_blocking_active_turn: bool,
-) -> bool {
-    enqueued && !has_blocking_active_turn
 }
 
 #[async_trait::async_trait]
@@ -142,27 +119,6 @@ impl IntakeQueueCommitEffects for IntakeGateQueueEffects<'_> {
             &self.data.provider,
         )
         .await
-    }
-}
-
-#[cfg(test)]
-mod schedule_post_enqueue_idle_drain_tests {
-    use super::should_schedule_post_enqueue_idle_drain;
-
-    #[test]
-    fn schedules_when_enqueued_and_slot_idle() {
-        assert!(should_schedule_post_enqueue_idle_drain(true, false));
-    }
-
-    #[test]
-    fn skips_when_real_turn_holds_slot() {
-        assert!(!should_schedule_post_enqueue_idle_drain(true, true));
-    }
-
-    #[test]
-    fn skips_when_enqueue_was_refused() {
-        assert!(!should_schedule_post_enqueue_idle_drain(false, false));
-        assert!(!should_schedule_post_enqueue_idle_drain(false, true));
     }
 }
 

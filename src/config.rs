@@ -1376,15 +1376,6 @@ pub struct PlaceholderConfig {
     pub live_events_enabled: bool,
     #[serde(default = "default_true")]
     pub status_panel_v2_enabled: bool,
-    /// #3805 P2: rollout gate for the two-message panel model (answer chunks
-    /// first, the live status panel re-anchored beneath the latest chunk).
-    /// Default OFF and restart-required — the whole `placeholder` section is
-    /// boot-bound, copied into shared UI state once at startup (see
-    /// `config_live_reload::restart_required_changes`). PR-A is pure
-    /// scaffolding: no branch reads this flag yet (later PR-B~ gates the
-    /// two-message create/re-anchor path behind it).
-    #[serde(default)]
-    pub two_message_panel_enabled: bool,
 }
 
 impl Default for PlaceholderConfig {
@@ -1392,7 +1383,6 @@ impl Default for PlaceholderConfig {
         Self {
             live_events_enabled: true,
             status_panel_v2_enabled: true,
-            two_message_panel_enabled: false,
         }
     }
 }
@@ -2955,57 +2945,6 @@ pub fn load_graceful() -> Config {
 pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-#[cfg(test)]
-pub(crate) struct TestEnvVarGuard {
-    _lock: Option<std::sync::MutexGuard<'static, ()>>,
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl TestEnvVarGuard {
-    pub(crate) fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-        let lock = shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            _lock: Some(lock),
-            key,
-            previous,
-        }
-    }
-
-    pub(crate) fn set_path_after_shared_test_env_lock(
-        key: &'static str,
-        value: &std::path::Path,
-    ) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            _lock: None,
-            key,
-            previous,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestEnvVarGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_agentdesk_root_for_test(path: &std::path::Path) -> TestEnvVarGuard {
-    TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", path)
 }
 
 /// Compatibility shim for legacy provider signatures that still mention

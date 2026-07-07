@@ -8,6 +8,7 @@ ENTRYPOINT_DIR = REPO_ROOT / "scripts" / "launchd-migrated"
 SPECIFIC_USER_HOME = "/Users/itismyfield"
 
 MIGRATED_SHELL_JOBS = [
+    "agent-feedback-briefing",
     "ai-integrated-briefing",
     "banchan-day-reminder-cook",
     "banchan-day-reminder-prep",

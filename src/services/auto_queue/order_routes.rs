@@ -1,9 +1,4 @@
 use super::*;
-use axum::extract::Extension;
-
-use crate::api_caller_observability::{
-    RequestPrincipal, log_identity_consumption, manager_channel_check_relied_on_claimed_header,
-};
 
 // ── Authenticated order submission callback ─────────────────────────────────
 
@@ -87,22 +82,11 @@ pub(super) async fn submit_order_with_pg(
     state: &AppState,
     run_id: &str,
     headers: &HeaderMap,
-    principal: Option<&RequestPrincipal>,
     body: &OrderBody,
     pool: &sqlx::PgPool,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_agent_id =
         crate::services::kanban::resolve_requesting_agent_id_with_pg(pool, headers).await;
-    let config = crate::config::load_graceful();
-    log_identity_consumption(
-        "POST /api/queue/runs/{id}/order",
-        principal,
-        caller_agent_id.as_deref(),
-        manager_channel_check_relied_on_claimed_header(
-            headers,
-            config.kanban.manager_channel_id.as_deref(),
-        ),
-    );
     let run_row = match sqlx::query(
         "SELECT status, repo
          FROM auto_queue_runs
@@ -272,7 +256,6 @@ pub async fn submit_order(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-    principal: Option<Extension<RequestPrincipal>>,
     Json(body): Json<OrderBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if let Err(response) =
@@ -283,13 +266,5 @@ pub async fn submit_order(
     let Some(pg_pool) = state.pg_pool.clone() else {
         return pg_unavailable_response();
     };
-    submit_order_with_pg(
-        &state,
-        &run_id,
-        &headers,
-        principal.as_ref().map(|Extension(principal)| principal),
-        &body,
-        &pg_pool,
-    )
-    .await
+    submit_order_with_pg(&state, &run_id, &headers, &body, &pg_pool).await
 }

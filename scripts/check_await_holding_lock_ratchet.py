@@ -21,16 +21,7 @@ from pathlib import Path
 # Monotonic ceiling: the number of `#[allow(clippy::await_holding_lock)]`
 # attributes permitted across the workspace. Lower this as sites are removed;
 # never raise it casually.
-#
-# 34 → 36 (#3982): the two backstop regression tests
-# `backstop_orphan_reclaim_downgrades_then_claims` and
-# `backstop_failed_reclaim_falls_back_to_bounded_abort`
-# (src/services/discord/tui_direct_pending_start.rs) hold `worker_test_lock()`
-# across `tokio::time::advance` awaits that drive `run_worker`. The guard
-# serializes tests mutating the process-wide PRESENT index / durable-store root;
-# releasing it before the awaits would let concurrent tests stomp the statics.
-# Both are test-only and cannot deadlock a live task. Justified, reviewable raise.
-BASELINE = 53  # +16 (#4091 r7 batch-4): crate-wide test env-lock isolation sweep — async tests in queue_io/race_loss/terminal_controller_cutover/voice-pcm-harness/operator_connectors/worktree_orphan_sweep now hold shared_test_env_lock across await to serialize AGENTDESK_ROOT_DIR against parallel tests (all test-only, SAFETY-commented). # +1 (#4091 r5): tui_prompt_relay runtime-binding test holds tui_prompt_dedupe::TEST_LOCK across await to serialize shared dedupe-map resets against parallel tests (test-only, SAFETY comment at site). # +1 (#4068): mailbox snapshot peek-only test holds lock_test_env() guard across await to serialize AGENTDESK_ROOT_DIR
+BASELINE = 34
 
 ALLOW_RE = re.compile(r"#\[allow\([^)]*\bclippy::await_holding_lock\b")
 

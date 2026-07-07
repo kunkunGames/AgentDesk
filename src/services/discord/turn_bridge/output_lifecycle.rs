@@ -22,7 +22,10 @@ pub(super) fn classify_bridge_output_owner(
 
 impl BridgeOutputOwner {
     pub(super) fn skips_bridge_spinner_cleanup(self) -> bool {
-        matches!(self, BridgeOutputOwner::WatcherRelay)
+        matches!(
+            self,
+            BridgeOutputOwner::WatcherRelay | BridgeOutputOwner::StandbyRelay
+        )
     }
 }
 
@@ -58,8 +61,8 @@ mod tests {
         let owner = classify_bridge_output_owner(true, false).expect("standby owner");
         assert_eq!(owner, BridgeOutputOwner::StandbyRelay);
         assert!(
-            !owner.skips_bridge_spinner_cleanup(),
-            "standby relay does not commit reactions, so bridge must clean the spinner"
+            owner.skips_bridge_spinner_cleanup(),
+            "standby relay owns visible output delivery"
         );
     }
 

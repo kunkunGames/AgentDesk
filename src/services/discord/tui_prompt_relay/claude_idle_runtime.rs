@@ -138,25 +138,25 @@ pub(super) fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             &transcript_path,
                             line_end_offset,
                         );
-                        if !claude_idle_prompt_observation_should_tail_response(observation) {
-                            continue;
-                        }
-                        // #3305/#4033/#4082: use the same injected-prompt decision
-                        // that renders the observer note before selecting an
-                        // external owner. Local-only slash echoes and neutral compact
-                        // continuation records never start a model turn, so they must
-                        // not wait for / create a TUI-direct synthetic inflight.
-                        let relay_prompt_decision =
-                            relay_observed_prompt_injected_prompt_decision(&prompt);
-                        if !relay_prompt_decision.starts_external_turn_lifecycle() {
+                        // #3305: a LOCAL-completing pass-through command's
+                        // `<command-*>` transcript echo (/effort /compact /cost
+                        // /context) never starts a model turn, so do NOT select an
+                        // external turn owner / wait for a synthetic claim / spawn a
+                        // response tail for it. Skipping here (after advancing the
+                        // offset so it is not re-scanned) keeps the inflight table
+                        // empty so the next injection is not FOREIGN-ABORTed; the
+                        // broadcast relay still posts the kind-only guidance note. A
+                        // /loop echo is off the allow-list and keeps full lifecycle.
+                        if is_local_only_slash_command_prompt(&prompt) {
                             tracing::info!(
                                 tmux_session_name = %tmux_session_name,
                                 channel_id = channel_id.get(),
-                                injected_class = ?relay_prompt_decision.injected_class,
-                                slash_command_kind = relay_prompt_decision.slash_command_kind.as_deref().unwrap_or(""),
-                                local_only_slash = relay_prompt_decision.local_only_slash,
-                                "Claude idle transcript relay skipped injected prompt with no external-turn lifecycle (no external turn owner / synthetic claim / response tail)"
+                                slash_command_kind = %slash_command_control_kind(&prompt),
+                                "Claude idle transcript relay skipped local-only pass-through slash command (no external turn owner / synthetic claim / response tail)"
                             );
+                            continue;
+                        }
+                        if !claude_idle_prompt_observation_should_tail_response(observation) {
                             continue;
                         }
                         let lease = record_external_turn_lease_for_output(
@@ -440,11 +440,6 @@ pub(super) fn resolved_claude_idle_relay_transcript_path(
             &transcript_path,
             resolved_session_id,
         );
-    } else if transcript_recent_enough_for_binding_refresh(&transcript_path) {
-        crate::services::tui_prompt_dedupe::refresh_tmux_runtime_binding_activity(
-            tmux_session_name,
-            &binding.output_path,
-        );
     }
     Some(transcript_path)
 }
@@ -473,8 +468,8 @@ pub(super) fn resolve_idle_relay_transcript(
         return Some(transcript_path);
     }
 
-    // #2843 (codex P0): a relay-live watcher may suppress the idle tail ONLY
-    // when the watcher itself is tailing the freshest transcript. Comparing the
+    // #2843 (codex P0): a non-stale watcher may suppress the idle tail ONLY when
+    // the watcher itself is tailing the freshest transcript. Comparing the
     // runtime binding's path is wrong — re-registering the binding does not
     // retarget the running watcher, so the binding can be fresh while the
     // watcher still tails a stale/missing file (then the idle tail would be
@@ -482,8 +477,8 @@ pub(super) fn resolve_idle_relay_transcript(
     // output path.
     let watcher_covers_current_transcript = shared
         .tmux_watchers
-        .tmux_session_live_for_relay(tmux_session_name)
-        .is_some_and(|live| live)
+        .tmux_session_is_stale(tmux_session_name)
+        .is_some_and(|stale| !stale)
         && transcript_path.exists()
         && shared
             .tmux_watchers
@@ -494,59 +489,6 @@ pub(super) fn resolve_idle_relay_transcript(
     }
 
     Some(transcript_path)
-}
-
-#[cfg(unix)]
-fn transcript_recent_enough_for_binding_refresh(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    let age = std::time::SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or_default();
-    age.as_secs()
-        < u64::try_from(crate::services::tui_turn_state::STALE_USER_SUBMITTED_RECLAIM_SECS)
-            .unwrap_or(0)
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transcript_binding_refresh_requires_recent_activity() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let transcript_path = tmp.path().join("claude.jsonl");
-        std::fs::write(&transcript_path, b"old transcript\n").expect("write transcript");
-        filetime::set_file_mtime(
-            &transcript_path,
-            filetime::FileTime::from_system_time(
-                std::time::SystemTime::now()
-                    - std::time::Duration::from_secs(
-                        crate::services::tui_turn_state::STALE_USER_SUBMITTED_RECLAIM_SECS as u64
-                            + 1,
-                    ),
-            ),
-        )
-        .expect("set stale transcript mtime");
-
-        assert!(
-            !transcript_recent_enough_for_binding_refresh(&transcript_path),
-            "a dead-but-existing Claude transcript must not refresh binding TTL"
-        );
-
-        filetime::set_file_mtime(
-            &transcript_path,
-            filetime::FileTime::from_system_time(std::time::SystemTime::now()),
-        )
-        .expect("set fresh transcript mtime");
-        assert!(transcript_recent_enough_for_binding_refresh(
-            &transcript_path
-        ));
-    }
 }
 
 #[cfg(unix)]
