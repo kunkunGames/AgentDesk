@@ -10,6 +10,7 @@ from scripts.analyze_prs import (
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
+    is_unrelated_inventory_file,
 )
 
 
@@ -367,6 +368,23 @@ Update analyzer hygiene checks to match the current template.
 """
 
         self.assertFalse(has_template_summary(body))
+
+
+class PrAnalyzerInventoryRefreshTests(unittest.TestCase):
+    def test_allowed_inventory_files_are_not_flagged(self):
+        self.assertFalse(is_unrelated_inventory_file("TEST_PLAN.md"))
+        self.assertFalse(is_unrelated_inventory_file("scripts/generate_inventory_docs.py"))
+        self.assertFalse(is_unrelated_inventory_file(".github/workflows/ci-pr.yml"))
+        self.assertFalse(is_unrelated_inventory_file("scripts/audit_allowlist.toml"))
+        self.assertFalse(is_unrelated_inventory_file("scripts/giant_file_registry.toml"))
+        self.assertFalse(is_unrelated_inventory_file("docs/generated/module-inventory.md"))
+        self.assertFalse(is_unrelated_inventory_file("docs/generated/route-inventory.md"))
+
+    def test_unrelated_source_and_workflow_files_are_flagged(self):
+        self.assertTrue(is_unrelated_inventory_file("src/main.rs"))
+        self.assertTrue(is_unrelated_inventory_file(".github/workflows/release.yml"))
+        self.assertTrue(is_unrelated_inventory_file("package.json"))
+        self.assertTrue(is_unrelated_inventory_file("scripts/analyze_prs.py"))
 
 
 class PrAnalyzerScratchPathTests(unittest.TestCase):

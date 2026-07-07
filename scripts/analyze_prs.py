@@ -178,6 +178,22 @@ def has_overlap_reference(body):
 def has_template_summary(body):
     return has_non_empty_body_field(body, ["summary"], stop_at_field_labels=False)
 
+def is_unrelated_inventory_file(path):
+    if not path:
+        return False
+    allowed = {
+        "TEST_PLAN.md",
+        "scripts/generate_inventory_docs.py",
+        ".github/workflows/ci-pr.yml",
+        "scripts/audit_allowlist.toml",
+        "scripts/giant_file_registry.toml",
+    }
+    if path in allowed:
+        return False
+    if path.startswith("docs/generated/"):
+        return False
+    return True
+
 def is_scratch_file_path(path):
     if not path or "/" in path:
         return False
@@ -314,6 +330,14 @@ def main():
             inventory_refresh_count += 1
             if not has_duplicate_guard_ack(body):
                 print("  [!] MISSING DUPLICATE PR GUARD: Inventory refresh PR body lacks a completed duplicate-pr guard acknowledgement.")
+            if files_data.get("files") is not None:
+                unrelated_files = []
+                for f in files_data["files"]:
+                    path = f.get("path", "")
+                    if is_unrelated_inventory_file(path):
+                        unrelated_files.append(path)
+                if unrelated_files:
+                    print(f"  [!] UNRELATED FILES IN INVENTORY REFRESH: Cartographer-Lite/Redline inventory refresh PRs must not include unrelated source, stale workflow changes, or old broad-branch baggage. Found: {', '.join(unrelated_files)}")
 
     if inventory_refresh_count > 1:
         print("\n[!] WARNING: Multiple open inventory refresh PRs detected. Ensure strict duplicate-PR guard is followed.")
