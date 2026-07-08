@@ -46,7 +46,7 @@
 | Path | Prod |
 | --- | ---: |
 | `src/cli/client.rs` | 2378 |
-| `src/cli/dcserver.rs` | 1633 |
+| `src/cli/dcserver.rs` | 1631 |
 | `src/cli/direct.rs` | 1812 |
 | `src/cli/doctor/orchestrator.rs` | 4381 |
 | `src/cli/init.rs` | 1444 |

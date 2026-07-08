@@ -57,7 +57,7 @@
 | `cli` | `src/cli/mod.rs` | 21 | 21 | 0 |  |
 | `cli::args` | `src/cli/args.rs` | 1037 | 969 | 68 |  |
 | `cli::client` | `src/cli/client.rs` | 2563 | 2378 | 185 | giant-file |
-| `cli::dcserver` | `src/cli/dcserver.rs` | 1633 | 1633 | 0 | giant-file |
+| `cli::dcserver` | `src/cli/dcserver.rs` | 1631 | 1631 | 0 | giant-file |
 | `cli::direct` | `src/cli/direct.rs` | 1812 | 1812 | 0 | giant-file |
 | `cli::discord` | `src/cli/discord.rs` | 123 | 123 | 0 |  |
 | `cli::doctor` | `src/cli/doctor.rs` | 9 | 9 | 0 |  |
@@ -380,7 +380,7 @@
 | `services::claude_tui::tui_relay` | `src/services/claude_tui/tui_relay.rs` | 1129 | 587 | 542 |  |
 | `services::cluster` | `src/services/cluster/mod.rs` | 32 | 32 | 0 |  |
 | `services::cluster::capability_routing` | `src/services/cluster/capability_routing.rs` | 261 | 261 | 0 |  |
-| `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 1258 | 627 | 631 |  |
+| `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 1312 | 632 | 680 |  |
 | `services::cluster::intake_routing` | `src/services/cluster/intake_routing.rs` | 351 | 149 | 202 |  |
 | `services::cluster::intake_worker` | `src/services/cluster/intake_worker.rs` | 417 | 336 | 81 |  |
 | `services::cluster::intake_worker_capabilities` | `src/services/cluster/intake_worker_capabilities.rs` | 83 | 83 | 0 |  |
