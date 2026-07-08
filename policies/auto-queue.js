@@ -349,11 +349,16 @@ var autoQueue = {
       }
       var gateContext = {};
       var gateResult = {};
-      if (gateDispatch.context && gateDispatch.context !== "{}" && gateDispatch.context !== "[]") {
-        try { gateContext = JSON.parse(gateDispatch.context); } catch (e) { gateContext = {}; }
-      }
-      if (gateDispatch.result && gateDispatch.result !== "{}" && gateDispatch.result !== "[]") {
-        try { gateResult = JSON.parse(gateDispatch.result); } catch (e) { gateResult = {}; }
+      if (gateDispatch.id === dispatch.id) {
+        gateContext = context;
+        gateResult = result;
+      } else {
+        if (gateDispatch.context && gateDispatch.context !== "{}" && gateDispatch.context !== "[]") {
+          try { gateContext = JSON.parse(gateDispatch.context); } catch (e) { gateContext = {}; }
+        }
+        if (gateDispatch.result && gateDispatch.result !== "{}" && gateDispatch.result !== "[]") {
+          try { gateResult = JSON.parse(gateDispatch.result); } catch (e) { gateResult = {}; }
+        }
       }
       var expectedVerdict = (gateContext.phase_gate && gateContext.phase_gate.pass_verdict) || "phase_gate_passed";
       var gateVerdict = gateResult.verdict || gateResult.decision || gateResult.phase_gate_verdict || null;
