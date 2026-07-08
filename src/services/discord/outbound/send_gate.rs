@@ -396,6 +396,7 @@ impl SendCallerClass {
             "merge-automation",
             "lifecycle_notifier",
             "routine-runtime",
+            "scheduled_message",
             "headless_turn",
             "slo_alerter",
             "quality_regression_alerter",
@@ -444,6 +445,7 @@ mod send_source_tests {
         assert!(is_allowed_send_source("headless_turn"));
         assert!(is_allowed_send_source("lifecycle_notifier"));
         assert!(is_allowed_send_source("routine-runtime"));
+        assert!(is_allowed_send_source("scheduled_message"));
         assert!(is_allowed_send_source("slo_alerter"));
         assert!(is_allowed_send_source("quality_regression_alerter"));
         assert!(is_allowed_send_source("auto-queue-monitor"));

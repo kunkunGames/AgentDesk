@@ -142,8 +142,10 @@ pub async fn fire_claimed(
         return;
     }
 
+    // Compare against the claim time, not the fire slot: a worker that wakes
+    // up late must not deliver a message whose expiry has already passed.
     if let Some(expires_at) = message.expires_at {
-        if expires_at <= fire.fire_scheduled_at {
+        if expires_at <= now {
             if let Err(error) = db::mark_expired_pg(pool, &message.id, &fire.delivery_id).await {
                 tracing::warn!(id = message.id, "[smsg] expire transition failed: {error}");
             }
@@ -364,17 +366,12 @@ pub(crate) fn build_agent_prompt(message: &ScheduledMessageRow) -> String {
 /// when the delivery transitioned.
 async fn poll_agent_delivery(pool: &PgPool, delivery: RunningAgentDelivery) -> bool {
     let Some(turn_id) = delivery.turn_id.as_deref() else {
-        // Crash window between arming and recording the turn id: no turn to
-        // watch, so rewind for the bounded re-arm path.
-        interrupt_delivery(
-            pool,
-            &delivery.delivery_id,
-            &delivery.scheduled_message_id,
-            delivery.scheduled_at,
-            "agent delivery has no recorded turn",
-        )
-        .await;
-        return true;
+        // Unreachable: the listing query only returns rows with a recorded
+        // turn_id. Never interrupt here — a missing turn id means the start
+        // call is still in flight (trigger-now fires outside the scheduler
+        // tick), and rewinding would race it into a duplicate delivery.
+        // Pre-turn crashes are owned by lease expiry recovery.
+        return false;
     };
 
     match find_turn_delivery_evidence(pool, turn_id, delivery.started_at).await {
@@ -572,19 +569,6 @@ async fn finish_and_finalize(
     now: DateTime<Utc>,
 ) {
     let message = &fire.message;
-    if let Err(db_error) = db::finish_delivery_pg(
-        pool,
-        &fire.delivery_id,
-        delivery_status,
-        error,
-        outbox_id,
-        fallback_outbox_id,
-    )
-    .await
-    {
-        tracing::warn!(id = message.id, "[smsg] delivery finish failed: {db_error}");
-        return;
-    }
     let (next, forced_terminal) = compute_resume(
         message.schedule.as_deref(),
         &message.timezone,
@@ -598,18 +582,24 @@ async fn finish_and_finalize(
         db::STATUS_FAILED
     });
     let next = forced_terminal.is_none().then_some(next).flatten();
-    if let Err(db_error) = db::finalize_parent_pg(
+    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
         pool,
-        &message.id,
         &fire.delivery_id,
+        delivery_status,
+        error,
+        outbox_id,
+        fallback_outbox_id,
+        &message.id,
         fired,
         terminal_status,
-        error,
         next,
     )
     .await
     {
-        tracing::warn!(id = message.id, "[smsg] parent finalize failed: {db_error}");
+        tracing::warn!(
+            id = message.id,
+            "[smsg] delivery finalize failed: {db_error}"
+        );
     }
 }
 
@@ -621,22 +611,6 @@ async fn finalize_agent_delivery(
     fallback_outbox_id: Option<i64>,
     fired: bool,
 ) {
-    if let Err(db_error) = db::finish_delivery_pg(
-        pool,
-        &delivery.delivery_id,
-        delivery_status,
-        error,
-        None,
-        fallback_outbox_id,
-    )
-    .await
-    {
-        tracing::warn!(
-            delivery_id = delivery.delivery_id,
-            "[smsg] delivery finish failed: {db_error}"
-        );
-        return;
-    }
     let now = Utc::now();
     let (next, forced_terminal) = compute_resume(
         delivery.schedule.as_deref(),
@@ -651,20 +625,23 @@ async fn finalize_agent_delivery(
         db::STATUS_FAILED
     });
     let next = forced_terminal.is_none().then_some(next).flatten();
-    if let Err(db_error) = db::finalize_parent_pg(
+    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
         pool,
-        &delivery.scheduled_message_id,
         &delivery.delivery_id,
+        delivery_status,
+        error,
+        None,
+        fallback_outbox_id,
+        &delivery.scheduled_message_id,
         fired,
         terminal_status,
-        error,
         next,
     )
     .await
     {
         tracing::warn!(
             id = delivery.scheduled_message_id,
-            "[smsg] parent finalize failed: {db_error}"
+            "[smsg] delivery finalize failed: {db_error}"
         );
     }
 }
@@ -689,13 +666,12 @@ async fn interrupt_delivery(
     fire_scheduled_at: DateTime<Utc>,
     error: &str,
 ) {
-    if let Err(db_error) = db::finish_delivery_pg(
+    if let Err(db_error) = db::interrupt_delivery_and_rewind_pg(
         pool,
         delivery_id,
-        db::DELIVERY_INTERRUPTED,
-        Some(error),
-        None,
-        None,
+        message_id,
+        fire_scheduled_at,
+        error,
     )
     .await
     {
@@ -703,22 +679,6 @@ async fn interrupt_delivery(
             id = message_id,
             "[smsg] interrupt transition failed: {db_error}"
         );
-        return;
-    }
-    if let Err(db_error) = sqlx::query(
-        "UPDATE scheduled_messages
-         SET status = 'scheduled', scheduled_at = $3,
-             in_flight_delivery_id = NULL, last_error = $4, updated_at = NOW()
-         WHERE id = $1 AND in_flight_delivery_id = $2 AND status = 'firing'",
-    )
-    .bind(message_id)
-    .bind(delivery_id)
-    .bind(fire_scheduled_at)
-    .bind(error)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(id = message_id, "[smsg] parent rewind failed: {db_error}");
     }
 }
 

@@ -601,10 +601,11 @@ pub async fn trigger_now_pg(
 
 // ── Delivery + parent state transitions (worker) ────────────────────────────
 
-/// Terminal transition for a delivery row. No-op when the row already left
-/// `running` (stale lease double-completion guard, message_outbox pattern).
-pub async fn finish_delivery_pg(
-    pool: &PgPool,
+/// Terminal transition for a delivery row inside a caller-owned transaction.
+/// No-op when the row already left `running` (stale lease double-completion
+/// guard, message_outbox pattern). Returns whether the row transitioned.
+async fn finish_delivery_tx(
+    tx: &mut Transaction<'_, Postgres>,
     delivery_id: &str,
     status: &str,
     error: Option<&str>,
@@ -624,9 +625,93 @@ pub async fn finish_delivery_pg(
     .bind(error)
     .bind(outbox_id)
     .bind(fallback_outbox_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(updated.rows_affected() > 0)
+}
+
+/// Atomically finish a delivery and finalize its parent in one transaction, so
+/// a crash between the two writes can never strand the parent in `firing` with
+/// a terminal in-flight delivery. When the delivery already left `running`
+/// (another node completed it), the parent is left untouched and `false` is
+/// returned. `next_scheduled_at` present → recurring: re-arm for that slot;
+/// otherwise the parent lands on `terminal_status`.
+#[allow(clippy::too_many_arguments)]
+pub async fn finish_delivery_and_finalize_parent_pg(
+    pool: &PgPool,
+    delivery_id: &str,
+    delivery_status: &str,
+    error: Option<&str>,
+    outbox_id: Option<i64>,
+    fallback_outbox_id: Option<i64>,
+    message_id: &str,
+    fired: bool,
+    terminal_status: &str,
+    next_scheduled_at: Option<DateTime<Utc>>,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !finish_delivery_tx(
+        &mut tx,
+        delivery_id,
+        delivery_status,
+        error,
+        outbox_id,
+        fallback_outbox_id,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    finalize_parent_tx(
+        &mut tx,
+        message_id,
+        delivery_id,
+        fired,
+        terminal_status,
+        error,
+        next_scheduled_at,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Atomically mark a delivery `interrupted` and rewind its parent to the fire
+/// slot so the due scan re-arms it (bounded by the claim-time retry cap).
+pub async fn interrupt_delivery_and_rewind_pg(
+    pool: &PgPool,
+    delivery_id: &str,
+    message_id: &str,
+    fire_scheduled_at: DateTime<Utc>,
+    error: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !finish_delivery_tx(
+        &mut tx,
+        delivery_id,
+        DELIVERY_INTERRUPTED,
+        Some(error),
+        None,
+        None,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE scheduled_messages
+         SET status = 'scheduled', scheduled_at = $3,
+             in_flight_delivery_id = NULL, last_error = $4, updated_at = NOW()
+         WHERE id = $1 AND in_flight_delivery_id = $2 AND status = 'firing'",
+    )
+    .bind(message_id)
+    .bind(delivery_id)
+    .bind(fire_scheduled_at)
+    .bind(error)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn mark_delivery_agent_turn_started_pg(
@@ -648,8 +733,8 @@ pub async fn mark_delivery_agent_turn_started_pg(
 
 /// Close out the parent after its in-flight delivery reached a terminal state.
 /// `next_scheduled_at` present → recurring: re-arm for the next slot.
-pub async fn finalize_parent_pg(
-    pool: &PgPool,
+async fn finalize_parent_tx(
+    tx: &mut Transaction<'_, Postgres>,
     message_id: &str,
     delivery_id: &str,
     fired: bool,
@@ -673,7 +758,7 @@ pub async fn finalize_parent_pg(
             .bind(next)
             .bind(fired)
             .bind(last_error)
-            .execute(pool)
+            .execute(&mut **tx)
             .await?;
         }
         None => {
@@ -690,7 +775,7 @@ pub async fn finalize_parent_pg(
             .bind(terminal_status)
             .bind(fired)
             .bind(last_error)
-            .execute(pool)
+            .execute(&mut **tx)
             .await?;
         }
     }
@@ -702,23 +787,32 @@ pub async fn mark_expired_pg(
     message_id: &str,
     delivery_id: &str,
 ) -> Result<(), sqlx::Error> {
-    finish_delivery_pg(
-        pool,
+    let mut tx = pool.begin().await?;
+    // Stale double-completion guard: when the delivery already left `running`
+    // (a lease-recovered peer re-armed and finished this slot), that peer owns
+    // the parent's final state — don't overwrite it with 'expired'.
+    if !finish_delivery_tx(
+        &mut tx,
         delivery_id,
         DELIVERY_INTERRUPTED,
         Some("definition expired before firing"),
         None,
         None,
     )
-    .await?;
+    .await?
+    {
+        return Ok(());
+    }
     sqlx::query(
         "UPDATE scheduled_messages
          SET status = 'expired', in_flight_delivery_id = NULL, updated_at = NOW()
-         WHERE id = $1",
+         WHERE id = $1 AND in_flight_delivery_id = $2",
     )
     .bind(message_id)
-    .execute(pool)
+    .bind(delivery_id)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -726,6 +820,12 @@ pub async fn mark_expired_pg(
 
 /// Agent-mode deliveries still awaiting transcript evidence, joined with the
 /// parent fields the poller needs. Extends the lease of everything returned.
+///
+/// Only rows with a recorded `turn_id` qualify: a running row without one is
+/// still inside `start_agent_turn` (possibly on another node — trigger-now
+/// fires outside the scheduler tick), and touching it here would both keep its
+/// lease alive forever and race the in-flight start. Pre-turn crashes are
+/// owned by lease expiry + `recover_expired_leases_pg`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RunningAgentDelivery {
     pub delivery_id: String,
@@ -756,6 +856,7 @@ pub async fn list_running_agent_deliveries_pg(
          WHERE d.id IN (
              SELECT id FROM scheduled_message_deliveries
              WHERE status = 'running' AND delivery_kind = 'agent'
+               AND turn_id IS NOT NULL
              ORDER BY created_at
              LIMIT $2
              FOR UPDATE SKIP LOCKED)
