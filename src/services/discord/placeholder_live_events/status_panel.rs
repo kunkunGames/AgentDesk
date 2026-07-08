@@ -3,9 +3,8 @@ use crate::services::provider::ProviderKind;
 
 use super::common::{
     EVENT_LINE_MAX_CHARS, STATUS_PANEL_MAX_CHARS, STATUS_PANEL_SUBAGENT_LIMIT,
-    STATUS_PANEL_TASK_LIMIT, STATUS_PANEL_TODO_LIMIT, STATUS_PANEL_WORKFLOW_LIMIT,
-    escape_status_panel_markdown, normalize_summary, sanitized_tool_name, truncate_chars,
-    truncate_chars_with_marker,
+    STATUS_PANEL_TODO_LIMIT, STATUS_PANEL_WORKFLOW_LIMIT, escape_status_panel_markdown,
+    normalize_summary, sanitized_tool_name, truncate_chars, truncate_chars_with_marker,
 };
 use super::completion_footer::compact_live_panel_terminal_lines;
 use super::context_panel::{ContextPanelSnapshot, render_context_panel_line};
@@ -14,7 +13,7 @@ use super::status_events::{is_schedule_wakeup_tool, parse_eta_secs};
 use super::subagent_summary::render_subagent_done_summary;
 use super::task_panel::{
     STUCK_BACKGROUND_TASK_TTL, TaskPanelSnapshot, TaskToolSlot, finish_background_task_tool_slot,
-    force_abort_stuck_background_task_slots, render_task_panel_line, render_task_tool_slot,
+    force_abort_stuck_background_task_slots, render_live_tasks_section, render_task_panel_line,
     take_slot_ordinal, task_tool_slot_is_unfinished_background, upsert_background_task_tool_slot,
     upsert_task_tool_slot,
 };
@@ -590,16 +589,10 @@ pub(super) fn render_status_panel(
 
     // #3983 item 5a: the compact 🖥️ Recent + host block is removed from the footer
     // (the terminal echo is retired from the status panel entirely).
-    if !snapshot.tasks.is_empty() {
-        let lines = snapshot
-            .tasks
-            .iter()
-            .rev()
-            .take(STATUS_PANEL_TASK_LIMIT)
-            .map(render_task_tool_slot)
-            .collect::<Vec<_>>();
-        let lines = compact_live_panel_terminal_lines(&lines).map_or(lines, |(out, _)| out); // #3404 cap
-        sections.push(format!("Tasks\n{}", lines.join("\n")));
+    // #4093: the in-progress-only Tasks section (filter + #3404 compaction +
+    // empty-section guard) lives in `task_panel::render_live_tasks_section`.
+    if let Some(section) = render_live_tasks_section(&snapshot.tasks) {
+        sections.push(section);
     }
 
     if !matches!(provider, ProviderKind::Codex) && !snapshot.subagents.is_empty() {
