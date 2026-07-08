@@ -25,8 +25,6 @@
 - Agent:
 - Boundary:
 - Primary files:
-- Public API impact:
-- Docs impact:
 - Verification commands and results:
 - Skipped checks with reasons:
 - Risk:

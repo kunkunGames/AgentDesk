@@ -243,10 +243,6 @@ def main():
             print("  [!] MISSING BOUNDARY: PR body lacks the required 'Boundary' field.")
         if not has_non_empty_body_field(body, ["primary files"]):
             print("  [!] MISSING PRIMARY FILES: PR body lacks the required 'Primary files' field.")
-        if not has_non_empty_body_field(body, ["public api impact"], allow_none=True):
-            print("  [!] MISSING PUBLIC API IMPACT: PR body lacks the required 'Public API impact' field.")
-        if not has_non_empty_body_field(body, ["docs impact"], allow_none=True):
-            print("  [!] MISSING DOCS IMPACT: PR body lacks the required 'Docs impact' field.")
         if not has_non_empty_body_field(body, ["queue hygiene invariant"]):
             print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
         if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"]):
