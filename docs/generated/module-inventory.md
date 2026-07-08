@@ -187,7 +187,7 @@
 | `kanban::hooks` | `src/kanban/hooks.rs` | 347 | 347 | 0 |  |
 | `kanban::review_tuning` | `src/kanban/review_tuning.rs` | 242 | 242 | 0 |  |
 | `kanban::state_machine` | `src/kanban/state_machine.rs` | 64 | 64 | 0 |  |
-| `kanban::terminal_cleanup` | `src/kanban/terminal_cleanup.rs` | 417 | 369 | 48 |  |
+| `kanban::terminal_cleanup` | `src/kanban/terminal_cleanup.rs` | 368 | 368 | 0 |  |
 | `kanban::transition_cleanup` | `src/kanban/transition_cleanup.rs` | 341 | 341 | 0 |  |
 | `kanban::transition_core` | `src/kanban/transition_core.rs` | 674 | 674 | 0 |  |
 | `launch` | `src/launch.rs` | 67 | 67 | 0 |  |
