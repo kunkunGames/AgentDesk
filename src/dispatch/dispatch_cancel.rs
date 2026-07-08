@@ -276,7 +276,7 @@ async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx_inner(
     .bind(&kanban_card_id)
     .bind(&dispatch_type)
     .bind(&current_status)
-    .bind(cancel_payload.clone())
+    .bind(cancel_payload.as_ref())
     .execute(&mut **tx)
     .await;
 
