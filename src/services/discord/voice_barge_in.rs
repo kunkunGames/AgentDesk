@@ -2878,8 +2878,13 @@ fn transcript_dirs_from_config(config: &VoiceConfig) -> Vec<PathBuf> {
 
 fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if raw.starts_with("~/") || raw == "~" {
-        return crate::runtime_layout::expand_user_path(&raw).unwrap_or_else(|| path.to_path_buf());
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     path.to_path_buf()
 }
