@@ -107,7 +107,7 @@ pub async fn create_scheduled_message(
         }
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("insert scheduled message: {error}"),
+            format!("create scheduled message: {error}"),
         ),
     }
 }
@@ -450,7 +450,7 @@ pub async fn patch_scheduled_message(
         ),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("update scheduled message: {error}"),
+            format!("save scheduled message: {error}"),
         ),
     }
 }
