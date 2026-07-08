@@ -290,6 +290,18 @@
   latch never needs cross-node coordination; a worker restart simply re-arms the
   channel (re-injecting at most one redundant `/compact` is harmless and idle-gated).
 
+- #4234/#4235/#4236 voice connection lifecycle registries:
+  `src/services/discord/voice_lifecycle.rs`. Three process-static singletons —
+  `lifecycle_router()` (`DashMap<provider, UnboundedSender<ReconnectRequest>>`),
+  `rejoin_inflight()` (`DashSet<(provider, guild)>`), and the pre-existing
+  `voice_occupancy()` in `commands/voice.rs` — are all **worker-local**. A guild's
+  songbird voice connection is pinned to whichever node's bot token holds it
+  (Discord allows one voice connection per bot-token per guild), so the rejoin
+  supervisor, its in-flight guard, and the occupancy desired-state map never need
+  cross-node coordination: a node only supervises the connections it itself owns.
+  The `reconnect-degraded` alert dedup reuses the existing per-process
+  `voice_notify_dedup` set, so it is likewise once-per-node, not cluster-global.
+
 ## Required Invariants
 
 ### `singleton_on_leader`
@@ -405,6 +417,24 @@
 
 ### Audited touches
 
+- #4275 watcher/jsonl segment-boundary separator: `tmux_output_stream.rs`
+  (WATCHER) `process_watcher_lines_for_turn` now guards the bare
+  `full_response.push_str(text)` for `assistant` text blocks — when the running
+  response is non-empty and `semantic_boundaries::semantic_chunk_separator_needed`
+  reports a genuine sentence boundary (not a decimal, file extension, markdown
+  continuation, open inline-code span, or — r2, folded into the shared predicate
+  via `text_ends_inside_open_code_fence` so the watcher matches the streaming
+  path's `streamed_text_inside_open_code_fence` guard — inside an open ``` code
+  fence), it inserts `"\n\n"` before appending.
+  This is the watcher-path twin of the #3608 streaming-path separator: Claude
+  interleaves prose with `tool_use`, so pre-/post-tool text arrive as two discrete
+  events that previously glued into one run-on line. The `content_block_delta`
+  intra-block streaming push (qwen `--include-partial-messages`) is deliberately
+  left a bare `push_str` so a separator never fractures a single sentence.
+  Classification: worker-local — the change only reshapes the per-node watcher's
+  in-memory `full_response` assembly before relay; it adds no new inflight-row
+  field, delivery record, PG lease, leader gate, or cross-node routing state, and
+  no DB/schema change.
 - #3805 P2 PR-D two-message rollover re-anchor: `turn_bridge/mod.rs` (SINK) and
   `tmux_watcher.rs` (WATCHER) each re-anchor the separate two-message status panel
   BELOW the new tail answer after a mid-turn answer rollover, gated on the

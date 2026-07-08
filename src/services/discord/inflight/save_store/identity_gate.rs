@@ -15,6 +15,53 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     state: &InflightTurnState,
     caller: &'static str,
 ) -> GuardedSaveOutcome {
+    save_inflight_state_identity_gated_in_root(root, state, caller, false)
+}
+
+/// #4259 PR-2a rework (codex r1): identity-guarded save that PINS the 4-field
+/// turn identity (`user_msg_id`, `started_at`, `tmux_session_name`,
+/// `turn_start_offset`) plus the restart/rebind authority and id-0 offsetless
+/// fail-closed gates of [`save_inflight_state_if_identity_unchanged`], but
+/// deliberately ALLOWS the snapshot to RESTAMP `output_path`.
+///
+/// Runtime-handoff stamps legitimately re-point the row at the output the live
+/// runtime actually writes: a warm follow-up reuses a resolved legacy `/tmp`
+/// session path that differs from the intake seed
+/// (`resolve_session_temp_path`; claude.rs/codex.rs/qwen.rs follow-up arms), so
+/// the strict `output_path` equality of the `_if_identity_unchanged` variant
+/// would refuse a legitimate same-turn stamp. Use THIS variant for
+/// runtime-handoff (re)stamp sites; it still refuses rows re-owned by another
+/// turn. The held-back blind sites in `turn_bridge/runtime_handoff_loop.rs`
+/// (RuntimeReady ProcessBackend/ClaudeEAdapter/ClaudeTui/CodexTui,
+/// ProcessReady, and the watcher-handoff helper — see
+/// `scripts/check_inflight_blind_save_ratchet.py`) are expected to convert to
+/// this variant too, once each site's identity-pinned fields (notably
+/// `tmux_session_name`, which some of them first-populate or clear) are
+/// verified stable across the stamp.
+pub(in crate::services::discord) fn save_inflight_state_if_identity_matches_allow_output_restamp(
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    save_inflight_state_if_identity_matches_allow_output_restamp_in_root(&root, state, caller)
+}
+
+pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_matches_allow_output_restamp_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> GuardedSaveOutcome {
+    save_inflight_state_identity_gated_in_root(root, state, caller, true)
+}
+
+fn save_inflight_state_identity_gated_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    caller: &'static str,
+    allow_output_restamp: bool,
+) -> GuardedSaveOutcome {
     let Some(provider) = state.provider_kind() else {
         return GuardedSaveOutcome::IoError;
     };
@@ -30,7 +77,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     let Ok(data) = fs::read_to_string(&path) else {
         tracing::debug!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?InflightTurnIdentity::from_state(state),
             "inflight identity-refresh save skipped because durable row is missing"
@@ -40,7 +87,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     let Ok(on_disk) = serde_json::from_str::<InflightTurnState>(&data) else {
         tracing::debug!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?InflightTurnIdentity::from_state(state),
             "inflight identity-refresh save skipped because durable row is malformed"
@@ -52,7 +99,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     if state.user_msg_id == 0 && state.turn_start_offset.is_none() {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -62,10 +109,10 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
         );
         return GuardedSaveOutcome::IdentityMismatch;
     }
-    if on_disk.output_path != state.output_path {
+    if !allow_output_restamp && on_disk.output_path != state.output_path {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -81,7 +128,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -102,7 +149,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
     ) {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -120,7 +167,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_identity_un
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = state.channel_id,
+                channel_id = state.channel_id,
                 caller = caller,
                 snapshot_identity = ?expected,
                 error = %error,
@@ -176,7 +223,7 @@ pub(in crate::services::discord::inflight) fn patch_restart_full_response_if_ide
     if state.user_msg_id == 0 && state.turn_start_offset.is_none() {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -193,7 +240,7 @@ pub(in crate::services::discord::inflight) fn patch_restart_full_response_if_ide
     {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             snapshot_identity = ?expected,
             durable_identity = ?durable,
@@ -215,7 +262,7 @@ pub(in crate::services::discord::inflight) fn patch_restart_full_response_if_ide
     {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             response_sent_offset = response_sent_offset,
             full_response_len = state.full_response.len(),
@@ -229,7 +276,7 @@ pub(in crate::services::discord::inflight) fn patch_restart_full_response_if_ide
     {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             caller = caller,
             response_sent_offset = response_sent_offset,
             raw_full_response_len = on_disk.full_response.len(),
@@ -250,7 +297,7 @@ pub(in crate::services::discord::inflight) fn patch_restart_full_response_if_ide
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = state.channel_id,
+                channel_id = state.channel_id,
                 caller = caller,
                 error = %error,
                 "restart-preserved full_response patch failed; leaving durable row untouched"
@@ -399,7 +446,7 @@ pub(in crate::services::discord) fn bind_recovery_anchor_if_matches_identity(
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = channel_id,
+                channel_id,
                 error = %error,
                 "inflight recovery anchor bind could not read on-disk row; blocking durable anchor write"
             );
@@ -428,7 +475,7 @@ pub(in crate::services::discord) fn bind_recovery_anchor_if_matches_identity(
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = channel_id,
+                channel_id,
                 error = %error,
                 "inflight recovery anchor bind failed; leaving on-disk row untouched"
             );
@@ -500,7 +547,7 @@ pub(in crate::services::discord::inflight) fn persist_leak_recovery_response_off
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = channel_id,
+                channel_id,
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "leak recovery offset patch failed; leaving on-disk row untouched"
@@ -562,7 +609,7 @@ pub(in crate::services::discord::inflight) fn persist_recovery_output_path_if_ma
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = channel_id,
+                channel_id,
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "recovery output-path patch failed; leaving on-disk row untouched"
@@ -742,7 +789,7 @@ fn save_existing_inflight_rebind_adoption_impl_in_root(
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = state.channel_id,
+                channel_id = state.channel_id,
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "existing inflight rebind adoption save failed; leaving on-disk row untouched"
@@ -800,7 +847,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_matches_ide
     if on_disk.output_path != state.output_path {
         tracing::info!(
             provider = %provider.as_str(),
-            channel = state.channel_id,
+            channel_id = state.channel_id,
             snapshot_identity = ?expected,
             durable_identity = ?InflightTurnIdentity::from_state(&on_disk),
             snapshot_output_path = ?state.output_path.as_deref(),
@@ -831,7 +878,7 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_matches_ide
         Err(error) => {
             tracing::warn!(
                 provider = %provider.as_str(),
-                channel = state.channel_id,
+                channel_id = state.channel_id,
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "inflight identity-guarded save failed; leaving on-disk row untouched"

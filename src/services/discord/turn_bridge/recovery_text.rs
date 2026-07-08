@@ -29,11 +29,7 @@ fn direct_runtime_context_unavailable(error: &str) -> bool {
         || error.contains("direct runtime pg context is unavailable")
 }
 
-fn store_session_retry_context_pg(
-    pg_pool: &sqlx::PgPool,
-    key: &str,
-    history: &str,
-) -> Result<(), String> {
+fn store_kv_meta_value_pg(pg_pool: &sqlx::PgPool, key: &str, history: &str) -> Result<(), String> {
     let key = key.to_string();
     let history = history.to_string();
     crate::utils::async_bridge::block_on_pg_result(
@@ -80,18 +76,18 @@ fn insert_recovery_audit_pg(
     )
 }
 
-fn take_session_retry_context_pg(pg_pool: &sqlx::PgPool, key: &str) -> Option<String> {
+fn take_kv_meta_value_pg(pg_pool: &sqlx::PgPool, key: &str) -> Option<String> {
     let key = key.to_string();
     crate::utils::async_bridge::block_on_pg_result(
         pg_pool,
-        move |pool| async move { take_session_retry_context_pg_async(&pool, &key).await },
+        move |pool| async move { take_kv_meta_value_pg_async(&pool, &key).await },
         |message| message,
     )
     .ok()
     .flatten()
 }
 
-async fn take_session_retry_context_pg_async(
+async fn take_kv_meta_value_pg_async(
     pool: &sqlx::PgPool,
     key: &str,
 ) -> Result<Option<String>, String> {
@@ -125,7 +121,7 @@ async fn take_session_retry_context_pg_async(
     }))
 }
 
-fn take_session_retry_context_runtime_pg(key: &str) -> Option<String> {
+fn take_kv_meta_value_runtime_pg(key: &str) -> Option<String> {
     let key = key.to_string();
     crate::utils::async_bridge::block_on_result(
         async move {
@@ -135,7 +131,7 @@ fn take_session_retry_context_runtime_pg(key: &str) -> Option<String> {
                 return Ok(None);
             };
 
-            take_session_retry_context_pg_async(&pool, &key).await
+            take_kv_meta_value_pg_async(&pool, &key).await
         },
         |message| message,
     )
@@ -158,7 +154,7 @@ fn store_session_retry_context_kv_only(
         Ok(()) => Ok(()),
         Err(err) if direct_runtime_context_unavailable(&err) => {
             if let Some(pg_pool) = pg_pool {
-                store_session_retry_context_pg(pg_pool, &key, history)
+                store_kv_meta_value_pg(pg_pool, &key, history)
             } else {
                 Err(err)
             }
@@ -256,8 +252,8 @@ pub(in crate::services::discord) fn take_session_retry_context_for_turn_with_aud
         }
         Ok(None) => None,
         Err(err) if direct_runtime_context_unavailable(&err) => pg_pool
-            .and_then(|pg_pool| take_session_retry_context_pg(pg_pool, &key))
-            .or_else(|| take_session_retry_context_runtime_pg(&key)),
+            .and_then(|pg_pool| take_kv_meta_value_pg(pg_pool, &key))
+            .or_else(|| take_kv_meta_value_runtime_pg(&key)),
         Err(_) => None,
     };
 
@@ -278,6 +274,94 @@ pub(in crate::services::discord) fn take_session_retry_context_for_turn_with_aud
         raw_context: history,
         audit_record,
     })
+}
+
+// ---------------------------------------------------------------------------
+// #4307 PR-B: voluntary tool_feedback reminder stash → next-turn injection.
+//
+// The reminder is generated at turn end in `completion_postlude.rs` (when a
+// turn ran `recall` but skipped the voluntary `tool_feedback`). Turn N stashes
+// it here; turn N+1's intake takes it and injects it into the next prompt.
+// Same kv_meta storage layer (`internal_api::set_kv_value` with a direct-PG
+// fallback) and the same one-shot take/put-back contract as the session-retry
+// recovery context above — reusing the generic `*_kv_meta_value_pg` helpers —
+// but a distinct key so the two channels are independent (a turn may stash a
+// reminder without a retry context, and vice versa). No recovery-audit row:
+// reminders are lightweight and not part of the prompt-manifest sha256 chain.
+//
+// The key carries a provider axis (codex dual-review r1): on a channel shared
+// by multiple provider bots, provider B's intake must not take (or its stash
+// overwrite) provider A's reminder — the pending search_event_ids belong to
+// A's memento session. Deliberately NOT token-scoped: a token rotation would
+// orphan the stash, while the provider axis is stable across rotations.
+fn voluntary_feedback_reminder_key(provider: &ProviderKind, channel_id: u64) -> String {
+    format!(
+        "voluntary_feedback_reminder:{}:{channel_id}",
+        provider.as_str()
+    )
+}
+
+pub(in crate::services::discord) fn store_voluntary_feedback_reminder(
+    pg_pool: Option<&sqlx::PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    reminder: &str,
+) -> Result<(), String> {
+    let reminder = reminder.trim();
+    if reminder.is_empty() {
+        return Ok(());
+    }
+
+    let key = voluntary_feedback_reminder_key(provider, channel_id);
+    match super::super::internal_api::set_kv_value(&key, reminder) {
+        Ok(()) => Ok(()),
+        Err(err) if direct_runtime_context_unavailable(&err) => {
+            if let Some(pg_pool) = pg_pool {
+                store_kv_meta_value_pg(pg_pool, &key, reminder)
+            } else {
+                Err(err)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// One-shot take: reads and deletes the stashed reminder so it is injected into
+/// exactly one turn (no duplicate injection on turn N+2 unless a fresh reminder
+/// is stashed). Mirrors `take_session_retry_context_for_turn_with_audit`'s
+/// KV-then-PG-fallback take, minus the audit stamping.
+pub(in crate::services::discord) fn take_voluntary_feedback_reminder(
+    pg_pool: Option<&sqlx::PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<String> {
+    let key = voluntary_feedback_reminder_key(provider, channel_id);
+    let reminder = match super::super::internal_api::take_kv_value(&key) {
+        Ok(Some(reminder)) => Some(reminder),
+        Ok(None) => None,
+        Err(err) if direct_runtime_context_unavailable(&err) => pg_pool
+            .and_then(|pg_pool| take_kv_meta_value_pg(pg_pool, &key))
+            .or_else(|| take_kv_meta_value_runtime_pg(&key)),
+        Err(_) => None,
+    }?;
+    let reminder = reminder.trim().to_string();
+    if reminder.is_empty() {
+        None
+    } else {
+        Some(reminder)
+    }
+}
+
+/// Put the stashed reminder back after a turn took it but failed to establish
+/// (TUI-busy enqueue refusal). Blind upsert, matching
+/// `restore_session_retry_context_after_take`'s accepted-race semantics.
+pub(in crate::services::discord) fn restore_voluntary_feedback_reminder_after_take(
+    pg_pool: Option<&sqlx::PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    reminder: &str,
+) -> Result<(), String> {
+    store_voluntary_feedback_reminder(pg_pool, provider, channel_id, reminder)
 }
 
 fn build_discord_recent_recovery_context_from_parts<'a>(
@@ -348,8 +432,9 @@ async fn emit_session_resume_failed_with_recovery(
 mod tests {
     use super::{
         build_discord_recent_recovery_context_from_parts, direct_runtime_context_unavailable,
-        restore_session_retry_context_after_take, store_session_retry_context_with_audit,
-        take_session_retry_context_for_turn_with_audit,
+        restore_session_retry_context_after_take, restore_voluntary_feedback_reminder_after_take,
+        store_session_retry_context_with_audit, store_voluntary_feedback_reminder,
+        take_session_retry_context_for_turn_with_audit, take_voluntary_feedback_reminder,
     };
 
     #[test]
@@ -442,6 +527,108 @@ mod tests {
             take_session_retry_context_for_turn_with_audit(Some(&pool), channel_id, None)
                 .expect("second take returns restored context");
         assert_eq!(second_take.raw_context, original_context);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// #4307 PR-B: the voluntary tool_feedback reminder must survive the
+    /// stash → take → put-back → take round trip (independent kv_meta key), and
+    /// a one-shot take must consume it so it is not re-injected on a later turn.
+    #[tokio::test]
+    async fn voluntary_feedback_reminder_stash_take_and_put_back_round_trips_pg() {
+        use crate::services::provider::ProviderKind;
+
+        let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
+            "agentdesk_reminder_text",
+            "recovery text voluntary feedback reminder round trip",
+        )
+        .await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        let provider = ProviderKind::Claude;
+        let channel_id = 9_000_000_000_004_307;
+        let reminder = "이번 턴 recall 2건 중 tool_feedback 0/2. 다음 search_event_ids에 대해 \
+             tool_feedback(search_event_id, relevant, sufficient)을 평가 후 턴 종료: [se-1, se-2]";
+
+        // No reminder stashed → take yields nothing.
+        assert!(
+            take_voluntary_feedback_reminder(Some(&pool), &provider, channel_id).is_none(),
+            "take without a stash must be None"
+        );
+
+        store_voluntary_feedback_reminder(Some(&pool), &provider, channel_id, reminder)
+            .expect("stash voluntary feedback reminder");
+
+        let first_take = take_voluntary_feedback_reminder(Some(&pool), &provider, channel_id)
+            .expect("first take returns the stashed reminder");
+        assert_eq!(first_take, reminder);
+
+        // One-shot: the stash is consumed by the successful take.
+        assert!(
+            take_voluntary_feedback_reminder(Some(&pool), &provider, channel_id).is_none(),
+            "reminder must be consumed by the take (no duplicate injection)"
+        );
+
+        // Put-back after a take that failed to establish a turn.
+        restore_voluntary_feedback_reminder_after_take(
+            Some(&pool),
+            &provider,
+            channel_id,
+            &first_take,
+        )
+        .expect("put the reminder back after a refused turn");
+        let second_take = take_voluntary_feedback_reminder(Some(&pool), &provider, channel_id)
+            .expect("second take returns the restored reminder");
+        assert_eq!(second_take, reminder);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// #4307 PR-B rework (codex dual-review r1): on a channel shared by
+    /// multiple provider bots, another provider's intake must neither consume
+    /// nor clobber a reminder stashed by the originating provider — the key is
+    /// provider-scoped.
+    #[tokio::test]
+    async fn voluntary_feedback_reminder_is_not_consumed_by_other_provider_pg() {
+        use crate::services::provider::ProviderKind;
+
+        let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
+            "agentdesk_reminder_xprov",
+            "recovery text voluntary feedback reminder provider scoping",
+        )
+        .await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        let claude = ProviderKind::Claude;
+        let codex = ProviderKind::Codex;
+        let channel_id = 9_000_000_000_004_308;
+        let claude_reminder = "claude pending tool_feedback: [se-claude-1]";
+        let codex_reminder = "codex pending tool_feedback: [se-codex-1]";
+
+        store_voluntary_feedback_reminder(Some(&pool), &claude, channel_id, claude_reminder)
+            .expect("stash claude reminder");
+
+        // Another provider's take on the same channel must not consume it.
+        assert!(
+            take_voluntary_feedback_reminder(Some(&pool), &codex, channel_id).is_none(),
+            "codex take must not consume claude's reminder"
+        );
+
+        // Another provider's stash must not overwrite it either.
+        store_voluntary_feedback_reminder(Some(&pool), &codex, channel_id, codex_reminder)
+            .expect("stash codex reminder");
+        assert_eq!(
+            take_voluntary_feedback_reminder(Some(&pool), &claude, channel_id).as_deref(),
+            Some(claude_reminder),
+            "claude's reminder survives the codex stash on the same channel"
+        );
+        assert_eq!(
+            take_voluntary_feedback_reminder(Some(&pool), &codex, channel_id).as_deref(),
+            Some(codex_reminder),
+            "codex's reminder is stored independently"
+        );
 
         pool.close().await;
         pg_db.drop().await;

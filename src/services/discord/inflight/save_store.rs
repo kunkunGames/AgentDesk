@@ -24,66 +24,35 @@ pub(in crate::services::discord) use self::identity_gate::{
     recovery_anchor_msg_id_if_matches_identity,
     save_existing_inflight_rebind_adoption_if_matches_identity,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
-    save_inflight_delivery_rewind_if_matches_identity, save_inflight_state_if_identity_unchanged,
-    save_inflight_state_if_matches_identity,
+    save_inflight_delivery_rewind_if_matches_identity,
+    save_inflight_state_if_identity_matches_allow_output_restamp,
+    save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
 };
 
-#[cfg(test)]
-use self::identity_gate::save_inflight_state_if_identity_unchanged_in_root;
 #[cfg(test)]
 pub(super) use self::identity_gate::{
     save_existing_inflight_rebind_adoption_if_matches_identity_in_root,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root,
     save_inflight_state_if_matches_identity_in_root,
 };
+#[cfg(test)]
+use self::identity_gate::{
+    save_inflight_state_if_identity_matches_allow_output_restamp_in_root,
+    save_inflight_state_if_identity_unchanged_in_root,
+};
 
-// Direct production callers of `save_inflight_state` remain intentionally broad
-// while #4111 narrows three RMW sites. Starting inventory for a future
-// write-API restriction, generated with `rg -n "save_inflight_state\("
-// src/services/discord` and excluding test-only surfaces: files/modules named
-// `tests.rs` / `*_tests.rs` and any `#[cfg(test)]` or `#[cfg(all(test, unix))]`
-// test modules are not production call sites. Current production inventory: 40
-// callers.
-// - src/services/discord/router/message_handler/headless_turn.rs:1071
-// - src/services/discord/router/message_handler/intake_turn.rs:2515
-// - src/services/discord/router/message_handler/provider_isolation.rs:460
-// - src/services/discord/router/message_handler/watchdog.rs:822
-// - src/services/discord/session_runtime/worktree.rs:599
-// - src/services/discord/tui_prompt_relay/codex_idle_rollout.rs:140
-// - src/services/discord/tui_prompt_relay/synthetic_start.rs:297
-// - src/services/discord/tui_prompt_relay/synthetic_start.rs:344
-// - src/services/discord/turn_bridge/mod.rs:1094
-// - src/services/discord/turn_bridge/mod.rs:1139
-// - src/services/discord/turn_bridge/mod.rs:1161
-// - src/services/discord/turn_bridge/mod.rs:1650
-// - src/services/discord/turn_bridge/mod.rs:1694
-// - src/services/discord/turn_bridge/mod.rs:2531
-// - src/services/discord/turn_bridge/mod.rs:2987
-// - src/services/discord/turn_bridge/mod.rs:3040
-// - src/services/discord/turn_bridge/mod.rs:3064
-// - src/services/discord/turn_bridge/mod.rs:3239
-// - src/services/discord/turn_bridge/mod.rs:3270
-// - src/services/discord/turn_bridge/mod.rs:3300
-// - src/services/discord/turn_bridge/mod.rs:3704
-// - src/services/discord/turn_bridge/mod.rs:3725
-// - src/services/discord/turn_bridge/mod.rs:3735
-// - src/services/discord/turn_bridge/mod.rs:3774
-// - src/services/discord/turn_bridge/mod.rs:3829
-// - src/services/discord/turn_bridge/mod.rs:3851
-// - src/services/discord/turn_bridge/mod.rs:3868
-// - src/services/discord/turn_bridge/mod.rs:3897
-// - src/services/discord/turn_bridge/mod.rs:3929
-// - src/services/discord/turn_bridge/mod.rs:4500
-// - src/services/discord/turn_bridge/mod.rs:4524
-// - src/services/discord/turn_bridge/mod.rs:4537
-// - src/services/discord/turn_bridge/mod.rs:4549
-// - src/services/discord/turn_bridge/mod.rs:5536
-// - src/services/discord/turn_bridge/mod.rs:6330
-// - src/services/discord/turn_bridge/mod.rs:6374
-// - src/services/discord/turn_bridge/retry_state.rs:328
-// - src/services/discord/turn_bridge/two_message_panel.rs:205
-// - src/services/discord/turn_bridge/watcher_handoff.rs:427
-// - src/services/discord/turn_bridge/watcher_handoff.rs:451
+/// Blind whole-blob write of `InflightTurnState`: serializes the ENTIRE row and
+/// clobbers whatever is on disk, with no compare-and-set on turn identity.
+///
+/// SEALED (#4259) — do not add new callers. A concurrent turn that legitimately
+/// re-owns the channel between a caller's snapshot and this write is silently
+/// overwritten. For any new site use the drop-in guarded variant
+/// `save_inflight_state_if_identity_unchanged` (save_store/identity_gate.rs),
+/// which refuses that race and returns a `GuardedSaveOutcome`. The remaining
+/// blind callers are tracked as a monotonically-decreasing ceiling by
+/// `scripts/check_inflight_blind_save_ratchet.py` — that ratchet is the living
+/// inventory that replaced the stale hand-maintained line-number list, and its
+/// BASELINE is lowered per track as #4259 PR-2..N convert the sites.
 pub(in crate::services::discord) fn save_inflight_state(
     state: &InflightTurnState,
 ) -> Result<(), String> {
@@ -508,6 +477,89 @@ mod tests {
             "legitimate id-0 TUI-direct turns with a turn_start_offset still own the row"
         );
         assert_eq!(persisted.response_sent_offset, state.response_sent_offset);
+    }
+
+    // #4259 PR-2a rework (codex r1): a warm follow-up runtime handoff
+    // legitimately re-points `output_path` at the resolved legacy /tmp session
+    // path — the restamp variant must accept the same-identity restamp and land
+    // the NEW path, where `_if_identity_unchanged` would decline it.
+    #[test]
+    fn output_restamp_save_persists_new_output_path_when_identity_matches() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Codex;
+        let mut state = state_with_full_response(44_090, "seeded", "AgentDesk-codex-restamp-4259");
+        save_inflight_state_in_root(temp.path(), &state).expect("seed intake-path row");
+
+        let seeded_output_path = state.output_path.clone();
+        state.output_path = Some("/tmp/legacy/AgentDesk-codex-restamp-4259.jsonl".to_string());
+        state.last_offset = 4096;
+        assert_ne!(
+            state.output_path, seeded_output_path,
+            "fixture must exercise a genuine output_path restamp"
+        );
+        assert_eq!(
+            save_inflight_state_if_identity_unchanged_in_root(
+                temp.path(),
+                &state,
+                "test::output_restamp_strict_variant_declines",
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "the strict variant must keep declining output_path drift"
+        );
+        assert_eq!(
+            save_inflight_state_if_identity_matches_allow_output_restamp_in_root(
+                temp.path(),
+                &state,
+                "test::output_restamp_saves",
+            ),
+            GuardedSaveOutcome::Saved
+        );
+
+        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(
+            persisted.output_path.as_deref(),
+            Some("/tmp/legacy/AgentDesk-codex-restamp-4259.jsonl"),
+            "restamped output_path must land"
+        );
+        assert_eq!(persisted.last_offset, 4096);
+    }
+
+    // #4259 PR-2a rework (codex r1): the restamp variant still pins the 4-field
+    // turn identity — a row re-owned by another turn is never clobbered.
+    #[test]
+    fn output_restamp_save_declines_when_another_turn_owns_the_row() {
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let provider = ProviderKind::Codex;
+        let mut owner =
+            state_with_full_response(44_091, "owner response", "AgentDesk-codex-restamp-own-4259");
+        owner.user_msg_id = 88_001;
+        save_inflight_state_in_root(temp.path(), &owner).expect("seed re-owned row");
+
+        let mut stale =
+            state_with_full_response(44_091, "stale snapshot", "AgentDesk-codex-restamp-own-4259");
+        stale.user_msg_id = 77_010;
+        stale.output_path = Some("/tmp/legacy/AgentDesk-codex-restamp-own-4259.jsonl".to_string());
+        assert_eq!(
+            save_inflight_state_if_identity_matches_allow_output_restamp_in_root(
+                temp.path(),
+                &stale,
+                "test::output_restamp_identity_mismatch_skips",
+            ),
+            GuardedSaveOutcome::IdentityMismatch
+        );
+
+        let persisted_path = inflight_state_path(temp.path(), &provider, owner.channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert_eq!(persisted.user_msg_id, 88_001);
+        assert_eq!(persisted.full_response, "owner response");
+        assert_eq!(persisted.output_path, owner.output_path);
     }
 
     #[test]

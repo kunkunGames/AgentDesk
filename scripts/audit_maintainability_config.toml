@@ -23,11 +23,15 @@
 # new turn_anchor.rs). More specific than the `**` glob below, so it must precede it
 # for fnmatch first-match precedence.
 "src/services/discord/placeholder_live_events/status_panel.rs" = 794 # 2026-07-08 #4177: 738 -> 794 (+56), reviewable admission — store subagent agentId metadata, safely fallback-pair genuine async completions, and trim finished slots first.
-"src/services/discord/placeholder_live_events/status_events.rs" = 782 # 2026-07-08 #4177 r2: 779 -> 782 (+3), reviewable admission — restore parent_tool_use_id doc placement and add task_notification_agent_id doc; prior #4177: 720 -> 779 (+59), carry task-notification/toolUseResult agentId and description metadata into SubagentEnd fallback matching.
+"src/services/discord/placeholder_live_events/status_events.rs" = 794 # 2026-07-08 #4338: 782 -> 794 (+12), reviewable admission — decode harness XML entities once at the footer-mode task-notification bridge (codex r1 finding 2); prior #4177 r2: 779 -> 782 (+3), restore parent_tool_use_id doc placement and add task_notification_agent_id doc; prior #4177: 720 -> 779 (+59), carry task-notification/toolUseResult agentId and description metadata into SubagentEnd fallback matching.
 "src/services/discord/placeholder_live_events/**" = 700
 "src/services/discord/prompt_builder/**" = 700
 "src/services/discord/runtime_bootstrap/**" = 700
+"src/services/discord/tmux_watcher/streaming_status_tick.rs" = 963 # 2026-07-08 #4229 S3: approved contiguous verbatim extraction of the throttled streaming status tick (orphan reclaim/suppression/panel create-bind/rollover/re-anchor/placeholder edit); below giant threshold, but irreducible as one review-verified move.
+"src/services/discord/tmux_watcher/turn_stream_collector.rs" = 1161 # 2026-07-08 #4229 S4: approved contiguous verbatim extraction of the turn stream collector (seed restore/first parse/forward/monitor auto-turn claim/active read-parse loop); giant file (>=1000), registered in giant_file_registry.toml; irreducible as one review-verified move.
+"src/services/discord/tmux_watcher/no_result_exits.rs" = 814 # 2026-07-08 #4229 S6: approved contiguous verbatim extraction of the no-result exit handler (fresh ready-for-input idle structural finalize / tmux-death break / cancel-shutdown break / ready-for-input stall notice+dispatch-fail / #3419 watchdog-timeout finalize); below giant threshold (<1000), but irreducible as one review-verified move.
 "src/services/discord/tmux_watcher/**" = 700
 "src/services/discord/turn_bridge/headless_delivery.rs" = 700
+"src/services/discord/turn_bridge/stream_loop.rs" = 1638 # 2026-07-08 #4230 S6: registered giant-file, plan-marked irreducible stream loop shell (event arms share placeholder/background/transcript/inflight state); tracked in giant_file_registry.toml.
 "src/services/discord/turn_bridge/status_panel.rs" = 700
 "src/services/discord/turn_bridge/voice_completion.rs" = 700

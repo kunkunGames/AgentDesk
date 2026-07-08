@@ -45,6 +45,7 @@ mod prompt_builder;
 mod queue_dispatch;
 mod queue_io;
 mod queue_marker;
+mod queue_overflow_dlq;
 mod queue_reactions;
 mod queued_placeholders_store;
 mod reaction_cleanup;
@@ -123,6 +124,7 @@ mod voice_background_driver;
 mod voice_barge_in;
 mod voice_config_cache;
 mod voice_id_sequences;
+mod voice_lifecycle;
 mod voice_routing;
 mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
@@ -441,8 +443,8 @@ mod last_message_checkpoint_tests {
 }
 
 pub(in crate::services::discord) use queue_io::{
-    schedule_deferred_idle_queue_kickoff, schedule_deferred_idle_queue_kickoff_immediate,
-    spawn_turn_completion_idle_queue_listener,
+    arm_slow_idle_queue_backstop_if_queue_nonempty, schedule_deferred_idle_queue_kickoff,
+    schedule_deferred_idle_queue_kickoff_immediate, spawn_turn_completion_idle_queue_listener,
 };
 pub(super) fn single_message_panel_enabled() -> bool {
     single_message_panel::enabled()
@@ -3030,7 +3032,8 @@ pub(in crate::services::discord) fn queue_exit_feedback_emoji(kind: QueueExitKin
     match kind {
         QueueExitKind::Cancelled => '🚫',
         QueueExitKind::Expired => '⌛',
-        QueueExitKind::Superseded => '⏏',
+        // #4260 dual r1: `Overflow` inherits the pre-split ⏏ feedback.
+        QueueExitKind::Superseded | QueueExitKind::Overflow => '⏏',
     }
 }
 
@@ -3043,7 +3046,8 @@ fn queue_exit_card_body(kind: QueueExitKind) -> &'static str {
     match kind {
         QueueExitKind::Cancelled => "🚫 **큐에서 제거됨** — 사용자 취소로 처리되지 않습니다.",
         QueueExitKind::Expired => "⌛ **큐에서 제거됨** — 대기 시간 초과로 처리되지 않습니다.",
-        QueueExitKind::Superseded => {
+        // #4260 dual r1: the pre-split ⏏ text carries over to `Overflow`.
+        QueueExitKind::Superseded | QueueExitKind::Overflow => {
             "⏏ **큐에서 제거됨** — 후속 메시지로 대체되어 처리되지 않습니다."
         }
     }
@@ -3129,6 +3133,7 @@ mod queue_exit_feedback_reconciler_tests {
                 MessageId::new(100_000_000_000_234),
                 QueueExitKind::Superseded,
             ),
+            (MessageId::new(100_000_000_000_235), QueueExitKind::Overflow),
         ];
 
         for (message_id, kind) in cases {
@@ -3236,6 +3241,19 @@ async fn apply_queue_exit_feedback(
     // `queue_exit_drain_queued_placeholders` doc).
     let visible_cards_to_clear =
         queue_exit_drain_queued_placeholders(shared, channel_id, &queue_exit_events).await;
+
+    // #4260 dual r1: dead-letter + notice for capacity-`Overflow` evicts only
+    // (benign Superseded producers pass through untouched). Fire-and-forget —
+    // detached spawns inside — and sited before the Http guard below because
+    // neither call needs an Http source nor may stall feedback on a pool
+    // acquire.
+    queue_overflow_dlq::record_queue_overflow_dead_letters(shared, channel_id, &queue_exit_events);
+    queue_overflow_dlq::maybe_notify_orphan_queue_overflow(
+        shared,
+        channel_id,
+        &queue_exit_events,
+        &visible_cards_to_clear,
+    );
 
     // Phase 5.2 of intake-node-routing (issue #2009): use gateway-or-token
     // fallback so cluster-standby workers can still rewrite queue-exit
@@ -4045,6 +4063,17 @@ async fn kickoff_idle_queue_channel(
             provider = provider.as_str(),
             "KICKOFF: skipped queued turn after fresh mailbox/TUI guard"
         );
+        return IdleQueueKickoffChannelOutcome::default();
+    }
+
+    // #4270 A — pre-dequeue hosted-TUI readiness gate. A verifiably busy hosted
+    // TUI defers the promotion BEFORE `take_next_soft` and BEFORE the queued-view
+    // teardown below (turn-view started/⏳ flip + 📬 marker drain + merged-card
+    // deletion), so a still-busy channel keeps its steady `📬 Queued` view with
+    // zero churn. No-start here is fail-open: callers arm the slow (60s)
+    // backstop on a no-start with backlog, and the watcher-idle re-drain
+    // delivers the fast edge once the TUI reaches Idle.
+    if router::hosted_tui_promote_readiness_blocked(shared, provider, channel_id).await {
         return IdleQueueKickoffChannelOutcome::default();
     }
 

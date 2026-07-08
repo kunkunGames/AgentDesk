@@ -64,6 +64,14 @@ echo "=== await_holding_lock ratchet guard ==="
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
 
+echo "=== Discord log field-key drift guard (#4218) ==="
+"$PYTHON" scripts/check_log_key_drift.py
+"$PYTHON" -m unittest tests.test_log_key_drift
+
+echo "=== Inflight blind-save ratchet guard (#4259) ==="
+"$PYTHON" scripts/check_inflight_blind_save_ratchet.py
+"$PYTHON" -m unittest tests.test_inflight_blind_save_ratchet
+
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
 
@@ -138,13 +146,6 @@ echo "=== Portable deployable path lint ==="
   tests.test_script_python_policy \
   tests.test_analyze_prs
 
-echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036) ==="
-# Generic committed markdown freshness drift is warning-only for ordinary PRs
-# and is refreshed by the weekly regen-docs workflow. This CI invocation writes
-# the current generated view into the workspace so the checks below compare
-# against current source facts.
-# The generator hard-fails (exit 2) on giant-file registry drift: unregistered
-# new giants, ghost registrations left after decomposition, or deadline-less
 echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036) ==="
 # Generic committed markdown freshness drift is warning-only for ordinary PRs
 # and is refreshed by the weekly regen-docs workflow. This CI invocation writes

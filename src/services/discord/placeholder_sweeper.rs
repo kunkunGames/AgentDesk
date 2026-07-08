@@ -595,11 +595,11 @@ async fn run_placeholder_sweep_pass(
                 // SAFETY-NET so triage can hunt the missing hook.
                 tracing::warn!(
                     "[sweeper SAFETY-NET] abandoning inflight age={age_secs}s — \
-                     explicit cleanup signal missed for {provider}/{channel} (msg {msg_id}); \
+                     explicit cleanup signal missed for {provider}/{channel_id} (msg {msg_id}); \
                      investigate (pane_dead/generation/heartbeat hooks)",
                     age_secs = age_secs,
                     provider = provider.as_str(),
-                    channel = state.channel_id,
+                    channel_id = state.channel_id,
                     msg_id = state.current_msg_id,
                 );
                 let text = build_abandoned_placeholder(&state);
@@ -977,6 +977,10 @@ pub(super) fn spawn_placeholder_sweeper(
             // owns this reclaim so an aborted anchor always converges (#3282).
             let drained_abort_markers =
                 super::tui_direct_abort_marker::sweep_expired(&shared, &provider).await;
+            // #4278 orphan-`⏳` sweep (mechanism: turn_view_reconciler::orphan_sweep).
+            let swept_orphan_anchors =
+                super::turn_view_reconciler::sweep_orphan_tui_anchor_reactions(&shared, &provider)
+                    .await;
             // #3859: finalize placeholders stranded by a failure-path inflight
             // eviction (turn-task Drop / heartbeat-gap sweeper). Each durable
             // abandon-request is edited to its terminal "중단됨" card BY MESSAGE
@@ -990,10 +994,11 @@ pub(super) fn spawn_placeholder_sweeper(
                 || drained > 0
                 || drained_abort_markers > 0
                 || drained_abandon_requests > 0
+                || swept_orphan_anchors > 0
             {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={} drained_abort_markers={} drained_abandon_requests={}",
+                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={} drained_abort_markers={} drained_abandon_requests={} swept_orphan_anchors={}",
                     provider.as_str(),
                     report.scanned,
                     report.stalled,
@@ -1001,7 +1006,8 @@ pub(super) fn spawn_placeholder_sweeper(
                     report.reclaimed_panels,
                     drained,
                     drained_abort_markers,
-                    drained_abandon_requests
+                    drained_abandon_requests,
+                    swept_orphan_anchors
                 );
                 sweeps_since_heartbeat = 0;
             }

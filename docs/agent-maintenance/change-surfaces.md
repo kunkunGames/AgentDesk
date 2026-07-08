@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-07-04 (against #4049 S4-a2 queue-marker reconciler migration, landed on top of the #4081 delivery-record fingerprint sidecar — freeze counts re-synced to the regenerated module inventory).
+> Last refreshed: 2026-07-08 (against #4218 log field-key unification — tmux watcher path touched by tracing key rename only, `channel =` -> `channel_id =`; line counts and freeze entries unchanged).
 >
 > PR #3456 dcserver-robustness: freeze counts re-synced after the reconcile
 > row-allocation churn reduction (`src/reconcile.rs` now 1816 prod lines) and the
@@ -233,12 +233,23 @@
     late-frame fresh row B is rejected; -576 from #3841 extracting placeholder
     suppression helpers to `tmux_placeholder_suppression/`;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7169 production lines; #4170 gated rollover recovery mirror update on edit success (+2); #4229 S1
-    moved the pause/epoch-discard + prompt-too-long/auth-expired/provider-overload
-    terminal exits verbatim to the non-giant
-    `tmux_watcher/terminal_abort_exits.rs` child module, ratcheting the root down
-    after behavior-preserving decompose; #4049 S4-b1 inventory sync recorded the
-    hotfile count; #4081
+  - `src/services/discord/tmux_watcher.rs` (5218 production lines; #4229 S4
+    moved the turn stream collector (seed restore/first parse-forward/monitor
+    auto-turn claim/active read-parse loop) verbatim to
+    `tmux_watcher/turn_stream_collector.rs` (1158 production lines), ratcheting
+    the root down after behavior-preserving decompose; #4229 S3 moved the
+    throttled streaming status tick (orphan reclaim, streaming
+    suppression, status-panel create/bind, rollover, re-anchor, placeholder
+    edit) verbatim to `tmux_watcher/streaming_status_tick.rs`, ratcheting the
+    root down after behavior-preserving decompose; #4229 S2
+    moved the loop poll prologue (heartbeat/pause/rotation/initial-read/empty-poll/post-terminal suppression)
+    verbatim to the non-giant `tmux_watcher/loop_poll_prologue.rs` child module,
+    ratcheting the root down after behavior-preserving decompose; #4170 gated
+    rollover recovery mirror update on edit success (+2); #4229 S1 moved the
+    pause/epoch-discard + prompt-too-long/auth-expired/provider-overload terminal
+    exits verbatim to the non-giant `tmux_watcher/terminal_abort_exits.rs` child
+    module, ratcheting the root down after behavior-preserving decompose; #4049
+    S4-b1 inventory sync recorded the hotfile count; #4081
     round2 moved `commit_watcher_direct_terminal_session_idle` verbatim into
     `tmux_watcher/liveness.rs` and kept only thin duplicate-guard/long-body
     wiring in the root loop; -18 from
@@ -1189,7 +1200,7 @@
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
     new behaviour to `health/watcher_respawn.rs`).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (2825 lines; +1 net from #4139 — the TUI-busy enqueue-refusal branch now calls `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`, non-baselined), which puts the taken session-retry recovery context back via a KV-only restore (no new audit row) before rewriting the refusal notice, so refusal branches no longer drop context the successful-requeue branch preserves; +2 from #4117 delaying the session-retry recovery-context take past the stale-dispatch abort and race-loss returns so unused context is never consumed/audit-stamped; +2 from #4107 moving hosted-TUI busy pre-submit mailbox release ahead of retry enqueue so the active-message retry passes the actor guard; -5 from #4049 S4-b routing queue-exit feedback through the reconciler; +5 from #4049 S4-a2 round-7 threading the reconciler's per-start-attempt token from the optimistic Pending record into the race-loss rollback path so stale delayed rollback cannot clobber a same-generation re-dispatch; +13 from #4049 S4-a2 routing queue-marker add/remove through `queue_marker.rs` so standalone 📬 notifications use `turn_view_reconciler` while ➕/🔄 stay auxiliary; -11 from #4019 R1 routing dequeue queue-marker cleanup through the shared 📬/➕/🔄 marker list and shortening the local contract note; +10 from #3813 Phase 3 (§4/AC#6) a single `edit_channel_message` call-site surfacing the hosted-TUI busy preflight readiness wait (⏳ TUI 준비 대기 중) on the intake placeholder so a safe up-to-45s wait doesn't look like a stalled session start — the render logic/const/tests live in sibling `tui_followup.rs` (non-baselined), the root only adds the one edit call before `wait_readiness` moves into spawn_blocking, and the compact state is transient (overwritten by dispatch streaming on ready or by the queued-card/delete/refusal-notice paths on still-busy); +18 from #3813 Phase 1a intake latency spans — six thin observation-only mark/emit call-sites (turn-claimed anchor + placeholder/prep/input marks + `submitted`/`deferred_busy` emit); all monotonic-`Instant` measurement + formatting lives in sibling `latency_spans.rs`, no control-flow change; -856 from #3837 behavior-preserving decomposition lifting three cohesive `handle_text_message` clusters verbatim into sibling `intake_turn/` submodules — `voice_intake::resolve_intake_voice_announcement` (voice-announcement resolution), `race_loss::handle_race_loss_enqueue` (the `if !started` mailbox enqueue + queued-placeholder render + queue-pending reaction lifecycle), and `turn_watchdog::spawn_text_turn_watchdog` (the per-turn watchdog spawn); pure code movement + path/visibility plumbing, no logic change; +21 from #3905 threading the intake gate's already-authorized, non-consuming voice-announcement resolution into direct dispatch (new `handle_text_message` `gate_resolved_voice_announcement` param + the trust-the-carry-forward resolution branch) so a sibling-gateway durable-consume race no longer WARN-drops an announce the gate authorized; #3464 single-dispatch dedup preserved via the unchanged per-message `route_voice_transcript_announcement_once` claim; +16 from #3811 recording the original-request turn anchor (`set_turn_request_anchor`) gated on the won mailbox claim (`started == true`) so a queued message never bleeds the active turn's deeplink; +1 from #3751 routing paused-watcher attach through owner-channel persistence helper; -65 from #3653 removing the separate session-restore notify bot send path so restore is absorbed by the session/status panel; -40 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +23 from #3557 Codex review: cap the INITIAL watchdog deadline at the provider hard ceiling (+one-shot ceiling warn); +27 from #3557 (A) per-turn hard-ceiling clamp wired into the watchdog auto-extend block; +1 from #3479 item-3 `shared.dispatch.<field>` nesting;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (2834 lines; +9 from #4307 PR-B routing the voluntary tool_feedback reminder through the same take/inject/put-back path as the session-retry recovery context — intake folds the reminder stashed at the previous turn's end (provider-scoped kv key, codex dual-review r1) into `reply_context` via the sibling `take_and_merge_feedback_reminder` (turn_start.rs, non-baselined; take+merge logic lives there) so it reaches the prompt via `context_chunks` AND is carried forward inside `reply_context.clone()` on a TUI-busy requeue, and the refusal branch forwards `&provider` + the owned reminder to `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`, non-baselined) for a KV-only put-back under the same provider key; the stash itself lives in sibling `completion_postlude.rs` and the storage/format helpers in `recovery_text.rs`/`response_format.rs` (all non-baselined); +1 net from #4139 — the TUI-busy enqueue-refusal branch now calls `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`, non-baselined), which puts the taken session-retry recovery context back via a KV-only restore (no new audit row) before rewriting the refusal notice, so refusal branches no longer drop context the successful-requeue branch preserves; +2 from #4117 delaying the session-retry recovery-context take past the stale-dispatch abort and race-loss returns so unused context is never consumed/audit-stamped; +2 from #4107 moving hosted-TUI busy pre-submit mailbox release ahead of retry enqueue so the active-message retry passes the actor guard; -5 from #4049 S4-b routing queue-exit feedback through the reconciler; +5 from #4049 S4-a2 round-7 threading the reconciler's per-start-attempt token from the optimistic Pending record into the race-loss rollback path so stale delayed rollback cannot clobber a same-generation re-dispatch; +13 from #4049 S4-a2 routing queue-marker add/remove through `queue_marker.rs` so standalone 📬 notifications use `turn_view_reconciler` while ➕/🔄 stay auxiliary; -11 from #4019 R1 routing dequeue queue-marker cleanup through the shared 📬/➕/🔄 marker list and shortening the local contract note; +10 from #3813 Phase 3 (§4/AC#6) a single `edit_channel_message` call-site surfacing the hosted-TUI busy preflight readiness wait (⏳ TUI 준비 대기 중) on the intake placeholder so a safe up-to-45s wait doesn't look like a stalled session start — the render logic/const/tests live in sibling `tui_followup.rs` (non-baselined), the root only adds the one edit call before `wait_readiness` moves into spawn_blocking, and the compact state is transient (overwritten by dispatch streaming on ready or by the queued-card/delete/refusal-notice paths on still-busy); +18 from #3813 Phase 1a intake latency spans — six thin observation-only mark/emit call-sites (turn-claimed anchor + placeholder/prep/input marks + `submitted`/`deferred_busy` emit); all monotonic-`Instant` measurement + formatting lives in sibling `latency_spans.rs`, no control-flow change; -856 from #3837 behavior-preserving decomposition lifting three cohesive `handle_text_message` clusters verbatim into sibling `intake_turn/` submodules — `voice_intake::resolve_intake_voice_announcement` (voice-announcement resolution), `race_loss::handle_race_loss_enqueue` (the `if !started` mailbox enqueue + queued-placeholder render + queue-pending reaction lifecycle), and `turn_watchdog::spawn_text_turn_watchdog` (the per-turn watchdog spawn); pure code movement + path/visibility plumbing, no logic change; +21 from #3905 threading the intake gate's already-authorized, non-consuming voice-announcement resolution into direct dispatch (new `handle_text_message` `gate_resolved_voice_announcement` param + the trust-the-carry-forward resolution branch) so a sibling-gateway durable-consume race no longer WARN-drops an announce the gate authorized; #3464 single-dispatch dedup preserved via the unchanged per-message `route_voice_transcript_announcement_once` claim; +16 from #3811 recording the original-request turn anchor (`set_turn_request_anchor`) gated on the won mailbox claim (`started == true`) so a queued message never bleeds the active turn's deeplink; +1 from #3751 routing paused-watcher attach through owner-channel persistence helper; -65 from #3653 removing the separate session-restore notify bot send path so restore is absorbed by the session/status panel; -40 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +23 from #3557 Codex review: cap the INITIAL watchdog deadline at the provider hard ceiling (+one-shot ceiling warn); +27 from #3557 (A) per-turn hard-ceiling clamp wired into the watchdog auto-extend block; +1 from #3479 item-3 `shared.dispatch.<field>` nesting;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; #3464 extracted the
     unauthorized-voice-announcement scope decision to `voice_announcement_scope.rs`;
@@ -1227,8 +1238,21 @@
     clusters into `tmux_runtime/` child modules (`interrupt_policy.rs`,
     `process_table.rs`, `pid_exit.rs` — see their entries below); no longer a
     giant-file. Bugfix only outside a further extraction plan).
-  - `src/services/discord/turn_bridge/mod.rs` (5017 lines; production LoC; -673
-    from #4230 S2 moving the runtime handoff stream arms and
+  - `src/services/discord/turn_bridge/mod.rs` (1231 lines; production LoC; -1
+    from #4307 PR-A removing the dead auto-submit re-export
+    (`submit_pending_feedbacks` / `should_submit_automatic_feedback_fallback`);
+    prior -1260
+    from #4230 S6 moving the main stream loop shell + remaining event arms to
+    `turn_bridge/stream_loop.rs`; behavior-preserving decompose. Prior -1339
+    from #4230 S5 moving the terminal outcome delivery block to
+    `turn_bridge/terminal_outcome_delivery.rs`; behavior-preserving decompose.
+    Prior -495
+    from #4230 S4 moving the post-loop owner classification + finalizer block to
+    `turn_bridge/post_loop_finalize.rs`; behavior-preserving decompose. Prior
+    -693 from #4230 S3 moving the completion postlude + inflight epilogue
+    cluster (including the intact #4185 restart-cancel block) to
+    `turn_bridge/completion_postlude.rs`; behavior-preserving decompose. Prior
+    -673 from #4230 S2 moving the runtime handoff stream arms and
     `handle_watcher_runtime_handoff` to
     `turn_bridge/runtime_handoff_loop.rs`; behavior-preserving decompose. Prior -501
     from #4230 S1 moving `CompletionGuard`/`InflightCleanupGuard` to
@@ -1414,6 +1438,22 @@
     so the parent call sites + inline tests stay byte-identical; the two
     discord-level `super::` refs (`response_sanitizer`, `DISCORD_MSG_LIMIT`)
     deepened to `super::super::`; no IO/async; not a giant-file).
+  - `src/services/discord/turn_bridge/completion_postlude.rs` (917 prod
+    lines; #4230 S3 completion postlude + inflight epilogue extracted verbatim
+    from the final post-loop tail of `spawn_turn_bridge`: status-panel completion,
+    final ADK status, watcher resume, transcript/memory/analytics persistence,
+    metrics, restart-report cleanup, inflight preserve/clear, mailbox recovery
+    marker cleanup, and the final queued-turn drain. The #4185 restart-cancel
+    branch moved intact; discord-level `super::` refs are deepened one level;
+    behavior-preserving decompose; not a giant-file).
+  - `src/services/discord/turn_bridge/post_loop_finalize.rs` (720 prod lines;
+    #4230 S4 post-loop owner classification + finalizer block extracted
+    verbatim from `spawn_turn_bridge`: stream-exit placeholder cleanup, orphaned
+    tool finalization, API friction extraction, follow-up requeue candidate,
+    review dispatch guard, bridge output owner classification, `TURN_ACTIVE`
+    publish, finalizing counters, early TUI gate, busy-watcher handoff, and
+    single-authority finalizer submission. Discord-level `super::` refs are
+    deepened one level; behavior-preserving decompose; not a giant-file).
   - `src/services/discord/turn_bridge/completion_guard.rs` (872 prod lines; no
     longer a giant-file after #3479 verbatim-extracted two leaf child modules
     under `completion_guard/` (1834 -> 872 prod). It now holds the
@@ -1471,6 +1511,24 @@
     giant-file-registry [[entry]] was removed. #3038 turn_bridge S1 moved
     `advance_tmux_relay_confirmed_end` here; split the remaining lease wiring
     vs delivery helpers before adding behavior).
+  - `src/services/discord/turn_bridge/stream_loop.rs` (1638 prod lines; #4230 S6
+    main stream loop shell extracted verbatim from `turn_bridge/mod.rs`: cancel
+    gates, ready-frame drain, `RetryBoundary`/`Init`/`Text`/`Thinking`/`ToolUse`/
+    `ToolResult`/`TaskNotification`/`Done`/`Error`/status arms, runtime handoff
+    delegation, stream/status ticks, long-running placeholder open/retarget
+    state, and bridge latency span emission. Registered giant-file (#4230
+    decompose target continuation — see `giant-file-registry.md`, owner
+    `discord-relay`, deadline 2026-08-31); plan-marked irreducible because the
+    arms share placeholder state, background-child tracking, transcript events,
+    and inflight persistence. Bugfix only outside the #4230 decompose plan).
+  - `src/services/discord/turn_bridge/terminal_outcome_delivery.rs` (1669 lines;
+    production LoC; #4230 S5 terminal outcome delivery extracted verbatim from
+    `turn_bridge/mod.rs`: cancel, prompt-too-long, recovery retry, empty
+    response, terminal delivery leases, terminal-controller cutover, voice/TUI
+    completion, dispatch completion/failure, watcher-delivered marking, `tv_done`,
+    and terminal status readiness. Registered giant-file (#4230 decompose target
+    continuation — see `giant-file-registry.md`, owner `discord-relay`, deadline
+    2026-08-31). Bugfix only outside the #4230 decompose plan).
   - `src/services/discord/outbound/turn_output_controller.rs` (1034 prod lines;
     crossed the giant threshold in #3998 E13 when the controller-facing lease
     guard moved from `TurnKey` to `DeliveryLeaseKey` for id-0 disambiguation.
@@ -1621,7 +1679,10 @@
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
     lines).
-  - `src/services/discord/placeholder_sweeper.rs` (1014 lines; -6 from #4047
+  - `src/services/discord/placeholder_sweeper.rs` (1020 lines; #4278 kept the
+    periodic loop at a thin call — the orphan-`⏳` sweep orchestration
+    (pass-local marker cache + TOCTOU re-verification probes) lives in
+    `turn_view_reconciler/orphan_sweep.rs`; -6 from #4047
     S2-b deleting the TimedOut-completion-gate status-panel reconcile call —
     the suppression path it backfilled no longer exists; +10 from #3859
     draining the new `abandon_request_store` each sweep pass (finalizing
@@ -1757,7 +1818,7 @@
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/config.rs` (2705 lines; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required)).
-  - `src/server/mod.rs` (2806 lines; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token).
+  - `src/server/mod.rs` (2821 lines; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1508 lines).
   - `src/reconcile.rs` (1902 lines; +39 from #4104 standardized inflight-row

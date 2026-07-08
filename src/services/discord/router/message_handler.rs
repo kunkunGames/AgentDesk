@@ -22,9 +22,10 @@ pub(crate) use super::turn_start::{
 use super::turn_start::{
     cli_just_spawned_for_emit, dispatch_reset_lifecycle_code, emit_session_strategy_lifecycle,
     load_session_runtime_state, log_session_strategy_diagnostic, put_back_session_retry_context,
-    refresh_session_strategy_after_pending_reset, release_mailbox_after_hosted_tui_busy_pre_submit,
+    put_back_voluntary_feedback_reminder, refresh_session_strategy_after_pending_reset,
+    release_mailbox_after_hosted_tui_busy_pre_submit,
     release_mailbox_after_placeholder_post_failure, session_runtime_state_after_redirect,
-    take_session_retry_context,
+    take_and_merge_feedback_reminder, take_session_retry_context,
 };
 #[cfg(test)]
 use super::turn_start::{session_strategy_lifecycle_event, should_emit_session_strategy_lifecycle};
@@ -69,6 +70,14 @@ pub(in crate::services::discord) use self::headless_turn::{
 };
 pub(in crate::services::discord) use self::intake_turn::{IntakeDeps, handle_text_message};
 pub(crate) use self::intake_turn::{IntakeRequest, execute_intake_turn_core};
+// #4270 — pre-teardown hosted-TUI readiness probe + live-dispatch defer for the
+// queued-turn promote entrypoints (idle kickoff in discord/mod.rs, live
+// dispatch in gateway.rs).
+#[cfg(test)]
+pub(in crate::services::discord) use self::tui_followup::set_hosted_tui_promote_busy_for_tests;
+pub(in crate::services::discord) use self::tui_followup::{
+    defer_promoted_dispatch_if_hosted_tui_busy, hosted_tui_promote_readiness_blocked,
+};
 
 #[cfg(test)]
 mod session_strategy_lifecycle_tests;

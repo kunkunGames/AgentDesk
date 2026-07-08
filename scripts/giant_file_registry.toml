@@ -281,6 +281,15 @@ deadline = "2026-10-31"
 decompose_issue = "#3832"
 
 [[entry]]
+# #4229 S4 follow-up: turn stream collection was moved out of the watcher root
+# as an irreducible review-verified slice; keep it tracked until a later
+# behavior-preserving split can bring it below the prod-giant threshold.
+file = "src/services/discord/tmux_watcher/turn_stream_collector.rs"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#4229"
+
+[[entry]]
 # #3834 r2: restart-path scan moved out of the recovery_engine root, but the
 # verbatim `restore_inflight_turns` body remains a tracked giant until follow-up
 # slices can split the scan/session-retry internals without behavior changes.
@@ -485,6 +494,28 @@ file = "src/services/discord/turn_bridge/mod.rs"
 owner = "discord-relay"
 deadline = "2026-08-31"
 decompose_issue = "#3038"
+
+[[entry]]
+# Created by #4230 S5 as the approved high-coupling terminal outcome delivery
+# extraction from turn_bridge/mod.rs. It remains over the giant threshold because
+# cancel, prompt-too-long, recovery retry, terminal delivery leases, controller
+# cutover, voice/TUI completion, dispatch completion, watcher-delivered marking,
+# and terminal readiness must stay together until the next decomposition stage.
+file = "src/services/discord/turn_bridge/terminal_outcome_delivery.rs"
+owner = "discord-relay"
+deadline = "2026-08-31"
+decompose_issue = "#4230"
+
+[[entry]]
+# Created by #4230 S6 as the approved stream-loop shell extraction from
+# turn_bridge/mod.rs. It remains over the giant threshold because the event arms
+# share placeholder state, background-child tracking, transcript events, inflight
+# persistence, cancel gates, and stream-tick state; the approved plan marks this
+# loop shell irreducible for this stage.
+file = "src/services/discord/turn_bridge/stream_loop.rs"
+owner = "discord-relay"
+deadline = "2026-08-31"
+decompose_issue = "#4230"
 
 [[entry]]
 # Crossed the 1000-prod-LoC giant threshold in #3540: the durable pending

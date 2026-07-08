@@ -77,6 +77,26 @@ Serenity/Poise 기반 Discord gateway, message router, turn bridge, tmux watcher
 - restart recovery, inflight restore, watcher cleanup
 - round-table meeting orchestration과 Discord side-effect delivery
 
+Turn bridge decomposition anchors:
+- `turn_bridge/completion_postlude.rs` — status-panel completion, final ADK
+  status, watcher resume, transcript/memory/analytics persistence, metrics,
+  restart-report cleanup, inflight preserve/clear, mailbox recovery marker
+  cleanup, and queued-turn drain.
+- `turn_bridge/post_loop_finalize.rs` — stream-exit placeholder cleanup,
+  orphaned tool finalization, API friction extraction, follow-up requeue
+  candidate, review dispatch guard, bridge output owner classification,
+  `TURN_ACTIVE` publish, finalizing counters, early TUI gate, busy-watcher
+  handoff, and single-authority finalizer submission.
+- `turn_bridge/stream_loop.rs` — main stream receive/drain loop, cancel gates,
+  remaining stream event arms, long-running placeholder open/retarget state,
+  runtime handoff delegation, stream/status ticks, and bridge latency span
+  emission.
+- `turn_bridge/terminal_outcome_delivery.rs` — cancel, prompt-too-long,
+  recovery retry, empty response, terminal delivery lease commits,
+  terminal-controller cutover, voice completion, TUI completion gate, dispatch
+  completion/failure, watcher-delivered marking, `tv_done`, and terminal
+  status readiness.
+
 ### 2. Session + Provider Runtime (`src/services/`, `src/dispatch/`)
 
 세션 실행 백엔드, provider adapter, dispatch lifecycle, runtime/platform abstraction이 여기에 있다. 이 영역은 "어떤 provider 프로세스를 어떻게 띄우고, 결과를 어떻게 회수하는가"를 담당한다.

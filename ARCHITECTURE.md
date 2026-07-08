@@ -104,6 +104,7 @@ src/
 │   ├── meetings.rs
 │   ├── mod.rs
 │   ├── postgres.rs
+│   ├── relay_dead_letter.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
 │   ├── session_status.rs
@@ -287,6 +288,7 @@ src/
 │   ├── maintenance.rs
 │   ├── mod.rs
 │   ├── multinode_regression.rs
+│   ├── outbox_delivery_alert.rs
 │   ├── resource_locks.rs
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
@@ -627,10 +629,13 @@ src/
 │   │   │   ├── entry.rs
 │   │   │   ├── jsonl_rotation.rs
 │   │   │   ├── liveness.rs
+│   │   │   ├── loop_poll_prologue.rs
+│   │   │   ├── no_result_exits.rs
 │   │   │   ├── orphan_status_panel_cleanup.rs
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── panel_decisions_tests.rs
 │   │   │   ├── placeholder_reclaim.rs
+│   │   │   ├── post_stream_exit.rs
 │   │   │   ├── prompt_observe.rs
 │   │   │   ├── provider_session_persistence.rs
 │   │   │   ├── session_bound_ack.rs
@@ -638,9 +643,12 @@ src/
 │   │   │   ├── single_message_footer.rs
 │   │   │   ├── single_message_footer_tests.rs
 │   │   │   ├── stall_exit.rs
+│   │   │   ├── streaming_status_tick.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
 │   │   │   ├── terminal_abort_exits.rs
+│   │   │   ├── terminal_commit_epilogue.rs
+│   │   │   ├── terminal_direct_fallback.rs
 │   │   │   ├── terminal_long_chunks.rs
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
@@ -648,6 +656,7 @@ src/
 │   │   │   ├── tests.rs
 │   │   │   ├── turn_identity.rs
 │   │   │   ├── turn_identity_tests.rs
+│   │   │   ├── turn_stream_collector.rs
 │   │   │   ├── two_message_panel.rs
 │   │   │   ├── utf8_chunk_decoder.rs
 │   │   │   └── utf8_chunk_decoder_tests.rs
@@ -682,6 +691,8 @@ src/
 │   │   │   ├── completion_guard/
 │   │   │   │   ├── completion_context.rs
 │   │   │   │   └── completion_postgres.rs
+│   │   │   ├── runtime_handoff_loop/
+│   │   │   │   └── guarded_save.rs
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
@@ -692,6 +703,7 @@ src/
 │   │   │   ├── chunk_compose.rs
 │   │   │   ├── chunk_compose_tests.rs
 │   │   │   ├── completion_guard.rs
+│   │   │   ├── completion_postlude.rs
 │   │   │   ├── context_window.rs
 │   │   │   ├── early_tui_completion.rs
 │   │   │   ├── finalize_epilogue.rs
@@ -702,6 +714,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── output_lifecycle.rs
 │   │   │   ├── panel_lifecycle.rs
+│   │   │   ├── post_loop_finalize.rs
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
 │   │   │   ├── response_delivery.rs
@@ -712,11 +725,13 @@ src/
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── status_panel.rs
 │   │   │   ├── status_panel_tests.rs
+│   │   │   ├── stream_loop.rs
 │   │   │   ├── stream_tick.rs
 │   │   │   ├── streaming_edit_text.rs
 │   │   │   ├── task_notification_lifecycle.rs
 │   │   │   ├── terminal_controller_cutover.rs
 │   │   │   ├── terminal_delivery.rs
+│   │   │   ├── terminal_outcome_delivery.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
 │   │   │   ├── two_message_panel.rs
@@ -733,6 +748,7 @@ src/
 │   │   │   ├── reconcile.rs
 │   │   │   └── watcher_backstop.rs
 │   │   ├── turn_view_reconciler/
+│   │   │   ├── orphan_sweep.rs
 │   │   │   └── tests.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── tests/
@@ -793,6 +809,7 @@ src/
 │   │   ├── queue_dispatch.rs
 │   │   ├── queue_io.rs
 │   │   ├── queue_marker.rs
+│   │   ├── queue_overflow_dlq.rs
 │   │   ├── queue_reactions.rs
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── reaction_cleanup.rs
@@ -854,6 +871,7 @@ src/
 │   │   ├── voice_barge_in.rs
 │   │   ├── voice_config_cache.rs
 │   │   ├── voice_id_sequences.rs
+│   │   ├── voice_lifecycle.rs
 │   │   ├── voice_routing.rs
 │   │   └── voice_sensitivity.rs
 │   ├── dispatches/
@@ -974,6 +992,7 @@ src/
 │   ├── turn_orchestrator/
 │   │   ├── active_source_dedup.rs
 │   │   ├── dispatch_reservation.rs
+│   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── registry_purge.rs
 │   │   └── turn_finished_signal.rs

@@ -206,6 +206,79 @@ pub(super) fn put_back_session_retry_context(
     }
 }
 
+/// #4307 PR-B: one-shot take of the voluntary tool_feedback reminder stashed at
+/// the previous turn's end (provider-scoped key — see
+/// `recovery_text::voluntary_feedback_reminder_key`). Mirrors
+/// `take_session_retry_context`; the take deletes the stash so the reminder is
+/// injected into exactly one turn.
+pub(super) fn take_voluntary_feedback_reminder(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> Option<String> {
+    super::super::turn_bridge::recovery_text::take_voluntary_feedback_reminder(
+        shared.pg_pool.as_ref(),
+        provider,
+        channel_id.get(),
+    )
+}
+
+/// #4307 PR-B: take the reminder stashed at the previous turn's end and fold its
+/// formatted block into `reply_context`, so it reaches the next prompt (via the
+/// intake `context_chunks`) AND is carried forward inside `reply_context.clone()`
+/// if this turn is re-queued for a TUI-busy retry. Returns the owned reminder
+/// (for the refusal-branch put-back) alongside the augmented reply context.
+///
+/// Extracted from `intake_turn.rs` (rather than inlined like the sibling
+/// session-retry take) to keep that frozen giant file from re-inflating.
+pub(super) fn take_and_merge_feedback_reminder(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    reply_context: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let feedback_reminder = take_voluntary_feedback_reminder(shared, provider, channel_id);
+    let reply_context = super::response_format::merge_reply_contexts(
+        reply_context,
+        feedback_reminder
+            .as_deref()
+            .and_then(super::response_format::format_voluntary_feedback_reminder),
+    );
+    (feedback_reminder, reply_context)
+}
+
+/// #4307 PR-B: put the taken reminder back when a turn consumed it but failed to
+/// establish (TUI-busy enqueue refusal), so it is not lost. Mirrors
+/// `put_back_session_retry_context`. The provider must match the take above so
+/// the put-back lands under the same provider-scoped key.
+pub(super) fn put_back_voluntary_feedback_reminder(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    reminder: Option<&str>,
+    reason: Option<&str>,
+) {
+    let Some(reminder) = reminder else {
+        return;
+    };
+    if let Err(error) =
+        super::super::turn_bridge::recovery_text::restore_voluntary_feedback_reminder_after_take(
+            shared.pg_pool.as_ref(),
+            provider,
+            channel_id.get(),
+            reminder,
+        )
+    {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            provider = provider.as_str(),
+            reason = reason.unwrap_or("unknown"),
+            error = %error,
+            "failed to put back voluntary tool_feedback reminder after TUI-busy enqueue refusal"
+        );
+    }
+}
+
 pub(super) async fn emit_session_strategy_lifecycle(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -429,13 +502,20 @@ pub(in crate::services::discord) async fn release_mailbox_after_hosted_tui_busy_
 ) -> bool {
     let finish = super::super::mailbox_finish_turn(shared, provider, channel_id).await;
     if finish.mailbox_online && finish.has_pending {
-        super::super::schedule_deferred_idle_queue_kickoff(
-            shared.clone(),
-            provider.clone(),
+        // #4270 B — edge-trigger conversion: do NOT re-arm the fast ~2s deferred
+        // kickoff for a hosted-TUI busy-defer release (that fixed-delay re-kick,
+        // combined with the mailbox-only kickoff gate, was the ~2s promote
+        // spin). Arm ONLY the slow (60s) fail-open backstop; the fast wakeup is
+        // delegated to the watcher-idle re-drain when the TUI reaches Idle, and
+        // the pre-claim readiness gate (#4270 A) absorbs any interim kick
+        // without re-claiming the mailbox.
+        super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
+            shared,
+            provider,
             channel_id,
             "hosted_tui_busy_pre_submit_pending",
-        );
-        true
+        )
+        .await
     } else {
         false
     }
