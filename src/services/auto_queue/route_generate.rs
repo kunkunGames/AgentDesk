@@ -176,29 +176,10 @@ pub async fn generate(
     // — return 500 so the caller does not silently get a duplicate dispatch.
     let mut active_dispatch_skips: Vec<serde_json::Value> = Vec::new();
     {
-        let active_dispatches = if cards.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            let card_ids: Vec<String> = cards.iter().map(|c| c.card_id.clone()).collect();
-            match active_dispatch_ids_for_cards_pg(pool, &card_ids).await {
-                Ok(map) => map,
-                Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!(
-                                "active-dispatch batch lookup failed: {error}"
-                            ),
-                        })),
-                    );
-                }
-            }
-        };
-
         let mut retained = Vec::with_capacity(cards.len());
         for card in cards.into_iter() {
-            match active_dispatches.get(&card.card_id) {
-                Some(existing_dispatch_id) => {
+            match active_dispatch_id_for_card_pg(pool, &card.card_id).await {
+                Ok(Some(existing_dispatch_id)) => {
                     if let Some(issue_number) = card.github_issue_number {
                         active_dispatch_skips.push(json!({
                             "issue_number": issue_number,
@@ -211,13 +192,24 @@ pub async fn generate(
                         AutoQueueLogContext::new()
                             .card(card.card_id.as_str())
                             .agent(card.agent_id.as_str())
-                            .dispatch(existing_dispatch_id),
+                            .dispatch(&existing_dispatch_id),
                         "⏭ GENERATE: card {} already has active dispatch {}, skipping",
                         card.card_id,
                         existing_dispatch_id
                     );
                 }
-                None => retained.push(card),
+                Ok(None) => retained.push(card),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!(
+                                "active-dispatch lookup failed for card {}: {error}",
+                                card.card_id
+                            ),
+                        })),
+                    );
+                }
             }
         }
         cards = retained;
@@ -724,27 +716,19 @@ pub(crate) async fn collect_generate_skip_breakdown(
 /// Returns a `Result` so callers can fail closed on lookup errors (codex
 /// iter-1 P2): swallowing a SQL failure here would let a card with a live
 /// dispatch slip into a generated run and reintroduce the #1442 incident.
-pub(crate) async fn active_dispatch_ids_for_cards_pg(
+pub(crate) async fn active_dispatch_id_for_card_pg(
     pool: &sqlx::PgPool,
-    card_ids: &[String],
-) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
-    if card_ids.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT DISTINCT ON (kanban_card_id) kanban_card_id, id
+    card_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT id
          FROM task_dispatches
-         WHERE kanban_card_id = ANY($1)
+         WHERE kanban_card_id = $1
            AND status IN ('pending', 'dispatched')
-         ORDER BY kanban_card_id, created_at DESC",
+         ORDER BY created_at DESC
+         LIMIT 1",
     )
-    .bind(card_ids)
-    .fetch_all(pool)
-    .await?;
-
-    let mut map = std::collections::HashMap::with_capacity(rows.len());
-    for (card_id, dispatch_id) in rows {
-        map.insert(card_id, dispatch_id);
-    }
-    Ok(map)
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await
 }
