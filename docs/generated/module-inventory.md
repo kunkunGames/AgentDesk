@@ -605,25 +605,25 @@
 | `services::discord::router::intake_gate::reaction_remove` | `src/services/discord/router/intake_gate/reaction_remove.rs` | 226 | 226 | 0 |  |
 | `services::discord::router::intake_gate::stale_turn` | `src/services/discord/router/intake_gate/stale_turn.rs` | 630 | 283 | 347 |  |
 | `services::discord::router::intake_queue_transaction` | `src/services/discord/router/intake_queue_transaction.rs` | 832 | 474 | 358 |  |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 82 | 82 | 0 |  |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 83 | 83 | 0 |  |
 | `services::discord::router::message_handler::attachments` | `src/services/discord/router/message_handler/attachments.rs` | 142 | 114 | 28 |  |
 | `services::discord::router::message_handler::control` | `src/services/discord/router/message_handler/control.rs` | 149 | 149 | 0 |  |
 | `services::discord::router::message_handler::goal_lifecycle` | `src/services/discord/router/message_handler/goal_lifecycle.rs` | 250 | 211 | 39 |  |
 | `services::discord::router::message_handler::headless_turn` | `src/services/discord/router/message_handler/headless_turn.rs` | 1544 | 1337 | 207 | giant-file |
-| `services::discord::router::message_handler::intake_turn` | `src/services/discord/router/message_handler/intake_turn.rs` | 2976 | 2825 | 151 | giant-file |
+| `services::discord::router::message_handler::intake_turn` | `src/services/discord/router/message_handler/intake_turn.rs` | 3070 | 2834 | 236 | giant-file |
 | `services::discord::router::message_handler::intake_turn::race_loss` | `src/services/discord/router/message_handler/intake_turn/race_loss.rs` | 704 | 609 | 95 |  |
 | `services::discord::router::message_handler::intake_turn::turn_watchdog` | `src/services/discord/router/message_handler/intake_turn/turn_watchdog.rs` | 256 | 256 | 0 |  |
 | `services::discord::router::message_handler::intake_turn::voice_intake` | `src/services/discord/router/message_handler/intake_turn/voice_intake.rs` | 155 | 155 | 0 |  |
 | `services::discord::router::message_handler::latency_spans` | `src/services/discord/router/message_handler/latency_spans.rs` | 230 | 158 | 72 |  |
 | `services::discord::router::message_handler::provider_isolation` | `src/services/discord/router/message_handler/provider_isolation.rs` | 505 | 505 | 0 |  |
-| `services::discord::router::message_handler::tui_followup` | `src/services/discord/router/message_handler/tui_followup.rs` | 963 | 937 | 26 |  |
+| `services::discord::router::message_handler::tui_followup` | `src/services/discord/router/message_handler/tui_followup.rs` | 978 | 952 | 26 |  |
 | `services::discord::router::message_handler::turn_lifecycle` | `src/services/discord/router/message_handler/turn_lifecycle.rs` | 183 | 183 | 0 |  |
 | `services::discord::router::message_handler::voice_announcement_route` | `src/services/discord/router/message_handler/voice_announcement_route.rs` | 444 | 106 | 338 |  |
 | `services::discord::router::message_handler::voice_announcement_scope` | `src/services/discord/router/message_handler/voice_announcement_scope.rs` | 125 | 73 | 52 |  |
 | `services::discord::router::message_handler::watchdog` | `src/services/discord/router/message_handler/watchdog.rs` | 1228 | 959 | 269 |  |
-| `services::discord::router::response_format` | `src/services/discord/router/response_format.rs` | 360 | 336 | 24 |  |
+| `services::discord::router::response_format` | `src/services/discord/router/response_format.rs` | 430 | 351 | 79 |  |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 130 | 130 | 0 |  |
-| `services::discord::router::turn_start` | `src/services/discord/router/turn_start.rs` | 449 | 449 | 0 |  |
+| `services::discord::router::turn_start` | `src/services/discord/router/turn_start.rs` | 522 | 522 | 0 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 893 | 301 | 592 |  |
 | `services::discord::runtime_bootstrap::framework_setup` | `src/services/discord/runtime_bootstrap/framework_setup.rs` | 350 | 326 | 24 |  |
 | `services::discord::runtime_bootstrap::gateway_lease` | `src/services/discord/runtime_bootstrap/gateway_lease.rs` | 259 | 259 | 0 |  |
@@ -747,7 +747,7 @@
 | `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 936 | 878 | 58 |  |
 | `services::discord::turn_bridge::completion_guard::completion_context` | `src/services/discord/turn_bridge/completion_guard/completion_context.rs` | 449 | 449 | 0 |  |
 | `services::discord::turn_bridge::completion_guard::completion_postgres` | `src/services/discord/turn_bridge/completion_guard/completion_postgres.rs` | 644 | 548 | 96 |  |
-| `services::discord::turn_bridge::completion_postlude` | `src/services/discord/turn_bridge/completion_postlude.rs` | 915 | 915 | 0 |  |
+| `services::discord::turn_bridge::completion_postlude` | `src/services/discord/turn_bridge/completion_postlude.rs` | 935 | 935 | 0 |  |
 | `services::discord::turn_bridge::context_window` | `src/services/discord/turn_bridge/context_window.rs` | 170 | 100 | 70 |  |
 | `services::discord::turn_bridge::early_tui_completion` | `src/services/discord/turn_bridge/early_tui_completion.rs` | 71 | 71 | 0 |  |
 | `services::discord::turn_bridge::finalize_epilogue` | `src/services/discord/turn_bridge/finalize_epilogue.rs` | 306 | 156 | 150 |  |
@@ -759,7 +759,7 @@
 | `services::discord::turn_bridge::panel_lifecycle` | `src/services/discord/turn_bridge/panel_lifecycle.rs` | 232 | 232 | 0 |  |
 | `services::discord::turn_bridge::post_loop_finalize` | `src/services/discord/turn_bridge/post_loop_finalize.rs` | 720 | 720 | 0 |  |
 | `services::discord::turn_bridge::recall_feedback` | `src/services/discord/turn_bridge/recall_feedback.rs` | 482 | 372 | 110 |  |
-| `services::discord::turn_bridge::recovery_text` | `src/services/discord/turn_bridge/recovery_text.rs` | 654 | 511 | 143 |  |
+| `services::discord::turn_bridge::recovery_text` | `src/services/discord/turn_bridge/recovery_text.rs` | 841 | 595 | 246 |  |
 | `services::discord::turn_bridge::response_delivery` | `src/services/discord/turn_bridge/response_delivery.rs` | 139 | 75 | 64 |  |
 | `services::discord::turn_bridge::retry_state` | `src/services/discord/turn_bridge/retry_state.rs` | 753 | 384 | 369 |  |
 | `services::discord::turn_bridge::runtime_handoff_loop` | `src/services/discord/turn_bridge/runtime_handoff_loop.rs` | 934 | 934 | 0 |  |
