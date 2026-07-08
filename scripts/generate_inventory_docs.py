@@ -1521,6 +1521,7 @@ def write_documents(documents: dict[Path, str], check: bool) -> int:
     if stale_paths:
         print("")
         print("generated docs are stale; rerun `python3 scripts/generate_inventory_docs.py`")
+        print("NOTE: Generated inventory is stale. Check for existing open PRs to avoid duplicate inventory refreshes before opening a new PR.")
         return 1
 
     if wrote_files:
