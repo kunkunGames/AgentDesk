@@ -127,7 +127,7 @@
 | `db::prompt_manifests::repository` | `src/db/prompt_manifests/repository.rs` | 268 | 268 | 0 |  |
 | `db::prompt_manifests::retention` | `src/db/prompt_manifests/retention.rs` | 96 | 96 | 0 |  |
 | `db::prompt_manifests::storage_stats` | `src/db/prompt_manifests/storage_stats.rs` | 122 | 122 | 0 |  |
-| `db::scheduled_messages` | `src/db/scheduled_messages.rs` | 812 | 812 | 0 |  |
+| `db::scheduled_messages` | `src/db/scheduled_messages.rs` | 913 | 913 | 0 |  |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 304 | 278 | 26 |  |
 | `db::session_observability` | `src/db/session_observability.rs` | 216 | 216 | 0 |  |
 | `db::session_status` | `src/db/session_status.rs` | 78 | 78 | 0 |  |
@@ -522,7 +522,7 @@
 | `services::discord::outbound::reaction_control` | `src/services/discord/outbound/reaction_control.rs` | 105 | 72 | 33 |  |
 | `services::discord::outbound::result` | `src/services/discord/outbound/result.rs` | 151 | 151 | 0 |  |
 | `services::discord::outbound::send_api` | `src/services/discord/outbound/send_api.rs` | 591 | 295 | 296 |  |
-| `services::discord::outbound::send_gate` | `src/services/discord/outbound/send_gate.rs` | 639 | 433 | 206 |  |
+| `services::discord::outbound::send_gate` | `src/services/discord/outbound/send_gate.rs` | 641 | 434 | 207 |  |
 | `services::discord::outbound::send_target` | `src/services/discord/outbound/send_target.rs` | 193 | 144 | 49 |  |
 | `services::discord::outbound::send_to_agent` | `src/services/discord/outbound/send_to_agent.rs` | 157 | 93 | 64 |  |
 | `services::discord::outbound::serenity_reference` | `src/services/discord/outbound/serenity_reference.rs` | 147 | 147 | 0 |  |
@@ -935,7 +935,7 @@
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 133 | 64 | 69 |  |
 | `services::routines::session_control` | `src/services/routines/session_control.rs` | 1065 | 899 | 166 |  |
 | `services::routines::store` | `src/services/routines/store.rs` | 4430 | 3686 | 744 | giant-file |
-| `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 822 | 724 | 98 |  |
+| `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 782 | 684 | 98 |  |
 | `services::service_error` | `src/services/service_error.rs` | 1 | 1 | 0 |  |
 | `services::session_activity` | `src/services/session_activity.rs` | 354 | 275 | 79 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1078 | 667 | 411 |  |

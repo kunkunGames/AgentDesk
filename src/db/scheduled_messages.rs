@@ -50,7 +50,7 @@ pub struct ScheduledMessageRow {
     pub expires_at: Option<DateTime<Utc>>,
     pub status: String,
     pub in_flight_delivery_id: Option<String>,
-    pub fire_count: i32,
+    pub fire_count: i64,
     pub last_fired_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub source: String,

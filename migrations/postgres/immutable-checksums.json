@@ -408,7 +408,7 @@
     },
     {
       "path": "migrations/postgres/0079_scheduled_messages.sql",
-      "sha256": "06e79cb2c612fcd605e284b90e27c63de6b81707e5ebde16a5a472910ea43b9c",
+      "sha256": "f83622cd6a57f7885d727dcd6edd39e01fa0ab3ed36706d3ac6e0fa7695d15ca",
       "version": 79
     }
   ],

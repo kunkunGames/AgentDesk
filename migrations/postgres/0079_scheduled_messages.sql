@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS scheduled_messages (
     -- 'scheduled' | 'firing' | 'sent' | 'failed' | 'canceled' | 'expired'
     status                TEXT NOT NULL DEFAULT 'scheduled',
     in_flight_delivery_id TEXT,
-    fire_count            INTEGER NOT NULL DEFAULT 0,
+    fire_count            BIGINT NOT NULL DEFAULT 0,
     last_fired_at         TIMESTAMPTZ,
     last_error            TEXT,
     source                TEXT NOT NULL DEFAULT 'api',
@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS scheduled_message_deliveries (
     outbox_id            BIGINT,
     turn_id              TEXT,
     fallback_outbox_id   BIGINT,
-    retry_count          INTEGER NOT NULL DEFAULT 0,
+    retry_count          INTEGER NOT NULL DEFAULT 0, -- agentdesk-audit: allow-int4 (bounded by the claim-time MAX_FIRE_RETRIES re-arm cap; small retry counter, not unbounded growth)
     next_attempt_at      TIMESTAMPTZ,
     error                TEXT,
     started_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
