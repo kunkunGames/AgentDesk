@@ -2359,20 +2359,6 @@ fn validate_complete_request(
         )
     };
 
-    if body.guild_id.trim().is_empty() {
-        return Err(bad_request(
-            OnboardingRerunPolicy::ReuseExisting,
-            false,
-            "guild_id is required for onboarding completion".to_string(),
-        ));
-    }
-    if let Err(error) = parse_owner_id(body.owner_id.as_deref()) {
-        return Err(bad_request(
-            OnboardingRerunPolicy::ReuseExisting,
-            false,
-            error,
-        ));
-    }
     let explicit_rerun_policy = body
         .rerun_policy
         .as_deref()
@@ -2389,6 +2375,21 @@ fn validate_complete_request(
             ));
         }
     };
+
+    if body.guild_id.trim().is_empty() {
+        return Err(bad_request(
+            rerun_policy,
+            explicit_rerun_policy,
+            "guild_id is required for onboarding completion".to_string(),
+        ));
+    }
+    if let Err(error) = parse_owner_id(body.owner_id.as_deref()) {
+        return Err(bad_request(
+            rerun_policy,
+            explicit_rerun_policy,
+            error,
+        ));
+    }
     let request_fingerprint = match requested_channel_fingerprint(body, provider) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
