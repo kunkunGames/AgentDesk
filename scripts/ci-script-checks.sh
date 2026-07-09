@@ -77,7 +77,7 @@ echo "=== CI runner hardening guard ==="
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -92,6 +92,18 @@ done
 for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch shell file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
+for scratch_file in scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch Python file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
+for scratch_file in scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch JavaScript file detected in repository root: $scratch_file"
     FAIL=1
   fi
 done
