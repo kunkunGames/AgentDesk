@@ -563,17 +563,13 @@ var reviewAutomation = {
     // explicit verdict, create a review-decision dispatch so the original agent
     // can inspect the review comments and decide the outcome.
     if (!verdict && result.auto_completed && dispatch.dispatch_type === "review") {
-      var cards = agentdesk.db.query(
-        "SELECT assigned_agent_id, title, github_issue_number, status FROM kanban_cards WHERE id = ?",
-        [dispatch.kanban_card_id]
-      );
+      var card = agentdesk.cards.get(dispatch.kanban_card_id);
       // Guard: skip dispatch creation for terminal cards — prevents stale review loops after dismiss
-      if (cards.length > 0 && agentdesk.pipeline.isTerminal(cards[0].status, cfg)) {
+      if (card && agentdesk.pipeline.isTerminal(card.status, cfg)) {
         agentdesk.log.info("[review] Card " + dispatch.kanban_card_id + " already terminal — skipping review-decision dispatch");
         return;
       }
-      if (cards.length > 0 && cards[0].assigned_agent_id) {
-        var card = cards[0];
+      if (card && card.assigned_agent_id) {
         var issueNum = card.github_issue_number || "?";
         // #2051 Finding 26 (P2): dedupe pending review-decision dispatches.
         // If the previous round's review-decision is still pending/dispatched
