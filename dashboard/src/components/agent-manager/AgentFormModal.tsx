@@ -7,6 +7,7 @@ import { localeName, useI18n } from "../../i18n";
 import EmojiPicker from "./EmojiPicker";
 import AgentPromptEditor from "./AgentPromptEditor";
 import type { FormData } from "./types";
+import { useReturnFocus } from "../common/overlay/useReturnFocus";
 import {
   SurfaceActionButton,
   SurfaceCard,
@@ -66,6 +67,7 @@ export default function AgentFormModal({
   });
   const formValues = watch();
   const spriteNum = formValues.sprite_number ?? 0;
+  useReturnFocus(true);
 
   // ESC 키로 닫기
   useEffect(() => {
@@ -140,6 +142,7 @@ export default function AgentFormModal({
             <div className="space-y-4">
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
             <div
+              id="sprite-spinbutton"
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
               role="spinbutton"
               aria-label={tr("스프라이트 번호", "Sprite Number")}
@@ -166,6 +169,8 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-controls="sprite-spinbutton"
+                  tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -206,6 +211,8 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-controls="sprite-spinbutton"
+                  tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",

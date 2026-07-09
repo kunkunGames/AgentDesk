@@ -8,6 +8,7 @@ import * as api from "../../api";
 import { DEPT_BLANK, DEPT_COLORS } from "./constants";
 import EmojiPicker from "./EmojiPicker";
 import type { Translator } from "./types";
+import { useReturnFocus } from "../common/overlay/useReturnFocus";
 import {
   SurfaceActionButton,
   SurfaceNotice,
@@ -98,6 +99,7 @@ export default function DepartmentFormModal({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const overlayRef = useRef<HTMLDivElement>(null);
   const colorButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  useReturnFocus(true);
 
   // sort_order 기반 다음 순번 계산
   const nextSortOrder = (() => {
@@ -313,17 +315,17 @@ export default function DepartmentFormModal({
               <div className="flex items-start gap-3">
                 <div>
                   <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
-                    {tr("아이콘", "Icon")}
+                    {tr("이모지", "Emoji")}
                   </label>
                   <EmojiPicker
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
                     aria-label={
                       form.icon
-                        ? t({ ko: `선택된 아이콘: ${form.icon}, 아이콘 변경`, en: `Selected icon: ${form.icon}, change icon` })
-                        : t({ ko: "아이콘 선택기 열기", en: "Open icon picker" })
+                        ? t({ ko: `선택된 이모지: ${form.icon}, 이모지 변경`, en: `Selected emoji: ${form.icon}, change emoji` })
+                        : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
                     }
-                    dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
+                    dialogLabel={t({ ko: "이모지 선택", en: "Choose an emoji" })}
                   />
                 </div>
                 <div className="flex-1">
