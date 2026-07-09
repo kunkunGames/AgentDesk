@@ -621,9 +621,41 @@ esac
 
 # ── Step 5: Smoke test ────────────────────────────────────────────────────────
 info "Waiting for health check (port $HEALTH_PORT)..."
+
+# #4382: read the LIVE `degraded_reasons` straight off public /api/health — the
+# axis that actually decides `degraded`/`status` — so a degraded deploy names its
+# own cause in the log instead of leaving operators to misread the unrelated
+# `startup_degraded_reasons`. jq-optional (falls back to the pure-bash readers).
+log_health_degraded_reasons() {
+  local body_file http_code health_json status degraded reasons
+  body_file="$(mktemp)"
+  # #4386-review defect 2: do NOT use `curl -f`. A degraded deploy answers
+  # /api/health with HTTP 503, and `-f` discards the body on non-2xx — throwing
+  # away the exact `degraded_reasons` this function exists to log. Capture the
+  # body regardless of status code (`-o` + `-w '%{http_code}'`).
+  http_code="$(curl -s --max-time 3 -o "$body_file" -w '%{http_code}' \
+    "http://${ADK_DEFAULT_LOOPBACK}:${HEALTH_PORT}/api/health" 2>/dev/null || true)"
+  health_json="$(cat "$body_file" 2>/dev/null || true)"
+  rm -f "$body_file"
+  if [ -z "$health_json" ]; then
+    info "  health snapshot unavailable (could not read /api/health, http=${http_code:-none})"
+    return 0
+  fi
+  status="$(_health_json_get_string_field "$health_json" status)"
+  reasons="$(_health_json_get_string_array_csv "$health_json" degraded_reasons)"
+  if _health_json_field_is_true "$health_json" degraded; then
+    degraded=true
+  else
+    degraded=false
+  fi
+  info "  health(${http_code:-?}): status=${status:-unknown} degraded=${degraded} degraded_reasons=[${reasons}]"
+}
+
 if wait_for_http_service_health "$LABEL" "$HEALTH_PORT" 10 2 0 1; then
   ok "Health check passed on :$HEALTH_PORT/api/health"
+  log_health_degraded_reasons
 else
+  log_health_degraded_reasons
   fail "Health check failed after waiting for :$HEALTH_PORT/api/health. Check logs:"
   echo "  $AD_HOME/logs/dcserver.stdout.log"
   echo "  $AD_HOME/logs/dcserver.stderr.log"
