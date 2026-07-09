@@ -59,7 +59,9 @@ pub(crate) fn sanitize_hidden_context(input: &str) -> String {
         }
 
         if in_code_block {
-            out.push(line.to_string());
+            if !dropping_block {
+                out.push(line.to_string());
+            }
             continue;
         }
 
@@ -174,4 +176,17 @@ fn trim_blank_edges(lines: Vec<String>) -> String {
         .map(|index| index + 1)
         .unwrap_or(start);
     lines[start..end].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_hidden_context_drops_code_blocks() {
+        let input = "[Authoritative Instructions]\nSome instruction\n```rust\nsecret_code();\n```\nMore instructions\n\nPublic reply";
+        let output = sanitize_hidden_context(input);
+        assert!(!output.contains("secret_code"), "Secret code leaked! Output:\n{}", output);
+        assert!(output.contains("Public reply"));
+    }
 }
