@@ -186,7 +186,10 @@ mod tests {
     fn test_sanitize_hidden_context_drops_code_blocks() {
         let input = "[Authoritative Instructions]\nSome instruction\n```rust\nsecret_code();\n```\nMore instructions\n\nPublic reply";
         let output = sanitize_hidden_context(input);
-        assert!(!output.contains("secret_code"), "Secret code leaked! Output:\n{}", output);
+        assert!(
+            !output.contains("secret_code"),
+            "Secret code leaked! Output:\n{output}"
+        );
         assert!(output.contains("Public reply"));
     }
 }
