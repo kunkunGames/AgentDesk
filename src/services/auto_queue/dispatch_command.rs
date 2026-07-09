@@ -422,12 +422,19 @@ pub(super) fn normalize_similarity_path(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+pub(super) fn file_path_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
+        )
+        .expect("file path regex must compile") // agentdesk-audit: allow-unwrap — literal compile-time pattern, failure is a programmer error
+    })
+}
+
 pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
-    let re = regex::Regex::new(
-        r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
-    )
-    .expect("file path regex must compile");
-    re.find_iter(text)
+    file_path_regex()
+        .find_iter(text)
         .filter_map(|m| normalize_similarity_path(m.as_str()))
         .collect()
 }
