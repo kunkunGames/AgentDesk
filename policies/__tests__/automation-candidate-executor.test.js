@@ -375,6 +375,7 @@ test("card at MAX_DISPATCH_RETRIES limit → permanently skipped", () => {
 
   assert.equal(r.action, "complete", "card at max retries should be permanently skipped");
   assert.equal(r.checkpoint.stats.dispatched, 0, "should not count as dispatched");
+  assert.equal(r.checkpoint.stats.stalled_candidates, 1, "should count as stalled");
 });
 
 // --- Checkpoint version mismatch ---
