@@ -152,13 +152,7 @@
     "session ended … start a new session" tmux-death notice and its
     `should_send_session_ended_notice`/`session_ended_notice`/
     `TmuxDeathLifecycleDecision` plumbing).
-  - `src/services/discord/tmux.rs` (1624 lines; +11 from #4380 broadening the
-    watcher-yield escape hatch (`watcher_should_yield_to_inflight_state`) to honour
-    the `readopted_from_inflight` crash re-adopt marker via
-    `crash_resume_guard::crash_readopt_live_relay_resume_required`, so a
-    crash-recovered live turn resumes relay instead of yielding to the now-dead
-    bridge (the escape-hatch body + tests; predicate lives in the non-giant
-    `crash_resume_guard.rs`); -17 from #4151 removing
+  - `src/services/discord/tmux.rs` (1613 lines; -17 from #4151 removing
     `format_monitor_suppressed_body` — its only caller was the unreachable #1009
     MonitorAutoTurn suppressed-body replacement in tmux_watcher.rs (dead since
     #1708; #4144 r2 closed the None-kind Edit path); -8 from #4198 routing the restored-watcher release D-section through the shared `turn_finalizer::cleanup` helpers (`snapshot_role_override` / `clear_watchdog_and_kick_thread_parents_after_turn_release` / `remove_owned_role_override`); +32 from #4105 adding
@@ -1619,7 +1613,7 @@
     `audit_maintainability_config.toml`; the root is no longer a prod giant and
     was removed from `giant_file_registry.toml`; #3038 S5 locked the final
     root ratchet at 274 production lines).
-  - `src/services/discord/voice_barge_in.rs` (2905 lines after #3906 added the
+  - `src/services/discord/voice_barge_in.rs` (2893 lines after #3906 added the
     deterministic voice intake feedback (P1 Phase-1 intake chime emitted right
     before `start_voice_turn` plus removal of the redundant foreground-start
     chime, and the P4 `DONE_CHIME_FILE_NAME` const; the bulky
@@ -1823,7 +1817,7 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2723 lines; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease).
+  - `src/config.rs` (2705 lines; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required)).
   - `src/server/mod.rs` (2821 lines; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1508 lines).
@@ -1832,14 +1826,12 @@
     stale-inflight preservation review hardening; periodic reconcile loop
     covering stale inflights, orphan uploads, dispatched-session drift, and
     queue-review drift — split before adding non-bugfix behavior).
-  - `src/server/maintenance.rs` (1119 lines; #3909 added the leader-only voice
+  - `src/server/maintenance.rs` (1014 lines; #3909 added the leader-only voice
     TTS cache/temp sweep (`ProgressTtsCacheSweepJob`, 15th MaintenanceJob) +
     runtime-config threading, tipping the per-job-impl static registry over the
     1000-line giant threshold — also registered in `giant_file_registry.toml`.
-    The sweep LOGIC lives in `services::maintenance::jobs::voice_cache_sweep`.
-    #4231 promoted the per-job startup-stagger literals to named `*_STARTUP_STAGGER`
-    constants with rationale comments (behavior-preserving; +105 doc/const lines).
-    Bugfix/readability-only, decompose the storage/voice job-impl clusters into siblings).
+    The sweep LOGIC lives in `services::maintenance::jobs::voice_cache_sweep`;
+    bugfix-only, decompose the storage/voice job-impl clusters into siblings).
 - active_callsite_coverage: n/a.
 - invariants: config precedence, runtime path generation, kanban state, receipt
   persistence, and GitHub sync must keep their existing owner-specific

@@ -26,38 +26,6 @@ set -euo pipefail
 #                                      offline/emergency deploy.
 #   AGENTDESK_DEPLOY_FAST=1            opt into the release-fast Cargo profile
 #                                      for lower-latency dev-loop deploys.
-# Resource-contention pre-flight (#4255 — runs on every node before the build):
-#   AGENTDESK_DEPLOY_MAX_LOADAVG           1-min load-average ceiling; over it the
-#                                          deploy refuses. Default: 1.5 × logical
-#                                          CPU count (e.g. 21.0 on a 14-core box).
-#                                          The load probe is SKIPPED (fail-open) if
-#                                          the CPU count is unreadable and no
-#                                          explicit ceiling is set.
-#   AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL macOS memory-pressure ceiling
-#                                          (kern.memorystatus_vm_pressure_level:
-#                                          1=normal 2=warn 4=critical). Refuse when
-#                                          the level is >= this. Default: 4.
-#   AGENTDESK_DEPLOY_HIGH_CPU_PCT           ps %CPU at/above which a non-deploy
-#                                          process (own process group excluded) is
-#                                          flagged by pid/name. Default: 90.
-#   AGENTDESK_DEPLOY_RUNAWAY_CPU_RATIO      a flagged process refuses ON ITS OWN
-#                                          (no corroboration) when it is a SUSTAINED
-#                                          runaway: cumulative-CPU / elapsed >= this
-#                                          ratio (the 07-07 zombie-ugrep shape, a
-#                                          single core never moves loadavg on a
-#                                          many-core box). Default: 0.8. Otherwise a
-#                                          lone hot process is advisory unless
-#                                          corroborated by load-over-ceiling or
-#                                          memory pressure at/above the block level.
-#   AGENTDESK_DEPLOY_RUNAWAY_MIN_ELAPSED    seconds a process must have lived before
-#                                          the runaway rule applies — spares a fresh
-#                                          legitimate burst (a rust-analyzer reindex
-#                                          begun 90 s ago has ratio ~1 but is not a
-#                                          zombie). Default: 600.
-#   AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=1
-#                                          escape hatch — proceed past a failed
-#                                          resource pre-flight (findings are still
-#                                          printed, downgraded to warnings).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_defaults.sh
@@ -105,11 +73,6 @@ DEPLOY_PEERS_OVERRIDE=()
 DEPLOY_PEERS_FILE="${AGENTDESK_DEPLOY_PEERS_FILE:-$ADK_REL/config/deploy-peers.txt}"
 DEPLOY_PEER_INVOCATION="${AGENTDESK_DEPLOY_PEER_INVOCATION:-0}"
 DEPLOY_FAST="${AGENTDESK_DEPLOY_FAST:-0}"
-# #4348 Defect 3: bound the peer SSH connection phase so an unreachable mDNS
-# alias (e.g. mac-book.local not resolving) fails fast instead of hanging the
-# whole cluster deploy. Only the connect is bounded; a reachable peer's long
-# remote build is unaffected.
-DEPLOY_SSH_CONNECT_TIMEOUT="${AGENTDESK_DEPLOY_SSH_CONNECT_TIMEOUT:-10}"
 
 # Parse flags non-destructively into shell vars + env so that the lock-acquire
 # re-exec (lockf/flock pass-through) and the detached-helper tmux script both
@@ -618,62 +581,6 @@ ${summary}"
     _notify_channel "$content"
 }
 
-_manifest_latest_migration_name() {
-    # Latest postgres migration recorded by the LAST SUCCESSFUL deploy. The
-    # manifest is only rewritten on the success path (after DEPLOY_OK), so during
-    # a failing deploy it still reflects the binary that is now the rollback
-    # target (.prev). Prints the migration filename; returns non-zero when the
-    # manifest or field is absent so the caller can fail closed. See #4348.
-    local manifest="$ADK_REL/runtime/release-source.json"
-    [ -f "$manifest" ] || return 1
-    python3 - "$manifest" <<'PY' 2>/dev/null
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception:
-    sys.exit(1)
-value = data.get("latest_postgres_migration") or ""
-if not value:
-    sys.exit(1)
-print(value)
-PY
-}
-
-_rollback_would_brick_on_migration() {
-    # #4348 Defect 2: refuse a rollback that would strand the previous binary
-    # behind a migration the new binary already applied to the SHARED Postgres.
-    # The old binary aborts boot with "migration N was previously applied but is
-    # missing in the resolved migrations", and because the row lives in the
-    # shared DB, every OTHER node bricks on its next restart too. Returns 0 =>
-    # rollback unsafe (fail-forward); returns 1 => rollback safe. Fails CLOSED on
-    # any ambiguity (safety > minimal-change): a rollback must never brick.
-    if [ "${AGENTDESK_DEPLOY_FORCE_ROLLBACK:-0}" = "1" ]; then
-        echo "  ▸ [rollback-guard] AGENTDESK_DEPLOY_FORCE_ROLLBACK=1 — skipping migration-advance guard" >&2
-        return 1
-    fi
-    local new_path new_name old_name
-    new_path="$(_latest_postgres_migration_path 2>/dev/null || true)"
-    if [ -z "$new_path" ]; then
-        echo "  ⚠ [rollback-guard] cannot resolve the new binary's latest migration ($REPO/migrations/postgres) — treating rollback as unsafe" >&2
-        return 0
-    fi
-    new_name="$(basename "$new_path")"
-    old_name="$(_manifest_latest_migration_name || true)"
-    if [ -z "$old_name" ]; then
-        echo "  ⚠ [rollback-guard] no previous-deploy migration record ($ADK_REL/runtime/release-source.json) — cannot prove the rollback binary handles ${new_name}; treating rollback as unsafe" >&2
-        return 0
-    fi
-    if _migration_advanced "$new_name" "$old_name"; then
-        echo "  ▸ [rollback-guard] new migration ${new_name} is ahead of rollback target ${old_name}" >&2
-        return 0
-    fi
-    echo "  ▸ [rollback-guard] rollback target ${old_name} is at/ahead of new migration ${new_name} — safe to roll back" >&2
-    return 1
-}
-
 # #3858: restore the last-known-good release binary and restart the service.
 # Invoked from the EXIT trap (via _cleanup_on_exit) whenever the binary was
 # promoted but the deploy never reached DEPLOY_OK — i.e. ANY non-zero exit after
@@ -691,36 +598,6 @@ _rollback_release_binary() {
     [ -n "$rel_binary" ] && [ -n "$plist" ] || return 0
     if [ ! -f "$rel_backup" ]; then
         echo "⚠ No rollback backup available (${rel_backup:-unset} missing) — cannot auto-rollback"
-        return 0
-    fi
-
-    # #4348 Defect 2: fail-forward instead of bricking when the new binary
-    # advanced the shared Postgres schema past what the rollback target can boot.
-    if _rollback_would_brick_on_migration; then
-        echo ""
-        echo "🛑 ROLLBACK REFUSED — schema migrations advanced beyond the rollback target (#4348)"
-        echo "   The new binary already applied a Postgres migration to the SHARED database that"
-        echo "   the previous binary ($rel_backup) does not embed. Restarting the old binary would"
-        echo "   fail with 'migration was previously applied but is missing in the resolved"
-        echo "   migrations' and REFUSE TO BOOT. Because the migration row lives in the shared"
-        echo "   Postgres, rolling back would ALSO brick every other node on its next restart —"
-        echo "   turning a one-node deploy failure into a cluster-wide outage."
-        echo ""
-        echo "   FAIL-FORWARD: leaving the NEW binary live (it is what is currently running under"
-        echo "   launchd). The rollback backup at $rel_backup is preserved for manual use."
-        echo ""
-        echo "   MANUAL INTERVENTION REQUIRED:"
-        echo "     1. Check whether the new binary is actually serving:"
-        echo "          curl -s http://${ADK_DEFAULT_LOOPBACK}:${rel_port}/api/health"
-        echo "        If it reports server_up/db/dashboard true, the deploy likely tripped a"
-        echo "        readiness edge case — confirm it is serving and no rollback is needed."
-        echo "     2. If the new binary is genuinely broken, FIX FORWARD: patch the code and"
-        echo "        redeploy. Do NOT downgrade the binary while the newer migration is applied."
-        echo "     3. A manual downgrade is only safe AFTER you revert the migration on the shared"
-        echo "        Postgres. To force the classic auto-rollback on a re-run (once the DB is"
-        echo "        reverted), set AGENTDESK_DEPLOY_FORCE_ROLLBACK=1."
-        echo "     4. Release logs: ${ADK_REL:-}/logs/"
-        echo ""
         return 0
     fi
 
@@ -747,7 +624,7 @@ _rollback_release_binary() {
         echo "⚠ launchd bootstrap failed during rollback — using tmux fallback"
         start_release_tmux_fallback || true
     fi
-    if wait_for_http_service_health "$plist" "$rel_port" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1; then
+    if wait_for_http_service_health "$plist" "$rel_port" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1; then
         echo "✓ Rollback succeeded — release healthy on :${rel_port} with previous binary"
     else
         echo "✗ Rollback restart did not reach healthy state — manual intervention required (logs: ${ADK_REL:-}/logs/)"
@@ -832,12 +709,6 @@ _deploy_peer_env_prelude() {
         AGENTDESK_DEPLOY_SKIP_BUILD_CACHE_CLEANUP \
         AGENTDESK_DEPLOY_SKIP_FRESHNESS \
         AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS \
-        AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT \
-        AGENTDESK_DEPLOY_MAX_LOADAVG \
-        AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL \
-        AGENTDESK_DEPLOY_HIGH_CPU_PCT \
-        AGENTDESK_DEPLOY_RUNAWAY_CPU_RATIO \
-        AGENTDESK_DEPLOY_RUNAWAY_MIN_ELAPSED \
         AGENTDESK_DEPLOY_TEST_MODE \
         AGENTDESK_REL_PORT \
         AGENTDESK_REPORT_CHANNEL_ID \
@@ -883,13 +754,13 @@ git merge --quiet --ff-only origin/main"
     remote_deploy_command="${remote_cd_command} && ${env_prelude} bash scripts/deploy-release.sh${quoted_args}"
 
     echo "▸ [peer:$peer] Pre-syncing repo (fast-forward only)..."
-    if ! ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$remote_presync_command")"; then
-        echo "✗ [peer:$peer] Pre-sync failed (diverged, fetch error, or unreachable within ${DEPLOY_SSH_CONNECT_TIMEOUT}s). Resolve on the peer and retry."
+    if ! ssh "$peer" "bash -lc $(printf '%q' "$remote_presync_command")"; then
+        echo "✗ [peer:$peer] Pre-sync failed (diverged or fetch error). Resolve on the peer and retry."
         return 1
     fi
 
     echo "▸ [peer:$peer] Running deploy-release.sh..."
-    if ! ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$remote_deploy_command")"; then
+    if ! ssh "$peer" "bash -lc $(printf '%q' "$remote_deploy_command")"; then
         echo "✗ [peer:$peer] deploy-release.sh failed"
         return 1
     fi
@@ -1002,12 +873,6 @@ export AGENTDESK_DEPLOY_BINARY=$(printf '%q' "${AGENTDESK_DEPLOY_BINARY:-}")
 export AGENTDESK_DEPLOY_FAST=$(printf '%q' "${AGENTDESK_DEPLOY_FAST:-0}")
 export AGENTDESK_DEPLOY_SKIP_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}")
 export AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}")
-export AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=$(printf '%q' "${AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT:-0}")
-export AGENTDESK_DEPLOY_MAX_LOADAVG=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_LOADAVG:-}")
-export AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL:-}")
-export AGENTDESK_DEPLOY_HIGH_CPU_PCT=$(printf '%q' "${AGENTDESK_DEPLOY_HIGH_CPU_PCT:-}")
-export AGENTDESK_DEPLOY_RUNAWAY_CPU_RATIO=$(printf '%q' "${AGENTDESK_DEPLOY_RUNAWAY_CPU_RATIO:-}")
-export AGENTDESK_DEPLOY_RUNAWAY_MIN_ELAPSED=$(printf '%q' "${AGENTDESK_DEPLOY_RUNAWAY_MIN_ELAPSED:-}")
 export AGENTDESK_DEPLOY_ALLOW_NON_MAIN=$(printf '%q' "${AGENTDESK_DEPLOY_ALLOW_NON_MAIN:-0}")
 export AGENTDESK_DEPLOY_ALLOW_DIRTY=$(printf '%q' "${AGENTDESK_DEPLOY_ALLOW_DIRTY:-0}")
 export AGENTDESK_DEPLOY_LOCK_FILE=$(printf '%q' "$DEPLOY_LOCK_FILE")
@@ -1056,21 +921,6 @@ if _self_hosted_release_session; then
 fi
 
 _acquire_release_deploy_lock "$@"
-
-# #4255: resource-contention pre-flight — refuse (or, with the force hatch,
-# warn) BEFORE any expensive build work when the machine is already saturated by
-# another builder / high-load process, which twice KILLED a mid-flight deploy
-# (07-05 concurrent UE build, 07-07 runaway ugrep). Runs on EVERY node: each
-# peer invokes this same script under its own lock, so it checks its own local
-# resources. Exact-name builder matching (pgrep -x) means the ssh client, sshd,
-# and the deploy script itself are never mistaken for contention, and the
-# high-CPU scan excludes this deploy's own process group. Skipped in the
-# detached-helper dry run (DEPLOY_TEST_MODE=1), which never builds.
-if [ "$DEPLOY_TEST_MODE" != "1" ]; then
-    if ! _preflight_resource_contention; then
-        exit 1
-    fi
-fi
 
 # #743: Zero-inflight gate for create-pr dispatches on the release runtime.
 # A restart during an in-flight create-pr dispatch leaves its completion
@@ -1640,11 +1490,7 @@ fi
 REL_PORT="${AGENTDESK_REL_PORT:-$ADK_DEFAULT_PORT}"
 echo "▸ Waiting for release health on :${REL_PORT}..."
 REL_HEALTHY=false
-# #4348 Defect 1: the trailing `1` opts the DEPLOY readiness gate into treating a
-# serving node that is unhealthy SOLELY because no provider runtimes are
-# registered (leader-only / no-agent-session node) as deploy-ready. Runtime
-# /api/health keeps reporting unhealthy for monitoring; only this gate relaxes.
-if wait_for_http_service_health "$PLIST_REL" "$REL_PORT" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1; then
+if wait_for_http_service_health "$PLIST_REL" "$REL_PORT" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1; then
     REL_HEALTHY=true
 fi
 
@@ -1675,11 +1521,7 @@ rm -f "$REL_BINARY_BACKUP" 2>/dev/null || true
 # interrupted prior backup copy never lingers in bin/.
 rm -f "$REL_BINARY_BACKUP.tmp" 2>/dev/null || true
 
-if _health_json_unhealthy_only_no_provider_runtimes "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then
-    echo "✓ Release is serving on :${REL_PORT} (deploy-ready: no provider runtimes registered —"
-    echo "  leader-only / no-agent-session node; runtime /api/health stays unhealthy for"
-    echo "  monitoring, but the server, DB, and dashboard are up [#4348])"
-elif _health_json_field_exists "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}" "fully_recovered" \
+if _health_json_field_exists "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}" "fully_recovered" \
   && ! _health_json_field_is_true "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}" "fully_recovered"; then
     echo "✓ Release is serving on :${REL_PORT} (startup recovery still in progress)"
 elif _health_json_reconcile_only "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then

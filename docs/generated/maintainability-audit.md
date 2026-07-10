@@ -8,7 +8,7 @@ Automated audit of giant files, route SRP violations, direct Discord sends, serv
 
 Hard-gating is **enabled** for 10 checks: `giant_files`, `giant_file_ratchet`, `namespace_size_caps`, `direct_discord_sends`, `direct_discord_reactions`, `footer_view_writes`, `manual_json_row_mapping`, `git_subprocess_callsites`, `legacy_sqlite_refs`, `source_of_truth_alias_writes`.
 
-Baseline no-regression gates are **enabled** for 3 checks: `parent_test_residue`, `route_srp_violations`, `service_server_backflow`.
+Baseline no-regression gates are **enabled** for 2 checks: `route_srp_violations`, `service_server_backflow`.
 
 ## Summary
 
@@ -16,7 +16,6 @@ Baseline no-regression gates are **enabled** for 3 checks: `parent_test_residue`
 |---|---:|:--:|:--:|
 | `giant_files` | 0 | YES | no |
 | `giant_file_ratchet` | 0 | YES | no |
-| `parent_test_residue` | 6 | no | YES |
 | `namespace_size_caps` | 0 | YES | no |
 | `route_srp_violations` | 10 | no | YES |
 | `service_server_backflow` | 0 | no | YES |
@@ -40,19 +39,6 @@ _No findings._
 Production giants listed in scripts/audit_maintainability_giant_baseline.toml must not exceed their frozen production-LoC baseline.
 
 _No findings._
-
-## Parent test residue (`parent_test_residue`)
-
-Decomposition parents whose inline test LoC exceeds 3x their production LoC (files >= 500 raw lines). Migrate stranded tests with the production code; frozen offenders are baselined in scripts/audit_maintainability_config.toml.
-
-| Severity | File | Line | Message |
-|---|---|---:|---|
-| warn | `src/services/discord/inflight.rs` |  | 5451 test LoC vs 590 prod LoC (ratio 9.24x > 3x, 6041 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/inflight/save_store.rs` |  | 730 test LoC vs 235 prod LoC (ratio 3.11x > 3x, 965 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/recovery_engine/manual_rebind/codex_tui_replay.rs` |  | 711 test LoC vs 233 prod LoC (ratio 3.05x > 3x, 944 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 131 prod LoC (ratio 3.44x > 3x, 581 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 1048 prod LoC (ratio 3.81x > 3x, 5040 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 428 test LoC vs 87 prod LoC (ratio 4.92x > 3x, 515 raw); migrate the stranded tests with the decomposed production code |
 
 ## Namespace size caps (`namespace_size_caps`)
 
@@ -130,4 +116,3 @@ _No findings._
 File-write callsites that touch alias paths listed in docs/source-of-truth.md. Writes should target the canonical path.
 
 _No findings._
-

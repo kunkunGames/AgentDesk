@@ -2882,6 +2882,7 @@ fn transcript_dirs_from_config(config: &VoiceConfig) -> Vec<PathBuf> {
     vec![crate::voice::utils::expand_tilde(&config.audio.transcripts_dir)]
 }
 
+
 fn lock_monitor(
     monitor: &std::sync::Mutex<LiveBargeInMonitor>,
 ) -> std::sync::MutexGuard<'_, LiveBargeInMonitor> {
@@ -3302,8 +3303,6 @@ mod tests {
             )
             .0,
             turn_view_reconciler: super::super::turn_view_reconciler::TurnViewReconciler::default(),
-            readopted_mailbox_ledger:
-                super::super::readopted_mailbox_ledger::ReadoptedMailboxLedger::default(),
         })
     }
 

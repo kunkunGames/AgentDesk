@@ -194,20 +194,8 @@ pub(super) async fn complete_recovery_visible_turn(
         background,
         source,
         |tmux_session_name| async move {
-            // #4353: `super::tmux` is cfg(unix). No tmux pane means nothing can be
-            // pending in one.
-            #[cfg(unix)]
-            {
-                super::tmux::sniff_background_agent_pending_for_completion(
-                    tmux_session_name.as_deref(),
-                )
+            super::tmux::sniff_background_agent_pending_for_completion(tmux_session_name.as_deref())
                 .await
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tmux_session_name;
-                false
-            }
         },
     )
     .await

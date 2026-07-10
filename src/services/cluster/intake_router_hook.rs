@@ -276,11 +276,6 @@ pub(crate) enum RanLocalReason {
 pub(crate) struct IntakeRouterContext<'a> {
     pub mode: IntakeRoutingMode,
     pub leader_instance_id: &'a str,
-    /// Provider of the bot handling this intake (#4349). Worker claim is
-    /// scoped on this, so it must be the forwarding bot's provider — never
-    /// `agents.provider`, which is a single column shared by an agent's
-    /// cc and cdx channels.
-    pub provider: &'a str,
     pub channel_id: &'a str,
     pub user_msg_id: &'a str,
     pub request_owner_id: &'a str,
@@ -348,12 +343,7 @@ pub(crate) async fn try_route_intake(
 
     // Resolve agent + preference. NoAgentForChannel is NOT an error —
     // many channels (DMs, ad-hoc cross-bot) have no agent row.
-    //
-    // #4349: the agent's own `provider` column is deliberately ignored for
-    // routing. It is a single value shared by the agent's cc and cdx
-    // channels, so on a paired agent it disagrees with the bot that is
-    // actually handling this message. `ctx.provider` is that bot.
-    let (agent_id, _agent_provider, preferred_labels) =
+    let (agent_id, agent_provider, preferred_labels) =
         match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => {
@@ -388,7 +378,7 @@ pub(crate) async fn try_route_intake(
                 .filter(|node| {
                     crate::services::cluster::node_registry::node_supports_intake_provider(
                         node,
-                        ctx.provider,
+                        &agent_provider,
                     )
                 })
                 .collect();
@@ -476,9 +466,7 @@ async fn try_route_node_override(
     ctx: &IntakeRouterContext<'_>,
     target: &str,
 ) -> IntakeRouterDecision {
-    // #4349: `agents.provider` is ignored here for the same reason as in
-    // `try_route_intake` — the handling bot is `ctx.provider`.
-    let (agent_id, _agent_provider, _) =
+    let (agent_id, agent_provider, _) =
         match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => {
@@ -524,7 +512,7 @@ async fn try_route_node_override(
                 .is_some_and(|status| status.eq_ignore_ascii_case("online"))
             && crate::services::cluster::node_registry::node_supports_intake_provider(
                 node,
-                ctx.provider,
+                &agent_provider,
             )
     });
     if !target_online {
@@ -570,7 +558,6 @@ fn build_payload_for_insert(
     InsertPendingPayload {
         target_instance_id: target.to_string(),
         forwarded_by_instance_id: ctx.leader_instance_id.to_string(),
-        provider: ctx.provider.to_string(),
         required_labels: serde_json::Value::Array(
             preferred_labels
                 .iter()
@@ -694,7 +681,6 @@ mod pg_tests {
         IntakeRouterContext {
             mode,
             leader_instance_id: "leader-1",
-            provider: "claude",
             channel_id: channel,
             user_msg_id: "9999",
             request_owner_id: "100",
