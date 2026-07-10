@@ -428,14 +428,12 @@ pub(super) fn file_path_regex() -> &'static regex::Regex {
         regex::Regex::new(
             r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
         )
-        // agentdesk-audit: allow-unwrap - static regex is known to be valid
-        .expect("file path regex must compile")
+        .expect("file path regex must compile") // agentdesk-audit: allow-unwrap - static regex is known to be valid
     })
 }
 
 pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
-    file_path_regex()
-        .find_iter(text)
+    file_path_regex().find_iter(text)
         .filter_map(|m| normalize_similarity_path(m.as_str()))
         .collect()
 }
