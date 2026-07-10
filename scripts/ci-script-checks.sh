@@ -76,6 +76,15 @@ echo "=== Inflight blind-save ratchet guard (#4259) ==="
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
 
+echo "=== PR infrastructure failure rerun classifier (#4392) ==="
+./scripts/ci/infra-failure-rerun.sh --self-test
+
+echo "=== CI timeout wrapper tests (#4413) ==="
+"$PYTHON" -m unittest tests.test_ci_timeout
+
+echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
+"$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
+
 echo "=== Scratch file guard ==="
 FAIL=0
 for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql; do
@@ -147,6 +156,13 @@ echo "=== Portable deployable path lint ==="
   tests.test_script_python_policy \
   tests.test_analyze_prs
 
+echo "=== Relay watchdog + PG tunnel supervisor tests (#4381/#4378) ==="
+# The out-of-band relay watchdog is a deployable Python script; it is not
+# covered by shellcheck (only *.sh) nor by cargo, so this unittest run is its
+# ONLY CI gate. It also pins the deploy/plist wiring so the watchdog cannot
+# silently fall out of the deploy again (the 06-29 relay-gap-watch failure).
+"$PYTHON" -m unittest tests.test_relay_watchdog tests.test_pg_tunnel
+
 echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036) ==="
 # Generic committed markdown freshness drift is warning-only for ordinary PRs
 # and is refreshed by the weekly regen-docs workflow. This CI invocation writes
@@ -158,6 +174,9 @@ echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invar
 # (exit 1) is a hard fail in PRs to prevent drift merging and spawning
 # duplicate downstream inventory refresh PRs.
 "$PYTHON" scripts/generate_inventory_docs.py --check
+
+echo "=== Inventory prod/test split regression tests (#4394) ==="
+"$PYTHON" -m unittest tests.test_inventory_giant_split
 
 echo "=== API docs coverage gate (#3719) ==="
 "$PYTHON" scripts/check_api_docs_coverage.py

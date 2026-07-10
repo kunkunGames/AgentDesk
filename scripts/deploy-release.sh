@@ -888,6 +888,28 @@ git merge --quiet --ff-only origin/main"
         return 1
     fi
 
+    # Operator-private routines are excluded from the repo (.gitignore:50), so the
+    # peer's own `git fetch` above cannot deliver them. Push them before the peer
+    # deploys: leadership can move between nodes, and the routine runtime is a
+    # LeaderOnly worker that resolves `script_ref` against the local disk. A node
+    # missing these files fails every routine row with "routine script ... is not
+    # loaded". No --delete: the peer may hold routines this node does not.
+    if [ -d "$ADK_REL/routines" ]; then
+        local peer_adk_rel
+        if ! peer_adk_rel="$(ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" \
+            'bash -lc '"$(printf '%q' 'echo "${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}"')"'')"; then
+            echo "✗ [peer:$peer] could not resolve remote AGENTDESK_ROOT_DIR"
+            return 1
+        fi
+        peer_adk_rel="$(printf '%s' "$peer_adk_rel" | tr -d '\r')"
+        echo "▸ [peer:$peer] Syncing operator routine scripts..."
+        if ! rsync -a -e "ssh -o ConnectTimeout=$DEPLOY_SSH_CONNECT_TIMEOUT" \
+            "$ADK_REL/routines/" "$peer:$peer_adk_rel/routines/"; then
+            echo "✗ [peer:$peer] routine script sync failed"
+            return 1
+        fi
+    fi
+
     echo "▸ [peer:$peer] Running deploy-release.sh..."
     if ! ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$remote_deploy_command")"; then
         echo "✗ [peer:$peer] deploy-release.sh failed"
@@ -1221,7 +1243,15 @@ if [ -d "$REPO/routines" ]; then
     ROUTINES_STAGED="$ADK_REL/routines.new"
     rm -rf "$ROUTINES_STAGED"
     mkdir -p "$ROUTINES_STAGED"
-    rsync -a --delete "$REPO/routines/" "$ROUTINES_STAGED/"
+    # Operator-private routines (.gitignore:50) live only under $ADK_REL/routines,
+    # never in the repo. Seed the staging dir with them first so the repo overlay
+    # below cannot delete a routine whose row still exists in `routines`; the
+    # runtime would then fail it with "routine script ... is not loaded".
+    if [ -d "$ADK_REL/routines" ]; then
+        rsync -a "$ADK_REL/routines/" "$ROUTINES_STAGED/"
+    fi
+    # Engine-owned routines win on conflict. No --delete: see above.
+    rsync -a "$REPO/routines/" "$ROUTINES_STAGED/"
 else
     echo "⚠ Routines source missing: $REPO/routines"
     echo "  Skipping routine staging — existing $ADK_REL/routines/ will be retained."
@@ -1378,6 +1408,11 @@ chmod +x "$STAGED_BINARY"
 xattr -d com.apple.provenance "$STAGED_BINARY" 2>/dev/null || true
 sign_binary_with_fallback "$STAGED_BINARY"
 _clean_release_build_cache_after_staging
+
+# #4381: a deploy restarts dcserver, so a short relay gap is EXPECTED here.
+# Touch the marker the out-of-band relay watchdog checks; while it is fresh
+# (deploy_quiet_secs) the watchdog logs instead of alerting.
+touch "$ADK_REL/logs/relay-watchdog.deploy-marker" 2>/dev/null || true
 
 # Stop release — wait for process to actually die (flock release)
 echo "▸ Stopping release..."
@@ -1686,6 +1721,199 @@ elif _health_json_reconcile_only "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; 
     echo "✓ Release is serving on :${REL_PORT} (provider reconcile in progress)"
 else
     echo "✓ Release is healthy on :${REL_PORT}"
+fi
+
+# ── Out-of-band relay watchdog (#4381) ────────────────────────────────────────
+# Deliberately OUTSIDE dcserver's launchd job: the watchdog must survive exactly
+# the failures it watches for (dcserver crash-looping on PG loss, #4379). The
+# repo is the source of truth — the machine-local prototype (and the 06-29
+# relay-gap-watch before it) evaporated because nothing deployed it. Runs after
+# DEPLOY_OK on purpose: a failed deploy leaves the previous watchdog untouched.
+WATCHDOG_LABEL="com.agentdesk.relay-watchdog"
+WATCHDOG_PLIST_PATH="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
+WATCHDOG_BIN="$ADK_REL/bin/relay-watchdog.py"
+WATCHDOG_CONFIG="$ADK_REL/config/relay-watchdog.json"
+echo "▸ Installing out-of-band relay watchdog (#4381)..."
+if install -m 0755 "$REPO/scripts/relay_watchdog.py" "$WATCHDOG_BIN"; then
+    if [ -f "$WATCHDOG_CONFIG" ]; then
+        WATCHDOG_PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+        # INVARIANT: the ENTIRE watchdog block is fail-open. We are past
+        # DEPLOY_OK, so any failure here (permissions, full disk, launchd)
+        # must degrade to a loud ⚠ warning and let the script continue —
+        # aborting would poison the exit code of a HEALTHY deploy and skip
+        # _write_release_source_manifest / _deploy_to_all_peers below.
+        # The function body runs from an `if` guard, so `set -e` is suspended
+        # inside it; every step therefore carries its own `|| return 1`.
+        #
+        # Runtime python preflight: relay_watchdog.py declares MIN_PYTHON=3.10
+        # and exits 1 below it. If `command -v python3` resolved to the macOS
+        # system 3.9, arming the plist would put KeepAlive into a silent ~30s
+        # crash-loop — refuse to arm instead (r4 review, PR #4399).
+        _xml_escape() {
+            # Plist bodies are XML: raw &, <, > (and quotes, for safety) in an
+            # operator path would render the plist plutil-invalid and the
+            # watchdog silently unarmed (r4 review, PR #4399).
+            local s=$1
+            s=${s//&/\&amp;}
+            s=${s//</\&lt;}
+            s=${s//>/\&gt;}
+            s=${s//\"/\&quot;}
+            s=${s//\'/\&apos;}
+            printf '%s' "$s"
+        }
+        _install_relay_watchdog_plist() {
+            local label_x python_x bin_x root_x
+            label_x=$(_xml_escape "$WATCHDOG_LABEL") || return 1
+            python_x=$(_xml_escape "$WATCHDOG_PYTHON") || return 1
+            bin_x=$(_xml_escape "$WATCHDOG_BIN") || return 1
+            root_x=$(_xml_escape "$ADK_REL") || return 1
+            mkdir -p "$HOME/Library/LaunchAgents" || return 1
+            cat > "$WATCHDOG_PLIST_PATH.tmp" <<PLIST_EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label_x</string>
+  <key>ProgramArguments</key>
+  <array><string>$python_x</string><string>$bin_x</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$root_x/logs/relay-watchdog.launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$root_x/logs/relay-watchdog.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AGENTDESK_ROOT_DIR</key><string>$root_x</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+            # Atomic publish: launchd never sees a half-written plist, and an
+            # interrupted write leaves only the .tmp (cleaned by the caller).
+            mv -f "$WATCHDOG_PLIST_PATH.tmp" "$WATCHDOG_PLIST_PATH" || return 1
+        }
+        if ! "$WATCHDOG_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+            echo "⚠ Relay watchdog requires python3 >= 3.10 (MIN_PYTHON in relay_watchdog.py);"
+            echo "  resolved runner: $WATCHDOG_PYTHON — NOT armed (arming would KeepAlive-crash-loop)."
+            echo "  Install a newer python3 (e.g. brew install python) and redeploy."
+        elif _install_relay_watchdog_plist; then
+            xattr -d com.apple.quarantine "$WATCHDOG_PLIST_PATH" 2>/dev/null || true
+            # bootout+bootstrap (not kickstart) so a script/plist change is picked up.
+            launchctl bootout "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" 2>/dev/null || true
+            if launchctl bootstrap "$LAUNCHD_DOMAIN" "$WATCHDOG_PLIST_PATH"; then
+                echo "✓ Relay watchdog armed ($WATCHDOG_LABEL)"
+            else
+                echo "⚠ Relay watchdog bootstrap FAILED — relay gaps will go unwatched"
+            fi
+        else
+            rm -f "$WATCHDOG_PLIST_PATH.tmp" 2>/dev/null || true
+            echo "⚠ Relay watchdog plist write FAILED ($WATCHDOG_PLIST_PATH) — not armed"
+            echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
+        fi
+    else
+        echo "⚠ Relay watchdog config missing: $WATCHDOG_CONFIG"
+        echo "  Watchdog NOT armed on this node. Channel ids are operator config"
+        echo "  (never hardcoded in the repo); create the config — see the"
+        echo "  scripts/relay_watchdog.py docstring — then redeploy."
+    fi
+else
+    echo "⚠ Relay watchdog staging FAILED (source: $REPO/scripts/relay_watchdog.py)"
+fi
+
+# ── Consumer-owned PostgreSQL SSH tunnel supervisor (#4378) ──────────────────
+# This is deliberately a separate launchd lifetime from dcserver: dcserver may
+# crash-loop while PG is absent (#4379), but the process that restores PG must
+# remain alive.  Like the relay watchdog above, this block is after DEPLOY_OK
+# and entirely fail-open so an ops-side install failure cannot turn a healthy,
+# health-confirmed binary deploy into a rollback or skip peer propagation.
+PG_TUNNEL_LABEL="com.agentdesk.pg-tunnel"
+PG_TUNNEL_PLIST_PATH="$HOME/Library/LaunchAgents/$PG_TUNNEL_LABEL.plist"
+PG_TUNNEL_BIN="$ADK_REL/bin/pg-tunnel.sh"
+PG_TUNNEL_CONFIG="$ADK_REL/config/pg-tunnel.env"
+echo "▸ Staging consumer-owned PG tunnel supervisor (#4378)..."
+if install -m 0755 "$REPO/scripts/pg_tunnel.sh" "$PG_TUNNEL_BIN"; then
+    # Machine-local config is the node-identity gate.  It is intentionally not
+    # shipped by the repo: mac-mini and future nodes must never arm a tunnel
+    # pointed back at themselves merely because cluster deploy propagated.
+    if [ -f "$PG_TUNNEL_CONFIG" ]; then
+        _pg_xml_escape() {
+            local s=$1
+            s=${s//&/\&amp;}
+            s=${s//</\&lt;}
+            s=${s//>/\&gt;}
+            s=${s//\"/\&quot;}
+            s=${s//\'/\&apos;}
+            printf '%s' "$s"
+        }
+        _install_pg_tunnel_plist() {
+            local label_x bin_x config_x root_x
+            label_x=$(_pg_xml_escape "$PG_TUNNEL_LABEL") || return 1
+            bin_x=$(_pg_xml_escape "$PG_TUNNEL_BIN") || return 1
+            config_x=$(_pg_xml_escape "$PG_TUNNEL_CONFIG") || return 1
+            root_x=$(_pg_xml_escape "$ADK_REL") || return 1
+            mkdir -p "$HOME/Library/LaunchAgents" || return 1
+            cat > "$PG_TUNNEL_PLIST_PATH.tmp" <<PLIST_EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label_x</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$bin_x</string>
+    <string>$config_x</string>
+    <string>-N</string>
+    <string>-T</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-o</string><string>ConnectTimeout=10</string>
+    <string>-o</string><string>ServerAliveInterval=15</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-L</string><string>127.0.0.1:15432:127.0.0.1:5432</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$root_x/logs/pg-tunnel.launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$root_x/logs/pg-tunnel.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AGENTDESK_ROOT_DIR</key><string>$root_x</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+            # Atomic publish: launchd never observes a partially-written XML.
+            mv -f "$PG_TUNNEL_PLIST_PATH.tmp" "$PG_TUNNEL_PLIST_PATH" || return 1
+        }
+        if ! "$PG_TUNNEL_BIN" --check-config "$PG_TUNNEL_CONFIG"; then
+            echo "⚠ PG tunnel config invalid: $PG_TUNNEL_CONFIG — NOT armed"
+            echo "  Required: PG_TUNNEL_SSH_TARGET=mac-mini (or PG_TUNNEL_HOST alias)."
+        elif _install_pg_tunnel_plist; then
+            xattr -d com.apple.quarantine "$PG_TUNNEL_PLIST_PATH" 2>/dev/null || true
+            echo "⚠ PG tunnel deploy prerequisite: on mac-mini, bootout and remove BOTH"
+            echo "  reverse plists (com.agentdesk.macbook-pg-tunnel and"
+            echo "  com.agentdesk.macbook-memento-tunnel) before this job is activated."
+            # bootout+bootstrap (not kickstart): pick up both wrapper and plist.
+            launchctl bootout "$LAUNCHD_DOMAIN/$PG_TUNNEL_LABEL" 2>/dev/null || true
+            if launchctl bootstrap "$LAUNCHD_DOMAIN" "$PG_TUNNEL_PLIST_PATH"; then
+                echo "✓ PG tunnel supervisor armed ($PG_TUNNEL_LABEL)"
+            else
+                echo "⚠ PG tunnel bootstrap FAILED — dcserver PG path is unsupervised"
+            fi
+        else
+            rm -f "$PG_TUNNEL_PLIST_PATH.tmp" 2>/dev/null || true
+            echo "⚠ PG tunnel plist write FAILED ($PG_TUNNEL_PLIST_PATH) — not armed"
+            echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
+        fi
+    else
+        echo "▸ PG tunnel config absent: $PG_TUNNEL_CONFIG"
+        echo "  Supervisor NOT armed on this node (machine-local node gate)."
+    fi
+else
+    echo "⚠ PG tunnel staging FAILED (source: $REPO/scripts/pg_tunnel.sh)"
 fi
 
 _write_release_source_manifest

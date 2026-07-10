@@ -180,7 +180,7 @@ fn status_events_from_task_notification_with_metadata(
     status: &str,
     summary: &str,
     tool_use_id: Option<&str>,
-    agent_id: Option<&str>,
+    notification_task_id: Option<&str>,
 ) -> Vec<StatusEvent> {
     let mut events = Vec::new();
     match kind {
@@ -188,6 +188,7 @@ fn status_events_from_task_notification_with_metadata(
         "subagent" => {
             let summary = first_content_line(summary);
             let desc = subagent_desc_from_notification_summary(&summary);
+            let agent_id = clean_status_key(notification_task_id);
             if !summary.is_empty() {
                 events.push(match tool_use_id {
                     Some(tool_use_id) => StatusEvent::SubagentActivity {
@@ -200,7 +201,7 @@ fn status_events_from_task_notification_with_metadata(
             if notification_is_terminal(status) {
                 events.push(StatusEvent::SubagentEnd {
                     success: !notification_is_error(status),
-                    agent_id: clean_status_key(agent_id),
+                    agent_id,
                     desc,
                     tool_use_id: tool_use_id.map(str::to_string),
                     summary: None,
@@ -223,7 +224,7 @@ fn status_events_from_task_notification_with_metadata(
             // !is_error), like the subagent/background arms — running emits nothing.
             if notification_is_terminal(status) {
                 events.push(StatusEvent::WorkflowEnd {
-                    task_id: None,
+                    task_id: clean_status_key(notification_task_id),
                     success: !notification_is_error(status),
                     summary: Some(first_content_line(summary)).filter(|value| !value.is_empty()),
                 });
@@ -260,9 +261,7 @@ pub(in crate::services::discord) fn status_events_from_task_notification_xml_for
         return Vec::new();
     }
     let kind = parsed.kind();
-    let agent_id = (kind == "subagent")
-        .then(|| parsed.task_id.as_deref())
-        .flatten();
+    let notification_task_id = parsed.task_id.as_deref();
     // #4338 rework (codex r1): the harness XML-escapes the free-form `<summary>`
     // prose in the injected envelope; when the notify card is footer-suppressed
     // this bridge is the summary's only visible surface (panel slot text), so
@@ -280,13 +279,15 @@ pub(in crate::services::discord) fn status_events_from_task_notification_xml_for
         status,
         &summary,
         parsed.tool_use_id.as_deref(),
-        agent_id,
+        notification_task_id,
     );
-    // #3393 finding 1 (XML-scoped): drop an id-less terminal `SubagentEnd` — it
-    // would fall back in the panel to "the last unfinished slot" and flip/evict
-    // the WRONG one (permanently, post-#3391). A missing id → no terminal effect
-    // (heartbeat/activity kept). The `system` path keeps its id-less fallback.
-    events.into_iter().filter(idful_subagent_or_other).collect()
+    // #3393 finding 1 (XML-scoped), narrowed by #4396 point 2: drop an id-less
+    // terminal `SubagentEnd` only when it ALSO carries no fallback key. With an
+    // agent_id/desc key the panel closes ONLY a uniquely matching slot (zero or
+    // ambiguous matches are dropped there — see `StatusPanelState::apply`), so
+    // async completions whose notification omits `<tool-use-id>` still land
+    // without ever guessing "the last unfinished slot" (the pre-#3393 bug).
+    events.into_iter().filter(keyed_subagent_or_other).collect()
 }
 
 /// #4097: `kind=background` XML task-notification cards are noisy lifecycle
@@ -304,9 +305,19 @@ fn background_task_notification_xml_status_transition(kind: &str, status: Option
     kind == "background" && status.is_some_and(|value| !value.trim().is_empty())
 }
 
-/// #3393 finding 1 XML-bridge drop predicate: `false` for an id-less `SubagentEnd`.
-fn idful_subagent_or_other(event: &StatusEvent) -> bool {
-    !matches!(event, StatusEvent::SubagentEnd { tool_use_id, .. } if tool_use_id.is_none())
+/// #3393/#4396 XML-bridge drop predicate: `false` only for an id-less
+/// `SubagentEnd` with NO fallback match key (agent_id and desc both absent —
+/// both are emitted pre-cleaned, `Some` iff non-empty).
+fn keyed_subagent_or_other(event: &StatusEvent) -> bool {
+    !matches!(
+        event,
+        StatusEvent::SubagentEnd {
+            tool_use_id: None,
+            agent_id: None,
+            desc: None,
+            ..
+        }
+    )
 }
 
 pub(in crate::services::discord) fn status_events_from_json(value: &Value) -> Vec<StatusEvent> {

@@ -6130,11 +6130,13 @@ fn task_completion_card_suppression_requires_idful_matching_subagent_slot() {
     );
 }
 
-// #3393 finding 1: an id-LESS subagent `<task-notification>` XML (no
-// `<tool-use-id>` child) must produce NO terminal effect. Before the fix the XML
-// bridge emitted `SubagentEnd { tool_use_id: None }`, the panel fell back to "the
-// last unfinished subagent slot", and the WRONG slot was finalized (and, with
-// #3391, evicted on delivery). The bridge now drops id-less terminal ends.
+// #3393 finding 1, semantics narrowed by #4396 point 2: an id-LESS subagent
+// `<task-notification>` XML (no `<tool-use-id>` child) whose agent_id/desc keys
+// match NO slot must produce NO terminal effect. Pre-#3393 the panel fell back
+// to "the last unfinished subagent slot" and finalized (and, with #3391,
+// evicted) the WRONG slot. The bridge now forwards a KEYED id-less terminal end
+// (#4396) but the panel closes only a UNIQUE agent_id/desc match — a zero-match
+// end is dropped there, so the live foreground slot stays untouched.
 #[test]
 fn task_notification_xml_idless_subagent_does_not_flip_or_evict_a_slot() {
     let events = PlaceholderLiveEvents::default();
@@ -6164,11 +6166,18 @@ fn task_notification_xml_idless_subagent_does_not_flip_or_evict_a_slot() {
         <result>Done.</result>\n\
         </task-notification>";
     let bridged = status_events_from_task_notification_xml_for_footer_mode(idless, true);
+    // #4396: the bridge forwards the keyed id-less terminal end (task-id/desc
+    // present); safety now lives in the panel's unique-match gate below.
     assert!(
-        !bridged
-            .iter()
-            .any(|e| matches!(e, StatusEvent::SubagentEnd { .. })),
-        "id-less subagent XML must NOT bridge a SubagentEnd: {bridged:?}"
+        bridged.iter().any(|e| matches!(
+            e,
+            StatusEvent::SubagentEnd {
+                tool_use_id: None,
+                agent_id: Some(_),
+                ..
+            }
+        )),
+        "keyed id-less subagent XML must bridge an id-less SubagentEnd: {bridged:?}"
     );
     events.push_status_events(channel_id, bridged);
 
@@ -6205,6 +6214,833 @@ fn task_notification_xml_idless_subagent_does_not_flip_or_evict_a_slot() {
     );
 }
 
+// #4396 point 2: an id-less terminal subagent `<task-notification>` (async
+// completions frequently omit `<tool-use-id>`) closes the UNIQUELY matching
+// slot — paired here by the launch ack's agentId — and must NOT touch the
+// newest unfinished slot (the pre-#3393 "last unfinished" guess). Reverting the
+// bridge filter to drop all id-less terminal ends leaves the async slot
+// unfinished (first assert); reverting the panel's unique-match gate to the
+// last-unfinished guess closes the decoy (second assert).
+#[test]
+fn task_notification_xml_idless_terminal_closes_unique_agent_id_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_001);
+    let agent_id = "a4396idless01";
+
+    // Async background slot in its post-launch-ack shape: launch tool-use id +
+    // toolUseResult.agentId + background promotion (#3920).
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("Async 4396 worker".to_string()),
+            agent_id: Some(agent_id.to_string()),
+            tool_use_id: Some("toolu_4396_async".to_string()),
+            background: true,
+        },
+    );
+    // Decoy: the NEWEST unfinished foreground slot — a last-unfinished fallback
+    // would (wrongly) land here.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "scout", "description": "Decoy newest slot"}).to_string(),
+            Some("toolu_4396_decoy"),
+        ),
+    );
+
+    // Real async completion shape: terminal, `<task-id>` only, NO
+    // `<tool-use-id>`; the XML caption differs from every launch desc so ONLY
+    // the agent_id can pair it.
+    let raw = format!(
+        "<task-notification>\n\
+        <task-id>{agent_id}</task-id>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"Different 4396 terminal caption\" completed</summary>\n\
+        <result>Done.</result>\n\
+        </task-notification>"
+    );
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(&raw, true);
+    assert!(
+        bridged.iter().any(|e| matches!(
+            e,
+            StatusEvent::SubagentEnd {
+                tool_use_id: None,
+                agent_id: Some(id),
+                ack_only: false,
+                ..
+            } if id.as_str() == agent_id
+        )),
+        "keyed id-less terminal end must pass the bridge filter: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let async_slot = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_async"))
+        .unwrap_or_else(|| panic!("async slot missing: {:?}", guard.subagents));
+    assert_eq!(
+        async_slot.finished,
+        Some(true),
+        "the unique agent_id match must close the async slot"
+    );
+    let decoy = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_decoy"))
+        .unwrap_or_else(|| panic!("decoy slot missing: {:?}", guard.subagents));
+    assert_eq!(
+        decoy.finished, None,
+        "the newest unfinished slot must never be guessed closed"
+    );
+}
+
+// #4396 point 2 safety guard: an id-less terminal end whose only key (desc)
+// matches MULTIPLE unfinished slots is dropped at the panel — ambiguity must
+// never finalize (or #3391-evict) either candidate. Weakening
+// `unique_unfinished_subagent`'s ambiguity bail (returning the first match)
+// closes one of the duplicates and fails this test.
+#[test]
+fn task_notification_xml_idless_terminal_ambiguous_desc_is_dropped() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_002);
+    for tool_use_id in ["toolu_4396_dup_a", "toolu_4396_dup_b"] {
+        events.push_status_event(
+            channel_id,
+            StatusEvent::SubagentStart {
+                subagent_type: Some("agent".to_string()),
+                desc: Some("Duplicate 4396 desc".to_string()),
+                agent_id: None,
+                tool_use_id: Some(tool_use_id.to_string()),
+                background: true,
+            },
+        );
+    }
+    // Terminal, no `<task-id>`, no `<tool-use-id>`: desc is the only key and it
+    // is ambiguous across both slots.
+    let raw = "<task-notification>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"Duplicate 4396 desc\" completed</summary>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        bridged.iter().any(|e| matches!(
+            e,
+            StatusEvent::SubagentEnd {
+                tool_use_id: None,
+                desc: Some(_),
+                ..
+            }
+        )),
+        "desc-keyed id-less terminal end must pass the bridge filter: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(guard.subagents.len(), 2, "no slot may be evicted");
+    for slot in guard.subagents.iter() {
+        assert_eq!(
+            slot.finished, None,
+            "an ambiguous desc match must not close any slot: {:?}",
+            guard.subagents
+        );
+    }
+}
+
+// #4396 point 2 filter guard: a key-LESS id-less terminal end (no `<task-id>`,
+// empty `Agent ""` caption → no desc key) still never leaves the XML bridge, so
+// the panel's legacy last-unfinished fallback (kept for the stream-json
+// `system` path) stays unreachable from XML. Reverting the bridge filter to
+// forward key-less ends closes the live slot below and fails this test.
+#[test]
+fn task_notification_xml_keyless_idless_terminal_still_dropped_at_bridge() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_003);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "scout", "description": "Keyless guard slot"}).to_string(),
+            Some("toolu_4396_keyless"),
+        ),
+    );
+    let raw = "<task-notification>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"\" completed</summary>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        !bridged
+            .iter()
+            .any(|e| matches!(e, StatusEvent::SubagentEnd { .. })),
+        "key-less id-less terminal XML must NOT bridge a SubagentEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(guard.subagents.len(), 1);
+    assert_eq!(
+        guard.subagents[0].finished, None,
+        "the live slot must stay running: {:?}",
+        guard.subagents
+    );
+}
+
+// #4396 r2 (opus review repro): instance A is force-aborted by the render-tick
+// TTL sweep, a SAME-desc instance B respawns live, then A's REAL completion
+// arrives late as an id-less desc-keyed end. Among unfinished slots B is the
+// unique desc match — but the end belongs to A. The matcher must treat the
+// finished same-key slot as an ownership conflict and DROP: live B stays
+// running and swept A keeps its ✗. Reverting the matcher to scan only
+// unfinished slots closes B and fails this test.
+#[test]
+fn idless_end_with_desc_shared_by_finished_slot_never_closes_the_live_respawn() {
+    use super::task_panel::STUCK_BACKGROUND_TASK_TTL;
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_006);
+    // Instance A: background, then force-aborted by the periodic render-tick
+    // sweep (the exact precondition the sweep itself creates).
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("research foo".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu_4396_r2_a".to_string()),
+            background: true,
+        },
+    );
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.subagents[0].started_at = std::time::Instant::now()
+            .checked_sub(STUCK_BACKGROUND_TASK_TTL + std::time::Duration::from_secs(60))
+            .expect("monotonic clock far enough past origin");
+    }
+    let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    // Instance B: respawned with the SAME desc, live.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("research foo".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu_4396_r2_b".to_string()),
+            background: true,
+        },
+    );
+
+    // A's real completion, late: id-less, desc is the only key.
+    let raw = "<task-notification>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"research foo\" completed</summary>\n\
+        </task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(raw, true),
+    );
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot_a = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_r2_a"))
+        .expect("swept instance A");
+    assert_eq!(
+        slot_a.finished,
+        Some(false),
+        "swept instance A keeps its forced ✗ (the late end is dropped, not re-routed)"
+    );
+    let slot_b = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_r2_b"))
+        .expect("live respawn B");
+    assert_eq!(
+        slot_b.finished, None,
+        "the live same-desc respawn must NOT be closed by A's late completion"
+    );
+}
+
+// #4396 r2: the agent_id branch has the same finished/live ownership hole — a
+// finished slot sharing the agent_id (A closed, B a live re-launch reusing the
+// id, e.g. a resumed agent) makes an id-less agent_id-keyed end ambiguous. It
+// must drop without closing B and without falling through to the desc key.
+#[test]
+fn idless_end_with_agent_id_shared_by_finished_slot_never_closes_the_live_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_007);
+    let agent_id = "a4396r2shared";
+    // Instance A: closed by its exact-id genuine completion.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("first run".to_string()),
+            agent_id: Some(agent_id.to_string()),
+            tool_use_id: Some("toolu_4396_r2_id_a".to_string()),
+            background: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            agent_id: None,
+            desc: None,
+            tool_use_id: Some("toolu_4396_r2_id_a".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+    // Instance B: live, same agent_id.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("second run".to_string()),
+            agent_id: Some(agent_id.to_string()),
+            tool_use_id: Some("toolu_4396_r2_id_b".to_string()),
+            background: true,
+        },
+    );
+
+    let raw = format!(
+        "<task-notification>\n\
+        <task-id>{agent_id}</task-id>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"second run\" completed</summary>\n\
+        </task-notification>"
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(&raw, true),
+    );
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot_b = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_r2_id_b"))
+        .expect("live slot B");
+    assert_eq!(
+        slot_b.finished, None,
+        "an agent_id shared with a finished slot must drop the end (no close, no desc fallthrough)"
+    );
+}
+
+// #4396 r3 (codex review repro): the r2 finished-slot conflict guard only holds
+// while the finished slot is still IN the state. Here A is TTL-forced ✗ by the
+// render-tick sweep, the completion footer delivers it and the #3391 eviction
+// REMOVES it from the state, a same-desc B respawns live, and A's real
+// completion finally arrives (id-less, desc-keyed). Without the tombstone the
+// evicted A is invisible and B becomes the unique live match → wrong-kill. The
+// tombstone ring must drop the end — logged with the tombstone conflict reason
+// — and leave B running. Removing the `contains_fresh` check in
+// `unique_live_owner` (or the eviction-path `push_slot_keys`) closes B and
+// fails this test.
+#[test]
+fn idless_end_after_finished_slot_eviction_never_closes_the_live_respawn() {
+    use super::completion_footer::{SlotKey, TerminalSlotId};
+    use super::task_panel::STUCK_BACKGROUND_TASK_TTL;
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturingWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_009);
+    // Instance A: background, then TTL-forced ✗ by the periodic render tick.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("research foo".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu_4396_r3_a".to_string()),
+            background: true,
+        },
+    );
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.subagents[0].started_at = std::time::Instant::now()
+            .checked_sub(STUCK_BACKGROUND_TASK_TTL + std::time::Duration::from_secs(60))
+            .expect("monotonic clock far enough past origin");
+    }
+    let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    // Footer delivery evicts terminal A — it leaves the state entirely (#3391).
+    events.evict_delivered_terminal_footer_tasks(
+        channel_id,
+        &[TerminalSlotId::Subagent(SlotKey::ToolUseId(
+            "toolu_4396_r3_a".to_string(),
+        ))],
+    );
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.subagents.is_empty(),
+            "precondition: evicted A must have left the state: {:?}",
+            guard.subagents
+        );
+    }
+
+    // Instance B: same-desc live respawn.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some("research foo".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu_4396_r3_b".to_string()),
+            background: true,
+        },
+    );
+
+    // A's real completion, late: id-less, desc is the only key. Capture the
+    // panel's INFO logs across the apply to assert the tombstone drop reason.
+    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(CapturingWriter {
+            buffer: buffer.clone(),
+        })
+        .finish();
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let raw = "<task-notification>\n\
+            <status>completed</status>\n\
+            <summary>Agent \"research foo\" completed</summary>\n\
+            </task-notification>";
+        events.push_status_events(
+            channel_id,
+            status_events_from_task_notification_xml_for_footer_mode(raw, true),
+        );
+    }
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot_b = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_r3_b"))
+        .expect("live respawn B");
+    assert_eq!(
+        slot_b.finished, None,
+        "the live same-desc respawn must NOT be closed by evicted A's late completion"
+    );
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
+    assert!(
+        logs.contains("tombstone"),
+        "the drop must be logged with the tombstone conflict reason, got: {logs}"
+    );
+}
+
+// #4396 r4 (codex review repro): r3's tombstone guard was asymmetric — each
+// fallback branch only tombstone-checked the SINGLE key it matched on. Here A is
+// id-less (desc-only), so its eviction leaves only a DESC tombstone. B respawns
+// live carrying an agent_id, and A's late completion arrives as an id-BEARING
+// task-notification whose `<task-id>` equals B's agent_id (the harness resume
+// contract: a resumed task re-notifies under the same task-id). The agent_id was
+// never tombstoned, so an agent_id-first matcher uniquely matches live B and
+// wrong-kills it. r4 makes the agent_id branch consult the carried DESC
+// tombstone too → the same-desc tombstone drops the end and leaves B running.
+// Removing that cross-key tombstone check closes B and fails this test.
+#[test]
+fn idless_end_after_eviction_with_new_agent_id_still_respects_desc_tombstone() {
+    use super::completion_footer::{SlotKey, TerminalSlotId};
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_010);
+    let shared_desc = "research foo";
+    let reused_agent_id = "a4396r3lateid";
+
+    // A left the state before its task-notification arrived. The panel never
+    // learned A's agent id, so eviction can only tombstone its desc.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some(shared_desc.to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu_4396_r3_desc_only_a".to_string()),
+            background: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: false,
+            agent_id: None,
+            desc: None,
+            tool_use_id: Some("toolu_4396_r3_desc_only_a".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+    events.evict_delivered_terminal_footer_tasks(
+        channel_id,
+        &[TerminalSlotId::Subagent(SlotKey::ToolUseId(
+            "toolu_4396_r3_desc_only_a".to_string(),
+        ))],
+    );
+
+    // B is a live same-desc respawn. It has the agent id that A's late XML will
+    // carry, so an agent_id-first matcher must still notice the desc tombstone.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("agent".to_string()),
+            desc: Some(shared_desc.to_string()),
+            agent_id: Some(reused_agent_id.to_string()),
+            tool_use_id: Some("toolu_4396_r3_desc_only_b".to_string()),
+            background: true,
+        },
+    );
+
+    let raw = format!(
+        "<task-notification>\n\
+        <task-id>{reused_agent_id}</task-id>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"{shared_desc}\" completed</summary>\n\
+        </task-notification>"
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(&raw, true),
+    );
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let slot_b = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_r3_desc_only_b"))
+        .expect("live respawn B");
+    assert_eq!(
+        slot_b.finished, None,
+        "same-desc tombstone must prevent an agent_id-first wrong-kill"
+    );
+}
+
+// #4407 codex repro: a late workflow-A completion XML must not close the only
+// live workflow-B slot just because the completion reached the bridge without
+// a usable id. Main closes wf-b here; the fixed path preserves wf-a's task-id
+// and appends a separate finished wf-a slot.
+#[test]
+fn issue_4407_workflow_xml_completion_with_mismatched_task_id_never_closes_live_workflow() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_407_001);
+
+    events.push_status_event(
+        channel_id,
+        StatusEvent::WorkflowStart {
+            task_id: Some("wf-b".to_string()),
+            name: Some("workflow B".to_string()),
+        },
+    );
+
+    let raw = "<task-notification><task-id>wf-a</task-id><status>completed</status>\
+        <summary>Dynamic workflow \"workflow A\" completed</summary></task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(raw, true),
+    );
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let wf_b = guard
+        .workflows
+        .iter()
+        .find(|slot| slot.task_id.as_deref() == Some("wf-b"))
+        .unwrap_or_else(|| panic!("live wf-b slot missing: {:?}", guard.workflows));
+    assert_eq!(
+        wf_b.finished, None,
+        "late wf-a completion XML must not close live wf-b: {:?}",
+        guard.workflows
+    );
+    assert!(
+        guard
+            .workflows
+            .iter()
+            .any(|slot| slot.task_id.as_deref() == Some("wf-a") && slot.finished == Some(true)),
+        "late wf-a completion must render as its own finished slot: {:?}",
+        guard.workflows
+    );
+}
+
+#[test]
+fn issue_4407_workflow_end_matching_rules_preserve_legacy_and_current_paths() {
+    let events = PlaceholderLiveEvents::default();
+
+    for (channel, status, success) in [(4_407_002, "completed", true), (4_407_003, "failed", false)]
+    {
+        let channel_id = ChannelId::new(channel);
+        events.push_status_event(
+            channel_id,
+            StatusEvent::WorkflowStart {
+                task_id: Some("wf-same".to_string()),
+                name: Some("workflow same".to_string()),
+            },
+        );
+        let raw = format!(
+            "<task-notification><task-id>wf-same</task-id><status>{status}</status>\
+            <summary>Dynamic workflow \"workflow same\" {status}</summary></task-notification>"
+        );
+        events.push_status_events(
+            channel_id,
+            status_events_from_task_notification_xml_for_footer_mode(&raw, true),
+        );
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.workflows.len(),
+            1,
+            "same-id end must not add a ghost slot"
+        );
+        assert_eq!(guard.workflows[0].finished, Some(success));
+    }
+
+    let legacy_channel = ChannelId::new(4_407_004);
+    events.push_status_event(
+        legacy_channel,
+        StatusEvent::WorkflowStart {
+            task_id: None,
+            name: Some("legacy workflow".to_string()),
+        },
+    );
+    events.push_status_event(
+        legacy_channel,
+        StatusEvent::WorkflowEnd {
+            task_id: None,
+            success: true,
+            summary: None,
+        },
+    );
+    let legacy_entry = events
+        .status_by_channel
+        .get(&legacy_channel)
+        .expect("status panel state");
+    let legacy = legacy_entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        legacy.workflows[0].finished,
+        Some(true),
+        "id-less legacy end must still close the unique id-less slot"
+    );
+
+    let adopt_channel = ChannelId::new(4_407_005);
+    events.push_status_event(
+        adopt_channel,
+        StatusEvent::WorkflowStart {
+            task_id: None,
+            name: Some("adopted workflow".to_string()),
+        },
+    );
+    events.push_status_event(
+        adopt_channel,
+        StatusEvent::WorkflowEnd {
+            task_id: Some("wf-adopted".to_string()),
+            success: true,
+            summary: None,
+        },
+    );
+    let adopt_entry = events
+        .status_by_channel
+        .get(&adopt_channel)
+        .expect("status panel state");
+    let adopt = adopt_entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(adopt.workflows.len(), 1, "adopt must close in place");
+    assert_eq!(adopt.workflows[0].task_id.as_deref(), Some("wf-adopted"));
+    assert_eq!(adopt.workflows[0].finished, Some(true));
+}
+
+#[test]
+fn issue_4407_idless_workflow_end_for_unique_id_bearing_slot_drops_without_status_transition() {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturingWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_407_006);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::WorkflowStart {
+            task_id: Some("wf-live".to_string()),
+            name: Some("live workflow".to_string()),
+        },
+    );
+
+    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(CapturingWriter {
+            buffer: buffer.clone(),
+        })
+        .finish();
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        events.push_status_event(
+            channel_id,
+            StatusEvent::WorkflowEnd {
+                task_id: None,
+                success: true,
+                summary: Some("legacy completion".to_string()),
+            },
+        );
+    }
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        guard.workflows.len(),
+        1,
+        "drop must not add a ghost workflow"
+    );
+    assert_eq!(guard.workflows[0].task_id.as_deref(), Some("wf-live"));
+    assert_eq!(
+        guard.workflows[0].finished, None,
+        "id-less end must not close the only id-bearing workflow"
+    );
+    assert!(
+        matches!(guard.status, DerivedStatus::WorkflowRunning { .. }),
+        "drop must not transition WorkflowRunning back to Running: {:?}",
+        guard.status
+    );
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
+    assert!(
+        logs.contains("#4407: dropped id-less WorkflowEnd"),
+        "drop must be logged, got: {logs}"
+    );
+}
+
 // #3393 finding 3: a workflow `<task-notification>` XML with a NON-terminal
 // status (e.g. running) must NOT emit `WorkflowEnd`; terminal statuses still map
 // success via `!is_error`, consistent with the subagent/background arms.
@@ -6225,9 +7061,14 @@ fn task_notification_xml_workflow_gates_workflow_end_on_terminal_status() {
     let completed_events =
         status_events_from_task_notification_xml_for_footer_mode(completed, true);
     assert!(
-        completed_events
-            .iter()
-            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: true, .. })),
+        completed_events.iter().any(|e| matches!(
+            e,
+            StatusEvent::WorkflowEnd {
+                task_id: Some(task_id),
+                success: true,
+                ..
+            } if task_id == "wf2"
+        )),
         "status=completed workflow XML must emit WorkflowEnd{{success:true}}: {completed_events:?}"
     );
 
@@ -6235,9 +7076,14 @@ fn task_notification_xml_workflow_gates_workflow_end_on_terminal_status() {
         <summary>Dynamic workflow \"probe\" failed</summary></task-notification>";
     let failed_events = status_events_from_task_notification_xml_for_footer_mode(failed, true);
     assert!(
-        failed_events
-            .iter()
-            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: false, .. })),
+        failed_events.iter().any(|e| matches!(
+            e,
+            StatusEvent::WorkflowEnd {
+                task_id: Some(task_id),
+                success: false,
+                ..
+            } if task_id == "wf3"
+        )),
         "status=failed workflow XML must emit WorkflowEnd{{success:false}}: {failed_events:?}"
     );
 }
@@ -7316,6 +8162,159 @@ fn finished_background_subagent_slot_untouched_by_ttl_sweep() {
         .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_finished_subagent"))
         .expect("finished subagent slot");
     assert_eq!(slot.finished, original_finished);
+}
+
+// #4396 point 2: the #4177 stuck-subagent TTL sweep must also run on the
+// periodic panel render tick — a long single turn never crosses a turn-boundary
+// reset, so without this the stuck slot survives for hours. Removing the sweep
+// call from `render_status_panel_with_heartbeat` leaves the stale slot
+// unfinished and fails this test; the fresh slot proves the sweep stays scoped.
+#[test]
+fn stuck_background_subagent_swept_on_periodic_panel_render_tick() {
+    use super::task_panel::STUCK_BACKGROUND_TASK_TTL;
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_004);
+    for (desc, tool_use_id) in [
+        ("stuck subagent", "toolu_4396_tick_stuck"),
+        ("fresh subagent", "toolu_4396_tick_fresh"),
+    ] {
+        events.push_status_event(
+            channel_id,
+            StatusEvent::SubagentStart {
+                subagent_type: Some("bgworker".to_string()),
+                desc: Some(desc.to_string()),
+                agent_id: None,
+                tool_use_id: Some(tool_use_id.to_string()),
+                background: true,
+            },
+        );
+    }
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .subagents
+            .iter_mut()
+            .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_tick_stuck"))
+            .expect("stuck subagent slot")
+            .started_at = std::time::Instant::now()
+            .checked_sub(STUCK_BACKGROUND_TASK_TTL + std::time::Duration::from_secs(60))
+            .expect("monotonic clock far enough past origin");
+    }
+
+    // The periodic panel edit tick (NOT a turn boundary).
+    let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stuck = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_tick_stuck"))
+        .expect("stuck subagent slot");
+    assert_eq!(
+        stuck.finished,
+        Some(false),
+        "the render tick must force-abort the TTL-expired stuck slot"
+    );
+    let fresh = guard
+        .subagents
+        .iter()
+        .find(|slot| slot.tool_use_id.as_deref() == Some("toolu_4396_tick_fresh"))
+        .expect("fresh subagent slot");
+    assert_eq!(
+        fresh.finished, None,
+        "an in-TTL background slot must survive the render-tick sweep"
+    );
+}
+
+// #4396 point 2 liveness guard: observed slot activity refreshes the TTL clock,
+// so a background subagent that is demonstrably ALIVE (its activity/heartbeat
+// notifications keep arriving) is never force-aborted by the render-tick sweep
+// mid-run. Removing either refresh (`SubagentActivity` id-keyed path or the
+// id-less `SubagentEvent` path) lets the sweep kill a live slot and fails this
+// test.
+#[test]
+fn subagent_activity_refreshes_ttl_clock_so_live_slots_survive_render_sweep() {
+    use super::task_panel::STUCK_BACKGROUND_TASK_TTL;
+
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_396_005);
+    for (desc, tool_use_id) in [
+        ("id-keyed live worker", "toolu_4396_live_a"),
+        ("event-touched live worker", "toolu_4396_live_b"),
+    ] {
+        events.push_status_event(
+            channel_id,
+            StatusEvent::SubagentStart {
+                subagent_type: Some("bgworker".to_string()),
+                desc: Some(desc.to_string()),
+                agent_id: None,
+                tool_use_id: Some(tool_use_id.to_string()),
+                background: true,
+            },
+        );
+    }
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale_at = std::time::Instant::now()
+            .checked_sub(STUCK_BACKGROUND_TASK_TTL + std::time::Duration::from_secs(60))
+            .expect("monotonic clock far enough past origin");
+        for slot in guard.subagents.iter_mut() {
+            slot.started_at = stale_at;
+        }
+    }
+
+    // Both slots are silent past the TTL, then show life: slot A via its
+    // id-keyed nested-record activity, slot B (the last unfinished slot) via an
+    // id-less SubagentEvent.
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentActivity {
+            tool_use_id: Some("toolu_4396_live_a".to_string()),
+            summary: "[Bash]".to_string(),
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEvent {
+            summary: "still working".to_string(),
+        },
+    );
+
+    let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    let entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for slot in guard.subagents.iter() {
+        assert_eq!(
+            slot.finished, None,
+            "a slot with fresh activity must survive the render-tick sweep: {:?}",
+            guard.subagents
+        );
+    }
 }
 
 // ===========================================================================

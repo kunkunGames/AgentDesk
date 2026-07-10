@@ -67,6 +67,8 @@ src/
 │   │   └── tests.rs
 │   ├── automation_candidates/
 │   │   └── verdict_tests.rs
+│   ├── dispatched_sessions/
+│   │   └── rebind_override.rs
 │   ├── dispatches/
 │   │   ├── outbox/
 │   │   │   ├── claim.rs
@@ -400,7 +402,8 @@ src/
 │   │   ├── mod.rs
 │   │   ├── rollout_index.rs
 │   │   ├── rollout_tail.rs
-│   │   └── session.rs
+│   │   ├── session.rs
+│   │   └── warm_followup.rs
 │   ├── discord/
 │   │   ├── catch_up/
 │   │   │   ├── classification.rs
@@ -453,6 +456,7 @@ src/
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
 │   │   │   ├── provider_probe.rs
+│   │   │   ├── rebind_request.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── redaction.rs
 │   │   │   ├── relay_auto_heal.rs
@@ -461,6 +465,7 @@ src/
 │   │   │   ├── session_enrichment.rs
 │   │   │   ├── snapshot.rs
 │   │   │   ├── stall_liveness.rs
+│   │   │   ├── stall_verdict.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── idle_recap/
 │   │   │   ├── context_display.rs
@@ -541,6 +546,7 @@ src/
 │   │   │   ├── crash_resume_guard.rs
 │   │   │   ├── jsonl_extract.rs
 │   │   │   ├── manual_rebind_output_path.rs
+│   │   │   ├── manual_rebind_override.rs
 │   │   │   ├── output_path_detect.rs
 │   │   │   ├── phase_policy.rs
 │   │   │   ├── rebind_runtime.rs
@@ -701,11 +707,20 @@ src/
 │   │   │   │   └── completion_postgres.rs
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   └── guarded_save.rs
+│   │   │   ├── stream_loop/
+│   │   │   │   ├── content_arms.rs
+│   │   │   │   └── tool_arms.rs
+│   │   │   ├── terminal_outcome_delivery/
+│   │   │   │   ├── cancel_prompt_replace.rs
+│   │   │   │   ├── delivery_epilogue.rs
+│   │   │   │   ├── empty_response_recovery.rs
+│   │   │   │   └── recovery_retry.rs
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
 │   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
+│   │   │   ├── activity_heartbeat.rs
 │   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── chunk_compose.rs
@@ -734,12 +749,14 @@ src/
 │   │   │   ├── status_panel.rs
 │   │   │   ├── status_panel_tests.rs
 │   │   │   ├── stream_loop.rs
+│   │   │   ├── stream_receiver.rs
 │   │   │   ├── stream_tick.rs
 │   │   │   ├── streaming_edit_text.rs
 │   │   │   ├── task_notification_lifecycle.rs
 │   │   │   ├── terminal_controller_cutover.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── terminal_outcome_delivery.rs
+│   │   │   ├── thinking.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
 │   │   │   ├── two_message_panel.rs
@@ -827,7 +844,9 @@ src/
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
 │   │   ├── relay_recovery.rs
+│   │   ├── relay_recovery_auto_heal_apply.rs
 │   │   ├── relay_recovery_auto_heal_attempts.rs
+│   │   ├── relay_recovery_auto_heal_confirm.rs
 │   │   ├── relay_recovery_completion_footer.rs
 │   │   ├── replace_outcome_policy.rs
 │   │   ├── response_sanitizer.rs
