@@ -1,8 +1,6 @@
 use axum::{Router, routing::get};
 
-use super::super::{
-    ApiRouter, AppState, analytics, protected_api_domain, receipt,
-};
+use super::super::{ApiRouter, AppState, analytics, protected_api_domain, receipt};
 
 // Category: analytics
 
