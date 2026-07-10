@@ -262,7 +262,7 @@
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 13 | 13 | 0 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 83 | 83 | 0 |  |
 | `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 59 | 59 | 0 |  |
-| `server::routes::domains::analytics` | `src/server/routes/domains/analytics.rs` | 24 | 24 | 0 |  |
+| `server::routes::domains::analytics` | `src/server/routes/domains/analytics.rs` | 22 | 22 | 0 |  |
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 86 | 86 | 0 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 87 | 87 | 0 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 | 39 | 0 |  |
