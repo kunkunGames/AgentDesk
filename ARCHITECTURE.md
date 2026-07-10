@@ -36,12 +36,10 @@ src/
 │   ├── args.rs
 │   ├── client.rs
 │   ├── dcserver.rs
-│   ├── dcserver_pg_bootstrap.rs
 │   ├── direct.rs
 │   ├── discord.rs
 │   ├── doctor.rs
 │   ├── init.rs
-│   ├── json_output.rs
 │   ├── migrate.rs
 │   ├── mod.rs
 │   ├── monitoring.rs
@@ -177,7 +175,6 @@ src/
 │   ├── legacy_migration.rs
 │   ├── mod.rs
 │   ├── paths.rs
-│   ├── skill_refresh.rs
 │   └── skill_sync.rs
 ├── server/
 │   ├── dto/
@@ -472,8 +469,6 @@ src/
 │   │   │   │   └── mod.rs
 │   │   │   ├── save_store/
 │   │   │   │   └── identity_gate.rs
-│   │   │   ├── stall_recovery_tests/
-│   │   │   │   └── flake_isolation_4361.rs
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
 │   │   │   ├── finalizer_identity.rs
@@ -516,7 +511,6 @@ src/
 │   │   │   ├── slot_rehydration.rs
 │   │   │   ├── status_events.rs
 │   │   │   ├── status_panel.rs
-│   │   │   ├── subagent_panel.rs
 │   │   │   ├── subagent_rollout.rs
 │   │   │   ├── subagent_summary.rs
 │   │   │   ├── task_panel.rs
@@ -538,7 +532,6 @@ src/
 │   │   │   │   └── mod.rs
 │   │   │   ├── analytics_transcript.rs
 │   │   │   ├── completion_delivery.rs
-│   │   │   ├── crash_resume_guard.rs
 │   │   │   ├── jsonl_extract.rs
 │   │   │   ├── manual_rebind_output_path.rs
 │   │   │   ├── output_path_detect.rs
@@ -597,7 +590,6 @@ src/
 │   │   ├── runtime_bootstrap/
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
-│   │   │   ├── gateway_lease_tests.rs
 │   │   │   ├── gateway_runtime.rs
 │   │   │   ├── intake.rs
 │   │   │   ├── orphan_recovery.rs
@@ -822,7 +814,6 @@ src/
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── reaction_cleanup.rs
 │   │   ├── reaction_lifecycle.rs
-│   │   ├── readopted_mailbox_ledger.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs

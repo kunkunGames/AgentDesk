@@ -188,16 +188,17 @@ var autoQueue = {
     if (isSidePathDispatch(dispatch.dispatch_type)) return;
 
     var context = {};
-    if (dispatch.context && dispatch.context !== "{}" && dispatch.context !== "[]") {
+    if (dispatch.context && dispatch.context !== "{}" && dispatch.context !== "[]" && dispatch.context.indexOf('"phase_gate"') !== -1) {
       try { context = JSON.parse(dispatch.context); } catch (e) { context = {}; }
-    }
-    var result = {};
-    if (dispatch.result && dispatch.result !== "{}" && dispatch.result !== "[]") {
-      try { result = JSON.parse(dispatch.result); } catch (e) { result = {}; }
     }
     var gate = context.phase_gate;
     if (!gate || !gate.run_id || gate.batch_phase == null) {
       return;
+    }
+
+    var result = {};
+    if (dispatch.result && dispatch.result !== "{}" && dispatch.result !== "[]") {
+      try { result = JSON.parse(dispatch.result); } catch (e) { result = {}; }
     }
 
     var phase = null;

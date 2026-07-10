@@ -20,8 +20,7 @@ pub(crate) use super::capability_routing::{
 };
 use super::intake_worker_capabilities::capabilities_with_runtime_state;
 pub(crate) use super::intake_worker_capabilities::{
-    deregister_gateway_waiter, node_awaits_gateway, node_supports_intake_provider,
-    refresh_worker_node_runtime_capabilities, register_gateway_waiter,
+    node_supports_intake_provider, refresh_worker_node_runtime_capabilities,
     register_intake_worker_provider,
 };
 

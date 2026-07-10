@@ -428,7 +428,7 @@ pub(super) fn file_path_regex() -> &'static regex::Regex {
         regex::Regex::new(
             r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
         )
-        .expect("file path regex must compile") // agentdesk-audit: allow-unwrap — literal compile-time pattern, failure is a programmer error
+        .expect("file path regex must compile")
     })
 }
 

@@ -12,21 +12,21 @@
 | Path | Prod | Owner | Deadline | Decompose Issue |
 | --- | ---: | --- | --- | --- |
 | `src/db/automation_candidates.rs` | 1003 | automation-pipeline | 2026-08-31 | #3405 |
-| `src/server/maintenance.rs` | 1119 | server-runtime | 2026-10-31 | #3909 |
+| `src/server/maintenance.rs` | 1014 | server-runtime | 2026-10-31 | #3909 |
 | `src/server/worker_registry.rs` | 1278 | server-runtime | 2026-08-31 | #3739 |
 | `src/services/codex_tui/rollout_tail.rs` | 1276 | discord-relay | 2026-10-31 | #3843 |
-| `src/services/discord/catch_up.rs` | 1691 | discord-relay | 2026-10-31 | #3405 |
+| `src/services/discord/catch_up.rs` | 1659 | discord-relay | 2026-10-31 | #3405 |
 | `src/services/discord/health/recovery.rs` | 2750 | discord-relay | 2026-10-31 | #3839 |
 | `src/services/discord/idle_recap.rs` | 1374 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/outbound/delivery_record.rs` | 1276 | discord-relay | 2026-10-31 | #3405 |
 | `src/services/discord/outbound/turn_output_controller.rs` | 1180 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/placeholder_sweeper.rs` | 1020 | discord-relay | 2026-08-31 | #3405 |
-| `src/services/discord/recovery_engine/restore_inflight.rs` | 2313 | discord-relay | 2026-10-31 | #3834 |
+| `src/services/discord/recovery_engine/restore_inflight.rs` | 2303 | discord-relay | 2026-10-31 | #3834 |
 | `src/services/discord/relay_recovery.rs` | 1520 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/router/intake_gate.rs` | 1607 | discord-relay | 2026-10-31 | #3838 |
 | `src/services/discord/router/message_handler/intake_turn.rs` | 2834 | discord-relay | 2026-10-31 | #3837 |
 | `src/services/discord/session_relay_sink.rs` | 1690 | discord-relay | 2026-08-31 | #3405 |
-| `src/services/discord/tmux.rs` | 1624 | discord-relay | 2026-10-31 | #3841 |
+| `src/services/discord/tmux.rs` | 1613 | discord-relay | 2026-10-31 | #3841 |
 | `src/services/discord/tmux_watcher.rs` | 3559 | discord-relay | 2026-10-31 | #3832 |
 | `src/services/discord/tmux_watcher/turn_stream_collector.rs` | 1161 | discord-relay | 2026-10-31 | #4229 |
 | `src/services/discord/tui_direct_pending_start.rs` | 1495 | discord-relay | 2026-08-31 | #3540 |
@@ -48,8 +48,8 @@
 
 | Path | Prod |
 | --- | ---: |
-| `src/cli/client.rs` | 2474 |
-| `src/cli/dcserver.rs` | 1667 |
+| `src/cli/client.rs` | 2410 |
+| `src/cli/dcserver.rs` | 1633 |
 | `src/cli/direct.rs` | 1812 |
 | `src/cli/doctor/orchestrator.rs` | 4381 |
 | `src/cli/init.rs` | 1444 |
@@ -57,7 +57,7 @@
 | `src/cli/migrate/plan.rs` | 1513 |
 | `src/cli/migrate/source.rs` | 1612 |
 | `src/cli/provider_cli/mod.rs` | 1039 |
-| `src/config.rs` | 2723 |
+| `src/config.rs` | 2705 |
 | `src/db/auto_queue/entries.rs` | 1508 |
 | `src/db/auto_queue/phase_gates.rs` | 1639 |
 | `src/db/dispatched_sessions.rs` | 1734 |
@@ -78,7 +78,7 @@
 | `src/server/routes/agents_crud.rs` | 1903 |
 | `src/server/routes/agents_setup.rs` | 1365 |
 | `src/server/routes/escalation.rs` | 1376 |
-| `src/server/routes/health_api.rs` | 1771 |
+| `src/server/routes/health_api.rs` | 1664 |
 | `src/server/routes/kanban.rs` | 2725 |
 | `src/server/routes/meetings.rs` | 1290 |
 | `src/server/routes/resume.rs` | 1260 |
@@ -94,7 +94,7 @@
 | `src/services/discord/commands/text_commands.rs` | 1476 |
 | `src/services/discord/formatting.rs` | 2862 |
 | `src/services/discord/meeting_orchestrator.rs` | 3222 |
-| `src/services/discord/mod.rs` | 4168 |
+| `src/services/discord/mod.rs` | 4166 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1337 |
 | `src/services/discord_config_audit.rs` | 1288 |
 | `src/services/dispatched_sessions.rs` | 1815 |

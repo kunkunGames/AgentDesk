@@ -78,9 +78,7 @@ impl TuiReadyState {
 /// (`inflight::rebind_reap`, #3879): both classify "the pane may still be
 /// alive, but runtime activity has gone quiescent past a long inter-activity
 /// ceiling".
-// #4353: a plain `i64`. `destructive_cancel_gate`, `manual_rebind_output_path`
-// and `dispatched_sessions` all read it unguarded, so `cfg(unix)` broke non-unix
-// builds without gating anything platform-specific.
+#[cfg(unix)]
 pub(crate) const STALE_USER_SUBMITTED_RECLAIM_SECS: i64 = 600;
 
 /// #3981/#4024: decide whether a busy JSONL `UserSubmitted` turn-state is a

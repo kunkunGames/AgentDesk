@@ -1984,13 +1984,11 @@ fn background_bash_notification_finalizes_only_exact_tool_use_id() {
         ),
     );
 
-    // #4093: completed tasks are hidden from the live panel, so verify the ✓ on
-    // the completion footer, which still renders terminal marks.
-    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let done_block = done
-        .block
-        .expect("completed background task should render in the completion footer");
-    let done_line = footer_line_containing(&done_block, "Bash Launch codex for voice S2");
+    let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = done
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for voice S2"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {done}"));
     assert!(
         done_line.contains('✓'),
         "matching notification must mark ✓: {done_line}"
@@ -2025,14 +2023,11 @@ fn background_bash_failed_notification_marks_task_failed() {
         ),
     );
 
-    // #4093: the live panel now HIDES terminal (failed) tasks, so verify the ✗
-    // finalization on the completion footer — the surface that still renders the
-    // terminal result summary.
-    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = rendered
-        .block
-        .expect("failed background task should render in the completion footer");
-    let line = footer_line_containing(&block, "Bash Deploy release runtime");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("Bash Deploy release runtime"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {rendered}"));
     assert!(
         line.contains('✗'),
         "failed notification must mark ✗: {line}"
@@ -2121,13 +2116,11 @@ fn background_bash_record_reconstruction_ack_does_not_finalize_then_notification
         ),
     );
 
-    // #4093: completed tasks are hidden from the live panel; verify the flipped
-    // ✓ on the completion footer, which still renders terminal marks.
-    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let done_block = done
-        .block
-        .expect("reconstructed completed task should render in the completion footer");
-    let done_line = footer_line_containing(&done_block, "Bash Launch codex for SharedData S4");
+    let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = done
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for SharedData S4"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {done}"));
     assert!(
         done_line.contains('✓'),
         "matching reconstructed notification must flip ✓: {done_line}"
@@ -3229,16 +3222,11 @@ fn status_panel_tracks_one_level_subagents() {
         status_events_from_tool_result(Some("Task"), false),
     );
 
-    // #4367: a completed subagent is hidden from the live panel, so verify it on
-    // the completion footer, which still renders terminal subagent marks.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    assert!(block.contains("Subagents"));
-    assert!(block.contains("explorer Inspect bridge"));
-    assert!(block.contains("found turn bridge"));
-    assert!(block.contains("✓"));
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(rendered.contains("Subagents"));
+    assert!(rendered.contains("explorer Inspect bridge"));
+    assert!(rendered.contains("found turn bridge"));
+    assert!(rendered.contains("✓"));
 }
 
 // #3084: a long-running Task subagent returns its result AFTER intervening
@@ -3292,22 +3280,17 @@ fn status_panel_pairs_subagent_by_tool_use_id_despite_interleaving() {
         status_events_from_tool_result_with_id(Some("Task"), false, Some("task-a")),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the ✓
-    // pairing on the completion footer, which still renders terminal marks.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    assert!(block.contains("Subagents"));
-    assert!(block.contains("explorer Investigate #3084"));
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(rendered.contains("Subagents"));
+    assert!(rendered.contains("explorer Investigate #3084"));
     // The subagent must be marked done — no ghost running marker.
     assert!(
-        block.contains('✓'),
-        "subagent should be closed as done, got: {block}"
+        rendered.contains('✓'),
+        "subagent should be closed as done, got: {rendered}"
     );
     assert!(
-        !block.contains('✗'),
-        "successful subagent must not show failure marker, got: {block}"
+        !rendered.contains('✗'),
+        "successful subagent must not show failure marker, got: {rendered}"
     );
 }
 
@@ -3553,16 +3536,17 @@ fn status_panel_parallel_subagents_close_correct_slots_in_reverse_order() {
         status_events_from_tool_result_with_id(Some("Task"), true, Some("task-a")),
     );
 
-    // #4367: both completed subagents are hidden from the live panel, so verify
-    // per-slot markers on the completion footer (still terminal-aware).
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagents should render in the completion footer");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     // Each slot rendered on its own line; assert per-slot markers so we catch
     // mis-attribution (e.g. A's failure landing on B).
-    let alpha_line = footer_line_containing(&block, "alpha Task A work");
-    let beta_line = footer_line_containing(&block, "beta Task B work");
+    let alpha_line = rendered
+        .lines()
+        .find(|line| line.contains("alpha Task A work"))
+        .unwrap_or_else(|| panic!("alpha slot missing in: {rendered}"));
+    let beta_line = rendered
+        .lines()
+        .find(|line| line.contains("beta Task B work"))
+        .unwrap_or_else(|| panic!("beta slot missing in: {rendered}"));
     assert!(
         alpha_line.contains('✗'),
         "Task A failed and must show ✗, got: {alpha_line}"
@@ -3612,13 +3596,11 @@ fn status_panel_renders_subagent_done_summary_from_tool_use_result() {
         })),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the Done
-    // summary on the completion footer, which still renders terminal marks.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "explorer Investigate #3086");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("explorer Investigate #3086"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
     // 81 tools, 28824 → 28.8k tokens, 1_140_000ms → 19m.
     assert!(
         line.contains("Done (81 tools · 28.8k tokens · 19m)"),
@@ -3662,13 +3644,11 @@ fn status_panel_subagent_done_summary_handles_singular_and_small_values() {
         })),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the Done
-    // summary on the completion footer, which still renders terminal marks.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "tiny Quick probe");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("tiny Quick probe"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
     assert!(
         line.contains("Done (1 tool · 940 tokens · 45s)"),
         "expected singular/small-value summary, got: {line}"
@@ -3698,13 +3678,11 @@ fn status_panel_subagent_without_accounting_has_no_done_summary() {
         status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_plain")),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the ✓
-    // (and absent Done summary) on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "plain No accounting");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("plain No accounting"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
     assert!(line.contains('✓'), "slot must still close as done: {line}");
     assert!(
         !line.contains("Done ("),
@@ -3771,15 +3749,15 @@ fn status_panel_subagent_summary_attaches_only_to_matching_slot() {
         })),
     );
 
-    // #4367: the finished subagent is hidden from the live panel, but the footer
-    // renders BOTH the finished (finisher) and still-running (worker) slots, so
-    // verify summary attribution there.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("subagents should render in the completion footer");
-    let finisher_line = footer_line_containing(&block, "finisher Finishing work");
-    let worker_line = footer_line_containing(&block, "worker Still running");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let finisher_line = rendered
+        .lines()
+        .find(|line| line.contains("finisher Finishing work"))
+        .unwrap_or_else(|| panic!("finisher slot missing in: {rendered}"));
+    let worker_line = rendered
+        .lines()
+        .find(|line| line.contains("worker Still running"))
+        .unwrap_or_else(|| panic!("worker slot missing in: {rendered}"));
 
     // The matching subagent gets the Done summary and is marked done.
     assert!(
@@ -3852,13 +3830,12 @@ fn status_panel_background_subagent_not_marked_done_on_launch_ack() {
         channel_id,
         status_events_from_task_notification("subagent", "completed", "all done"),
     );
-    // #4367: the now-completed subagent is hidden from the live panel; verify the
-    // ✓ on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed background subagent should render in the completion footer");
-    let bg_done_line = footer_line_containing(&block, "bgworker Long background job");
+    let rendered_done =
+        events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let bg_done_line = rendered_done
+        .lines()
+        .find(|line| line.contains("bgworker Long background job"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_done}"));
     assert!(
         bg_done_line.contains('✓'),
         "background subagent must be ✓ after a terminal task_notification, got: {bg_done_line}"
@@ -4098,13 +4075,11 @@ fn status_panel_async_completion_with_accounting_still_finalizes_subagent() {
         })),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the Done
-    // summary + ✓ on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "asyncworker Completion accounting");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("asyncworker Completion accounting"))
+        .unwrap_or_else(|| panic!("async completion slot missing in: {rendered}"));
     assert!(
         line.contains("Done (12 tools · 5k tokens · 30s)") && line.contains('✓'),
         "completion with accounting must still finalize, got: {line}"
@@ -4148,13 +4123,11 @@ fn status_panel_foreground_completion_without_agent_id_still_finalizes_subagent(
         })),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the Done
-    // summary + ✓ on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "fgworker No agent id completion");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("fgworker No agent id completion"))
+        .unwrap_or_else(|| panic!("foreground completion slot missing in: {rendered}"));
     assert!(
         line.contains("Done (3 tools · 1.5k tokens · 20s)") && line.contains('✓'),
         "foreground completion without agentId must still finalize, got: {line}"
@@ -4222,13 +4195,12 @@ fn status_panel_background_ack_only_unmatched_id_waits_for_matching_completion()
         }],
     );
 
-    // #4367: the now-completed subagent is hidden from the live panel; verify the
-    // Done summary + ✓ on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed background subagent should render in the completion footer");
-    let done_line = footer_line_containing(&block, "bgworker Background fallback guard");
+    let rendered_done =
+        events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = rendered_done
+        .lines()
+        .find(|line| line.contains("bgworker Background fallback guard"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_done}"));
     assert!(
         done_line.contains("Done (3 tools · 1.2k tokens · 42s)"),
         "matching summary completion must attach accounting, got: {done_line}"
@@ -4323,13 +4295,11 @@ fn status_panel_foreground_subagent_summary_completion_still_marks_done() {
         }],
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the Done
-    // summary + ✓ on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "fgworker Summary completion");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("fgworker Summary completion"))
+        .unwrap_or_else(|| panic!("foreground subagent slot missing in: {rendered}"));
     assert!(
         line.contains("Done (2 tools · 900 tokens · 11s)"),
         "foreground summary completion must keep Done summary, got: {line}"
@@ -4372,13 +4342,11 @@ fn status_panel_background_subagent_failed_launch_marked_failed() {
         status_events_from_tool_result_with_id(Some("Task"), true, Some("toolu_bg_fail")),
     );
 
-    // #4367: the failed (terminal) subagent is hidden from the live panel; verify
-    // the ✗ finalization on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("failed background subagent should render in the completion footer");
-    let bg_line = footer_line_containing(&block, "bgworker Doomed background job");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let bg_line = rendered
+        .lines()
+        .find(|line| line.contains("bgworker Doomed background job"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered}"));
     assert!(
         bg_line.contains('✗'),
         "failed background launch must finalize as ✗, got: {bg_line}"
@@ -4410,13 +4378,11 @@ fn status_panel_foreground_subagent_marked_done_on_tool_result() {
         status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_fg")),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the ✓ on
-    // the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let fg_line = footer_line_containing(&block, "fgworker Quick job");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let fg_line = rendered
+        .lines()
+        .find(|line| line.contains("fgworker Quick job"))
+        .unwrap_or_else(|| panic!("foreground subagent slot missing in: {rendered}"));
     assert!(
         fg_line.contains('✓'),
         "foreground subagent must be ✓ on its tool_result, got: {fg_line}"
@@ -4486,14 +4452,15 @@ fn status_panel_batched_multi_subagent_summaries_land_on_own_slots() {
         })),
     );
 
-    // #4367: both completed subagents are hidden from the live panel; verify the
-    // per-slot Done summaries on the completion footer (still terminal-aware).
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagents should render in the completion footer");
-    let alpha_line = footer_line_containing(&block, "alpha Task A");
-    let beta_line = footer_line_containing(&block, "beta Task B");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let alpha_line = rendered
+        .lines()
+        .find(|line| line.contains("alpha Task A"))
+        .unwrap_or_else(|| panic!("alpha slot missing in: {rendered}"));
+    let beta_line = rendered
+        .lines()
+        .find(|line| line.contains("beta Task B"))
+        .unwrap_or_else(|| panic!("beta slot missing in: {rendered}"));
 
     // A's aggregate lands on A's slot (tuA), B's on B's slot (tuB) — NOT both on
     // the first block.
@@ -4512,93 +4479,6 @@ fn status_panel_batched_multi_subagent_summaries_land_on_own_slots() {
     assert!(
         beta_line.contains('✓'),
         "beta must be marked done, got: {beta_line}"
-    );
-}
-
-// #4396: a single batched `user` record may complete N parallel subagents while
-// carrying only ONE record-level `toolUseResult` aggregate (no per-block
-// aggregates). The aggregate is owned by the FIRST id-bearing block; the other
-// Task results must STILL close their slots (summary-less `SubagentEnd`), not
-// fall through to a bare `ToolEnd` that leaves them permanently unfinished —
-// the exact #4396 symptom: no footer ✓/✗ and the #4367 live filter never hides
-// them. An unrelated ordinary tool result batched into the same record must
-// stay a no-op (its id matches no subagent slot).
-#[test]
-fn status_panel_batched_record_level_aggregate_closes_all_parallel_subagents() {
-    let events = PlaceholderLiveEvents::default();
-    let channel_id = ChannelId::new(4396);
-
-    // Three subagents launched in parallel.
-    for (subagent_type, desc, id) in [
-        ("alpha", "Scout A", "toolu_4396_a"),
-        ("beta", "Scout B", "toolu_4396_b"),
-        ("gamma", "Scout C", "toolu_4396_c"),
-    ] {
-        events.push_status_events(
-            channel_id,
-            status_events_from_tool_use_with_id(
-                "Task",
-                &json!({"subagent_type": subagent_type, "description": desc}).to_string(),
-                Some(id),
-            ),
-        );
-    }
-
-    // ONE `user` record batches ALL THREE Task results (plus an unrelated
-    // ordinary tool result) with only a RECORD-level aggregate.
-    events.push_status_events(
-        channel_id,
-        status_events_from_json(&json!({
-            "type": "user",
-            "message": {
-                "content": [
-                    { "type": "tool_result", "tool_use_id": "toolu_4396_a", "is_error": false },
-                    { "type": "tool_result", "tool_use_id": "toolu_4396_b", "is_error": false },
-                    { "type": "tool_result", "tool_use_id": "toolu_4396_c", "is_error": false },
-                    { "type": "tool_result", "tool_use_id": "toolu_4396_bash", "is_error": false }
-                ]
-            },
-            "toolUseResult": {
-                "agentId": "aalpha4396000000",
-                "totalToolUseCount": 7,
-                "totalTokens": 4200,
-                "totalDurationMs": 21_000
-            }
-        })),
-    );
-
-    // Every parallel subagent is terminal: the completion footer marks ALL
-    // THREE ✓ (the record aggregate's Done summary belongs to the first
-    // id-bearing block only).
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagents should render in the completion footer");
-    for needle in ["alpha Scout A", "beta Scout B", "gamma Scout C"] {
-        let line = footer_line_containing(&block, needle);
-        assert!(
-            line.contains('✓'),
-            "every batched parallel subagent must be marked done, got: {line}"
-        );
-    }
-    assert!(
-        footer_line_containing(&block, "alpha Scout A").contains("Done (7 tools"),
-        "record-level aggregate belongs to the first id-bearing block, got: {block}"
-    );
-    // The unrelated ordinary tool result must not fabricate a subagent entry.
-    assert_eq!(
-        block.matches('✓').count(),
-        3,
-        "exactly the three launched subagents close — no ghost from the \
-         unrelated tool result, got: {block}"
-    );
-
-    // #4367 live filter: all three are terminal, so the live panel hides the
-    // whole Subagents section (this is what stayed stuck before the fix).
-    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(
-        !rendered.contains("Subagents"),
-        "all-terminal subagents must vanish from the live panel, got: {rendered}"
     );
 }
 
@@ -4700,17 +4580,15 @@ fn status_panel_unmatched_completion_fallback_pairs_by_agent_id_or_description()
         },
     );
 
-    // #4367: the completed subagents are hidden from the live panel; verify the ✓
-    // fallback finalization on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagents should render in the completion footer");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     for expected in [
         "agent Agent-id carried slot",
         "agent Description carried slot",
     ] {
-        let line = footer_line_containing(&block, expected);
+        let line = rendered
+            .lines()
+            .find(|line| line.contains(expected))
+            .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
         assert!(
             line.contains('✓'),
             "unique fallback completion must finalize {expected}, got: {line}"
@@ -4977,13 +4855,11 @@ fn status_panel_subagent_summary_no_rollout_io_on_hot_path() {
         })),
     );
 
-    // #4367: the completed subagent is hidden from the live panel; verify the
-    // partial Done summary on the completion footer.
-    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
-    let block = footer
-        .block
-        .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "partial Partial accounting");
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("partial Partial accounting"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
     // Only the in-stream tool_count survives; tokens/duration are omitted (no IO
     // fallback computed them).
     assert!(
@@ -5422,37 +5298,13 @@ fn status_panel_taskupdate_updates_existing_task_by_id() {
         ),
     );
 
-    // #4093: a `completed` task is hidden from the live panel, so the in-place
-    // update (TaskUpdate mutates the existing slot rather than appending a new
-    // one) is verified via state. The single slot carries the merged fields:
-    // the latest name, the TaskCreate summary (TaskUpdate sent none), and the
-    // new terminal status. Scope the guard so it is dropped before the render
-    // below re-locks the same channel entry (the mutex is not reentrant).
-    {
-        let status_entry = events
-            .status_by_channel
-            .get(&channel_id)
-            .expect("status panel state");
-        let guard = status_entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            guard.tasks.len(),
-            1,
-            "TaskUpdate must update the existing slot by id, not append"
-        );
-        let slot = &guard.tasks[0];
-        assert_eq!(slot.task_id.as_deref(), Some("task-1"));
-        assert_eq!(slot.summary.as_deref(), Some("Wire Tasks panel"));
-        assert_eq!(slot.status.as_deref(), Some("completed"));
-    }
-
-    // And the completed task is absent from the live panel per #4093.
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(
-        !rendered.contains("Wire Tasks panel"),
-        "completed task must not render in the live panel: {rendered}"
-    );
+    let task_lines = rendered
+        .lines()
+        .filter(|line| line.starts_with("└ Task"))
+        .collect::<Vec<_>>();
+    assert_eq!(task_lines.len(), 1, "rendered:\n{rendered}");
+    assert!(rendered.contains("TaskUpdate task-1 · Wire Tasks panel · completed"));
 }
 
 #[test]
@@ -6695,28 +6547,22 @@ fn rehydration_bound_skips_records_before_compact_boundary() {
 }
 
 // ===========================================================================
-// #4093 + #4367: the live (turn-in-progress) status panel HIDES completed
-// Tasks/Subagents outright (superseding #3404's terminal-slot compaction, now
-// removed — see completion_footer.rs).
+// #3404: live (turn-in-progress) status-panel terminal-slot compaction.
 // ===========================================================================
 
-// Representative "several completed" backlog size for the hide-completed tests.
-// (Formerly aliased the removed #3404 `LIVE_PANEL_TERMINAL_RENDER_CAP`; the live
-// panel no longer caps terminal rows, so this is now just an arbitrary count.)
-const COMPLETED_SAMPLE: usize = 3;
+const LIVE_CAP: usize = super::completion_footer::LIVE_PANEL_TERMINAL_RENDER_CAP;
 
-// #4093 (supersedes #3404 for the Tasks section): during a long turn the LIVE
-// panel used to accumulate completed Tasks — #3404 capped the display at a few
-// completions plus a `… (+N completed)` summary. #4093 goes further: completed
-// Task slots are hidden from the live panel entirely so they can never mask or
-// crowd out in-progress work, while every running entry and the section header
-// stay. (The completion footer still renders the ✓ result summary.) #4093 후속
-// removed the #3404 compactor outright — see completion_footer.rs.
+// #3404 fail-on-base: during a long turn the LIVE panel accumulated EVERY
+// completed Task forever; the running entry and even the section budget got
+// starved. Compaction keeps only the most recent `LIVE_CAP` completions plus all
+// running entries and collapses the rest into a `… (+N completed)` summary. On
+// HEAD (no compaction) all completed lines render and no summary line exists, so
+// this fails.
 #[test]
-fn live_panel_hides_completed_tasks_keeping_running_and_header() {
+fn live_panel_compacts_completed_tasks_keeping_running_and_header() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_404_001);
-    let completed = COMPLETED_SAMPLE + 4;
+    let completed = LIVE_CAP + 4;
     for i in 0..completed {
         let id = format!("toolu_3404_done_{i:02}");
         push_background_bash_task(&events, channel_id, &format!("Completed job {i:02}"), &id);
@@ -6725,38 +6571,35 @@ fn live_panel_hides_completed_tasks_keeping_running_and_header() {
     push_background_bash_task(&events, channel_id, "Still running", "toolu_3404_run");
 
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let rendered_done = panel.matches('✓').count();
     assert_eq!(
-        panel.matches('✓').count(),
-        0,
-        "live panel must hide all completed tasks: {panel}"
+        rendered_done, LIVE_CAP,
+        "live panel must cap rendered completions at {LIVE_CAP}: {panel}"
     );
+    let collapsed = completed - LIVE_CAP;
     assert!(
-        !panel.contains("completed)"),
-        "no compaction summary when completed tasks are hidden: {panel}"
+        panel.contains(&format!("… (+{collapsed} completed)")),
+        "older completions must collapse into a summary: {panel}"
     );
     assert!(panel.contains("Tasks"), "Tasks header survives: {panel}");
     assert!(
         panel.contains("Still running"),
-        "the running entry is always shown: {panel}"
+        "the running entry is never capped: {panel}"
     );
-    assert!(
-        !panel.contains("Completed job"),
-        "no completed task line renders in the live panel: {panel}"
-    );
+    // The most recent completion stays visible; the oldest is collapsed away.
+    assert!(panel.contains(&format!("Completed job {:02}", completed - 1)));
+    assert!(!panel.contains("Completed job 00"));
 }
 
-// #4367 (supersedes #3404 for the Subagents section, mirroring #4093 for Tasks):
-// during a long turn the LIVE panel used to accumulate completed Subagents —
-// #3404 capped the display at a few completions plus a `… (+N completed)`
-// summary. #4367 goes further: completed subagent slots are hidden from the live
-// panel entirely so they can never mask or crowd out in-progress work, while the
-// running entry and the section header stay. (The completion footer still renders
-// the ✓ result summary.)
+// #3404 fail-on-base: the bug's headline symptom — a long backlog of completed
+// SUBAGENTS truncated the whole Subagents section to `…`. Compaction keeps the
+// Subagents header + running entry visible. On HEAD the running subagent and the
+// header are pushed out, so this fails.
 #[test]
-fn live_panel_hides_completed_subagents_keeping_running_and_header() {
+fn live_panel_compaction_keeps_subagents_section_and_running_entry() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_404_002);
-    for i in 0..(COMPLETED_SAMPLE + 5) {
+    for i in 0..(LIVE_CAP + 5) {
         let id = format!("toolu_3404_sub_{i:02}");
         events.push_status_event(
             channel_id,
@@ -6794,7 +6637,7 @@ fn live_panel_hides_completed_subagents_keeping_running_and_header() {
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(
         panel.contains("Subagents"),
-        "Subagents header survives: {panel}"
+        "Subagents header survives compaction: {panel}"
     );
     assert!(
         panel.contains("Live inspection"),
@@ -6802,29 +6645,21 @@ fn live_panel_hides_completed_subagents_keeping_running_and_header() {
     );
     assert_eq!(
         panel.matches('✓').count(),
-        0,
-        "live panel must hide all completed subagents: {panel}"
-    );
-    assert!(
-        !panel.contains("completed)"),
-        "no compaction summary when completed subagents are hidden: {panel}"
-    );
-    assert!(
-        !panel.contains("Audit chunk"),
-        "no completed subagent line renders in the live panel: {panel}"
+        LIVE_CAP,
+        "completed subagents are capped: {panel}"
     );
 }
 
-// #3404 SAFETY (still holds after #4093 + #4367): the live path must NEVER mutate
-// slot state — hiding a completed slot from the live RENDER must leave it in state
-// so the Ok-gated completion-footer eviction (#3391) stays authoritative and no ✓
-// is lost unseen. After a live render that hides every completed slot, the
-// completion footer still sees and can deliver every one of them.
+// #3404 SAFETY: the live path must NEVER mutate slot state — a ✓ that the live
+// edit dropped from the RENDER must still be in state so the Ok-gated
+// completion-footer eviction (#3391) remains authoritative and no ✓ is lost
+// unseen. After a compacted live render, the completion footer still sees and
+// can deliver every completed slot.
 #[test]
-fn live_panel_render_preserves_state_for_footer_eviction() {
+fn live_panel_compaction_preserves_state_for_footer_eviction() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_404_003);
-    let completed = COMPLETED_SAMPLE + 3;
+    let completed = LIVE_CAP + 3;
     let mut ids = Vec::new();
     for i in 0..completed {
         let id = format!("toolu_3404_state_{i:02}");
@@ -6833,7 +6668,7 @@ fn live_panel_render_preserves_state_for_footer_eviction() {
         ids.push(id);
     }
 
-    // The live render hides the completed slots but must not touch state.
+    // Live render compacts the display but must not touch state.
     let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
 
     // The completion footer (separate render) still reports EVERY completed slot
@@ -6842,32 +6677,99 @@ fn live_panel_render_preserves_state_for_footer_eviction() {
     assert_eq!(
         footer.delivered_terminal_ids.len(),
         completed,
-        "live render must not remove slots from state: {:?}",
+        "live compaction must not remove slots from state: {:?}",
         footer.delivered_terminal_ids
     );
 }
 
-// #4093 (supersedes #3404 for the Tasks section): even a small backlog of
-// completed tasks (at or under the old compaction cap) is now hidden entirely —
-// no ✓ marks and no `… (+N completed)` summary render in the live panel.
+// #3404: a small backlog at or under the cap renders verbatim (no summary line,
+// no behavior change for short turns).
 #[test]
-fn live_panel_hides_completed_tasks_even_under_cap() {
+fn live_panel_no_compaction_under_cap() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_404_004);
-    for i in 0..COMPLETED_SAMPLE {
+    for i in 0..LIVE_CAP {
         let id = format!("toolu_3404_small_{i:02}");
         push_background_bash_task(&events, channel_id, &format!("Job {i:02}"), &id);
         complete_background_bash_task(&events, channel_id, &id);
     }
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert_eq!(
-        panel.matches('✓').count(),
-        0,
-        "completed tasks are hidden from the live panel: {panel}"
-    );
+    assert_eq!(panel.matches('✓').count(), LIVE_CAP);
     assert!(
         !panel.contains("completed)"),
-        "no summary when completed tasks are hidden: {panel}"
+        "no summary under cap: {panel}"
+    );
+}
+
+// #3404 unit: the compaction primitive keeps the newest `cap` terminal lines,
+// preserves every in-flight line in place, and emits one summary for the rest.
+#[test]
+fn compact_live_panel_terminal_lines_caps_and_preserves_inflight() {
+    use super::completion_footer::compact_live_panel_terminal_lines;
+    // Newest-first order (the live panel renders `.rev()`).
+    let lines: Vec<String> = vec![
+        "└ Bash running A ⠸".to_string(),
+        "└ Bash done 5 ✓".to_string(),
+        "└ Bash done 4 ✓".to_string(),
+        "└ Bash done 3 ✓".to_string(),
+        "└ Bash done 2 ✗".to_string(),
+        "└ Bash done 1 ✓".to_string(),
+    ];
+    let (out, collapsed) =
+        compact_live_panel_terminal_lines(&lines).expect("over-cap input must compact");
+    assert_eq!(collapsed, 5 - LIVE_CAP);
+    // Running line preserved in position.
+    assert_eq!(out[0], "└ Bash running A ⠸");
+    // Exactly `cap` terminal lines survive (the newest), plus one summary line.
+    assert_eq!(
+        out.iter()
+            .filter(|l| l.ends_with('✓') || l.ends_with('✗'))
+            .count(),
+        LIVE_CAP
+    );
+    assert_eq!(out.iter().filter(|l| l.contains("completed)")).count(), 1);
+    assert!(out.iter().any(|l| l.contains("done 5")));
+    assert!(!out.iter().any(|l| l.contains("done 1")));
+    // Under-cap input is left untouched.
+    assert!(compact_live_panel_terminal_lines(&lines[..2].to_vec()).is_none());
+}
+
+// #3404 codex r1 — the compaction INFO log is count-change gated: same counts
+// across render ticks must not re-log; zero counts re-arm the gate so the next
+// compaction episode logs again.
+#[test]
+fn compaction_log_gate_fires_on_change_only() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_100);
+    assert!(
+        events.compaction_counts_changed(channel_id, 4, 0),
+        "first over-cap render logs"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 4, 0),
+        "same counts stay silent"
+    );
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "count growth logs"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 5, 1),
+        "steady state stays silent"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 0, 0),
+        "zero never logs"
+    );
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "zero re-arms the next episode"
+    );
+    // codex r2: a turn reset (even residual-preserving) re-arms the gate.
+    events.clear_channel_preserving_footer_residuals(channel_id);
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "turn reset re-arms the gate without an interleaved zero render"
     );
 }
 
