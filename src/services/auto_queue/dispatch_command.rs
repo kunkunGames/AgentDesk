@@ -423,11 +423,12 @@ pub(super) fn normalize_similarity_path(raw: &str) -> Option<String> {
 }
 
 pub(super) fn file_path_regex() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
             r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
         )
+        // agentdesk-audit: allow-unwrap - static regex is known to be valid
         .expect("file path regex must compile")
     })
 }
