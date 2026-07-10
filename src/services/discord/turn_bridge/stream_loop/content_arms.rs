@@ -1,8 +1,8 @@
 //! Content/status/terminal stream-loop arms for `turn_bridge::spawn_turn_bridge`.
 
-use std::sync::Arc;
-
+use super::super::thinking::{redacted_thinking_transcript_event, thinking_status_line};
 use super::*;
+use std::sync::Arc;
 
 pub(super) enum StreamContentArmMessage {
     RetryBoundary,
