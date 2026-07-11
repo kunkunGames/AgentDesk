@@ -31,10 +31,11 @@ async fn create_test_pool(
     (pg_db, pool)
 }
 
-async fn insert_recurring_agent_message(
+async fn insert_agent_message(
     pool: &PgPool,
     agent_id: &str,
     on_agent_failure: &str,
+    schedule: Option<&str>,
 ) -> ScheduledMessageRow {
     sqlx::query(
         "INSERT INTO agents (id, name, discord_channel_id)
@@ -49,7 +50,7 @@ async fn insert_recurring_agent_message(
     db::insert_scheduled_message_pg(
         pool,
         &db::NewScheduledMessage {
-            content: format!("retry exhaustion payload for {agent_id}"),
+            content: format!("scheduled agent payload for {agent_id}"),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "announce".to_string(),
@@ -58,7 +59,7 @@ async fn insert_recurring_agent_message(
             agent_instruction: None,
             on_agent_failure: on_agent_failure.to_string(),
             scheduled_at: Utc::now() - Duration::minutes(1),
-            schedule: Some("@every 10m".to_string()),
+            schedule: schedule.map(str::to_string),
             timezone: "UTC".to_string(),
             expires_at: None,
             source: "postgres_test".to_string(),
@@ -67,7 +68,23 @@ async fn insert_recurring_agent_message(
         },
     )
     .await
-    .expect("insert recurring scheduled message")
+    .expect("insert scheduled agent message")
+}
+
+async fn insert_recurring_agent_message(
+    pool: &PgPool,
+    agent_id: &str,
+    on_agent_failure: &str,
+) -> ScheduledMessageRow {
+    insert_agent_message(pool, agent_id, on_agent_failure, Some("@every 10m")).await
+}
+
+async fn insert_one_shot_agent_message(
+    pool: &PgPool,
+    agent_id: &str,
+    on_agent_failure: &str,
+) -> ScheduledMessageRow {
+    insert_agent_message(pool, agent_id, on_agent_failure, None).await
 }
 
 async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
@@ -881,6 +898,167 @@ async fn postgres_agent_evidence_before_runtime_ack_is_not_missed() {
         .expect("fast-evidence parent exists");
     assert_eq!(completed.status, db::STATUS_SCHEDULED);
     assert_eq!(completed.fire_count, 1);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_provider_error_transcripts_fail_without_false_delivery() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_provider_error_transcript",
+        "scheduled message provider-error transcript regression",
+    )
+    .await;
+    let cases = [
+        (
+            "scheduled-codex-usage-limit-agent",
+            "codex-provider-error-worker",
+            "scheduled-codex-usage-limit-turn",
+            "Error: You've hit your usage limit. Try again later.",
+            serde_json::json!([{
+                "kind": "error",
+                "content": "You've hit your usage limit. Try again later.",
+                "status": "error",
+                "is_error": true
+            }, {
+                "kind": "system",
+                "content": "voluntary feedback recorded",
+                "is_error": false
+            }]),
+        ),
+        (
+            "scheduled-qwen-api-error-agent",
+            "qwen-provider-error-worker",
+            "scheduled-qwen-api-error-turn",
+            "[API Error: 400 status code (no body)]",
+            serde_json::json!([
+                {
+                    "kind": "assistant",
+                    "content": "[API Error: 400 status code (no body)]",
+                    "is_error": false
+                },
+                {
+                    "kind": "result",
+                    "content": "[API Error: 400 status code (no body)]",
+                    "status": "success",
+                    "is_error": false
+                }
+            ]),
+        ),
+    ];
+
+    for (agent_id, owner, turn_id, assistant_message, events_json) in cases {
+        let message = insert_one_shot_agent_message(&pool, agent_id, "fail").await;
+        let fire = claim_one(&pool, owner).await;
+        record_confirmed_agent_turn(&pool, &fire, turn_id).await;
+        let mut running = db::list_running_agent_deliveries_pg(&pool, owner, LEASE_SECS, 10)
+            .await
+            .expect("poll provider-error agent turn");
+        let delivery = running
+            .pop()
+            .expect("provider-error delivery should be polled");
+        sqlx::query(
+            "INSERT INTO session_transcripts (turn_id, assistant_message, events_json)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(turn_id)
+        .bind(assistant_message)
+        .bind(sqlx::types::Json(events_json))
+        .execute(&pool)
+        .await
+        .expect("seed provider-error transcript evidence");
+
+        assert!(resolve_agent_delivery(&pool, &delivery, false).await);
+        let deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+            .await
+            .expect("read provider-error delivery");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].status, db::DELIVERY_FAILED);
+        assert_eq!(deliveries[0].fallback_outbox_id, None);
+        assert!(
+            deliveries[0].error.as_deref().is_some_and(
+                |error| error == "agent turn returned terminal provider error transcript"
+            )
+        );
+
+        let parent = db::get_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("read provider-error parent")
+            .expect("provider-error parent exists");
+        assert_eq!(parent.status, db::STATUS_FAILED);
+        assert_eq!(parent.fire_count, 0);
+        assert!(
+            parent.last_error.as_deref().is_some_and(
+                |error| error == "agent turn returned terminal provider error transcript"
+            )
+        );
+    }
+
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox WHERE source = $1")
+            .bind(OUTBOX_SOURCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count provider-error fallback outbox rows");
+    assert_eq!(outbox_count, 0);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_transcript_event_probe_tolerates_unknown_or_legacy_json() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_transcript_event_compat",
+        "scheduled message transcript-event compatibility regression",
+    )
+    .await;
+    let lower_bound = Utc::now() - Duration::minutes(1);
+    let cases = [
+        (
+            "scheduled-future-event-turn",
+            serde_json::json!([{"kind": "future_event", "content": "forward compatible"}]),
+        ),
+        (
+            "scheduled-legacy-event-shape-turn",
+            serde_json::json!({"legacy": true}),
+        ),
+        (
+            "scheduled-recovered-assistant-turn",
+            serde_json::json!([
+                {
+                    "kind": "error",
+                    "content": "recoverable tool attempt failed",
+                    "is_error": true
+                },
+                {
+                    "kind": "assistant",
+                    "content": "recovered without a result event",
+                    "is_error": false
+                }
+            ]),
+        ),
+    ];
+
+    for (turn_id, events_json) in cases {
+        sqlx::query(
+            "INSERT INTO session_transcripts (turn_id, assistant_message, events_json)
+             VALUES ($1, 'normal delivered answer', $2)",
+        )
+        .bind(turn_id)
+        .bind(sqlx::types::Json(events_json))
+        .execute(&pool)
+        .await
+        .expect("seed forward-compatible transcript event evidence");
+
+        assert_eq!(
+            find_turn_delivery_evidence(&pool, turn_id, lower_bound)
+                .await
+                .expect("query forward-compatible transcript evidence"),
+            Some(TurnEvidence::Delivered)
+        );
+    }
 
     pool.close().await;
     pg_db.drop().await;
