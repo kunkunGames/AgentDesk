@@ -27,6 +27,11 @@ mod postgres_tests;
 /// slow clients); anything older is a user error for one-shot messages.
 const PAST_TOLERANCE_SECS: i64 = 60;
 
+/// Info-only scheduled pushes must not wake an agent that owns the target
+/// channel. `announce` is the authoritative agent-to-agent trigger bot, while
+/// `notify` is the canonical non-actionable delivery sink.
+const DEFAULT_SCHEDULED_MESSAGE_BOT: &str = "notify";
+
 type ApiResponse = (StatusCode, Json<JsonValue>);
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> ApiResponse {
@@ -48,6 +53,12 @@ fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, ApiResponse>
                 format!("{field} must be an RFC3339 timestamp: {error}"),
             )
         })
+}
+
+fn scheduled_message_bot_or_default(bot: Option<&str>) -> String {
+    bot.filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_SCHEDULED_MESSAGE_BOT)
+        .to_string()
 }
 
 // ── Create ──────────────────────────────────────────────────────────────────
@@ -219,11 +230,7 @@ async fn validate_create(
         content: content.to_string(),
         title: body.title.clone().filter(|value| !value.trim().is_empty()),
         target_channel_id,
-        bot: body
-            .bot
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "announce".to_string()),
+        bot: scheduled_message_bot_or_default(body.bot.as_deref()),
         delivery_kind,
         agent_id,
         agent_instruction: body

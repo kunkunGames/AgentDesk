@@ -88,6 +88,60 @@ async fn claim_after_exhausting_rearms(pool: &PgPool) -> ClaimedFire {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_default_notify_reaches_push_outbox() {
+    let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
+        "agentdesk_smsg_notify_default",
+        "scheduled message default notify bot regression",
+    )
+    .await;
+    let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
+
+    let stored_bot: String = sqlx::query_scalar(
+        "INSERT INTO scheduled_messages
+             (id, content, target_channel_id, scheduled_at, timezone)
+         VALUES
+             ('smsg-notify-default', 'info-only scheduled push', '123456789',
+              NOW() - INTERVAL '1 second', 'UTC')
+         RETURNING bot",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert scheduled message through the database default");
+    assert_eq!(stored_bot, "notify");
+
+    let mut claims =
+        db::claim_due_fires_pg(&pool, "notify-default-worker", 1, LEASE_SECS, Utc::now())
+            .await
+            .expect("claim default-notify scheduled push");
+    assert_eq!(claims.len(), 1);
+    fire_claimed(
+        &pool,
+        None,
+        claims.pop().expect("claimed default-notify fire"),
+        Utc::now(),
+    )
+    .await;
+
+    let deliveries = db::list_deliveries_pg(&pool, "smsg-notify-default", 10, None)
+        .await
+        .expect("load default-notify delivery");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, db::DELIVERY_SENT);
+    let outbox_id = deliveries[0]
+        .outbox_id
+        .expect("push should record its outbox handoff");
+    let outbox_bot: String = sqlx::query_scalar("SELECT bot FROM message_outbox WHERE id = $1")
+        .bind(outbox_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load default-notify outbox row");
+    assert_eq!(outbox_bot, "notify");
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_definitions() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_retry_exhaustion",
