@@ -478,6 +478,29 @@ fn patch_string(
     }
 }
 
+fn normalize_effective_scheduled_at(
+    scheduled_at: DateTime<Utc>,
+    schedule: Option<&str>,
+    timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
+    if let Some(schedule) = schedule {
+        let next = crate::services::routines::next_due_after(schedule, timezone, now)
+            .map_err(|error| format!("{error}"))?;
+        return Ok(
+            if scheduled_at < now - Duration::seconds(PAST_TOLERANCE_SECS) {
+                next
+            } else {
+                scheduled_at
+            },
+        );
+    }
+    if scheduled_at < now - Duration::seconds(PAST_TOLERANCE_SECS) {
+        return Err("scheduledAt is in the past and no schedule is set".to_string());
+    }
+    Ok(scheduled_at)
+}
+
 async fn build_patch(
     pool: &PgPool,
     body: &serde_json::Map<String, JsonValue>,
@@ -552,19 +575,16 @@ async fn build_patch(
         .clone()
         .unwrap_or_else(|| existing.timezone.clone());
     let now = Utc::now();
-    if let Some(schedule) = effective_schedule.as_deref() {
-        let next = crate::services::routines::next_due_after(schedule, &effective_timezone, now)
-            .map_err(|error| bad_request(format!("{error}")))?;
-        if effective_scheduled_at < now - Duration::seconds(PAST_TOLERANCE_SECS) {
-            patch.scheduled_at = Some(next);
-            effective_scheduled_at = next;
-        }
-    } else if patch.scheduled_at.is_some()
-        && effective_scheduled_at < now - Duration::seconds(PAST_TOLERANCE_SECS)
-    {
-        return Err(bad_request(
-            "scheduledAt is in the past and no schedule is set".to_string(),
-        ));
+    let normalized_scheduled_at = normalize_effective_scheduled_at(
+        effective_scheduled_at,
+        effective_schedule.as_deref(),
+        &effective_timezone,
+        now,
+    )
+    .map_err(bad_request)?;
+    if normalized_scheduled_at != effective_scheduled_at {
+        patch.scheduled_at = Some(normalized_scheduled_at);
+        effective_scheduled_at = normalized_scheduled_at;
     }
     let effective_expires_at = patch.expires_at.unwrap_or(existing.expires_at);
     if let Some(expires_at) = effective_expires_at {
@@ -600,9 +620,15 @@ pub async fn cancel_scheduled_message(
                 "status": status,
             })),
         ),
-        Ok(CancelOutcome::Canceled { was_firing }) => {
-            let note =
-                was_firing.then_some("delivery was in flight; it may already have been handed off");
+        Ok(CancelOutcome::Canceled {
+            was_firing,
+            handoff_started,
+        }) => {
+            let note = if handoff_started {
+                Some("delivery was already handed off; downstream delivery may still complete")
+            } else {
+                was_firing.then_some("in-flight delivery was canceled before handoff")
+            };
             (
                 StatusCode::OK,
                 Json(json!({"canceled": true, "note": note})),
@@ -624,6 +650,25 @@ pub async fn trigger_scheduled_message_now(
         Ok(pool) => pool,
         Err(response) => return response,
     };
+    if state.health_registry.is_none() {
+        match db::get_scheduled_message_pg(pool, &id).await {
+            Ok(Some(row))
+                if row.status == db::STATUS_SCHEDULED && row.delivery_kind == db::KIND_AGENT =>
+            {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Discord runtime is unavailable for agent delivery",
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("load scheduled message: {error}"),
+                );
+            }
+        }
+    }
     let claimed = match db::trigger_now_pg(
         pool,
         &id,
@@ -761,4 +806,29 @@ async fn render_deliveries(
             rendered
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn patch_rejects_stale_effective_one_shot_time() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap();
+        let stale = now - Duration::minutes(2);
+        assert_eq!(
+            normalize_effective_scheduled_at(stale, None, "UTC", now).unwrap_err(),
+            "scheduledAt is in the past and no schedule is set"
+        );
+    }
+
+    #[test]
+    fn patch_realigns_stale_recurring_time() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap();
+        let stale = now - Duration::minutes(2);
+        let normalized =
+            normalize_effective_scheduled_at(stale, Some("@every 10m"), "UTC", now).unwrap();
+        assert!(normalized > now);
+    }
 }

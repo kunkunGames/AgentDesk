@@ -54,8 +54,33 @@ async fn insert_recurring_agent_message(
     .expect("insert recurring scheduled message")
 }
 
+async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
+    db::insert_scheduled_message_pg(
+        pool,
+        &db::NewScheduledMessage {
+            content: "guarded push payload".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "announce".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::minutes(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("insert due push scheduled message")
+}
+
 async fn claim_one(pool: &PgPool, owner: &str) -> ClaimedFire {
-    let mut claimed = db::claim_due_fires_pg(pool, owner, 10, LEASE_SECS, Utc::now())
+    let mut claimed = db::claim_due_fires_pg(pool, owner, true, 10, LEASE_SECS, Utc::now())
         .await
         .expect("claim due scheduled message");
     assert_eq!(claimed.len(), 1, "exactly one definition should be due");
@@ -110,10 +135,16 @@ async fn postgres_scheduled_message_default_notify_reaches_push_outbox() {
     .expect("insert scheduled message through the database default");
     assert_eq!(stored_bot, "notify");
 
-    let mut claims =
-        db::claim_due_fires_pg(&pool, "notify-default-worker", 1, LEASE_SECS, Utc::now())
-            .await
-            .expect("claim default-notify scheduled push");
+    let mut claims = db::claim_due_fires_pg(
+        &pool,
+        "notify-default-worker",
+        true,
+        1,
+        LEASE_SECS,
+        Utc::now(),
+    )
+    .await
+    .expect("claim default-notify scheduled push");
     assert_eq!(claims.len(), 1);
     fire_claimed(
         &pool,
@@ -237,13 +268,110 @@ async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_defi
             .is_some_and(|reason| reason.contains(":fallback:"))
     );
 
+    let expired_message =
+        insert_recurring_agent_message(&pool, "scheduled-retry-expired-agent", "push_raw").await;
+    let mut expired_fire = claim_after_exhausting_rearms(&pool).await;
+    let expired_at = Utc::now() - Duration::seconds(1);
+    sqlx::query("UPDATE scheduled_messages SET expires_at = $2 WHERE id = $1")
+        .bind(&expired_message.id)
+        .bind(expired_at)
+        .execute(&pool)
+        .await
+        .expect("expire retry-exhausted definition");
+    expired_fire.message.expires_at = Some(expired_at);
+    fire_claimed(&pool, None, expired_fire.clone(), Utc::now()).await;
+
+    let expired_parent = db::get_scheduled_message_pg(&pool, &expired_message.id)
+        .await
+        .expect("read expired parent")
+        .expect("expired parent exists");
+    assert_eq!(expired_parent.status, db::STATUS_EXPIRED);
+    assert_eq!(expired_parent.fire_count, 0);
+    let expired_deliveries = db::list_deliveries_pg(&pool, &expired_message.id, 10, None)
+        .await
+        .expect("list expired deliveries");
+    assert_eq!(expired_deliveries.len(), 1);
+    assert_eq!(expired_deliveries[0].status, db::DELIVERY_INTERRUPTED);
+    assert_eq!(expired_deliveries[0].fallback_outbox_id, None);
+
     assert!(
-        db::claim_due_fires_pg(&pool, "post-terminal-worker", 10, LEASE_SECS, Utc::now())
-            .await
-            .expect("scan after terminal exhaustion")
-            .is_empty(),
+        db::claim_due_fires_pg(
+            &pool,
+            "post-terminal-worker",
+            true,
+            10,
+            LEASE_SECS,
+            Utc::now(),
+        )
+        .await
+        .expect("scan after terminal exhaustion")
+        .is_empty(),
         "recurring definitions must not advance to another slot after retry exhaustion"
     );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_missing_runtime_does_not_consume_retry() {
+    let (pg_db, pool) = create_test_pool().await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-runtime-wait-agent", "fail").await;
+    let first = claim_one(&pool, "runtime-missing-worker").await;
+
+    fire_claimed(&pool, None, first, Utc::now()).await;
+
+    let waiting = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read deferred parent")
+        .expect("deferred parent exists");
+    assert_eq!(waiting.status, db::STATUS_SCHEDULED);
+    assert_eq!(waiting.in_flight_delivery_id, None);
+    assert!(
+        db::list_deliveries_pg(&pool, &message.id, 10, None)
+            .await
+            .expect("list deferred deliveries")
+            .is_empty(),
+        "a missing process-wide runtime is not a delivery attempt"
+    );
+
+    let second = claim_one(&pool, "runtime-restored-worker").await;
+    assert_eq!(second.retry_count, 0);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_cancel_before_push_handoff_enqueues_nothing() {
+    let (pg_db, pool) = create_test_pool().await;
+    let message = insert_due_push_message(&pool).await;
+    let fire = claim_one(&pool, "cancel-before-handoff-worker").await;
+    assert!(matches!(
+        db::cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel claimed push"),
+        db::CancelOutcome::Canceled {
+            was_firing: true,
+            handoff_started: false
+        }
+    ));
+
+    fire_claimed(&pool, None, fire, Utc::now()).await;
+
+    let canceled = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read canceled parent")
+        .expect("canceled parent exists");
+    assert_eq!(canceled.status, "canceled");
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox WHERE source = $1")
+            .bind(OUTBOX_SOURCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count scheduled outbox rows");
+    assert_eq!(outbox_count, 0);
 
     pool.close().await;
     pg_db.drop().await;

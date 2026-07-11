@@ -1,8 +1,5 @@
-//! Repository layer for the scheduled-message reservation pool.
-//!
-//! All raw SQL for `scheduled_messages` and `scheduled_message_deliveries`
-//! lives here. Route handlers and the scheduler worker delegate to these
-//! functions and never issue SQL directly.
+//! Repository layer for the scheduled-message reservation pool. Route handlers
+//! and the scheduler worker delegate all reservation SQL to this module.
 //!
 //! Design: docs/design/scheduled-messages.md — definition + delivery rows
 //! (routines/routine_runs pattern), at-most-once firing per
@@ -13,8 +10,14 @@ use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
+mod handoff;
 #[cfg(test)]
 mod postgres_tests;
+
+pub(crate) use handoff::{
+    defer_delivery_without_retry_pg, lock_active_delivery_claim_tx,
+    mark_delivery_agent_turn_started_pg, record_delivery_outbox_handoff_tx,
+};
 
 pub const STATUS_SCHEDULED: &str = "scheduled";
 pub const STATUS_FIRING: &str = "firing";
@@ -351,6 +354,9 @@ pub enum CancelOutcome {
         /// True when a firing delivery was marked interrupted; the message may
         /// already be past the outbox/turn handoff point.
         was_firing: bool,
+        /// True when the active delivery had already recorded an outbox or
+        /// agent-turn handoff before cancellation acquired the parent lock.
+        handoff_started: bool,
     },
 }
 
@@ -375,7 +381,24 @@ pub async fn cancel_scheduled_message_pg(
         return Ok(CancelOutcome::AlreadyTerminal(status));
     }
     let was_firing = status == STATUS_FIRING;
+    let mut handoff_started = false;
     if let Some(delivery_id) = in_flight.as_deref() {
+        let handoff = sqlx::query(
+            "SELECT outbox_id, fallback_outbox_id, turn_id
+             FROM scheduled_message_deliveries
+             WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(handoff) = handoff {
+            handoff_started = handoff.try_get::<Option<i64>, _>("outbox_id")?.is_some()
+                || handoff
+                    .try_get::<Option<i64>, _>("fallback_outbox_id")?
+                    .is_some()
+                || handoff.try_get::<Option<String>, _>("turn_id")?.is_some();
+        }
         sqlx::query(
             "UPDATE scheduled_message_deliveries
              SET status = 'interrupted', error = 'canceled by operator',
@@ -395,7 +418,10 @@ pub async fn cancel_scheduled_message_pg(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(CancelOutcome::Canceled { was_firing })
+    Ok(CancelOutcome::Canceled {
+        was_firing,
+        handoff_started,
+    })
 }
 
 // ── Deliveries ──────────────────────────────────────────────────────────────
@@ -451,6 +477,7 @@ pub async fn outbox_statuses_for_deliveries_pg(
 pub async fn claim_due_fires_pg(
     pool: &PgPool,
     claim_owner: &str,
+    claim_agent: bool,
     batch: i64,
     lease_secs: i64,
     now: DateTime<Utc>,
@@ -459,11 +486,13 @@ pub async fn claim_due_fires_pg(
     let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
+           AND ($2 OR delivery_kind <> 'agent')
          ORDER BY scheduled_at
-         LIMIT $2
+         LIMIT $3
          FOR UPDATE SKIP LOCKED"
     ))
     .bind(now)
+    .bind(claim_agent)
     .bind(batch)
     .fetch_all(&mut *tx)
     .await?;
@@ -760,30 +789,6 @@ pub async fn interrupt_delivery_and_rewind_pg(
     .await?;
     tx.commit().await?;
     Ok(true)
-}
-
-pub async fn mark_delivery_agent_turn_started_pg(
-    pool: &PgPool,
-    delivery_id: &str,
-    claim_token: &str,
-    turn_id: &str,
-    lease_secs: i64,
-) -> Result<bool, sqlx::Error> {
-    let updated = sqlx::query(
-        "UPDATE scheduled_message_deliveries
-         SET turn_id = $3,
-             started_at = NOW(),
-             lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
-             updated_at = NOW()
-         WHERE id = $1 AND claim_token = $2 AND status = 'running'",
-    )
-    .bind(delivery_id)
-    .bind(claim_token)
-    .bind(turn_id)
-    .bind(lease_secs)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected() > 0)
 }
 
 /// Close out the parent after its in-flight delivery reached a terminal state.

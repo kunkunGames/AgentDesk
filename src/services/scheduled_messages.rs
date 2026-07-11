@@ -22,7 +22,7 @@ use crate::services::discord::health::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 use crate::services::message_outbox::{
-    OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
+    OutboxEnqueueError, OutboxMessage, enqueue_outbox_tx_returning_id_with_persistent_dedupe,
 };
 
 const CLAIM_BATCH: i64 = 10;
@@ -87,7 +87,16 @@ async fn tick_once(
     }
 
     let now = Utc::now();
-    match db::claim_due_fires_pg(pool, claim_owner, CLAIM_BATCH, LEASE_SECS, now).await {
+    match db::claim_due_fires_pg(
+        pool,
+        claim_owner,
+        health_registry.is_some(),
+        CLAIM_BATCH,
+        LEASE_SECS,
+        now,
+    )
+    .await
+    {
         Ok(claimed) => {
             for fire in claimed {
                 did_work = true;
@@ -124,16 +133,6 @@ pub async fn fire_claimed(
 ) {
     let message = &fire.message;
 
-    if fire.retry_count > MAX_FIRE_RETRIES {
-        let error = format!("fire retry budget exhausted after {MAX_FIRE_RETRIES} re-arms");
-        if message.delivery_kind == db::KIND_AGENT && message.on_agent_failure == "push_raw" {
-            finish_exhausted_agent_with_raw_fallback(pool, &fire, &error).await;
-        } else {
-            finish_terminal_failure(pool, &fire, &error).await;
-        }
-        return;
-    }
-
     // Compare against the claim time, not the fire slot: a worker that wakes
     // up late must not deliver a message whose expiry has already passed.
     if let Some(expires_at) = message.expires_at {
@@ -147,6 +146,16 @@ pub async fn fire_claimed(
         }
     }
 
+    if fire.retry_count > MAX_FIRE_RETRIES {
+        let error = format!("fire retry budget exhausted after {MAX_FIRE_RETRIES} re-arms");
+        if message.delivery_kind == db::KIND_AGENT && message.on_agent_failure == "push_raw" {
+            finish_exhausted_agent_with_raw_fallback(pool, &fire, &error).await;
+        } else {
+            finish_terminal_failure(pool, &fire, &error).await;
+        }
+        return;
+    }
+
     match message.delivery_kind.as_str() {
         db::KIND_PUSH => fire_push(pool, &fire, now).await,
         db::KIND_AGENT => fire_agent(pool, health_registry, &fire).await,
@@ -155,6 +164,43 @@ pub async fn fire_claimed(
             finish_terminal_failure(pool, &fire, &error).await;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimHandoff {
+    Enqueued(i64),
+    ClaimLost,
+}
+
+async fn enqueue_outbox_for_active_claim(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    message: OutboxMessage<'_>,
+    fallback: bool,
+) -> Result<ClaimHandoff, OutboxEnqueueError> {
+    let mut tx = pool.begin().await?;
+    if !db::lock_active_delivery_claim_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        tx.rollback().await?;
+        return Ok(ClaimHandoff::ClaimLost);
+    }
+
+    let outbox_id = enqueue_outbox_tx_returning_id_with_persistent_dedupe(&mut tx, message).await?;
+    if !db::record_delivery_outbox_handoff_tx(
+        &mut tx,
+        delivery_id,
+        claim_token,
+        outbox_id,
+        fallback,
+    )
+    .await?
+    {
+        tx.rollback().await?;
+        return Ok(ClaimHandoff::ClaimLost);
+    }
+    tx.commit().await?;
+    Ok(ClaimHandoff::Enqueued(outbox_id))
 }
 
 async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
@@ -173,8 +219,11 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
         message.id,
         fire.fire_scheduled_at.timestamp_micros()
     );
-    match enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+    match enqueue_outbox_for_active_claim(
         pool,
+        &message.id,
+        &fire.delivery_id,
+        &fire.claim_token,
         OutboxMessage {
             target: &target,
             content: &message.content,
@@ -183,10 +232,11 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
             reason_code: Some(&reason_code),
             session_key: None,
         },
+        false,
     )
     .await
     {
-        Ok(outbox_id) => {
+        Ok(ClaimHandoff::Enqueued(outbox_id)) => {
             finish_and_finalize(
                 pool,
                 fire,
@@ -199,6 +249,13 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
             )
             .await;
         }
+        Ok(ClaimHandoff::ClaimLost) => {
+            tracing::info!(
+                id = message.id,
+                delivery_id = fire.delivery_id,
+                "[smsg] push handoff skipped after claim cancellation"
+            );
+        }
         Err(error) => {
             let error = format!("outbox enqueue failed: {error}");
             tracing::warn!(id = message.id, "[smsg] {error}");
@@ -209,6 +266,25 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
 
 async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fire: &ClaimedFire) {
     let message = &fire.message;
+    let Some(health_registry) = health_registry else {
+        let reason = "discord runtime health registry unavailable";
+        if let Err(error) = db::defer_delivery_without_retry_pg(
+            pool,
+            &fire.delivery_id,
+            &fire.claim_token,
+            &message.id,
+            fire.fire_scheduled_at,
+            reason,
+        )
+        .await
+        {
+            tracing::warn!(
+                id = message.id,
+                "[smsg] runtime-unavailable defer failed: {error}"
+            );
+        }
+        return;
+    };
     match start_agent_turn(pool, health_registry, fire).await {
         Ok(_) => {
             // Delivery stays running; poll_agent_delivery owns completion.
@@ -226,15 +302,13 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
 /// channel when no target was pinned).
 async fn start_agent_turn(
     pool: &PgPool,
-    health_registry: Option<&HealthRegistry>,
+    health_registry: &HealthRegistry,
     fire: &ClaimedFire,
 ) -> anyhow::Result<String> {
     use anyhow::anyhow;
 
     let message = &fire.message;
 
-    let registry =
-        health_registry.ok_or_else(|| anyhow!("discord runtime health registry unavailable"))?;
     let agent_id = message
         .agent_id
         .as_deref()
@@ -269,6 +343,7 @@ async fn start_agent_turn(
     let turn_id = reservation.turn_id().to_string();
     let recorded = db::mark_delivery_agent_turn_started_pg(
         pool,
+        &message.id,
         &fire.delivery_id,
         &fire.claim_token,
         &turn_id,
@@ -290,7 +365,7 @@ async fn start_agent_turn(
     }));
 
     let outcome = start_reserved_headless_agent_turn_with_owner_channel(
-        registry,
+        health_registry,
         owner_channel,
         turn_channel,
         provider,
@@ -455,24 +530,36 @@ fn raw_fallback_target(target_channel_id: Option<&str>, agent_id: Option<&str>) 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawFallbackHandoff {
+    Enqueued(i64),
+    NoTarget,
+    ClaimLost,
+}
+
 async fn enqueue_raw_fallback(
     pool: &PgPool,
     scheduled_message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
     fire_scheduled_at: DateTime<Utc>,
     target_channel_id: Option<&str>,
     agent_id: Option<&str>,
     content: &str,
     bot: &str,
-) -> Result<Option<i64>, OutboxEnqueueError> {
+) -> Result<RawFallbackHandoff, OutboxEnqueueError> {
     let Some(target) = raw_fallback_target(target_channel_id, agent_id) else {
-        return Ok(None);
+        return Ok(RawFallbackHandoff::NoTarget);
     };
     let reason_code = format!(
         "scheduled_message:v1:{scheduled_message_id}:fallback:{}",
         fire_scheduled_at.timestamp_micros()
     );
-    enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+    match enqueue_outbox_for_active_claim(
         pool,
+        scheduled_message_id,
+        delivery_id,
+        claim_token,
         OutboxMessage {
             target: &target,
             content,
@@ -481,19 +568,45 @@ async fn enqueue_raw_fallback(
             reason_code: Some(&reason_code),
             session_key: None,
         },
+        true,
     )
     .await
-    .map(Some)
+    {
+        Ok(ClaimHandoff::Enqueued(outbox_id)) => Ok(RawFallbackHandoff::Enqueued(outbox_id)),
+        Ok(ClaimHandoff::ClaimLost) => Ok(RawFallbackHandoff::ClaimLost),
+        Err(error) => Err(error),
+    }
 }
 
 /// Terminal agent failure: honor on_agent_failure. `push_raw` demotes the
 /// original content to a direct outbox push so must-deliver announcements
 /// still go out; `fail` records the failure.
 async fn apply_agent_failure(pool: &PgPool, delivery: &RunningAgentDelivery, reason: &str) {
+    if delivery
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        if let Err(error) = db::mark_expired_pg(
+            pool,
+            &delivery.scheduled_message_id,
+            &delivery.delivery_id,
+            &delivery.claim_token,
+        )
+        .await
+        {
+            tracing::warn!(
+                delivery_id = delivery.delivery_id,
+                "[smsg] expired agent delivery transition failed: {error}"
+            );
+        }
+        return;
+    }
     if delivery.on_agent_failure == "push_raw" {
         match enqueue_raw_fallback(
             pool,
             &delivery.scheduled_message_id,
+            &delivery.delivery_id,
+            &delivery.claim_token,
             delivery.fire_scheduled_at,
             delivery.target_channel_id.as_deref(),
             delivery.agent_id.as_deref(),
@@ -502,7 +615,7 @@ async fn apply_agent_failure(pool: &PgPool, delivery: &RunningAgentDelivery, rea
         )
         .await
         {
-            Ok(Some(fallback_outbox_id)) => {
+            Ok(RawFallbackHandoff::Enqueued(fallback_outbox_id)) => {
                 let error = format!("{reason}; fell back to raw push");
                 finalize_agent_delivery(
                     pool,
@@ -515,7 +628,8 @@ async fn apply_agent_failure(pool: &PgPool, delivery: &RunningAgentDelivery, rea
                 .await;
                 return;
             }
-            Ok(None) => {}
+            Ok(RawFallbackHandoff::ClaimLost) => return,
+            Ok(RawFallbackHandoff::NoTarget) => {}
             Err(error) => tracing::warn!(
                 delivery_id = delivery.delivery_id,
                 "[smsg] push_raw fallback enqueue failed: {error}"
@@ -538,6 +652,8 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
     match enqueue_raw_fallback(
         pool,
         &message.id,
+        &fire.delivery_id,
+        &fire.claim_token,
         fire.fire_scheduled_at,
         message.target_channel_id.as_deref(),
         message.agent_id.as_deref(),
@@ -546,7 +662,7 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
     )
     .await
     {
-        Ok(Some(fallback_outbox_id)) => {
+        Ok(RawFallbackHandoff::Enqueued(fallback_outbox_id)) => {
             let error = format!("{reason}; fell back to raw push");
             finish_terminal(
                 pool,
@@ -559,9 +675,10 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
             )
             .await;
         }
-        Ok(None) => {
+        Ok(RawFallbackHandoff::NoTarget) => {
             finish_terminal_failure(pool, fire, &format!("{reason}; no fallback target")).await;
         }
+        Ok(RawFallbackHandoff::ClaimLost) => {}
         Err(error) => {
             finish_terminal_failure(
                 pool,

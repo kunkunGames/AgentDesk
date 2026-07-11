@@ -53,7 +53,7 @@ async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMess
 }
 
 async fn claim_one(pool: &PgPool, owner: &str, lease_secs: i64) -> ClaimedFire {
-    let mut claims = claim_due_fires_pg(pool, owner, 10, lease_secs, Utc::now())
+    let mut claims = claim_due_fires_pg(pool, owner, true, 10, lease_secs, Utc::now())
         .await
         .expect("claim due scheduled message");
     assert_eq!(claims.len(), 1, "exactly one definition should be due");
@@ -181,6 +181,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     assert!(
         !mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &second.delivery_id,
             &first.claim_token,
             "stale-turn",
@@ -248,6 +249,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     assert!(
         mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &second.delivery_id,
             &second.claim_token,
             "current-turn",
@@ -302,6 +304,56 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
             .expect("read finalized delivery");
     assert_eq!(final_parent_status, STATUS_SENT);
     assert_eq!(final_delivery_status, DELIVERY_SENT);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_agent_claim_waits_for_runtime_and_cancel_fences_start() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_runtime_gate",
+        "scheduled message runtime and cancellation gate",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+
+    let without_runtime = claim_due_fires_pg(&pool, "no-runtime", false, 10, 30, Utc::now())
+        .await
+        .expect("scan without Discord runtime");
+    assert!(without_runtime.is_empty());
+    assert_eq!(
+        get_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("read waiting definition")
+            .expect("waiting definition exists")
+            .status,
+        STATUS_SCHEDULED
+    );
+
+    let fire = claim_one(&pool, "runtime-ready", 30).await;
+    assert_eq!(fire.retry_count, 0);
+    assert!(matches!(
+        cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel before agent handoff"),
+        CancelOutcome::Canceled {
+            was_firing: true,
+            handoff_started: false
+        }
+    ));
+    assert!(
+        !mark_delivery_agent_turn_started_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "must-not-start",
+            600,
+        )
+        .await
+        .expect("canceled claim must fence turn handoff")
+    );
 
     pool.close().await;
     pg_db.drop().await;

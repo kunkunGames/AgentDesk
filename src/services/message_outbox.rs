@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::services::provider::{CancelToken, cancel_requested};
 
@@ -438,6 +438,18 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     pool: &PgPool,
     message: OutboxMessage<'_>,
 ) -> Result<i64, OutboxEnqueueError> {
+    let mut tx = pool.begin().await?;
+    let outbox_id = enqueue_outbox_tx_returning_id_with_persistent_dedupe(&mut tx, message).await?;
+    tx.commit().await?;
+    Ok(outbox_id)
+}
+
+/// Transaction-scoped persistent handoff used when a caller must hold its own
+/// claim fence until the outbox row is durable.
+pub(crate) async fn enqueue_outbox_tx_returning_id_with_persistent_dedupe(
+    tx: &mut Transaction<'_, Postgres>,
+    message: OutboxMessage<'_>,
+) -> Result<i64, OutboxEnqueueError> {
     validate_outbox_source(message.source)?;
     let reason_code = normalized_reason_code(message.reason_code);
     let session_key = normalized_session_key(message.target, message.session_key);
@@ -464,7 +476,7 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     .bind(reason_code)
     .bind(session_key.as_deref())
     .bind(dedupe_key.as_deref())
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(Into::into)
 }

@@ -25,7 +25,7 @@
 | `config_live_reload` | 1 |
 | `crate` | 1 |
 | `credential` | 1 |
-| `db` | 53 |
+| `db` | 54 |
 | `dispatch` | 10 |
 | `engine` | 31 |
 | `error` | 1 |
@@ -132,7 +132,8 @@
 | `db::prompt_manifests::retention` | `src/db/prompt_manifests/retention.rs` | 96 | 96 | 0 |  |
 | `db::prompt_manifests::storage_stats` | `src/db/prompt_manifests/storage_stats.rs` | 122 | 122 | 0 |  |
 | `db::relay_dead_letter` | `src/db/relay_dead_letter.rs` | 250 | 133 | 117 |  |
-| `db::scheduled_messages` | `src/db/scheduled_messages.rs` | 993 | 993 | 0 |  |
+| `db::scheduled_messages` | `src/db/scheduled_messages.rs` | 998 | 998 | 0 |  |
+| `db::scheduled_messages::handoff` | `src/db/scheduled_messages/handoff.rs` | 134 | 134 | 0 |  |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 304 | 278 | 26 |  |
 | `db::session_observability` | `src/db/session_observability.rs` | 216 | 216 | 0 |  |
 | `db::session_status` | `src/db/session_status.rs` | 78 | 78 | 0 |  |
@@ -303,7 +304,7 @@
 | `server::routes::routines::handlers` | `src/server/routes/routines/handlers.rs` | 501 | 501 | 0 |  |
 | `server::routes::routines::helpers` | `src/server/routes/routines/helpers.rs` | 325 | 244 | 81 |  |
 | `server::routes::routines::responses` | `src/server/routes/routines/responses.rs` | 195 | 76 | 119 |  |
-| `server::routes::scheduled_messages` | `src/server/routes/scheduled_messages.rs` | 764 | 764 | 0 |  |
+| `server::routes::scheduled_messages` | `src/server/routes/scheduled_messages.rs` | 834 | 810 | 24 |  |
 | `server::routes::session_activity` | `src/server/routes/session_activity.rs` | 13 | 13 | 0 |  |
 | `server::routes::settings` | `src/server/routes/settings.rs` | 93 | 93 | 0 |  |
 | `server::routes::skill_usage_analytics` | `src/server/routes/skill_usage_analytics.rs` | 425 | 425 | 0 |  |
@@ -907,7 +908,7 @@
 | `services::memory::memento_instructions_cache` | `src/services/memory/memento_instructions_cache.rs` | 241 | 143 | 98 |  |
 | `services::memory::memento_throttle` | `src/services/memory/memento_throttle.rs` | 836 | 752 | 84 |  |
 | `services::memory::runtime_state` | `src/services/memory/runtime_state.rs` | 315 | 315 | 0 |  |
-| `services::message_outbox` | `src/services/message_outbox.rs` | 1025 | 632 | 393 |  |
+| `services::message_outbox` | `src/services/message_outbox.rs` | 1037 | 644 | 393 |  |
 | `services::message_outbox_recovery` | `src/services/message_outbox_recovery.rs` | 166 | 166 | 0 |  |
 | `services::message_outbox_recovery_support` | `src/services/message_outbox_recovery_support.rs` | 138 | 138 | 0 |  |
 | `services::monitoring_store` | `src/services/monitoring_store.rs` | 141 | 141 | 0 |  |
@@ -988,7 +989,7 @@
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 133 | 64 | 69 |  |
 | `services::routines::session_control` | `src/services/routines/session_control.rs` | 1065 | 899 | 166 |  |
 | `services::routines::store` | `src/services/routines/store.rs` | 4433 | 3689 | 744 | giant-file |
-| `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 938 | 797 | 141 |  |
+| `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 1055 | 914 | 141 |  |
 | `services::service_error` | `src/services/service_error.rs` | 1 | 1 | 0 |  |
 | `services::session_activity` | `src/services/session_activity.rs` | 354 | 275 | 79 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1078 | 667 | 411 |  |
