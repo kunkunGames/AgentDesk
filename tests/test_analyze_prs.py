@@ -395,6 +395,7 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         script = Path("scripts/ci-script-checks.sh").read_text()
 
         self.assertIn("scratch.sh", script)
+        self.assertIn("verify.sh", script)
         self.assertIn("scratchpad.sh", script)
         self.assertIn("scratch[._-]*.sh", script)
         self.assertIn("scratchpad[._-]*.sh", script)
