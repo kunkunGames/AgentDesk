@@ -12,7 +12,7 @@
 //!     completion-evidence model as `RoutineAgentExecutor`.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::sync::Arc;
 
 use crate::db::scheduled_messages as db;
@@ -23,6 +23,7 @@ use crate::services::discord::health::{
 };
 use crate::services::message_outbox::{
     OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
+    enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
 };
 
 const CLAIM_BATCH: i64 = 10;
@@ -32,8 +33,9 @@ pub(crate) const LEASE_SECS: i64 = 120;
 /// definition is failed outright (claim-time cap; slot retry_count counts
 /// re-arms of the same fire slot).
 const MAX_FIRE_RETRIES: i32 = 3;
-/// Agent turns that produced no transcript evidence within this window fall
-/// back per on_agent_failure. Matches the routines agent-completion default.
+/// Agent turns without terminal evidence after this window fail closed. Raw
+/// fallback is reserved for definitive NO_REPLY/empty-response outcomes so a
+/// late live turn cannot race a second user-visible delivery.
 const AGENT_COMPLETION_TIMEOUT_SECS: i64 = 1800;
 const OUTBOX_SOURCE: &str = "scheduled_message";
 
@@ -49,9 +51,10 @@ pub async fn scheduled_message_loop(
     // pattern) — agent fires need a live runtime to start turns.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let claim_owner = format!(
-        "scheduled-messages:{}:{}",
+        "scheduled-messages:{}:{}:{}",
         std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string()),
-        std::process::id()
+        std::process::id(),
+        uuid::Uuid::new_v4()
     );
     tracing::info!("[smsg] scheduled message worker started (adaptive backoff 500ms-5s)");
 
@@ -97,7 +100,9 @@ async fn tick_once(
         Err(error) => tracing::warn!("[smsg] due claim failed: {error}"),
     }
 
-    match db::list_running_agent_deliveries_pg(pool, LEASE_SECS, AGENT_POLL_BATCH).await {
+    match db::list_running_agent_deliveries_pg(pool, claim_owner, LEASE_SECS, AGENT_POLL_BATCH)
+        .await
+    {
         Ok(running) => {
             for delivery in running {
                 if poll_agent_delivery(pool, delivery).await {
@@ -318,6 +323,20 @@ async fn start_agent_turn(
             outcome.status.as_str()
         ));
     }
+    match db::release_agent_delivery_to_poller_pg(pool, &fire.delivery_id, &fire.claim_token).await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            delivery_id = fire.delivery_id,
+            turn_id,
+            "[smsg] started turn could not be released to poller; lease adoption will recover it"
+        ),
+        Err(error) => tracing::warn!(
+            delivery_id = fire.delivery_id,
+            turn_id,
+            "[smsg] failed to release started turn to poller; lease adoption will recover it: {error}"
+        ),
+    }
     Ok(turn_id)
 }
 
@@ -361,23 +380,12 @@ async fn poll_agent_delivery(pool: &PgPool, delivery: RunningAgentDelivery) -> b
     };
 
     match find_turn_delivery_evidence(pool, turn_id, delivery.started_at).await {
-        Ok(Some(TurnEvidence::Delivered)) => {
-            finalize_agent_delivery(pool, &delivery, db::DELIVERY_SENT, None, None, true).await;
-            true
-        }
-        Ok(Some(TurnEvidence::TerminalFailure(reason))) => {
-            apply_agent_failure(pool, &delivery, &reason).await;
-            true
-        }
+        Ok(Some(_)) => resolve_agent_delivery(pool, &delivery, false).await,
         Ok(None) => {
             let deadline =
                 delivery.started_at + chrono::Duration::seconds(AGENT_COMPLETION_TIMEOUT_SECS);
             if Utc::now() >= deadline {
-                let reason = format!(
-                    "agent turn produced no transcript within {AGENT_COMPLETION_TIMEOUT_SECS}s"
-                );
-                apply_agent_failure(pool, &delivery, &reason).await;
-                return true;
+                return resolve_agent_delivery(pool, &delivery, true).await;
             }
             false
         }
@@ -414,17 +422,27 @@ async fn find_turn_delivery_evidence(
     turn_id: &str,
     started_at: DateTime<Utc>,
 ) -> Result<Option<TurnEvidence>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    find_turn_delivery_evidence_on_connection(&mut connection, turn_id, started_at).await
+}
+
+async fn find_turn_delivery_evidence_on_connection(
+    connection: &mut PgConnection,
+    turn_id: &str,
+    started_at: DateTime<Utc>,
+) -> Result<Option<TurnEvidence>, sqlx::Error> {
     let delivered: Option<String> = sqlx::query_scalar(
         "SELECT assistant_message
          FROM session_transcripts
          WHERE turn_id = $1
            AND created_at >= $2
            AND BTRIM(assistant_message) <> ''
+         ORDER BY created_at ASC
          LIMIT 1",
     )
     .bind(turn_id)
     .bind(started_at)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
     if let Some(assistant_message) = delivered {
         return Ok(Some(transcript_delivery_evidence(&assistant_message)));
@@ -442,7 +460,7 @@ async fn find_turn_delivery_evidence(
     )
     .bind(turn_id)
     .bind(started_at)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?;
     Ok(terminal.map(|_| {
         TurnEvidence::TerminalFailure("agent turn ended with an empty response".to_string())
@@ -488,51 +506,165 @@ async fn enqueue_raw_fallback(
     .map(Some)
 }
 
-/// Terminal agent failure: honor on_agent_failure. `push_raw` demotes the
-/// original content to a direct outbox push so must-deliver announcements
-/// still go out; `fail` records the failure.
-async fn apply_agent_failure(pool: &PgPool, delivery: &RunningAgentDelivery, reason: &str) {
-    if delivery.on_agent_failure == "push_raw" {
-        match enqueue_raw_fallback(
-            pool,
-            &delivery.scheduled_message_id,
-            delivery.fire_scheduled_at,
-            delivery.target_channel_id.as_deref(),
-            delivery.agent_id.as_deref(),
-            &delivery.content,
-            &delivery.bot,
-        )
-        .await
-        {
-            Ok(Some(fallback_outbox_id)) => {
-                let error = format!("{reason}; fell back to raw push");
-                finalize_agent_delivery(
-                    pool,
-                    delivery,
-                    db::DELIVERY_SENT,
-                    Some(&error),
-                    Some(fallback_outbox_id),
-                    true,
-                )
-                .await;
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
+async fn enqueue_raw_fallback_on_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scheduled_message_id: &str,
+    fire_scheduled_at: DateTime<Utc>,
+    target_channel_id: Option<&str>,
+    agent_id: Option<&str>,
+    content: &str,
+    bot: &str,
+) -> Result<Option<i64>, OutboxEnqueueError> {
+    let Some(target) = raw_fallback_target(target_channel_id, agent_id) else {
+        return Ok(None);
+    };
+    let reason_code = format!(
+        "scheduled_message:v1:{scheduled_message_id}:fallback:{}",
+        fire_scheduled_at.timestamp_micros()
+    );
+    enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(
+        tx,
+        OutboxMessage {
+            target: &target,
+            content,
+            bot,
+            source: OUTBOX_SOURCE,
+            reason_code: Some(&reason_code),
+            session_key: None,
+        },
+    )
+    .await
+    .map(Some)
+}
+
+/// Re-check completion evidence while holding the active parent + delivery
+/// locks, then commit the terminal state and any raw fallback together.
+///
+/// A timeout without terminal evidence deliberately fails closed without a
+/// fallback: the headless turn may still relay a late answer, so staging raw
+/// content at that boundary could deliver both messages to the user.
+async fn resolve_agent_delivery(
+    pool: &PgPool,
+    delivery: &RunningAgentDelivery,
+    allow_timeout: bool,
+) -> bool {
+    match resolve_agent_delivery_inner(pool, delivery, allow_timeout).await {
+        Ok(transitioned) => transitioned,
+        Err(error) => {
+            tracing::warn!(
                 delivery_id = delivery.delivery_id,
-                "[smsg] push_raw fallback enqueue failed: {error}"
-            ),
+                "[smsg] atomic agent delivery resolution failed: {error}"
+            );
+            false
         }
     }
-    finalize_agent_delivery(
-        pool,
-        delivery,
-        db::DELIVERY_FAILED,
-        Some(reason),
-        None,
-        false,
+}
+
+async fn resolve_agent_delivery_inner(
+    pool: &PgPool,
+    delivery: &RunningAgentDelivery,
+    allow_timeout: bool,
+) -> anyhow::Result<bool> {
+    let Some(turn_id) = delivery.turn_id.as_deref() else {
+        return Ok(false);
+    };
+    let mut tx = pool.begin().await?;
+    if !db::lock_active_delivery_tx(
+        &mut tx,
+        &delivery.scheduled_message_id,
+        &delivery.delivery_id,
+        &delivery.claim_token,
     )
-    .await;
+    .await?
+    {
+        return Ok(false);
+    }
+
+    let evidence =
+        find_turn_delivery_evidence_on_connection(&mut tx, turn_id, delivery.started_at).await?;
+    let now = Utc::now();
+    let (delivery_status, error, fallback_outbox_id, fired) = match evidence {
+        Some(TurnEvidence::Delivered) => (db::DELIVERY_SENT, None, None, true),
+        Some(TurnEvidence::TerminalFailure(reason)) => {
+            if delivery.on_agent_failure == "push_raw" {
+                match enqueue_raw_fallback_on_tx(
+                    &mut tx,
+                    &delivery.scheduled_message_id,
+                    delivery.fire_scheduled_at,
+                    delivery.target_channel_id.as_deref(),
+                    delivery.agent_id.as_deref(),
+                    &delivery.content,
+                    &delivery.bot,
+                )
+                .await?
+                {
+                    Some(outbox_id) => (
+                        db::DELIVERY_SENT,
+                        Some(format!("{reason}; fell back to raw push")),
+                        Some(outbox_id),
+                        true,
+                    ),
+                    None => (
+                        db::DELIVERY_FAILED,
+                        Some(format!("{reason}; no fallback target")),
+                        None,
+                        false,
+                    ),
+                }
+            } else {
+                (db::DELIVERY_FAILED, Some(reason), None, false)
+            }
+        }
+        None => {
+            let deadline =
+                delivery.started_at + chrono::Duration::seconds(AGENT_COMPLETION_TIMEOUT_SECS);
+            if !allow_timeout || now < deadline {
+                return Ok(false);
+            }
+            let mut reason = format!(
+                "agent turn produced no terminal evidence within {AGENT_COMPLETION_TIMEOUT_SECS}s"
+            );
+            if delivery.on_agent_failure == "push_raw" {
+                reason.push_str(
+                    "; raw fallback suppressed because the live turn may still relay a late answer",
+                );
+            }
+            (db::DELIVERY_FAILED, Some(reason), None, false)
+        }
+    };
+
+    let (next, forced_terminal) = compute_resume(
+        delivery.schedule.as_deref(),
+        &delivery.timezone,
+        delivery.scheduled_at,
+        delivery.expires_at,
+        now,
+    );
+    let terminal_status = forced_terminal.unwrap_or(if delivery_status == db::DELIVERY_SENT {
+        db::STATUS_SENT
+    } else {
+        db::STATUS_FAILED
+    });
+    let next = forced_terminal.is_none().then_some(next).flatten();
+    let transitioned = db::finish_locked_delivery_and_finalize_parent_tx(
+        &mut tx,
+        &delivery.delivery_id,
+        &delivery.claim_token,
+        delivery_status,
+        error.as_deref(),
+        None,
+        fallback_outbox_id,
+        &delivery.scheduled_message_id,
+        fired,
+        terminal_status,
+        next,
+    )
+    .await?;
+    if !transitioned {
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedFire, reason: &str) {
@@ -706,50 +838,6 @@ async fn finish_and_finalize(
     {
         tracing::warn!(
             id = message.id,
-            "[smsg] delivery finalize failed: {db_error}"
-        );
-    }
-}
-
-async fn finalize_agent_delivery(
-    pool: &PgPool,
-    delivery: &RunningAgentDelivery,
-    delivery_status: &str,
-    error: Option<&str>,
-    fallback_outbox_id: Option<i64>,
-    fired: bool,
-) {
-    let now = Utc::now();
-    let (next, forced_terminal) = compute_resume(
-        delivery.schedule.as_deref(),
-        &delivery.timezone,
-        delivery.scheduled_at,
-        delivery.expires_at,
-        now,
-    );
-    let terminal_status = forced_terminal.unwrap_or(if delivery_status == db::DELIVERY_SENT {
-        db::STATUS_SENT
-    } else {
-        db::STATUS_FAILED
-    });
-    let next = forced_terminal.is_none().then_some(next).flatten();
-    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
-        pool,
-        &delivery.delivery_id,
-        &delivery.claim_token,
-        delivery_status,
-        error,
-        None,
-        fallback_outbox_id,
-        &delivery.scheduled_message_id,
-        fired,
-        terminal_status,
-        next,
-    )
-    .await
-    {
-        tracing::warn!(
-            id = delivery.scheduled_message_id,
             "[smsg] delivery finalize failed: {db_error}"
         );
     }

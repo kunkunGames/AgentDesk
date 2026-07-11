@@ -469,6 +469,46 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     .map_err(Into::into)
 }
 
+/// Transaction-scoped variant of the persistent handoff helper.
+///
+/// Callers use this when the outbox reservation and their own state transition
+/// must commit atomically. Keeping the same dedupe identity as the pool helper
+/// makes crash recovery and competing workers converge on one durable row.
+pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    message: OutboxMessage<'_>,
+) -> Result<i64, OutboxEnqueueError> {
+    validate_outbox_source(message.source)?;
+    let reason_code = normalized_reason_code(message.reason_code);
+    let session_key = normalized_session_key(message.target, message.session_key);
+    let dedupe_key = dedupe_key_for_message(
+        message.target,
+        message.content,
+        reason_code,
+        session_key.as_deref(),
+    );
+
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO message_outbox
+         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+         ON CONFLICT (dedupe_key)
+             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+         DO UPDATE SET dedupe_expires_at = NULL
+         RETURNING id",
+    )
+    .bind(message.target)
+    .bind(message.content)
+    .bind(message.bot)
+    .bind(message.source)
+    .bind(reason_code)
+    .bind(session_key.as_deref())
+    .bind(dedupe_key.as_deref())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
 pub(crate) async fn enqueue_outbox_pg_returning_id_with_ttl_and_cancel(
     pool: &PgPool,
     message: OutboxMessage<'_>,

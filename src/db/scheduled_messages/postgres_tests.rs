@@ -367,6 +367,14 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         );
     }
 
+    let competing = list_running_agent_deliveries_pg(&pool, "competing-worker", 600, 10)
+        .await
+        .expect("poll active deliveries from a competing owner");
+    assert!(
+        competing.is_empty(),
+        "a different owner must not process an active poll lease"
+    );
+
     sqlx::query(
         "UPDATE scheduled_message_deliveries
          SET lease_expires_at = NOW() + INTERVAL '60 seconds',
@@ -382,10 +390,10 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
     .await
     .expect("seed deterministic poll ordering");
 
-    let first = list_running_agent_deliveries_pg(&pool, 600, 1)
+    let first = list_running_agent_deliveries_pg(&pool, "poll-worker", 600, 1)
         .await
         .expect("poll first running agent delivery");
-    let second = list_running_agent_deliveries_pg(&pool, 600, 1)
+    let second = list_running_agent_deliveries_pg(&pool, "poll-worker", 600, 1)
         .await
         .expect("poll second running agent delivery");
     assert_eq!(first.len(), 1);
@@ -445,12 +453,15 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
         Some(fire.delivery_id.as_str())
     );
 
-    let adopted = list_running_agent_deliveries_pg(&pool, 600, 10)
+    let adopted = list_running_agent_deliveries_pg(&pool, "adopting-worker", 600, 10)
         .await
         .expect("adopt expired durable turn");
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].delivery_id, fire.delivery_id);
-    assert_eq!(adopted[0].claim_token, fire.claim_token);
+    assert_ne!(
+        adopted[0].claim_token, fire.claim_token,
+        "lease adoption must fence the stale owner with a new token"
+    );
     assert_eq!(adopted[0].turn_id.as_deref(), Some("durable-turn"));
     let renewed_lease: DateTime<Utc> = sqlx::query_scalar(
         "SELECT lease_expires_at
@@ -464,10 +475,27 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
     assert!(renewed_lease > Utc::now());
 
     assert!(
-        finish_delivery_and_finalize_parent_pg(
+        !finish_delivery_and_finalize_parent_pg(
             &pool,
             &fire.delivery_id,
             &fire.claim_token,
+            DELIVERY_SENT,
+            None,
+            None,
+            None,
+            &message.id,
+            true,
+            STATUS_SENT,
+            None,
+        )
+        .await
+        .expect("reject stale adopted-turn owner")
+    );
+    assert!(
+        finish_delivery_and_finalize_parent_pg(
+            &pool,
+            &fire.delivery_id,
+            &adopted[0].claim_token,
             DELIVERY_SENT,
             None,
             None,
