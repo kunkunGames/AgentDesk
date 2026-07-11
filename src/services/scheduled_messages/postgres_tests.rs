@@ -104,6 +104,18 @@ async fn record_confirmed_agent_turn(pool: &PgPool, fire: &ClaimedFire, turn_id:
         .expect("record agent turn intent")
     );
     assert!(
+        db::commit_delivery_agent_launch_pg(
+            pool,
+            &fire.message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            turn_id,
+            LEASE_SECS,
+        )
+        .await
+        .expect("commit agent turn launch")
+    );
+    assert!(
         db::mark_delivery_agent_turn_started_pg(
             pool,
             &fire.message.id,
@@ -535,6 +547,71 @@ async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_an
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_launch_compat_migration_backfills_legacy_turn_as_ambiguous() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_launch_compat",
+        "scheduled message legacy turn launch barrier migration",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-legacy-launch-agent", "fail").await;
+    let fire = claim_one(&pool, "legacy-launch-worker").await;
+    sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET turn_id = 'legacy-ambiguous-turn',
+             turn_intent_at = NULL,
+             launch_committed_at = NULL,
+             turn_started_at = NULL,
+             lease_expires_at = NOW() - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(&fire.delivery_id)
+    .execute(&pool)
+    .await
+    .expect("simulate public-0084 legacy active turn");
+
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/postgres/0086_scheduled_message_launch_commit_and_runtime_defer.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply launch-commit compatibility migration");
+
+    let (started_at, turn_intent_at, launch_committed_at, turn_started_at): (
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT started_at, turn_intent_at, launch_committed_at, turn_started_at
+         FROM scheduled_message_deliveries
+         WHERE id = $1",
+    )
+    .bind(&fire.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read migrated legacy launch state");
+    assert_eq!(turn_intent_at, None);
+    assert_eq!(launch_committed_at, Some(started_at));
+    assert_eq!(turn_started_at, Some(started_at));
+    assert_eq!(
+        db::recover_expired_leases_pg(&pool)
+            .await
+            .expect("recover migrated legacy turn"),
+        0,
+        "legacy turn ids must be adopted rather than replacement-rearmed"
+    );
+    let parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read migrated legacy parent")
+        .expect("migrated legacy parent exists");
+    assert_eq!(parent.status, db::STATUS_FIRING);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_poller() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_agent_trigger_retry",
@@ -705,6 +782,95 @@ async fn postgres_agent_timeout_with_push_raw_fails_closed_without_outbox() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_agent_evidence_before_runtime_ack_is_not_missed() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_fast_agent_evidence",
+        "scheduled message pre-ack agent evidence",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-fast-evidence-agent", "fail").await;
+    let fire = claim_one(&pool, "fast-evidence-worker").await;
+    let turn_id = "scheduled-fast-evidence-turn";
+    assert!(
+        db::record_delivery_agent_turn_intent_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            turn_id,
+        )
+        .await
+        .expect("record fast-evidence turn intent")
+    );
+    assert!(
+        db::commit_delivery_agent_launch_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            turn_id,
+            LEASE_SECS,
+        )
+        .await
+        .expect("commit fast-evidence turn launch")
+    );
+    sqlx::query(
+        "INSERT INTO session_transcripts (turn_id, assistant_message)
+         VALUES ($1, 'fast relay before scheduler acknowledgement')",
+    )
+    .bind(turn_id)
+    .execute(&pool)
+    .await
+    .expect("seed evidence before runtime acknowledgement");
+    assert!(
+        db::mark_delivery_agent_turn_started_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            turn_id,
+            LEASE_SECS,
+        )
+        .await
+        .expect("record later runtime acknowledgement")
+    );
+    assert!(
+        db::release_agent_delivery_to_poller_pg(&pool, &fire.delivery_id, &fire.claim_token)
+            .await
+            .expect("release fast-evidence turn")
+    );
+    let (evidence_at, turn_started_at): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT transcript.created_at, delivery.turn_started_at
+         FROM session_transcripts AS transcript
+         JOIN scheduled_message_deliveries AS delivery ON delivery.turn_id = transcript.turn_id
+         WHERE transcript.turn_id = $1",
+    )
+    .bind(turn_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read evidence/runtime ordering");
+    assert!(evidence_at <= turn_started_at);
+
+    let mut running =
+        db::list_running_agent_deliveries_pg(&pool, "fast-evidence-poller", LEASE_SECS, 10)
+            .await
+            .expect("poll fast-evidence turn");
+    let delivery = running.pop().expect("fast-evidence turn should be polled");
+    assert!(delivery.launch_committed_at <= evidence_at);
+    assert!(resolve_agent_delivery(&pool, &delivery, false).await);
+    let completed = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read fast-evidence parent")
+        .expect("fast-evidence parent exists");
+    assert_eq!(completed.status, db::STATUS_SCHEDULED);
+    assert_eq!(completed.fire_count, 1);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_definitive_agent_failure_atomically_enqueues_one_fallback() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_agent_fallback_atomic",
@@ -789,6 +955,7 @@ async fn postgres_missing_runtime_waits_without_consuming_agent_retry() {
         .expect("runtime-deferred parent exists");
     assert_eq!(waiting.status, db::STATUS_SCHEDULED);
     assert_eq!(waiting.in_flight_delivery_id, None);
+    assert_eq!(waiting.scheduled_at, message.scheduled_at);
     assert!(
         db::list_deliveries_pg(&pool, &message.id, 10, None)
             .await
@@ -796,8 +963,53 @@ async fn postgres_missing_runtime_waits_without_consuming_agent_retry() {
             .is_empty(),
         "a missing process-wide runtime is not a delivery attempt"
     );
-    let second = claim_one(&pool, "runtime-restored-worker").await;
+    let defer_until: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT runtime_defer_until
+         FROM scheduled_messages
+         WHERE id = $1",
+    )
+    .bind(&message.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read runtime defer not-before");
+    assert!(defer_until > Utc::now());
+    assert!(
+        db::claim_due_fires_pg(
+            &pool,
+            "runtime-hot-loop-worker",
+            true,
+            10,
+            LEASE_SECS,
+            Utc::now(),
+        )
+        .await
+        .expect("scan before runtime defer not-before")
+        .is_empty(),
+        "runtime bootstrap must not hot-loop the same overdue definition"
+    );
+    let mut restored = db::claim_due_fires_pg(
+        &pool,
+        "runtime-restored-worker",
+        true,
+        10,
+        LEASE_SECS,
+        defer_until + Duration::milliseconds(1),
+    )
+    .await
+    .expect("claim after runtime defer not-before");
+    assert_eq!(restored.len(), 1);
+    let second = restored.pop().expect("runtime-restored claim");
     assert_eq!(second.retry_count, 0);
+    let cleared_defer: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT runtime_defer_until
+         FROM scheduled_messages
+         WHERE id = $1",
+    )
+    .bind(&message.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read cleared runtime defer gate");
+    assert_eq!(cleared_defer, None);
 
     pool.close().await;
     pg_db.drop().await;

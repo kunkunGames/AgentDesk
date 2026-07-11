@@ -56,7 +56,8 @@ fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, ApiResponse>
 }
 
 fn scheduled_message_bot_or_default(bot: Option<&str>) -> String {
-    bot.filter(|value| !value.trim().is_empty())
+    bot.map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_SCHEDULED_MESSAGE_BOT)
         .to_string()
 }
@@ -519,8 +520,9 @@ fn normalize_effective_scheduled_at(
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>, String> {
     if let Some(schedule) = schedule {
-        let next = crate::services::routines::next_due_after(schedule, timezone, now)
-            .map_err(|error| format!("{error}"))?;
+        let next =
+            crate::services::routines::next_due_after_anchor(schedule, timezone, scheduled_at, now)
+                .map_err(|error| format!("{error}"))?;
         return Ok(
             if scheduled_at < now - Duration::seconds(PAST_TOLERANCE_SECS) {
                 next
@@ -875,9 +877,9 @@ mod tests {
     #[test]
     fn patch_realigns_stale_recurring_time() {
         let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap();
-        let stale = now - Duration::minutes(2);
+        let stale = now - Duration::minutes(17);
         let normalized =
             normalize_effective_scheduled_at(stale, Some("@every 10m"), "UTC", now).unwrap();
-        assert!(normalized > now);
+        assert_eq!(normalized, now + Duration::minutes(3));
     }
 }

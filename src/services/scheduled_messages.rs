@@ -12,8 +12,16 @@
 //!     completion-evidence model as `RoutineAgentExecutor`.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::Arc;
+
+mod evidence;
+
+#[cfg(test)]
+use evidence::transcript_delivery_evidence;
+use evidence::{
+    TurnEvidence, find_turn_delivery_evidence, find_turn_delivery_evidence_on_connection,
+};
 
 use crate::db::scheduled_messages as db;
 use crate::db::scheduled_messages::{ClaimedFire, RunningAgentDelivery, ScheduledMessageRow};
@@ -37,6 +45,7 @@ const FIRE_RETRY_BACKOFF_SECS: [i64; 3] = [60, 300, 900];
 /// fallback is reserved for definitive NO_REPLY/empty-response outcomes so a
 /// late live turn cannot race a second user-visible delivery.
 const AGENT_COMPLETION_TIMEOUT_SECS: i64 = 1800;
+const RUNTIME_DEFER_SECS: i64 = 15;
 const OUTBOX_SOURCE: &str = "scheduled_message";
 
 // ── Scheduler loop ──────────────────────────────────────────────────────────
@@ -271,12 +280,14 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
     let message = &fire.message;
     let Some(health_registry) = health_registry else {
         let reason = "discord runtime health registry unavailable";
+        let retry_not_before = runtime_defer_until(Utc::now());
         if let Err(error) = db::defer_delivery_without_retry_pg(
             pool,
             &fire.delivery_id,
             &fire.claim_token,
             &message.id,
             message.scheduled_at,
+            retry_not_before,
             reason,
         )
         .await
@@ -289,19 +300,29 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
         return;
     };
     match start_agent_turn(pool, health_registry, fire).await {
-        Ok(_) => {
+        Ok(AgentTurnStartDisposition::Started) => {
             // Delivery stays running; poll_agent_delivery owns completion.
+        }
+        Ok(AgentTurnStartDisposition::Consumed(turn_id)) => {
+            finish_terminal_failure(
+                pool,
+                fire,
+                &format!("scheduled message turn {turn_id} was consumed without a provider start"),
+            )
+            .await;
         }
         Err(error) => {
             tracing::warn!(id = message.id, "[smsg] agent turn start failed: {error}");
             let reason = format!("agent turn start failed: {error}");
             if agent_start_error_is_runtime_unavailable(&error) {
+                let retry_not_before = runtime_defer_until(Utc::now());
                 if let Err(defer_error) = db::defer_delivery_without_retry_pg(
                     pool,
                     &fire.delivery_id,
                     &fire.claim_token,
                     &message.id,
                     message.scheduled_at,
+                    retry_not_before,
                     &reason,
                 )
                 .await
@@ -316,6 +337,17 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
             }
         }
     }
+}
+
+enum AgentTurnStartDisposition {
+    Started,
+    /// A lifecycle command was consumed before provider/bridge spawn. Repeating
+    /// it could repeat the lifecycle side effect, so terminalize instead.
+    Consumed(String),
+}
+
+fn runtime_defer_until(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(RUNTIME_DEFER_SECS)
 }
 
 fn agent_start_error_is_runtime_unavailable(error: &anyhow::Error) -> bool {
@@ -338,7 +370,7 @@ async fn start_agent_turn(
     pool: &PgPool,
     health_registry: &HealthRegistry,
     fire: &ClaimedFire,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AgentTurnStartDisposition> {
     use anyhow::anyhow;
 
     let message = &fire.message;
@@ -397,19 +429,20 @@ async fn start_agent_turn(
         "parent_channel_id": owner_channel_num.to_string(),
     }));
 
-    // Do not span the external runtime call with a database transaction. A
-    // final fenced read still lets an operator cancellation that won after the
-    // intent write stop the launch at the last durable boundary.
-    let still_active = db::agent_turn_intent_is_active_pg(
+    // Final cancellation/claim fence. Once this at-most-once barrier commits,
+    // recovery must treat the turn as possibly launched even if this process
+    // dies before persisting the later runtime acknowledgement.
+    let launch_committed = db::commit_delivery_agent_launch_pg(
         pool,
         &message.id,
         &fire.delivery_id,
         &fire.claim_token,
         &turn_id,
+        LEASE_SECS,
     )
     .await
-    .map_err(|error| anyhow!("re-check scheduled message turn intent {turn_id}: {error}"))?;
-    if !still_active {
+    .map_err(|error| anyhow!("commit scheduled message turn launch {turn_id}: {error}"))?;
+    if !launch_committed {
         return Err(anyhow!(
             "scheduled message claim was canceled before turn {turn_id} launch"
         ));
@@ -430,33 +463,42 @@ async fn start_agent_turn(
     .await
     .map_err(|error| anyhow!("start scheduled message turn for {agent_id}: {error}"))?;
 
-    if outcome.turn_id != turn_id {
-        return Err(anyhow!(
-            "reserved scheduled message turn id mismatch: expected {turn_id} but started {}",
-            outcome.turn_id
-        ));
-    }
     if outcome.status.as_str() != "started" {
-        return Err(anyhow!(
-            "scheduled message turn {turn_id} was not started (status: {})",
-            outcome.status.as_str()
-        ));
+        return Ok(AgentTurnStartDisposition::Consumed(turn_id));
     }
 
-    let confirmed = db::mark_delivery_agent_turn_started_pg(
-        pool,
-        &message.id,
-        &fire.delivery_id,
-        &fire.claim_token,
-        &turn_id,
-        LEASE_SECS,
-    )
-    .await
-    .map_err(|error| anyhow!("confirm scheduled message turn {turn_id}: {error}"))?;
-    if !confirmed {
-        return Err(anyhow!(
-            "scheduled message claim was lost after turn {turn_id} launched"
-        ));
+    // `HeadlessTurnStartError` is a pre-spawn contract. After `Started`, never
+    // bubble a database/mismatch problem into the retry path: the committed
+    // launch is ambiguous and a replacement could duplicate a late relay.
+    if outcome.turn_id != turn_id {
+        tracing::error!(
+            expected_turn_id = turn_id,
+            actual_turn_id = outcome.turn_id,
+            "[smsg] started turn id mismatched its reservation; leaving launch committed and fail-closed"
+        );
+    } else {
+        match db::mark_delivery_agent_turn_started_pg(
+            pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            &turn_id,
+            LEASE_SECS,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                delivery_id = fire.delivery_id,
+                turn_id,
+                "[smsg] launched turn could not record its runtime acknowledgement; launch remains fail-closed"
+            ),
+            Err(error) => tracing::warn!(
+                delivery_id = fire.delivery_id,
+                turn_id,
+                "[smsg] failed to record runtime acknowledgement; launch remains fail-closed: {error}"
+            ),
+        }
     }
     match db::release_agent_delivery_to_poller_pg(pool, &fire.delivery_id, &fire.claim_token).await
     {
@@ -472,7 +514,7 @@ async fn start_agent_turn(
             "[smsg] failed to release started turn to poller; lease adoption will recover it: {error}"
         ),
     }
-    Ok(turn_id)
+    Ok(AgentTurnStartDisposition::Started)
 }
 
 pub(crate) fn build_agent_prompt(message: &ScheduledMessageRow) -> String {
@@ -514,7 +556,7 @@ async fn poll_agent_delivery(pool: &PgPool, delivery: RunningAgentDelivery) -> b
         return false;
     };
 
-    match find_turn_delivery_evidence(pool, turn_id, delivery.started_at).await {
+    match find_turn_delivery_evidence(pool, turn_id, delivery.launch_committed_at).await {
         Ok(Some(_)) => resolve_agent_delivery(pool, &delivery, false).await,
         Ok(None) => {
             let deadline =
@@ -532,74 +574,6 @@ async fn poll_agent_delivery(pool: &PgPool, delivery: RunningAgentDelivery) -> b
             false
         }
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum TurnEvidence {
-    Delivered,
-    TerminalFailure(String),
-}
-
-fn transcript_delivery_evidence(assistant_message: &str) -> TurnEvidence {
-    if assistant_message.trim().eq_ignore_ascii_case("NO_REPLY") {
-        TurnEvidence::TerminalFailure("agent turn returned NO_REPLY".to_string())
-    } else {
-        TurnEvidence::Delivered
-    }
-}
-
-/// Transcript-based completion evidence, same sources as
-/// `RoutineAgentExecutor::find_turn_completion`: a non-empty assistant
-/// transcript proves relay delivery; an `empty_response` terminal quality
-/// event proves the turn died without output.
-async fn find_turn_delivery_evidence(
-    pool: &PgPool,
-    turn_id: &str,
-    started_at: DateTime<Utc>,
-) -> Result<Option<TurnEvidence>, sqlx::Error> {
-    let mut connection = pool.acquire().await?;
-    find_turn_delivery_evidence_on_connection(&mut connection, turn_id, started_at).await
-}
-
-async fn find_turn_delivery_evidence_on_connection(
-    connection: &mut PgConnection,
-    turn_id: &str,
-    started_at: DateTime<Utc>,
-) -> Result<Option<TurnEvidence>, sqlx::Error> {
-    let delivered: Option<String> = sqlx::query_scalar(
-        "SELECT assistant_message
-         FROM session_transcripts
-         WHERE turn_id = $1
-           AND created_at >= $2
-           AND BTRIM(assistant_message) <> ''
-         ORDER BY created_at ASC
-         LIMIT 1",
-    )
-    .bind(turn_id)
-    .bind(started_at)
-    .fetch_optional(&mut *connection)
-    .await?;
-    if let Some(assistant_message) = delivered {
-        return Ok(Some(transcript_delivery_evidence(&assistant_message)));
-    }
-
-    let terminal: Option<String> = sqlx::query_scalar(
-        "SELECT event_type::text
-         FROM agent_quality_event
-         WHERE correlation_id = $1
-           AND source_event_id = $1
-           AND created_at >= $2
-           AND event_type = 'turn_error'::agent_quality_event_type
-           AND payload #>> '{details,outcome}' = 'empty_response'
-         LIMIT 1",
-    )
-    .bind(turn_id)
-    .bind(started_at)
-    .fetch_optional(&mut *connection)
-    .await?;
-    Ok(terminal.map(|_| {
-        TurnEvidence::TerminalFailure("agent turn ended with an empty response".to_string())
-    }))
 }
 
 fn raw_fallback_target(target_channel_id: Option<&str>, agent_id: Option<&str>) -> Option<String> {
@@ -685,7 +659,8 @@ async fn resolve_agent_delivery_inner(
     }
 
     let evidence =
-        find_turn_delivery_evidence_on_connection(&mut tx, turn_id, delivery.started_at).await?;
+        find_turn_delivery_evidence_on_connection(&mut tx, turn_id, delivery.launch_committed_at)
+            .await?;
     let now = Utc::now();
     let deadline = delivery.started_at + chrono::Duration::seconds(AGENT_COMPLETION_TIMEOUT_SECS);
     let timed_out = evidence.is_none() && allow_timeout && now >= deadline;

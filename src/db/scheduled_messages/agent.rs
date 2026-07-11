@@ -5,10 +5,10 @@ use uuid::Uuid;
 /// Agent-mode deliveries still awaiting transcript evidence, joined with the
 /// parent fields the poller needs. Extends the lease of everything returned.
 ///
-/// Only runtime-confirmed rows qualify. A recorded `turn_id` with NULL
-/// `turn_started_at` is a durable launch intent; renewing it here would turn a
-/// pre-launch crash into a phantom live turn. Intent-only crashes are owned by
-/// lease expiry + [`recover_expired_leases_pg`].
+/// Only launch-committed rows qualify. `turn_started_at` may still be NULL when
+/// a process died after the at-most-once launch barrier but before persisting
+/// the runtime acknowledgement; that ambiguous turn must be polled/fail closed
+/// rather than replaced. Intent-only crashes remain owned by lease recovery.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RunningAgentDelivery {
     pub delivery_id: String,
@@ -16,6 +16,9 @@ pub struct RunningAgentDelivery {
     pub claim_token: String,
     pub fire_scheduled_at: DateTime<Utc>,
     pub turn_id: Option<String>,
+    /// Effective at-most-once evidence lower bound. Legacy rows written by an
+    /// old binary use their original delivery start as the conservative anchor.
+    pub launch_committed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     pub content: String,
     pub target_channel_id: Option<String>,
@@ -42,7 +45,8 @@ pub async fn list_running_agent_deliveries_pg(
              WHERE candidate.status = 'running'
                AND candidate.delivery_kind = 'agent'
                AND candidate.turn_id IS NOT NULL
-               AND candidate.turn_started_at IS NOT NULL
+               AND (candidate.launch_committed_at IS NOT NULL
+                    OR candidate.turn_intent_at IS NULL)
                AND (candidate.claim_owner = $1 OR candidate.claim_owner IS NULL
                     OR candidate.lease_expires_at IS NULL
                     OR candidate.lease_expires_at <= NOW())
@@ -65,9 +69,11 @@ pub async fn list_running_agent_deliveries_pg(
            AND m.status = 'firing' AND m.in_flight_delivery_id = d.id
            AND d.status = 'running' AND d.delivery_kind = 'agent'
            AND d.turn_id IS NOT NULL
-           AND d.turn_started_at IS NOT NULL
+           AND (d.launch_committed_at IS NOT NULL OR d.turn_intent_at IS NULL)
          RETURNING d.id AS delivery_id, d.scheduled_message_id, d.claim_token,
-                   d.fire_scheduled_at, d.turn_id, d.turn_started_at AS started_at,
+                   d.fire_scheduled_at, d.turn_id,
+                   COALESCE(d.launch_committed_at, d.started_at) AS launch_committed_at,
+                   COALESCE(d.turn_started_at, d.launch_committed_at, d.started_at) AS started_at,
                    m.content, m.target_channel_id, m.bot, m.agent_id,
                    m.on_agent_failure, m.schedule, m.timezone,
                    d.resume_scheduled_at AS scheduled_at, m.expires_at",
@@ -80,6 +86,127 @@ pub async fn list_running_agent_deliveries_pg(
     .await
 }
 
+/// Persist the reserved turn identity without declaring that the external
+/// runtime has started it. Intent-only rows are not polled or lease-renewed.
+pub async fn record_delivery_agent_turn_intent_pg(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    turn_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !super::lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET turn_id = $3, turn_intent_at = NOW(), launch_committed_at = NULL,
+             turn_started_at = NULL, updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND status = 'running'
+           AND turn_id IS NULL AND launch_committed_at IS NULL",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(turn_id)
+    .execute(&mut *tx)
+    .await?;
+    let recorded = updated.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(recorded)
+}
+
+/// Commit the at-most-once agent launch immediately before invoking the
+/// external headless runtime. This is the final parent/claim/cancellation
+/// fence: recovery may poll or fail closed after this barrier, but it must
+/// never start a replacement turn solely because the runtime ack is absent.
+pub async fn commit_delivery_agent_launch_pg(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    turn_id: &str,
+    lease_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !super::lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET launch_committed_at = NOW(),
+             lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
+             updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
+           AND launch_committed_at IS NULL AND status = 'running'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(turn_id)
+    .bind(lease_secs)
+    .execute(&mut *tx)
+    .await?;
+    let committed = updated.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(committed)
+}
+
+/// Record the runtime acknowledgement only after the headless start API
+/// reports `Started`. The earlier launch commit remains the recovery barrier.
+pub async fn mark_delivery_agent_turn_started_pg(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    turn_id: &str,
+    lease_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !super::lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET turn_started_at = NOW(),
+             started_at = NOW(),
+             lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
+             updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
+           AND launch_committed_at IS NOT NULL
+           AND turn_started_at IS NULL AND status = 'running'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(turn_id)
+    .bind(lease_secs)
+    .execute(&mut *tx)
+    .await?;
+    let recorded = updated.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(recorded)
+}
+
+/// Hand a successfully started durable turn from the fire worker to the
+/// completion poller. The next poll adopts it with a fresh fencing token;
+/// failed starts keep their original token so the fire worker can rewind them.
+pub async fn release_agent_delivery_to_poller_pg(
+    pool: &PgPool,
+    delivery_id: &str,
+    claim_token: &str,
+) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET claim_owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND status = 'running'
+           AND turn_id IS NOT NULL AND launch_committed_at IS NOT NULL",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected() > 0)
+}
+
 /// Return an agent claim to `scheduled` without consuming its retry budget
 /// when a process-wide prerequisite (the Discord runtime) is unavailable.
 pub async fn defer_delivery_without_retry_pg(
@@ -88,6 +215,7 @@ pub async fn defer_delivery_without_retry_pg(
     claim_token: &str,
     message_id: &str,
     resume_scheduled_at: DateTime<Utc>,
+    retry_not_before: DateTime<Utc>,
     reason: &str,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -108,12 +236,14 @@ pub async fn defer_delivery_without_retry_pg(
     sqlx::query(
         "UPDATE scheduled_messages
          SET status = 'scheduled', scheduled_at = $3,
-             in_flight_delivery_id = NULL, last_error = $4, updated_at = NOW()
+             runtime_defer_until = $4,
+             in_flight_delivery_id = NULL, last_error = $5, updated_at = NOW()
          WHERE id = $1 AND in_flight_delivery_id = $2 AND status = 'firing'",
     )
     .bind(message_id)
     .bind(delivery_id)
     .bind(resume_scheduled_at)
+    .bind(retry_not_before)
     .bind(reason)
     .execute(&mut *tx)
     .await?;
@@ -121,11 +251,10 @@ pub async fn defer_delivery_without_retry_pg(
     Ok(true)
 }
 
-/// Boot/lease recovery: expired pre-launch deliveries become `interrupted` and
-/// their parents return to `scheduled` so the due scan can re-arm the slot.
-/// Once `turn_started_at` confirms a runtime launch, the durable turn is
-/// adopted by the regular poller instead of restarted; claim fencing cannot
-/// prevent an old turn from relaying a duplicate after a replacement starts.
+/// Boot/lease recovery: expired intent-only deliveries become `interrupted`
+/// and their parents return to `scheduled` so the due scan can re-arm the slot.
+/// Once `launch_committed_at` crosses the at-most-once barrier, the durable turn
+/// is adopted by the regular poller even when its runtime ack is missing.
 pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
@@ -136,7 +265,8 @@ pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error
          JOIN scheduled_message_deliveries d ON d.id = m.in_flight_delivery_id
          WHERE m.status = 'firing'
            AND d.status = 'running'
-           AND d.turn_started_at IS NULL
+           AND (d.turn_id IS NULL
+                OR (d.turn_intent_at IS NOT NULL AND d.launch_committed_at IS NULL))
            AND d.lease_expires_at IS NOT NULL
            AND d.lease_expires_at < NOW()
          ORDER BY d.lease_expires_at, m.id
@@ -154,8 +284,12 @@ pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error
         let delivery_updated = sqlx::query(
             "UPDATE scheduled_message_deliveries
              SET status = 'interrupted', error = 'delivery lease expired',
+                 turn_id = NULL, turn_intent_at = NULL,
+                 launch_committed_at = NULL, turn_started_at = NULL,
                  finished_at = NOW(), updated_at = NOW()
              WHERE id = $1 AND status = 'running'
+               AND (turn_id IS NULL
+                    OR (turn_intent_at IS NOT NULL AND launch_committed_at IS NULL))
                AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()",
         )
         .bind(&delivery_id)

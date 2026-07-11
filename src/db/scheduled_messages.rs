@@ -16,8 +16,10 @@ use uuid::Uuid;
 mod agent;
 mod outbox;
 pub use agent::{
-    RunningAgentDelivery, defer_delivery_without_retry_pg, list_running_agent_deliveries_pg,
-    recover_expired_leases_pg,
+    RunningAgentDelivery, commit_delivery_agent_launch_pg, defer_delivery_without_retry_pg,
+    list_running_agent_deliveries_pg, mark_delivery_agent_turn_started_pg,
+    record_delivery_agent_turn_intent_pg, recover_expired_leases_pg,
+    release_agent_delivery_to_poller_pg,
 };
 pub use outbox::outbox_statuses_for_deliveries_pg;
 
@@ -305,8 +307,10 @@ pub async fn update_scheduled_message_pg(
     id: &str,
     patch: &ScheduledMessagePatch,
 ) -> Result<Option<ScheduledMessageRow>, sqlx::Error> {
-    let mut builder: QueryBuilder<Postgres> =
-        QueryBuilder::new("UPDATE scheduled_messages SET updated_at = NOW()");
+    let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+        "UPDATE scheduled_messages
+         SET updated_at = NOW(), runtime_defer_until = NULL",
+    );
     if let Some(content) = &patch.content {
         builder.push(", content = ").push_bind(content);
     }
@@ -360,7 +364,7 @@ pub enum CancelOutcome {
         /// already be past the outbox/turn handoff point.
         was_firing: bool,
         /// True only when the active delivery had already recorded an outbox
-        /// handoff or a runtime-confirmed agent turn before cancellation won.
+        /// handoff or committed an agent launch before cancellation won.
         handoff_started: bool,
     },
 }
@@ -389,7 +393,8 @@ pub async fn cancel_scheduled_message_pg(
     let mut handoff_started = false;
     if let Some(delivery_id) = in_flight.as_deref() {
         let handoff = sqlx::query(
-            "SELECT outbox_id, fallback_outbox_id, turn_started_at
+            "SELECT outbox_id, fallback_outbox_id, turn_id,
+                    turn_intent_at, launch_committed_at
              FROM scheduled_message_deliveries
              WHERE id = $1
              FOR UPDATE",
@@ -403,8 +408,16 @@ pub async fn cancel_scheduled_message_pg(
                     .try_get::<Option<i64>, _>("fallback_outbox_id")?
                     .is_some()
                 || handoff
-                    .try_get::<Option<DateTime<Utc>>, _>("turn_started_at")?
-                    .is_some();
+                    .try_get::<Option<DateTime<Utc>>, _>("launch_committed_at")?
+                    .is_some()
+                // Rolling-deploy compatibility: an old writer can persist a
+                // turn id after 0086 without the new intent/commit markers.
+                // Its launch state is unknowable, so report/adopt it as handed
+                // off rather than risk a replacement.
+                || (handoff.try_get::<Option<String>, _>("turn_id")?.is_some()
+                    && handoff
+                        .try_get::<Option<DateTime<Utc>>, _>("turn_intent_at")?
+                        .is_none());
         }
         sqlx::query(
             "UPDATE scheduled_message_deliveries
@@ -471,6 +484,7 @@ pub async fn claim_due_fires_pg(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
            AND $2
+           AND (runtime_defer_until IS NULL OR runtime_defer_until <= $1)
            AND NOT EXISTS (
                SELECT 1
                FROM scheduled_message_deliveries AS retry
@@ -539,6 +553,8 @@ async fn arm_delivery_slot_tx(
                 retry_count = scheduled_message_deliveries.retry_count + 1,
                 outbox_id = NULL,
                 turn_id = NULL,
+                turn_intent_at = NULL,
+                launch_committed_at = NULL,
                 turn_started_at = NULL,
                 fallback_outbox_id = NULL,
                 next_attempt_at = NULL,
@@ -595,7 +611,8 @@ async fn arm_delivery_slot_tx(
     let resume_scheduled_at: DateTime<Utc> = armed.try_get("resume_scheduled_at")?;
     sqlx::query(
         "UPDATE scheduled_messages
-         SET status = 'firing', in_flight_delivery_id = $2, updated_at = NOW()
+         SET status = 'firing', in_flight_delivery_id = $2,
+             runtime_defer_until = NULL, updated_at = NOW()
          WHERE id = $1",
     )
     .bind(&message.id)
@@ -853,7 +870,9 @@ pub async fn interrupt_delivery_and_rewind_pg(
     }
     sqlx::query(
         "UPDATE scheduled_message_deliveries
-         SET next_attempt_at = $3, updated_at = NOW()
+         SET turn_id = NULL, turn_intent_at = NULL,
+             launch_committed_at = NULL, turn_started_at = NULL,
+             next_attempt_at = $3, updated_at = NOW()
          WHERE id = $1 AND claim_token = $2 AND status = 'interrupted'",
     )
     .bind(delivery_id)
@@ -875,117 +894,6 @@ pub async fn interrupt_delivery_and_rewind_pg(
     .await?;
     tx.commit().await?;
     Ok(true)
-}
-
-/// Persist the reserved turn identity without declaring that the external
-/// runtime has started it. Intent-only rows are not polled or lease-renewed.
-pub async fn record_delivery_agent_turn_intent_pg(
-    pool: &PgPool,
-    message_id: &str,
-    delivery_id: &str,
-    claim_token: &str,
-    turn_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
-        return Ok(false);
-    }
-    let updated = sqlx::query(
-        "UPDATE scheduled_message_deliveries
-         SET turn_id = $3, turn_started_at = NULL, updated_at = NOW()
-         WHERE id = $1 AND claim_token = $2 AND status = 'running'",
-    )
-    .bind(delivery_id)
-    .bind(claim_token)
-    .bind(turn_id)
-    .execute(&mut *tx)
-    .await?;
-    let recorded = updated.rows_affected() > 0;
-    tx.commit().await?;
-    Ok(recorded)
-}
-
-/// Last-moment cancellation fence between persisting a turn intent and
-/// invoking the external headless runtime.
-pub async fn agent_turn_intent_is_active_pg(
-    pool: &PgPool,
-    message_id: &str,
-    delivery_id: &str,
-    claim_token: &str,
-    turn_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
-        return Ok(false);
-    }
-    let active = sqlx::query_scalar::<_, i32>(
-        "SELECT 1
-         FROM scheduled_message_deliveries
-         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
-           AND status = 'running'",
-    )
-    .bind(delivery_id)
-    .bind(claim_token)
-    .bind(turn_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .is_some();
-    tx.commit().await?;
-    Ok(active)
-}
-
-/// Confirm a turn only after the headless runtime reports `started`.
-pub async fn mark_delivery_agent_turn_started_pg(
-    pool: &PgPool,
-    message_id: &str,
-    delivery_id: &str,
-    claim_token: &str,
-    turn_id: &str,
-    lease_secs: i64,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
-        return Ok(false);
-    }
-    let updated = sqlx::query(
-        "UPDATE scheduled_message_deliveries
-         SET turn_started_at = NOW(),
-             started_at = NOW(),
-             lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
-             updated_at = NOW()
-         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
-           AND status = 'running'",
-    )
-    .bind(delivery_id)
-    .bind(claim_token)
-    .bind(turn_id)
-    .bind(lease_secs)
-    .execute(&mut *tx)
-    .await?;
-    let recorded = updated.rows_affected() > 0;
-    tx.commit().await?;
-    Ok(recorded)
-}
-
-/// Hand a successfully started durable turn from the fire worker to the
-/// completion poller. The next poll adopts it with a fresh fencing token;
-/// failed starts keep their original token so the fire worker can rewind them.
-pub async fn release_agent_delivery_to_poller_pg(
-    pool: &PgPool,
-    delivery_id: &str,
-    claim_token: &str,
-) -> Result<bool, sqlx::Error> {
-    let updated = sqlx::query(
-        "UPDATE scheduled_message_deliveries
-         SET claim_owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
-         WHERE id = $1 AND claim_token = $2 AND status = 'running'
-           AND turn_id IS NOT NULL AND turn_started_at IS NOT NULL",
-    )
-    .bind(delivery_id)
-    .bind(claim_token)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected() > 0)
 }
 
 /// Close out the parent after its in-flight delivery reached a terminal state.
