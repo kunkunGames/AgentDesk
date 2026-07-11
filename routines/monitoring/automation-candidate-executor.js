@@ -35,7 +35,7 @@ function emptyCheckpoint() {
     version: CHECKPOINT_VERSION,
     // card_id -> { dispatched_at, iteration, status }
     dispatched: {},
-    // card_id -> { attempt_count, last_attempted_at, first_attempted_at }
+    // card_id -> { attempt_count, last_attempted_at, first_attempted_at, status?, stalled_at? }
     pending: {},
     stats: { ticks: 0, dispatched: 0, skipped: 0, max_iterations_reached: 0, stalled_candidates: 0 },
   };
@@ -251,7 +251,13 @@ agentdesk.routines.register({
       const activePending = pending && pendingIteration === iteration ? pending : null;
 
       if (activePending && (activePending.attempt_count || 0) >= MAX_DISPATCH_RETRIES) {
-        cp.stats.stalled_candidates = (cp.stats.stalled_candidates || 0) + 1;
+        if (activePending.status !== "stalled") {
+          cp.pending[cardId] = Object.assign({}, activePending, {
+            status: "stalled",
+            stalled_at: nowStr,
+          });
+          cp.stats.stalled_candidates = (cp.stats.stalled_candidates || 0) + 1;
+        }
         continue;
       }
       if (activePending && isRecent(activePending.last_attempted_at, nowStr, DISPATCH_RETRY_MS)) {

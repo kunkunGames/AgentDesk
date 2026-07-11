@@ -351,7 +351,7 @@ test("card attempted after DISPATCH_RETRY_MS → re-dispatched", () => {
 
 // --- MAX_DISPATCH_RETRIES ---
 
-test("card at MAX_DISPATCH_RETRIES limit → permanently skipped", () => {
+test("card at MAX_DISPATCH_RETRIES limit → stalled once across repeated ticks", () => {
   const { tick } = loadRoutine(ROUTINE_PATH);
   const cardId = "card-max-retries";
   const obs = [makeReadyObs(cardId)];
@@ -376,6 +376,22 @@ test("card at MAX_DISPATCH_RETRIES limit → permanently skipped", () => {
   assert.equal(r.action, "complete", "card at max retries should be permanently skipped");
   assert.equal(r.checkpoint.stats.dispatched, 0, "should not count as dispatched");
   assert.equal(r.checkpoint.stats.stalled_candidates, 1, "should count as stalled");
+  assert.equal(r.checkpoint.pending[cardId].status, "stalled");
+  assert.equal(r.checkpoint.pending[cardId].stalled_at, BASE_NOW.toISOString());
+
+  const nextNow = new Date(BASE_NOW.getTime() + 60 * 1000);
+  const repeated = tick({
+    now: nextNow,
+    checkpoint: r.checkpoint,
+    observations: obs,
+    automationInventory: [],
+  });
+
+  assert.equal(repeated.action, "complete");
+  assert.equal(repeated.checkpoint.stats.stalled_candidates, 1,
+    "the same stalled candidate must not be recounted on later ticks");
+  assert.equal(repeated.checkpoint.pending[cardId].stalled_at, BASE_NOW.toISOString(),
+    "the first stalled transition timestamp must remain stable");
 });
 
 // --- Checkpoint version mismatch ---
