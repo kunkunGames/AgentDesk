@@ -24,6 +24,7 @@ from unittest import mock
 
 import scripts.relay_watchdog as relay_watchdog
 from scripts.relay_watchdog import (
+    COVERAGE_ACTIVITY_FRESH_SECS,
     COVERAGE_CONFIRM_TICKS,
     COVERAGE_COVERED,
     COVERAGE_UNCOVERED,
@@ -47,6 +48,7 @@ from scripts.relay_watchdog import (
     ChannelConfig,
     Config,
     ConfigError,
+    CoverageActivityProbe,
     Runtime,
     TranscriptCandidate,
     WatcherStateProbe,
@@ -57,6 +59,7 @@ from scripts.relay_watchdog import (
     delivered_watermark_for_path,
     delivered_watermarks,
     evaluate,
+    evaluate_active_foreground_coverage,
     evaluate_coverage,
     evaluate_pg_health,
     evaluate_selector_sync,
@@ -67,6 +70,7 @@ from scripts.relay_watchdog import (
     newest_transcript,
     norm,
     parse_config,
+    parse_watcher_state_probe,
     parse_transcript_ts,
     project_slug,
     recheck_selected_transcript,
@@ -933,6 +937,25 @@ class EvaluateBoundaryTests(unittest.TestCase):
 
 
 class CoverageEvaluationTests(unittest.TestCase):
+    NOW_MS = 1_800_000_000_000
+
+    @classmethod
+    def active_foreground(cls, **overrides) -> CoverageActivityProbe:
+        fields = {
+            "relay_stall_state": "active_foreground_stream",
+            "active_turn": "foreground",
+            "queue_depth": 0,
+            "tmux_alive": True,
+            "watcher_attached": True,
+            "watcher_attached_stale": False,
+            "watcher_owns_live_relay": True,
+            "last_outbound_activity_ms": cls.NOW_MS - 1,
+            "last_relay_ts_ms": cls.NOW_MS - 2,
+            "desynced": True,
+        }
+        fields.update(overrides)
+        return CoverageActivityProbe(**fields)
+
     def test_live_expected_session_with_healthy_watcher_is_covered(self):
         verdict = evaluate_coverage(True, 200, True, False, 1)
         self.assertEqual(verdict.state, COVERAGE_COVERED)
@@ -970,6 +993,222 @@ class CoverageEvaluationTests(unittest.TestCase):
         self.assertEqual(verdict.reason, "attached_but_desynced")
         self.assertTrue(verdict.confirmed)
 
+    def test_recent_active_foreground_stream_covers_transient_desync(self):
+        verdict = evaluate_coverage(
+            True,
+            200,
+            True,
+            True,
+            1,
+            self.active_foreground(),
+            self.NOW_MS,
+        )
+        self.assertEqual(verdict.state, COVERAGE_COVERED)
+        self.assertEqual(verdict.reason, "active_foreground_recent_activity")
+        self.assertEqual(verdict.consecutive_uncovered, 0)
+        self.assertFalse(verdict.confirmed)
+
+    def test_relay_timestamp_is_valid_freshness_fallback(self):
+        verdict = evaluate_active_foreground_coverage(
+            self.active_foreground(
+                last_outbound_activity_ms=None,
+                last_relay_ts_ms=self.NOW_MS - 1,
+            ),
+            self.NOW_MS,
+        )
+        self.assertEqual(verdict.state, COVERAGE_COVERED)
+
+    def test_activity_freshness_boundary_is_strict(self):
+        inside = evaluate_active_foreground_coverage(
+            self.active_foreground(
+                last_outbound_activity_ms=(
+                    self.NOW_MS - COVERAGE_ACTIVITY_FRESH_SECS * 1000 + 1
+                ),
+                last_relay_ts_ms=None,
+            ),
+            self.NOW_MS,
+        )
+        boundary = evaluate_active_foreground_coverage(
+            self.active_foreground(
+                last_outbound_activity_ms=(
+                    self.NOW_MS - COVERAGE_ACTIVITY_FRESH_SECS * 1000
+                ),
+                last_relay_ts_ms=None,
+            ),
+            self.NOW_MS,
+        )
+        self.assertEqual(inside.state, COVERAGE_COVERED)
+        self.assertEqual(boundary.state, COVERAGE_UNCOVERED)
+        self.assertEqual(boundary.reason, "active_foreground_activity_stale")
+
+    def test_future_activity_timestamp_cannot_suppress_desync(self):
+        activity = self.active_foreground(
+            last_outbound_activity_ms=self.NOW_MS + 1,
+            last_relay_ts_ms=None,
+        )
+        activity_verdict = evaluate_active_foreground_coverage(
+            activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(activity_verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(
+            activity_verdict.reason,
+            "active_foreground_activity_future",
+        )
+
+        coverage_verdict = evaluate_coverage(
+            True,
+            200,
+            True,
+            True,
+            1,
+            activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(coverage_verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(coverage_verdict.reason, "attached_but_desynced")
+        self.assertTrue(coverage_verdict.confirmed)
+
+    def test_oversized_activity_timestamp_fails_closed_without_throwing(self):
+        activity = self.active_foreground(
+            last_outbound_activity_ms=10**400,
+            last_relay_ts_ms=None,
+        )
+        activity_verdict = evaluate_active_foreground_coverage(
+            activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(activity_verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(
+            activity_verdict.reason,
+            "active_foreground_activity_invalid",
+        )
+
+        coverage_verdict = evaluate_coverage(
+            True,
+            200,
+            True,
+            True,
+            1,
+            activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(coverage_verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(coverage_verdict.reason, "attached_but_desynced")
+        self.assertTrue(coverage_verdict.confirmed)
+
+    def test_invalid_freshness_clock_cannot_suppress_desync(self):
+        for now_ms, freshness_secs in (
+            (None, 60),
+            (self.NOW_MS, 0),
+            (10**400, 60),
+        ):
+            with self.subTest(now_ms=now_ms, freshness_secs=freshness_secs):
+                verdict = evaluate_coverage(
+                    True,
+                    200,
+                    True,
+                    True,
+                    1,
+                    self.active_foreground(),
+                    now_ms,
+                    freshness_secs,
+                )
+                self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+                self.assertEqual(verdict.reason, "attached_but_desynced")
+                self.assertTrue(verdict.confirmed)
+
+    def test_explicit_stall_evidence_never_uses_foreground_bypass(self):
+        cases = {
+            "queue": {"queue_depth": 1},
+            "dead tmux": {"tmux_alive": False},
+            "detached nested watcher": {"watcher_attached": False},
+            "stale attachment": {"watcher_attached_stale": True},
+            "lost live relay ownership": {"watcher_owns_live_relay": False},
+            "relay-dead classifier": {
+                "relay_stall_state": "tmux_alive_relay_dead"
+            },
+            "no activity": {
+                "last_outbound_activity_ms": None,
+                "last_relay_ts_ms": None,
+            },
+            "stale activity": {
+                "last_outbound_activity_ms": (
+                    self.NOW_MS - COVERAGE_ACTIVITY_FRESH_SECS * 1000
+                ),
+                "last_relay_ts_ms": None,
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                verdict = evaluate_coverage(
+                    True,
+                    200,
+                    True,
+                    True,
+                    1,
+                    self.active_foreground(**overrides),
+                    self.NOW_MS,
+                )
+                self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+                self.assertEqual(verdict.reason, "attached_but_desynced")
+                self.assertTrue(verdict.confirmed)
+
+    def test_partial_or_malformed_active_schema_cannot_suppress_desync(self):
+        partial = CoverageActivityProbe(
+            relay_stall_state="active_foreground_stream",
+            active_turn="foreground",
+        )
+        malformed = self.active_foreground(malformed=True)
+        for activity in (partial, malformed):
+            with self.subTest(activity=activity):
+                verdict = evaluate_coverage(
+                    True,
+                    200,
+                    True,
+                    True,
+                    1,
+                    activity,
+                    self.NOW_MS,
+                )
+                self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+                self.assertEqual(verdict.reason, "attached_but_desynced")
+                self.assertEqual(
+                    verdict.consecutive_uncovered, COVERAGE_CONFIRM_TICKS
+                )
+                self.assertTrue(verdict.confirmed)
+
+    def test_nested_desync_disagreement_cannot_suppress_top_level_desync(self):
+        verdict = evaluate_coverage(
+            True,
+            200,
+            True,
+            True,
+            1,
+            self.active_foreground(desynced=False),
+            self.NOW_MS,
+        )
+        self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(verdict.reason, "attached_but_desynced")
+        self.assertTrue(verdict.confirmed)
+
+    def test_active_evidence_cannot_override_detached_or_404(self):
+        activity = self.active_foreground()
+        detached = evaluate_coverage(
+            True, 200, False, True, 1, activity, self.NOW_MS
+        )
+        missing = evaluate_coverage(
+            True, 404, None, None, 1, activity, self.NOW_MS
+        )
+        self.assertEqual((detached.state, detached.reason), (
+            COVERAGE_UNCOVERED,
+            "detached",
+        ))
+        self.assertEqual((missing.state, missing.reason), (
+            COVERAGE_UNCOVERED,
+            "watcher_state_404",
+        ))
+
     def test_dead_expected_session_is_left_to_stall_watchdog(self):
         verdict = evaluate_coverage(False, 200, False, True, 1)
         self.assertEqual(verdict.state, COVERAGE_COVERED)
@@ -980,6 +1219,130 @@ class CoverageEvaluationTests(unittest.TestCase):
         verdict = evaluate_coverage(True, 200, None, None, 1)
         self.assertEqual(verdict.state, COVERAGE_UNKNOWN)
         self.assertEqual(verdict.consecutive_uncovered, 0)
+
+
+class WatcherStateParserTests(unittest.TestCase):
+    NOW_MS = CoverageEvaluationTests.NOW_MS
+
+    @classmethod
+    def payload(cls, **relay_overrides) -> dict:
+        relay_health = {
+            "active_turn": "foreground",
+            "queue_depth": 0,
+            "tmux_alive": True,
+            "watcher_attached": True,
+            "watcher_attached_stale": False,
+            "watcher_owns_live_relay": True,
+            "last_outbound_activity_ms": cls.NOW_MS - 1,
+            "last_relay_ts_ms": cls.NOW_MS - 2,
+            "desynced": True,
+        }
+        relay_health.update(relay_overrides)
+        return {
+            "attached": True,
+            "desynced": True,
+            "bound_output_path": "/tmp/live.jsonl",
+            "relay_stall_state": "active_foreground_stream",
+            "relay_health": relay_health,
+        }
+
+    def test_parses_actual_active_foreground_schema(self):
+        probe = parse_watcher_state_probe(200, self.payload())
+        self.assertEqual(
+            probe,
+            WatcherStateProbe(
+                200,
+                True,
+                True,
+                "/tmp/live.jsonl",
+                CoverageActivityProbe(
+                    relay_stall_state="active_foreground_stream",
+                    active_turn="foreground",
+                    queue_depth=0,
+                    tmux_alive=True,
+                    watcher_attached=True,
+                    watcher_attached_stale=False,
+                    watcher_owns_live_relay=True,
+                    last_outbound_activity_ms=self.NOW_MS - 1,
+                    last_relay_ts_ms=self.NOW_MS - 2,
+                    desynced=True,
+                ),
+            ),
+        )
+
+    def test_nullable_activity_timestamps_are_valid_schema(self):
+        probe = parse_watcher_state_probe(
+            200,
+            self.payload(
+                last_outbound_activity_ms=None,
+                last_relay_ts_ms=self.NOW_MS - 1,
+            ),
+        )
+        self.assertIsNotNone(probe.relay_activity)
+        self.assertFalse(probe.relay_activity.malformed)
+        self.assertIsNone(probe.relay_activity.last_outbound_activity_ms)
+        self.assertEqual(probe.relay_activity.last_relay_ts_ms, self.NOW_MS - 1)
+
+    def test_exact_types_reject_bool_integer_and_string_boolean(self):
+        probe = parse_watcher_state_probe(
+            200,
+            self.payload(
+                queue_depth=True,
+                watcher_attached_stale="false",
+                last_outbound_activity_ms="1800000000000",
+            ),
+        )
+        self.assertIsNotNone(probe.relay_activity)
+        self.assertTrue(probe.relay_activity.malformed)
+        self.assertIsNone(probe.relay_activity.queue_depth)
+        self.assertIsNone(probe.relay_activity.watcher_attached_stale)
+        self.assertIsNone(probe.relay_activity.last_outbound_activity_ms)
+
+    def test_partial_active_schema_preserves_legacy_desync_detection(self):
+        probe = parse_watcher_state_probe(
+            200,
+            {
+                "attached": True,
+                "desynced": True,
+                "relay_stall_state": "active_foreground_stream",
+                "relay_health": {"active_turn": "foreground"},
+            },
+        )
+        verdict = evaluate_coverage(
+            True,
+            probe.status,
+            probe.attached,
+            probe.desynced,
+            1,
+            probe.relay_activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+        self.assertEqual(verdict.reason, "attached_but_desynced")
+        self.assertTrue(verdict.confirmed)
+
+    def test_legacy_schema_retains_original_desync_detection(self):
+        probe = parse_watcher_state_probe(
+            200, {"attached": True, "desynced": True}
+        )
+        self.assertIsNone(probe.relay_activity)
+        verdict = evaluate_coverage(
+            True,
+            probe.status,
+            probe.attached,
+            probe.desynced,
+            1,
+            probe.relay_activity,
+            self.NOW_MS,
+        )
+        self.assertEqual(verdict.state, COVERAGE_UNCOVERED)
+        self.assertTrue(verdict.confirmed)
+
+    def test_non_mapping_and_non_200_never_invent_activity(self):
+        self.assertEqual(parse_watcher_state_probe(200, []), WatcherStateProbe(200))
+        self.assertEqual(
+            parse_watcher_state_probe(404, self.payload()), WatcherStateProbe(404)
+        )
 
 
 class SelectorSyncEvaluationTests(unittest.TestCase):
@@ -1687,6 +2050,80 @@ class RuntimeCoverageProbeTests(unittest.TestCase):
             probe = self.make_rt().watcher_state("999")
         self.assertEqual(probe, WatcherStateProbe(200, True, False))
 
+    def test_watcher_state_wires_production_active_foreground_shape(self):
+        completed = subprocess.CompletedProcess(
+            ["curl"],
+            0,
+            stdout=json.dumps(WatcherStateParserTests.payload()) + "\n200",
+            stderr="",
+        )
+        with mock.patch.object(relay_watchdog.subprocess, "run", return_value=completed):
+            probe = self.make_rt().watcher_state("999")
+        self.assertEqual(probe.status, 200)
+        self.assertTrue(probe.attached)
+        self.assertTrue(probe.desynced)
+        self.assertEqual(
+            probe.relay_activity,
+            CoverageEvaluationTests.active_foreground(),
+        )
+
+    def test_production_activity_clock_anomalies_fail_closed(self):
+        cases = (
+            (
+                "future",
+                CoverageEvaluationTests.NOW_MS + 1,
+                "active_foreground_activity_future",
+            ),
+            (
+                "oversized",
+                10**400,
+                "active_foreground_activity_invalid",
+            ),
+        )
+        for name, timestamp, reason in cases:
+            with self.subTest(name=name):
+                completed = subprocess.CompletedProcess(
+                    ["curl"],
+                    0,
+                    stdout=(
+                        json.dumps(
+                            WatcherStateParserTests.payload(
+                                last_outbound_activity_ms=timestamp,
+                                last_relay_ts_ms=None,
+                            )
+                        )
+                        + "\n200"
+                    ),
+                    stderr="",
+                )
+                with mock.patch.object(
+                    relay_watchdog.subprocess,
+                    "run",
+                    return_value=completed,
+                ):
+                    probe = self.make_rt().watcher_state("999")
+                activity_verdict = evaluate_active_foreground_coverage(
+                    probe.relay_activity,
+                    CoverageEvaluationTests.NOW_MS,
+                )
+                self.assertEqual(activity_verdict.state, COVERAGE_UNCOVERED)
+                self.assertEqual(activity_verdict.reason, reason)
+                coverage_verdict = evaluate_coverage(
+                    True,
+                    probe.status,
+                    probe.attached,
+                    probe.desynced,
+                    1,
+                    probe.relay_activity,
+                    CoverageEvaluationTests.NOW_MS,
+                )
+                self.assertEqual(coverage_verdict.state, COVERAGE_UNCOVERED)
+                self.assertEqual(
+                    coverage_verdict.reason,
+                    "attached_but_desynced",
+                )
+                self.assertTrue(coverage_verdict.confirmed)
+
     def test_watcher_state_malformed_200_keeps_status_but_not_claims(self):
         completed = subprocess.CompletedProcess(
             ["curl"], 0, stdout='{"attached":"true"}\n200', stderr=""
@@ -1976,6 +2413,27 @@ class TickChannelTests(unittest.TestCase):
         rt.live_sessions = {expected_tmux_session_name(TICK_CHANNEL)}
         rt.watcher_probe = probe
 
+    def active_foreground_probe(self, **overrides) -> WatcherStateProbe:
+        fields = {
+            "relay_stall_state": "active_foreground_stream",
+            "active_turn": "foreground",
+            "queue_depth": 0,
+            "tmux_alive": True,
+            "watcher_attached": True,
+            "watcher_attached_stale": False,
+            "watcher_owns_live_relay": True,
+            "last_outbound_activity_ms": int(self.now * 1000) - 1,
+            "last_relay_ts_ms": int(self.now * 1000) - 2,
+            "desynced": True,
+        }
+        fields.update(overrides)
+        return WatcherStateProbe(
+            status=200,
+            attached=True,
+            desynced=True,
+            relay_activity=CoverageActivityProbe(**fields),
+        )
+
     def test_metadata_only_growth_cannot_steal_live_selection(self):
         stale_compact = self.proj_dir / "stale-compact.jsonl"
         stagnant_dir = self.projects / (
@@ -2231,6 +2689,111 @@ class TickChannelTests(unittest.TestCase):
             "actionable coverage alerts must trigger an agent turn "
             "(send-to-agent handoff), not bot-direct delivery",
         )
+
+    def test_active_foreground_desync_does_not_advance_coverage_confirmation(self):
+        rt = self.make_rt()
+        self.arm_coverage(rt, self.active_foreground_probe())
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        tick_channel(rt, TICK_CHANNEL, state, self.now)
+
+        self.assertEqual(rt.alerts, [])
+        self.assertNotIn("coverage_uncovered_ticks", state["999"])
+        self.assertNotIn("last_coverage_alert", state["999"])
+
+    def test_back_to_back_foreground_churn_never_accumulates_confirmation(self):
+        rt = self.make_rt()
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        for tick_index in range(10):
+            tick_at = self.now + tick_index * rt.cfg.poll_secs
+            self.arm_coverage(
+                rt,
+                self.active_foreground_probe(
+                    last_outbound_activity_ms=int(tick_at * 1000) - 1,
+                    last_relay_ts_ms=int(tick_at * 1000) - 2,
+                ),
+            )
+            tick_channel(rt, TICK_CHANNEL, state, tick_at)
+            self.assertNotIn("coverage_uncovered_ticks", state["999"])
+
+        self.assertEqual(rt.alerts, [])
+        self.assertNotIn("last_coverage_alert", state["999"])
+
+    def test_stale_foreground_desync_still_confirms_coverage_alert(self):
+        rt = self.make_rt()
+        stale_ms = int(self.now * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
+        self.arm_coverage(
+            rt,
+            self.active_foreground_probe(
+                last_outbound_activity_ms=stale_ms,
+                last_relay_ts_ms=None,
+            ),
+        )
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        tick_channel(rt, TICK_CHANNEL, state, self.now)
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("커버리지 불변식 위반", rt.alerts[0][0])
+        self.assertIn("attached_but_desynced", rt.alerts[0][0])
+
+    def test_partial_foreground_schema_cannot_suppress_coverage_alert(self):
+        rt = self.make_rt()
+        self.arm_coverage(
+            rt,
+            WatcherStateProbe(
+                status=200,
+                attached=True,
+                desynced=True,
+                relay_activity=CoverageActivityProbe(
+                    relay_stall_state="active_foreground_stream",
+                    active_turn="foreground",
+                ),
+            ),
+        )
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        tick_channel(rt, TICK_CHANNEL, state, self.now)
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("커버리지 불변식 위반", rt.alerts[0][0])
+        self.assertIn("attached_but_desynced", rt.alerts[0][0])
+        self.assertEqual(
+            state["999"]["coverage_uncovered_ticks"], COVERAGE_CONFIRM_TICKS
+        )
+
+    def test_active_foreground_evidence_cannot_suppress_detached_alert(self):
+        rt = self.make_rt()
+        probe = self.active_foreground_probe()
+        self.arm_coverage(
+            rt,
+            WatcherStateProbe(
+                status=200,
+                attached=False,
+                desynced=True,
+                relay_activity=probe.relay_activity,
+            ),
+        )
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        tick_channel(rt, TICK_CHANNEL, state, self.now)
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("커버리지 불변식 위반", rt.alerts[0][0])
+        self.assertIn("detached", rt.alerts[0][0])
+
+    def test_active_foreground_coverage_cannot_suppress_transcript_gap(self):
+        rt = self.gap_rt()
+        self.arm_coverage(rt, self.active_foreground_probe())
+        state = {"999": {"coverage_uncovered_ticks": 1}}
+
+        tick_channel(rt, TICK_CHANNEL, state, self.now)
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("릴레이 갭 감지", rt.alerts[0][0])
+        self.assertNotIn("last_coverage_alert", state["999"])
+        self.assertIn("last_alert", state["999"])
 
     def test_coverage_alert_is_suppressed_during_deploy_window(self):
         rt = self.make_rt()

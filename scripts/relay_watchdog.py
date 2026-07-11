@@ -86,6 +86,11 @@ COVERAGE_COVERED = "covered"
 COVERAGE_UNCOVERED = "uncovered"
 COVERAGE_UNKNOWN = "unknown"
 COVERAGE_CONFIRM_TICKS = 2
+# A foreground turn must show an outbound/relay write inside this window before
+# a transient watcher-state desync can be treated as covered.  Ten minutes
+# matches the watchdog's calibrated delivery grace while still letting a
+# genuinely stalled foreground turn resume normal two-tick escalation.
+COVERAGE_ACTIVITY_FRESH_SECS = 10 * 60
 
 # Independent selector-sync states (#4408 phase 2, I1).  Compares the dcserver's
 # asserted relay bind (B = watcher-state `bound_output_path`) against the
@@ -1387,6 +1392,29 @@ class CoverageVerdict:
 
 
 @dataclass(frozen=True)
+class CoverageActivityVerdict:
+    state: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CoverageActivityProbe:
+    """Exact watcher-state fields that can corroborate a foreground stream."""
+
+    relay_stall_state: str | None = None
+    active_turn: str | None = None
+    queue_depth: int | None = None
+    tmux_alive: bool | None = None
+    watcher_attached: bool | None = None
+    watcher_attached_stale: bool | None = None
+    watcher_owns_live_relay: bool | None = None
+    last_outbound_activity_ms: int | None = None
+    last_relay_ts_ms: int | None = None
+    desynced: bool | None = None
+    malformed: bool = False
+
+
+@dataclass(frozen=True)
 class SelectorVerdict:
     state: str
     reason: str
@@ -1405,6 +1433,278 @@ class WatcherStateProbe:
     # is bound to (`bound_output_path`). `None` means an old server without the
     # field, a JSON null, or a non-200 response — all fail-closed to no alarm.
     bound_output_path: str | None = None
+    # #4458: derived foreground/liveness evidence from top-level
+    # `relay_stall_state` plus nested `relay_health`. `None` is a legacy server
+    # with neither field and preserves the pre-#4458 desync behavior.
+    relay_activity: CoverageActivityProbe | None = None
+
+
+def parse_watcher_state_probe(
+    status: int | None, payload: object
+) -> WatcherStateProbe:
+    """Pure, exact-type parser for the watcher-state response contract."""
+    if status != 200:
+        return WatcherStateProbe(status)
+    if not isinstance(payload, Mapping):
+        return WatcherStateProbe(200)
+
+    attached_raw = payload.get("attached")
+    desynced_raw = payload.get("desynced")
+    bound_output_path = payload.get("bound_output_path")
+    attached = attached_raw if isinstance(attached_raw, bool) else None
+    desynced = desynced_raw if isinstance(desynced_raw, bool) else None
+    bound = bound_output_path if isinstance(bound_output_path, str) else None
+
+    has_activity_schema = (
+        "relay_stall_state" in payload or "relay_health" in payload
+    )
+    if not has_activity_schema:
+        return WatcherStateProbe(200, attached, desynced, bound)
+
+    malformed = False
+    stall_raw = payload.get("relay_stall_state")
+    if stall_raw is None:
+        relay_stall_state = None
+    elif isinstance(stall_raw, str) and stall_raw:
+        relay_stall_state = stall_raw
+    else:
+        relay_stall_state = None
+        malformed = True
+
+    relay_raw = payload.get("relay_health")
+    if not isinstance(relay_raw, Mapping):
+        return WatcherStateProbe(
+            200,
+            attached,
+            desynced,
+            bound,
+            CoverageActivityProbe(
+                relay_stall_state=relay_stall_state,
+                malformed=True,
+            ),
+        )
+
+    def string_field(key: str) -> tuple[str | None, bool]:
+        if key not in relay_raw:
+            return None, False
+        value = relay_raw.get(key)
+        if isinstance(value, str) and value:
+            return value, False
+        return None, True
+
+    def bool_field(
+        key: str, *, nullable: bool = False
+    ) -> tuple[bool | None, bool]:
+        if key not in relay_raw:
+            return None, False
+        value = relay_raw.get(key)
+        if isinstance(value, bool):
+            return value, False
+        if value is None and nullable:
+            return None, False
+        return None, True
+
+    def int_field(
+        key: str, *, nullable: bool = False
+    ) -> tuple[int | None, bool]:
+        if key not in relay_raw:
+            return None, False
+        value = relay_raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value, False
+        if value is None and nullable:
+            return None, False
+        return None, True
+
+    active_turn, bad_active_turn = string_field("active_turn")
+    queue_depth, bad_queue_depth = int_field("queue_depth")
+    tmux_alive, bad_tmux_alive = bool_field("tmux_alive", nullable=True)
+    watcher_attached, bad_watcher_attached = bool_field("watcher_attached")
+    watcher_attached_stale, bad_watcher_attached_stale = bool_field(
+        "watcher_attached_stale"
+    )
+    watcher_owns_live_relay, bad_watcher_owns_live_relay = bool_field(
+        "watcher_owns_live_relay"
+    )
+    last_outbound_activity_ms, bad_last_outbound_activity_ms = int_field(
+        "last_outbound_activity_ms", nullable=True
+    )
+    last_relay_ts_ms, bad_last_relay_ts_ms = int_field(
+        "last_relay_ts_ms", nullable=True
+    )
+    relay_desynced, bad_relay_desynced = bool_field("desynced")
+    malformed = malformed or any(
+        (
+            bad_active_turn,
+            bad_queue_depth,
+            bad_tmux_alive,
+            bad_watcher_attached,
+            bad_watcher_attached_stale,
+            bad_watcher_owns_live_relay,
+            bad_last_outbound_activity_ms,
+            bad_last_relay_ts_ms,
+            bad_relay_desynced,
+        )
+    )
+    return WatcherStateProbe(
+        200,
+        attached,
+        desynced,
+        bound,
+        CoverageActivityProbe(
+            relay_stall_state=relay_stall_state,
+            active_turn=active_turn,
+            queue_depth=queue_depth,
+            tmux_alive=tmux_alive,
+            watcher_attached=watcher_attached,
+            watcher_attached_stale=watcher_attached_stale,
+            watcher_owns_live_relay=watcher_owns_live_relay,
+            last_outbound_activity_ms=last_outbound_activity_ms,
+            last_relay_ts_ms=last_relay_ts_ms,
+            desynced=relay_desynced,
+            malformed=malformed,
+        ),
+    )
+
+
+def evaluate_active_foreground_coverage(
+    activity: CoverageActivityProbe | None,
+    now_ms: object,
+    freshness_secs: object = COVERAGE_ACTIVITY_FRESH_SECS,
+) -> CoverageActivityVerdict:
+    """Prove that an attached desync is a live foreground streaming snapshot."""
+    if activity is None:
+        # Legacy watcher-state: retain the original attached+desynced failure.
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_schema_absent"
+        )
+
+    # Explicit negative evidence always wins over partial/malformed positive
+    # evidence. These are real coverage failures, not parser uncertainty.
+    if (
+        activity.relay_stall_state is not None
+        and activity.relay_stall_state != "active_foreground_stream"
+    ):
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "relay_stall_state_not_active_foreground"
+        )
+    if activity.active_turn is not None and activity.active_turn != "foreground":
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_turn_not_foreground"
+        )
+    if activity.queue_depth is not None and activity.queue_depth != 0:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_queue_not_empty"
+        )
+    if activity.tmux_alive is False:
+        return CoverageActivityVerdict(COVERAGE_UNCOVERED, "tmux_not_alive")
+    if activity.watcher_attached is False:
+        return CoverageActivityVerdict(COVERAGE_UNCOVERED, "watcher_detached")
+    if activity.watcher_attached_stale is True:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "watcher_attachment_stale"
+        )
+    if activity.watcher_owns_live_relay is False:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "watcher_does_not_own_live_relay"
+        )
+    if activity.desynced is False:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "watcher_state_desync_inconsistent"
+        )
+
+    active_hint = (
+        activity.relay_stall_state == "active_foreground_stream"
+        or activity.active_turn == "foreground"
+    )
+    required_evidence_missing = any(
+        field is None
+        for field in (
+            activity.relay_stall_state,
+            activity.active_turn,
+            activity.queue_depth,
+            activity.tmux_alive,
+            activity.watcher_attached,
+            activity.watcher_attached_stale,
+            activity.watcher_owns_live_relay,
+            activity.desynced,
+        )
+    )
+    if activity.malformed or required_evidence_missing:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_evidence_incomplete"
+        )
+    if not active_hint:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_not_observed"
+        )
+    if not (
+        activity.relay_stall_state == "active_foreground_stream"
+        and activity.active_turn == "foreground"
+        and activity.queue_depth == 0
+        and activity.tmux_alive is True
+        and activity.watcher_attached is True
+        and activity.watcher_attached_stale is False
+        and activity.watcher_owns_live_relay is True
+        and activity.desynced is True
+    ):
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_evidence_rejected"
+        )
+
+    if not (
+        _is_finite_nonnegative_number(now_ms)
+        and _is_finite_nonnegative_number(freshness_secs)
+        and float(freshness_secs) > 0
+    ):
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_clock_unknown"
+        )
+    now_value = float(now_ms)
+    freshness_ms = float(freshness_secs) * 1000
+    if not math.isfinite(freshness_ms):
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_clock_unknown"
+        )
+    timestamps: list[float] = []
+    for raw_timestamp in (
+        activity.last_outbound_activity_ms,
+        activity.last_relay_ts_ms,
+    ):
+        if not (
+            isinstance(raw_timestamp, int)
+            and not isinstance(raw_timestamp, bool)
+            and raw_timestamp > 0
+        ):
+            continue
+        try:
+            timestamp = float(raw_timestamp)
+        except (OverflowError, ValueError):
+            return CoverageActivityVerdict(
+                COVERAGE_UNCOVERED, "active_foreground_activity_invalid"
+            )
+        if not math.isfinite(timestamp):
+            return CoverageActivityVerdict(
+                COVERAGE_UNCOVERED, "active_foreground_activity_invalid"
+            )
+        timestamps.append(timestamp)
+    if not timestamps:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_activity_absent"
+        )
+    freshest = max(timestamps)
+    age_ms = now_value - freshest
+    if age_ms < 0:
+        return CoverageActivityVerdict(
+            COVERAGE_UNCOVERED, "active_foreground_activity_future"
+        )
+    if age_ms < freshness_ms:
+        return CoverageActivityVerdict(
+            COVERAGE_COVERED, "active_foreground_recent_activity"
+        )
+    return CoverageActivityVerdict(
+        COVERAGE_UNCOVERED, "active_foreground_activity_stale"
+    )
 
 
 def evaluate_coverage(
@@ -1413,14 +1713,20 @@ def evaluate_coverage(
     attached: bool | None,
     desynced: bool | None,
     previous_uncovered: int,
+    relay_activity: CoverageActivityProbe | None = None,
+    now_ms: object = None,
+    activity_freshness_secs: object = COVERAGE_ACTIVITY_FRESH_SECS,
 ) -> CoverageVerdict:
     """Pure I2 judgment for expected tmux coverage.
 
-    E is independently enumerated tmux liveness. A is exactly
-    ``attached and not desynced`` from watcher-state. Only E && !A advances
-    confirmation. Transport/schema uncertainty is unknown (never an alert),
-    while an authoritative watcher-state 404 is uncovered. Two consecutive
-    uncovered ticks are required.
+    E is independently enumerated tmux liveness. A is normally
+    ``attached and not desynced`` from watcher-state; #4458 also accepts an
+    exact, fresh active-foreground relay proof while the snapshot is transiently
+    desynced. Only E && !A advances confirmation. Core watcher-state transport/
+    schema uncertainty is unknown, but optional activity evidence can only prove
+    the exception; incomplete or malformed activity never weakens an otherwise
+    authoritative attached+desynced failure. An authoritative watcher-state 404
+    is uncovered. Two consecutive uncovered ticks are required.
     """
 
     def uncovered(reason: str) -> CoverageVerdict:
@@ -1451,6 +1757,17 @@ def evaluate_coverage(
     if attached is False:
         return uncovered("detached")
     if attached is True and desynced is True:
+        activity_verdict = evaluate_active_foreground_coverage(
+            relay_activity,
+            now_ms,
+            activity_freshness_secs,
+        )
+        if activity_verdict.state == COVERAGE_COVERED:
+            return CoverageVerdict(
+                COVERAGE_COVERED, activity_verdict.reason, 0, False
+            )
+        # Supplemental activity is a one-way exception proof. Any outcome
+        # other than exact COVERED retains the original desync invariant.
         return uncovered("attached_but_desynced")
     return CoverageVerdict(COVERAGE_UNKNOWN, "watcher_state_malformed", 0, False)
 
@@ -1577,12 +1894,13 @@ def evaluate(
 
 
 def _is_finite_nonnegative_number(value: object) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and float(value) >= 0.0
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0.0
 
 
 def _bounded_delivered_watermarks(
@@ -1882,17 +2200,7 @@ class Runtime:
             payload = json.loads(body)
         except json.JSONDecodeError:
             return WatcherStateProbe(200)
-        if not isinstance(payload, dict):
-            return WatcherStateProbe(200)
-        attached = payload.get("attached")
-        desynced = payload.get("desynced")
-        bound_output_path = payload.get("bound_output_path")
-        return WatcherStateProbe(
-            200,
-            attached if isinstance(attached, bool) else None,
-            desynced if isinstance(desynced, bool) else None,
-            bound_output_path if isinstance(bound_output_path, str) else None,
-        )
+        return parse_watcher_state_probe(200, payload)
 
     def discord_haystack(self, channel_id: str) -> str | None:
         try:
@@ -2336,6 +2644,8 @@ def tick_coverage(
         probe.attached,
         probe.desynced,
         previous,
+        probe.relay_activity,
+        int(now * 1000),
     )
     if verdict.consecutive_uncovered:
         chs["coverage_uncovered_ticks"] = verdict.consecutive_uncovered
