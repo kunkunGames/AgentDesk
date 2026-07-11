@@ -62,7 +62,7 @@
 # The #4267 exemplar: inflight.rs kept its ~5.4k-line inline test module after
 # its production logic was carved into the inflight/ children (ratio ~9.2x).
 # Tracked for migration alongside the #4201 decomposition.
-"src/services/discord/inflight.rs" = 5451
+"src/services/discord/inflight.rs" = 5355
 # turn_finalizer.rs is itself a production giant (1048 prod LoC) carrying a
 # 3992-line inline test module (ratio ~3.8x). Freeze pending test migration.
 "src/services/discord/turn_finalizer.rs" = 3992
