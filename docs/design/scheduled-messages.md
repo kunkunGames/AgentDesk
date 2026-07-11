@@ -189,7 +189,11 @@ firing    ──(DELETE)──▶ canceled   (진행 중 delivery는 interrupted
   재시도·최종 실패는 outbox가 자체 소유하며(retry_count/next_attempt_at),
   스케줄러는 outbox 상태를 다시 폴링하지 않는다 — 감시 책임을 이중으로 두지
   않는다. 최종 전송 결과는 `deliveries.outbox_id` 조인으로 조회 가능
-  (GET deliveries 응답에 outbox 상태를 lazy join으로 포함).
+  (GET deliveries 응답에 outbox 상태를 lazy join으로 포함). slot dedupe row는
+  `dedupe_expires_at IS NULL`인 영구 sentinel이므로 실시간 outbox GC와 정기 DB
+  retention 모두 이를 삭제하지 않는다. 이는 fire slot당 row 하나가 계속 남는
+  저장공간 trade-off이며, 별도 compact dedupe ledger가 생기기 전까지 at-most-once
+  계약을 우선한다.
 - **agent 모드의 "sent" 판정 = relay 증거 확인**: 예약한 turn ID의
   `session_transcripts`에서 non-empty assistant 메시지를 확인하면 relay된
   답변이 게시됐다고 판정한다. `NO_REPLY`(대소문자/주변 공백 무시)는 전달
@@ -419,6 +423,7 @@ agent 전달인데 이 프로세스에 Discord runtime이 없으면 claim 전에
 | `src/server/routes/docs/inventory/endpoints/part_09.rs` | API docs 인벤토리 항목 (coverage 가드 필수) |
 | `src/services/scheduled_messages.rs` | `scheduled_message_loop` 워커 (fire/감시/복구) |
 | `src/server/worker_registry.rs` | 워커 등록 항목 추가 (`ScheduledMessages`, leader-only) |
+| `src/server/outbox_gc.rs`, `src/services/maintenance/jobs/db_retention.rs` | 영구 slot dedupe sentinel을 GC/retention에서 보존 |
 | `src/services/routines/store.rs` | `next_due_after_anchor`를 `pub(crate)`로 공개 (스케줄 문법 + slot anchor 재사용) |
 | `src/services/discord/outbound/source_registry.rs` | `scheduled_message`를 LoopbackInternal source로 등록 |
 
