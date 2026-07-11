@@ -207,9 +207,13 @@ firing    ──(DELETE)──▶ canceled   (진행 중 delivery는 interrupted
   `session_transcripts`에서 non-empty assistant 메시지를 확인하면 relay된
   답변이 게시됐다고 판정한다. evidence 시각 하한은 늦은 runtime ack가 아니라
   `launch_committed_at`이므로 매우 빠른 reply/error도 놓치지 않는다.
-  `NO_REPLY`(대소문자/주변 공백 무시)는 전달
-  성공이 아니다. `NO_REPLY`와 `empty_response`처럼 turn이 끝났다는 확정 증거가
-  있을 때만 `push_raw`로 강등한다. 30분 내 terminal evidence가 없으면 아직
+  trailing `System` postlude를 제외한 마지막 typed event가 `Error`이거나
+  `[API Error:`/known-provider error-only envelope이면 실패 증거다. 뒤따르는
+  `System` feedback은 무시하고, 정상 `Assistant`/`Result`가 이어지는 recoverable
+  tool 오류는 성공 답변을 가리지 않는다.
+  `NO_REPLY`(대소문자/주변 공백 무시)도 전달 성공이 아니다.
+  `NO_REPLY`와 `empty_response`처럼 turn이 끝났다는 확정 증거가 있을 때만
+  `push_raw`로 강등한다. 30분 내 terminal evidence가 없으면 아직
   살아 있는 turn이 늦게 relay할 수 있으므로 raw fallback 없이 fail-closed한다.
   정의가 그 사이 만료됐더라도 아직 살아 있는 evidence 없는 turn은 조기 종료하지
   않고, 확정 실패 또는 30분 timeout 시점에만 fallback 없이 `expired`로 닫는다.

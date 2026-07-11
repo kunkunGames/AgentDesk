@@ -1134,6 +1134,7 @@ src/
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_auth.rs
+│   ├── provider_error_transcript.rs
 │   ├── provider_exec.rs
 │   ├── provider_hosting.rs
 │   ├── provider_output_guard.rs
