@@ -89,21 +89,21 @@ async fn tick_once(
         Err(error) => tracing::warn!("[smsg] lease recovery failed: {error}"),
     }
 
-    let now = Utc::now();
+    let claim_now = Utc::now();
     match db::claim_due_fires_pg(
         pool,
         claim_owner,
         health_registry.is_some(),
         CLAIM_BATCH,
         LEASE_SECS,
-        now,
+        claim_now,
     )
     .await
     {
         Ok(claimed) => {
             for fire in claimed {
                 did_work = true;
-                fire_claimed(pool, health_registry, fire, now).await;
+                fire_claimed(pool, health_registry, fire, Utc::now()).await;
             }
         }
         Err(error) => tracing::warn!("[smsg] due claim failed: {error}"),
