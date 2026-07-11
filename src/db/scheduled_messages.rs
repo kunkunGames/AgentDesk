@@ -10,13 +10,18 @@ use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
+mod agent_polling;
 mod handoff;
 #[cfg(test)]
 mod postgres_tests;
 
+pub use agent_polling::{
+    RunningAgentDelivery, list_running_agent_deliveries_pg, recover_expired_leases_pg,
+};
 pub(crate) use handoff::{
-    defer_delivery_without_retry_pg, lock_active_delivery_claim_tx,
-    mark_delivery_agent_turn_started_pg, record_delivery_outbox_handoff_tx,
+    agent_turn_intent_is_active_pg, defer_delivery_without_retry_pg, lock_active_delivery_claim_tx,
+    mark_delivery_agent_turn_started_pg, record_delivery_agent_turn_intent_pg,
+    record_delivery_outbox_handoff_tx,
 };
 
 pub const STATUS_SCHEDULED: &str = "scheduled";
@@ -384,7 +389,7 @@ pub async fn cancel_scheduled_message_pg(
     let mut handoff_started = false;
     if let Some(delivery_id) = in_flight.as_deref() {
         let handoff = sqlx::query(
-            "SELECT outbox_id, fallback_outbox_id, turn_id
+            "SELECT outbox_id, fallback_outbox_id, turn_started_at
              FROM scheduled_message_deliveries
              WHERE id = $1
              FOR UPDATE",
@@ -397,7 +402,9 @@ pub async fn cancel_scheduled_message_pg(
                 || handoff
                     .try_get::<Option<i64>, _>("fallback_outbox_id")?
                     .is_some()
-                || handoff.try_get::<Option<String>, _>("turn_id")?.is_some();
+                || handoff
+                    .try_get::<Option<DateTime<Utc>>, _>("turn_started_at")?
+                    .is_some();
         }
         sqlx::query(
             "UPDATE scheduled_message_deliveries
@@ -474,10 +481,12 @@ pub async fn outbox_statuses_for_deliveries_pg(
 /// delivery slot row is created (or an interrupted one from a prior attempt is
 /// re-armed). Multi-node safe: `FOR UPDATE SKIP LOCKED` on the definition and
 /// `uq_smdel_fire_slot` on the delivery keep each fire slot at-most-once.
+/// When the process has no Discord delivery runtime, no kind is claimed: push
+/// rows also depend on the co-located `message_outbox_loop` to drain handoffs.
 pub async fn claim_due_fires_pg(
     pool: &PgPool,
     claim_owner: &str,
-    claim_agent: bool,
+    delivery_runtime_available: bool,
     batch: i64,
     lease_secs: i64,
     now: DateTime<Utc>,
@@ -486,13 +495,13 @@ pub async fn claim_due_fires_pg(
     let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
-           AND ($2 OR delivery_kind <> 'agent')
+           AND $2
          ORDER BY scheduled_at
          LIMIT $3
          FOR UPDATE SKIP LOCKED"
     ))
     .bind(now)
-    .bind(claim_agent)
+    .bind(delivery_runtime_available)
     .bind(batch)
     .fetch_all(&mut *tx)
     .await?;
@@ -500,7 +509,7 @@ pub async fn claim_due_fires_pg(
     let mut claimed = Vec::with_capacity(due.len());
     for message in due {
         let Some(fire) =
-            arm_delivery_slot_tx(&mut tx, &message, claim_owner, lease_secs, now).await?
+            arm_delivery_slot_tx(&mut tx, &message, claim_owner, lease_secs, now, None).await?
         else {
             continue;
         };
@@ -520,6 +529,7 @@ async fn arm_delivery_slot_tx(
     claim_owner: &str,
     lease_secs: i64,
     now: DateTime<Utc>,
+    resume_scheduled_at: Option<DateTime<Utc>>,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
     let delivery_id = format!("smdel_{}", Uuid::new_v4());
     let claim_token = format!("smclaim_{}", Uuid::new_v4());
@@ -527,9 +537,9 @@ async fn arm_delivery_slot_tx(
     let armed = sqlx::query(
         "INSERT INTO scheduled_message_deliveries
             (id, scheduled_message_id, fire_scheduled_at, delivery_kind, status,
-             claim_owner, claim_token, lease_expires_at)
+             claim_owner, claim_token, lease_expires_at, resume_scheduled_at)
          VALUES ($1, $2, $3, $4, 'running', $5, $6,
-                 $7 + ($8::bigint * INTERVAL '1 second'))
+                 $7 + ($8::bigint * INTERVAL '1 second'), $9)
          ON CONFLICT (scheduled_message_id, fire_scheduled_at) DO UPDATE
             SET status = 'running',
                 claim_owner = EXCLUDED.claim_owner,
@@ -538,6 +548,7 @@ async fn arm_delivery_slot_tx(
                 retry_count = scheduled_message_deliveries.retry_count + 1,
                 outbox_id = NULL,
                 turn_id = NULL,
+                turn_started_at = NULL,
                 fallback_outbox_id = NULL,
                 next_attempt_at = NULL,
                 error = NULL,
@@ -545,7 +556,7 @@ async fn arm_delivery_slot_tx(
                 finished_at = NULL,
                 updated_at = NOW()
           WHERE scheduled_message_deliveries.status = 'interrupted'
-         RETURNING id, retry_count, claim_token",
+         RETURNING id, retry_count, claim_token, resume_scheduled_at",
     )
     .bind(&delivery_id)
     .bind(&message.id)
@@ -555,6 +566,7 @@ async fn arm_delivery_slot_tx(
     .bind(&claim_token)
     .bind(now)
     .bind(lease_secs)
+    .bind(resume_scheduled_at)
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -589,18 +601,29 @@ async fn arm_delivery_slot_tx(
     let armed_id: String = armed.try_get("id")?;
     let retry_count: i32 = armed.try_get("retry_count")?;
     let claim_token: String = armed.try_get("claim_token")?;
+    let resume_scheduled_at: Option<DateTime<Utc>> = armed.try_get("resume_scheduled_at")?;
     sqlx::query(
         "UPDATE scheduled_messages
-         SET status = 'firing', in_flight_delivery_id = $2, updated_at = NOW()
+         SET status = 'firing', in_flight_delivery_id = $2,
+             scheduled_at = COALESCE($3, scheduled_at), updated_at = NOW()
          WHERE id = $1",
     )
     .bind(&message.id)
     .bind(&armed_id)
+    .bind(resume_scheduled_at)
     .execute(&mut **tx)
     .await?;
 
+    let mut claimed_message = message.clone();
+    if let Some(resume_scheduled_at) = resume_scheduled_at {
+        // A trigger-now attempt owns a distinct dedupe slot, but recurrence
+        // must continue from the definition's reserved slot. Keep that anchor
+        // on the delivery so every interrupted re-arm returns the same view.
+        claimed_message.scheduled_at = resume_scheduled_at;
+    }
+
     Ok(Some(ClaimedFire {
-        message: message.clone(),
+        message: claimed_message,
         delivery_id: armed_id,
         claim_token,
         fire_scheduled_at,
@@ -633,13 +656,16 @@ pub async fn trigger_now_pg(
     let original_scheduled_at = message.scheduled_at;
     let now = Utc::now();
     message.scheduled_at = now;
-    let mut claimed = arm_delivery_slot_tx(&mut tx, &message, claim_owner, lease_secs, now).await?;
+    let claimed = arm_delivery_slot_tx(
+        &mut tx,
+        &message,
+        claim_owner,
+        lease_secs,
+        now,
+        Some(original_scheduled_at),
+    )
+    .await?;
     tx.commit().await?;
-    if let Some(claimed) = claimed.as_mut() {
-        // Keep the definition's own slot visible to the fire executor so a
-        // recurring row resumes at its original time instead of skipping ahead.
-        claimed.message.scheduled_at = original_scheduled_at;
-    }
     Ok(claimed)
 }
 
@@ -879,120 +905,4 @@ pub async fn mark_expired_pg(
     .await?;
     tx.commit().await?;
     Ok(true)
-}
-
-// ── Agent-mode polling / recovery (worker) ──────────────────────────────────
-
-/// Agent-mode deliveries still awaiting transcript evidence, joined with the
-/// parent fields the poller needs. Extends the lease of everything returned.
-///
-/// Only rows with a recorded `turn_id` qualify: a running row without one is
-/// still inside `start_agent_turn` (possibly on another node — trigger-now
-/// fires outside the scheduler tick), and touching it here would both keep its
-/// lease alive forever and race the in-flight start. Pre-turn crashes are
-/// owned by lease expiry + `recover_expired_leases_pg`.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct RunningAgentDelivery {
-    pub delivery_id: String,
-    pub scheduled_message_id: String,
-    pub claim_token: String,
-    pub fire_scheduled_at: DateTime<Utc>,
-    pub turn_id: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub content: String,
-    pub target_channel_id: Option<String>,
-    pub bot: String,
-    pub agent_id: Option<String>,
-    pub on_agent_failure: String,
-    pub schedule: Option<String>,
-    pub timezone: String,
-    pub scheduled_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
-pub async fn list_running_agent_deliveries_pg(
-    pool: &PgPool,
-    lease_secs: i64,
-    limit: i64,
-) -> Result<Vec<RunningAgentDelivery>, sqlx::Error> {
-    sqlx::query_as::<_, RunningAgentDelivery>(
-        "UPDATE scheduled_message_deliveries d
-         SET lease_expires_at = NOW() + ($1::bigint * INTERVAL '1 second'),
-             updated_at = NOW()
-         FROM scheduled_messages m
-         WHERE d.id IN (
-             SELECT id FROM scheduled_message_deliveries
-             WHERE status = 'running' AND delivery_kind = 'agent'
-               AND turn_id IS NOT NULL
-             ORDER BY created_at
-             LIMIT $2
-             FOR UPDATE SKIP LOCKED)
-           AND m.id = d.scheduled_message_id
-         RETURNING d.id AS delivery_id, d.scheduled_message_id, d.claim_token,
-                   d.fire_scheduled_at, d.turn_id, d.started_at,
-                   m.content, m.target_channel_id, m.bot, m.agent_id,
-                   m.on_agent_failure, m.schedule, m.timezone,
-                   m.scheduled_at, m.expires_at",
-    )
-    .bind(lease_secs)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-}
-
-/// Boot/lease recovery: expired running deliveries become `interrupted` and
-/// their parents return to `scheduled` so the due scan can re-arm the slot
-/// (bounded by the retry cap enforced at claim time).
-pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let rows = sqlx::query(
-        "SELECT m.id AS scheduled_message_id,
-                d.id AS delivery_id,
-                d.fire_scheduled_at
-         FROM scheduled_messages m
-         JOIN scheduled_message_deliveries d ON d.id = m.in_flight_delivery_id
-         WHERE m.status = 'firing'
-           AND d.status = 'running'
-           AND d.lease_expires_at IS NOT NULL
-           AND d.lease_expires_at < NOW()
-         ORDER BY d.lease_expires_at, m.id
-         FOR UPDATE OF m SKIP LOCKED",
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut recovered = 0_u64;
-    for row in rows {
-        let delivery_id: String = row.try_get("delivery_id")?;
-        let message_id: String = row.try_get("scheduled_message_id")?;
-        let fire_scheduled_at: DateTime<Utc> = row.try_get("fire_scheduled_at")?;
-        // The parent lock is held before this child update. Re-check the lease
-        // cutoff so a concurrent token-guarded turn-start renewal wins safely.
-        let delivery_updated = sqlx::query(
-            "UPDATE scheduled_message_deliveries
-             SET status = 'interrupted', error = 'delivery lease expired',
-                 finished_at = NOW(), updated_at = NOW()
-             WHERE id = $1 AND status = 'running'
-               AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()",
-        )
-        .bind(&delivery_id)
-        .execute(&mut *tx)
-        .await?;
-        if delivery_updated.rows_affected() == 0 {
-            continue;
-        }
-        let parent_updated = sqlx::query(
-            "UPDATE scheduled_messages
-             SET status = 'scheduled', scheduled_at = $3,
-                 in_flight_delivery_id = NULL, updated_at = NOW()
-             WHERE id = $1 AND in_flight_delivery_id = $2 AND status = 'firing'",
-        )
-        .bind(&message_id)
-        .bind(&delivery_id)
-        .bind(fire_scheduled_at)
-        .execute(&mut *tx)
-        .await?;
-        recovered = recovered.saturating_add(parent_updated.rows_affected());
-    }
-    tx.commit().await?;
-    Ok(recovered)
 }

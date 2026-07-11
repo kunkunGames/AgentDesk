@@ -255,13 +255,13 @@
 | `GET` | `/api/routines/{id}/runs` | `routines::list_routine_runs` | `src/server/routes/routines/handlers.rs:116` | `src/server/routes/domains/ops.rs:245` |
 | `POST` | `/api/routines/{id}/session/kill` | `routines::kill_routine_session` | `src/server/routes/routines/handlers.rs:424` | `src/server/routes/domains/ops.rs:254` |
 | `POST` | `/api/routines/{id}/session/reset` | `routines::reset_routine_session` | `src/server/routes/routines/handlers.rs:417` | `src/server/routes/domains/ops.rs:250` |
-| `GET` | `/api/scheduled-messages` | `scheduled_messages::list_scheduled_messages` | `src/server/routes/scheduled_messages.rs:321` | `src/server/routes/domains/ops.rs:258` |
+| `GET` | `/api/scheduled-messages` | `scheduled_messages::list_scheduled_messages` | `src/server/routes/scheduled_messages.rs:349` | `src/server/routes/domains/ops.rs:258` |
 | `POST` | `/api/scheduled-messages` | `scheduled_messages::create_scheduled_message` | `src/server/routes/scheduled_messages.rs:87` | `src/server/routes/domains/ops.rs:258` |
-| `DELETE` | `/api/scheduled-messages/{id}` | `scheduled_messages::cancel_scheduled_message` | `src/server/routes/scheduled_messages.rs:604` | `src/server/routes/domains/ops.rs:263` |
-| `GET` | `/api/scheduled-messages/{id}` | `scheduled_messages::get_scheduled_message` | `src/server/routes/scheduled_messages.rs:368` | `src/server/routes/domains/ops.rs:263` |
-| `PATCH` | `/api/scheduled-messages/{id}` | `scheduled_messages::patch_scheduled_message` | `src/server/routes/scheduled_messages.rs:410` | `src/server/routes/domains/ops.rs:263` |
-| `GET` | `/api/scheduled-messages/{id}/deliveries` | `scheduled_messages::list_scheduled_message_deliveries` | `src/server/routes/scheduled_messages.rs:732` | `src/server/routes/domains/ops.rs:273` |
-| `POST` | `/api/scheduled-messages/{id}/trigger-now` | `scheduled_messages::trigger_scheduled_message_now` | `src/server/routes/scheduled_messages.rs:645` | `src/server/routes/domains/ops.rs:269` |
+| `DELETE` | `/api/scheduled-messages/{id}` | `scheduled_messages::cancel_scheduled_message` | `src/server/routes/scheduled_messages.rs:632` | `src/server/routes/domains/ops.rs:263` |
+| `GET` | `/api/scheduled-messages/{id}` | `scheduled_messages::get_scheduled_message` | `src/server/routes/scheduled_messages.rs:396` | `src/server/routes/domains/ops.rs:263` |
+| `PATCH` | `/api/scheduled-messages/{id}` | `scheduled_messages::patch_scheduled_message` | `src/server/routes/scheduled_messages.rs:438` | `src/server/routes/domains/ops.rs:263` |
+| `GET` | `/api/scheduled-messages/{id}/deliveries` | `scheduled_messages::list_scheduled_message_deliveries` | `src/server/routes/scheduled_messages.rs:758` | `src/server/routes/domains/ops.rs:273` |
+| `POST` | `/api/scheduled-messages/{id}/trigger-now` | `scheduled_messages::trigger_scheduled_message_now` | `src/server/routes/scheduled_messages.rs:673` | `src/server/routes/domains/ops.rs:269` |
 | `GET` | `/api/session-termination-events` | `termination_events::list_termination_events` | `src/server/routes/termination_events.rs:23` | `src/server/routes/domains/ops.rs:213` |
 | `GET` | `/api/sessions` | `agents_crud::list_sessions` | `src/server/routes/agents_crud.rs:1831` | `src/server/routes/domains/agents.rs:51` |
 | `GET` | `/api/sessions/{id}/tmux-output` | `dispatched_sessions::tmux_output` | `src/server/routes/dispatched_sessions.rs:93` | `src/server/routes/domains/ops.rs:209` |
@@ -299,4 +299,4 @@
 | `GET` | `/api/v1/tokens` | `tokens` | `src/server/routes/v1.rs:202` | `src/server/routes/v1.rs:119` |
 | `GET` | `/api/voice/config` | `voice_config::get_voice_config` | `src/server/routes/voice_config.rs:109` | `src/server/routes/domains/admin.rs:68` |
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:117` | `src/server/routes/domains/admin.rs:68` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:460` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:461` |

@@ -344,6 +344,78 @@ async fn postgres_scheduled_message_missing_runtime_does_not_consume_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_push_raw_enqueue_error_rearms_instead_of_losing_fallback() {
+    let (pg_db, pool) = create_test_pool().await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-fallback-retry-agent", "push_raw").await;
+    let fire = claim_one(&pool, "fallback-attempt-0").await;
+
+    // Force only the outbox handoff to fail while leaving the scheduled-message
+    // transaction available to record a retryable interruption.
+    sqlx::query(
+        "ALTER TABLE message_outbox
+         ADD CONSTRAINT reject_scheduled_message_source_for_test
+         CHECK (source <> 'scheduled_message')",
+    )
+    .execute(&pool)
+    .await
+    .expect("install fallback enqueue failure constraint");
+
+    let delivery = RunningAgentDelivery {
+        delivery_id: fire.delivery_id.clone(),
+        scheduled_message_id: message.id.clone(),
+        claim_token: fire.claim_token.clone(),
+        fire_scheduled_at: fire.fire_scheduled_at,
+        turn_id: Some("terminal-agent-turn".to_string()),
+        started_at: Utc::now(),
+        retry_count: fire.retry_count,
+        content: message.content.clone(),
+        target_channel_id: message.target_channel_id.clone(),
+        bot: message.bot.clone(),
+        agent_id: message.agent_id.clone(),
+        on_agent_failure: message.on_agent_failure.clone(),
+        schedule: message.schedule.clone(),
+        timezone: message.timezone.clone(),
+        scheduled_at: message.scheduled_at,
+        expires_at: message.expires_at,
+    };
+    apply_agent_failure(&pool, &delivery, "agent turn returned NO_REPLY").await;
+
+    let parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read fallback-retry parent")
+        .expect("fallback-retry parent exists");
+    assert_eq!(parent.status, db::STATUS_SCHEDULED);
+    assert_eq!(parent.scheduled_at, fire.fire_scheduled_at);
+    assert!(
+        parent
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("push_raw fallback enqueue failed"))
+    );
+    let deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+        .await
+        .expect("list fallback-retry deliveries");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, db::DELIVERY_INTERRUPTED);
+    assert_eq!(deliveries[0].fallback_outbox_id, None);
+
+    sqlx::query(
+        "ALTER TABLE message_outbox
+         DROP CONSTRAINT reject_scheduled_message_source_for_test",
+    )
+    .execute(&pool)
+    .await
+    .expect("remove fallback enqueue failure constraint");
+    let retry = claim_one(&pool, "fallback-attempt-1").await;
+    assert_eq!(retry.delivery_id, fire.delivery_id);
+    assert_eq!(retry.retry_count, 1);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_scheduled_message_cancel_before_push_handoff_enqueues_nothing() {
     let (pg_db, pool) = create_test_pool().await;
     let message = insert_due_push_message(&pool).await;

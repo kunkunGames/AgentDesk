@@ -279,6 +279,8 @@ async fn validate_targeting(
             "agentId is required for agent delivery",
         ));
     };
+    validate_explicit_agent_target(target_channel_id)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
     let bindings = crate::db::agents::load_agent_channel_bindings_pg(pool, agent_id)
         .await
         .map_err(|error| {
@@ -298,6 +300,32 @@ async fn validate_targeting(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' has no primary Discord channel"),
         ));
+    }
+    Ok(())
+}
+
+fn validate_explicit_agent_target(target_channel_id: Option<&str>) -> Result<(), String> {
+    validate_explicit_agent_target_with(
+        target_channel_id,
+        crate::services::dispatches::outbox_route::resolve_channel_alias_pub,
+    )
+}
+
+fn validate_explicit_agent_target_with(
+    target_channel_id: Option<&str>,
+    resolve_alias: impl FnOnce(&str) -> Option<u64>,
+) -> Result<(), String> {
+    let Some(target_channel_id) = target_channel_id else {
+        return Ok(());
+    };
+    if resolve_alias(target_channel_id)
+        .or_else(|| target_channel_id.parse::<u64>().ok())
+        .is_none()
+    {
+        return Err(
+            "targetChannelId must be a configured channel alias or numeric Discord channel ID"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -652,12 +680,10 @@ pub async fn trigger_scheduled_message_now(
     };
     if state.health_registry.is_none() {
         match db::get_scheduled_message_pg(pool, &id).await {
-            Ok(Some(row))
-                if row.status == db::STATUS_SCHEDULED && row.delivery_kind == db::KIND_AGENT =>
-            {
+            Ok(Some(row)) if row.status == db::STATUS_SCHEDULED => {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Discord runtime is unavailable for agent delivery",
+                    "Discord runtime is unavailable for scheduled delivery",
                 );
             }
             Ok(_) => {}
@@ -830,5 +856,33 @@ mod tests {
         let normalized =
             normalize_effective_scheduled_at(stale, Some("@every 10m"), "UTC", now).unwrap();
         assert!(normalized > now);
+    }
+
+    #[test]
+    fn explicit_agent_target_accepts_numeric_discord_channel_id() {
+        assert!(validate_explicit_agent_target_with(Some("1492021444308238487"), |_| None).is_ok());
+    }
+
+    #[test]
+    fn explicit_agent_target_accepts_configured_alias() {
+        assert!(
+            validate_explicit_agent_target_with(Some("web-dev-orders"), |alias| {
+                (alias == "web-dev-orders").then_some(1492021444308238487)
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_agent_target_rejects_unknown_non_numeric_value() {
+        assert_eq!(
+            validate_explicit_agent_target_with(Some("missing-channel"), |_| None).unwrap_err(),
+            "targetChannelId must be a configured channel alias or numeric Discord channel ID"
+        );
+    }
+
+    #[test]
+    fn omitted_agent_target_keeps_primary_channel_fallback() {
+        assert!(validate_explicit_agent_target_with(None, |_| None).is_ok());
     }
 }

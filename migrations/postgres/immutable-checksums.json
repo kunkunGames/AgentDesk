@@ -430,6 +430,11 @@
       "path": "migrations/postgres/0083_scheduled_message_notify_default.sql",
       "sha256": "5e49faf014ac91328d721bb18b35b5b99cf8eba93dfca15f2d41509a2331afc2",
       "version": 83
+    },
+    {
+      "path": "migrations/postgres/0084_scheduled_message_delivery_handoff_state.sql",
+      "sha256": "c59b872bf505633e35e61b704993fbb989690797a98823132bdbfe71c1e31255",
+      "version": 84
     }
   ],
   "version": 1
