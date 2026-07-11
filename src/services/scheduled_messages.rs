@@ -124,18 +124,10 @@ pub async fn fire_claimed(
 ) {
     let message = &fire.message;
 
-    if fire.retry_count > MAX_FIRE_RETRIES {
-        let error = format!("fire retry budget exhausted after {MAX_FIRE_RETRIES} re-arms");
-        if message.delivery_kind == db::KIND_AGENT && message.on_agent_failure == "push_raw" {
-            finish_exhausted_agent_with_raw_fallback(pool, &fire, &error).await;
-        } else {
-            finish_terminal_failure(pool, &fire, &error).await;
-        }
-        return;
-    }
-
     // Compare against the claim time, not the fire slot: a worker that wakes
-    // up late must not deliver a message whose expiry has already passed.
+    // up late must not deliver a message whose expiry has already passed. This
+    // check intentionally precedes retry exhaustion: `push_raw` is still a
+    // delivery and must never bypass the definition's expiry boundary.
     if let Some(expires_at) = message.expires_at {
         if expires_at <= now {
             if let Err(error) =
@@ -145,6 +137,16 @@ pub async fn fire_claimed(
             }
             return;
         }
+    }
+
+    if fire.retry_count > MAX_FIRE_RETRIES {
+        let error = format!("fire retry budget exhausted after {MAX_FIRE_RETRIES} re-arms");
+        if message.delivery_kind == db::KIND_AGENT && message.on_agent_failure == "push_raw" {
+            finish_exhausted_agent_with_raw_fallback(pool, &fire, &error).await;
+        } else {
+            finish_terminal_failure(pool, &fire, &error).await;
+        }
+        return;
     }
 
     match message.delivery_kind.as_str() {

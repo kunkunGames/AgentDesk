@@ -35,3 +35,40 @@ async fn postgres_scheduled_message_explicit_target_still_requires_agent_primary
     pool.close().await;
     pg_db.drop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_rejects_invalid_agent_primary_channel() {
+    let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
+        "agentdesk_smsg_invalid_primary",
+        "scheduled message invalid agent primary channel validation",
+    )
+    .await;
+    let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id)
+         VALUES ('scheduled-agent-invalid-primary', 'Scheduled Agent Invalid Primary',
+                 'not-a-known-channel-alias')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed agent with an invalid primary channel");
+
+    let (status, Json(body)) = validate_targeting(
+        &pool,
+        db::KIND_AGENT,
+        None,
+        Some("scheduled-agent-invalid-primary"),
+    )
+    .await
+    .expect_err("an invalid owner channel must fail before fire time");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.get("error").and_then(JsonValue::as_str),
+        Some("agent 'scheduled-agent-invalid-primary' has an invalid primary Discord channel")
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}

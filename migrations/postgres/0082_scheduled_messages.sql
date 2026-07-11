@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS scheduled_message_deliveries (
     scheduled_message_id TEXT NOT NULL REFERENCES scheduled_messages(id),
     -- The fire slot this delivery serves; dedupe axis for at-most-once firing.
     fire_scheduled_at    TIMESTAMPTZ NOT NULL,
+    -- Recurrence anchor to restore after a trigger-now slot retries. For a
+    -- regular fire this equals fire_scheduled_at; for a manual fire it keeps
+    -- the definition's original future slot.
+    resume_scheduled_at  TIMESTAMPTZ NOT NULL,
     delivery_kind        TEXT NOT NULL,
     -- 'running' | 'sent' | 'failed' | 'interrupted'
     status               TEXT NOT NULL DEFAULT 'running',

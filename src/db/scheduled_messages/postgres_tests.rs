@@ -306,3 +306,181 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     pool.close().await;
     pg_db.drop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_poll_rotation",
+        "scheduled message agent poll lease rotation regression",
+    )
+    .await;
+    let agent_id = "scheduled-poll-agent";
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id)
+         VALUES ($1, 'Scheduled Poll Agent', '123456789')",
+    )
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("seed scheduled-message poll agent");
+
+    for label in ["older", "newer"] {
+        insert_scheduled_message_pg(
+            &pool,
+            &NewScheduledMessage {
+                content: format!("scheduled poll {label}"),
+                title: None,
+                target_channel_id: Some("123456789".to_string()),
+                bot: "announce".to_string(),
+                delivery_kind: KIND_AGENT.to_string(),
+                agent_id: Some(agent_id.to_string()),
+                agent_instruction: None,
+                on_agent_failure: "fail".to_string(),
+                scheduled_at: Utc::now() - Duration::seconds(1),
+                schedule: None,
+                timezone: "UTC".to_string(),
+                expires_at: None,
+                source: "postgres_test".to_string(),
+                created_by: Some("postgres_test".to_string()),
+                dedupe_key: None,
+            },
+        )
+        .await
+        .expect("insert scheduled-message poll definition");
+    }
+
+    let claims = claim_due_fires_pg(&pool, "poll-worker", 10, 60, Utc::now())
+        .await
+        .expect("claim scheduled-message poll definitions");
+    assert_eq!(claims.len(), 2);
+    for (index, claim) in claims.iter().enumerate() {
+        assert!(
+            mark_delivery_agent_turn_started_pg(
+                &pool,
+                &claim.delivery_id,
+                &claim.claim_token,
+                &format!("poll-turn-{index}"),
+                60,
+            )
+            .await
+            .expect("record scheduled-message poll turn")
+        );
+    }
+
+    sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET lease_expires_at = NOW() + INTERVAL '60 seconds',
+             created_at = CASE WHEN id = $1
+                 THEN NOW() - INTERVAL '2 minutes'
+                 ELSE NOW() - INTERVAL '1 minute'
+             END
+         WHERE id = $1 OR id = $2",
+    )
+    .bind(&claims[0].delivery_id)
+    .bind(&claims[1].delivery_id)
+    .execute(&pool)
+    .await
+    .expect("seed deterministic poll ordering");
+
+    let first = list_running_agent_deliveries_pg(&pool, 600, 1)
+        .await
+        .expect("poll first running agent delivery");
+    let second = list_running_agent_deliveries_pg(&pool, 600, 1)
+        .await
+        .expect("poll second running agent delivery");
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(
+        first[0].delivery_id, second[0].delivery_id,
+        "renewing one batch must move it behind still-expiring deliveries"
+    );
+    let mut observed = vec![first[0].delivery_id.clone(), second[0].delivery_id.clone()];
+    observed.sort();
+    let mut expected = claims
+        .iter()
+        .map(|claim| claim.delivery_id.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(observed, expected);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_turn_adoption",
+        "scheduled message started turn lease adoption regression",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+    let fire = claim_one(&pool, "turn-owner", 30).await;
+    assert!(
+        mark_delivery_agent_turn_started_pg(
+            &pool,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "durable-turn",
+            -1,
+        )
+        .await
+        .expect("record expired durable turn")
+    );
+
+    assert_eq!(
+        recover_expired_leases_pg(&pool)
+            .await
+            .expect("recover expired pre-turn leases"),
+        0,
+        "a recorded turn must be adopted rather than restarted"
+    );
+    let parent = get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read adopted parent")
+        .expect("adopted parent exists");
+    assert_eq!(parent.status, STATUS_FIRING);
+    assert_eq!(
+        parent.in_flight_delivery_id.as_deref(),
+        Some(fire.delivery_id.as_str())
+    );
+
+    let adopted = list_running_agent_deliveries_pg(&pool, 600, 10)
+        .await
+        .expect("adopt expired durable turn");
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(adopted[0].delivery_id, fire.delivery_id);
+    assert_eq!(adopted[0].claim_token, fire.claim_token);
+    assert_eq!(adopted[0].turn_id.as_deref(), Some("durable-turn"));
+    let renewed_lease: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT lease_expires_at
+         FROM scheduled_message_deliveries
+         WHERE id = $1",
+    )
+    .bind(&fire.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read adopted turn lease");
+    assert!(renewed_lease > Utc::now());
+
+    assert!(
+        finish_delivery_and_finalize_parent_pg(
+            &pool,
+            &fire.delivery_id,
+            &fire.claim_token,
+            DELIVERY_SENT,
+            None,
+            None,
+            None,
+            &message.id,
+            true,
+            STATUS_SENT,
+            None,
+        )
+        .await
+        .expect("finish adopted durable turn")
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}

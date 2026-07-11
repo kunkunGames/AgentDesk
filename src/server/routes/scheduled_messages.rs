@@ -197,10 +197,11 @@ async fn validate_create(
         }
     }
 
-    let target_channel_id = body
-        .target_channel_id
-        .clone()
-        .filter(|value| !value.trim().is_empty());
+    let target_channel_id = normalize_target_channel_id(
+        body.target_channel_id
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+    )?;
     let agent_id = body
         .agent_id
         .clone()
@@ -286,13 +287,46 @@ async fn validate_targeting(
             format!("agent '{agent_id}' not found"),
         ));
     };
-    if bindings.primary_channel().is_none() {
+    let Some(primary_channel) = bindings.primary_channel() else {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' has no primary Discord channel"),
         ));
+    };
+    if resolve_channel_reference(&primary_channel).is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("agent '{agent_id}' has an invalid primary Discord channel"),
+        ));
+    }
+    if bindings.resolved_primary_provider_kind().is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("agent '{agent_id}' has no configured primary provider"),
+        ));
     }
     Ok(())
+}
+
+fn resolve_channel_reference(value: &str) -> Option<u64> {
+    let value = value.trim();
+    crate::services::dispatches::outbox_route::resolve_channel_alias_pub(value)
+        .or_else(|| value.parse::<u64>().ok())
+        .filter(|channel_id| *channel_id > 0)
+}
+
+fn normalize_target_channel_id(value: Option<String>) -> Result<Option<String>, ApiResponse> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    resolve_channel_reference(&value)
+        .map(|channel_id| Some(channel_id.to_string()))
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "targetChannelId must be a positive Discord channel id or known alias",
+            )
+        })
 }
 
 // ── List / Get ──────────────────────────────────────────────────────────────
@@ -484,7 +518,11 @@ async fn build_patch(
         patch.content = Some(content);
     }
     patch.title = patch_string(body, "title").map_err(|e| bad_request(e))?;
-    patch.target_channel_id = patch_string(body, "targetChannelId").map_err(|e| bad_request(e))?;
+    patch.target_channel_id =
+        match patch_string(body, "targetChannelId").map_err(|e| bad_request(e))? {
+            Some(value) => Some(normalize_target_channel_id(value)?),
+            None => None,
+        };
     if let Some(bot) = patch_string(body, "bot").map_err(|e| bad_request(e))? {
         patch.bot = Some(bot.ok_or_else(|| bad_request("bot must not be null".to_string()))?);
     }
@@ -754,4 +792,22 @@ async fn render_deliveries(
             rendered
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_channel_ids_are_normalized_and_invalid_values_rejected() {
+        assert_eq!(
+            normalize_target_channel_id(Some(" 123456789 ".to_string())).unwrap(),
+            Some("123456789".to_string())
+        );
+        assert!(normalize_target_channel_id(Some("0".to_string())).is_err());
+        assert!(
+            normalize_target_channel_id(Some("not-a-known-channel-alias".to_string())).is_err()
+        );
+        assert_eq!(normalize_target_channel_id(None).unwrap(), None);
+    }
 }

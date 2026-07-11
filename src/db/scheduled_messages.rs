@@ -13,6 +13,9 @@ use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
+mod outbox;
+pub use outbox::outbox_statuses_for_deliveries_pg;
+
 #[cfg(test)]
 mod postgres_tests;
 
@@ -419,29 +422,6 @@ pub async fn list_deliveries_pg(
     builder.build_query_as().fetch_all(pool).await
 }
 
-/// Final delivery state of the outbox rows a delivery handed off to, keyed by
-/// outbox row id. Used to lazily enrich the deliveries API response.
-pub async fn outbox_statuses_for_deliveries_pg(
-    pool: &PgPool,
-    outbox_ids: &[i64],
-) -> Result<Vec<(i64, String)>, sqlx::Error> {
-    if outbox_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = sqlx::query("SELECT id, status FROM message_outbox WHERE id = ANY($1)")
-        .bind(outbox_ids)
-        .fetch_all(pool)
-        .await?;
-    rows.into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<i64, _>("id")?,
-                row.try_get::<String, _>("status")?,
-            ))
-        })
-        .collect()
-}
-
 // ── Firing (worker) ─────────────────────────────────────────────────────────
 
 /// Claim up to `batch` due definitions for firing. For each claimed row a
@@ -470,8 +450,16 @@ pub async fn claim_due_fires_pg(
 
     let mut claimed = Vec::with_capacity(due.len());
     for message in due {
-        let Some(fire) =
-            arm_delivery_slot_tx(&mut tx, &message, claim_owner, lease_secs, now).await?
+        let Some(fire) = arm_delivery_slot_tx(
+            &mut tx,
+            &message,
+            message.scheduled_at,
+            message.scheduled_at,
+            claim_owner,
+            lease_secs,
+            now,
+        )
+        .await?
         else {
             continue;
         };
@@ -488,19 +476,20 @@ pub async fn claim_due_fires_pg(
 async fn arm_delivery_slot_tx(
     tx: &mut Transaction<'_, Postgres>,
     message: &ScheduledMessageRow,
+    fire_scheduled_at: DateTime<Utc>,
+    resume_scheduled_at: DateTime<Utc>,
     claim_owner: &str,
     lease_secs: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
     let delivery_id = format!("smdel_{}", Uuid::new_v4());
     let claim_token = format!("smclaim_{}", Uuid::new_v4());
-    let fire_scheduled_at = message.scheduled_at;
     let armed = sqlx::query(
         "INSERT INTO scheduled_message_deliveries
-            (id, scheduled_message_id, fire_scheduled_at, delivery_kind, status,
-             claim_owner, claim_token, lease_expires_at)
-         VALUES ($1, $2, $3, $4, 'running', $5, $6,
-                 $7 + ($8::bigint * INTERVAL '1 second'))
+            (id, scheduled_message_id, fire_scheduled_at, resume_scheduled_at,
+             delivery_kind, status, claim_owner, claim_token, lease_expires_at)
+         VALUES ($1, $2, $3, $4, $5, 'running', $6, $7,
+                 $8 + ($9::bigint * INTERVAL '1 second'))
          ON CONFLICT (scheduled_message_id, fire_scheduled_at) DO UPDATE
             SET status = 'running',
                 claim_owner = EXCLUDED.claim_owner,
@@ -516,11 +505,12 @@ async fn arm_delivery_slot_tx(
                 finished_at = NULL,
                 updated_at = NOW()
           WHERE scheduled_message_deliveries.status = 'interrupted'
-         RETURNING id, retry_count, claim_token",
+         RETURNING id, retry_count, claim_token, resume_scheduled_at",
     )
     .bind(&delivery_id)
     .bind(&message.id)
     .bind(fire_scheduled_at)
+    .bind(resume_scheduled_at)
     .bind(&message.delivery_kind)
     .bind(claim_owner)
     .bind(&claim_token)
@@ -560,6 +550,7 @@ async fn arm_delivery_slot_tx(
     let armed_id: String = armed.try_get("id")?;
     let retry_count: i32 = armed.try_get("retry_count")?;
     let claim_token: String = armed.try_get("claim_token")?;
+    let resume_scheduled_at: DateTime<Utc> = armed.try_get("resume_scheduled_at")?;
     sqlx::query(
         "UPDATE scheduled_messages
          SET status = 'firing', in_flight_delivery_id = $2, updated_at = NOW()
@@ -570,8 +561,10 @@ async fn arm_delivery_slot_tx(
     .execute(&mut **tx)
     .await?;
 
+    let mut claimed_message = message.clone();
+    claimed_message.scheduled_at = resume_scheduled_at;
     Ok(Some(ClaimedFire {
-        message: message.clone(),
+        message: claimed_message,
         delivery_id: armed_id,
         claim_token,
         fire_scheduled_at,
@@ -596,21 +589,26 @@ pub async fn trigger_now_pg(
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(mut message) = message else {
+    let Some(message) = message else {
         return Ok(None);
     };
     // Manual fires get their own slot at NOW() so the original scheduled_at
     // slot stays free for the regular due scan (relevant for recurring rows).
+    // The original slot is persisted separately as the recurrence anchor so
+    // transient retries cannot shift the definition's cadence.
     let original_scheduled_at = message.scheduled_at;
     let now = Utc::now();
-    message.scheduled_at = now;
-    let mut claimed = arm_delivery_slot_tx(&mut tx, &message, claim_owner, lease_secs, now).await?;
+    let claimed = arm_delivery_slot_tx(
+        &mut tx,
+        &message,
+        now,
+        original_scheduled_at,
+        claim_owner,
+        lease_secs,
+        now,
+    )
+    .await?;
     tx.commit().await?;
-    if let Some(claimed) = claimed.as_mut() {
-        // Keep the definition's own slot visible to the fire executor so a
-        // recurring row resumes at its original time instead of skipping ahead.
-        claimed.message.scheduled_at = original_scheduled_at;
-    }
     Ok(claimed)
 }
 
@@ -919,7 +917,7 @@ pub async fn list_running_agent_deliveries_pg(
              SELECT id FROM scheduled_message_deliveries
              WHERE status = 'running' AND delivery_kind = 'agent'
                AND turn_id IS NOT NULL
-             ORDER BY created_at
+             ORDER BY lease_expires_at, created_at, id
              LIMIT $2
              FOR UPDATE SKIP LOCKED)
            AND m.id = d.scheduled_message_id
@@ -935,9 +933,11 @@ pub async fn list_running_agent_deliveries_pg(
     .await
 }
 
-/// Boot/lease recovery: expired running deliveries become `interrupted` and
-/// their parents return to `scheduled` so the due scan can re-arm the slot
-/// (bounded by the retry cap enforced at claim time).
+/// Boot/lease recovery: expired pre-turn deliveries become `interrupted` and
+/// their parents return to `scheduled` so the due scan can re-arm the slot.
+/// Once a turn id is recorded, the durable turn is adopted by the regular
+/// poller instead of restarted; claim fencing cannot prevent an old turn from
+/// relaying a user-visible duplicate after a replacement turn starts.
 pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
@@ -948,6 +948,7 @@ pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error
          JOIN scheduled_message_deliveries d ON d.id = m.in_flight_delivery_id
          WHERE m.status = 'firing'
            AND d.status = 'running'
+           AND d.turn_id IS NULL
            AND d.lease_expires_at IS NOT NULL
            AND d.lease_expires_at < NOW()
          ORDER BY d.lease_expires_at, m.id

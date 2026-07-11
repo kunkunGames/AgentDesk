@@ -2,15 +2,14 @@ use super::*;
 use chrono::Duration;
 use sqlx::Row;
 
-async fn create_test_pool() -> (
+async fn create_test_pool(
+    prefix: &str,
+    label: &str,
+) -> (
     crate::dispatch::test_support::DispatchPostgresTestDb,
     PgPool,
 ) {
-    let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
-        "agentdesk_smsg_retry_exhaustion",
-        "scheduled message retry exhaustion regression",
-    )
-    .await;
+    let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(prefix, label).await;
     let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
     (pg_db, pool)
 }
@@ -90,7 +89,11 @@ async fn claim_after_exhausting_rearms(pool: &PgPool) -> ClaimedFire {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_definitions() {
-    let (pg_db, pool) = create_test_pool().await;
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_retry_exhaustion",
+        "scheduled message retry exhaustion regression",
+    )
+    .await;
 
     let failed_message =
         insert_recurring_agent_message(&pool, "scheduled-retry-fail-agent", "fail").await;
@@ -190,6 +193,127 @@ async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_defi
             .is_empty(),
         "recurring definitions must not advance to another slot after retry exhaustion"
     );
+
+    let expired_message =
+        insert_recurring_agent_message(&pool, "scheduled-retry-expired-agent", "push_raw").await;
+    let expires_at = Utc::now() + Duration::minutes(5);
+    sqlx::query("UPDATE scheduled_messages SET expires_at = $2 WHERE id = $1")
+        .bind(&expired_message.id)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .expect("set scheduled-message expiry");
+    let expired_fire = claim_after_exhausting_rearms(&pool).await;
+    let outbox_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox")
+        .fetch_one(&pool)
+        .await
+        .expect("count outbox rows before expired fire");
+    fire_claimed(
+        &pool,
+        None,
+        expired_fire.clone(),
+        expires_at + Duration::seconds(1),
+    )
+    .await;
+
+    let expired_parent = db::get_scheduled_message_pg(&pool, &expired_message.id)
+        .await
+        .expect("read expired parent")
+        .expect("expired parent exists");
+    assert_eq!(expired_parent.status, db::STATUS_EXPIRED);
+    assert_eq!(expired_parent.fire_count, 0);
+    assert_eq!(expired_parent.last_fired_at, None);
+    assert_eq!(expired_parent.in_flight_delivery_id, None);
+    let expired_deliveries = db::list_deliveries_pg(&pool, &expired_message.id, 10, None)
+        .await
+        .expect("list expired deliveries");
+    assert_eq!(expired_deliveries.len(), 1);
+    assert_eq!(expired_deliveries[0].status, db::DELIVERY_INTERRUPTED);
+    assert_eq!(expired_deliveries[0].fallback_outbox_id, None);
+    let outbox_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox")
+        .fetch_one(&pool)
+        .await
+        .expect("count outbox rows after expired fire");
+    assert_eq!(
+        outbox_count_after, outbox_count_before,
+        "an expired push_raw definition must not enqueue a fallback"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_trigger_retry",
+        "scheduled message trigger-now retry anchor regression",
+    )
+    .await;
+    let original_scheduled_at = Utc::now() + Duration::hours(2);
+    let message = db::insert_scheduled_message_pg(
+        &pool,
+        &db::NewScheduledMessage {
+            content: "trigger-now cadence payload".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "announce".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: original_scheduled_at,
+            schedule: Some("@every 1h".to_string()),
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("insert trigger-now recurring definition");
+
+    let manual = db::trigger_now_pg(&pool, &message.id, "manual-worker", LEASE_SECS)
+        .await
+        .expect("trigger recurring definition")
+        .expect("scheduled definition should trigger");
+    assert_eq!(manual.message.scheduled_at, original_scheduled_at);
+    assert!(manual.fire_scheduled_at < original_scheduled_at);
+    assert!(
+        db::interrupt_delivery_and_rewind_pg(
+            &pool,
+            &manual.delivery_id,
+            &manual.claim_token,
+            &message.id,
+            manual.fire_scheduled_at,
+            "retry manual fire",
+        )
+        .await
+        .expect("interrupt manual fire")
+    );
+
+    let mut retries = db::claim_due_fires_pg(&pool, "retry-worker", 10, LEASE_SECS, Utc::now())
+        .await
+        .expect("reclaim manual fire");
+    assert_eq!(retries.len(), 1);
+    let retry = retries.pop().expect("manual retry exists");
+    assert_eq!(retry.delivery_id, manual.delivery_id);
+    assert_eq!(retry.fire_scheduled_at, manual.fire_scheduled_at);
+    assert_eq!(
+        retry.message.scheduled_at, original_scheduled_at,
+        "a manual retry must retain the definition's regular cadence anchor"
+    );
+
+    fire_claimed(&pool, None, retry, Utc::now()).await;
+    let resumed = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read resumed recurring definition")
+        .expect("resumed recurring definition exists");
+    assert_eq!(resumed.status, db::STATUS_SCHEDULED);
+    assert_eq!(resumed.scheduled_at, original_scheduled_at);
+    assert_eq!(resumed.fire_count, 1);
+    assert_eq!(resumed.in_flight_delivery_id, None);
 
     pool.close().await;
     pg_db.drop().await;
