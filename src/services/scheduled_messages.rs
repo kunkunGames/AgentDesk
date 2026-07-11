@@ -991,7 +991,23 @@ mod postgres_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
     use chrono::TimeZone;
+
+    fn transcript_event(
+        kind: SessionTranscriptEventKind,
+        content: &str,
+        is_error: bool,
+    ) -> SessionTranscriptEvent {
+        SessionTranscriptEvent {
+            kind,
+            tool_name: None,
+            summary: None,
+            content: content.to_string(),
+            status: is_error.then(|| "error".to_string()),
+            is_error,
+        }
+    }
 
     fn message_with(
         schedule: Option<&str>,
@@ -1076,12 +1092,128 @@ mod tests {
     fn no_reply_transcripts_are_terminal_failures() {
         for message in ["NO_REPLY", " no_reply ", "No_RePlY\n"] {
             assert_eq!(
-                transcript_delivery_evidence(message),
+                transcript_delivery_evidence(message, &[]),
                 TurnEvidence::TerminalFailure("agent turn returned NO_REPLY".to_string())
             );
         }
         assert_eq!(
-            transcript_delivery_evidence("예약 내용을 전달했습니다."),
+            transcript_delivery_evidence("예약 내용을 전달했습니다.", &[]),
+            TurnEvidence::Delivered
+        );
+    }
+
+    #[test]
+    fn terminal_error_event_rejects_usage_limit_transcript() {
+        let message = "Error: You've hit your usage limit. Try again later.";
+        let events = [transcript_event(
+            SessionTranscriptEventKind::Error,
+            "You've hit your usage limit. Try again later.",
+            true,
+        )];
+
+        assert_eq!(
+            transcript_delivery_evidence(message, &events),
+            TurnEvidence::TerminalFailure(
+                "agent turn returned terminal provider error transcript".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn strong_untyped_api_error_envelope_is_terminal_failure() {
+        let message = "[API Error: 400 status code (no body)]";
+        let events = [
+            transcript_event(SessionTranscriptEventKind::Assistant, message, false),
+            transcript_event(SessionTranscriptEventKind::Result, message, false),
+        ];
+
+        assert_eq!(
+            transcript_delivery_evidence(message, &events),
+            TurnEvidence::TerminalFailure(
+                "agent turn returned terminal provider error transcript".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn ordinary_error_text_and_recovered_tool_error_are_delivered() {
+        let ordinary = "Error summary: CI failed in lint; the fix is ready.";
+        let assistant_events = [transcript_event(
+            SessionTranscriptEventKind::Assistant,
+            ordinary,
+            false,
+        )];
+        assert_eq!(
+            transcript_delivery_evidence(ordinary, &assistant_events),
+            TurnEvidence::Delivered
+        );
+
+        let recoverable_tool_error = [
+            transcript_event(SessionTranscriptEventKind::ToolUse, "run check", false),
+            transcript_event(
+                SessionTranscriptEventKind::Error,
+                "first attempt failed",
+                true,
+            ),
+            transcript_event(
+                SessionTranscriptEventKind::Assistant,
+                "retry succeeded",
+                false,
+            ),
+            transcript_event(SessionTranscriptEventKind::Result, "delivered", false),
+        ];
+        assert_eq!(
+            transcript_delivery_evidence("Recovered and delivered.", &recoverable_tool_error),
+            TurnEvidence::Delivered
+        );
+        assert_eq!(
+            transcript_delivery_evidence(
+                "Error: Unknown Codex error handling is documented here.",
+                &[]
+            ),
+            TurnEvidence::Delivered
+        );
+    }
+
+    #[test]
+    fn final_non_system_event_ignores_system_tail_and_honors_recovery() {
+        let error = transcript_event(SessionTranscriptEventKind::Error, "provider failed", true);
+        let result = transcript_event(SessionTranscriptEventKind::Result, "recovered", false);
+        let system = transcript_event(
+            SessionTranscriptEventKind::System,
+            "voluntary feedback recorded",
+            false,
+        );
+
+        assert_eq!(
+            transcript_delivery_evidence("provider failed", &[error.clone(), system.clone()]),
+            TurnEvidence::TerminalFailure(
+                "agent turn returned terminal provider error transcript".to_string()
+            )
+        );
+        assert_eq!(
+            transcript_delivery_evidence(
+                "Recovered and delivered.",
+                &[
+                    error.clone(),
+                    transcript_event(
+                        SessionTranscriptEventKind::Assistant,
+                        "recovered without a result event",
+                        false,
+                    )
+                ]
+            ),
+            TurnEvidence::Delivered
+        );
+        assert_eq!(
+            transcript_delivery_evidence(
+                "Recovered and delivered.",
+                &[error, result.clone(), system.clone()]
+            ),
+            TurnEvidence::Delivered
+        );
+        assert_eq!(
+            transcript_delivery_evidence("Delivered.", &[result, system]),
             TurnEvidence::Delivered
         );
     }
