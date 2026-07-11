@@ -433,7 +433,7 @@
     },
     {
       "path": "migrations/postgres/0084_scheduled_message_delivery_handoff_state.sql",
-      "sha256": "c59b872bf505633e35e61b704993fbb989690797a98823132bdbfe71c1e31255",
+      "sha256": "37b08c7ba3a5f0ede52b5d06077255cbc3cba9066c40d2bf8c565034b8026fcc",
       "version": 84
     }
   ],

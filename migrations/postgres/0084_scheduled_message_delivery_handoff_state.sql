@@ -4,4 +4,3 @@
 ALTER TABLE scheduled_message_deliveries
     ADD COLUMN IF NOT EXISTS resume_scheduled_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS turn_started_at TIMESTAMPTZ;
-
