@@ -97,6 +97,8 @@ src/
 │   │   ├── retention.rs
 │   │   ├── storage_stats.rs
 │   │   └── tests.rs
+│   ├── scheduled_messages/
+│   │   └── postgres_tests.rs
 │   ├── agents.rs
 │   ├── automation_candidates.rs
 │   ├── cancel_tombstones.rs
@@ -235,6 +237,8 @@ src/
 │   │   │   ├── handlers.rs
 │   │   │   ├── helpers.rs
 │   │   │   └── responses.rs
+│   │   ├── scheduled_messages/
+│   │   │   └── postgres_tests.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -1027,6 +1031,8 @@ src/
 │   │   ├── runtime_config.rs
 │   │   ├── session_control.rs
 │   │   └── store.rs
+│   ├── scheduled_messages/
+│   │   └── postgres_tests.rs
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
