@@ -351,6 +351,50 @@ test("card attempted after DISPATCH_RETRY_MS → re-dispatched", () => {
 
 // --- MAX_DISPATCH_RETRIES ---
 
+test("card at MAX_DISPATCH_RETRIES limit waits for retry window before stalled", () => {
+  const { tick } = loadRoutine(ROUTINE_PATH);
+  const cardId = "card-max-retries-in-flight";
+  const obs = [makeReadyObs(cardId)];
+  const recentAttempt = new Date(BASE_NOW.getTime() - 60 * 1000).toISOString();
+  const checkpoint = {
+    version: 2,
+    dispatched: {},
+    pending: {
+      [cardId]: {
+        first_attempted_at: recentAttempt,
+        last_attempted_at: recentAttempt,
+        attempt_count: MAX_DISPATCH_RETRIES,
+        iteration: 1,
+      },
+    },
+    stats: { ticks: 0, dispatched: 0, skipped: 0, max_iterations_reached: 0 },
+  };
+
+  const withinWindow = tick({
+    now: BASE_NOW,
+    checkpoint,
+    observations: obs,
+    automationInventory: [],
+  });
+
+  assert.equal(withinWindow.action, "complete");
+  assert.equal(withinWindow.checkpoint.stats.stalled_candidates, 0);
+  assert.equal(withinWindow.checkpoint.pending[cardId].status, undefined);
+  assert.equal(withinWindow.checkpoint.pending[cardId].stalled_at, undefined);
+
+  const afterWindow = new Date(BASE_NOW.getTime() + 30 * 60 * 1000);
+  const stalled = tick({
+    now: afterWindow,
+    checkpoint: withinWindow.checkpoint,
+    observations: obs,
+    automationInventory: [],
+  });
+
+  assert.equal(stalled.checkpoint.stats.stalled_candidates, 1);
+  assert.equal(stalled.checkpoint.pending[cardId].status, "stalled");
+  assert.equal(stalled.checkpoint.pending[cardId].stalled_at, afterWindow.toISOString());
+});
+
 test("card at MAX_DISPATCH_RETRIES limit → stalled once across repeated ticks", () => {
   const { tick } = loadRoutine(ROUTINE_PATH);
   const cardId = "card-max-retries";

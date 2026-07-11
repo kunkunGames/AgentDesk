@@ -249,8 +249,14 @@ agentdesk.routines.register({
         delete cp.pending[cardId];
       }
       const activePending = pending && pendingIteration === iteration ? pending : null;
+      const retryWindowOpen = activePending
+        && isRecent(activePending.last_attempted_at, nowStr, DISPATCH_RETRY_MS);
 
       if (activePending && (activePending.attempt_count || 0) >= MAX_DISPATCH_RETRIES) {
+        if (activePending.status !== "stalled" && retryWindowOpen) {
+          cp.stats.skipped++;
+          continue;
+        }
         if (activePending.status !== "stalled") {
           cp.pending[cardId] = Object.assign({}, activePending, {
             status: "stalled",
@@ -260,7 +266,7 @@ agentdesk.routines.register({
         }
         continue;
       }
-      if (activePending && isRecent(activePending.last_attempted_at, nowStr, DISPATCH_RETRY_MS)) {
+      if (retryWindowOpen) {
         cp.stats.skipped++;
         continue;
       }
