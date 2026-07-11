@@ -21,6 +21,7 @@ mod evidence;
 use evidence::transcript_delivery_evidence;
 use evidence::{
     TurnEvidence, find_turn_delivery_evidence, find_turn_delivery_evidence_on_connection,
+    poll_running_agent_deliveries,
 };
 
 use crate::db::scheduled_messages as db;
@@ -118,17 +119,14 @@ async fn tick_once(
         Err(error) => tracing::warn!("[smsg] due claim failed: {error}"),
     }
 
-    match db::list_running_agent_deliveries_pg(pool, claim_owner, LEASE_SECS, AGENT_POLL_BATCH)
-        .await
+    // A process without Discord runtime also has no message_outbox worker.
+    // Leave durable agent turns untouched for a runtime-capable leader to
+    // adopt; resolving NO_REPLY here could otherwise finalize a reservation
+    // after enqueueing a push_raw fallback that nobody can deliver.
+    if health_registry.is_some()
+        && poll_running_agent_deliveries(pool, claim_owner, LEASE_SECS, AGENT_POLL_BATCH).await
     {
-        Ok(running) => {
-            for delivery in running {
-                if poll_agent_delivery(pool, delivery).await {
-                    did_work = true;
-                }
-            }
-        }
-        Err(error) => tracing::warn!("[smsg] agent delivery poll failed: {error}"),
+        did_work = true;
     }
 
     did_work

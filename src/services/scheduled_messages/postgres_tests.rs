@@ -7,6 +7,18 @@ fn at_postgres_precision(value: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> 
         .expect("PostgreSQL-compatible timestamp should be representable")
 }
 
+#[test]
+fn postgres_precision_normalizes_linux_nanosecond_timestamps() {
+    let linux_clock_value = chrono::DateTime::<Utc>::from_timestamp(1_784_000_000, 248_030_315)
+        .expect("representative Linux nanosecond timestamp");
+    let normalized = at_postgres_precision(linux_clock_value);
+    assert_eq!(normalized.timestamp_subsec_nanos(), 248_030_000);
+    assert_eq!(
+        normalized.timestamp_micros(),
+        linux_clock_value.timestamp_micros()
+    );
+}
+
 async fn create_test_pool(
     prefix: &str,
     label: &str,
@@ -437,7 +449,11 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
     assert_eq!(retries.len(), 1);
     let retry = retries.pop().expect("manual retry exists");
     assert_eq!(retry.delivery_id, manual.delivery_id);
-    assert_eq!(retry.fire_scheduled_at, manual.fire_scheduled_at);
+    assert_eq!(
+        retry.fire_scheduled_at,
+        at_postgres_precision(manual.fire_scheduled_at),
+        "PostgreSQL stores the manual NOW() slot at microsecond precision"
+    );
     assert_eq!(
         retry.message.scheduled_at, original_scheduled_at,
         "a manual retry must retain the definition's regular cadence anchor"
@@ -926,6 +942,90 @@ async fn postgres_definitive_agent_failure_atomically_enqueues_one_fallback() {
         .expect("definitive fallback parent exists");
     assert_eq!(parent.status, db::STATUS_SCHEDULED);
     assert_eq!(parent.fire_count, 1);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_runtime_absence_defers_terminal_agent_fallback_polling() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_runtime_absent_agent_poll",
+        "scheduled agent fallback polling waits for Discord runtime",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-runtime-absent-poll-agent", "push_raw")
+            .await;
+    let fire = claim_one(&pool, "agent-launch-worker").await;
+    let turn_id = "scheduled-runtime-absent-poll-turn";
+    record_confirmed_agent_turn(&pool, &fire, turn_id).await;
+    assert!(
+        db::release_agent_delivery_to_poller_pg(&pool, &fire.delivery_id, &fire.claim_token)
+            .await
+            .expect("release confirmed turn to completion poller")
+    );
+    sqlx::query(
+        "INSERT INTO session_transcripts (turn_id, assistant_message)
+         VALUES ($1, 'NO_REPLY')",
+    )
+    .bind(turn_id)
+    .execute(&pool)
+    .await
+    .expect("seed terminal no-reply evidence");
+
+    assert!(
+        !tick_once(&pool, None, "runtime-absent-poller").await,
+        "a Postgres-only process must not consume terminal agent evidence"
+    );
+    let waiting_parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read runtime-gated parent")
+        .expect("runtime-gated parent exists");
+    assert_eq!(waiting_parent.status, db::STATUS_FIRING);
+    assert_eq!(
+        waiting_parent.in_flight_delivery_id.as_deref(),
+        Some(fire.delivery_id.as_str())
+    );
+    assert_eq!(waiting_parent.fire_count, 0);
+    let waiting_deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+        .await
+        .expect("read runtime-gated delivery");
+    assert_eq!(waiting_deliveries.len(), 1);
+    assert_eq!(waiting_deliveries[0].status, "running");
+    assert_eq!(waiting_deliveries[0].fallback_outbox_id, None);
+    let waiting_outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox WHERE source = $1")
+            .bind(OUTBOX_SOURCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count fallback rows while runtime is absent");
+    assert_eq!(waiting_outbox_count, 0);
+
+    let runtime = HealthRegistry::new();
+    assert!(
+        tick_once(&pool, Some(&runtime), "runtime-restored-poller").await,
+        "a runtime-capable leader should adopt and resolve the durable turn"
+    );
+    let completed_parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read runtime-restored parent")
+        .expect("runtime-restored parent exists");
+    assert_eq!(completed_parent.status, db::STATUS_SCHEDULED);
+    assert_eq!(completed_parent.fire_count, 1);
+    assert_eq!(completed_parent.in_flight_delivery_id, None);
+    let completed_deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+        .await
+        .expect("read runtime-restored delivery");
+    assert_eq!(completed_deliveries[0].status, db::DELIVERY_SENT);
+    assert!(completed_deliveries[0].fallback_outbox_id.is_some());
+    let completed_outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox WHERE source = $1")
+            .bind(OUTBOX_SOURCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count fallback rows after runtime restoration");
+    assert_eq!(completed_outbox_count, 1);
 
     pool.close().await;
     pg_db.drop().await;

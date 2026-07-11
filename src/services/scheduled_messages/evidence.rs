@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 
+use crate::db::scheduled_messages as db;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TurnEvidence {
     Delivered,
@@ -69,4 +71,27 @@ pub(super) async fn find_turn_delivery_evidence_on_connection(
     Ok(terminal.map(|_| {
         TurnEvidence::TerminalFailure("agent turn ended with an empty response".to_string())
     }))
+}
+
+pub(super) async fn poll_running_agent_deliveries(
+    pool: &PgPool,
+    claim_owner: &str,
+    lease_secs: i64,
+    limit: i64,
+) -> bool {
+    match db::list_running_agent_deliveries_pg(pool, claim_owner, lease_secs, limit).await {
+        Ok(running) => {
+            let mut transitioned = false;
+            for delivery in running {
+                if super::poll_agent_delivery(pool, delivery).await {
+                    transitioned = true;
+                }
+            }
+            transitioned
+        }
+        Err(error) => {
+            tracing::warn!("[smsg] agent delivery poll failed: {error}");
+            false
+        }
+    }
 }

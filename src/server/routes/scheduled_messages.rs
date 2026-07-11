@@ -218,6 +218,17 @@ async fn validate_create(
         .agent_id
         .clone()
         .filter(|value| !value.trim().is_empty());
+    let agent_instruction = body
+        .agent_instruction
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+
+    validate_agent_only_fields(
+        &delivery_kind,
+        agent_id.as_deref(),
+        agent_instruction.as_deref(),
+        body.on_agent_failure.is_some(),
+    )?;
 
     validate_targeting(
         pool,
@@ -234,10 +245,7 @@ async fn validate_create(
         bot: scheduled_message_bot_or_default(body.bot.as_deref()),
         delivery_kind,
         agent_id,
-        agent_instruction: body
-            .agent_instruction
-            .clone()
-            .filter(|value| !value.trim().is_empty()),
+        agent_instruction,
         on_agent_failure,
         scheduled_at,
         schedule,
@@ -257,6 +265,36 @@ async fn validate_create(
             .clone()
             .filter(|value| !value.trim().is_empty()),
     })
+}
+
+fn validate_agent_only_fields(
+    delivery_kind: &str,
+    agent_id: Option<&str>,
+    agent_instruction: Option<&str>,
+    on_agent_failure_explicit: bool,
+) -> Result<(), ApiResponse> {
+    if delivery_kind != db::KIND_PUSH {
+        return Ok(());
+    }
+    if agent_id.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "agentId is only valid for agent delivery",
+        ));
+    }
+    if agent_instruction.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "agentInstruction is only valid for agent delivery",
+        ));
+    }
+    if on_agent_failure_explicit {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "onAgentFailure is only valid for agent delivery",
+        ));
+    }
+    Ok(())
 }
 
 async fn validate_targeting(
@@ -597,6 +635,16 @@ async fn build_patch(
         .agent_id
         .clone()
         .unwrap_or_else(|| existing.agent_id.clone());
+    let effective_agent_instruction = patch
+        .agent_instruction
+        .clone()
+        .unwrap_or_else(|| existing.agent_instruction.clone());
+    validate_agent_only_fields(
+        effective_kind,
+        effective_agent.as_deref(),
+        effective_agent_instruction.as_deref(),
+        patch.on_agent_failure.is_some(),
+    )?;
     validate_targeting(
         pool,
         effective_kind,
