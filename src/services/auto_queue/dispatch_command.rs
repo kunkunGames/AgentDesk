@@ -648,7 +648,7 @@ pub(super) fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
 
     let mut planned_entries = Vec::with_capacity(n);
     for (group_num, root) in component_roots.iter().enumerate() {
-        let mut members = std::mem::take(components.get_mut(root).unwrap());
+        let mut members = std::mem::take(components.get_mut(root).unwrap()); // agentdesk-audit: allow-unwrap - root is generated from components keys
         members.sort_by_key(|idx| planning_sort_key(&cards[*idx], *idx));
         let member_set: HashSet<usize> = members.iter().copied().collect();
 
