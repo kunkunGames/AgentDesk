@@ -22,8 +22,7 @@ use crate::services::discord::health::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 use crate::services::message_outbox::{
-    OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
-    enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
+    OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
 };
 
 const CLAIM_BATCH: i64 = 10;
@@ -33,6 +32,7 @@ pub(crate) const LEASE_SECS: i64 = 120;
 /// definition is failed outright (claim-time cap; slot retry_count counts
 /// re-arms of the same fire slot).
 const MAX_FIRE_RETRIES: i32 = 3;
+const FIRE_RETRY_BACKOFF_SECS: [i64; 3] = [60, 300, 900];
 /// Agent turns without terminal evidence after this window fail closed. Raw
 /// fallback is reserved for definitive NO_REPLY/empty-response outcomes so a
 /// late live turn cannot race a second user-visible delivery.
@@ -90,7 +90,16 @@ async fn tick_once(
     }
 
     let now = Utc::now();
-    match db::claim_due_fires_pg(pool, claim_owner, CLAIM_BATCH, LEASE_SECS, now).await {
+    match db::claim_due_fires_pg(
+        pool,
+        claim_owner,
+        health_registry.is_some(),
+        CLAIM_BATCH,
+        LEASE_SECS,
+        now,
+    )
+    .await
+    {
         Ok(claimed) => {
             for fire in claimed {
                 did_work = true;
@@ -180,8 +189,9 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
         message.id,
         fire.fire_scheduled_at.timestamp_micros()
     );
-    match enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+    match commit_push_handoff(
         pool,
+        fire,
         OutboxMessage {
             target: &target,
             content: &message.content,
@@ -190,22 +200,16 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
             reason_code: Some(&reason_code),
             session_key: None,
         },
+        now,
     )
     .await
     {
-        Ok(outbox_id) => {
-            finish_and_finalize(
-                pool,
-                fire,
-                db::DELIVERY_SENT,
-                None,
-                Some(outbox_id),
-                None,
-                true,
-                now,
-            )
-            .await;
-        }
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            id = message.id,
+            delivery_id = fire.delivery_id,
+            "[smsg] push handoff skipped after claim cancellation"
+        ),
         Err(error) => {
             let error = format!("outbox enqueue failed: {error}");
             tracing::warn!(id = message.id, "[smsg] {error}");
@@ -214,8 +218,76 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
     }
 }
 
+async fn commit_push_handoff(
+    pool: &PgPool,
+    fire: &ClaimedFire,
+    message: OutboxMessage<'_>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    if !db::lock_active_delivery_tx(
+        &mut tx,
+        &fire.message.id,
+        &fire.delivery_id,
+        &fire.claim_token,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    let outbox_id =
+        enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(&mut tx, message).await?;
+    let (next, forced_terminal) = compute_resume(
+        fire.message.schedule.as_deref(),
+        &fire.message.timezone,
+        fire.message.scheduled_at,
+        fire.message.expires_at,
+        now,
+    );
+    let terminal_status = forced_terminal.unwrap_or(db::STATUS_SENT);
+    let next = forced_terminal.is_none().then_some(next).flatten();
+    let transitioned = db::finish_locked_delivery_and_finalize_parent_tx(
+        &mut tx,
+        &fire.delivery_id,
+        &fire.claim_token,
+        db::DELIVERY_SENT,
+        None,
+        Some(outbox_id),
+        None,
+        &fire.message.id,
+        true,
+        terminal_status,
+        next,
+    )
+    .await?;
+    if !transitioned {
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fire: &ClaimedFire) {
     let message = &fire.message;
+    let Some(health_registry) = health_registry else {
+        let reason = "discord runtime health registry unavailable";
+        if let Err(error) = db::defer_delivery_without_retry_pg(
+            pool,
+            &fire.delivery_id,
+            &fire.claim_token,
+            &message.id,
+            message.scheduled_at,
+            reason,
+        )
+        .await
+        {
+            tracing::warn!(
+                id = message.id,
+                "[smsg] runtime-unavailable defer failed: {error}"
+            );
+        }
+        return;
+    };
     match start_agent_turn(pool, health_registry, fire).await {
         Ok(_) => {
             // Delivery stays running; poll_agent_delivery owns completion.
@@ -233,15 +305,13 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
 /// channel when no target was pinned).
 async fn start_agent_turn(
     pool: &PgPool,
-    health_registry: Option<&HealthRegistry>,
+    health_registry: &HealthRegistry,
     fire: &ClaimedFire,
 ) -> anyhow::Result<String> {
     use anyhow::anyhow;
 
     let message = &fire.message;
 
-    let registry =
-        health_registry.ok_or_else(|| anyhow!("discord runtime health registry unavailable"))?;
     let agent_id = message
         .agent_id
         .as_deref()
@@ -276,6 +346,7 @@ async fn start_agent_turn(
     let turn_id = reservation.turn_id().to_string();
     let recorded = db::mark_delivery_agent_turn_started_pg(
         pool,
+        &message.id,
         &fire.delivery_id,
         &fire.claim_token,
         &turn_id,
@@ -297,7 +368,7 @@ async fn start_agent_turn(
     }));
 
     let outcome = start_reserved_headless_agent_turn_with_owner_channel(
-        registry,
+        health_registry,
         owner_channel,
         turn_channel,
         provider,
@@ -475,37 +546,6 @@ fn raw_fallback_target(target_channel_id: Option<&str>, agent_id: Option<&str>) 
     }
 }
 
-async fn enqueue_raw_fallback(
-    pool: &PgPool,
-    scheduled_message_id: &str,
-    fire_scheduled_at: DateTime<Utc>,
-    target_channel_id: Option<&str>,
-    agent_id: Option<&str>,
-    content: &str,
-    bot: &str,
-) -> Result<Option<i64>, OutboxEnqueueError> {
-    let Some(target) = raw_fallback_target(target_channel_id, agent_id) else {
-        return Ok(None);
-    };
-    let reason_code = format!(
-        "scheduled_message:v1:{scheduled_message_id}:fallback:{}",
-        fire_scheduled_at.timestamp_micros()
-    );
-    enqueue_outbox_pg_returning_id_with_persistent_dedupe(
-        pool,
-        OutboxMessage {
-            target: &target,
-            content,
-            bot,
-            source: OUTBOX_SOURCE,
-            reason_code: Some(&reason_code),
-            session_key: None,
-        },
-    )
-    .await
-    .map(Some)
-}
-
 async fn enqueue_raw_fallback_on_tx(
     tx: &mut Transaction<'_, Postgres>,
     scheduled_message_id: &str,
@@ -583,6 +623,35 @@ async fn resolve_agent_delivery_inner(
     let evidence =
         find_turn_delivery_evidence_on_connection(&mut tx, turn_id, delivery.started_at).await?;
     let now = Utc::now();
+    let deadline = delivery.started_at + chrono::Duration::seconds(AGENT_COMPLETION_TIMEOUT_SECS);
+    let timed_out = evidence.is_none() && allow_timeout && now >= deadline;
+    let terminal_failure = matches!(&evidence, Some(TurnEvidence::TerminalFailure(_)));
+    if (terminal_failure || timed_out)
+        && delivery
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+    {
+        let error = "definition expired while agent turn awaited terminal evidence";
+        let transitioned = db::finish_locked_delivery_and_finalize_parent_tx(
+            &mut tx,
+            &delivery.delivery_id,
+            &delivery.claim_token,
+            db::DELIVERY_INTERRUPTED,
+            Some(error),
+            None,
+            None,
+            &delivery.scheduled_message_id,
+            false,
+            db::STATUS_EXPIRED,
+            None,
+        )
+        .await?;
+        if !transitioned {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        return Ok(true);
+    }
     let (delivery_status, error, fallback_outbox_id, fired) = match evidence {
         Some(TurnEvidence::Delivered) => (db::DELIVERY_SENT, None, None, true),
         Some(TurnEvidence::TerminalFailure(reason)) => {
@@ -616,9 +685,7 @@ async fn resolve_agent_delivery_inner(
             }
         }
         None => {
-            let deadline =
-                delivery.started_at + chrono::Duration::seconds(AGENT_COMPLETION_TIMEOUT_SECS);
-            if !allow_timeout || now < deadline {
+            if !timed_out {
                 return Ok(false);
             }
             let mut reason = format!(
@@ -669,8 +736,43 @@ async fn resolve_agent_delivery_inner(
 
 async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedFire, reason: &str) {
     let message = &fire.message;
-    match enqueue_raw_fallback(
-        pool,
+    if raw_fallback_target(
+        message.target_channel_id.as_deref(),
+        message.agent_id.as_deref(),
+    )
+    .is_none()
+    {
+        finish_terminal_failure(pool, fire, &format!("{reason}; no fallback target")).await;
+        return;
+    }
+    match commit_exhausted_fallback(pool, fire, reason).await {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(
+            id = message.id,
+            delivery_id = fire.delivery_id,
+            "[smsg] exhausted fallback skipped after claim cancellation"
+        ),
+        Err(error) => {
+            let error = format!("{reason}; push_raw fallback enqueue failed: {error}");
+            finish_terminal_failure(pool, fire, &error).await;
+        }
+    }
+}
+
+async fn commit_exhausted_fallback(
+    pool: &PgPool,
+    fire: &ClaimedFire,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let message = &fire.message;
+    let mut tx = pool.begin().await?;
+    if !db::lock_active_delivery_tx(&mut tx, &message.id, &fire.delivery_id, &fire.claim_token)
+        .await?
+    {
+        return Ok(false);
+    }
+    let Some(fallback_outbox_id) = enqueue_raw_fallback_on_tx(
+        &mut tx,
         &message.id,
         fire.fire_scheduled_at,
         message.target_channel_id.as_deref(),
@@ -678,33 +780,30 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
         &message.content,
         &message.bot,
     )
-    .await
-    {
-        Ok(Some(fallback_outbox_id)) => {
-            let error = format!("{reason}; fell back to raw push");
-            finish_terminal(
-                pool,
-                fire,
-                db::DELIVERY_SENT,
-                Some(&error),
-                None,
-                Some(fallback_outbox_id),
-                true,
-            )
-            .await;
-        }
-        Ok(None) => {
-            finish_terminal_failure(pool, fire, &format!("{reason}; no fallback target")).await;
-        }
-        Err(error) => {
-            finish_terminal_failure(
-                pool,
-                fire,
-                &format!("{reason}; push_raw fallback enqueue failed: {error}"),
-            )
-            .await;
-        }
+    .await?
+    else {
+        return Ok(false);
+    };
+    let error = format!("{reason}; fell back to raw push");
+    let transitioned = db::finish_locked_delivery_and_finalize_parent_tx(
+        &mut tx,
+        &fire.delivery_id,
+        &fire.claim_token,
+        db::DELIVERY_SENT,
+        Some(&error),
+        None,
+        Some(fallback_outbox_id),
+        &message.id,
+        true,
+        db::STATUS_FAILED,
+        None,
+    )
+    .await?;
+    if !transitioned {
+        return Ok(false);
     }
+    tx.commit().await?;
+    Ok(true)
 }
 
 // ── Shared transitions ──────────────────────────────────────────────────────
@@ -796,65 +895,30 @@ fn compute_resume(
     (Some(next), None)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn finish_and_finalize(
-    pool: &PgPool,
-    fire: &ClaimedFire,
-    delivery_status: &str,
-    error: Option<&str>,
-    outbox_id: Option<i64>,
-    fallback_outbox_id: Option<i64>,
-    fired: bool,
-    now: DateTime<Utc>,
-) {
-    let message = &fire.message;
-    let (next, forced_terminal) = compute_resume(
-        message.schedule.as_deref(),
-        &message.timezone,
-        message.scheduled_at,
-        message.expires_at,
-        now,
-    );
-    let terminal_status = forced_terminal.unwrap_or(if delivery_status == db::DELIVERY_SENT {
-        db::STATUS_SENT
-    } else {
-        db::STATUS_FAILED
-    });
-    let next = forced_terminal.is_none().then_some(next).flatten();
-    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
-        pool,
-        &fire.delivery_id,
-        &fire.claim_token,
-        delivery_status,
-        error,
-        outbox_id,
-        fallback_outbox_id,
-        &message.id,
-        fired,
-        terminal_status,
-        next,
-    )
-    .await
-    {
-        tracing::warn!(
-            id = message.id,
-            "[smsg] delivery finalize failed: {db_error}"
-        );
-    }
-}
-
 /// Transient failure: mark the delivery interrupted and rewind the parent to
 /// its fire slot so the due scan re-arms it (bounded by MAX_FIRE_RETRIES).
 async fn interrupt_for_retry(pool: &PgPool, fire: &ClaimedFire, error: &str) {
+    let next_attempt_at = fire_retry_next_at(fire.retry_count, Utc::now());
     interrupt_delivery(
         pool,
         &fire.delivery_id,
         &fire.claim_token,
         &fire.message.id,
         fire.fire_scheduled_at,
+        next_attempt_at,
         error,
     )
     .await;
+}
+
+fn fire_retry_next_at(
+    retry_count_before_increment: i32,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    usize::try_from(retry_count_before_increment)
+        .ok()
+        .and_then(|index| FIRE_RETRY_BACKOFF_SECS.get(index))
+        .map(|delay_secs| now + chrono::Duration::seconds(*delay_secs))
 }
 
 async fn interrupt_delivery(
@@ -863,6 +927,7 @@ async fn interrupt_delivery(
     claim_token: &str,
     message_id: &str,
     fire_scheduled_at: DateTime<Utc>,
+    next_attempt_at: Option<DateTime<Utc>>,
     error: &str,
 ) {
     if let Err(db_error) = db::interrupt_delivery_and_rewind_pg(
@@ -871,6 +936,7 @@ async fn interrupt_delivery(
         claim_token,
         message_id,
         fire_scheduled_at,
+        next_attempt_at,
         error,
     )
     .await
@@ -948,6 +1014,25 @@ mod tests {
             next,
             Some(Utc.with_ymd_and_hms(2026, 7, 8, 0, 30, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn fire_retry_backoff_is_exponential_and_capped() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 7, 0, 0).unwrap();
+        assert_eq!(
+            fire_retry_next_at(0, now),
+            Some(now + chrono::Duration::seconds(60))
+        );
+        assert_eq!(
+            fire_retry_next_at(1, now),
+            Some(now + chrono::Duration::seconds(300))
+        );
+        assert_eq!(
+            fire_retry_next_at(2, now),
+            Some(now + chrono::Duration::seconds(900))
+        );
+        assert_eq!(fire_retry_next_at(3, now), None);
+        assert_eq!(fire_retry_next_at(-1, now), None);
     }
 
     #[test]

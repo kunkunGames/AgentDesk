@@ -53,7 +53,7 @@ async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMess
 }
 
 async fn claim_one(pool: &PgPool, owner: &str, lease_secs: i64) -> ClaimedFire {
-    let mut claims = claim_due_fires_pg(pool, owner, 10, lease_secs, Utc::now())
+    let mut claims = claim_due_fires_pg(pool, owner, true, 10, lease_secs, Utc::now())
         .await
         .expect("claim due scheduled message");
     assert_eq!(claims.len(), 1, "exactly one definition should be due");
@@ -91,6 +91,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
             &first.claim_token,
             &message.id,
             first.fire_scheduled_at,
+            None,
             "retry this slot",
         )
         .await
@@ -156,6 +157,116 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_retry_waits_until_next_attempt_at() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_retry_backoff",
+        "scheduled message retry backoff claim gate",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+    let first = claim_one(&pool, "retry-backoff-worker-a", 30).await;
+    let retry_at = Utc::now() + Duration::minutes(5);
+    assert!(
+        interrupt_delivery_and_rewind_pg(
+            &pool,
+            &first.delivery_id,
+            &first.claim_token,
+            &message.id,
+            first.fire_scheduled_at,
+            Some(retry_at),
+            "mailbox temporarily busy",
+        )
+        .await
+        .expect("schedule delayed retry")
+    );
+
+    let blocked = claim_due_fires_pg(
+        &pool,
+        "retry-backoff-worker-b",
+        true,
+        10,
+        30,
+        retry_at - Duration::seconds(1),
+    )
+    .await
+    .expect("scan before retry deadline");
+    assert!(blocked.is_empty());
+
+    let mut ready = claim_due_fires_pg(
+        &pool,
+        "retry-backoff-worker-c",
+        true,
+        10,
+        30,
+        retry_at + Duration::seconds(1),
+    )
+    .await
+    .expect("scan after retry deadline");
+    assert_eq!(ready.len(), 1);
+    let second = ready.pop().expect("delayed retry should be claimable");
+    assert_eq!(second.delivery_id, first.delivery_id);
+    assert_eq!(second.retry_count, 1);
+    assert_ne!(second.claim_token, first.claim_token);
+    let next_attempt_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT next_attempt_at FROM scheduled_message_deliveries WHERE id = $1",
+    )
+    .bind(&second.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read rearmed retry deadline");
+    assert_eq!(next_attempt_at, None);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_message_backoff_does_not_block_other_due_rows() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_retry_fairness",
+        "scheduled message retry backoff head-of-line regression",
+    )
+    .await;
+    let delayed = insert_due_message(&pool, KIND_AGENT).await;
+    sqlx::query(
+        "UPDATE scheduled_messages SET scheduled_at = NOW() - INTERVAL '2 minutes' WHERE id = $1",
+    )
+    .bind(&delayed.id)
+    .execute(&pool)
+    .await
+    .expect("make delayed definition oldest");
+    let ready_message = insert_due_message(&pool, KIND_PUSH).await;
+    let mut first_claim =
+        claim_due_fires_pg(&pool, "retry-fairness-worker-a", true, 1, 30, Utc::now())
+            .await
+            .expect("claim oldest due definition");
+    let first = first_claim.pop().expect("oldest definition should claim");
+    assert_eq!(first.message.id, delayed.id);
+    assert!(
+        interrupt_delivery_and_rewind_pg(
+            &pool,
+            &first.delivery_id,
+            &first.claim_token,
+            &delayed.id,
+            first.fire_scheduled_at,
+            Some(Utc::now() + Duration::minutes(5)),
+            "delay oldest definition",
+        )
+        .await
+        .expect("back off oldest definition")
+    );
+
+    let claims = claim_due_fires_pg(&pool, "retry-fairness-worker-b", true, 10, 30, Utc::now())
+        .await
+        .expect("claim around backed-off definition");
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].message.id, ready_message.id);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_renews_lease() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_claim_fence",
@@ -171,6 +282,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
             &first.claim_token,
             &message.id,
             first.fire_scheduled_at,
+            None,
             "replace worker-a",
         )
         .await
@@ -181,6 +293,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     assert!(
         !mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &second.delivery_id,
             &first.claim_token,
             "stale-turn",
@@ -213,6 +326,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
             &first.claim_token,
             &message.id,
             second.fire_scheduled_at,
+            None,
             "stale rewind",
         )
         .await
@@ -248,6 +362,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     assert!(
         mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &second.delivery_id,
             &second.claim_token,
             "current-turn",
@@ -349,7 +464,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         .expect("insert scheduled-message poll definition");
     }
 
-    let claims = claim_due_fires_pg(&pool, "poll-worker", 10, 60, Utc::now())
+    let claims = claim_due_fires_pg(&pool, "poll-worker", true, 10, 60, Utc::now())
         .await
         .expect("claim scheduled-message poll definitions");
     assert_eq!(claims.len(), 2);
@@ -357,6 +472,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         assert!(
             mark_delivery_agent_turn_started_pg(
                 &pool,
+                &claim.message.id,
                 &claim.delivery_id,
                 &claim.claim_token,
                 &format!("poll-turn-{index}"),
@@ -427,6 +543,7 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
     assert!(
         mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &fire.delivery_id,
             &fire.claim_token,
             "durable-turn",
@@ -434,6 +551,12 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
         )
         .await
         .expect("record expired durable turn")
+    );
+    assert!(
+        release_agent_delivery_to_poller_pg(&pool, &fire.delivery_id, &fire.claim_token)
+            .await
+            .expect("release durable turn to completion poller"),
+        "a successfully started turn must become immediately adoptable"
     );
 
     assert_eq!(
@@ -508,6 +631,133 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
         .await
         .expect("finish adopted durable turn")
     );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_agent_claim_waits_for_runtime_and_cancel_fences_turn_start() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_runtime_gate",
+        "scheduled message runtime and cancellation gate",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+
+    let without_runtime = claim_due_fires_pg(&pool, "no-runtime", false, 10, 30, Utc::now())
+        .await
+        .expect("scan without Discord runtime");
+    assert!(without_runtime.is_empty());
+    assert_eq!(
+        get_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("read waiting definition")
+            .expect("waiting definition exists")
+            .status,
+        STATUS_SCHEDULED
+    );
+
+    let fire = claim_one(&pool, "runtime-ready", 30).await;
+    assert_eq!(fire.retry_count, 0);
+    assert!(matches!(
+        cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel before agent handoff"),
+        CancelOutcome::Canceled { was_firing: true }
+    ));
+    assert!(
+        !mark_delivery_agent_turn_started_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "must-not-start",
+            600,
+        )
+        .await
+        .expect("canceled claim must fence turn handoff")
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_turn_start_parent_lock",
+        "scheduled message turn start parent lock regression",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+    let fire = claim_one(&pool, "turn-start-lock-worker", 30).await;
+
+    let mut cancel_tx = pool.begin().await.expect("begin cancellation transaction");
+    sqlx::query("SELECT id FROM scheduled_messages WHERE id = $1 FOR UPDATE")
+        .bind(&message.id)
+        .fetch_one(&mut *cancel_tx)
+        .await
+        .expect("lock parent before cancellation");
+
+    let mark_pool = pool.clone();
+    let message_id = message.id.clone();
+    let delivery_id = fire.delivery_id.clone();
+    let claim_token = fire.claim_token.clone();
+    let mut mark_task = tokio::spawn(async move {
+        mark_delivery_agent_turn_started_pg(
+            &mark_pool,
+            &message_id,
+            &delivery_id,
+            &claim_token,
+            "must-not-cross-cancel",
+            600,
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut mark_task)
+            .await
+            .is_err(),
+        "turn start must wait behind the active parent lock"
+    );
+
+    sqlx::query(
+        "UPDATE scheduled_messages
+         SET status = 'canceled', in_flight_delivery_id = NULL, updated_at = NOW()
+         WHERE id = $1 AND status = 'firing' AND in_flight_delivery_id = $2",
+    )
+    .bind(&message.id)
+    .bind(&fire.delivery_id)
+    .execute(&mut *cancel_tx)
+    .await
+    .expect("cancel locked parent");
+    sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET status = 'interrupted', error = 'canceled',
+             finished_at = NOW(), updated_at = NOW()
+         WHERE id = $1 AND status = 'running'",
+    )
+    .bind(&fire.delivery_id)
+    .execute(&mut *cancel_tx)
+    .await
+    .expect("interrupt canceled child");
+    cancel_tx.commit().await.expect("commit cancellation");
+
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(2), mark_task)
+        .await
+        .expect("turn-start waiter should resume after cancel")
+        .expect("turn-start task should join")
+        .expect("turn-start query should succeed");
+    assert!(!recorded, "cancellation must fence the waiting turn start");
+    let (status, turn_id): (String, Option<String>) =
+        sqlx::query_as("SELECT status, turn_id FROM scheduled_message_deliveries WHERE id = $1")
+            .bind(&fire.delivery_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read canceled delivery");
+    assert_eq!(status, DELIVERY_INTERRUPTED);
+    assert_eq!(turn_id, None);
 
     pool.close().await;
     pg_db.drop().await;

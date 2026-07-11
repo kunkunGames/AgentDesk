@@ -53,8 +53,33 @@ async fn insert_recurring_agent_message(
     .expect("insert recurring scheduled message")
 }
 
+async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
+    db::insert_scheduled_message_pg(
+        pool,
+        &db::NewScheduledMessage {
+            content: "guarded push payload".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::minutes(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("insert due push scheduled message")
+}
+
 async fn claim_one(pool: &PgPool, owner: &str) -> ClaimedFire {
-    let mut claimed = db::claim_due_fires_pg(pool, owner, 10, LEASE_SECS, Utc::now())
+    let mut claimed = db::claim_due_fires_pg(pool, owner, true, 10, LEASE_SECS, Utc::now())
         .await
         .expect("claim due scheduled message");
     assert_eq!(claimed.len(), 1, "exactly one definition should be due");
@@ -73,6 +98,7 @@ async fn claim_after_exhausting_rearms(pool: &PgPool) -> ClaimedFire {
                 &fire.claim_token,
                 &fire.message.id,
                 fire.fire_scheduled_at,
+                None,
                 "test retry before exhaustion",
             )
             .await
@@ -109,10 +135,16 @@ async fn postgres_scheduled_message_default_notify_reaches_push_outbox() {
     .expect("insert scheduled message through the database default");
     assert_eq!(stored_bot, "notify");
 
-    let mut claims =
-        db::claim_due_fires_pg(&pool, "notify-default-worker", 1, LEASE_SECS, Utc::now())
-            .await
-            .expect("claim default-notify scheduled push");
+    let mut claims = db::claim_due_fires_pg(
+        &pool,
+        "notify-default-worker",
+        true,
+        1,
+        LEASE_SECS,
+        Utc::now(),
+    )
+    .await
+    .expect("claim default-notify scheduled push");
     assert_eq!(claims.len(), 1);
     fire_claimed(
         &pool,
@@ -241,10 +273,17 @@ async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_defi
     );
 
     assert!(
-        db::claim_due_fires_pg(&pool, "post-terminal-worker", 10, LEASE_SECS, Utc::now())
-            .await
-            .expect("scan after terminal exhaustion")
-            .is_empty(),
+        db::claim_due_fires_pg(
+            &pool,
+            "post-terminal-worker",
+            true,
+            10,
+            LEASE_SECS,
+            Utc::now(),
+        )
+        .await
+        .expect("scan after terminal exhaustion")
+        .is_empty(),
         "recurring definitions must not advance to another slot after retry exhaustion"
     );
 
@@ -341,15 +380,17 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
             &manual.claim_token,
             &message.id,
             manual.fire_scheduled_at,
+            None,
             "retry manual fire",
         )
         .await
         .expect("interrupt manual fire")
     );
 
-    let mut retries = db::claim_due_fires_pg(&pool, "retry-worker", 10, LEASE_SECS, Utc::now())
-        .await
-        .expect("reclaim manual fire");
+    let mut retries =
+        db::claim_due_fires_pg(&pool, "retry-worker", true, 10, LEASE_SECS, Utc::now())
+            .await
+            .expect("reclaim manual fire");
     assert_eq!(retries.len(), 1);
     let retry = retries.pop().expect("manual retry exists");
     assert_eq!(retry.delivery_id, manual.delivery_id);
@@ -417,6 +458,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
         .await
         .expect("trigger recurring agent definition")
         .expect("scheduled agent definition should trigger");
+    let retry_at = Utc::now() + Duration::minutes(5);
     assert!(
         db::interrupt_delivery_and_rewind_pg(
             &pool,
@@ -424,20 +466,39 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
             &manual.claim_token,
             &message.id,
             manual.fire_scheduled_at,
+            Some(retry_at),
             "retry manual agent fire",
         )
         .await
         .expect("interrupt manual agent fire")
     );
-    let mut retries =
-        db::claim_due_fires_pg(&pool, "retry-agent-worker", 10, LEASE_SECS, Utc::now())
-            .await
-            .expect("reclaim manual agent fire");
+    let blocked = db::claim_due_fires_pg(
+        &pool,
+        "early-retry-agent-worker",
+        true,
+        10,
+        LEASE_SECS,
+        retry_at - Duration::seconds(1),
+    )
+    .await
+    .expect("scan before manual retry deadline");
+    assert!(blocked.is_empty());
+    let mut retries = db::claim_due_fires_pg(
+        &pool,
+        "retry-agent-worker",
+        true,
+        10,
+        LEASE_SECS,
+        retry_at + Duration::seconds(1),
+    )
+    .await
+    .expect("reclaim manual agent fire");
     assert_eq!(retries.len(), 1);
     let retry = retries.pop().expect("manual agent retry exists");
     assert!(
         db::mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &retry.delivery_id,
             &retry.claim_token,
             "agent-trigger-retry-turn",
@@ -489,6 +550,7 @@ async fn postgres_agent_timeout_with_push_raw_fails_closed_without_outbox() {
     assert!(
         db::mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &fire.delivery_id,
             &fire.claim_token,
             "scheduled-timeout-turn",
@@ -557,6 +619,7 @@ async fn postgres_definitive_agent_failure_atomically_enqueues_one_fallback() {
     assert!(
         db::mark_delivery_agent_turn_started_pg(
             &pool,
+            &message.id,
             &fire.delivery_id,
             &fire.claim_token,
             turn_id,
@@ -609,6 +672,200 @@ async fn postgres_definitive_agent_failure_atomically_enqueues_one_fallback() {
         .expect("definitive fallback parent exists");
     assert_eq!(parent.status, db::STATUS_SCHEDULED);
     assert_eq!(parent.fire_count, 1);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_missing_runtime_waits_without_consuming_agent_retry() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_runtime_wait",
+        "scheduled message missing runtime retry budget regression",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-runtime-wait-agent", "fail").await;
+
+    let without_runtime =
+        db::claim_due_fires_pg(&pool, "no-runtime", false, 10, LEASE_SECS, Utc::now())
+            .await
+            .expect("scan agent definitions without Discord runtime");
+    assert!(without_runtime.is_empty());
+
+    let first = claim_one(&pool, "runtime-missing-direct-fire").await;
+    fire_claimed(&pool, None, first, Utc::now()).await;
+    let waiting = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read runtime-deferred parent")
+        .expect("runtime-deferred parent exists");
+    assert_eq!(waiting.status, db::STATUS_SCHEDULED);
+    assert_eq!(waiting.in_flight_delivery_id, None);
+    assert!(
+        db::list_deliveries_pg(&pool, &message.id, 10, None)
+            .await
+            .expect("list runtime-deferred deliveries")
+            .is_empty(),
+        "a missing process-wide runtime is not a delivery attempt"
+    );
+    let second = claim_one(&pool, "runtime-restored-worker").await;
+    assert_eq!(second.retry_count, 0);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_cancel_before_push_handoff_enqueues_nothing() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_cancel_push_handoff",
+        "scheduled message canceled push handoff regression",
+    )
+    .await;
+    let message = insert_due_push_message(&pool).await;
+    let fire = claim_one(&pool, "cancel-before-push-handoff").await;
+    assert!(matches!(
+        db::cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel claimed push"),
+        db::CancelOutcome::Canceled { was_firing: true }
+    ));
+
+    fire_claimed(&pool, None, fire, Utc::now()).await;
+
+    let canceled = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read canceled push parent")
+        .expect("canceled push parent exists");
+    assert_eq!(canceled.status, "canceled");
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox WHERE source = $1")
+            .bind(OUTBOX_SOURCE)
+            .fetch_one(&pool)
+            .await
+            .expect("count scheduled push outbox rows");
+    assert_eq!(outbox_count, 0);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_expired_running_agent_never_enqueues_raw_fallback() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_expired_agent_fallback",
+        "scheduled message expired running-agent fallback regression",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-expired-live-agent", "push_raw").await;
+    let fire = claim_one(&pool, "expired-agent-worker").await;
+    let turn_id = "scheduled-expired-agent-turn";
+    assert!(
+        db::mark_delivery_agent_turn_started_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            turn_id,
+            LEASE_SECS,
+        )
+        .await
+        .expect("record expiring agent turn")
+    );
+    sqlx::query(
+        "UPDATE scheduled_messages SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(&message.id)
+    .execute(&pool)
+    .await
+    .expect("expire running agent definition");
+    let mut running =
+        db::list_running_agent_deliveries_pg(&pool, "expired-agent-worker", LEASE_SECS, 10)
+            .await
+            .expect("poll expired running agent");
+    let delivery = running
+        .pop()
+        .expect("expired running agent should be polled");
+    sqlx::query(
+        "INSERT INTO session_transcripts (turn_id, assistant_message)
+         VALUES ($1, 'NO_REPLY')",
+    )
+    .bind(turn_id)
+    .execute(&pool)
+    .await
+    .expect("seed expired no-reply evidence");
+
+    assert!(resolve_agent_delivery(&pool, &delivery, false).await);
+    let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_outbox")
+        .fetch_one(&pool)
+        .await
+        .expect("count expired agent fallback rows");
+    assert_eq!(outbox_count, 0);
+    let parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read expired agent parent")
+        .expect("expired agent parent exists");
+    assert_eq!(parent.status, db::STATUS_EXPIRED);
+    let deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+        .await
+        .expect("read expired agent delivery");
+    assert_eq!(deliveries[0].status, db::DELIVERY_INTERRUPTED);
+    assert_eq!(deliveries[0].fallback_outbox_id, None);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_expiry_does_not_terminalize_a_still_live_agent_turn() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_expired_live_turn",
+        "scheduled message live turn expiry fence regression",
+    )
+    .await;
+    let message =
+        insert_recurring_agent_message(&pool, "scheduled-expired-running-agent", "push_raw").await;
+    let fire = claim_one(&pool, "expired-live-agent-worker").await;
+    assert!(
+        db::mark_delivery_agent_turn_started_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "scheduled-expired-live-turn",
+            LEASE_SECS,
+        )
+        .await
+        .expect("record live agent turn")
+    );
+    sqlx::query(
+        "UPDATE scheduled_messages SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(&message.id)
+    .execute(&pool)
+    .await
+    .expect("expire definition while its turn is live");
+    let mut running =
+        db::list_running_agent_deliveries_pg(&pool, "expired-live-agent-worker", LEASE_SECS, 10)
+            .await
+            .expect("poll live expired definition");
+    let delivery = running.pop().expect("live turn should remain pollable");
+
+    assert!(
+        !resolve_agent_delivery(&pool, &delivery, false).await,
+        "expiry alone cannot close a turn that may still relay"
+    );
+    let parent = db::get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read live expired parent")
+        .expect("live expired parent exists");
+    assert_eq!(parent.status, db::STATUS_FIRING);
+    let deliveries = db::list_deliveries_pg(&pool, &message.id, 10, None)
+        .await
+        .expect("read live expired delivery");
+    assert_eq!(deliveries[0].status, "running");
+    assert_eq!(deliveries[0].fallback_outbox_id, None);
 
     pool.close().await;
     pg_db.drop().await;

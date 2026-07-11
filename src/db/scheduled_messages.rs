@@ -16,7 +16,8 @@ use uuid::Uuid;
 mod agent;
 mod outbox;
 pub use agent::{
-    RunningAgentDelivery, list_running_agent_deliveries_pg, recover_expired_leases_pg,
+    RunningAgentDelivery, defer_delivery_without_retry_pg, list_running_agent_deliveries_pg,
+    recover_expired_leases_pg,
 };
 pub use outbox::outbox_statuses_for_deliveries_pg;
 
@@ -435,6 +436,7 @@ pub async fn list_deliveries_pg(
 pub async fn claim_due_fires_pg(
     pool: &PgPool,
     claim_owner: &str,
+    claim_agent: bool,
     batch: i64,
     lease_secs: i64,
     now: DateTime<Utc>,
@@ -443,11 +445,21 @@ pub async fn claim_due_fires_pg(
     let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
+           AND ($2 OR delivery_kind <> 'agent')
+           AND NOT EXISTS (
+               SELECT 1
+               FROM scheduled_message_deliveries AS retry
+               WHERE retry.scheduled_message_id = scheduled_messages.id
+                 AND retry.fire_scheduled_at = scheduled_messages.scheduled_at
+                 AND retry.status = 'interrupted'
+                 AND retry.next_attempt_at > $1
+           )
          ORDER BY scheduled_at
-         LIMIT $2
+         LIMIT $3
          FOR UPDATE SKIP LOCKED"
     ))
     .bind(now)
+    .bind(claim_agent)
     .bind(batch)
     .fetch_all(&mut *tx)
     .await?;
@@ -793,6 +805,7 @@ pub async fn interrupt_delivery_and_rewind_pg(
     claim_token: &str,
     message_id: &str,
     fire_scheduled_at: DateTime<Utc>,
+    next_attempt_at: Option<DateTime<Utc>>,
     error: &str,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
@@ -813,6 +826,16 @@ pub async fn interrupt_delivery_and_rewind_pg(
         return Ok(false);
     }
     sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET next_attempt_at = $3, updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND status = 'interrupted'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(next_attempt_at)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "UPDATE scheduled_messages
          SET status = 'scheduled', scheduled_at = $3,
              in_flight_delivery_id = NULL, last_error = $4, updated_at = NOW()
@@ -830,11 +853,16 @@ pub async fn interrupt_delivery_and_rewind_pg(
 
 pub async fn mark_delivery_agent_turn_started_pg(
     pool: &PgPool,
+    message_id: &str,
     delivery_id: &str,
     claim_token: &str,
     turn_id: &str,
     lease_secs: i64,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
     let updated = sqlx::query(
         "UPDATE scheduled_message_deliveries
          SET turn_id = $3,
@@ -847,9 +875,11 @@ pub async fn mark_delivery_agent_turn_started_pg(
     .bind(claim_token)
     .bind(turn_id)
     .bind(lease_secs)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(updated.rows_affected() > 0)
+    let recorded = updated.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(recorded)
 }
 
 /// Hand a successfully started durable turn from the fire worker to the

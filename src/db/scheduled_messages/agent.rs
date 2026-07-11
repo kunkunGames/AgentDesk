@@ -79,6 +79,47 @@ pub async fn list_running_agent_deliveries_pg(
     .await
 }
 
+/// Return an agent claim to `scheduled` without consuming its retry budget
+/// when a process-wide prerequisite (the Discord runtime) is unavailable.
+pub async fn defer_delivery_without_retry_pg(
+    pool: &PgPool,
+    delivery_id: &str,
+    claim_token: &str,
+    message_id: &str,
+    resume_scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !super::lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM scheduled_message_deliveries
+         WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .execute(&mut *tx)
+    .await?;
+    if deleted.rows_affected() == 0 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE scheduled_messages
+         SET status = 'scheduled', scheduled_at = $3,
+             in_flight_delivery_id = NULL, last_error = $4, updated_at = NOW()
+         WHERE id = $1 AND in_flight_delivery_id = $2 AND status = 'firing'",
+    )
+    .bind(message_id)
+    .bind(delivery_id)
+    .bind(resume_scheduled_at)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Boot/lease recovery: expired pre-turn deliveries become `interrupted` and
 /// their parents return to `scheduled` so the due scan can re-arm the slot.
 /// Once a turn id is recorded, the durable turn is adopted by the regular
