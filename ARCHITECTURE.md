@@ -97,6 +97,10 @@ src/
 │   │   ├── retention.rs
 │   │   ├── storage_stats.rs
 │   │   └── tests.rs
+│   ├── scheduled_messages/
+│   │   ├── agent.rs
+│   │   ├── outbox.rs
+│   │   └── postgres_tests.rs
 │   ├── agents.rs
 │   ├── automation_candidates.rs
 │   ├── cancel_tombstones.rs
@@ -109,6 +113,7 @@ src/
 │   ├── mod.rs
 │   ├── postgres.rs
 │   ├── relay_dead_letter.rs
+│   ├── scheduled_messages.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
 │   ├── session_status.rs
@@ -234,6 +239,8 @@ src/
 │   │   │   ├── handlers.rs
 │   │   │   ├── helpers.rs
 │   │   │   └── responses.rs
+│   │   ├── scheduled_messages/
+│   │   │   └── postgres_tests.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -281,6 +288,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
+│   │   ├── scheduled_messages.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── skill_usage_analytics.rs
@@ -297,6 +305,7 @@ src/
 │   ├── mod.rs
 │   ├── multinode_regression.rs
 │   ├── outbox_delivery_alert.rs
+│   ├── outbox_gc.rs
 │   ├── resource_locks.rs
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
@@ -1025,6 +1034,9 @@ src/
 │   │   ├── runtime_config.rs
 │   │   ├── session_control.rs
 │   │   └── store.rs
+│   ├── scheduled_messages/
+│   │   ├── evidence.rs
+│   │   └── postgres_tests.rs
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
@@ -1095,6 +1107,7 @@ src/
 │   ├── remote_stub.rs
 │   ├── retrospectives.rs
 │   ├── review_decision.rs
+│   ├── scheduled_messages.rs
 │   ├── service_error.rs
 │   ├── session_activity.rs
 │   ├── session_backend.rs
