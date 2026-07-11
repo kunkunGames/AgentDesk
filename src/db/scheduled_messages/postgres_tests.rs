@@ -74,6 +74,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
         "UPDATE scheduled_message_deliveries
          SET outbox_id = 101,
              turn_id = 'stale-turn',
+             turn_started_at = NOW(),
              fallback_outbox_id = 202,
              next_attempt_at = NOW() + INTERVAL '5 minutes',
              error = 'stale attempt error'
@@ -109,7 +110,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
 
     let row = sqlx::query(
         "SELECT status, claim_owner, claim_token, retry_count,
-                outbox_id, turn_id, fallback_outbox_id, next_attempt_at,
+                outbox_id, turn_id, turn_started_at, fallback_outbox_id, next_attempt_at,
                 error, finished_at, lease_expires_at
          FROM scheduled_message_deliveries
          WHERE id = $1",
@@ -130,6 +131,11 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
     assert_eq!(row.try_get::<i32, _>("retry_count").unwrap(), 1);
     assert_eq!(row.try_get::<Option<i64>, _>("outbox_id").unwrap(), None);
     assert_eq!(row.try_get::<Option<String>, _>("turn_id").unwrap(), None);
+    assert_eq!(
+        row.try_get::<Option<DateTime<Utc>>, _>("turn_started_at")
+            .unwrap(),
+        None
+    );
     assert_eq!(
         row.try_get::<Option<i64>, _>("fallback_outbox_id").unwrap(),
         None
@@ -291,16 +297,15 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     let second = claim_one(&pool, "worker-b", 20).await;
 
     assert!(
-        !mark_delivery_agent_turn_started_pg(
+        !record_delivery_agent_turn_intent_pg(
             &pool,
             &message.id,
             &second.delivery_id,
             &first.claim_token,
             "stale-turn",
-            600,
         )
         .await
-        .expect("stale turn start must be a guarded no-op")
+        .expect("stale turn intent must be a guarded no-op")
     );
     assert!(
         !finish_delivery_and_finalize_parent_pg(
@@ -360,6 +365,41 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     let lease_before = lease_before.expect("claimed attempt has a lease");
 
     assert!(
+        record_delivery_agent_turn_intent_pg(
+            &pool,
+            &message.id,
+            &second.delivery_id,
+            &second.claim_token,
+            "current-turn",
+        )
+        .await
+        .expect("current turn intent should update delivery")
+    );
+    let (turn_id, turn_started_at, lease_after_intent): (
+        Option<String>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT turn_id, turn_started_at, lease_expires_at
+         FROM scheduled_message_deliveries
+         WHERE id = $1",
+    )
+    .bind(&second.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read agent launch intent");
+    assert_eq!(turn_id.as_deref(), Some("current-turn"));
+    assert_eq!(turn_started_at, None);
+    assert_eq!(lease_after_intent, Some(lease_before));
+    assert!(
+        list_running_agent_deliveries_pg(&pool, "worker-b", 600, 10)
+            .await
+            .expect("poll before launch confirmation")
+            .is_empty(),
+        "an intent-only row must not be polled or have its lease renewed"
+    );
+
+    assert!(
         mark_delivery_agent_turn_started_pg(
             &pool,
             &message.id,
@@ -369,21 +409,22 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
             600,
         )
         .await
-        .expect("current turn start should update delivery")
+        .expect("current turn start should confirm delivery")
     );
-    let (turn_id, lease_after): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT turn_id, lease_expires_at
-         FROM scheduled_message_deliveries
-         WHERE id = $1",
-    )
-    .bind(&second.delivery_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read renewed agent lease");
-    assert_eq!(turn_id.as_deref(), Some("current-turn"));
+    let (turn_started_at, lease_after): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT turn_started_at, lease_expires_at
+             FROM scheduled_message_deliveries
+             WHERE id = $1",
+        )
+        .bind(&second.delivery_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read confirmed agent lease");
+    assert!(turn_started_at.is_some());
     assert!(
         lease_after.expect("renewed lease") > lease_before,
-        "recording the current turn must extend the claim lease"
+        "confirming the current turn must extend the claim lease"
     );
 
     assert!(
@@ -469,13 +510,25 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         .expect("claim scheduled-message poll definitions");
     assert_eq!(claims.len(), 2);
     for (index, claim) in claims.iter().enumerate() {
+        let turn_id = format!("poll-turn-{index}");
+        assert!(
+            record_delivery_agent_turn_intent_pg(
+                &pool,
+                &claim.message.id,
+                &claim.delivery_id,
+                &claim.claim_token,
+                &turn_id,
+            )
+            .await
+            .expect("record scheduled-message poll turn intent")
+        );
         assert!(
             mark_delivery_agent_turn_started_pg(
                 &pool,
                 &claim.message.id,
                 &claim.delivery_id,
                 &claim.claim_token,
-                &format!("poll-turn-{index}"),
+                &turn_id,
                 60,
             )
             .await
@@ -540,6 +593,17 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
     let fire = claim_one(&pool, "turn-owner", 30).await;
+    assert!(
+        record_delivery_agent_turn_intent_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "durable-turn",
+        )
+        .await
+        .expect("record durable turn intent")
+    );
     assert!(
         mark_delivery_agent_turn_started_pg(
             &pool,
@@ -637,6 +701,204 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_agent_launch_intent_crash_rearms_without_phantom_lease_renewal() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_agent_intent_recovery",
+        "scheduled agent pre-launch crash recovery",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+    let first = claim_one(&pool, "pre-launch-worker", 30).await;
+    assert!(
+        record_delivery_agent_turn_intent_pg(
+            &pool,
+            &message.id,
+            &first.delivery_id,
+            &first.claim_token,
+            "never-launched-turn",
+        )
+        .await
+        .expect("record launch intent")
+    );
+    sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET lease_expires_at = NOW() - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(&first.delivery_id)
+    .execute(&pool)
+    .await
+    .expect("expire launch-intent lease");
+
+    assert!(
+        list_running_agent_deliveries_pg(&pool, "poller", 600, 10)
+            .await
+            .expect("poll confirmed agent deliveries")
+            .is_empty(),
+        "intent-only rows must not be selected for lease renewal"
+    );
+    assert_eq!(
+        recover_expired_leases_pg(&pool)
+            .await
+            .expect("recover expired launch intent"),
+        1
+    );
+
+    let retry = claim_one(&pool, "replacement-worker", 30).await;
+    assert_eq!(retry.delivery_id, first.delivery_id);
+    assert_eq!(retry.retry_count, 1);
+    let (turn_id, turn_started_at): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT turn_id, turn_started_at
+         FROM scheduled_message_deliveries
+         WHERE id = $1",
+    )
+    .bind(&retry.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read replacement launch state");
+    assert_eq!(turn_id, None);
+    assert_eq!(turn_started_at, None);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_runtime_absence_blocks_push_claims_too() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_push_runtime_gate",
+        "scheduled push runtime gate",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_PUSH).await;
+
+    assert!(
+        claim_due_fires_pg(&pool, "no-runtime", false, 10, 30, Utc::now())
+            .await
+            .expect("scan push without Discord runtime")
+            .is_empty()
+    );
+    let waiting = get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("read waiting push")
+        .expect("waiting push exists");
+    assert_eq!(waiting.status, STATUS_SCHEDULED);
+    let deliveries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_message_deliveries
+         WHERE scheduled_message_id = $1",
+    )
+    .bind(&message.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count runtime-gated deliveries");
+    assert_eq!(deliveries, 0);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_cancel_reports_confirmed_agent_handoff_not_intent() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_agent_intent_cancel",
+        "scheduled agent intent cancellation fence",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_AGENT).await;
+    let fire = claim_one(&pool, "intent-worker", 30).await;
+    assert!(
+        record_delivery_agent_turn_intent_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "intent-only-turn",
+        )
+        .await
+        .expect("record agent launch intent")
+    );
+    assert!(matches!(
+        cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel after agent intent"),
+        CancelOutcome::Canceled {
+            was_firing: true,
+            handoff_started: false
+        }
+    ));
+    assert!(
+        !agent_turn_intent_is_active_pg(
+            &pool,
+            &message.id,
+            &fire.delivery_id,
+            &fire.claim_token,
+            "intent-only-turn",
+        )
+        .await
+        .expect("re-check canceled turn intent")
+    );
+
+    let launched_message = insert_scheduled_message_pg(
+        &pool,
+        &NewScheduledMessage {
+            content: "already launched agent delivery".to_string(),
+            title: None,
+            target_channel_id: None,
+            bot: "notify".to_string(),
+            delivery_kind: KIND_AGENT.to_string(),
+            agent_id: Some("scheduled-test-agent".to_string()),
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::seconds(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("insert launched agent message");
+    let launched = claim_one(&pool, "launched-worker", 30).await;
+    assert!(
+        record_delivery_agent_turn_intent_pg(
+            &pool,
+            &launched_message.id,
+            &launched.delivery_id,
+            &launched.claim_token,
+            "launched-turn",
+        )
+        .await
+        .expect("record launched turn intent")
+    );
+    assert!(
+        mark_delivery_agent_turn_started_pg(
+            &pool,
+            &launched_message.id,
+            &launched.delivery_id,
+            &launched.claim_token,
+            "launched-turn",
+            600,
+        )
+        .await
+        .expect("confirm launched turn")
+    );
+    assert!(matches!(
+        cancel_scheduled_message_pg(&pool, &launched_message.id)
+            .await
+            .expect("cancel confirmed agent turn"),
+        CancelOutcome::Canceled {
+            was_firing: true,
+            handoff_started: true
+        }
+    ));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_agent_claim_waits_for_runtime_and_cancel_fences_turn_start() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_runtime_gate",
@@ -664,19 +926,21 @@ async fn postgres_agent_claim_waits_for_runtime_and_cancel_fences_turn_start() {
         cancel_scheduled_message_pg(&pool, &message.id)
             .await
             .expect("cancel before agent handoff"),
-        CancelOutcome::Canceled { was_firing: true }
+        CancelOutcome::Canceled {
+            was_firing: true,
+            handoff_started: false
+        }
     ));
     assert!(
-        !mark_delivery_agent_turn_started_pg(
+        !record_delivery_agent_turn_intent_pg(
             &pool,
             &message.id,
             &fire.delivery_id,
             &fire.claim_token,
             "must-not-start",
-            600,
         )
         .await
-        .expect("canceled claim must fence turn handoff")
+        .expect("canceled claim must fence turn intent")
     );
 
     pool.close().await;
@@ -705,13 +969,12 @@ async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
     let delivery_id = fire.delivery_id.clone();
     let claim_token = fire.claim_token.clone();
     let mut mark_task = tokio::spawn(async move {
-        mark_delivery_agent_turn_started_pg(
+        record_delivery_agent_turn_intent_pg(
             &mark_pool,
             &message_id,
             &delivery_id,
             &claim_token,
             "must-not-cross-cancel",
-            600,
         )
         .await
     });
@@ -719,7 +982,7 @@ async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
         tokio::time::timeout(std::time::Duration::from_millis(150), &mut mark_task)
             .await
             .is_err(),
-        "turn start must wait behind the active parent lock"
+        "turn intent must wait behind the active parent lock"
     );
 
     sqlx::query(
@@ -746,10 +1009,10 @@ async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
 
     let recorded = tokio::time::timeout(std::time::Duration::from_secs(2), mark_task)
         .await
-        .expect("turn-start waiter should resume after cancel")
-        .expect("turn-start task should join")
-        .expect("turn-start query should succeed");
-    assert!(!recorded, "cancellation must fence the waiting turn start");
+        .expect("turn-intent waiter should resume after cancel")
+        .expect("turn-intent task should join")
+        .expect("turn-intent query should succeed");
+    assert!(!recorded, "cancellation must fence the waiting turn intent");
     let (status, turn_id): (String, Option<String>) =
         sqlx::query_as("SELECT status, turn_id FROM scheduled_message_deliveries WHERE id = $1")
             .bind(&fire.delivery_id)

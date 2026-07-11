@@ -5,11 +5,10 @@ use uuid::Uuid;
 /// Agent-mode deliveries still awaiting transcript evidence, joined with the
 /// parent fields the poller needs. Extends the lease of everything returned.
 ///
-/// Only rows with a recorded `turn_id` qualify: a running row without one is
-/// still inside `start_agent_turn` (possibly on another node — trigger-now
-/// fires outside the scheduler tick), and touching it here would both keep its
-/// lease alive forever and race the in-flight start. Pre-turn crashes are
-/// owned by lease expiry + [`recover_expired_leases_pg`].
+/// Only runtime-confirmed rows qualify. A recorded `turn_id` with NULL
+/// `turn_started_at` is a durable launch intent; renewing it here would turn a
+/// pre-launch crash into a phantom live turn. Intent-only crashes are owned by
+/// lease expiry + [`recover_expired_leases_pg`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RunningAgentDelivery {
     pub delivery_id: String,
@@ -43,6 +42,7 @@ pub async fn list_running_agent_deliveries_pg(
              WHERE candidate.status = 'running'
                AND candidate.delivery_kind = 'agent'
                AND candidate.turn_id IS NOT NULL
+               AND candidate.turn_started_at IS NOT NULL
                AND (candidate.claim_owner = $1 OR candidate.claim_owner IS NULL
                     OR candidate.lease_expires_at IS NULL
                     OR candidate.lease_expires_at <= NOW())
@@ -65,8 +65,9 @@ pub async fn list_running_agent_deliveries_pg(
            AND m.status = 'firing' AND m.in_flight_delivery_id = d.id
            AND d.status = 'running' AND d.delivery_kind = 'agent'
            AND d.turn_id IS NOT NULL
+           AND d.turn_started_at IS NOT NULL
          RETURNING d.id AS delivery_id, d.scheduled_message_id, d.claim_token,
-                   d.fire_scheduled_at, d.turn_id, d.started_at,
+                   d.fire_scheduled_at, d.turn_id, d.turn_started_at AS started_at,
                    m.content, m.target_channel_id, m.bot, m.agent_id,
                    m.on_agent_failure, m.schedule, m.timezone,
                    d.resume_scheduled_at AS scheduled_at, m.expires_at",
@@ -120,11 +121,11 @@ pub async fn defer_delivery_without_retry_pg(
     Ok(true)
 }
 
-/// Boot/lease recovery: expired pre-turn deliveries become `interrupted` and
+/// Boot/lease recovery: expired pre-launch deliveries become `interrupted` and
 /// their parents return to `scheduled` so the due scan can re-arm the slot.
-/// Once a turn id is recorded, the durable turn is adopted by the regular
-/// poller instead of restarted; claim fencing cannot prevent an old turn from
-/// relaying a user-visible duplicate after a replacement turn starts.
+/// Once `turn_started_at` confirms a runtime launch, the durable turn is
+/// adopted by the regular poller instead of restarted; claim fencing cannot
+/// prevent an old turn from relaying a duplicate after a replacement starts.
 pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let rows = sqlx::query(
@@ -135,7 +136,7 @@ pub async fn recover_expired_leases_pg(pool: &PgPool) -> Result<u64, sqlx::Error
          JOIN scheduled_message_deliveries d ON d.id = m.in_flight_delivery_id
          WHERE m.status = 'firing'
            AND d.status = 'running'
-           AND d.turn_id IS NULL
+           AND d.turn_started_at IS NULL
            AND d.lease_expires_at IS NOT NULL
            AND d.lease_expires_at < NOW()
          ORDER BY d.lease_expires_at, m.id

@@ -658,9 +658,15 @@ pub async fn cancel_scheduled_message(
                 "status": status,
             })),
         ),
-        Ok(CancelOutcome::Canceled { was_firing }) => {
-            let note =
-                was_firing.then_some("delivery was in flight; it may already have been handed off");
+        Ok(CancelOutcome::Canceled {
+            was_firing,
+            handoff_started,
+        }) => {
+            let note = if handoff_started {
+                Some("delivery was already handed off; downstream delivery may still complete")
+            } else {
+                was_firing.then_some("in-flight delivery was canceled before handoff")
+            };
             (
                 StatusCode::OK,
                 Json(json!({"canceled": true, "note": note})),
@@ -684,12 +690,10 @@ pub async fn trigger_scheduled_message_now(
     };
     if state.health_registry.is_none() {
         match db::get_scheduled_message_pg(pool, &id).await {
-            Ok(Some(row))
-                if row.status == db::STATUS_SCHEDULED && row.delivery_kind == db::KIND_AGENT =>
-            {
+            Ok(Some(row)) if row.status == db::STATUS_SCHEDULED => {
                 return error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Discord runtime is unavailable for agent delivery",
+                    "Discord runtime is unavailable for scheduled delivery",
                 );
             }
             Ok(_) => {}

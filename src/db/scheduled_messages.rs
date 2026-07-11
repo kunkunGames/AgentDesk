@@ -359,6 +359,9 @@ pub enum CancelOutcome {
         /// True when a firing delivery was marked interrupted; the message may
         /// already be past the outbox/turn handoff point.
         was_firing: bool,
+        /// True only when the active delivery had already recorded an outbox
+        /// handoff or a runtime-confirmed agent turn before cancellation won.
+        handoff_started: bool,
     },
 }
 
@@ -383,7 +386,26 @@ pub async fn cancel_scheduled_message_pg(
         return Ok(CancelOutcome::AlreadyTerminal(status));
     }
     let was_firing = status == STATUS_FIRING;
+    let mut handoff_started = false;
     if let Some(delivery_id) = in_flight.as_deref() {
+        let handoff = sqlx::query(
+            "SELECT outbox_id, fallback_outbox_id, turn_started_at
+             FROM scheduled_message_deliveries
+             WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(handoff) = handoff {
+            handoff_started = handoff.try_get::<Option<i64>, _>("outbox_id")?.is_some()
+                || handoff
+                    .try_get::<Option<i64>, _>("fallback_outbox_id")?
+                    .is_some()
+                || handoff
+                    .try_get::<Option<DateTime<Utc>>, _>("turn_started_at")?
+                    .is_some();
+        }
         sqlx::query(
             "UPDATE scheduled_message_deliveries
              SET status = 'interrupted', error = 'canceled by operator',
@@ -403,7 +425,10 @@ pub async fn cancel_scheduled_message_pg(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(CancelOutcome::Canceled { was_firing })
+    Ok(CancelOutcome::Canceled {
+        was_firing,
+        handoff_started,
+    })
 }
 
 // ── Deliveries ──────────────────────────────────────────────────────────────
@@ -436,7 +461,7 @@ pub async fn list_deliveries_pg(
 pub async fn claim_due_fires_pg(
     pool: &PgPool,
     claim_owner: &str,
-    claim_agent: bool,
+    delivery_runtime_available: bool,
     batch: i64,
     lease_secs: i64,
     now: DateTime<Utc>,
@@ -445,7 +470,7 @@ pub async fn claim_due_fires_pg(
     let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
-           AND ($2 OR delivery_kind <> 'agent')
+           AND $2
            AND NOT EXISTS (
                SELECT 1
                FROM scheduled_message_deliveries AS retry
@@ -459,7 +484,7 @@ pub async fn claim_due_fires_pg(
          FOR UPDATE SKIP LOCKED"
     ))
     .bind(now)
-    .bind(claim_agent)
+    .bind(delivery_runtime_available)
     .bind(batch)
     .fetch_all(&mut *tx)
     .await?;
@@ -514,6 +539,7 @@ async fn arm_delivery_slot_tx(
                 retry_count = scheduled_message_deliveries.retry_count + 1,
                 outbox_id = NULL,
                 turn_id = NULL,
+                turn_started_at = NULL,
                 fallback_outbox_id = NULL,
                 next_attempt_at = NULL,
                 error = NULL,
@@ -851,6 +877,64 @@ pub async fn interrupt_delivery_and_rewind_pg(
     Ok(true)
 }
 
+/// Persist the reserved turn identity without declaring that the external
+/// runtime has started it. Intent-only rows are not polled or lease-renewed.
+pub async fn record_delivery_agent_turn_intent_pg(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    turn_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET turn_id = $3, turn_started_at = NULL, updated_at = NOW()
+         WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(turn_id)
+    .execute(&mut *tx)
+    .await?;
+    let recorded = updated.rows_affected() > 0;
+    tx.commit().await?;
+    Ok(recorded)
+}
+
+/// Last-moment cancellation fence between persisting a turn intent and
+/// invoking the external headless runtime.
+pub async fn agent_turn_intent_is_active_pg(
+    pool: &PgPool,
+    message_id: &str,
+    delivery_id: &str,
+    claim_token: &str,
+    turn_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    if !lock_active_delivery_tx(&mut tx, message_id, delivery_id, claim_token).await? {
+        return Ok(false);
+    }
+    let active = sqlx::query_scalar::<_, i32>(
+        "SELECT 1
+         FROM scheduled_message_deliveries
+         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
+           AND status = 'running'",
+    )
+    .bind(delivery_id)
+    .bind(claim_token)
+    .bind(turn_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    tx.commit().await?;
+    Ok(active)
+}
+
+/// Confirm a turn only after the headless runtime reports `started`.
 pub async fn mark_delivery_agent_turn_started_pg(
     pool: &PgPool,
     message_id: &str,
@@ -865,11 +949,12 @@ pub async fn mark_delivery_agent_turn_started_pg(
     }
     let updated = sqlx::query(
         "UPDATE scheduled_message_deliveries
-         SET turn_id = $3,
+         SET turn_started_at = NOW(),
              started_at = NOW(),
              lease_expires_at = NOW() + ($4::bigint * INTERVAL '1 second'),
              updated_at = NOW()
-         WHERE id = $1 AND claim_token = $2 AND status = 'running'",
+         WHERE id = $1 AND claim_token = $2 AND turn_id = $3
+           AND status = 'running'",
     )
     .bind(delivery_id)
     .bind(claim_token)
@@ -894,7 +979,7 @@ pub async fn release_agent_delivery_to_poller_pg(
         "UPDATE scheduled_message_deliveries
          SET claim_owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
          WHERE id = $1 AND claim_token = $2 AND status = 'running'
-           AND turn_id IS NOT NULL",
+           AND turn_id IS NOT NULL AND turn_started_at IS NOT NULL",
     )
     .bind(delivery_id)
     .bind(claim_token)

@@ -294,9 +294,40 @@ async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fir
         }
         Err(error) => {
             tracing::warn!(id = message.id, "[smsg] agent turn start failed: {error}");
-            interrupt_for_retry(pool, fire, &format!("agent turn start failed: {error}")).await;
+            let reason = format!("agent turn start failed: {error}");
+            if agent_start_error_is_runtime_unavailable(&error) {
+                if let Err(defer_error) = db::defer_delivery_without_retry_pg(
+                    pool,
+                    &fire.delivery_id,
+                    &fire.claim_token,
+                    &message.id,
+                    message.scheduled_at,
+                    &reason,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        id = message.id,
+                        "[smsg] booting-runtime defer failed: {defer_error}"
+                    );
+                }
+            } else {
+                interrupt_for_retry(pool, fire, &reason).await;
+            }
         }
     }
+}
+
+fn agent_start_error_is_runtime_unavailable(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    [
+        "provider runtime not registered",
+        "provider runtime is not ready",
+        "matched runtime is not ready",
+        "provider token unavailable",
+    ]
+    .into_iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Start a headless agent turn whose relayed reply delivers the message.
@@ -344,16 +375,15 @@ async fn start_agent_turn(
     let prompt = build_agent_prompt(message);
     let reservation = reserve_headless_agent_turn(turn_channel);
     let turn_id = reservation.turn_id().to_string();
-    let recorded = db::mark_delivery_agent_turn_started_pg(
+    let recorded = db::record_delivery_agent_turn_intent_pg(
         pool,
         &message.id,
         &fire.delivery_id,
         &fire.claim_token,
         &turn_id,
-        LEASE_SECS,
     )
     .await
-    .map_err(|error| anyhow!("record scheduled message turn {turn_id}: {error}"))?;
+    .map_err(|error| anyhow!("record scheduled message turn intent {turn_id}: {error}"))?;
     if !recorded {
         return Err(anyhow!(
             "scheduled message claim was lost before turn {turn_id} could start"
@@ -366,6 +396,24 @@ async fn start_agent_turn(
         "target_channel_id": message.target_channel_id,
         "parent_channel_id": owner_channel_num.to_string(),
     }));
+
+    // Do not span the external runtime call with a database transaction. A
+    // final fenced read still lets an operator cancellation that won after the
+    // intent write stop the launch at the last durable boundary.
+    let still_active = db::agent_turn_intent_is_active_pg(
+        pool,
+        &message.id,
+        &fire.delivery_id,
+        &fire.claim_token,
+        &turn_id,
+    )
+    .await
+    .map_err(|error| anyhow!("re-check scheduled message turn intent {turn_id}: {error}"))?;
+    if !still_active {
+        return Err(anyhow!(
+            "scheduled message claim was canceled before turn {turn_id} launch"
+        ));
+    }
 
     let outcome = start_reserved_headless_agent_turn_with_owner_channel(
         health_registry,
@@ -392,6 +440,22 @@ async fn start_agent_turn(
         return Err(anyhow!(
             "scheduled message turn {turn_id} was not started (status: {})",
             outcome.status.as_str()
+        ));
+    }
+
+    let confirmed = db::mark_delivery_agent_turn_started_pg(
+        pool,
+        &message.id,
+        &fire.delivery_id,
+        &fire.claim_token,
+        &turn_id,
+        LEASE_SECS,
+    )
+    .await
+    .map_err(|error| anyhow!("confirm scheduled message turn {turn_id}: {error}"))?;
+    if !confirmed {
+        return Err(anyhow!(
+            "scheduled message claim was lost after turn {turn_id} launched"
         ));
     }
     match db::release_agent_delivery_to_poller_pg(pool, &fire.delivery_id, &fire.claim_token).await
@@ -1109,5 +1173,22 @@ mod tests {
         assert!(prompt.contains("3줄로 요약"));
         assert!(prompt.contains("내일 배포 예정"));
         assert!(prompt.contains("배포 공지"));
+    }
+
+    #[test]
+    fn booting_discord_runtime_errors_defer_without_consuming_retry() {
+        for message in [
+            "provider runtime not registered: codex",
+            "provider runtime is not ready for channel 123",
+            "matched runtime is not ready for provider codex on channel 123",
+            "provider token unavailable for channel 123",
+        ] {
+            assert!(agent_start_error_is_runtime_unavailable(&anyhow::anyhow!(
+                "start scheduled message turn: {message}"
+            )));
+        }
+        assert!(!agent_start_error_is_runtime_unavailable(&anyhow::anyhow!(
+            "agent mailbox is busy for channel 123"
+        )));
     }
 }
