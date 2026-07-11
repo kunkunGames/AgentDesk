@@ -208,7 +208,8 @@ src/
 │   │   │   │       ├── part_06.rs
 │   │   │   │       ├── part_07.rs
 │   │   │   │       ├── part_08.rs
-│   │   │   │       └── part_09.rs
+│   │   │   │       ├── part_09.rs
+│   │   │   │       └── part_10.rs
 │   │   │   ├── guides.rs
 │   │   │   ├── inventory.rs
 │   │   │   └── taxonomy.rs
@@ -264,6 +265,7 @@ src/
 │   │   ├── maintenance.rs
 │   │   ├── meetings.rs
 │   │   ├── memory_api.rs
+│   │   ├── message_outbox.rs
 │   │   ├── messages.rs
 │   │   ├── mod.rs
 │   │   ├── monitoring.rs
@@ -366,6 +368,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── warm_followup.rs
 │   │   ├── hook_bundle.rs
+│   │   ├── hook_output_guard.rs
+│   │   ├── hook_output_guard_tests.rs
 │   │   ├── hook_registry.rs
 │   │   ├── hook_relay.rs
 │   │   ├── hook_server.rs
@@ -378,6 +382,8 @@ src/
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
+│   │   ├── intake_router_hook/
+│   │   │   └── session_owner.rs
 │   │   ├── stream_relay/
 │   │   │   └── identity.rs
 │   │   ├── capability_routing.rs
@@ -507,6 +513,7 @@ src/
 │   │   │   ├── send_target.rs
 │   │   │   ├── send_to_agent.rs
 │   │   │   ├── serenity_reference.rs
+│   │   │   ├── source_registry.rs
 │   │   │   ├── transport.rs
 │   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
@@ -565,13 +572,16 @@ src/
 │   │   │   ├── restart.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
+│   │   │   ├── intake_dispatch/
+│   │   │   │   ├── notice.rs
+│   │   │   │   ├── queued.rs
+│   │   │   │   ├── skill.rs
+│   │   │   │   └── tests.rs
 │   │   │   ├── intake_gate/
 │   │   │   │   ├── busy_duplicate_notice.rs
 │   │   │   │   ├── component_events.rs
 │   │   │   │   ├── gate.rs
-│   │   │   │   ├── node_override_routing.rs
 │   │   │   │   ├── queue_effects.rs
-│   │   │   │   ├── reaction_remove.rs
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── intake_turn/
@@ -593,6 +603,7 @@ src/
 │   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
 │   │   │   ├── dispatch_trigger.rs
+│   │   │   ├── intake_dispatch.rs
 │   │   │   ├── intake_gate.rs
 │   │   │   ├── intake_queue_transaction.rs
 │   │   │   ├── message_handler.rs
@@ -630,6 +641,10 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── tmux/
+│   │   │   └── task_notification_kind_restart_roundtrip_tests.rs
+│   │   ├── tmux_output_stream/
+│   │   │   └── provider_output_guard_tests.rs
 │   │   ├── tmux_placeholder_suppression/
 │   │   │   ├── evidence.rs
 │   │   │   ├── mod.rs
@@ -651,6 +666,7 @@ src/
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── post_stream_exit.rs
 │   │   │   ├── prompt_observe.rs
+│   │   │   ├── provider_output_guard.rs
 │   │   │   ├── provider_session_persistence.rs
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
@@ -1053,6 +1069,9 @@ src/
 │   ├── long_turn_watchdog.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
+│   ├── message_outbox_recovery.rs
+│   ├── message_outbox_recovery_support.rs
+│   ├── message_outbox_recovery_tests.rs
 │   ├── mod.rs
 │   ├── monitoring_store.rs
 │   ├── opencode.rs
@@ -1066,6 +1085,8 @@ src/
 │   ├── provider_auth.rs
 │   ├── provider_exec.rs
 │   ├── provider_hosting.rs
+│   ├── provider_output_guard.rs
+│   ├── provider_output_guard_tests.rs
 │   ├── provider_runtime.rs
 │   ├── queue.rs
 │   ├── qwen.rs
@@ -1125,7 +1146,6 @@ src/
 │   ├── prompt.rs
 │   ├── receiver.rs
 │   ├── runtime_boundary.rs
-│   ├── runtime_process.rs
 │   ├── sanitizer.rs
 │   ├── stt.rs
 │   ├── stt_streaming.rs
