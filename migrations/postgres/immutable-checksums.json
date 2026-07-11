@@ -420,6 +420,11 @@
       "path": "migrations/postgres/0081_message_outbox_redrive_audit.sql",
       "sha256": "bf1646bb40425551447429adca8f119bfa6074a76725a7ebd739cb897da1e6ad",
       "version": 81
+    },
+    {
+      "path": "migrations/postgres/0082_scheduled_messages.sql",
+      "sha256": "94d03ed85d5d9db3dffeff067da22e6a23cf650171d1e3430c39e12a9be70e66",
+      "version": 82
     }
   ],
   "version": 1

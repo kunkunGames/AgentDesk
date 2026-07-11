@@ -426,6 +426,47 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_ttl(
     enqueue_outbox_pg_returning_id_with_ttl_and_cancel(pool, message, dedupe_ttl_secs, None).await
 }
 
+/// Enqueue an event whose dedupe identity must survive indefinitely.
+///
+/// This is intentionally narrower than the TTL helpers: callers must supply a
+/// reason/session identity that names one immutable event (for example one
+/// scheduled-message fire slot). The active partial unique index keeps the key
+/// while the row is pending or sent. A failed row releases the key so an
+/// operator or recovery path may stage a genuine retry. On duplicate, the
+/// existing row id is returned so callers retain an auditable handoff link.
+pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+    pool: &PgPool,
+    message: OutboxMessage<'_>,
+) -> Result<i64, sqlx::Error> {
+    let reason_code = normalized_reason_code(message.reason_code);
+    let session_key = normalized_session_key(message.target, message.session_key);
+    let dedupe_key = dedupe_key_for_message(
+        message.target,
+        message.content,
+        reason_code,
+        session_key.as_deref(),
+    );
+
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO message_outbox
+         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+         ON CONFLICT (dedupe_key)
+             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+         DO UPDATE SET dedupe_expires_at = NULL
+         RETURNING id",
+    )
+    .bind(message.target)
+    .bind(message.content)
+    .bind(message.bot)
+    .bind(message.source)
+    .bind(reason_code)
+    .bind(session_key.as_deref())
+    .bind(dedupe_key.as_deref())
+    .fetch_one(pool)
+    .await
+}
+
 pub(crate) async fn enqueue_outbox_pg_returning_id_with_ttl_and_cancel(
     pool: &PgPool,
     message: OutboxMessage<'_>,
