@@ -868,7 +868,7 @@ fn apply_review_target_context(
 ) {
     obj.insert(
         "reviewed_commit".to_string(),
-        json!(target.reviewed_commit.clone()),
+        json!(target.reviewed_commit),
     );
     // #2237 item 2: when the resolver returns None for branch/worktree_path/
     // target_repo, symmetrically remove any stale value from the persisted
