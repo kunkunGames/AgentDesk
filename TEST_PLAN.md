@@ -7,9 +7,9 @@
 - **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
 
 ## Execution Plan Guidelines
-- **Dedicated Testing Step:** Execution plans must include an explicit, dedicated step to run all relevant tests prior to the pre-commit step; running tests must not be bundled into the pre-commit step itself.
-- **Pre-commit Phrasing:** The description for the pre-commit step in the execution plan must strictly use the exact phrasing: "Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done."
-- **Concrete No-Change Commands:** When creating an execution plan for a no-change report that explicitly changes a queue-hygiene artifact, do not use vague instructions. Explicitly specify the concrete shell command to execute the empty commit (e.g., `git commit --allow-empty -m "<Agent>: no-change report"`). For general no-change reports that should not become PRs, do not instruct the creation of an empty commit.
+- **Dedicated Verification Step:** Plans for code changes must name the relevant test, lint, build, or generated-drift commands before final review and push. Keep the commands proportional to the changed surface; docs-only work may use focused document and diff checks.
+- **Finalization Step:** Describe finalization in environment-neutral terms and include a final diff/status review. Do not require an exact sentence or a provider-specific shell tool that may not exist in another agent runtime.
+- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies.
 
 ## PR Body Requirements
 Every PR must include:
