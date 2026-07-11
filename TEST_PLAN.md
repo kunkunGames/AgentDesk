@@ -9,7 +9,7 @@
 ## Execution Plan Guidelines
 - **Dedicated Testing Step:** Execution plans must include an explicit, dedicated step to run all relevant tests prior to the pre-commit step; running tests must not be bundled into the pre-commit step itself.
 - **Pre-commit Phrasing:** The description for the pre-commit step in the execution plan must strictly use the exact phrasing: "Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done."
-- **Concrete No-Change Commands:** When creating an execution plan for a no-change report, do not use vague instructions. Explicitly specify the concrete tool call to execute the empty commit (e.g., using `run_in_bash_session` with `git commit --allow-empty -m "<Agent>: no-change report"`).
+- **Concrete No-Change Commands:** When creating an execution plan for a no-change report that explicitly changes a queue-hygiene artifact, do not use vague instructions. Explicitly specify the concrete shell command to execute the empty commit (e.g., `git commit --allow-empty -m "<Agent>: no-change report"`). For general no-change reports that should not become PRs, do not instruct the creation of an empty commit.
 
 ## PR Body Requirements
 Every PR must include:
