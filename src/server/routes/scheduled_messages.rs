@@ -20,6 +20,9 @@ use crate::db::scheduled_messages::{
     CancelOutcome, ListFilters, NewScheduledMessage, ScheduledMessagePatch, ScheduledMessageRow,
 };
 
+#[cfg(test)]
+mod postgres_tests;
+
 /// Freshly created reservations may point slightly into the past (clock skew,
 /// slow clients); anything older is a user error for one-shot messages.
 const PAST_TOLERANCE_SECS: i64 = 60;

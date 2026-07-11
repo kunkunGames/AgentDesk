@@ -13,6 +13,9 @@ use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod postgres_tests;
+
 pub const STATUS_SCHEDULED: &str = "scheduled";
 pub const STATUS_FIRING: &str = "firing";
 pub const STATUS_SENT: &str = "sent";

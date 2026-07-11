@@ -437,7 +437,8 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_ttl(
 pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     pool: &PgPool,
     message: OutboxMessage<'_>,
-) -> Result<i64, sqlx::Error> {
+) -> Result<i64, OutboxEnqueueError> {
+    validate_outbox_source(message.source)?;
     let reason_code = normalized_reason_code(message.reason_code);
     let session_key = normalized_session_key(message.target, message.session_key);
     let dedupe_key = dedupe_key_for_message(
@@ -465,6 +466,7 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     .bind(dedupe_key.as_deref())
     .fetch_one(pool)
     .await
+    .map_err(Into::into)
 }
 
 pub(crate) async fn enqueue_outbox_pg_returning_id_with_ttl_and_cancel(
@@ -724,6 +726,17 @@ mod postgres_source_contract_tests {
         }
     }
 
+    fn scheduled_message_for_slot(reason_code: &str) -> OutboxMessage<'_> {
+        OutboxMessage {
+            target: "channel:4424",
+            content: "scheduled announcement",
+            bot: "announce",
+            source: "scheduled_message",
+            reason_code: Some(reason_code),
+            session_key: None,
+        }
+    }
+
     fn assert_source_error<T>(result: Result<T, OutboxEnqueueError>) {
         assert!(matches!(
             result,
@@ -761,6 +774,9 @@ mod postgres_source_contract_tests {
             )
             .await,
         );
+        assert_source_error(
+            enqueue_outbox_pg_returning_id_with_persistent_dedupe(&pool, forbidden_message()).await,
+        );
         assert_source_error(enqueue_outbox_pg_with_ttl(&pool, forbidden_message(), 60).await);
         assert_source_error(enqueue_outbox_pg(&pool, forbidden_message()).await);
         assert_source_error(enqueue_outbox_best_effort(Some(&pool), forbidden_message()).await);
@@ -786,6 +802,7 @@ mod postgres_source_contract_tests {
             "system",
             "lifecycle_notifier",
             "routine-runtime",
+            "scheduled_message",
             "headless_turn",
             "slo_alerter",
             "quality_regression_alerter",
@@ -849,6 +866,60 @@ mod postgres_source_contract_tests {
             .expect("enqueue fixed lifecycle source")
         );
         assert_eq!(row_count(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_dedupe_returns_old_row_and_distinct_slot_inserts_pg() {
+        let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
+            "agentdesk_message_outbox_persistent_dedupe",
+            "message_outbox persistent dedupe tests",
+        )
+        .await
+        else {
+            return;
+        };
+        let pool = pg_db.connect_and_migrate().await;
+
+        let first_id = enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+            &pool,
+            scheduled_message_for_slot("scheduled_message:v1:test:1000"),
+        )
+        .await
+        .expect("enqueue first scheduled-message slot");
+        sqlx::query(
+            "UPDATE message_outbox
+                SET created_at = NOW() - INTERVAL '2 hours'
+              WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(&pool)
+        .await
+        .expect("age first outbox row beyond the legacy TTL");
+
+        let duplicate_id = enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+            &pool,
+            scheduled_message_for_slot("scheduled_message:v1:test:1000"),
+        )
+        .await
+        .expect("dedupe the same old scheduled-message slot");
+        assert_eq!(duplicate_id, first_id);
+        assert_eq!(row_count(&pool).await, 1);
+        let dedupe_expires_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT dedupe_expires_at FROM message_outbox WHERE id = $1")
+                .bind(first_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read persistent dedupe expiry");
+        assert_eq!(dedupe_expires_at, None);
+
+        let next_slot_id = enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+            &pool,
+            scheduled_message_for_slot("scheduled_message:v1:test:2000"),
+        )
+        .await
+        .expect("enqueue a distinct scheduled-message slot");
+        assert_ne!(next_slot_id, first_id);
+        assert_eq!(row_count(&pool).await, 2);
     }
 }
 

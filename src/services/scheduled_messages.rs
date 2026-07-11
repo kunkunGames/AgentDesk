@@ -22,7 +22,7 @@ use crate::services::discord::health::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 use crate::services::message_outbox::{
-    OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
+    OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
 };
 
 const CLAIM_BATCH: i64 = 10;
@@ -463,7 +463,7 @@ async fn enqueue_raw_fallback(
     agent_id: Option<&str>,
     content: &str,
     bot: &str,
-) -> Result<Option<i64>, sqlx::Error> {
+) -> Result<Option<i64>, OutboxEnqueueError> {
     let Some(target) = raw_fallback_target(target_channel_id, agent_id) else {
         return Ok(None);
     };
@@ -548,7 +548,7 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
     {
         Ok(Some(fallback_outbox_id)) => {
             let error = format!("{reason}; fell back to raw push");
-            finish_and_finalize(
+            finish_terminal(
                 pool,
                 fire,
                 db::DELIVERY_SENT,
@@ -556,7 +556,6 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
                 None,
                 Some(fallback_outbox_id),
                 true,
-                Utc::now(),
             )
             .await;
         }
@@ -577,16 +576,43 @@ async fn finish_exhausted_agent_with_raw_fallback(pool: &PgPool, fire: &ClaimedF
 // ── Shared transitions ──────────────────────────────────────────────────────
 
 async fn finish_terminal_failure(pool: &PgPool, fire: &ClaimedFire, error: &str) {
-    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
+    finish_terminal(
         pool,
-        &fire.delivery_id,
-        &fire.claim_token,
+        fire,
         db::DELIVERY_FAILED,
         Some(error),
         None,
         None,
-        &fire.message.id,
         false,
+    )
+    .await;
+}
+
+/// Exhausting a fire slot is terminal for the definition, even when the
+/// agent failure policy successfully hands this final attempt to raw push.
+/// The delivery can record that fallback as sent, but the recurring parent
+/// stays failed and requires an operator decision instead of silently moving
+/// on to its next occurrence.
+#[allow(clippy::too_many_arguments)]
+async fn finish_terminal(
+    pool: &PgPool,
+    fire: &ClaimedFire,
+    delivery_status: &str,
+    error: Option<&str>,
+    outbox_id: Option<i64>,
+    fallback_outbox_id: Option<i64>,
+    fired: bool,
+) {
+    if let Err(db_error) = db::finish_delivery_and_finalize_parent_pg(
+        pool,
+        &fire.delivery_id,
+        &fire.claim_token,
+        delivery_status,
+        error,
+        outbox_id,
+        fallback_outbox_id,
+        &fire.message.id,
+        fired,
         db::STATUS_FAILED,
         None,
     )
@@ -765,6 +791,9 @@ async fn interrupt_delivery(
         );
     }
 }
+
+#[cfg(test)]
+mod postgres_tests;
 
 #[cfg(test)]
 mod tests {
