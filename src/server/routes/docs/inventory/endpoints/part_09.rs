@@ -146,7 +146,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ("schedule", body_param("string", false, "Recurrence: '@every <duration>' or 5-field cron (routine grammar)")),
             ("timezone", body_param("string", false, "Cron timezone (default Asia/Seoul)")),
             ("expiresAt", body_param("string", false, "RFC3339 end of a recurring reservation")),
-            ("bot", body_param("string", false, "Delivery bot (default announce)")),
+            ("bot", body_param("string", false, "Delivery bot (default notify; announce intentionally wakes a receiving agent)")),
             ("title", body_param("string", false, "Display title")),
             ("dedupeKey", body_param("string", false, "Idempotency key; unique among live reservations")),
         ])

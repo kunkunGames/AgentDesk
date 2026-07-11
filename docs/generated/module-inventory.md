@@ -303,7 +303,7 @@
 | `server::routes::routines::handlers` | `src/server/routes/routines/handlers.rs` | 501 | 501 | 0 |  |
 | `server::routes::routines::helpers` | `src/server/routes/routines/helpers.rs` | 325 | 244 | 81 |  |
 | `server::routes::routines::responses` | `src/server/routes/routines/responses.rs` | 195 | 76 | 119 |  |
-| `server::routes::scheduled_messages` | `src/server/routes/scheduled_messages.rs` | 757 | 757 | 0 |  |
+| `server::routes::scheduled_messages` | `src/server/routes/scheduled_messages.rs` | 764 | 764 | 0 |  |
 | `server::routes::session_activity` | `src/server/routes/session_activity.rs` | 13 | 13 | 0 |  |
 | `server::routes::settings` | `src/server/routes/settings.rs` | 93 | 93 | 0 |  |
 | `server::routes::skill_usage_analytics` | `src/server/routes/skill_usage_analytics.rs` | 425 | 425 | 0 |  |

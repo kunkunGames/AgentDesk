@@ -425,6 +425,11 @@
       "path": "migrations/postgres/0082_scheduled_messages.sql",
       "sha256": "94d03ed85d5d9db3dffeff067da22e6a23cf650171d1e3430c39e12a9be70e66",
       "version": 82
+    },
+    {
+      "path": "migrations/postgres/0083_scheduled_message_notify_default.sql",
+      "sha256": "5e49faf014ac91328d721bb18b35b5b99cf8eba93dfca15f2d41509a2331afc2",
+      "version": 83
     }
   ],
   "version": 1

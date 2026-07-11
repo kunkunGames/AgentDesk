@@ -1,5 +1,15 @@
 use super::*;
 
+#[test]
+fn scheduled_message_bot_defaults_to_non_triggering_notify() {
+    assert_eq!(scheduled_message_bot_or_default(None), "notify");
+    assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
+    assert_eq!(
+        scheduled_message_bot_or_default(Some("announce")),
+        "announce"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_scheduled_message_explicit_target_still_requires_agent_primary_channel() {
     let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
