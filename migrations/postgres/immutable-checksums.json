@@ -423,13 +423,23 @@
     },
     {
       "path": "migrations/postgres/0082_scheduled_messages.sql",
-      "sha256": "dc73ef6bd01fb7fc3c6e6be1657fa362d774d4798b4ab15dc3eb27d780197a65",
+      "sha256": "94d03ed85d5d9db3dffeff067da22e6a23cf650171d1e3430c39e12a9be70e66",
       "version": 82
     },
     {
       "path": "migrations/postgres/0083_scheduled_message_notify_default.sql",
       "sha256": "5e49faf014ac91328d721bb18b35b5b99cf8eba93dfca15f2d41509a2331afc2",
       "version": 83
+    },
+    {
+      "path": "migrations/postgres/0084_scheduled_message_delivery_handoff_state.sql",
+      "sha256": "37b08c7ba3a5f0ede52b5d06077255cbc3cba9066c40d2bf8c565034b8026fcc",
+      "version": 84
+    },
+    {
+      "path": "migrations/postgres/0085_scheduled_message_resume_anchor_not_null.sql",
+      "sha256": "3213ed7f91fa9531fb304ee90cd1c24fae1ca230d73dab8982fb832bc09908c6",
+      "version": 85
     }
   ],
   "version": 1

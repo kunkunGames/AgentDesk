@@ -47,7 +47,10 @@ recurring 자동화 전반은 `routines`의 영역이다. 이 테이블은 "이 
 ## DB 설계
 
 Postgres 전용 (messages 라우트와 동일하게 pg pool 필수). 마이그레이션:
-`migrations/postgres/0082_scheduled_messages.sql` (`0079`~`0081`은 최신 upstream 계열이 선점).
+`migrations/postgres/0082_scheduled_messages.sql`부터 `0085_scheduled_message_resume_anchor_not_null.sql`까지
+사용한다 (`0079`~`0081`은 최신 upstream 계열이 선점). 라이브에 적용된 0082와
+이어지는 0083의 원문은 immutable하게 유지하고, recurrence anchor 컬럼과 최종
+non-null invariant는 0084/0085에서 additive하게 적용한다.
 
 ### `scheduled_messages` — 예약 정의(풀)
 
@@ -133,6 +136,7 @@ CREATE TABLE IF NOT EXISTS scheduled_message_deliveries (
     scheduled_message_id TEXT NOT NULL REFERENCES scheduled_messages(id),
     fire_scheduled_at   TIMESTAMPTZ NOT NULL,       -- 이 발화가 예정됐던 시각 (dedupe 축)
     resume_scheduled_at TIMESTAMPTZ NOT NULL,       -- trigger-now retry 뒤 복원할 정규 recurrence anchor
+    turn_started_at     TIMESTAMPTZ,                -- 0084 호환 컬럼; recovery restart 권한으로 사용하지 않음
     delivery_kind       TEXT NOT NULL,              -- 발화 시점 스냅샷
     -- 'running' | 'sent' | 'failed' | 'interrupted'
     status              TEXT NOT NULL DEFAULT 'running',
@@ -416,7 +420,7 @@ agent 전달인데 이 프로세스에 Discord runtime이 없으면 claim 전에
 
 | 파일 | 내용 |
 |---|---|
-| `migrations/postgres/0082_scheduled_messages.sql`, `0083_scheduled_message_notify_default.sql` | 위 스키마 + info-only bot 기본값 보정 (+ immutable-checksums.json 갱신) |
+| `migrations/postgres/0082_scheduled_messages.sql` ~ `0085_scheduled_message_resume_anchor_not_null.sql` | 라이브 0082 checksum 보존 + info-only bot 기본값 + recurrence anchor additive backfill/non-null 보정 (+ immutable-checksums.json 갱신) |
 | `src/db/scheduled_messages.rs`, `src/db/scheduled_messages/{agent,outbox}.rs` | CRUD + due-claim + delivery/agent-poll/outbox 조회 쿼리 |
 | `src/server/routes/scheduled_messages.rs` | 위 7개 핸들러 |
 | `src/server/routes/mod.rs`, `domains/ops.rs` | 라우트 등록 (protected ops 도메인) |

@@ -2,6 +2,11 @@ use super::*;
 use chrono::Duration;
 use sqlx::Row;
 
+fn at_postgres_precision(value: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp_micros(value.timestamp_micros())
+        .expect("PostgreSQL-compatible timestamp should be representable")
+}
+
 async fn create_test_pool(
     prefix: &str,
     label: &str,
@@ -343,7 +348,7 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
         "scheduled message trigger-now retry anchor regression",
     )
     .await;
-    let original_scheduled_at = Utc::now() + Duration::hours(2);
+    let original_scheduled_at = at_postgres_precision(Utc::now() + Duration::hours(2));
     let message = db::insert_scheduled_message_pg(
         &pool,
         &db::NewScheduledMessage {
@@ -415,6 +420,95 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_anchor() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_resume_compat",
+        "scheduled message additive resume-anchor migration",
+    )
+    .await;
+    let original_scheduled_at = at_postgres_precision(Utc::now() + Duration::hours(2));
+    let message = db::insert_scheduled_message_pg(
+        &pool,
+        &db::NewScheduledMessage {
+            content: "legacy trigger-now cadence payload".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "announce".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: original_scheduled_at,
+            schedule: Some("@every 1h".to_string()),
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+        },
+    )
+    .await
+    .expect("insert legacy trigger-now definition");
+    let manual = db::trigger_now_pg(&pool, &message.id, "legacy-worker", LEASE_SECS)
+        .await
+        .expect("trigger legacy recurring definition")
+        .expect("legacy definition should trigger");
+    assert!(manual.fire_scheduled_at < original_scheduled_at);
+
+    sqlx::query(
+        "ALTER TABLE scheduled_message_deliveries
+         ALTER COLUMN resume_scheduled_at DROP NOT NULL",
+    )
+    .execute(&pool)
+    .await
+    .expect("simulate the nullable 0084 schema");
+    sqlx::query(
+        "UPDATE scheduled_message_deliveries
+         SET resume_scheduled_at = NULL
+         WHERE id = $1",
+    )
+    .bind(&manual.delivery_id)
+    .execute(&pool)
+    .await
+    .expect("simulate a pre-0084 active delivery");
+
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/postgres/0085_scheduled_message_resume_anchor_not_null.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("apply resume-anchor compatibility migration");
+
+    let restored_anchor: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT resume_scheduled_at
+         FROM scheduled_message_deliveries
+         WHERE id = $1",
+    )
+    .bind(&manual.delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read migrated resume anchor");
+    assert_eq!(
+        restored_anchor, original_scheduled_at,
+        "an active trigger-now delivery must resume the parent's regular slot"
+    );
+    let is_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'scheduled_message_deliveries'
+           AND column_name = 'resume_scheduled_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read migrated resume-anchor nullability");
+    assert_eq!(is_nullable, "NO");
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_poller() {
     let (pg_db, pool) = create_test_pool(
         "agentdesk_smsg_agent_trigger_retry",
@@ -430,7 +524,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
     .execute(&pool)
     .await
     .expect("seed trigger-now retry agent");
-    let original_scheduled_at = Utc::now() + Duration::hours(2);
+    let original_scheduled_at = at_postgres_precision(Utc::now() + Duration::hours(2));
     let message = db::insert_scheduled_message_pg(
         &pool,
         &db::NewScheduledMessage {
