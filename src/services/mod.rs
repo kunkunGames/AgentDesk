@@ -54,10 +54,6 @@ pub mod memory;
 // live on clean sibling modules. Remove during message_outbox dead-code cleanup.
 #[allow(dead_code)]
 pub mod message_outbox;
-pub mod message_outbox_recovery;
-pub(crate) mod message_outbox_recovery_support;
-#[cfg(test)]
-mod message_outbox_recovery_tests;
 pub mod monitoring_store;
 pub mod observability;
 pub mod onboarding;
@@ -87,7 +83,6 @@ pub mod provider_exec;
 // live on clean sibling modules. Remove during provider_hosting dead-code cleanup.
 #[allow(dead_code)]
 pub mod provider_hosting;
-pub(crate) mod provider_output_guard;
 pub mod provider_runtime;
 pub mod queue;
 pub mod qwen;
@@ -134,6 +129,3 @@ pub mod turn_orchestrator;
 // `services::remote` must replace `remote_stub` only when the ADR prerequisites
 // in `docs/codex-remote-ssh-policy.md` are satisfied.
 pub use remote_stub as remote;
-
-#[cfg(test)]
-mod provider_output_guard_tests;

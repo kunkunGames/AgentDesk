@@ -176,19 +176,14 @@ async fn enqueue_stuck_alert(
     pool: &PgPool,
     target: &str,
     content: &str,
-) -> Result<(), crate::services::message_outbox::OutboxEnqueueError> {
-    crate::services::message_outbox::enqueue_outbox_pg_returning_id_with_ttl(
-        pool,
-        crate::services::message_outbox::OutboxMessage {
-            target,
-            content,
-            bot: "notify",
-            source: "dispatch_watchdog",
-            reason_code: Some("dispatch_stuck"),
-            session_key: None,
-        },
-        0,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO message_outbox (target, content, bot, source, reason_code, status)
+         VALUES ($1, $2, 'notify', 'dispatch_watchdog', 'dispatch_stuck', 'pending')",
     )
+    .bind(target)
+    .bind(content)
+    .execute(pool)
     .await?;
     Ok(())
 }

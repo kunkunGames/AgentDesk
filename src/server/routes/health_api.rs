@@ -48,7 +48,7 @@ struct RelayRecoveryRequest {
     apply: bool,
 }
 
-pub(super) fn local_or_configured_control_endpoint_allowed(
+fn local_or_configured_control_endpoint_allowed(
     config: &crate::config::Config,
     peer_addr: Option<SocketAddr>,
 ) -> bool {

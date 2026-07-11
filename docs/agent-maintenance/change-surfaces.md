@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-07-11 (against #4424 message_outbox source contract and protected idempotent recovery API).
+> Last refreshed: 2026-07-08 (against #4218 log field-key unification — tmux watcher path touched by tracing key rename only, `channel =` -> `channel_id =`; line counts and freeze entries unchanged).
 >
 > PR #3456 dcserver-robustness: freeze counts re-synced after the reconcile
 > row-allocation churn reduction (`src/reconcile.rs` now 1816 prod lines) and the
@@ -46,38 +46,9 @@
 
 ## Surface Map (by feature)
 
-### `provider_output_guard`
-
-- canonical_modules:
-  - `src/services/provider_output_guard.rs` — pure, provider-aware,
-    Markdown-aware whole-response classifier (`Clean` / `Hold` / `Blocked`).
-  - `src/services/claude_tui/hook_output_guard.rs` — bounded Claude
-    Stop/SubagentStop transcript-tail reader with canonical-path containment.
-  - `src/services/discord/response_sanitizer.rs::sanitize_provider_response` —
-    terminal Discord fail-closed boundary.
-  - `src/services/discord/tmux_watcher/provider_output_guard.rs` and
-    `src/services/discord/turn_bridge/stream_tick.rs::guarded_bridge_rollover_edit`
-    — raw streaming-rollover boundaries.
-- legacy_modules: none. Do not add substring replacement or partial redaction
-  for provider harness control data; classify and hold/block the whole response.
-- invariants: inspect prose outside fenced and inline Markdown code; scope
-  Claude fingerprints to Claude; require compound high-confidence markers for
-  terminal blocking; hold partial/standalone control markers while streaming;
-  never advance a rollover offset after a held or blocked frame; never log or
-  echo matched raw text, transcript paths, or provider-supplied block reasons.
-- hook_boundary: transcript path/read/parse failures fail open so the provider
-  is not trapped in a Stop-hook retry loop; a classified Claude completion
-  returns only the static block decision/reason and enters neither prompt-ready,
-  broadcast, nor hook-registry delivery. `stop_hook_active=true` bypasses the
-  second inspection to bound the retry.
-- tests: `cargo test invariant_4371 --lib`; raw JSONL fixture coverage crosses
-  the real watcher parser and Discord formatter, while gateway seams pin both
-  streaming rollover paths to safe bodies/no offset progression.
-- related_issues: #4371.
-
 ### `discord_outbound`
 
-- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery,transport,send_to_agent,send_target,send_gate,send_api,manual_delivery,source_registry}.rs`
+- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery,transport,send_to_agent,send_target,send_gate,send_api,manual_delivery}.rs`
   (#1006 v3 domain types, pure planner, delivery implementation, shared
   transport/dedup primitives, and the #3038 send-to-agent/manual outbound
   dispatch surface).
@@ -90,9 +61,7 @@
     delivery lease/frontier/owner-context sidecar, plus the #4081 bounded
     recent-content fingerprint guard; bugfix only until split under #3405).
   - `src/services/message_outbox.rs` is the PG-backed message outbox
-    enqueue/claim/accounting surface; `src/services/message_outbox_recovery.rs`
-    plus `message_outbox_recovery_support.rs` own exact-ID inspection and
-    idempotent failed-row redrive (all below the giant-file threshold once
+    enqueue/claim/accounting surface (now below the giant-file threshold once
     `#[cfg(test)] mod` blocks are excluded; bugfix only until split).
 - active_callsite_coverage: see
   [`discord-outbound-migration.md`](discord-outbound-migration.md) (table is
@@ -183,9 +152,7 @@
     "session ended … start a new session" tmux-death notice and its
     `should_send_session_ended_notice`/`session_ended_notice`/
     `TmuxDeathLifecycleDecision` plumbing).
-  - `src/services/discord/tmux.rs` (1624 lines; test-only #4253 wires the
-    deterministic task-notification-kind disk-save/reload/restart roundtrip
-    module, with no production-LoC or runtime behavior change; +11 from #4380 broadening the
+  - `src/services/discord/tmux.rs` (1624 lines; +11 from #4380 broadening the
     watcher-yield escape hatch (`watcher_should_yield_to_inflight_state`) to honour
     the `readopted_from_inflight` crash re-adopt marker via
     `crash_resume_guard::crash_readopt_live_relay_resume_required`, so a
@@ -1591,8 +1558,7 @@
 
 ### `dashboard_routes`
 
-- canonical_modules: `src/server/routes/*.rs` (per-domain route module), including
-  the protected exact-ID `src/server/routes/message_outbox.rs` operator surface.
+- canonical_modules: `src/server/routes/*.rs` (per-domain route module).
   `src/server/routes/auto_queue.rs` is now a small HTTP-only facade;
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
