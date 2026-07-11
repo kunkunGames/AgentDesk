@@ -54,6 +54,8 @@ src/
 │   └── mod.rs
 ├── db/
 │   ├── auto_queue/
+│   │   ├── entries/
+│   │   │   └── dispatch_failure.rs
 │   │   ├── claim.rs
 │   │   ├── consultation.rs
 │   │   ├── entries.rs
@@ -966,7 +968,6 @@ src/
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
 │   │   ├── pg_io.rs
-│   │   ├── quality_alert.rs
 │   │   ├── queries.rs
 │   │   ├── recovery_audit.rs
 │   │   ├── relay_signal_alert.rs

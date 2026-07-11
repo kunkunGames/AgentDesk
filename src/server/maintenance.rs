@@ -213,8 +213,7 @@ impl MaintenanceJob for AgentQualityRollupJob {
             tracing::info!(
                 job = self.name(),
                 upserted_rows = report.upserted_rows,
-                alert_count = report.alert_count,
-                "agent quality rollup completed"
+                "agent quality aggregation rollup completed; alerts are owned by quality_regression_alerter"
             );
             Ok(())
         })
@@ -223,7 +222,8 @@ impl MaintenanceJob for AgentQualityRollupJob {
 
 /// #1104 (911-4) hourly regression rule engine.
 ///
-/// Runs the rule engine in `services::agent_quality::regression_alerts`
+/// Sole regression-alert authority. Runs the rule engine in
+/// `services::agent_quality::regression_alerts`
 /// against the `agent_quality_daily` rollup. The 15s startup stagger keeps
 /// it sequenced AFTER `agent_quality_rollup` (stagger=0) on the same tick
 /// so alerts always evaluate against the freshest aggregates.

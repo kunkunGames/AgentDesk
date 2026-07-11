@@ -786,13 +786,21 @@ class LegacySqliteCheck(unittest.TestCase):
         monitor = (REPO_ROOT / "scripts" / "auto-queue-monitor.sh").read_text(
             encoding="utf-8"
         )
-        discord_health = (
-            REPO_ROOT / "src" / "services" / "discord" / "health.rs"
+        outbox_route = (
+            REPO_ROOT / "src" / "server" / "routes" / "message_outbox.rs"
+        ).read_text(encoding="utf-8")
+        source_registry = (
+            REPO_ROOT
+            / "src"
+            / "services"
+            / "discord"
+            / "outbound"
+            / "source_registry.rs"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('source:"auto-queue"', monitor)
-        self.assertNotIn('source:"auto-queue-monitor"', monitor)
-        self.assertIn('"auto-queue"', discord_health)
+        self.assertIn("/api/message-outbox/monitor-alerts", monitor)
+        self.assertIn('source: "auto-queue-monitor"', outbox_route)
+        self.assertIn('"auto-queue-monitor"', source_registry)
 
 
 class SourceOfTruthAliasCheck(unittest.TestCase):
@@ -908,9 +916,13 @@ class HarnessCli(unittest.TestCase):
         self.assertEqual(json_payload["baseline_gate_count"], 3)
 
     def test_check_mode_returns_zero_with_no_findings(self) -> None:
-        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}):
+        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text("", encoding="utf-8")
             with mock.patch.object(sys, "stdout", new=mock.MagicMock()):
-                rc = HARNESS.main(["--check", "--format", "json"])
+                rc = HARNESS.main(
+                    ["--check", "--format", "json", "--allowlist", str(allowlist)]
+                )
         self.assertEqual(rc, 0)
 
     def test_check_mode_fails_on_direct_discord_send_regression(self) -> None:

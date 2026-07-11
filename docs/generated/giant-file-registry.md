@@ -55,7 +55,7 @@
 | `src/cli/migrate/source.rs` | 1612 |
 | `src/cli/provider_cli/mod.rs` | 1039 |
 | `src/config.rs` | 2723 |
-| `src/db/auto_queue/entries.rs` | 1508 |
+| `src/db/auto_queue/entries.rs` | 1408 |
 | `src/db/auto_queue/phase_gates.rs` | 1639 |
 | `src/db/dispatched_sessions.rs` | 1734 |
 | `src/db/dispatches/mod.rs` | 1028 |
@@ -66,7 +66,7 @@
 | `src/engine/loader.rs` | 1332 |
 | `src/engine/mod.rs` | 1279 |
 | `src/engine/ops/db_ops.rs` | 1212 |
-| `src/github/sync.rs` | 1508 |
+| `src/github/sync.rs` | 1504 |
 | `src/pipeline.rs` | 1383 |
 | `src/receipt.rs` | 1842 |
 | `src/reconcile.rs` | 1902 |
