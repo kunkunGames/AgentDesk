@@ -908,7 +908,7 @@
 | `services::git::branch_resolver` | `src/services/git/branch_resolver.rs` | 123 | 123 | 0 |  |
 | `services::git::commit_resolver` | `src/services/git/commit_resolver.rs` | 378 | 357 | 21 |  |
 | `services::git::remote` | `src/services/git/remote.rs` | 16 | 16 | 0 |  |
-| `services::git::repo_resolver` | `src/services/git/repo_resolver.rs` | 283 | 251 | 32 |  |
+| `services::git::repo_resolver` | `src/services/git/repo_resolver.rs` | 272 | 240 | 32 |  |
 | `services::git::runner` | `src/services/git/runner.rs` | 426 | 398 | 28 |  |
 | `services::git::worktree_resolver` | `src/services/git/worktree_resolver.rs` | 467 | 451 | 16 |  |
 | `services::github_issue_creation` | `src/services/github_issue_creation.rs` | 682 | 520 | 162 |  |
