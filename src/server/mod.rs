@@ -6,7 +6,6 @@ pub(crate) mod issue_specs;
 pub(crate) mod maintenance;
 pub(crate) mod multinode_regression;
 mod outbox_delivery_alert;
-mod outbox_gc;
 pub(crate) mod resource_locks;
 pub mod routes;
 pub(crate) mod task_dispatch_claims;
@@ -2902,9 +2901,10 @@ async fn message_outbox_loop(pg_pool: Arc<PgPool>, health_registry: Option<Arc<H
         // `background_should_yield`.
 
         if std::time::Instant::now() >= next_gc_at {
-            match outbox_gc::gc_stale_message_outbox_rows(pg_pool.as_ref()).await {
-                Ok((failed, sent)) if failed + sent > 0 => {
+            match crate::services::message_outbox::gc_stale_outbox_rows(pg_pool.as_ref()).await {
+                Ok((held, failed, sent)) if held + failed + sent > 0 => {
                     tracing::info!(
+                        held_pruned = held,
                         failed_pruned = failed,
                         sent_pruned = sent,
                         "[outbox] gc swept stale message_outbox rows"
