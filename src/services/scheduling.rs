@@ -48,7 +48,7 @@ fn parse_schedule(schedule: &str) -> Result<ParsedSchedule> {
     let trimmed = schedule.trim();
     if trimmed.is_empty() {
         return Err(anyhow!(
-            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+            "unsupported schedule '{schedule}'; expected @every <duration> or 5-field cron"
         ));
     }
     if trimmed.starts_with("@every ") || trimmed.starts_with("every ") {
@@ -56,14 +56,14 @@ fn parse_schedule(schedule: &str) -> Result<ParsedSchedule> {
     }
     if trimmed.starts_with('@') {
         return Err(anyhow!(
-            "unsupported routine schedule '{schedule}'; expected @every <duration> or 5-field cron"
+            "unsupported schedule '{schedule}'; expected @every <duration> or 5-field cron"
         ));
     }
 
     let field_count = trimmed.split_whitespace().count();
     if field_count != 5 {
         return Err(anyhow!(
-            "unsupported routine cron schedule '{schedule}'; expected exactly 5 fields"
+            "unsupported cron schedule '{schedule}'; expected exactly 5 fields"
         ));
     }
     let cron = CronParser::builder()
@@ -71,7 +71,7 @@ fn parse_schedule(schedule: &str) -> Result<ParsedSchedule> {
         .year(Year::Disallowed)
         .build()
         .parse(trimmed)
-        .map_err(|e| anyhow!("invalid routine cron schedule '{schedule}': {e}"))?;
+        .map_err(|e| anyhow!("invalid cron schedule '{schedule}': {e}"))?;
     Ok(ParsedSchedule::Cron(cron))
 }
 
@@ -79,7 +79,7 @@ fn next_every_due_after(duration: Duration, now: DateTime<Utc>) -> Result<DateTi
     checked_add_duration(
         truncate_to_second(now),
         duration,
-        "compute next routine interval occurrence",
+        "compute next interval occurrence",
     )
 }
 
@@ -90,9 +90,7 @@ fn next_every_due_after_anchor(
 ) -> Result<DateTime<Utc>> {
     let interval_secs = duration.num_seconds();
     if interval_secs <= 0 {
-        return Err(anyhow!(
-            "routine schedule duration must be greater than zero"
-        ));
+        return Err(anyhow!("schedule duration must be greater than zero"));
     }
 
     let anchor = truncate_to_second(anchor);
@@ -104,16 +102,16 @@ fn next_every_due_after_anchor(
         elapsed_secs
             .checked_div(interval_secs)
             .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?
+            .ok_or_else(|| anyhow!("compute anchored interval occurrence: overflow"))?
     };
     let total_secs = interval_secs
         .checked_mul(steps)
-        .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?;
+        .ok_or_else(|| anyhow!("compute anchored interval occurrence: overflow"))?;
 
     checked_add_duration(
         anchor,
         Duration::seconds(total_secs),
-        "compute anchored routine interval occurrence",
+        "compute anchored interval occurrence",
     )
 }
 
@@ -123,11 +121,11 @@ fn next_cron_due_after(
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>> {
     let timezone = Tz::from_str(default_timezone)
-        .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
+        .map_err(|_| anyhow!("invalid schedule timezone '{default_timezone}'"))?;
     let zoned_now = now.with_timezone(&timezone);
     cron.find_next_occurrence(&zoned_now, false)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
+        .map_err(|e| anyhow!("compute next cron occurrence: {e}"))
 }
 
 fn truncate_to_second(value: DateTime<Utc>) -> DateTime<Utc> {
@@ -154,7 +152,7 @@ fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
         .trim();
     if duration.is_empty() {
         return Err(anyhow!(
-            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+            "unsupported schedule '{schedule}'; expected @every <duration>"
         ));
     }
 
@@ -164,16 +162,14 @@ fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
     let (amount, unit) = duration.split_at(split_at);
     if amount.is_empty() || unit.trim().is_empty() {
         return Err(anyhow!(
-            "unsupported routine schedule '{schedule}'; expected @every <duration>"
+            "unsupported schedule '{schedule}'; expected @every <duration>"
         ));
     }
     let amount: i64 = amount
         .parse()
-        .map_err(|e| anyhow!("invalid routine schedule amount '{amount}': {e}"))?;
+        .map_err(|e| anyhow!("invalid schedule amount '{amount}': {e}"))?;
     if amount <= 0 {
-        return Err(anyhow!(
-            "routine schedule duration must be greater than zero"
-        ));
+        return Err(anyhow!("schedule duration must be greater than zero"));
     }
 
     let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
@@ -183,13 +179,13 @@ fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
         "d" | "day" | "days" => 60 * 60 * 24,
         other => {
             return Err(anyhow!(
-                "unsupported routine schedule unit '{other}'; expected s, m, h, or d"
+                "unsupported schedule unit '{other}'; expected s, m, h, or d"
             ));
         }
     };
     let seconds = amount
         .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("routine schedule duration is too large"))?;
+        .ok_or_else(|| anyhow!("schedule duration is too large"))?;
     Ok(Duration::seconds(seconds))
 }
 
@@ -216,7 +212,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_schedules() {
-        assert!(validate_schedule("").is_err());
+        let error = validate_schedule("").unwrap_err().to_string();
+        assert!(error.contains("unsupported schedule"));
+        assert!(!error.contains("routine"));
         assert!(validate_schedule("@every 0s").is_err());
         assert!(validate_schedule("@daily").is_err());
         assert!(validate_schedule("* * * * * *").is_err());

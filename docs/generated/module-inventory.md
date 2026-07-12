@@ -1022,7 +1022,7 @@
 | `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 1249 | 940 | 309 |  |
 | `services::scheduled_messages::evidence` | `src/services/scheduled_messages/evidence.rs` | 132 | 132 | 0 |  |
 | `services::scheduled_messages::timing` | `src/services/scheduled_messages/timing.rs` | 53 | 53 | 0 |  |
-| `services::scheduling` | `src/services/scheduling.rs` | 283 | 195 | 88 |  |
+| `services::scheduling` | `src/services/scheduling.rs` | 281 | 191 | 90 |  |
 | `services::service_error` | `src/services/service_error.rs` | 1 | 1 | 0 |  |
 | `services::session_activity` | `src/services/session_activity.rs` | 354 | 275 | 79 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1078 | 667 | 411 |  |
