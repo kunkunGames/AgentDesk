@@ -62,9 +62,9 @@ enum StaticSendSource {
     QueueOverflowNotice,
     OutboxDeliveryAlert,
     LongTurnWatchdog,
-    AgentQualityRollup,
     RelaySignalRollup,
     DispatchWatchdog,
+    StallWatchdog,
     AgentdeskCli,
     Operator,
     Dashboard,
@@ -119,9 +119,11 @@ const POLICIES: &[SourcePolicy] = &[
     policy!(QueueOverflowNotice, "queue_overflow_notice", LOOPBACK),
     policy!(OutboxDeliveryAlert, "outbox_delivery_alert", LOOPBACK),
     policy!(LongTurnWatchdog, "long_turn_watchdog", LOOPBACK),
-    policy!(AgentQualityRollup, "agent_quality_rollup", LOOPBACK),
     policy!(RelaySignalRollup, "relay_signal_rollup", LOOPBACK),
     policy!(DispatchWatchdog, "dispatch_watchdog", LOOPBACK),
+    // #4460: stall watchdog now MENTIONS the owner instead of force-terminating
+    // a suspected-stall turn — it posts a rate-limited outbox alert.
+    policy!(StallWatchdog, "stall_watchdog", LOOPBACK),
     policy!(AgentdeskCli, "agentdesk-cli", CLI),
     policy!(Operator, "operator", CLI),
     policy!(Dashboard, "dashboard", DASHBOARD),
@@ -184,9 +186,9 @@ mod tests {
         "queue_overflow_notice",
         "outbox_delivery_alert",
         "long_turn_watchdog",
-        "agent_quality_rollup",
         "relay_signal_rollup",
         "dispatch_watchdog",
+        "stall_watchdog",
     ];
 
     #[test]

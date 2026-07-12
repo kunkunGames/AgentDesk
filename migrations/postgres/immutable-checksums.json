@@ -445,6 +445,11 @@
       "path": "migrations/postgres/0086_scheduled_message_launch_commit_and_runtime_defer.sql",
       "sha256": "dffcc1786298a319875f7a1113b7c7d9a3ea538f2111537daef1f13dae0b2877",
       "version": 86
+    },
+    {
+      "path": "migrations/postgres/0087_task_notification_card_state.sql",
+      "sha256": "a0c69739f62c445823d0d8a1bc0b8715d76a251ca61c4ea91badbfc324232ca0",
+      "version": 87
     }
   ],
   "version": 1

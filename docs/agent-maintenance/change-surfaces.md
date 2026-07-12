@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-07-11 (against #4424 message_outbox source contract and protected idempotent recovery API).
+> Last refreshed: 2026-07-11 (manual: #4055 durable task-notification card authority).
 >
 > PR #3456 dcserver-robustness: freeze counts re-synced after the reconcile
 > row-allocation churn reduction (`src/reconcile.rs` now 1816 prod lines) and the
@@ -109,6 +109,37 @@
   `outbound/{message,policy,decision,result}.rs`.
 - related_issues: #1006, #1175, #1280.
 
+### `task_notification_card_authority`
+
+- canonical_modules:
+  - `src/services/discord/task_notification_delivery/{mod,store,gateway}.rs`
+    owns semantic identity, PG lease/CAS state, stable Discord nonce, bot
+    pinning, and classified create/edit/replacement delivery.
+  - `src/services/discord/tui_prompt_relay/task_notification_prompt.rs` owns
+    prompt observation/footer deferral; `session_relay_sink/task_notification_context.rs`
+    owns card-before-answer promotion and exact reference selection.
+  - `src/services/discord/gateway/outbound_messages.rs` adapts task-card
+    create/edit operations to outbound v3. `gateway.rs` maps structured Discord
+    errors while `outbound/transport.rs` owns the nonce-aware Serenity create
+    boundary and enforces the create nonce.
+- durable_state: PostgreSQL `task_notification_card_state` is cluster-shared
+  authority. The process-local store is a test/non-PG fallback only.
+- invariants: one logical event row and stable nonce; ambiguous creates retry
+  that nonce within Discord's bounded replay window (the PG row/message id is
+  the durable authority, not an indefinite Discord nonce guarantee); transient
+  edits never repost; replacement requires structured Discord `404/10008`; a
+  non-empty task response is sent only after card confirmation and references
+  that card; watcher direct fallback consults the exact PG event/turn fence and
+  stays blocked until the referenced response is confirmed and its commit-fence
+  decision has run; footer eviction requires the exact terminal `tool_use_id`.
+- tests: `task_notification_delivery/tests.rs`,
+  `session_relay_sink/task_notification_context.rs`, and
+  `placeholder_live_events/tests.rs`, plus
+  `tmux_watcher/terminal_direct_fallback.rs` for the fail-closed retry gate.
+  `just test` runs the non-PG task/card filters; `just test-postgres` runs the
+  unique-winner and crash-window replay cases.
+- related_issues: #4055, #3654, #4097.
+
 ### `policy_engine`
 
 - canonical_modules: `src/engine/mod.rs` (driver) plus `src/engine/ops/*.rs`
@@ -144,9 +175,11 @@
   - `src/dispatch/dispatch_context.rs` (2817 lines).
   - `src/dispatch/dispatch_create.rs` (1334 lines).
   - `src/dispatch/dispatch_status.rs` (1445 lines).
-  - `src/services/dispatches/outbox_route.rs` (1172 lines; route extraction
+  - `src/services/dispatches/outbox_route.rs` (1173 lines; +1 from #4055
+    preserving the typed transient delivery result; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
   - `src/services/dispatches/discord_delivery/orchestration.rs` (1496 lines;
+    +1 from #4055 preserving the typed transient delivery result;
     delivery orchestration surface extracted from the route layer in #1760,
     split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
@@ -782,8 +815,10 @@
     lives in the new `tui_task_card.rs` module, and the shared
     `strip_terminal_controls` + ASCII `truncate_chars` helpers were consolidated
     there too, so this file's surface shrank by one line overall; the new
-    `tui_task_card.rs` module (~1065 prod LoC — crossed the giant threshold in #4032 with Discord-limit clamps, fence-aware preview handling, and regression coverage; registered in the giant-file registry, decompose per #3405) hosts the
-    card render/parse/JSON-aggregate/dedupe-store logic; +48 from #3075 codex P1
+    `tui_task_card.rs` module now hosts only card render/parse/sanitizer logic;
+    #4055 moved its process-local delivery/store authority into the durable
+    `task_notification_delivery/` siblings, shrinking it to 818 prod LoC and
+    removing it from the giant-file registry. +48 from #3075 codex P1
     #1: a `CardSlot::Pending` variant + `TaskCardOutcome` enum so a repeat that
     races ahead of `record_card_message` drops as a no-op instead of building
     `MessageId::new(0)` (panic), plus the pre-record-repeat regression test);
@@ -1187,7 +1222,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2694 lines; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
+  - `src/services/discord/health/recovery.rs` (2560 lines; #4460 follow-up extracted non-destructive branch-4 paging into `health/recovery/stall_alert.rs` (174 prod lines): alerts use canonical `channel:<id>` plus the real provider session identity so Claude/Codex DMs select their provider bot while public channels keep `notify`, owner 0 and the TUI synthetic owner 1 never render mentions, and the production liveness decision suppresses pre-backstop producer-live pages while genuine stalls still page; the parent branch never cleans/cancels/deletes turn authority. The original #4460 change removed the branch-4 "desynced force-clean" execution and dropped `preserve_resume_selector_on_force_clean` plus the test-only force-clean hook seam; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
     round 4 requiring strict provider-less stale-mailbox repair to verify a
     peeked local mailbox has an active token or queue before treating it as
     ownership evidence; +45 from #4048 round 3 scoping provider-less
@@ -1267,8 +1302,9 @@
     `min(now+timeout, ceiling)` cap + one-shot ceiling warn and the auto-extend
     `clamp_auto_extend_deadline_ms` clamp, reusing the shared discord/mod.rs
     helpers, so headless Codex honors its 4h ceiling end to end).
-  - `src/services/discord/meeting_orchestrator.rs` (3222 lines after #3034
-    dead-code sweep removed `is_meeting_channel`).
+  - `src/services/discord/meeting_orchestrator.rs` (3222 lines; +1 from #4055
+    preserving the typed transient delivery result; #3034 dead-code sweep
+    removed `is_meeting_channel`).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (993 prod lines; provider
     stop-token/tmux binding runtime + the async interrupt/cancel/hard-stop
     orchestration + session-teardown. #3169: the claude-anonymous-teardown
@@ -1430,7 +1466,7 @@
     with persisted queue-marker state for notification-only 📬/⏳/✅/⚠/🛑 updates,
     queue cancel cleanup, and requeue coalescing; bugfix-only until a follow-up
     can split persistence/tests from the runtime reconciler).
-  - `src/services/discord/formatting.rs` (2862 lines; +41 from #4214 converting every Discord-limit length judgment in the send/chunk paths from UTF-8 byte length to unicode code-point count (Korean answers no longer split ~3x early at ~666 chars) with a safe char-budget→byte-index boundary mapper; code-fence preservation and the #1043 empty-chunk guard unchanged; +14 reconciled to the current module-inventory production surface per #4183 CI-red recovery (post-surgery inventory drift); -2 from #4049 S4-b doc-comment sync on the reconciler-routed reaction path; +25 from #3998 D1 exposing
+  - `src/services/discord/formatting.rs` (2566 lines; -296 from #4055 moving the durable continuation rollback journal into `formatting/rollback_journal.rs`; +41 from #4214 converting every Discord-limit length judgment in the send/chunk paths from UTF-8 byte length to unicode code-point count (Korean answers no longer split ~3x early at ~666 chars) with a safe char-budget→byte-index boundary mapper; code-fence preservation and the #1043 empty-chunk guard unchanged; +14 reconciled to the current module-inventory production surface per #4183 CI-red recovery (post-surgery inventory drift); -2 from #4049 S4-b doc-comment sync on the reconciler-routed reaction path; +25 from #3998 D1 exposing
     raw long-send created message ids and fallback replacement anchors for
     recovery anchor persistence while the existing `send_long_message_raw_with_reference`
     surface remains a unit-returning wrapper; presentation/chunking behavior unchanged. -25 from #4019 R1 moving
@@ -1687,7 +1723,7 @@
   - `src/config.rs` (2723 lines; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease).
   - `src/server/mod.rs` (2800 lines; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root; #1122 extracts message-outbox GC into `src/server/outbox_gc.rs`, net -21 production lines in root).
   - `src/receipt.rs` (1842 lines).
-  - `src/github/sync.rs` (1508 lines).
+  - `src/github/sync.rs` (1504 lines).
   - `src/reconcile.rs` (1902 lines; +39 from #4104 standardized inflight-row
     removal logging at the `sweep_stale_inflight_files` site; #3685 rebind-origin
     stale-inflight preservation review hardening; periodic reconcile loop
@@ -1723,8 +1759,9 @@
   - `src/db/auto_queue/tests.rs` is the migrated auto-queue test harness; it is a
     dedicated `*_tests.rs` file (excluded from the production giant-file count),
     so add coverage freely but keep it split-friendly.
-  - `src/db/auto_queue/entries.rs` (1508 lines; awaiting follow-up split per
-    auto-queue decompose epic #1782).
+  - `src/db/auto_queue/entries.rs` (1408 lines after #4448 extracted terminal
+    dispatch-failure/outbox atomicity into `entries/dispatch_failure.rs`;
+    awaiting follow-up split per auto-queue decompose epic #1782).
   - `src/db/auto_queue/phase_gates.rs` (1639 lines after #1980 durable
     reconciliation, production LoC; PG-backed tests for `current_batch_phase_pg`
     + `reconcile_phase_gate_for_terminal_dispatch_on_pg_tx` live in a
@@ -1786,7 +1823,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `src/services/settings.rs` (1114) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)
-- `src/services/dispatches/outbox_route.rs` (1172) — dispatch outbox route
+- `src/services/dispatches/outbox_route.rs` (1173) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
 - `src/services/claude.rs` (2948; -21 from #4113 backend_routing/availability extraction), `src/services/gemini.rs` (1358),
@@ -1851,13 +1888,6 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   fast with an actionable, non-timeout reason instead of false-submitting then
   blind-waiting/retrying the full timeout; gate every ready-return path —
   including the recorded-turn idle-transcript fallbacks — on the MCP-auth check.)
-- `src/services/discord/tui_task_card.rs` (~1065 prod LoC) — subtask/result
-  card render/parse/JSON-aggregate/dedupe-store logic plus the shared
-  `strip_terminal_controls`/ASCII-truncate helpers. Crossed the giant threshold
-  in #4032 with Discord-limit hard clamps, fence-aware Markdown preview
-  handling, and regression coverage; registered in the giant-file registry,
-  decompose per #3405 (lift preview rendering/budgeting and card-store state
-  into narrower siblings) before adding non-bugfix behavior.
 - `src/services/tmux_common.rs` (~1090 prod LoC) — Claude/Codex TUI pane-capture
   heuristics: ready-for-input, prompt-draft vs idle-suggestion-ghost, active-work
   streaming, MCP-auth banner, and `/effort` selector detection, plus session
@@ -1958,9 +1988,11 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   from #3864 moving SIGTERM queue-restore merge inside the mailbox actor; +10
   from #4018 round-2 adding the distinct `MonitorAutoTurn` active-turn marker
   while keeping monitor turns background for queue-yield/cancel semantics).
-- `src/services/discord/session_relay_sink.rs` (1679; -59 from #3998 S1-f2
+- `src/services/discord/session_relay_sink.rs` (1689; -59 from #3998 S1-f2
   retiring the A2b rollout getter/cache and flag-OFF pin tests; +7 from #3610
-  PR-1 passing the terminal anchor into the delivered-frontier shadow mirror).
+  PR-1 passing the terminal anchor into the delivered-frontier shadow mirror;
+  -1 prod from #4055 thin card-before-answer/context wiring, with task policy
+  extracted to `session_relay_sink/task_notification_context.rs`).
 
 Decomposed below the giant-file threshold (no longer frozen; bugfix-scoped but
 normal test growth is allowed): `src/services/analytics.rs`,
@@ -1972,7 +2004,9 @@ normal test growth is allowed): `src/services/analytics.rs`,
 `src/services/qwen_tmux_wrapper.rs`,
 `src/services/discord/session_runtime.rs`,
 `src/services/tui_turn_state.rs`,
-`src/voice/turn_link.rs`, `src/services/discord/commands/config.rs`
+`src/voice/turn_link.rs`, `src/services/discord/commands/config.rs`,
+`src/services/discord/tui_task_card.rs` (#4055: 1167 -> 818 after durable
+delivery/store authority moved to `task_notification_delivery/`).
 (#3038 S2: 1054 -> 954 after the session-override bookkeeping helpers
 moved verbatim to `discord/shared_state.rs` next to
 `SessionOverrideState`; still ratcheted at 954 in the frozen baseline).

@@ -14,10 +14,10 @@
 //!     in-memory atomics — atomics reset to 0 on every process restart and are
 //!     per-provider scoped, which breaks delta bookkeeping across deploys.
 //!   * Driven by the hourly `MaintenanceJob` scheduler (PG pool in hand), the
-//!     same proven harness `agent_quality_rollup` uses — not the per-provider
+//!     same proven scheduler harness the aggregation rollup uses — not the per-provider
 //!     stall watchdog (hot path, single-provider scope).
-//!   * Anti-spam is a TOCTOU-safe kv_meta dedupe-slot claim mirroring
-//!     `quality_alert.rs`, keyed by `relay_alert:{signal}:{hour_bucket}` with a
+//!   * Anti-spam is a TOCTOU-safe kv_meta dedupe-slot claim keyed by
+//!     `relay_alert:{signal}:{hour_bucket}` with a
 //!     1-hour TTL so each signal alerts at most once per hour.
 //!   * Delivery reuses the existing `message_outbox` enqueue path (bot
 //!     "notify"). It deliberately does NOT use the announce-bot fallback, whose
@@ -107,7 +107,7 @@ pub(super) fn effective_threshold(signal: &RelaySignal, override_threshold: Opti
 
 /// #3561: atomically claim the dedupe slot for `key` iff the previous claim is
 /// older than `RELAY_SIGNAL_ALERT_DEDUPE_TTL_SECS`. Mirrors
-/// `quality_alert::claim_quality_alert_slot_pg` — single-statement TOCTOU-safe
+/// the established alert-slot pattern — single-statement TOCTOU-safe
 /// claim, defensive `^[0-9]+$` guard against legacy non-numeric kv_meta values.
 async fn claim_relay_alert_slot_pg(pool: &PgPool, key: &str, now_ms: i64) -> Result<bool> {
     let dedupe_ms = RELAY_SIGNAL_ALERT_DEDUPE_TTL_SECS.saturating_mul(1000);
@@ -335,9 +335,9 @@ mod tests {
     }
 
     /// The canonical signal table must cover every relay-loss vector #3561
-    /// scopes: the three relay root-cause counters plus the two offset
-    /// invariant violations. A missing entry silently drops a signal from the
-    /// operator monitor, so guard the membership explicitly.
+    /// scopes: the three relay root-cause counters, offset invariant
+    /// violations, and fail-closed ambiguous task responses. A missing entry
+    /// silently drops a signal from the operator monitor, so guard membership.
     #[test]
     fn signal_table_covers_documented_relay_loss_vectors() {
         let keys: Vec<&str> = RELAY_SIGNAL_DEFINITIONS.iter().map(|s| s.key).collect();
@@ -346,6 +346,8 @@ mod tests {
             "relay_uncommitted_inflight_cleared",
             "relay_owner_unknown",
             "offset_invariant_violation",
+            "task_response_chunk_ambiguous",
+            "task_card_post_ambiguous",
         ] {
             assert!(
                 keys.contains(&expected),
@@ -402,6 +404,7 @@ mod tests {
             "relay_terminal_ack_timeout",
             "relay_uncommitted_inflight_cleared",
             "response_sent_offset_monotonic",
+            "task_response_chunk_delivery_ambiguous",
         ] {
             assert!(
                 statuses.contains(&expected),

@@ -39,6 +39,8 @@ src/
 │   ├── dcserver_pg_bootstrap.rs
 │   ├── direct.rs
 │   ├── discord.rs
+│   ├── discord_thread_create.rs
+│   ├── discord_thread_create_lock.rs
 │   ├── doctor.rs
 │   ├── init.rs
 │   ├── json_output.rs
@@ -54,6 +56,8 @@ src/
 │   └── mod.rs
 ├── db/
 │   ├── auto_queue/
+│   │   ├── entries/
+│   │   │   └── dispatch_failure.rs
 │   │   ├── claim.rs
 │   │   ├── consultation.rs
 │   │   ├── entries.rs
@@ -423,7 +427,9 @@ src/
 │   ├── discord/
 │   │   ├── catch_up/
 │   │   │   ├── classification.rs
-│   │   │   └── phase2.rs
+│   │   │   ├── classification_order_tests.rs
+│   │   │   ├── phase2.rs
+│   │   │   └── too_old_notice.rs
 │   │   ├── commands/
 │   │   │   ├── diagnostics/
 │   │   │   │   ├── mod.rs
@@ -464,10 +470,14 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── registry.rs
 │   │   ├── formatting/
-│   │   │   └── long_send_rollback.rs
+│   │   │   ├── long_send_rollback.rs
+│   │   │   └── rollback_journal.rs
+│   │   ├── gateway/
+│   │   │   └── outbound_messages.rs
 │   │   ├── health/
 │   │   │   ├── recovery/
 │   │   │   │   ├── leak_recovery_ledger.rs
+│   │   │   │   ├── stall_alert.rs
 │   │   │   │   └── watchdog_decisions.rs
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
@@ -494,10 +504,12 @@ src/
 │   │   │   ├── save_store/
 │   │   │   │   └── identity_gate.rs
 │   │   │   ├── stall_recovery_tests/
-│   │   │   │   └── flake_isolation_4361.rs
+│   │   │   │   ├── flake_isolation_4361.rs
+│   │   │   │   └── flake_isolation_4422.rs
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
 │   │   │   ├── finalizer_identity.rs
+│   │   │   ├── invariant_test_capture.rs
 │   │   │   ├── model.rs
 │   │   │   ├── orphan_relay_reclaim.rs
 │   │   │   ├── ownership_ops.rs
@@ -640,7 +652,8 @@ src/
 │   │   ├── session_relay_sink/
 │   │   │   ├── idle_jsonl.rs
 │   │   │   ├── orphan_reclaim.rs
-│   │   │   └── relay_format.rs
+│   │   │   ├── relay_format.rs
+│   │   │   └── task_notification_context.rs
 │   │   ├── session_runtime/
 │   │   │   ├── channel_routing.rs
 │   │   │   ├── restore_cwd.rs
@@ -651,6 +664,18 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── task_notification_delivery/
+│   │   │   ├── store/
+│   │   │   │   ├── missing_card_replacement.rs
+│   │   │   │   ├── response_chunks.rs
+│   │   │   │   ├── response_fence.rs
+│   │   │   │   └── response_identity.rs
+│   │   │   ├── card_post.rs
+│   │   │   ├── gateway.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── response_chunks.rs
+│   │   │   ├── store.rs
+│   │   │   └── tests.rs
 │   │   ├── tmux/
 │   │   │   └── task_notification_kind_restart_roundtrip_tests.rs
 │   │   ├── tmux_output_stream/
@@ -686,9 +711,11 @@ src/
 │   │   │   ├── streaming_status_tick.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
+│   │   │   ├── task_response_authority.rs
 │   │   │   ├── terminal_abort_exits.rs
 │   │   │   ├── terminal_commit_epilogue.rs
 │   │   │   ├── terminal_direct_fallback.rs
+│   │   │   ├── terminal_direct_fallback_tests.rs
 │   │   │   ├── terminal_long_chunks.rs
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
@@ -726,6 +753,7 @@ src/
 │   │   │   ├── synthetic_orphan_reclaim.rs
 │   │   │   ├── synthetic_start.rs
 │   │   │   ├── synthetic_start_wiring.rs
+│   │   │   ├── task_notification_prompt.rs
 │   │   │   └── tests.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
@@ -976,7 +1004,6 @@ src/
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
 │   │   ├── pg_io.rs
-│   │   ├── quality_alert.rs
 │   │   ├── queries.rs
 │   │   ├── recovery_audit.rs
 │   │   ├── relay_signal_alert.rs

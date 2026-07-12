@@ -5,7 +5,7 @@
 //! 1. [`compute_regressions`] reads the latest row per agent from
 //!    `agent_quality_daily`, computes `delta = baseline_30d - current_7d`
 //!    for each tracked metric, and emits a [`Regression`] when the delta
-//!    crosses [`DROP_THRESHOLD`] AND the per-window sample size is at
+//!    crosses the metric-specific drop threshold AND the per-window sample size is at
 //!    least [`MIN_SAMPLE_SIZE`].
 //! 2. [`should_fire_alert`] consults `quality_regression_cooldowns` and
 //!    only allows an alert through when the previous fire is older than
@@ -23,30 +23,20 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
-use crate::services::message_outbox::{OutboxMessage, enqueue_outbox_pg};
+use crate::services::message_outbox::{OutboxMessage, enqueue_outbox_pg_on_tx_with_ttl};
 
 /// Minimum 7d sample window required before an alert can fire. Mirrors the
 /// `QUALITY_SAMPLE_GUARD` used by the rollup itself in
 /// `services::observability`.
 pub const MIN_SAMPLE_SIZE: i64 = 5;
 
-/// Drop threshold expressed as an absolute fraction (0.20 == 20 percentage
-/// points). Applied to both review and turn metrics so the rule engine is
-/// uniform — the legacy path in observability uses a split 15%/20%p mix
-/// that pre-dates this rule engine.
-pub const DROP_THRESHOLD: f64 = 0.20;
+/// Policy preserved from the retired rollup-coupled producer: turn success is
+/// more sensitive (15 percentage points) while review pass uses 20 points.
+pub const TURN_DROP_THRESHOLD: f64 = 0.15;
+pub const REVIEW_DROP_THRESHOLD: f64 = 0.20;
 
 /// 24h cooldown per (agent_id, metric).
 pub const ALERT_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// Env var that overrides the alert channel; falls back to
-/// [`FALLBACK_ALERT_CHANNEL`] (adk-cc) when unset/empty.
-pub const ALERT_CHANNEL_ENV: &str = "ADK_QUALITY_ALERT_CHANNEL";
-
-/// Fallback Discord channel id (adk-cc) used when env var is unset.
-/// Same id as `services::slo::FALLBACK_ALERT_CHANNEL` so first-boot
-/// behaviour is consistent across alert pipelines.
-pub const FALLBACK_ALERT_CHANNEL: &str = "1479671298497183835";
 
 /// Optional drill-down URL prefix; the agent id is appended to form the
 /// final link. Configurable so dev / release / external dashboards can
@@ -93,13 +83,51 @@ impl Regression {
     }
 }
 
-/// Resolve the alert channel id (env override or fallback const).
-pub fn resolve_alert_channel() -> String {
-    std::env::var(ALERT_CHANNEL_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| FALLBACK_ALERT_CHANNEL.to_string())
+fn normalize_channel_target(channel: &str) -> Option<String> {
+    let channel = channel.trim();
+    if channel.is_empty() {
+        return None;
+    }
+    Some(if channel.starts_with("channel:") {
+        channel.to_string()
+    } else {
+        format!("channel:{channel}")
+    })
+}
+
+/// Preserve the retired producer's operator policy: the dedicated quality
+/// channel wins, then the shared human-alert channel. No configured target is
+/// an intentional off-switch; a hard-coded fallback would silently page a
+/// different channel after authority consolidation.
+pub(crate) async fn resolve_alert_channel_pg(pool: &PgPool) -> Result<Option<String>> {
+    let value = sqlx::query_scalar::<_, String>(
+        "SELECT value
+         FROM kv_meta
+         WHERE key IN ('agent_quality_monitoring_channel_id', 'kanban_human_alert_channel_id')
+           AND value IS NOT NULL
+           AND btrim(value) <> ''
+         ORDER BY CASE key
+                      WHEN 'agent_quality_monitoring_channel_id' THEN 0
+                      ELSE 1
+                  END
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| anyhow!("load agent quality alert target: {error}"))?;
+    Ok(value.as_deref().and_then(normalize_channel_target))
+}
+
+pub(crate) async fn resolve_alert_channel_with_env_pg(
+    pool: &PgPool,
+    env_key: &str,
+) -> Result<Option<String>> {
+    if let Ok(value) = std::env::var(env_key) {
+        if let Some(target) = normalize_channel_target(&value) {
+            return Ok(Some(target));
+        }
+    }
+    resolve_alert_channel_pg(pool).await
 }
 
 /// Resolve the drill-down base URL (env override or fallback const).
@@ -193,7 +221,7 @@ pub fn format_alert_message(regression: &Regression) -> String {
 
 /// Read the latest row per agent from `agent_quality_daily` and emit
 /// [`Regression`] entries for each (agent, metric) pair that crosses the
-/// [`DROP_THRESHOLD`] with sample_size ≥ [`MIN_SAMPLE_SIZE`] in *both*
+/// its metric-specific threshold with sample_size ≥ [`MIN_SAMPLE_SIZE`] in *both*
 /// the 7d window (current) and the 30d window (baseline).
 ///
 /// `measurement_unavailable_*d` flags from the rollup are honoured:
@@ -277,7 +305,11 @@ pub fn build_regression(
     let current = current_7d?;
     let baseline = baseline_30d?;
     let delta = baseline - current;
-    if delta < DROP_THRESHOLD {
+    let threshold = match metric {
+        QualityMetric::TurnSuccessRate => TURN_DROP_THRESHOLD,
+        QualityMetric::ReviewPassRate => REVIEW_DROP_THRESHOLD,
+    };
+    if delta <= threshold {
         return None;
     }
     if sample_7d < MIN_SAMPLE_SIZE || sample_30d < MIN_SAMPLE_SIZE {
@@ -338,9 +370,12 @@ pub fn should_fire_alert_pure(
     }
 }
 
-/// Upsert the cooldown row to advance the 24h window after a successful
-/// dispatch.
-pub async fn record_alert_sent(pool: &PgPool, regression: &Regression, now_ms: i64) -> Result<()> {
+/// Upsert the cooldown row in the caller's alert-outbox transaction.
+async fn record_alert_sent_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    regression: &Regression,
+    now_ms: i64,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO quality_regression_cooldowns
              (agent_id, metric, alerted_at_ms, last_baseline,
@@ -360,7 +395,7 @@ pub async fn record_alert_sent(pool: &PgPool, regression: &Regression, now_ms: i
     .bind(regression.current)
     .bind(regression.delta)
     .bind(regression.sample_size_7d)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .map_err(|error| anyhow!("record regression cooldown: {error}"))?;
     Ok(())
@@ -370,8 +405,8 @@ pub async fn record_alert_sent(pool: &PgPool, regression: &Regression, now_ms: i
 // Dispatch (PG)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Render and enqueue a single regression alert. Inserts into
-/// `message_outbox` with `bot=notify` then advances the cooldown.
+/// Render and enqueue a single regression alert. The outbox obligation and
+/// cooldown advance commit atomically, so neither can survive alone.
 /// Returns `true` when a new outbox row was created.
 pub async fn dispatch_alert(
     pool: &PgPool,
@@ -386,8 +421,12 @@ pub async fn dispatch_alert(
         regression.metric.as_str()
     );
 
-    let enqueued = enqueue_outbox_pg(
-        pool,
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| anyhow!("begin regression alert transaction: {error}"))?;
+    let enqueued = enqueue_outbox_pg_on_tx_with_ttl(
+        &mut tx,
         OutboxMessage {
             target: target_channel,
             content: &content,
@@ -396,13 +435,18 @@ pub async fn dispatch_alert(
             reason_code: Some("agent_quality.regression"),
             session_key: Some(&session_key),
         },
+        ALERT_COOLDOWN_MS / 1000,
     )
     .await
-    .map_err(|error| anyhow!("enqueue regression alert: {error}"))?;
+    .map_err(|error| anyhow!("enqueue regression alert: {error}"))?
+    .is_some();
 
     if enqueued {
-        record_alert_sent(pool, regression, now_ms).await?;
+        record_alert_sent_on_tx(&mut tx, regression, now_ms).await?;
     }
+    tx.commit()
+        .await
+        .map_err(|error| anyhow!("commit regression alert transaction: {error}"))?;
     Ok(enqueued)
 }
 
@@ -413,11 +457,13 @@ pub async fn dispatch_alert(
 /// Hourly entry point used by the maintenance scheduler. Returns the
 /// number of alerts actually dispatched (post-cooldown).
 pub async fn run_regression_alerter_pg(pool: &PgPool) -> Result<u64> {
+    let Some(target) = resolve_alert_channel_pg(pool).await? else {
+        return Ok(0);
+    };
     let regressions = compute_regressions(pool).await?;
     if regressions.is_empty() {
         return Ok(0);
     }
-    let target = resolve_alert_channel();
     let now_ms = chrono::Utc::now().timestamp_millis();
 
     let mut sent: u64 = 0;
@@ -464,6 +510,194 @@ pub async fn run_regression_alerter_pg(pool: &PgPool) -> Result<u64> {
 #[cfg(test)]
 mod explicit_decode_fallback_tests {
     use super::*;
+
+    fn must_ok<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn metric_thresholds_preserve_retired_authority_policy() {
+        assert!(
+            build_regression(
+                "agent-1",
+                QualityMetric::TurnSuccessRate,
+                Some(0.70),
+                Some(0.86),
+                MIN_SAMPLE_SIZE,
+                MIN_SAMPLE_SIZE,
+            )
+            .is_some()
+        );
+        assert!(
+            build_regression(
+                "agent-1",
+                QualityMetric::ReviewPassRate,
+                Some(0.70),
+                Some(0.86),
+                MIN_SAMPLE_SIZE,
+                MIN_SAMPLE_SIZE,
+            )
+            .is_none()
+        );
+        assert!(
+            build_regression(
+                "agent-1",
+                QualityMetric::ReviewPassRate,
+                Some(0.70),
+                Some(0.91),
+                MIN_SAMPLE_SIZE,
+                MIN_SAMPLE_SIZE,
+            )
+            .is_some()
+        );
+        assert!(
+            build_regression(
+                "agent-1",
+                QualityMetric::TurnSuccessRate,
+                Some(0.0),
+                Some(TURN_DROP_THRESHOLD),
+                MIN_SAMPLE_SIZE,
+                MIN_SAMPLE_SIZE,
+            )
+            .is_none(),
+            "the retired authority used a strict greater-than boundary"
+        );
+    }
+
+    #[test]
+    fn quality_channel_target_normalizes_without_implicit_fallback() {
+        assert_eq!(
+            normalize_channel_target(" 123 ").as_deref(),
+            Some("channel:123")
+        );
+        assert_eq!(
+            normalize_channel_target("channel:456").as_deref(),
+            Some("channel:456")
+        );
+        assert_eq!(normalize_channel_target("   "), None);
+    }
+
+    #[tokio::test]
+    async fn quality_channel_uses_db_precedence_and_no_target_off_switch_pg() {
+        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        assert_eq!(
+            must_ok(
+                resolve_alert_channel_pg(&pool).await,
+                "resolve empty quality target",
+            ),
+            None
+        );
+        must_ok(
+            sqlx::query(
+                "INSERT INTO kv_meta (key, value)
+                 VALUES ('kanban_human_alert_channel_id', 'human-channel')",
+            )
+            .execute(&pool)
+            .await,
+            "seed human alert target",
+        );
+        assert_eq!(
+            must_ok(
+                resolve_alert_channel_pg(&pool).await,
+                "resolve human quality target",
+            )
+            .as_deref(),
+            Some("channel:human-channel")
+        );
+
+        must_ok(
+            sqlx::query(
+                "INSERT INTO kv_meta (key, value)
+                 VALUES ('agent_quality_monitoring_channel_id', 'quality-channel')",
+            )
+            .execute(&pool)
+            .await,
+            "seed dedicated quality target",
+        );
+        assert_eq!(
+            must_ok(
+                resolve_alert_channel_pg(&pool).await,
+                "resolve dedicated quality target",
+            )
+            .as_deref(),
+            Some("channel:quality-channel")
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn regression_outbox_and_cooldown_commit_or_roll_back_together_pg() {
+        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let regression = Regression {
+            agent_id: "agent-atomic".to_string(),
+            metric: QualityMetric::TurnSuccessRate,
+            baseline: 0.95,
+            current: 0.70,
+            delta: 0.25,
+            sample_size_7d: 20,
+            sample_size_30d: 80,
+        };
+
+        assert!(
+            must_ok(
+                dispatch_alert(&pool, &regression, "channel:123", 1_000).await,
+                "dispatch atomic regression alert",
+            ),
+            "first dispatch must create an outbox obligation"
+        );
+        let committed = must_ok(
+            sqlx::query_as::<_, (i64, i64, bool)>(
+                "SELECT
+                    (SELECT COUNT(*) FROM message_outbox),
+                    (SELECT COUNT(*) FROM quality_regression_cooldowns),
+                    (SELECT dedupe_expires_at >= created_at + INTERVAL '24 hours'
+                       FROM message_outbox LIMIT 1)",
+            )
+            .fetch_one(&pool)
+            .await,
+            "load committed regression alert state",
+        );
+        assert_eq!(committed, (1, 1, true));
+
+        must_ok(
+            sqlx::query("DELETE FROM message_outbox")
+                .execute(&pool)
+                .await,
+            "clear outbox before rollback probe",
+        );
+        must_ok(
+            sqlx::query("DROP TABLE quality_regression_cooldowns")
+                .execute(&pool)
+                .await,
+            "remove cooldown table to force second statement failure",
+        );
+        let rejected = dispatch_alert(&pool, &regression, "channel:123", 2_000).await;
+        assert!(
+            rejected.is_err(),
+            "cooldown write failure must reject the whole transaction"
+        );
+        let outbox_count = must_ok(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM message_outbox")
+                .fetch_one(&pool)
+                .await,
+            "count outbox after rollback",
+        );
+        assert_eq!(
+            outbox_count, 0,
+            "outbox insert must roll back with cooldown"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
 
     #[test]
     fn returns_value_on_success() {

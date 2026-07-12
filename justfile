@@ -24,7 +24,10 @@ test: test-non-pg
 # fails legacy/full integration route tests; see docs/ci/rust-quality-gates.md.
 test-non-pg:
     cargo test --lib source_registry -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib tui_task_card::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib server::routes::message_outbox::tests -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib discord_thread_create -- --test-threads=1
     cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
     cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres

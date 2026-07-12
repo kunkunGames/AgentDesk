@@ -52,6 +52,9 @@ echo "=== message_outbox validated-insert guard (#4424) ==="
 "$PYTHON" scripts/check_message_outbox_inserts.py
 "$PYTHON" -m unittest tests.test_message_outbox_inserts
 
+echo "=== Alert dedupe/authority wiring contract (#4448) ==="
+"$PYTHON" -m unittest tests.test_alert_dedupe_4448 tests.test_auto_queue_monitor
+
 echo "=== State/lint hardening guard ==="
 "$PYTHON" scripts/audit_state_lint_hardening.py
 
@@ -79,6 +82,7 @@ echo "=== Inflight blind-save ratchet guard (#4259) ==="
 
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
+"$PYTHON" -m unittest tests.test_discord_thread_create_ci_wiring
 
 echo "=== PR infrastructure failure rerun classifier (#4392) ==="
 ./scripts/ci/infra-failure-rerun.sh --self-test
