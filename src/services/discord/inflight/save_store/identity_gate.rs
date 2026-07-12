@@ -619,6 +619,107 @@ pub(in crate::services::discord::inflight) fn persist_recovery_output_path_if_ma
     }
 }
 
+/// #4370: stamp the `readopted_from_inflight` marker onto the persisted row for a
+/// turn this process re-adopted from inflight, under the sidecar flock and pinned
+/// to the re-adopted turn's identity. Returns a [`GuardedSaveOutcome`]:
+///
+///   - `Saved`            — the marker is now set (or was already set → still
+///                          `Saved`, idempotent).
+///   - `Missing`          — no row exists; it was cleared concurrently. We do NOT
+///                          resurrect it (there is no live turn to protect).
+///   - `IdentityMismatch` — a newer turn (or a rebind-origin placeholder) owns the
+///                          row. We do NOT clobber it.
+///   - `IoError`          — filesystem / serialization failure.
+///
+/// This is a NARROW single-field read-modify-write (like
+/// [`persist_recovery_output_path_if_matches_identity_locked`]), deliberately NOT
+/// [`save_inflight_state_if_identity_unchanged`]. Re-adoption legitimately
+/// preserves a DrainRestart row's `restart_mode`, and the broad identity-refresh
+/// save REFUSES any row that still carries `restart_mode` (see
+/// `save_inflight_state_identity_gated_in_root`), so it would silently no-op on
+/// exactly the restart-resume rows this marker exists for. Here we re-read the
+/// on-disk row under the lock, verify it is still the SAME turn (identity match,
+/// and not a rebind-origin placeholder), flip ONLY the additive
+/// `readopted_from_inflight` bit, and persist — `restart_mode` and every other
+/// field are preserved. It never resurrects a concurrently-cleared row (closes
+/// the load-then-blind-save TOCTOU window, #4370 F1).
+pub(in crate::services::discord) fn mark_readopted_from_inflight_if_identity_unchanged(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    mark_readopted_from_inflight_if_identity_unchanged_in_root(
+        &root, provider, channel_id, expected,
+    )
+}
+
+pub(in crate::services::discord::inflight) fn mark_readopted_from_inflight_if_identity_unchanged_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedSaveOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return GuardedSaveOutcome::IoError;
+    }
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedSaveOutcome::IoError;
+    };
+    let Some(mut on_disk) = load_inflight_state_unlocked(&path) else {
+        return GuardedSaveOutcome::Missing;
+    };
+    // #4370 R3-5: match the broad `save_inflight_state_identity_gated_in_root`
+    // id-0 fail-closed gate. `InflightTurnIdentity` cannot disambiguate colliding
+    // `user_msg_id == 0 && turn_start_offset == None` rows (see the identity doc at
+    // `model.rs`), so an offsetless id-0 snapshot must never authorize mutating a
+    // durable row it cannot uniquely name. Not currently reachable (classify
+    // short-circuits `owner == TUI_DIRECT_SYNTHETIC_OWNER_USER_ID` to `Synthetic`
+    // before reading this marker, and real re-adopted owners carry a non-zero
+    // `user_msg_id`), but kept as defense-in-depth so this narrow patch stays as
+    // fail-closed as the broad save it deliberately preserves `restart_mode` past.
+    if expected.user_msg_id == 0 && expected.turn_start_offset.is_none() {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel_id,
+            snapshot_identity = ?expected,
+            durable_identity = ?InflightTurnIdentity::from_state(&on_disk),
+            "readopted-from-inflight marker skipped because offsetless id-0 snapshot cannot safely match a durable row (#4370 R3-5 fail-closed)"
+        );
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if on_disk.rebind_origin || !expected.matches_state(&on_disk) {
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if on_disk.readopted_from_inflight {
+        return GuardedSaveOutcome::Saved;
+    }
+
+    on_disk.readopted_from_inflight = true;
+    match persist_under_lock(
+        root,
+        &path,
+        &on_disk,
+        "src/services/discord/inflight.rs:mark_readopted_from_inflight_if_identity_unchanged_in_root",
+    ) {
+        Ok(()) => GuardedSaveOutcome::Saved,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id,
+                error = %error,
+                "readopted-from-inflight marker patch failed; leaving durable row untouched"
+            );
+            GuardedSaveOutcome::IoError
+        }
+    }
+}
+
 /// #3041 P1-2 (codex P1-2 R3): identity-guarded re-save for the bridge's
 /// delivery-lease `Skip` epilogue. On a Skip the live HOLDER (watcher) owns the
 /// turn and CLEARS the row on success, so the bridge epilogue must NOT blindly
@@ -744,7 +845,15 @@ fn save_existing_inflight_rebind_adoption_impl_in_root(
     if on_disk.restart_mode != state.restart_mode {
         return GuardedSaveOutcome::IdentityMismatch;
     }
-    if expected.user_msg_id == 0 || !expected.matches_state(&on_disk) {
+    // #4400 (b) r2: zero-id `expected` authorizes this save ONLY for the
+    // adoptable #3107 self-heal orphan carrying a birth `turn_start_offset`
+    // (the id-0 fail-closed rule of `identity_matches_with_offset_guard`); all
+    // other zero-id shapes keep the unconditional refusal (I2).
+    if !expected.matches_state(&on_disk)
+        || (expected.user_msg_id == 0
+            && !(on_disk.is_adoptable_orphaned_synthetic_watcher_row()
+                && on_disk.turn_start_offset.is_some()))
+    {
         return GuardedSaveOutcome::IdentityMismatch;
     }
     if let Some(expected_offset) = expected_turn_start_offset {
@@ -885,5 +994,291 @@ pub(in crate::services::discord::inflight) fn save_inflight_state_if_matches_ide
             );
             GuardedSaveOutcome::IoError
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain_restart_seed(channel_id: u64, tmux_session_name: &str) -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-test".to_string()),
+            343_742_347_365_974_026,
+            77_010,
+            18,
+            "user prompt".to_string(),
+            Some("session".to_string()),
+            Some(tmux_session_name.to_string()),
+            Some(format!("/tmp/{tmux_session_name}.jsonl")),
+            None,
+            512,
+        )
+    }
+
+    // #4370 F1: the `readopted_from_inflight` marker is a NARROW single-field
+    // patch. It lands on a DrainRestart-preserved row (where the broad
+    // identity-refresh save deliberately refuses `restart_mode` rows), preserving
+    // `restart_mode`; it never resurrects a concurrently-cleared row (`Missing`);
+    // and it refuses to clobber a different turn's row (`IdentityMismatch`).
+    #[test]
+    fn readopted_marker_lands_on_restart_preserved_row_and_never_resurrects() {
+        // #3293: pin the runtime root to a tempdir before any state construction
+        // resolves it, so an ambient `AGENTDESK_ROOT_DIR=~/.adk/release` (every
+        // release workspace has one) cannot make this test touch live state.
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            temp.path(),
+        );
+        let provider = ProviderKind::Codex;
+
+        // (1) Missing: no durable row → the marker patch does NOT resurrect it.
+        let mut state = drain_restart_seed(44_370, "AgentDesk-codex-4370-drain");
+        let expected = InflightTurnIdentity::from_state(&state);
+        assert_eq!(
+            mark_readopted_from_inflight_if_identity_unchanged_in_root(
+                temp.path(),
+                &provider,
+                state.channel_id,
+                &expected,
+            ),
+            GuardedSaveOutcome::Missing,
+            "an absent row must not be resurrected by the marker patch",
+        );
+
+        // (2) Saved on a DrainRestart-preserved row — where the broad refresh
+        // REFUSES (`restart_mode.is_some()`), proving why F1 needs this narrow
+        // patch instead of `save_inflight_state_if_identity_unchanged`.
+        state.set_restart_mode(InflightRestartMode::DrainRestart);
+        save_inflight_state_in_root(temp.path(), &state).expect("seed restart-preserved row");
+        let expected = InflightTurnIdentity::from_state(&state);
+        assert_eq!(
+            save_inflight_state_if_identity_unchanged_in_root(
+                temp.path(),
+                &state,
+                "test::readopted_marker_broad_refresh_refuses",
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "the broad identity-refresh save must keep refusing restart_mode rows",
+        );
+        assert_eq!(
+            mark_readopted_from_inflight_if_identity_unchanged_in_root(
+                temp.path(),
+                &provider,
+                state.channel_id,
+                &expected,
+            ),
+            GuardedSaveOutcome::Saved,
+        );
+
+        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(&persisted_path).expect("read persisted inflight"),
+        )
+        .expect("parse persisted inflight");
+        assert!(
+            persisted.readopted_from_inflight,
+            "the marker must land on the restart-preserved row"
+        );
+        assert_eq!(
+            persisted.restart_mode,
+            Some(InflightRestartMode::DrainRestart),
+            "restart_mode must be preserved by the single-field patch"
+        );
+
+        // (3) Idempotent: a re-mark of an already-marked row is a `Saved` no-op.
+        assert_eq!(
+            mark_readopted_from_inflight_if_identity_unchanged_in_root(
+                temp.path(),
+                &provider,
+                state.channel_id,
+                &expected,
+            ),
+            GuardedSaveOutcome::Saved,
+        );
+
+        // (4) IdentityMismatch: a different turn identity must not be clobbered.
+        let mut other = state.clone();
+        other.user_msg_id = 99_999;
+        let mismatched = InflightTurnIdentity::from_state(&other);
+        assert_eq!(
+            mark_readopted_from_inflight_if_identity_unchanged_in_root(
+                temp.path(),
+                &provider,
+                state.channel_id,
+                &mismatched,
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+        );
+
+        // (5) #4370 R3-5: an offsetless id-0 snapshot is refused fail-closed even
+        // against a byte-identical durable row. Because `InflightTurnIdentity`
+        // cannot uniquely name a `user_msg_id == 0 && turn_start_offset == None`
+        // row, the marker patch must never authorize mutating it (mirrors the
+        // broad `save_inflight_state_identity_gated_in_root` id-0 gate). Asserting
+        // `IdentityMismatch` (not `Missing`) proves BOTH that the row persisted AND
+        // that the id-0 guard — not a matches_state miss — produced the refusal.
+        let mut id0 = InflightTurnState::new(
+            ProviderKind::Codex,
+            54_370,
+            Some("adk-test".to_string()),
+            343_742_347_365_974_026,
+            0, // user_msg_id == 0
+            0,
+            "id0 offsetless prompt".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-codex-4370-id0".to_string()),
+            Some("/tmp/AgentDesk-codex-4370-id0.jsonl".to_string()),
+            None,
+            512,
+        );
+        // Force the offsetless id-0 shape the R3-5 guard fails closed on (the
+        // constructor seeds a `turn_start_offset` from `last_offset`).
+        id0.turn_start_offset = None;
+        assert_eq!(id0.user_msg_id, 0);
+        assert!(id0.turn_start_offset.is_none());
+        save_inflight_state_in_root(temp.path(), &id0).expect("seed offsetless id-0 row");
+        let id0_expected = InflightTurnIdentity::from_state(&id0);
+        assert_eq!(
+            mark_readopted_from_inflight_if_identity_unchanged_in_root(
+                temp.path(),
+                &ProviderKind::Codex,
+                id0.channel_id,
+                &id0_expected,
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "an offsetless id-0 snapshot must be refused fail-closed even against a byte-identical durable row (#4370 R3-5)",
+        );
+    }
+
+    /// The zero-id headless row exactly as the #3107 watcher self-heal
+    /// re-mints it (the #4400 (b) adoption subject): no request owner, no user
+    /// message, Watcher relay owner, live-stream anchors, birth offset stamped
+    /// by the constructor.
+    fn orphaned_synthetic_watcher_row(channel_id: u64) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            channel_id,
+            None,
+            0,
+            0,
+            1_518_888_000_000_000_001,
+            String::new(),
+            None,
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/48fdb7f3-0000-4000-8000-000000004400.jsonl".to_string()),
+            None,
+            8_192,
+        );
+        state.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
+        state
+    }
+
+    /// #4400 (b) review r2: the rebind adoption save must accept the adoptable
+    /// zero-id orphan (pre-fix it was refused as `IdentityMismatch`, turning
+    /// the classifier's 409 self-deadlock into a 500 self-deadlock — the fix
+    /// was invalid on the real path), while every OTHER zero-id shape keeps
+    /// the unconditional refusal. Each contrast row is a mutation kill: widen
+    /// the new arm past the orphan shape and its assert fails.
+    #[test]
+    fn rebind_adoption_save_adopts_zero_id_orphan_but_refuses_live_synthetic_shapes() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            temp.path(),
+        );
+        let provider = ProviderKind::Claude;
+
+        // (1) The adoptable orphan: Saved. The adoption mutates only the
+        // watcher-binding surface (tmux/output/owner) and must keep the row's
+        // zero-id identity and committed offsets untouched.
+        let orphan = orphaned_synthetic_watcher_row(64_400);
+        save_inflight_state_in_root(temp.path(), &orphan).expect("seed orphan row");
+        let expected = InflightTurnIdentity::from_state(&orphan);
+        let mut adopted = orphan.clone();
+        adopted.output_path = Some("/tmp/48fdb7f3-0000-4000-8000-000000004400.jsonl".to_string());
+        adopted.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
+        assert_eq!(
+            save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                orphan.turn_start_offset,
+            ),
+            GuardedSaveOutcome::Saved,
+            "#4400 (b): the adoption save must accept the orphaned zero-id synthetic watcher row \
+             — refusing it turns the respawn 409 deadlock into an Internal-error 500 deadlock (I1)",
+        );
+        let persisted_path = inflight_state_path(temp.path(), &provider, orphan.channel_id);
+        let persisted: InflightTurnState = serde_json::from_str(
+            &std::fs::read_to_string(&persisted_path).expect("read adopted row"),
+        )
+        .expect("parse adopted row");
+        assert_eq!(persisted.user_msg_id, 0);
+        assert_eq!(persisted.request_owner_user_id, 0);
+        assert_eq!(
+            persisted.last_offset, 8_192,
+            "the non-rebase adoption save must preserve the committed offset (I3)"
+        );
+
+        // (2) Opus-arm safety contrast: a live TUI-direct synthetic row
+        // (#4018 owner `request_owner_user_id == 1`) is NOT the orphan and
+        // must keep the refusal — adopting it would steal a live relay owner.
+        let mut tui_direct = orphaned_synthetic_watcher_row(64_401);
+        tui_direct.request_owner_user_id = 1;
+        save_inflight_state_in_root(temp.path(), &tui_direct).expect("seed TUI-direct row");
+        let tui_expected = InflightTurnIdentity::from_state(&tui_direct);
+        assert_eq!(
+            save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
+                temp.path(),
+                &tui_direct,
+                &tui_expected,
+                tui_direct.turn_start_offset,
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "a live TUI-direct synthetic row (owner 1) must keep the zero-id refusal (I2)",
+        );
+
+        // (3) Bridge-owned/default zero-id row: not the self-heal shape.
+        let mut bridge_owned = orphaned_synthetic_watcher_row(64_402);
+        bridge_owned.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::None);
+        save_inflight_state_in_root(temp.path(), &bridge_owned).expect("seed bridge-owned row");
+        let bridge_expected = InflightTurnIdentity::from_state(&bridge_owned);
+        assert_eq!(
+            save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
+                temp.path(),
+                &bridge_owned,
+                &bridge_expected,
+                bridge_owned.turn_start_offset,
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "a bridge-owned zero-id row must keep the refusal",
+        );
+
+        // (4) Offsetless zero-id orphan: fail closed (mirrors the id-0
+        // birth-offset rule in `identity_matches_with_offset_guard`).
+        let mut offsetless = orphaned_synthetic_watcher_row(64_403);
+        offsetless.turn_start_offset = None;
+        save_inflight_state_in_root(temp.path(), &offsetless).expect("seed offsetless row");
+        let offsetless_expected = InflightTurnIdentity::from_state(&offsetless);
+        assert_eq!(
+            save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
+                temp.path(),
+                &offsetless,
+                &offsetless_expected,
+                None,
+            ),
+            GuardedSaveOutcome::IdentityMismatch,
+            "an offsetless zero-id row cannot be uniquely named and must be refused fail-closed",
+        );
     }
 }

@@ -8,6 +8,10 @@
 >
 > Last refreshed: 2026-07-05 (#4089 — `worker_registry.rs` exposes the local RateLimitSync leader-worker active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: leader election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-leader switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the leader loop.)
 >
+> Last refreshed: 2026-07-11 (#4424 — message_outbox source authorization and leader-owned durable failed-row recovery).
+>
+> Last refreshed: 2026-07-11 (manual: scheduled-message leader worker ownership and touch gate).
+>
 > PR #3456 made the `src/server/worker_registry.rs` worker-lifecycle log fields
 > consistent: every started / stopped / future-exited / self-fenced /
 > supervisor-shutdown tracing event now emits the same structured spec fields
@@ -81,21 +85,33 @@
   worker inventory, with `dispatch_outbox_loop` at
   `src/server/worker_registry.rs:206`. `src/server/mod.rs:201` creates the
   registry, `src/server/mod.rs:207` runs boot-only steps, and
-  `src/server/mod.rs:208` starts workers after boot reconcile.
+  `src/server/mod.rs:208` starts workers after boot reconcile. The
+  `ScheduledMessages` spec registers `scheduled_message_loop` as
+  `WorkerExecutionScope::LeaderOnly`; its durable claim/recovery implementation
+  lives in `src/services/scheduled_messages.rs` and
+  `src/db/scheduled_messages.rs`.
 - legacy_modules: none. Workers are centrally registered, but most entries still
   assume that every server process may start its local loop.
 - do_not_edit_without_migration_plan: `src/server/worker_registry.rs` and the
-  worker starts in `src/server/mod.rs`.
+  worker starts in `src/server/mod.rs`. Scheduled-message ownership changes must
+  review `src/services/scheduled_messages.rs`,
+  `src/db/scheduled_messages.rs`, and the `ScheduledMessages` registry spec
+  together; do not make the loop worker-local without a replacement ownership
+  and Discord side-effect plan.
 - active_callsite_coverage: partial. Cluster identity and heartbeat are persisted
   through `src/server/cluster.rs`, and `src/server/worker_registry.rs` now
   classifies supervised workers as `leader_only` or `worker_local` before
   startup. `policy_tick_loop` already uses a PG advisory lock at
   `src/server/mod.rs:297`, and `github_sync_loop` uses one at
   `src/server/mod.rs:2798`; leader lease loss still needs per-loop self-fencing
-  before every side effect is considered failover-safe.
+  before every side effect is considered failover-safe. Scheduled messages are
+  leader-started and additionally fence each delivery attempt with a Postgres
+  lease, a per-attempt `claim_token`, and a durable fire-slot uniqueness key.
 - invariants: `singleton_on_leader`, `pg_lease_backed_claim`.
 - allowed_changes: `bugfix` for existing workers. `new_feature` workers must add
   a leader-only, lease-backed, or worker-local classification in the same change.
+  Any scheduled-message worker/service ownership change must refresh this page
+  in the same change.
 - tests: leader failover, duplicate singleton worker suppression, and the #884
   chaos suite.
 - related_issues: #876, #877, #878, #884.
@@ -417,6 +433,39 @@
 
 ### Audited touches
 
+- #4247 S0 reaction status-only containment removes the guild and DM reaction
+  gateway subscriptions plus the only destructive `ReactionRemove` intake
+  route. This narrows connection-level event intake on every node; it does not
+  change gateway lease acquisition, singleton ownership, worker routing, or
+  node-local/shared-Postgres authority. Explicit authenticated `/steer` and
+  `/stop` cancellation remain on their existing owners.
+
+- #4424 message_outbox source-contract recovery: the protected
+  `GET /api/message-outbox/failed` inspection route is read-only on any control
+  node, while `POST /api/message-outbox/failed/redrive` is classified as a
+  **leader-owned operator side effect** and the deployment runbook must target
+  the active leader. The mutation itself is shared-Postgres durable and
+  identity-safe: migration 0081 records a unique
+  `(message_outbox_id,idempotency_key)` audit claim, the service locks exact
+  requested rows, revalidates the central Loopback source contract, suppresses
+  active/sent semantic siblings and duplicate failed identities, and only then
+  updates the same failed row to pending. Consequently an accidental retry or
+  concurrent call on another node converges to `idempotent_replay`/no-op rather
+  than a second pending row or send. The normal message_outbox worker retains
+  its existing PG claim-owner fencing; no worker scope, gateway lease, target
+  authorization, or worker-local relay ownership changes. Operational live
+  redrive remains outside the implementation PR and is performed by the
+  orchestrator only after deploy and independent review.
+
+- #4230 S11 turn-bridge helper-zone retirement: the remaining free helpers in
+  `turn_bridge/mod.rs` moved verbatim to `retry_state.rs`, `stream_receiver.rs`,
+  `activity_heartbeat.rs`, `tmux_runtime.rs`, `cancel_finalize_policy.rs`,
+  `panel_lifecycle.rs`, and `thinking.rs`; their inline tests
+  moved with the owning behavior. Classification: worker-local — this is a
+  module-boundary-only refactor of the existing per-turn receiver, retry,
+  heartbeat, panel, cancel, and transcript helpers. It adds no state field,
+  database/schema write, PG lease, leader-only effect, cross-node read, or
+  singleton assumption; call sites and side-effect ordering are unchanged.
 - #4275 watcher/jsonl segment-boundary separator: `tmux_output_stream.rs`
   (WATCHER) `process_watcher_lines_for_turn` now guards the bare
   `full_response.push_str(text)` for `assistant` text blocks — when the running
@@ -593,6 +642,14 @@
   `/node`, worker spawn gate, and `/api/health.intake_routing` read the same
   effective authority. Classification: PG-lease-backed worker-local execution;
   no new gateway owner, no extra leader election surface.
+
+- #4350 session-owner intake affinity: leader-only routing resolves the existing
+  PG `sessions.instance_id` owner before `/node` or preferred labels, and every
+  Discord/skill/queued producer shares one admission path. Stale or conflicting
+  owners, distinct open routes, and foreign-owner node-local attachments fail
+  safe without local execution; queued items are front-requeued before marker
+  teardown. Worker execution remains instance-local and is the one intentional
+  admission bypass after an outbox claim. No new lease or migration.
 
 - #3630 frontier mirror for cancel/stop + prompt_too_long terminal arms:
   turn_bridge now mirrors only Delivered+committed terminal-replace lease ranges
@@ -1196,6 +1253,37 @@
   per-node mailbox/inflight/relay-owner surface; no leader election, PG lease,
   PG schema, cross-node read, or singleton assumption is introduced. The
   watchdog observe_only/force-clean behavior remains a follow-up audit item.
+- #4370 restart-resume stale mailbox (generalises #4018 to the restart path) -
+  **Worker-local relay lifecycle, no PG lease/schema**: #4018 keyed its stale
+  reclaim on the synthetic relay owner, but a dcserver restart re-adopts the REAL
+  user turn (`recovery_engine/runtime.rs::reregister_active_turn_from_inflight`,
+  mailbox owner == `request_owner_user_id`), so the synthetic-owner-only reclaim
+  could never free that mailbox and follow-up injection / task-notification
+  synthetic turns starved for relay ownership. The fix records the re-adopt in two
+  node-local places, each for a different reclaim shape: (a) an additive inflight-
+  row marker `readopted_from_inflight` (`inflight/model.rs`, `#[serde(default)]`,
+  legacy rows deserialize `false`; no `INFLIGHT_STATE_VERSION` bump), written by an
+  identity-guarded single-field patch `mark_readopted_from_inflight_if_identity_unchanged`
+  (NOT a blind whole-row save — it preserves `restart_mode` and never resurrects a
+  concurrently-cleared row), used for the PRESENT-row reclaim; and (b) an
+  IN-MEMORY, per-process `SharedData::readopted_mailbox_ledger`
+  (`DashMap<(provider, channel_id), ReadoptedMailboxOwner>`), the authority for the
+  ROW-ABSENT reclaim (the row was cleared but the mailbox stayed stuck). The ledger
+  is deliberately NOT persisted and NOT shared across nodes: only the process that
+  performed the re-adopt can know a mailbox is a re-adopted real turn, and a fresh
+  process re-derives the mailbox from disk, so its lifetime is exactly one process.
+  A stale entry is inert — a live successor turn owns a different
+  `active_user_message_id` and can never match — reinforced by the `age >= 120s`
+  gate on the resulting `OwnerInflightAbsent` reason. (c) `synthetic_start/stale_reclaim.rs`
+  eligibility is widened to a re-adopted-from-inflight real-user owner reusing the
+  EXISTING absent/`terminal_delivery_committed` predicate and the age gate. All
+  touched state is the same per-node mailbox / inflight / relay-owner surface #4018
+  used plus the new in-memory ledger; the marker is DELIBERATELY DISTINCT from
+  `relay_ownership_only` so the re-adopted turn's own `✅`/footer + analytics/transcript
+  still fire. No leader election, PG lease, PG schema, cross-node read, or singleton
+  assumption is introduced. The core-4 serial hotfiles (`turn_bridge/mod.rs`,
+  `tmux_watcher.rs`, `session_relay_sink.rs`, `turn_finalizer.rs`) are untouched, as
+  in #4018.
 - #3805 P2 PR-A (two-message model scaffolding — worker-local UI flag): adds the
   additive `two_message_panel_enabled` flag to `PlaceholderConfig` and threads it
   through the per-node UI plumbing (`runtime_bootstrap.rs` RunBotContext /

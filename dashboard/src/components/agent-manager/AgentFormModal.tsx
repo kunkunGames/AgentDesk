@@ -165,7 +165,7 @@ export default function AgentFormModal({
               <div className="flex flex-col items-center gap-1">
                 <button
                   type="button"
-                  aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-label={tr("다음 스프라이트", "Next sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -205,7 +205,7 @@ export default function AgentFormModal({
                 </div>
                 <button
                   type="button"
-                  aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-label={tr("이전 스프라이트", "Previous sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",

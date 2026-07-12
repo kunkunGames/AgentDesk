@@ -48,7 +48,7 @@ struct RelayRecoveryRequest {
     apply: bool,
 }
 
-fn local_or_configured_control_endpoint_allowed(
+pub(super) fn local_or_configured_control_endpoint_allowed(
     config: &crate::config::Config,
     peer_addr: Option<SocketAddr>,
 ) -> bool {
@@ -534,6 +534,100 @@ fn delivery_record_rollout_health_json() -> serde_json::Value {
     outbound::delivery_record_rollout_health_json()
 }
 
+/// Bare (argument-less) provider degraded-reason classifications emitted by
+/// `provider_probe::classify_provider`. Keep in sync with that producer.
+const PROVIDER_BARE_REASONS: &[&str] =
+    &["disconnected", "restart_pending", "reconcile_in_progress"];
+/// Counted (`<keyword>:<N>`) provider degraded-reason classifications emitted by
+/// `provider_probe::classify_provider`. Keep in sync with that producer.
+const PROVIDER_COUNTED_REASONS: &[&str] = &[
+    "deferred_hooks_backlog",
+    "pending_queue_depth",
+    "recovering_channels",
+];
+
+/// Sanitize one `provider:<name>:<reason>` string for public exposure.
+///
+/// #4386 round-2 defect: `<name>` is operator-controlled and — because a legacy
+/// `bot_settings.json` `provider` value is preserved verbatim as
+/// `ProviderKind::Unsupported(_)` — may itself contain `:`. A first-colon split
+/// (`split_once`) leaves everything after the first colon in the "reason" tail,
+/// leaking the rest of the name (`provider:prod-mini-01:customerA:disconnected`
+/// -> `customerA` survives). A left-anchored "is the first segment a known id"
+/// test is also bypassable (`provider:codex:leak:disconnected`). We therefore
+/// anchor on the FIXED reason vocabulary from the RIGHT: the trailing 1-2
+/// segments must match a known classification; everything before them is the
+/// name, which is replaced WHOLESALE with `unsupported` unless it is exactly a
+/// supported provider id (registry ids never contain `:`). Only the fixed reason
+/// keyword and an all-digits count can survive, so no arbitrary name byte leaks.
+/// Any unrecognized shape fails CLOSED to `provider:unsupported`.
+fn sanitize_provider_reason(rest: &str, supported: &[&str]) -> String {
+    let segments: Vec<&str> = rest.split(':').collect();
+    // Counted reason: `<name...> : <keyword> : <digits>`.
+    if segments.len() >= 3 {
+        let count = segments[segments.len() - 1];
+        let keyword = segments[segments.len() - 2];
+        if !count.is_empty()
+            && count.bytes().all(|b| b.is_ascii_digit())
+            && PROVIDER_COUNTED_REASONS.contains(&keyword)
+        {
+            let name = segments[..segments.len() - 2].join(":");
+            let reason = format!("{keyword}:{count}");
+            return sanitized_provider_reason(&name, &reason, supported);
+        }
+    }
+    // Bare reason: `<name...> : <keyword>`.
+    if segments.len() >= 2 {
+        let keyword = segments[segments.len() - 1];
+        if PROVIDER_BARE_REASONS.contains(&keyword) {
+            let name = segments[..segments.len() - 1].join(":");
+            return sanitized_provider_reason(&name, keyword, supported);
+        }
+    }
+    // Unknown / malformed shape: drop everything after `provider:` (fail closed).
+    "provider:unsupported".to_string()
+}
+
+fn sanitized_provider_reason(name: &str, reason: &str, supported: &[&str]) -> String {
+    if supported.contains(&name) {
+        format!("provider:{name}:{reason}")
+    } else {
+        format!("provider:unsupported:{reason}")
+    }
+}
+
+/// #4382 / #4386-review defect 1: `degraded_reasons` embeds `provider:<name>:...`
+/// where `<name>` can be an ARBITRARY, operator-chosen string — a legacy
+/// `bot_settings.json` `provider` field is parsed via
+/// `ProviderKind::from_str_or_unsupported`, which preserves the raw value as
+/// `Unsupported(_)` and re-emits it verbatim. Copying reasons unredacted onto the
+/// UNAUTHENTICATED public `/api/health` would leak internal identifiers/hostnames
+/// (e.g. `provider:prod-mini-01:disconnected`), breaking the allowlist guarantee
+/// the public projection is documented to uphold. Rewrite any `provider:<name>:`
+/// whose `<name>` is not a known, supported provider id to `provider:unsupported:`
+/// (see `sanitize_provider_reason` for the colon-safe, fail-closed parsing).
+/// `/api/health/detail` (authenticated) keeps the verbatim reasons. The rewrite is
+/// 1:1 so the `degraded <=> non-empty` invariant is preserved.
+fn sanitize_public_degraded_reasons(reasons: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = reasons else {
+        return serde_json::json!([]);
+    };
+    let supported = crate::services::provider::supported_provider_ids();
+    let sanitized: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|item| {
+            let Some(reason) = item.as_str() else {
+                return item;
+            };
+            match reason.strip_prefix("provider:") {
+                Some(rest) => serde_json::Value::String(sanitize_provider_reason(rest, &supported)),
+                None => serde_json::Value::String(reason.to_string()),
+            }
+        })
+        .collect();
+    serde_json::Value::Array(sanitized)
+}
+
 fn public_health_json(json: serde_json::Value) -> serde_json::Value {
     let status = json
         .get("status")
@@ -577,6 +671,18 @@ fn public_health_json(json: serde_json::Value) -> serde_json::Value {
         })
     });
     let degraded = status.as_str().is_some_and(|status| status != "healthy");
+    // #4382: carry the live `degraded_reasons` (the axis that actually decides
+    // `degraded`/`status`) into the public object instead of dropping it, so
+    // public-only consumers stop misattributing the cause to the unrelated
+    // `startup_degraded_reasons`. Always present (empty array when absent) so the
+    // `degraded <=> degraded_reasons non-empty` invariant holds on the public shape.
+    // Sanitized to strip operator-chosen provider ids before public exposure
+    // (#4386-review defect 1); see `sanitize_public_degraded_reasons`.
+    let degraded_reasons = sanitize_public_degraded_reasons(
+        json.get("degraded_reasons")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    );
     let mut public = serde_json::json!({
         "ok": !degraded,
         "status": status,
@@ -587,6 +693,7 @@ fn public_health_json(json: serde_json::Value) -> serde_json::Value {
         "fully_recovered": fully_recovered,
         "cluster_standby": cluster_standby,
         "degraded": degraded,
+        "degraded_reasons": degraded_reasons,
     });
     if let Some(startup_status) = startup_status {
         public["startup_status"] = startup_status;
@@ -2150,9 +2257,244 @@ mod tests {
         assert!(public.get("providers").is_none());
         assert!(public.get("mailboxes").is_none());
         assert!(public.get("config_audit").is_none());
-        assert!(public.get("degraded_reasons").is_none());
+        // #4382: the live `degraded_reasons` that DECIDES `degraded` must now be
+        // carried into public health verbatim (was dropped, forcing consumers to
+        // misattribute the cause to the unrelated `startup_degraded_reasons`).
+        assert_eq!(
+            public["degraded_reasons"],
+            json!(["provider:codex:pending_queue_depth:2"])
+        );
         // TEST-004: the detail-only audit block is dropped from public health.
         assert!(public.get("active_session_audit").is_none());
+    }
+
+    /// #4382 invariant: on the PUBLIC projection, `degraded` is true IFF
+    /// `degraded_reasons` is present and non-empty (both directions). A degraded
+    /// health with no reasons, or a healthy one carrying reasons, is unreachable
+    /// through this projection contract.
+    #[test]
+    fn public_health_json_degraded_iff_reasons_nonempty() {
+        // degraded => reasons present AND non-empty.
+        let degraded = public_health_json(json!({
+            "status": "degraded",
+            "version": "0.1.2",
+            "db": false,
+            "dashboard": true,
+            "server_up": true,
+            "degraded_reasons": ["db_unavailable", "provider:claude:pending_queue_depth:1"],
+        }));
+        assert_eq!(degraded["degraded"], json!(true));
+        let degraded_reasons = degraded["degraded_reasons"]
+            .as_array()
+            .expect("degraded_reasons is an array on public health");
+        assert!(
+            !degraded_reasons.is_empty(),
+            "degraded health must carry non-empty degraded_reasons"
+        );
+        assert_eq!(
+            degraded["degraded_reasons"],
+            json!(["db_unavailable", "provider:claude:pending_queue_depth:1"])
+        );
+
+        // healthy => reasons present but EMPTY, and degraded is false.
+        let healthy = public_health_json(json!({
+            "status": "healthy",
+            "version": "0.1.2",
+            "db": true,
+            "dashboard": true,
+            "server_up": true,
+            "degraded_reasons": [],
+        }));
+        assert_eq!(healthy["degraded"], json!(false));
+        assert_eq!(healthy["degraded_reasons"], json!([]));
+
+        // absent upstream array => still present as [] (the invariant never sees
+        // a missing key), and healthy stays not-degraded.
+        let absent = public_health_json(json!({
+            "status": "healthy",
+            "version": "0.1.2",
+            "db": true,
+            "dashboard": true,
+            "server_up": true,
+        }));
+        assert_eq!(absent["degraded"], json!(false));
+        assert_eq!(absent["degraded_reasons"], json!([]));
+    }
+
+    /// #4382 regression: `degraded_reasons` (the live axis that decides
+    /// `degraded`) and `startup_degraded_reasons` (a startup-only axis that does
+    /// NOT decide `degraded`) must surface as two DISTINCT public fields so a
+    /// consumer can no longer misattribute a runtime-degraded cause to startup.
+    #[test]
+    fn public_health_json_keeps_degraded_and_startup_reasons_distinct() {
+        let public = public_health_json(json!({
+            "status": "degraded",
+            "version": "0.1.2",
+            "db": true,
+            "dashboard": true,
+            "server_up": true,
+            "degraded_reasons": ["provider:codex:disconnected"],
+            "startup_degraded": true,
+            "startup_degraded_reasons": ["startup_doctor:disk_check:warned"],
+        }));
+        assert_eq!(public["degraded"], json!(true));
+        assert_eq!(
+            public["degraded_reasons"],
+            json!(["provider:codex:disconnected"])
+        );
+        assert_eq!(
+            public["startup_degraded_reasons"],
+            json!(["startup_doctor:disk_check:warned"])
+        );
+        // The two axes are genuinely different values, not aliases.
+        assert_ne!(
+            public["degraded_reasons"],
+            public["startup_degraded_reasons"]
+        );
+    }
+
+    /// #4386-review defect 1 + round-2 (P0 security): an operator-chosen provider
+    /// id — a legacy `bot_settings.json` value preserved verbatim as
+    /// `Unsupported(_)`, and thus possibly containing `:` — must NOT leak in ANY
+    /// part on the unauthenticated public `/api/health`. The public projection
+    /// replaces the WHOLE name with `unsupported`, keeping only the fixed reason
+    /// classification (and an all-digits count); unknown shapes fail closed to
+    /// `provider:unsupported`. Known providers pass through verbatim; the detail
+    /// path (raw snapshot json) retains the value untouched.
+    #[test]
+    fn public_health_json_sanitizes_provider_ids_including_colons() {
+        // (raw provider name, reason suffix, sensitive tokens that must NOT
+        //  appear anywhere in public, expected sanitized public element).
+        let cases: &[(&str, &str, &[&str], &str)] = &[
+            // simple unknown id
+            (
+                "prod-mini-01",
+                "disconnected",
+                &["prod-mini-01"],
+                "provider:unsupported:disconnected",
+            ),
+            // 1. colon IN the name — the tail (`customerA`) must not survive
+            (
+                "prod-mini-01:customerA",
+                "disconnected",
+                &["prod-mini-01", "customerA"],
+                "provider:unsupported:disconnected",
+            ),
+            // 2. many colons
+            (
+                "a:b:c",
+                "restart_pending",
+                &["a:b:c"],
+                "provider:unsupported:restart_pending",
+            ),
+            // 3. empty name
+            (
+                "",
+                "reconcile_in_progress",
+                &[],
+                "provider:unsupported:reconcile_in_progress",
+            ),
+            // 4. unicode + control chars in the name
+            (
+                "기밀-🤖\u{7}\u{202e}HOSTSECRET",
+                "disconnected",
+                &["기밀", "🤖", "HOSTSECRET"],
+                "provider:unsupported:disconnected",
+            ),
+            // colon-in-name with a COUNTED reason — only the digit count survives
+            (
+                "evil:host",
+                "pending_queue_depth:7",
+                &["evil", "host"],
+                "provider:unsupported:pending_queue_depth:7",
+            ),
+            // left-anchor bypass attempt: a real id used as a name prefix
+            (
+                "codex:leak",
+                "disconnected",
+                &["leak"],
+                "provider:unsupported:disconnected",
+            ),
+            // unknown reason keyword -> fail closed, name AND reason dropped
+            (
+                "secret-host",
+                "totally_new_reason",
+                &["secret-host", "totally_new_reason"],
+                "provider:unsupported",
+            ),
+        ];
+
+        for (name, reason, sensitive, expected) in cases {
+            let raw = format!("provider:{name}:{reason}");
+            let full = json!({
+                "status": "unhealthy", "version": "0.1.2", "db": true,
+                "dashboard": true, "server_up": true,
+                "degraded_reasons": [raw.clone()],
+            });
+            // detail/raw snapshot keeps the value verbatim (authenticated path).
+            assert_eq!(
+                full["degraded_reasons"],
+                json!([raw]),
+                "detail/raw must retain verbatim reason for {raw:?}"
+            );
+
+            let public = public_health_json(full);
+            let text = public.to_string();
+            for tok in *sensitive {
+                assert!(
+                    !text.contains(tok),
+                    "sensitive token {tok:?} leaked for raw {raw:?}: {text}"
+                );
+            }
+            assert_eq!(
+                public["degraded_reasons"],
+                json!([expected]),
+                "wrong sanitized value for raw {raw:?}"
+            );
+            // 1:1 rewrite keeps the degraded<=>non-empty invariant.
+            assert_eq!(public["degraded"], json!(true));
+        }
+
+        // 5. supported providers are FULLY preserved (including numeric tails)
+        // even when mixed with a sanitized unknown id and a non-provider reason.
+        let mixed = public_health_json(json!({
+            "status": "unhealthy", "version": "0.1.2", "db": false,
+            "dashboard": true, "server_up": true,
+            "degraded_reasons": [
+                "provider:codex:pending_queue_depth:2",
+                "provider:claude:disconnected",
+                "provider:gemini:recovering_channels:5",
+                "provider:prod-mini-01:customerA:disconnected",
+                "db_unavailable"
+            ],
+        }));
+        assert_eq!(
+            mixed["degraded_reasons"],
+            json!([
+                "provider:codex:pending_queue_depth:2",
+                "provider:claude:disconnected",
+                "provider:gemini:recovering_channels:5",
+                "provider:unsupported:disconnected",
+                "db_unavailable"
+            ])
+        );
+        let mixed_text = mixed.to_string();
+        assert!(!mixed_text.contains("prod-mini-01"));
+        assert!(!mixed_text.contains("customerA"));
+    }
+
+    /// Guards the whitelist source: the sanitizer trusts exactly the registry
+    /// ids, and those ids must never contain `:` (the delimiter the right-anchor
+    /// parser relies on to tell a single-segment trusted name from a crafted
+    /// multi-segment one).
+    #[test]
+    fn supported_provider_ids_contain_no_colon() {
+        for id in crate::services::provider::supported_provider_ids() {
+            assert!(
+                !id.contains(':'),
+                "supported provider id {id:?} contains ':'"
+            );
+        }
     }
 
     /// [TEST-003] public health omits the per-server OpenCode warm_servers
@@ -2315,7 +2657,7 @@ mod tests {
             &reasons_db
         ));
 
-        // Multiple reasons stay false.
+        // Multiple reasons with a Degraded status still leave fully_recovered=true.
         let reasons_outbox_disk = vec![
             json!("dispatch_outbox_oldest_pending_age:120"),
             json!("disk_low_free_bytes:104857600"),

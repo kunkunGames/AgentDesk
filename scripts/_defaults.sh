@@ -196,8 +196,10 @@ _health_json_get_string_field() {
     return
   fi
 
+  # #4348 review finding #2: match the TOP-LEVEL field only (jq's `.key` is
+  # top-level), so a nested `"status":"..."` cannot shadow the root value.
   match=$(
-    _health_json_compact "$health_json" \
+    _health_json_top_level_compact "$health_json" \
       | grep -Eo "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
       | head -n 1 \
       || true
@@ -209,7 +211,7 @@ _health_json_get_string_field() {
 _health_json_get_string_array_csv() {
   local health_json="$1"
   local key="$2"
-  local match
+  local raw
 
   [ -n "$health_json" ] || return 1
 
@@ -218,16 +220,184 @@ _health_json_get_string_array_csv() {
     return
   fi
 
-  match=$(
-    _health_json_compact "$health_json" \
-      | grep -Eo "\"$key\"[[:space:]]*:[[:space:]]*\\[[^]]*\\]" \
-      | head -n 1 \
-      || true
-  )
-  [ -n "$match" ] || return 0
+  # #4348 review finding #4: read the TOP-LEVEL array only (jq evaluates the
+  # root `.${key}`). A naive grep over the whole compacted body would pick up a
+  # same-named array nested inside another object (e.g. subsystem.degraded_reasons),
+  # accepting reconcile-only reasons that jq — reading the ABSENT top-level array
+  # as `[]` — correctly rejects.
+  raw=$(_health_json_top_level_field_raw "$key" "$(_health_json_compact "$health_json")")
+  # Only a genuine top-level ARRAY value contributes reasons; anything else
+  # (absent key, null, scalar, object) is treated as an empty list, matching
+  # jq's `(.key // []) | join(",")` for our reason-list callers.
+  case "$raw" in
+    *\[*\]*) ;;
+    *) return 0 ;;
+  esac
 
-  printf '%s' "$match" \
+  printf '%s' "$raw" \
     | sed -E 's/^[^[]*\[//; s/\]$//; s/"[[:space:]]*,[[:space:]]*"/,/g; s/^"//; s/"$//'
+}
+
+_health_json_top_level_only() {
+  # #4348 review finding #2: the jq-less field checks below must interrogate the
+  # ROOT object only — jq's `.field` / `has("field")` are top-level, so the
+  # grep fallback has to match top-level too. A naive grep over the compacted
+  # body matches ANY occurrence, so a nested object carrying `"server_up":true`
+  # (malformed / future-shape body) would satisfy a top-level `server_up` check
+  # that jq correctly REJECTS — a false-ready deploy path.
+  #
+  # This helper emits ONLY the brace-depth-1 portion of the root object: the
+  # contents of any nested object/array are elided while the top-level scalar
+  # key:value pairs (and their `,`/`}` delimiters) are preserved, so the
+  # existing grep patterns keep working but can no longer see nested keys. It is
+  # a pure-bash scan (no jq/python) that tracks JSON string state so braces or
+  # brackets inside string values never skew the depth count. NOTE: because
+  # nested containers are elided, callers that need ARRAY/object contents (e.g.
+  # degraded_reasons via _health_json_get_string_array_csv, or the legitimately
+  # nested latest_startup_doctor.skipped_reason) must NOT route through here.
+  local compact="$1"
+  local n=${#compact}
+  local i ch out="" depth=0 in_string=0 escaped=0
+
+  for (( i = 0; i < n; i++ )); do
+    ch="${compact:i:1}"
+    if [ "$in_string" -eq 1 ]; then
+      [ "$depth" -eq 1 ] && out+="$ch"
+      if [ "$escaped" -eq 1 ]; then
+        escaped=0
+      elif [ "$ch" = '\' ]; then
+        escaped=1
+      elif [ "$ch" = '"' ]; then
+        in_string=0
+      fi
+      continue
+    fi
+    case "$ch" in
+      '{'|'[')
+        depth=$((depth + 1))
+        [ "$depth" -eq 1 ] && out+="$ch"
+        ;;
+      '}'|']')
+        [ "$depth" -eq 1 ] && out+="$ch"
+        depth=$((depth - 1))
+        ;;
+      '"')
+        in_string=1
+        [ "$depth" -eq 1 ] && out+="$ch"
+        ;;
+      *)
+        [ "$depth" -eq 1 ] && out+="$ch"
+        ;;
+    esac
+  done
+
+  printf '%s' "$out"
+}
+
+_health_json_top_level_compact() {
+  # Compact + top-level-only, in one place so every scalar field check shares
+  # the same top-level view of the body (#4348 review finding #2).
+  local health_json="$1"
+  _health_json_top_level_only "$(_health_json_compact "$health_json")"
+}
+
+_health_json_top_level_field_raw() {
+  # #4348 review findings #3/#4: emit the RAW top-level value token for <key>
+  # from the root object (or nothing if <key> is absent at the top level),
+  # preserving the value's own nested contents INTACT — unlike
+  # _health_json_top_level_only, which elides all nested contents. This is what
+  # lets the jq-less path read `.degraded_reasons` (a top-level array whose
+  # elements matter) and `.latest_startup_doctor` (a top-level object we then
+  # descend into for skipped_reason) at the SAME paths jq uses, so a same-named
+  # key buried in some other nested object cannot shadow the root value.
+  #
+  # Pure-bash scan: finds a string that sits in KEY position at brace-depth 1
+  # (a depth-1 string immediately followed by `:`) and, on a name match,
+  # captures the following value up to the next depth-1 `,` / `}` / `]`. JSON
+  # string state is tracked throughout so punctuation inside string values never
+  # confuses key detection, depth accounting, or the value boundary. The
+  # returned token is whitespace-TRIMMED (both ends) so insignificant JSON
+  # whitespace before the delimiter — e.g. `"degraded_reasons":[...] }` — never
+  # trails into the value; the downstream array/scalar cleanups can then rely on
+  # the value ending exactly at `]`/`"`, matching jq (#4348 R2 whitespace fix).
+  local key="$1"
+  local compact="$2"
+  local n=${#compact}
+  local i ch
+  local depth=0 in_string=0 escaped=0
+  local cur_str="" pending_key="" awaiting_colon=0
+  local capturing=0 value="" cap_base=0
+
+  for (( i = 0; i < n; i++ )); do
+    ch="${compact:i:1}"
+
+    if [ "$capturing" -eq 1 ]; then
+      if [ "$in_string" -eq 1 ]; then
+        value+="$ch"
+        if [ "$escaped" -eq 1 ]; then
+          escaped=0
+        elif [ "$ch" = '\' ]; then
+          escaped=1
+        elif [ "$ch" = '"' ]; then
+          in_string=0
+        fi
+        continue
+      fi
+      case "$ch" in
+        '"') in_string=1; value+="$ch" ;;
+        '{'|'[') depth=$((depth + 1)); value+="$ch" ;;
+        '}'|']')
+          if [ "$depth" -le "$cap_base" ]; then
+            printf '%s' "$(_trim_whitespace "$value")"
+            return 0
+          fi
+          depth=$((depth - 1)); value+="$ch"
+          ;;
+        ',')
+          if [ "$depth" -eq "$cap_base" ]; then
+            printf '%s' "$(_trim_whitespace "$value")"
+            return 0
+          fi
+          value+="$ch"
+          ;;
+        *) value+="$ch" ;;
+      esac
+      continue
+    fi
+
+    if [ "$in_string" -eq 1 ]; then
+      if [ "$escaped" -eq 1 ]; then
+        escaped=0; cur_str+="$ch"
+      elif [ "$ch" = '\' ]; then
+        escaped=1; cur_str+="$ch"
+      elif [ "$ch" = '"' ]; then
+        in_string=0
+        if [ "$depth" -eq 1 ]; then
+          pending_key="$cur_str"
+          awaiting_colon=1
+        fi
+      else
+        cur_str+="$ch"
+      fi
+      continue
+    fi
+
+    case "$ch" in
+      '"') in_string=1; cur_str=""; awaiting_colon=0 ;;
+      ':')
+        if [ "$awaiting_colon" -eq 1 ] && [ "$depth" -eq 1 ] && [ "$pending_key" = "$key" ]; then
+          capturing=1; cap_base="$depth"; value=""
+        fi
+        awaiting_colon=0
+        ;;
+      '{'|'[') depth=$((depth + 1)); awaiting_colon=0 ;;
+      '}'|']') depth=$((depth - 1)); awaiting_colon=0 ;;
+      ' '|$'\t') ;;
+      *) awaiting_colon=0 ;;
+    esac
+  done
+
+  return 0
 }
 
 _health_json_field_is_true() {
@@ -241,7 +411,7 @@ _health_json_field_is_true() {
     return
   fi
 
-  _health_json_compact "$health_json" \
+  _health_json_top_level_compact "$health_json" \
     | grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*true([[:space:]]*[,}])"
 }
 
@@ -256,7 +426,7 @@ _health_json_field_is_false() {
     return
   fi
 
-  _health_json_compact "$health_json" \
+  _health_json_top_level_compact "$health_json" \
     | grep -Eq "\"$key\"[[:space:]]*:[[:space:]]*false([[:space:]]*[,}])"
 }
 
@@ -271,7 +441,7 @@ _health_json_field_exists() {
     return
   fi
 
-  _health_json_compact "$health_json" \
+  _health_json_top_level_compact "$health_json" \
     | grep -Eq "\"$key\"[[:space:]]*:"
 }
 
@@ -314,10 +484,108 @@ _health_json_reconcile_only() {
   return 0
 }
 
+_health_json_unhealthy_only_no_provider_runtimes() {
+  # #4348 DEPLOY/RESTART readiness rescue — NOT a runtime /health change.
+  # Returns 0 when the node is provably SERVING the new binary (server_up + db +
+  # dashboard all true) and its ONLY deploy-BLOCKING condition is that no
+  # provider runtimes are registered (leader-only / no-agent-session topology):
+  # providers.is_empty() emits `no_providers_registered`, the startup doctor is
+  # skipped with skipped_reason=no_provider_runtimes_registered, and status is
+  # pinned to `unhealthy` forever even though the server is fully up.
+  #
+  # NAME/SCOPE NOTE (#4348 review finding #1): the `_only_` here means the only
+  # deploy-BLOCKING cause is no-providers — it does NOT claim no-providers is
+  # the *sole* condition on the node. A serving no-provider node may ALSO carry
+  # a DEGRADED-severity axis (disk-low / stale outbox / pipeline warnings /
+  # opencode), and it still reports status=unhealthy (severity never downgrades
+  # Unhealthy→Degraded) with server_up=true, so this predicate still fires. That
+  # is INTENTIONAL and SAFE, not a false-ready:
+  #   • server_up && db && dashboard already prove the new binary is serving, so
+  #     no broken node is green-lit;
+  #   • those extra axes are DEGRADED severity = NON-BLOCKING for deploy — a
+  #     provider-present node with the same axis reports status=degraded and
+  #     PASSES the deploy gate today, so rescuing a no-provider node with a
+  #     co-existing degraded axis is CONSISTENT with the existing gate, not a
+  #     new risk;
+  #   • the PUBLIC /api/health body STRIPS degraded_reasons, so proving
+  #     "solely no-providers" from this body is impossible without switching the
+  #     gate to the detailed body — a larger change we deliberately do NOT make.
+  # The runtime /health endpoint intentionally keeps reporting unhealthy for
+  # monitoring; only the deploy/rollback readiness gate opts in to this rescue,
+  # and only for this EXACT deploy-blocking cause (server_up=false /
+  # db_unavailable / any other unhealthy DEPLOY-BLOCKING reason must still fail
+  # the gate).
+  local health_json="$1"
+  [ -n "$health_json" ] || return 1
+
+  if _health_json_has_jq; then
+    printf '%s' "$health_json" | jq -e '
+      (.server_up == true)
+      and (.db == true)
+      and (.dashboard == true)
+      and (.status == "unhealthy")
+      and (.startup_status == "doctor_skipped")
+      and (.latest_startup_doctor.skipped_reason == "no_provider_runtimes_registered")
+    ' >/dev/null 2>&1
+    return
+  fi
+
+  # jq-less fallback. Every predicate must hold, at the SAME paths jq reads.
+  _health_json_field_is_true "$health_json" "server_up" || return 1
+  _health_json_field_is_true "$health_json" "db" || return 1
+  _health_json_field_is_true "$health_json" "dashboard" || return 1
+  [ "$(_health_json_status "$health_json")" = "unhealthy" ] || return 1
+  # startup_status is a TOP-LEVEL field (jq: .startup_status).
+  [ "$(_health_json_get_string_field "$health_json" "startup_status")" = "doctor_skipped" ] || return 1
+  # #4348 review finding #3: skipped_reason must be read from the TOP-LEVEL
+  # latest_startup_doctor object specifically (jq:
+  # .latest_startup_doctor.skipped_reason), NOT grepped anywhere in the body —
+  # a decoy `skipped_reason` in some OTHER nested object must not satisfy this
+  # while the real latest_startup_doctor.skipped_reason differs. Extract the
+  # top-level object, then read its own top-level skipped_reason.
+  local lsd
+  lsd=$(_health_json_top_level_field_raw "latest_startup_doctor" "$(_health_json_compact "$health_json")")
+  [ -n "$lsd" ] || return 1
+  [ "$(_health_json_get_string_field "$lsd" "skipped_reason")" = "no_provider_runtimes_registered" ]
+}
+
+_migration_seq_from_name() {
+  # "0079_relay_dead_letter.sql" -> "79". Strips leading zeros so the result is a
+  # base-10 integer (avoids octal interpretation in `-gt` tests). Returns
+  # non-zero when the name has no leading numeric prefix. See #4348.
+  local name="$1" num
+  [ -n "$name" ] || return 1
+  num=$(printf '%s' "$name" | sed -E 's/^0*([0-9]+).*/\1/')
+  case "$num" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "$num"
+}
+
+_migration_advanced() {
+  # #4348: TRUE (return 0) when the new deploy's latest migration is strictly
+  # AHEAD of the rollback target's latest migration — i.e. rolling back would
+  # strand the old binary behind an already-applied migration and brick it.
+  # Fails CLOSED: if EITHER name cannot be resolved to a sequence number, treat
+  # it as advanced (unsafe to roll back) rather than gamble the node. Returns 1
+  # (safe to roll back) only when both resolve AND new <= old.
+  local new_name="$1" old_name="$2" new_seq old_seq
+  new_seq=$(_migration_seq_from_name "$new_name") || return 0
+  old_seq=$(_migration_seq_from_name "$old_name") || return 0
+  [ "$new_seq" -gt "$old_seq" ] && return 0
+  return 1
+}
+
 health_json_is_ready() {
   local health_json="$1"
   local require_dashboard="${2:-0}"
   local allow_reconcile_degraded="${3:-1}"
+  # #4348: when 1, treat a serving node whose only deploy-BLOCKING condition is
+  # no registered provider runtimes as DEPLOY-READY (co-existing degraded/
+  # non-blocking axes are permitted — see
+  # _health_json_unhealthy_only_no_provider_runtimes). Default 0 keeps every
+  # existing (non-deploy) caller's semantics unchanged.
+  local allow_no_provider_runtimes="${4:-0}"
   local status=""
 
   [ -n "$health_json" ] || return 1
@@ -331,7 +599,18 @@ health_json_is_ready() {
 
   if _health_json_field_exists "$health_json" "server_up"; then
     _health_json_field_is_true "$health_json" "server_up" || return 1
-    [ "$status" = "unhealthy" ] && return 1
+    if [ "$status" = "unhealthy" ]; then
+      # #4348: rescue a serving leader-only / no-session node whose only
+      # deploy-BLOCKING cause is no_provider_runtimes_registered (co-existing
+      # degraded/non-blocking axes are allowed — same as a provider-present
+      # degraded node that passes the gate). server_up is already confirmed true
+      # above, so db_unavailable can never take this branch.
+      if [ "$allow_no_provider_runtimes" = "1" ] \
+        && _health_json_unhealthy_only_no_provider_runtimes "$health_json"; then
+        return 0
+      fi
+      return 1
+    fi
     [ "$status" = "healthy" ] && return 0
     if [ "$allow_reconcile_degraded" = "1" ] \
       && _health_json_field_exists "$health_json" "fully_recovered" \
@@ -362,6 +641,10 @@ wait_for_http_service_health() {
   local delay_secs="$4"
   local require_dashboard="${5:-0}"
   local allow_reconcile_degraded="${6:-1}"
+  # #4348: opt-in — accept a serving node whose only deploy-BLOCKING condition
+  # is no registered provider runtimes (co-existing degraded/non-blocking axes
+  # permitted). Default 0 preserves existing callers.
+  local allow_no_provider_runtimes="${7:-0}"
 
   # shellcheck disable=SC2034 # Read by callers after the function returns.
   WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON=""
@@ -372,7 +655,7 @@ wait_for_http_service_health() {
     # shellcheck disable=SC2034 # Read by callers after the function returns.
     WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON="$health_json"
 
-    if health_json_is_ready "$health_json" "$require_dashboard" "$allow_reconcile_degraded"; then
+    if health_json_is_ready "$health_json" "$require_dashboard" "$allow_reconcile_degraded" "$allow_no_provider_runtimes"; then
       return 0
     fi
 
@@ -798,4 +1081,395 @@ EOF
 
   echo "✓ [gate] ${scope} active/finalizing turns drained (${waited}s, queued=${queue_depth})"
   return 0
+}
+
+# ── #4255 deploy pre-flight: resource-contention guard ──────────────────────
+# Two release deploys were KILLED mid-build by resource contention that this
+# guard exists to catch BEFORE an expensive `cargo build --release` starts:
+#   • 2026-07-05: a concurrent Unreal Engine build oversubscribed CPU/RAM.
+#   • 2026-07-07: a runaway `ugrep` pegged a core and starved the build.
+# Design: every probe FAILS OPEN — a metric that cannot be read is skipped, never
+# manufactured into a finding — so a clean machine is always a no-op and only a
+# positively-observed contention signal blocks. Builder detection uses exact
+# process-name matching (`pgrep -x`), NEVER `pgrep -f <pattern>`: `pgrep -f
+# deploy-release.sh` self-matches this very script and any monitoring wrapper
+# whose argv contains that string, which previously wedged a build gate into a
+# deadlock that never cleared. Exact-name matching also means the ssh client,
+# sshd, and a peer's remote deploy shell (all `ssh`/`sshd`/`bash`, never
+# `cargo`/`rustc`) can never be mistaken for a concurrent builder on the cluster
+# path. The one process the gate must NEVER refuse on is this node's release
+# dcserver — the deploy restarts it, so a busy target is the subject of the
+# deploy, not contention to wait out. It is exempted by launchd PID, or by exact
+# executable path AND a `dcserver` argv subcommand: never by basename (a dev-tree
+# build would match) and never by path alone (the release binary is multi-command,
+# so `agentdesk codex-tmux-wrapper` shares that path). See #4255.
+
+_preflight_cpu_count() {
+  # Logical CPU count, used to scale the default load-average ceiling so one
+  # default is sane on both the mac-mini (more cores) and the mac-book (fewer).
+  # Prints NOTHING when the count is unreadable — it must NEVER fabricate a value,
+  # because a guessed count fed into the load ceiling would fail CLOSED and
+  # falsely block a high-core host whose hw.ncpu happens to be unreadable. The
+  # load probe skips itself instead when no count is available (#4255 review).
+  local n=""
+  if command -v sysctl >/dev/null 2>&1; then
+    n="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  if [ -z "$n" ] && command -v nproc >/dev/null 2>&1; then
+    n="$(nproc 2>/dev/null || true)"
+  fi
+  case "$n" in
+    ''|*[!0-9]*) return 0 ;;   # unreadable → print nothing so the caller skips
+  esac
+  printf '%s' "$n"
+}
+
+_preflight_default_max_loadavg() {
+  # Default 1-min load-average ceiling = 1.5 × logical CPUs. Before OUR build
+  # starts the machine should be near-idle, so a load already at 1.5× core count
+  # means other work is saturating it (the 07-05 concurrent-UE-build incident).
+  # Prints NOTHING when the CPU count is unreadable, so the load probe is skipped
+  # rather than evaluated against a fabricated ceiling (#4255 review finding 2).
+  local ncpu
+  ncpu="$(_preflight_cpu_count)"
+  [ -n "$ncpu" ] || return 0
+  awk -v n="$ncpu" 'BEGIN { printf "%.2f", (n + 0) * 1.5 }'
+}
+
+_preflight_loadavg_1min() {
+  # 1-minute load average as a bare number, or nothing when unreadable.
+  # `sysctl -n vm.loadavg` → "{ 3.70 3.15 3.03 }"; the first token is the 1-min.
+  local raw field
+  if command -v sysctl >/dev/null 2>&1; then
+    raw="$(sysctl -n vm.loadavg 2>/dev/null || true)"
+    field="$(printf '%s' "$raw" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+$/) { print $i; exit } }')"
+    if [ -n "$field" ]; then
+      printf '%s' "$field"
+      return 0
+    fi
+  fi
+  # Fallback: parse `uptime` — macOS "load averages: 3.70 3.15 3.03" or
+  # GNU "load average: 3.70, 3.15, 3.03".
+  if command -v uptime >/dev/null 2>&1; then
+    uptime 2>/dev/null | sed -E 's/.*load averages?:[[:space:]]*//; s/,//g' | awk '{ print $1 }'
+    return 0
+  fi
+  return 0
+}
+
+_preflight_mem_pressure_level() {
+  # macOS memory-pressure level: 1 = normal, 2 = warn, 4 = critical
+  # (kern.memorystatus_vm_pressure_level). Prints the integer, or nothing when
+  # the sysctl is unavailable (e.g. Linux CI) so the memory gate is skipped.
+  command -v sysctl >/dev/null 2>&1 || return 0
+  local lvl
+  lvl="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || true)"
+  case "$lvl" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  printf '%s' "$lvl"
+}
+
+_preflight_num_gt() {
+  # Float-aware "a > b": returns 0 (true) only when both parse as numbers AND
+  # a > b. A non-numeric operand → return 1 (NOT greater) so an unreadable
+  # metric can never trip a gate.
+  local a="$1" b="$2"
+  case "$a" in ''|*[!0-9.]*) return 1 ;; esac
+  case "$b" in ''|*[!0-9.]*) return 1 ;; esac
+  awk -v a="$a" -v b="$b" 'BEGIN { exit !((a + 0) > (b + 0)) }'
+}
+
+_preflight_builder_pids() {
+  # Space-joined PIDs of an EXACT-named build tool. `pgrep -x <name>` only — see
+  # the header note: `pgrep -f` would self-match the deploy script/wrapper.
+  local name="$1"
+  command -v pgrep >/dev/null 2>&1 || return 0
+  pgrep -x "$name" 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+$//' || true
+}
+
+_preflight_self_pgid() {
+  ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+_preflight_high_cpu_processes() {
+  # Emit "pid<TAB>cpu<TAB>etime<TAB>time<TAB>comm" for each process whose ps %CPU
+  # (a ~1-minute decaying average on macOS) is >= the threshold, EXCLUDING this
+  # deploy's own process group so neither the deploy script, its lock wrapper,
+  # nor a peer's ssh-invoked shell is ever counted as contention. etime (wall
+  # ELAPSED) and time (cumulative CPU) let the caller tell a sustained runaway
+  # (the 07-07 zombie ugrep, pegged for its whole life) from a legitimate burst
+  # (#4255 review round 2). Neither duration contains spaces, so comm — which
+  # may be a path with spaces — stays the final, greedily-joined column.
+  local threshold="$1"
+  case "$threshold" in ''|*[!0-9.]*) return 0 ;; esac
+  command -v ps >/dev/null 2>&1 || return 0
+  local self_pgid
+  self_pgid="$(_preflight_self_pgid)"
+  ps -Ao pid=,pgid=,%cpu=,etime=,time=,comm= 2>/dev/null | awk -v thr="$threshold" -v spg="$self_pgid" '
+    {
+      pid = $1; pgid = $2; cpu = $3; etime = $4; cputime = $5;
+      comm = $6;
+      for (i = 7; i <= NF; i++) comm = comm " " $i;
+      if (spg != "" && pgid == spg) next;
+      if ((cpu + 0) >= (thr + 0)) printf "%s\t%s\t%s\t%s\t%s\n", pid, cpu, etime, cputime, comm;
+    }' || true
+}
+
+_preflight_ps_duration_to_seconds() {
+  # Convert a ps etime/time duration ("[[DD-]HH:]MM:SS[.frac]") to whole seconds.
+  # Prints NOTHING on an unparseable value so the caller SKIPS the probe (fail
+  # OPEN — never synthesize a default; #4255 review). etime looks like
+  # "MM:SS" / "HH:MM:SS" / "DD-HH:MM:SS"; time looks like "MM:SS.CC" / "HH:MM:SS".
+  local raw="$1" days=0 rest a b c extra hh=0 mm=0 ss=0 field
+  raw="$(_trim_whitespace "$raw")"
+  [ -n "$raw" ] || return 0
+  case "$raw" in
+    *-*) days="${raw%%-*}"; rest="${raw#*-}" ;;
+    *)   rest="$raw" ;;
+  esac
+  case "$days" in ''|*[!0-9]*) return 0 ;; esac
+  rest="${rest%%.*}"   # drop fractional seconds — sub-second precision is moot
+  IFS=':' read -r a b c extra <<EOF
+$rest
+EOF
+  [ -z "$extra" ] || return 0   # more than three colon fields → malformed
+  if [ -n "$c" ]; then
+    hh="$a"; mm="$b"; ss="$c"
+  elif [ -n "$b" ]; then
+    mm="$a"; ss="$b"
+  else
+    ss="$a"
+  fi
+  for field in "$hh" "$mm" "$ss"; do
+    case "$field" in ''|*[!0-9]*) return 0 ;; esac
+  done
+  printf '%s' "$(( 10#$days * 86400 + 10#$hh * 3600 + 10#$mm * 60 + 10#$ss ))"
+}
+
+_preflight_is_sustained_runaway() {
+  # Returns 0 when a hot process has been CPU-pegged for its ENTIRE (long) life —
+  # cumulative-CPU / elapsed >= ratio AND elapsed >= min_elapsed. That is the
+  # zombie/runaway signature (spins its whole life on one core, so it never moves
+  # loadavg on a many-core box) as opposed to a legitimate burst (mdworker, a
+  # fresh rust-analyzer reindex). Fails OPEN (return 1 = not classified) on any
+  # unparseable/missing duration — never hard-refuse on data we cannot trust.
+  local etime="$1" cputime="$2" ratio="$3" min_elapsed="$4"
+  local elapsed cpu
+  elapsed="$(_preflight_ps_duration_to_seconds "$etime")"
+  cpu="$(_preflight_ps_duration_to_seconds "$cputime")"
+  [ -n "$elapsed" ] && [ -n "$cpu" ] || return 1
+  case "$min_elapsed" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$elapsed" -ge "$min_elapsed" ] 2>/dev/null || return 1
+  awk -v c="$cpu" -v e="$elapsed" -v r="$ratio" 'BEGIN { exit !((e + 0) > 0 && (c + 0) >= (r + 0) * (e + 0)) }'
+}
+
+_preflight_release_binary() {
+  # Absolute path of the release dcserver binary this deploy is about to replace.
+  # Mirrors deploy-release.sh's ADK_REL derivation (which is already set by the
+  # time the gate runs, but recompute so the helper stands alone in tests).
+  local rel_root="${ADK_REL:-${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}}"
+  printf '%s' "${rel_root}/bin/agentdesk"
+}
+
+_preflight_deploy_target_pids() {
+  # Newline-separated PIDs of the release dcserver — the process this deploy
+  # RESTARTS. A busy deploy target is not contention to refuse; it is the target.
+  # Authoritative source: the launchd job's own PID, so a dev-tree `agentdesk`
+  # (same basename, different path) is never mistaken for the release daemon.
+  # `pgrep -x agentdesk` matches basename ONLY and would whitelist that dev
+  # build, so it is deliberately NOT used here. Prints nothing when launchctl is
+  # unavailable or the job is loaded-but-not-running ("PID" absent) — the caller
+  # then falls back to the exact executable-path match, and if that also misses,
+  # the guard keeps its pre-existing behavior (no silent widening).
+  command -v launchctl >/dev/null 2>&1 || return 0
+  local label="${AGENTDESK_DCSERVER_LABEL:-${AGENTDESK_PLIST_REL:-com.agentdesk.release}}"
+  # `launchctl list <label>` emits a plist dump containing `"PID" = 1234;`.
+  launchctl list "$label" 2>/dev/null \
+    | awk -F'= *' '/"PID"[[:space:]]*=/ { gsub(/[^0-9]/, "", $2); if ($2 != "") print $2 }' \
+    || true
+}
+
+_preflight_process_is_release_dcserver() {
+  # True when <pid>'s argv is the release binary running the `dcserver`
+  # subcommand. The release binary is MULTI-COMMAND (`agentdesk dcserver`,
+  # `agentdesk codex-tmux-wrapper`, …) and `ps -o comm=` reports the SAME
+  # executable path for every subcommand, so the path alone must never grant the
+  # deploy-target exemption — a runaway `agentdesk codex-tmux-wrapper` would ride
+  # in on it and starve the build (#4255 review round 4). `-ww` defeats ps's
+  # terminal-width argv truncation. Fails CLOSED (return 1 = not the target) on
+  # any unreadable argv: a process we cannot identify never earns the exemption.
+  local pid="$1" rel_binary="$2" args argv0 rest sub
+  [ -n "$pid" ] && [ -n "$rel_binary" ] || return 1
+  command -v ps >/dev/null 2>&1 || return 1
+  args="$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
+  [ -n "$args" ] || return 1
+  argv0="${args%% *}"
+  [ "$argv0" = "$rel_binary" ] || return 1
+  rest="${args#* }"
+  [ "$rest" != "$args" ] || return 1   # no argument → no subcommand → not dcserver
+  sub="${rest%% *}"
+  [ "$sub" = "dcserver" ]
+}
+
+_preflight_is_deploy_target() {
+  # _preflight_is_deploy_target <pid> <comm> <target_pids_newline_list> <rel_binary>
+  # True when the hot process IS the release dcserver being deployed. Two narrow
+  # matchers (#4255 review r3 self-lock, tightened in r4):
+  #   (a) the launchd job's PID — launchd only ever runs the dcserver job;
+  #   (b) exact executable path AND an argv whose subcommand is `dcserver` —
+  #       covers a tmux-fallback dcserver launchd does not own, without
+  #       exempting the binary's other subcommands.
+  # Never `pgrep -x agentdesk`: that matches basename only and would also
+  # whitelist a dev-tree build.
+  local pid="$1" comm="$2" target_pids="$3" rel_binary="$4" tp
+  [ -n "$pid" ] || return 1
+  if [ -n "$target_pids" ]; then
+    # Heredoc, not a pipe: a pipe would run the loop in a subshell where `return`
+    # cannot escape the function.
+    while IFS= read -r tp; do
+      [ -n "$tp" ] || continue
+      if [ "$tp" = "$pid" ]; then
+        return 0
+      fi
+    done <<EOF
+$target_pids
+EOF
+  fi
+  if [ -n "$rel_binary" ] && [ "$comm" = "$rel_binary" ]; then
+    if _preflight_process_is_release_dcserver "$pid" "$rel_binary"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_preflight_resource_contention() {
+  # #4255: refuse an expensive release build when the machine is already under
+  # resource contention that has twice killed a mid-flight deploy. Prints every
+  # detected cause with its pid / metric-vs-threshold and returns 1 (refuse)
+  # when any finding exists; returns 0 on a clean machine. Escape hatch:
+  # AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=1 proceeds anyway (findings are
+  # still printed, downgraded to warnings), consistent with the
+  # AGENTDESK_DEPLOY_FORCE_ROLLBACK force-through style.
+  local force="${AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT:-0}"
+  local max_load="${AGENTDESK_DEPLOY_MAX_LOADAVG:-}"
+  local max_pressure="${AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL:-4}"
+  local high_cpu_pct="${AGENTDESK_DEPLOY_HIGH_CPU_PCT:-90}"
+  local runaway_ratio="${AGENTDESK_DEPLOY_RUNAWAY_CPU_RATIO:-0.8}"
+  local runaway_min_elapsed="${AGENTDESK_DEPLOY_RUNAWAY_MIN_ELAPSED:-600}"
+  local load_is_override=0 system_pressured=0
+  local -a findings=()
+  local -a advisory_hot=()
+  local name pids loadavg pressure ncpu
+  local hpid hcpu hetime hcputime hcomm hp f desc
+  local rel_binary target_pids
+
+  case "$max_pressure" in ''|*[!0-9]*) max_pressure=4 ;; esac
+  case "$high_cpu_pct" in ''|*[!0-9.]*) high_cpu_pct=90 ;; esac
+  case "$runaway_ratio" in ''|*[!0-9.]*) runaway_ratio=0.8 ;; esac
+  case "$runaway_min_elapsed" in ''|*[!0-9]*) runaway_min_elapsed=600 ;; esac
+  if [ -n "$max_load" ]; then
+    load_is_override=1
+  else
+    # Empty when the CPU count is unreadable → the load probe skips itself below
+    # (fail OPEN), never blocking on a fabricated core count (#4255 review #2).
+    max_load="$(_preflight_default_max_loadavg)"
+  fi
+  ncpu="$(_preflight_cpu_count)"
+
+  # (1) Concurrent build tools — EXACT-name match only (never `pgrep -f`). These
+  # are the known deploy-killers (07-05 concurrent UE build) and stay a HARD
+  # refuse on their own — a builder is unambiguous, machine-wide contention.
+  for name in cargo rustc UnrealEditor UnrealEditor-Cmd UnrealBuildTool ShaderCompileWorker; do
+    pids="$(_preflight_builder_pids "$name" || true)"
+    if [ -n "$pids" ]; then
+      findings+=("concurrent build tool '${name}' running (pid ${pids}) — would oversubscribe CPU/RAM against the release build")
+    fi
+  done
+
+  # (2) Load average vs ceiling. SKIPPED entirely when the ceiling is unknown
+  # (unreadable CPU count AND no explicit override) — fail OPEN (#4255 review #2).
+  loadavg="$(_preflight_loadavg_1min || true)"
+  if [ -n "$loadavg" ] && [ -n "$max_load" ] && _preflight_num_gt "$loadavg" "$max_load"; then
+    if [ "$load_is_override" = "1" ]; then
+      findings+=("1-min load average ${loadavg} exceeds ceiling ${max_load} (AGENTDESK_DEPLOY_MAX_LOADAVG override)")
+    else
+      findings+=("1-min load average ${loadavg} exceeds ceiling ${max_load} (default 1.5×${ncpu} cores; set AGENTDESK_DEPLOY_MAX_LOADAVG)")
+    fi
+    system_pressured=1
+  fi
+
+  # (3) Memory pressure vs ceiling (macOS kern.memorystatus_vm_pressure_level).
+  pressure="$(_preflight_mem_pressure_level || true)"
+  if [ -n "$pressure" ] && [ "$pressure" -ge "$max_pressure" ] 2>/dev/null; then
+    findings+=("memory pressure level ${pressure} >= ceiling ${max_pressure} (1=normal 2=warn 4=critical; AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL)")
+    system_pressured=1
+  fi
+
+  # (4) Other high-CPU processes (own process group excluded). Per process, a
+  # hot (%CPU >= ceiling) NON-builder is classified:
+  #   • THE DEPLOY TARGET (this node's release dcserver) → ADVISORY, never a
+  #     refuse. The deploy restarts that very process, so its load is the thing
+  #     being replaced, not contention to wait out. Refusing on it self-locked
+  #     every deploy from a busy node: a dcserver whose cumulative CPU time (summed
+  #     over its threads) exceeds 0.8× its elapsed wall time trips the sustained-
+  #     runaway ratio without any machine-wide pressure at all (#4255 review r3).
+  #   • SUSTAINED RUNAWAY → HARD refuse on its own, no corroboration needed. A
+  #     process CPU-pegged for its ENTIRE long life (cpu-time/elapsed >= ratio
+  #     AND elapsed >= min_elapsed) is the 07-07 zombie-ugrep shape: a single-
+  #     core spinner never moves loadavg on a 14-core box, so the old
+  #     load/memory corroboration MISSED the very incident this guard exists for.
+  #   • hot AND system-pressured (load over ceiling OR memory at/above block
+  #     level) → HARD refuse — catches multi-process saturation.
+  #   • otherwise → ADVISORY (warn, proceed): a legitimate burst (a fresh
+  #     rust-analyzer reindex below the min-elapsed floor, a bursty mdworker with
+  #     a low lifetime ratio) must never block a deploy (#4255 review round 2).
+  # The min-elapsed floor is what spares a just-started legitimate burst whose
+  # short life makes the ratio trivially ~1.
+  rel_binary="$(_preflight_release_binary)"
+  target_pids="$(_preflight_deploy_target_pids || true)"
+  while IFS="$(printf '\t')" read -r hpid hcpu hetime hcputime hcomm; do
+    [ -n "$hpid" ] || continue
+    desc="high-CPU process '${hcomm}' (pid ${hpid}, ${hcpu}% ps-avg, elapsed ${hetime}, cpu-time ${hcputime})"
+    if _preflight_is_deploy_target "$hpid" "$hcomm" "$target_pids" "$rel_binary"; then
+      advisory_hot+=("${desc} — DEPLOY TARGET (release dcserver); this deploy restarts it, so its load never blocks (#4255)")
+    elif _preflight_is_sustained_runaway "$hetime" "$hcputime" "$runaway_ratio" "$runaway_min_elapsed"; then
+      findings+=("${desc} — SUSTAINED runaway: CPU-pegged for >=${runaway_min_elapsed}s at >=${runaway_ratio}× of its lifetime (07-07 zombie shape)")
+    elif [ "$system_pressured" = "1" ]; then
+      findings+=("${desc} — contending while the machine is under system-wide load/memory pressure")
+    else
+      advisory_hot+=("${desc} >= ${high_cpu_pct}% (AGENTDESK_DEPLOY_HIGH_CPU_PCT)")
+    fi
+  done <<EOF
+$(_preflight_high_cpu_processes "$high_cpu_pct")
+EOF
+
+  if [ "${#findings[@]}" -eq 0 ]; then
+    # Uncorroborated, non-runaway hot process(es): advisory only — but PROCEED.
+    if [ "${#advisory_hot[@]}" -gt 0 ]; then
+      echo "⚠ [gate] high-CPU process(es) noted but not a sustained runaway and no corroborating load/memory pressure — advisory, proceeding:" >&2
+      for hp in "${advisory_hot[@]}"; do
+        echo "    - $hp" >&2
+      done
+    fi
+    echo "▸ [gate] Resource pre-flight clear (load=${loadavg:-n/a}/${max_load:-skipped}, mem-pressure=${pressure:-n/a}/${max_pressure})"
+    return 0
+  fi
+
+  if [ "$force" = "1" ]; then
+    echo "⚠ [gate] Resource contention detected but AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=1 — proceeding anyway:" >&2
+    for f in "${findings[@]}"; do
+      echo "    - $f" >&2
+    done
+    return 0
+  fi
+
+  echo "🛑 [gate] Refusing release build — resource contention detected (#4255):" >&2
+  for f in "${findings[@]}"; do
+    echo "    - $f" >&2
+  done
+  echo "  Two prior deploys were KILLED mid-build by exactly this (07-05 concurrent UE build, 07-07 runaway ugrep)." >&2
+  echo "  Free the machine and retry, or set AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=1 to force through." >&2
+  return 1
 }

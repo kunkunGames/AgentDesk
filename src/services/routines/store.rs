@@ -909,6 +909,7 @@ impl RoutineStore {
             r#"
             UPDATE routines
             SET status = 'enabled',
+                pause_reason = NULL,
                 updated_at = NOW()
             WHERE id = $1
               AND status = 'paused'
@@ -2605,6 +2606,7 @@ impl RoutineStore {
                     r#"
                     UPDATE routines
                     SET status = 'enabled',
+                        pause_reason = NULL,
                         updated_at = NOW()
                     WHERE id = $1
                       AND status = 'paused'
@@ -2623,6 +2625,7 @@ impl RoutineStore {
                 r#"
                 UPDATE routines
                 SET status = 'enabled',
+                    pause_reason = NULL,
                     next_due_at = $2,
                     updated_at = NOW()
                 WHERE id = $1
@@ -3489,7 +3492,9 @@ fn parse_routine_schedule(schedule: &str) -> Result<ParsedRoutineSchedule> {
     Ok(ParsedRoutineSchedule::Cron(cron))
 }
 
-fn next_due_after(
+// pub(crate): scheduled messages reuse the routine schedule grammar
+// ('@every <duration>' | 5-field cron) for their optional recurrence.
+pub(crate) fn next_due_after(
     schedule: &str,
     default_timezone: &str,
     now: DateTime<Utc>,
@@ -3500,7 +3505,7 @@ fn next_due_after(
     }
 }
 
-fn next_due_after_anchor(
+pub(crate) fn next_due_after_anchor(
     schedule: &str,
     default_timezone: &str,
     anchor: DateTime<Utc>,

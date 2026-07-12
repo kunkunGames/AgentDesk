@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use poise::serenity_prelude as serenity;
@@ -664,6 +664,11 @@ pub(in crate::services::discord) fn classify_catch_up_message(
     if existing_ids.contains(&msg.message_id) {
         return CatchUpClassification::Duplicate;
     }
+    if is_restart_gap_notice(msg.author_is_bot, &msg.trimmed_text) {
+        // #4443: checked BEFORE TooOld so aged notices skip the drop/DLQ/
+        // re-notice path entirely (see is_restart_gap_notice).
+        return CatchUpClassification::SelfAuthored;
+    }
     if msg.age_secs > max_age_secs {
         return CatchUpClassification::TooOld;
     }
@@ -685,6 +690,20 @@ pub(in crate::services::discord) fn classify_catch_up_message(
 /// #4260: max entries listed in the aggregate too-old notice before we
 /// summarize the remainder as "… 외 N건" (keep the card compact).
 const CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS: usize = 10;
+
+/// #4443: leading marker of the aggregate restart-gap notice. Shared between
+/// the notice builder and the catch-up classifiers so a reworded notice cannot
+/// silently break the self-recollection guard.
+const CATCH_UP_TOO_OLD_NOTICE_PREFIX: &str = "⚠️ 재시작 공백으로";
+
+/// #4443: true when a message is our own restart-gap notice reposted through
+/// an allowed sender bot. Both catch-up phases must classify these out:
+/// re-collecting one nests it inside the next notice (one level per restart,
+/// every channel) and phase2 would hand a young one to the agent as input.
+/// Prefix + bot-author scoped so a human quoting the marker still recovers.
+fn is_restart_gap_notice(author_is_bot: bool, text: &str) -> bool {
+    author_is_bot && text.starts_with(CATCH_UP_TOO_OLD_NOTICE_PREFIX)
+}
 
 /// #4260: one message dropped as too-old during a catch-up scan, captured for
 /// the per-channel aggregate "재시작 공백" notice (silent-loss vector 1).
@@ -718,7 +737,7 @@ fn catch_up_too_old_notice(drops: &[CatchUpTooOldDrop]) -> Option<String> {
         return None;
     }
     let mut body = format!(
-        "⚠️ 재시작 공백으로 {}건이 5분 초과로 미처리되었습니다. 필요하면 다시 보내주세요:",
+        "{CATCH_UP_TOO_OLD_NOTICE_PREFIX} {}건이 5분 초과로 미처리되었습니다. 필요하면 다시 보내주세요:",
         drops.len()
     );
     for drop in drops.iter().take(CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS) {
@@ -773,7 +792,6 @@ pub(in crate::services::discord) async fn catch_up_missed_messages(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) {
-    let retry_checkpoints = HashMap::new();
     let pending_retry_channels = collect_catch_up_retry_pending_channels(shared);
     let pending_count = pending_retry_channels.len();
     if pending_count > 0 {
@@ -783,60 +801,93 @@ pub(in crate::services::discord) async fn catch_up_missed_messages(
         );
     }
     let api = SerenityCatchUpDiscordApi { http };
-    catch_up_missed_messages_inner_with_api_and_pending_retry_channels(
-        &api,
-        shared,
-        provider,
-        &retry_checkpoints,
-        &pending_retry_channels,
+    run_catch_up_sweep(
+        CatchUpDeps::new(&api, shared, provider)
+            .with_pending_retry_channels(&pending_retry_channels),
     )
     .await;
 }
 
-pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
+/// #4165 queue-drain retry entry: the same sweep as [`catch_up_missed_messages`]
+/// but seeded with caller-owned retry checkpoints (and no pending-channel
+/// collection) so a single channel can be re-scanned after its queue drains.
+pub(in crate::services::discord) async fn catch_up_missed_messages_for_retry(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     retry_checkpoints: &HashMap<ChannelId, CatchUpRetryState>,
 ) {
-    let pending_retry_channels = HashSet::new();
     let api = SerenityCatchUpDiscordApi { http };
-    catch_up_missed_messages_inner_with_api_and_pending_retry_channels(
-        &api,
-        shared,
-        provider,
-        retry_checkpoints,
-        &pending_retry_channels,
+    run_catch_up_sweep(
+        CatchUpDeps::new(&api, shared, provider).with_retry_checkpoints(retry_checkpoints),
     )
     .await;
 }
 
-async fn catch_up_missed_messages_inner_with_api<A: CatchUpDiscordApi + ?Sized>(
-    api: &A,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    retry_checkpoints: &HashMap<ChannelId, CatchUpRetryState>,
-) {
-    let pending_retry_channels = HashSet::new();
-    catch_up_missed_messages_inner_with_api_and_pending_retry_channels(
+/// #4233: injected dependencies for one catch-up sweep. Collapses the former
+/// 4-level wrapper chain (`catch_up_missed_messages` → `_inner` →
+/// `_inner_with_api` → `_inner_with_api_and_pending_retry_channels`), where each
+/// added injection point spawned a longer function name. Production builds this
+/// via [`CatchUpDeps::new`] (empty retry/pending defaults); the retry-drain
+/// entry and tests override the api / retry-checkpoint / pending-channel seams
+/// with the `with_*` builders.
+struct CatchUpDeps<'a, A: CatchUpDiscordApi + ?Sized> {
+    api: &'a A,
+    shared: &'a Arc<SharedData>,
+    provider: &'a ProviderKind,
+    retry_checkpoints: &'a HashMap<ChannelId, CatchUpRetryState>,
+    pending_retry_channels: &'a HashSet<ChannelId>,
+}
+
+/// Empty defaults so [`CatchUpDeps::new`] can hand out `'static` references for
+/// the common "no injected retry checkpoints / no pending channels" path.
+static CATCH_UP_EMPTY_RETRY_CHECKPOINTS: LazyLock<HashMap<ChannelId, CatchUpRetryState>> =
+    LazyLock::new(HashMap::new);
+static CATCH_UP_EMPTY_PENDING_RETRY_CHANNELS: LazyLock<HashSet<ChannelId>> =
+    LazyLock::new(HashSet::new);
+
+impl<'a, A: CatchUpDiscordApi + ?Sized> CatchUpDeps<'a, A> {
+    /// Default seam: no injected retry checkpoints and no pending retry
+    /// channels. Override with the `with_*` builders below.
+    fn new(api: &'a A, shared: &'a Arc<SharedData>, provider: &'a ProviderKind) -> Self {
+        Self {
+            api,
+            shared,
+            provider,
+            retry_checkpoints: &CATCH_UP_EMPTY_RETRY_CHECKPOINTS,
+            pending_retry_channels: &CATCH_UP_EMPTY_PENDING_RETRY_CHANNELS,
+        }
+    }
+
+    /// Inject the caller-owned per-channel retry checkpoints for this sweep
+    /// (queue-drain retry entry + retry-mode tests).
+    fn with_retry_checkpoints(
+        mut self,
+        retry_checkpoints: &'a HashMap<ChannelId, CatchUpRetryState>,
+    ) -> Self {
+        self.retry_checkpoints = retry_checkpoints;
+        self
+    }
+
+    /// Inject the channels observed carrying a pending retry checkpoint
+    /// (startup sweep + pending-map race tests).
+    fn with_pending_retry_channels(
+        mut self,
+        pending_retry_channels: &'a HashSet<ChannelId>,
+    ) -> Self {
+        self.pending_retry_channels = pending_retry_channels;
+        self
+    }
+}
+
+async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_, A>) {
+    let CatchUpDeps {
         api,
         shared,
         provider,
         retry_checkpoints,
-        &pending_retry_channels,
-    )
-    .await;
-}
-
-async fn catch_up_missed_messages_inner_with_api_and_pending_retry_channels<
-    A: CatchUpDiscordApi + ?Sized,
->(
-    api: &A,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    retry_checkpoints: &HashMap<ChannelId, CatchUpRetryState>,
-    pending_retry_channels: &HashSet<ChannelId>,
-) {
+        pending_retry_channels,
+    } = deps;
     let Some(root) = runtime_store::last_message_root() else {
         return;
     };
@@ -1466,6 +1517,12 @@ async fn catch_up_missed_messages_inner_with_api_and_pending_retry_channels<
                 stats.skipped += 1;
                 continue;
             }
+            if is_restart_gap_notice(msg.author.bot, text) {
+                // #4443: phase2's 10-minute window would otherwise hand a
+                // young notice straight to the agent after every deploy.
+                stats.skipped += 1;
+                continue;
+            }
             let mid = msg.id.get();
             if !is_allowed_turn_sender(
                 &allowed_bot_ids_phase2,
@@ -1662,19 +1719,19 @@ mod catch_up_recovery_tests {
     use super::{
         CATCH_UP_RECENT_MAX_PAGES, CATCH_UP_RETRY_DEFERRED_REARM_LIMIT,
         CATCH_UP_RETRY_FETCH_FAILURE_LIMIT, CATCH_UP_SCAN_PACE_DEFAULT_MS, CatchUpChannelCandidate,
-        CatchUpClassification, CatchUpDiscordApi, CatchUpFetchMode, CatchUpMessageView,
-        CatchUpRetryScanDecision, CatchUpRetryState, CatchUpTooOldDrop, ChannelId, MessageId,
-        Phase2EnqueueCommit, ProviderKind, RuntimeChannelBindingStatus, advance_phase2_checkpoint,
-        arm_catch_up_retry_pending, catch_up_enqueue_accepted, catch_up_fetch_mode_for_scan,
-        catch_up_intervention_created_at, catch_up_last_item_dedup_is_checkpoint_safe,
-        catch_up_message_age_reference_time, catch_up_missed_messages_inner_with_api,
-        catch_up_missed_messages_inner_with_api_and_pending_retry_channels,
+        CatchUpClassification, CatchUpDeps, CatchUpDiscordApi, CatchUpFetchMode,
+        CatchUpMessageView, CatchUpRetryScanDecision, CatchUpRetryState, CatchUpTooOldDrop,
+        ChannelId, MessageId, Phase2EnqueueCommit, ProviderKind, RuntimeChannelBindingStatus,
+        advance_phase2_checkpoint, arm_catch_up_retry_pending, catch_up_enqueue_accepted,
+        catch_up_fetch_mode_for_scan, catch_up_intervention_created_at,
+        catch_up_last_item_dedup_is_checkpoint_safe, catch_up_message_age_reference_time,
         catch_up_remaining_queue_capacity, catch_up_too_old_notice, catch_up_too_old_snippet,
         classify_catch_up_message, classify_phase2_enqueue_commit,
         collect_catch_up_retry_pending_channels, consume_catch_up_retry_state_for_scan,
-        insert_configured_catch_up_candidate, merge_catch_up_retry_checkpoint,
-        parse_catch_up_scan_pace, phase2_retry_after_checkpoint, prune_stale_checkpoint_files,
-        rearm_catch_up_retry_after_defer, rearm_catch_up_retry_after_fetch_failure,
+        insert_configured_catch_up_candidate, is_restart_gap_notice,
+        merge_catch_up_retry_checkpoint, parse_catch_up_scan_pace, phase2_retry_after_checkpoint,
+        prune_stale_checkpoint_files, rearm_catch_up_retry_after_defer,
+        rearm_catch_up_retry_after_fetch_failure, run_catch_up_sweep,
         should_fetch_older_recent_page, should_pace_before_scan,
         take_catch_up_retry_checkpoint_after_queue_drain,
     };
@@ -2073,6 +2130,83 @@ mod catch_up_recovery_tests {
     }
 
     #[test]
+    fn restart_gap_notice_from_allowed_bot_is_never_recollected() {
+        // #4443: the aggregate restart-gap notice is posted through an
+        // allowed sender bot. Re-collecting it as TooOld quoted it inside the
+        // next notice — one more nesting level per restart, spammed to every
+        // channel. The guard must fire BEFORE the TooOld branch (no DLQ, no
+        // drop entry) and regardless of age.
+        let notice_bot_id = 1481522187197218816;
+        let current_bot_id = 9001;
+        let notice_text = catch_up_too_old_notice(&[CatchUpTooOldDrop {
+            author_id: notice_bot_id,
+            snippet: "⚠️ 재시작 공백으로 1건이 5분 초과로 미처리되었습니다…".to_string(),
+        }])
+        .expect("non-empty drops produce a notice");
+        let mut view = CatchUpMessageView {
+            message_id: 1504813049431724099,
+            author_id: notice_bot_id,
+            author_is_bot: true,
+            is_processable_kind: true,
+            age_secs: 3600, // far beyond max_age — would be TooOld without the guard
+            trimmed_text: notice_text,
+        };
+        let existing = HashSet::new();
+
+        assert_eq!(
+            classify_catch_up_message(
+                &view,
+                Some(current_bot_id),
+                &existing,
+                300,
+                &[notice_bot_id],
+                None
+            ),
+            CatchUpClassification::SelfAuthored,
+            "aged notice must be classified out before the TooOld drop path"
+        );
+        view.age_secs = 60;
+        assert_eq!(
+            classify_catch_up_message(
+                &view,
+                Some(current_bot_id),
+                &existing,
+                300,
+                &[notice_bot_id],
+                None
+            ),
+            CatchUpClassification::SelfAuthored,
+            "young notice must not be recovered as a turn input either"
+        );
+
+        // Shared predicate (also wired into the phase2 enqueue loop):
+        assert!(is_restart_gap_notice(true, &view.trimmed_text));
+        assert!(
+            !is_restart_gap_notice(false, &view.trimmed_text),
+            "human-authored text is never a notice"
+        );
+        assert!(
+            !is_restart_gap_notice(true, "PM triage: pick up #42"),
+            "ordinary allowed-bot traffic must stay recoverable"
+        );
+
+        // A human message that merely mentions the marker mid-text still
+        // recovers — the guard is prefix + bot-author scoped.
+        let human = CatchUpMessageView {
+            message_id: 1504813049431724100,
+            author_id: 343742347365974026,
+            author_is_bot: false,
+            is_processable_kind: true,
+            age_secs: 60,
+            trimmed_text: "어제 '⚠️ 재시작 공백으로' 카드 왜 떴어?".to_string(),
+        };
+        assert_eq!(
+            classify_catch_up_message(&human, Some(current_bot_id), &existing, 300, &[], None),
+            CatchUpClassification::Recover
+        );
+    }
+
+    #[test]
     fn announce_bot_message_recovers_without_dispatch_marker() {
         // #3576: a catch-up scan must recover announce-authored trigger
         // traffic even without the DISPATCH:/monitor marker.
@@ -2317,13 +2451,9 @@ mod catch_up_recovery_tests {
             fetch_attempts: Some(Arc::clone(&fetch_attempts)),
             cleanup_hook: None,
         };
-        let retry_checkpoints = HashMap::new();
-        catch_up_missed_messages_inner_with_api_and_pending_retry_channels(
-            &api,
-            &shared,
-            &provider,
-            &retry_checkpoints,
-            &pending_retry_channels,
+        run_catch_up_sweep(
+            CatchUpDeps::new(&api, &shared, &provider)
+                .with_pending_retry_channels(&pending_retry_channels),
         )
         .await;
 
@@ -2379,9 +2509,7 @@ mod catch_up_recovery_tests {
                 }
             })),
         };
-        let retry_checkpoints = HashMap::new();
-
-        catch_up_missed_messages_inner_with_api(&api, &shared, &provider, &retry_checkpoints).await;
+        run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
         set_dir_readonly(&pending_queue_dir, false);
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
 
@@ -2497,9 +2625,7 @@ mod catch_up_recovery_tests {
             fetch_attempts: None,
             cleanup_hook: None,
         };
-        let retry_checkpoints = HashMap::new();
-
-        catch_up_missed_messages_inner_with_api(&api, &shared, &provider, &retry_checkpoints).await;
+        run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
 
         assert!(shared.last_message_ids.get(&channel_id).is_none());
         let pending = shared
@@ -2552,9 +2678,7 @@ mod catch_up_recovery_tests {
             fetch_attempts: None,
             cleanup_hook: None,
         };
-        let retry_checkpoints = HashMap::new();
-
-        catch_up_missed_messages_inner_with_api(&api, &shared, &provider, &retry_checkpoints).await;
+        run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
 
         let saved_checkpoint = *shared
             .last_message_ids
@@ -2594,9 +2718,7 @@ mod catch_up_recovery_tests {
             fetch_attempts: None,
             cleanup_hook: None,
         };
-        let retry_checkpoints = HashMap::new();
-
-        catch_up_missed_messages_inner_with_api(&api, &shared, &provider, &retry_checkpoints).await;
+        run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
 
         let saved_checkpoint = *shared
             .last_message_ids
@@ -2667,11 +2789,13 @@ mod catch_up_recovery_tests {
         };
         let retry_checkpoints = HashMap::from([(channel_id, retry_state)]);
 
-        catch_up_missed_messages_inner_with_api(
-            &TestCatchUpDiscordApi::transient_fetch_failure(),
-            &shared,
-            &provider,
-            &retry_checkpoints,
+        run_catch_up_sweep(
+            CatchUpDeps::new(
+                &TestCatchUpDiscordApi::transient_fetch_failure(),
+                &shared,
+                &provider,
+            )
+            .with_retry_checkpoints(&retry_checkpoints),
         )
         .await;
 
@@ -2703,11 +2827,13 @@ mod catch_up_recovery_tests {
         };
         let retry_checkpoints = HashMap::from([(channel_id, retry_state)]);
 
-        catch_up_missed_messages_inner_with_api(
-            &TestCatchUpDiscordApi::unknown_binding(),
-            &shared,
-            &provider,
-            &retry_checkpoints,
+        run_catch_up_sweep(
+            CatchUpDeps::new(
+                &TestCatchUpDiscordApi::unknown_binding(),
+                &shared,
+                &provider,
+            )
+            .with_retry_checkpoints(&retry_checkpoints),
         )
         .await;
 

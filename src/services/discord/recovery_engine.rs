@@ -62,6 +62,8 @@ mod state_extractors;
 mod manual_rebind;
 #[path = "recovery_engine/manual_rebind_output_path.rs"]
 mod manual_rebind_output_path;
+#[path = "recovery_engine/manual_rebind_override.rs"]
+mod manual_rebind_override;
 #[path = "recovery_engine/routing_orphan.rs"] // #3869 routing-orphan finalize
 mod routing_orphan;
 #[path = "recovery_engine/terminal_text_idempotency.rs"]
@@ -89,6 +91,19 @@ mod restore_inflight;
 // handling before restart-path watcher spawn into a leaf module.
 #[path = "recovery_engine/restore_persist_outcome.rs"]
 mod restore_persist_outcome;
+// #4380: crash-restart relay-resume guard (yield-gate escape-hatch predicate +
+// black-hole DLQ backstop). Lives here (a non-giant) so declaring it never
+// re-inflates the discord/mod.rs giant; unix-gated to match its callers (the
+// `tmux` watcher yield gate and the recovery watcher spawn path). The predicate +
+// backstop are re-exported at `pub(in crate::services::discord)` so the yield gate
+// in `tmux.rs` and the recovery re-adopt path can reach them.
+#[cfg(unix)]
+#[path = "recovery_engine/crash_resume_guard.rs"]
+mod crash_resume_guard;
+#[cfg(unix)]
+pub(in crate::services::discord) use self::crash_resume_guard::{
+    crash_readopt_live_relay_resume_required, guard_readopt_relay_resume_or_dead_letter,
+};
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::extract_response_from_output;
@@ -142,6 +157,7 @@ pub(super) use self::state_extractors::save_missing_session_handoff;
 pub(crate) use self::manual_rebind::{
     rebind_inflight_for_channel, rebind_inflight_for_channel_with_minimum_start_offset,
 };
+pub(crate) use self::manual_rebind_override::ManualRebindOverrides;
 // #3834: `reregister_active_turn_from_inflight` is re-exported (not just
 // re-imported) so the `recovery_engine::reregister_active_turn_from_inflight`
 // path stays valid for its `watchers::lifecycle` caller (via the `recovery`

@@ -50,9 +50,9 @@ mod queue_reactions;
 mod queued_placeholders_store;
 mod reaction_cleanup;
 mod reaction_lifecycle;
+mod readopted_mailbox_ledger;
 mod relay_health;
 pub(crate) mod relay_recovery;
-#[cfg(unix)] // #3089 A0: shared ReplaceLongMessageOutcome disposition policy.
 mod replace_outcome_policy;
 pub(crate) mod response_sanitizer;
 // #3983 item4: one-shot top session banner emit + dual-path (sink/watcher) de-dup.
@@ -136,7 +136,7 @@ pub(crate) use meeting_orchestrator as meeting;
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
 // here in mod.rs and `catch_up_missed_messages` in runtime_bootstrap recovery).
 pub(in crate::services::discord) use catch_up::{
-    CatchUpRetryState, catch_up_missed_messages, catch_up_missed_messages_inner,
+    CatchUpRetryState, catch_up_missed_messages, catch_up_missed_messages_for_retry,
     should_trigger_catch_up_retry, take_catch_up_retry_checkpoint_after_queue_drain,
 };
 pub(in crate::services::discord) use mailbox_finish::{
@@ -2277,6 +2277,7 @@ pub(crate) struct SharedData {
     pub(in crate::services::discord) turn_completion_events:
         tokio::sync::broadcast::Sender<turn_completion_events::TurnCompletionEvent>,
     pub(in crate::services::discord) turn_view_reconciler: turn_view_reconciler::TurnViewReconciler,
+    readopted_mailbox_ledger: readopted_mailbox_ledger::ReadoptedMailboxLedger, // #4370
 }
 
 impl SharedData {
@@ -2561,6 +2562,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         inflight_signals: tokio::sync::broadcast::channel(256).0,
         turn_completion_events: turn_completion_events::turn_completion_event_bus(),
         turn_view_reconciler: turn_view_reconciler::TurnViewReconciler::default(),
+        readopted_mailbox_ledger: readopted_mailbox_ledger::ReadoptedMailboxLedger::default(),
     })
 }
 
@@ -3481,7 +3483,7 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
             channel_id,
             queue_len_after
         );
-        catch_up_missed_messages_inner(&http, &shared, &provider, &retry_checkpoints).await;
+        catch_up_missed_messages_for_retry(&http, &shared, &provider, &retry_checkpoints).await;
         schedule_deferred_idle_queue_kickoff(
             shared,
             provider,
@@ -4108,6 +4110,33 @@ async fn kickoff_idle_queue_channel(
         channel_id
     );
 
+    let deps = router::IntakeDeps {
+        http: &ctx.http,
+        cache: Some(&ctx.cache),
+        ctx_for_chained_dispatch: Some(ctx),
+        shared,
+        token,
+    };
+    let admitted = match router::admit_queued_intake(
+        &deps,
+        provider.clone(),
+        channel_id,
+        &intervention,
+        intervention.author_id,
+        owner_name,
+        has_more,
+        false,
+        "intake_admission_pre_kickoff_defer",
+    )
+    .await
+    {
+        router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
+        router::QueuedAdmissionDisposition::Deferred => {
+            drop(dispatch_lease);
+            return IdleQueueKickoffChannelOutcome::default();
+        }
+    };
+
     let source_message_generations = intervention.source_message_queued_generations();
     queue_marker::start_and_drain_kickoff_markers(
         shared,
@@ -4131,36 +4160,8 @@ async fn kickoff_idle_queue_channel(
             .await;
     }
 
-    let deps = router::IntakeDeps {
-        http: &ctx.http,
-        cache: Some(&ctx.cache),
-        ctx_for_chained_dispatch: Some(ctx),
-        shared,
-        token,
-    };
-    if let Some(announcement) = intervention.voice_announcement.as_ref() {
-        crate::voice::announce_meta::global_store()
-            .insert_accepted_replay(intervention.message_id, announcement.clone());
-    }
-    let dispatch_result = router::handle_text_message(
-        &deps,
-        channel_id,
-        intervention.message_id,
-        intervention.author_id,
-        &owner_name,
-        &intervention.text,
-        true,
-        has_more,
-        false,
-        intervention.merge_consecutive,
-        intervention.reply_context.clone(),
-        intervention.has_reply_boundary,
-        None,
-        router::TurnKind::Foreground,
-        intervention.pending_uploads.clone(),
-        None,
-    )
-    .await;
+    let dispatch_result =
+        router::finish_admitted_queued_intake(&deps, admitted, &intervention).await;
     match dispatch_result {
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");

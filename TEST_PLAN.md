@@ -6,6 +6,11 @@
 - **Stale Branch Cleanup:** Treat low-signal or stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place. A no-change result should NOT become a PR unless it explicitly changes a queue-hygiene artifact.
 - **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
 
+## Execution Plan Guidelines
+- **Dedicated Verification Step:** Plans for code changes must name the relevant test, lint, build, or generated-drift commands before final review and push. Keep the commands proportional to the changed surface; docs-only work may use focused document and diff checks.
+- **Finalization Step:** Describe finalization in environment-neutral terms and include a final diff/status review. Do not require an exact sentence or a provider-specific shell tool that may not exist in another agent runtime.
+- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies.
+
 ## PR Body Requirements
 Every PR must include:
 - What changed

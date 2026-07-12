@@ -16,6 +16,7 @@
 //! module. Moved verbatim — zero logic change.
 
 use super::manual_rebind_output_path::saved_output_path_for_rebind_resolution;
+use super::manual_rebind_override::upsert_rebind_session_id_override;
 use super::*;
 
 mod adoption;
@@ -109,6 +110,7 @@ pub(crate) async fn rebind_inflight_for_channel(
     provider: &ProviderKind,
     channel_id: u64,
     tmux_session_override: Option<String>,
+    overrides: ManualRebindOverrides,
 ) -> Result<RebindOutcome, RebindError> {
     rebind_inflight_for_channel_inner(
         http,
@@ -116,6 +118,7 @@ pub(crate) async fn rebind_inflight_for_channel(
         provider,
         channel_id,
         tmux_session_override,
+        overrides,
         None,
     )
     .await
@@ -135,6 +138,7 @@ pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
         provider,
         channel_id,
         tmux_session_override,
+        ManualRebindOverrides::default(),
         minimum_initial_offset,
     )
     .await
@@ -146,6 +150,7 @@ async fn rebind_inflight_for_channel_inner(
     provider: &ProviderKind,
     channel_id: u64,
     tmux_session_override: Option<String>,
+    overrides: ManualRebindOverrides,
     minimum_initial_offset: Option<u64>,
 ) -> Result<RebindOutcome, RebindError> {
     let discord_channel_id = ChannelId::new(channel_id);
@@ -177,9 +182,11 @@ async fn rebind_inflight_for_channel_inner(
         );
     }
 
-    let existing_session_id = existing_inflight
-        .as_ref()
-        .and_then(|state| state.session_id.clone());
+    let existing_session_id = overrides.session_id().map(str::to_string).or_else(|| {
+        existing_inflight
+            .as_ref()
+            .and_then(|state| state.session_id.clone())
+    });
     let existing_saved_output_path = existing_inflight
         .as_ref()
         .and_then(|state| state.output_path.clone());
@@ -253,20 +260,28 @@ async fn rebind_inflight_for_channel_inner(
         return Err(RebindError::ChannelNotBound);
     }
 
+    upsert_rebind_session_id_override(shared, provider, &tmux_session_name, overrides.session_id())
+        .await?;
+
     let existing_saved_output_path_for_resolution = saved_output_path_for_rebind_resolution(
         shared,
         provider,
         existing_saved_output_path.as_deref(),
         existing_session_id.as_deref(),
         &tmux_session_name,
+        overrides.output_path(),
     )
     .await;
-    let runtime_state = resolve_rebind_runtime_state(
-        provider,
-        &tmux_session_name,
-        existing_saved_output_path_for_resolution.as_deref(),
-        existing_session_id.clone(),
-    )?;
+    let runtime_state =
+        match overrides.runtime_state(provider, &tmux_session_name, existing_session_id.clone())? {
+            Some(runtime_state) => runtime_state,
+            None => resolve_rebind_runtime_state(
+                provider,
+                &tmux_session_name,
+                existing_saved_output_path_for_resolution.as_deref(),
+                existing_session_id.clone(),
+            )?,
+        };
     let mut output_path = runtime_state.output_path;
     let mut synthetic_initial_offset = runtime_state.synthetic_initial_offset;
     let input_fifo_for_state = runtime_state.input_fifo_path;
@@ -618,6 +633,9 @@ async fn rebind_inflight_for_channel_inner(
         if session.channel_name.is_none() {
             session.channel_name = channel_name.clone();
         }
+        if session_id_for_state.is_some() {
+            session.session_id = session_id_for_state.clone();
+        }
         restore_recovered_session_worktree(session, &recovered_state_for_session);
     }
 
@@ -915,5 +933,297 @@ mod post_work_evidence_tests {
         );
         // rebind_origin and watcher ownership are independent flags and must coexist.
         assert!(state.rebind_origin);
+    }
+}
+
+#[cfg(test)]
+mod stall_watchdog_respawn_deadlock_tests {
+    //! #4400 (b): the 16:32Z self-deadlock — force-clean deleted the row, the
+    //! dying watcher's last poll re-minted a zero-id synthetic row via the
+    //! #3107 self-heal, and every subsequent watchdog respawn tick died on this
+    //! module's preflight with `InflightAlreadyExists` because that shape
+    //! classified as `Pending`. These tests pin both the adoption fix and the
+    //! untouched row-absent (07-07) create-new path.
+    use super::*;
+    use crate::services::provider::ProviderKind;
+
+    /// 16:32Z incident reproduction: with the re-minted orphan row persisted,
+    /// the respawn preflight must route onto the `InflightRestore` resume arm
+    /// (no 409 — invariant I1) and the resume machinery must start the watcher
+    /// at the row's committed offset so the backlog written while the watcher
+    /// was dead (the 16:30~16:37Z window) is still relayed (invariant I3).
+    /// Mutation kill: reverting the `can_adopt_orphaned_synthetic_watcher_row`
+    /// arm classifies this row `Pending` and the first assert fails.
+    #[test]
+    fn respawn_preflight_adopts_reacquired_orphan_row_instead_of_409() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let provider = ProviderKind::Claude;
+        let channel_id = 1_479_671_298_497_183_835_u64;
+        let output_path = tmp.path().join("claude-transcript.jsonl");
+        let output_path_str = output_path.display().to_string();
+        // 8_192 committed bytes plus 4_096 backlog bytes produced while the
+        // watcher was dead — resume must start AT the committed offset, not at
+        // EOF (which would drop the backlog) and not at 0 (rebase).
+        std::fs::write(&output_path, vec![b'x'; 12_288]).expect("write transcript");
+
+        // The row exactly as `reacquire_watcher_inflight_for_active_stream`
+        // (#3107 self-heal) re-mints it after force-clean deleted the real row,
+        // persisted through the same atomic if-absent path the self-heal uses.
+        let mut orphan = super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            None,
+            0,                         // request_owner_user_id — headless re-acquire
+            0,                         // user_msg_id
+            1_518_888_000_000_000_001, // current_msg_id — surviving placeholder message
+            String::new(),
+            None,
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some(output_path_str.clone()),
+            None,
+            8_192,
+        );
+        orphan.turn_source = super::inflight::TurnSource::ExternalInput;
+        orphan.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
+        assert!(
+            super::inflight::save_inflight_state_if_absent(&orphan).expect("persist orphan row"),
+            "the self-heal if-absent write must land on an empty store"
+        );
+
+        let existing = super::inflight::load_inflight_state(&provider, channel_id)
+            .expect("re-minted orphan row must load");
+        assert_eq!(
+            recovery_phase_for_existing_inflight_rebind(&existing),
+            RecoveryPhase::InflightRestore,
+            "respawn must adopt the re-minted orphan row onto the resume path instead of \
+             returning InflightAlreadyExists on every watchdog tick (I1)"
+        );
+
+        let (resume_offset, current_len, truncated) =
+            recovery_watcher_start_offset_for_state(&output_path_str, &existing);
+        assert_eq!(
+            resume_offset, 8_192,
+            "resume must preserve the row's committed offset — the dead-window backlog \
+             (bytes 8_192..12_288) stays relayable (I3)"
+        );
+        assert_eq!(current_len, 12_288);
+        assert!(!truncated, "a grown live file is not a truncation restart");
+    }
+
+    /// 07-07 regression pin: when force-clean actually deleted the row and no
+    /// self-heal re-minted one (row ABSENT at respawn), the preflight finds no
+    /// existing inflight and the synthetic rebind-origin birth path must still
+    /// create the row atomically — the adoption fix only reroutes rows that
+    /// exist.
+    #[test]
+    fn respawn_with_absent_row_still_creates_new_synthetic_inflight() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let provider = ProviderKind::Claude;
+        let channel_id = 1_479_671_298_497_184_007_u64;
+        assert!(
+            super::inflight::load_inflight_state(&provider, channel_id).is_none(),
+            "preflight must observe no existing inflight (the 07-07 shape)"
+        );
+
+        // Birth-site mirror of the `existing_inflight = None` branch of
+        // `rebind_inflight_for_channel`.
+        let mut state = super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cc".to_string()),
+            0,
+            0,
+            0,
+            String::from("/api/inflight/rebind"),
+            None,
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.rebind_origin = true;
+        state.turn_source = super::inflight::TurnSource::ExternalAdopted;
+        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
+
+        assert!(
+            super::inflight::save_inflight_state_create_new(&state).is_ok(),
+            "row-absent respawn must keep succeeding through the atomic create-new path"
+        );
+        assert!(
+            super::inflight::load_inflight_state(&provider, channel_id).is_some(),
+            "the synthetic rebind-origin row must be persisted"
+        );
+    }
+
+    /// #4400 (b) review r2: full-path 16:32Z reproduction through
+    /// `rebind_inflight_for_channel` itself. The r1 classifier/helper tests
+    /// proved the phase decision but missed that the resume machinery's
+    /// adoption save (`identity_gate.rs`) refused zero-id rows (`RebindError::
+    /// Internal` — a 500 loop instead of the 409 loop) and that the adopted
+    /// transcript's offsets were EOF-rebased (`adoption.rs` — backlog loss).
+    /// This test drives the REAL path end to end against a live tmux session:
+    ///   - `Ok(..)` kills reverting the identity-gate zero-id adoption arm
+    ///     (that mutation returns `Err(Internal("persist existing inflight
+    ///     watcher adoption …"))` — I1);
+    ///   - `initial_offset == 8_192` kills reverting the adopted-orphan
+    ///     durable-transcript arm (that mutation EOF-rebases to 12_288 — I3);
+    ///   - `watcher_spawned` + the registry entry prove the single-watcher
+    ///     claim was reached (the opus-arm safety property).
+    ///
+    /// Follows the `platform::tmux::live_pane_tests` precedent: skips when
+    /// tmux is unavailable. `session_id` is seeded on the orphan row to stand
+    /// in for the PG dispatched-session selector cache the live runtime
+    /// carries (`shared.pg_pool` is `None` in tests); the saved-output-path
+    /// `Keep` decision it produces is identical to the incident's.
+    #[cfg(unix)]
+    #[test]
+    fn rebind_full_path_adopts_orphan_row_and_resumes_at_committed_offset() {
+        // Sync `#[test]` + `block_on` (the `tmux_watcher/tests.rs` precedent)
+        // so the env-lock guard is never held across an `.await` inside an
+        // async fn — keeps the `await_holding_lock` ratchet baseline intact.
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping #4400 full-path rebind test: tmux is not available");
+            return;
+        }
+
+        let provider = ProviderKind::Claude;
+        let channel_id = 4_400_163_200_000_001_u64;
+        let discord_channel = ChannelId::new(channel_id);
+        // `-cc` suffix keeps `channel_supports_provider` resolving Claude for
+        // the parsed channel name; the pid keeps parallel runs collision-free.
+        let tmux_session = format!("AgentDesk-claude-e2e4400-{}-cc", std::process::id());
+        let created =
+            crate::services::platform::tmux::create_session(&tmux_session, None, "sleep 60")
+                .expect("create tmux session");
+        assert!(
+            created.status.success(),
+            "tmux session must start: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        // The ClaudeTui runtime-kind marker the live handoff writes — this is
+        // what `resolve_rebind_runtime_state` keys the transcript branch on.
+        crate::services::tmux_common::write_tmux_runtime_kind_marker(
+            &tmux_session,
+            RuntimeHandoffKind::ClaudeTui,
+        )
+        .expect("write runtime-kind marker");
+
+        // UUID-stem Claude transcript: 8_192 committed bytes + 4_096 backlog
+        // bytes written while the watcher was dead (no trailing newline, so
+        // the spawned watcher cannot consume a complete JSONL line).
+        let session_uuid = "48fdb7f3-4400-4000-8000-000000163200";
+        let transcript_path = tmp.path().join(format!("{session_uuid}.jsonl"));
+        let transcript_path_str = transcript_path.display().to_string();
+        std::fs::write(&transcript_path, vec![b'x'; 12_288]).expect("write transcript");
+
+        // The re-minted #3107 self-heal orphan row, persisted through the same
+        // atomic if-absent path the self-heal uses.
+        let mut orphan = super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            None,
+            0,
+            0,
+            1_518_888_000_000_000_001,
+            String::new(),
+            Some(session_uuid.to_string()),
+            Some(tmux_session.clone()),
+            Some(transcript_path_str.clone()),
+            None,
+            8_192,
+        );
+        orphan.turn_source = super::inflight::TurnSource::ExternalInput;
+        orphan.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
+        assert!(
+            super::inflight::save_inflight_state_if_absent(&orphan).expect("persist orphan row"),
+            "the self-heal if-absent write must land on an empty store"
+        );
+
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let http = std::sync::Arc::new(serenity::Http::new("Bot test-token"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let result = runtime.block_on(rebind_inflight_for_channel(
+            &http,
+            &shared,
+            &provider,
+            channel_id,
+            Some(tmux_session.clone()),
+            ManualRebindOverrides::default(),
+        ));
+
+        // Synchronous assertion window: on a current-thread runtime the
+        // spawned watcher task cannot run once `block_on` returns, so the
+        // persisted row below is exactly what the rebind path wrote.
+        let row = super::inflight::load_inflight_state(&provider, channel_id);
+        let watcher_entry = shared.tmux_watchers.remove(&discord_channel);
+        if let Some((_, handle)) = watcher_entry.as_ref() {
+            handle
+                .cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let _ = crate::services::platform::tmux::kill_session(&tmux_session, "#4400 e2e cleanup");
+
+        let outcome = result.expect(
+            "adopting the re-minted orphan row must resume the relay — neither the 409 \
+             (InflightAlreadyExists) nor the 500 (Internal adoption-save refusal) deadlock (I1)",
+        );
+        assert_eq!(
+            outcome.initial_offset, 8_192,
+            "the watcher must resume at the committed offset — an EOF rebase (12_288) would \
+             drop the backlog written while the watcher was dead (I3)"
+        );
+        assert!(
+            outcome.watcher_spawned,
+            "the single-watcher claim must be reached and spawn for the adopted row"
+        );
+        assert!(
+            watcher_entry.is_some(),
+            "the watcher registry must carry the channel's claimed watcher handle"
+        );
+
+        let row = row.expect("the adopted row must remain persisted");
+        assert_eq!(row.user_msg_id, 0, "adoption must not mint a fake user id");
+        assert_eq!(
+            row.request_owner_user_id, 0,
+            "adoption must not seize ownership for a synthetic owner (I2)"
+        );
+        assert_eq!(
+            row.last_offset, 8_192,
+            "the persisted committed offset must survive adoption un-rebased (I3)"
+        );
+        assert_eq!(
+            row.tmux_session_name.as_deref(),
+            Some(tmux_session.as_str())
+        );
+        assert_eq!(
+            row.output_path.as_deref(),
+            Some(transcript_path_str.as_str())
+        );
+        assert_eq!(
+            row.effective_relay_owner_kind(),
+            super::inflight::RelayOwnerKind::Watcher,
+            "the adopted row must stay watcher-owned"
+        );
     }
 }

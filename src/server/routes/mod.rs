@@ -27,6 +27,7 @@ pub mod kanban_repos;
 mod maintenance;
 pub mod meetings;
 pub mod memory_api;
+pub mod message_outbox;
 pub mod messages;
 pub mod monitoring;
 pub mod offices;
@@ -41,6 +42,7 @@ pub mod resume;
 pub mod review_verdict;
 pub mod reviews;
 pub mod routines;
+pub mod scheduled_messages;
 pub(crate) mod session_activity;
 pub mod settings;
 mod skill_usage_analytics;
@@ -523,6 +525,7 @@ fn compose_api_router(state: AppState) -> ApiRouter {
         .merge(domains::access::router())
         .merge(domains::onboarding::router(state.clone()))
         .merge(domains::agents::router(state.clone()))
+        .merge(domains::analytics::router(state.clone()))
         .merge(domains::kanban::router(state.clone()))
         .merge(domains::reviews::router(state.clone()))
         .merge(domains::ops::router(state.clone()))

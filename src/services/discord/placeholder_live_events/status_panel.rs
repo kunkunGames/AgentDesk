@@ -2,48 +2,55 @@ use crate::services::agent_protocol::{StatusEvent, StatusTodoItem, SubagentSumma
 use crate::services::provider::ProviderKind;
 
 use super::common::{
-    EVENT_LINE_MAX_CHARS, STATUS_PANEL_MAX_CHARS, STATUS_PANEL_SUBAGENT_LIMIT,
-    STATUS_PANEL_TASK_LIMIT, STATUS_PANEL_TODO_LIMIT, STATUS_PANEL_WORKFLOW_LIMIT,
-    escape_status_panel_markdown, normalize_summary, sanitized_tool_name, truncate_chars,
-    truncate_chars_with_marker,
+    STATUS_PANEL_MAX_CHARS, STATUS_PANEL_SUBAGENT_LIMIT, STATUS_PANEL_TODO_LIMIT,
+    STATUS_PANEL_WORKFLOW_LIMIT, escape_status_panel_markdown, normalize_summary, truncate_chars,
 };
-use super::completion_footer::compact_live_panel_terminal_lines;
 use super::context_panel::{ContextPanelSnapshot, render_context_panel_line};
 use super::session_panel::{SessionPanelSnapshot, render_session_panel_line};
 use super::status_events::{is_schedule_wakeup_tool, parse_eta_secs};
-use super::subagent_summary::render_subagent_done_summary;
+use super::subagent_panel::{
+    SubagentKeyTombstones, clean_match_key, log_idless_terminal_fallback,
+    match_subagent_end_fallback, render_live_subagents_section,
+};
 use super::task_panel::{
     STUCK_BACKGROUND_TASK_TTL, TaskPanelSnapshot, TaskToolSlot, finish_background_task_tool_slot,
-    force_abort_stuck_background_task_slots, render_task_panel_line, render_task_tool_slot,
+    force_abort_stuck_background_task_slots, render_live_tasks_section, render_task_panel_line,
     take_slot_ordinal, task_tool_slot_is_unfinished_background, upsert_background_task_tool_slot,
     upsert_task_tool_slot,
 };
 use super::workflow_panel::{
-    WorkflowAgentSlot, WorkflowSlot, render_workflow_slot, trim_workflow_slot, trim_workflows,
-    upsert_workflow_agent, upsert_workflow_phase, workflow_status_label,
+    WorkflowAgentSlot, WorkflowSlot, apply_workflow_end, render_workflow_slot, trim_workflow_slot,
+    trim_workflows, upsert_workflow_agent, upsert_workflow_phase, workflow_status_label,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SubagentSlot {
-    subagent_type: String,
+    // #4367: read by the extracted `subagent_panel::render_subagent_slot`.
+    pub(super) subagent_type: String,
     pub(super) desc: String,
-    recent: Option<String>,
+    // #4367: read by the extracted `subagent_panel::render_subagent_slot`.
+    pub(super) recent: Option<String>,
     pub(super) finished: Option<bool>,
     /// #3084: Task tool-use id that opened this slot, so `SubagentEnd` closes the
     /// exact slot among parallels instead of the first unfinished one.
     pub(super) tool_use_id: Option<String>,
-    agent_id: Option<String>,
+    // #4177/#4396: read by `subagent_panel::match_subagent_end_fallback`.
+    pub(super) agent_id: Option<String>,
     /// #3086: TUI-parity accounting from the finishing `SubagentEnd`; drives the
     /// `Done (N tools · M tokens · Xs)` summary on the render line.
-    summary: Option<SubagentSummary>,
+    // #4367: read by the extracted `subagent_panel::render_subagent_slot`.
+    pub(super) summary: Option<SubagentSummary>,
     /// `true` when launched with `run_in_background`: an ack-only `SubagentEnd`
     /// must NOT mark it ✓ (only a genuine completion finalizes it).
     background: bool,
     /// #3391: monotonic, never-reused per-entry slot id (mirrors
     /// `TaskToolSlot::ordinal`) backing slot-identity subagent eviction.
-    ordinal: u64,
-    /// #4177: monotonic creation instant. Turn-boundary reconciliation force-aborts
-    /// a stuck background subagent older than `STUCK_BACKGROUND_TASK_TTL`.
+    // #4396: read by `subagent_panel::log_idless_terminal_fallback`.
+    pub(super) ordinal: u64,
+    /// #4177: monotonic creation instant, refreshed on observed slot activity
+    /// (#4396 — so the TTL measures SILENCE, not lifetime). The stuck-slot sweep
+    /// (turn boundary + periodic render tick) force-aborts a background subagent
+    /// silent longer than `STUCK_BACKGROUND_TASK_TTL`.
     pub(super) started_at: std::time::Instant,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -92,6 +99,10 @@ pub(super) struct StatusPanelState {
     todos: Vec<StatusTodoItem>,
     pub(super) tasks: Vec<TaskToolSlot>,
     pub(super) subagents: Vec<SubagentSlot>,
+    // #4396 r3: ownership-conflict tombstones for subagent slots that LEFT this
+    // state (footer eviction / trim / resets) — consulted by the fallback
+    // matcher, carried across the turn reset. See `SubagentKeyTombstones`.
+    pub(super) recently_evicted_subagent_keys: SubagentKeyTombstones,
     pub(super) workflows: Vec<WorkflowSlot>,
     next_slot_ordinal: u64, // #3391: advancing, never-reused task/subagent ordinals.
     // #3477 item 3: instant the turn entered `Completed` (None until then); vs the
@@ -122,6 +133,13 @@ impl StatusPanelState {
         self.status = DerivedStatus::Running;
         self.todos.clear();
         self.tasks.clear();
+        // #4396 r3: the cleared subagents leave the state — tombstone their keys
+        // so a late end cannot close a same-key slot of the NEXT session.
+        let now = std::time::Instant::now();
+        for slot in &self.subagents {
+            self.recently_evicted_subagent_keys
+                .push_slot_keys(slot, now);
+        }
         self.subagents.clear();
         self.workflows.clear();
         self.completed_at = None; // #3477 item 3: drop the stale freshness gate.
@@ -179,9 +197,23 @@ impl StatusPanelState {
             .cloned()
             .collect::<Vec<_>>();
         let has_residuals = !tasks.is_empty() || !subagents.is_empty();
+        // #4396 r3: every slot NOT kept as a residual leaves the state here —
+        // tombstone the departing keys before the state is rebuilt.
+        for slot in self
+            .subagents
+            .iter()
+            .filter(|s| !s.is_unfinished_background())
+        {
+            self.recently_evicted_subagent_keys
+                .push_slot_keys(slot, now);
+        }
         *self = StatusPanelState {
             tasks,
             subagents,
+            // #4396 r3: the tombstones outlive the slots they guard.
+            recently_evicted_subagent_keys: std::mem::take(
+                &mut self.recently_evicted_subagent_keys,
+            ),
             background_agent_pending: self.background_agent_pending,
             // #3391: carry the counter so a residual ordinal is never reissued.
             next_slot_ordinal: self.next_slot_ordinal,
@@ -265,7 +297,10 @@ impl StatusPanelState {
                     started_at: std::time::Instant::now(),
                 });
                 self.status = DerivedStatus::SubagentRunning { desc };
-                trim_subagents(&mut self.subagents);
+                trim_subagents(
+                    &mut self.subagents,
+                    &mut self.recently_evicted_subagent_keys,
+                );
             }
             StatusEvent::SubagentEvent { summary } => {
                 if let Some(slot) = self
@@ -275,6 +310,7 @@ impl StatusPanelState {
                     .find(|slot| slot.finished.is_none())
                 {
                     slot.recent = Some(normalize_summary(&summary));
+                    slot.started_at = std::time::Instant::now(); // #4396: alive — reset the TTL clock.
                     self.status = DerivedStatus::SubagentRunning {
                         desc: slot.desc.clone(),
                     };
@@ -308,6 +344,7 @@ impl StatusPanelState {
                     .then(|| {
                         match_subagent_end_fallback(
                             &self.subagents,
+                            &self.recently_evicted_subagent_keys,
                             agent_id.as_deref(),
                             desc.as_deref(),
                         )
@@ -320,6 +357,30 @@ impl StatusPanelState {
                         .subagents
                         .iter()
                         .rposition(|slot| slot.finished.is_none() && slot.tool_use_id.is_none()),
+                    // #4396 point 2: an id-less GENUINE end that carries a match
+                    // key (async task-notification without `<tool-use-id>`) closes
+                    // ONLY a uniquely agent_id/desc-matched slot — zero/ambiguous
+                    // matches drop the event (a stale running slot beats
+                    // finalizing/evicting the wrong one). Key-LESS id-less ends
+                    // below keep the legacy last-unfinished fallback (`system`
+                    // stream path / failed id-less launches).
+                    None if clean_match_key(agent_id.as_deref()).is_some()
+                        || clean_match_key(desc.as_deref()).is_some() =>
+                    {
+                        let matched = match_subagent_end_fallback(
+                            &self.subagents,
+                            &self.recently_evicted_subagent_keys,
+                            agent_id.as_deref(),
+                            desc.as_deref(),
+                        );
+                        log_idless_terminal_fallback(
+                            &self.subagents,
+                            matched,
+                            agent_id.as_deref(),
+                            desc.as_deref(),
+                        );
+                        matched
+                    }
                     None => self
                         .subagents
                         .iter()
@@ -455,17 +516,11 @@ impl StatusPanelState {
                 success,
                 summary,
             } => {
-                {
-                    let slot = self.workflow_slot_mut(task_id);
-                    if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
-                        slot.recent = Some(normalize_summary(&summary));
+                if apply_workflow_end(&mut self.workflows, task_id, success, summary) {
+                    trim_workflows(&mut self.workflows);
+                    if matches!(self.status, DerivedStatus::WorkflowRunning { .. }) {
+                        self.status = DerivedStatus::Running;
                     }
-                    slot.finished = Some(success);
-                    trim_workflow_slot(slot);
-                }
-                trim_workflows(&mut self.workflows);
-                if matches!(self.status, DerivedStatus::WorkflowRunning { .. }) {
-                    self.status = DerivedStatus::Running;
                 }
             }
             StatusEvent::TurnCompleted {
@@ -498,6 +553,7 @@ impl StatusPanelState {
             if !summary.trim().is_empty() {
                 slot.recent = Some(summary);
             }
+            slot.started_at = std::time::Instant::now(); // #4396: alive — reset the TTL clock.
         }
     }
 
@@ -590,28 +646,19 @@ pub(super) fn render_status_panel(
 
     // #3983 item 5a: the compact 🖥️ Recent + host block is removed from the footer
     // (the terminal echo is retired from the status panel entirely).
-    if !snapshot.tasks.is_empty() {
-        let lines = snapshot
-            .tasks
-            .iter()
-            .rev()
-            .take(STATUS_PANEL_TASK_LIMIT)
-            .map(render_task_tool_slot)
-            .collect::<Vec<_>>();
-        let lines = compact_live_panel_terminal_lines(&lines).map_or(lines, |(out, _)| out); // #3404 cap
-        sections.push(format!("Tasks\n{}", lines.join("\n")));
+    // #4093: the in-progress-only Tasks section (filter + #3404 compaction +
+    // empty-section guard) lives in `task_panel::render_live_tasks_section`.
+    if let Some(section) = render_live_tasks_section(&snapshot.tasks) {
+        sections.push(section);
     }
 
-    if !matches!(provider, ProviderKind::Codex) && !snapshot.subagents.is_empty() {
-        let lines = snapshot
-            .subagents
-            .iter()
-            .rev()
-            .take(STATUS_PANEL_SUBAGENT_LIMIT)
-            .map(render_subagent_slot)
-            .collect::<Vec<_>>();
-        let lines = compact_live_panel_terminal_lines(&lines).map_or(lines, |(out, _)| out); // #3404 cap
-        sections.push(format!("Subagents\n{}", lines.join("\n")));
+    // #4367: the in-progress-only Subagents section (filter + #3404 compaction +
+    // empty-section guard) lives in `subagent_panel::render_live_subagents_section`,
+    // mirroring #4093's Tasks extraction. The Codex suppression stays here.
+    if !matches!(provider, ProviderKind::Codex)
+        && let Some(section) = render_live_subagents_section(&snapshot.subagents)
+    {
+        sections.push(section);
     }
 
     if !matches!(provider, ProviderKind::Codex) && !snapshot.workflows.is_empty() {
@@ -659,38 +706,6 @@ pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> Strin
     repair_fence_parity(&truncate_chars(&joined, STATUS_PANEL_MAX_CHARS))
 }
 
-pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {
-    let mut line = format!(
-        "└ {} {}",
-        sanitize_label(&slot.subagent_type),
-        escape_status_panel_markdown(&normalize_summary(&slot.desc))
-    );
-    if let Some(recent) = slot
-        .recent
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        line.push_str(" — ");
-        line.push_str(&escape_status_panel_markdown(&normalize_summary(recent)));
-    }
-    // #3086: append the TUI-parity Done summary on finished slots with accounting.
-    if let Some(summary) = slot
-        .summary
-        .as_ref()
-        .filter(|_| matches!(slot.finished, Some(true)))
-        .filter(|summary| !summary.is_empty())
-        && let Some(done) = render_subagent_done_summary(summary)
-    {
-        line.push_str(" — ");
-        line.push_str(&done);
-    }
-    // #3391: reserve marker width so a finished line always ENDS WITH its ✓/✗.
-    match slot.terminal_marker() {
-        Some(marker) => truncate_chars_with_marker(&line, marker, EVENT_LINE_MAX_CHARS),
-        None => truncate_chars(&line, EVENT_LINE_MAX_CHARS),
-    }
-}
-
 impl SubagentSlot {
     fn is_unfinished_background(&self) -> bool {
         self.background && self.finished.is_none()
@@ -715,10 +730,13 @@ impl SubagentSlot {
     }
 }
 
-/// #4177: at a turn boundary, force any background subagent slot that is still
-/// unfinished AND older than `STUCK_BACKGROUND_TASK_TTL` to terminal failed. Its
-/// terminal notification never arrived, so it would otherwise survive every
-/// residual-preserving reset as a ghost running entry. Returns the number swept.
+/// #4177: force any background subagent slot that is still unfinished AND silent
+/// longer than `STUCK_BACKGROUND_TASK_TTL` to terminal failed. Its terminal
+/// notification never arrived, so it would otherwise survive every
+/// residual-preserving reset as a ghost running entry. Runs at turn boundaries
+/// and (#4396 point 2) on the periodic panel render tick, so a long single turn
+/// bounds a stuck slot by the TTL instead of by turn length. Returns the number
+/// swept.
 pub(super) fn force_abort_stuck_subagent_slots(
     slots: &mut [SubagentSlot],
     now: std::time::Instant,
@@ -743,52 +761,14 @@ pub(super) fn force_abort_stuck_subagent_slots(
     swept
 }
 
-fn match_subagent_end_fallback(
-    slots: &[SubagentSlot],
-    agent_id: Option<&str>,
-    desc: Option<&str>,
-) -> Option<usize> {
-    if let Some(agent_id) = clean_match_key(agent_id) {
-        match unique_unfinished_subagent(slots, |slot| slot.agent_id.as_deref() == Some(agent_id)) {
-            Ok(Some(index)) => return Some(index),
-            Err(()) => return None,
-            Ok(None) => {}
-        }
-    }
-    let desc = clean_match_key(desc)?;
-    unique_unfinished_subagent(slots, |slot| slot.desc == desc).ok()?
-}
-
-fn unique_unfinished_subagent(
-    slots: &[SubagentSlot],
-    mut matches: impl FnMut(&SubagentSlot) -> bool,
-) -> Result<Option<usize>, ()> {
-    let mut found = None;
-    for (index, slot) in slots.iter().enumerate().rev() {
-        if slot.finished.is_none() && matches(slot) {
-            if found.is_some() {
-                return Err(());
-            }
-            found = Some(index);
-        }
-    }
-    Ok(found)
-}
-
-fn clean_match_key(raw: Option<&str>) -> Option<&str> {
-    raw.map(str::trim).filter(|value| !value.is_empty())
-}
-
-fn sanitize_label(raw: &str) -> String {
-    sanitized_tool_name(raw).unwrap_or_else(|| "Task".to_string())
-}
-
-fn trim_subagents(slots: &mut Vec<SubagentSlot>) {
+fn trim_subagents(slots: &mut Vec<SubagentSlot>, tombstones: &mut SubagentKeyTombstones) {
     while slots.len() > STATUS_PANEL_SUBAGENT_LIMIT {
         let remove_index = slots
             .iter()
             .position(|slot| slot.finished.is_some())
             .unwrap_or(0);
-        slots.remove(remove_index);
+        // #4396 r3: the trimmed slot leaves the state — tombstone its keys.
+        let removed = slots.remove(remove_index);
+        tombstones.push_slot_keys(&removed, std::time::Instant::now());
     }
 }

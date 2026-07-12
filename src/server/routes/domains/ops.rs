@@ -5,8 +5,9 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    health_api, idle_recap, maintenance, messages, monitoring, pipeline, prompt_manifest_retention,
-    protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
+    health_api, idle_recap, maintenance, message_outbox, messages, monitoring, pipeline,
+    prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api, routines,
+    scheduled_messages, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -23,6 +24,11 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/dispatch-outbox/failed",
                 get(health_api::list_dispatch_outbox_failures_handler)
                     .post(health_api::ack_dispatch_outbox_failures_handler),
+            )
+            .route("/message-outbox/failed", get(message_outbox::list_failed))
+            .route(
+                "/message-outbox/failed/redrive",
+                post(message_outbox::redrive_failed),
             )
             .route(
                 "/doctor/startup/latest",
@@ -248,6 +254,25 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/routines/{id}/session/kill",
                 post(routines::kill_routine_session),
+            )
+            .route(
+                "/scheduled-messages",
+                get(scheduled_messages::list_scheduled_messages)
+                    .post(scheduled_messages::create_scheduled_message),
+            )
+            .route(
+                "/scheduled-messages/{id}",
+                get(scheduled_messages::get_scheduled_message)
+                    .patch(scheduled_messages::patch_scheduled_message)
+                    .delete(scheduled_messages::cancel_scheduled_message),
+            )
+            .route(
+                "/scheduled-messages/{id}/trigger-now",
+                post(scheduled_messages::trigger_scheduled_message_now),
+            )
+            .route(
+                "/scheduled-messages/{id}/deliveries",
+                get(scheduled_messages::list_scheduled_message_deliveries),
             )
             .route("/queue/generate", post(auto_queue::generate))
             .route(

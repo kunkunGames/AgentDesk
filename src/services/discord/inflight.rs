@@ -133,6 +133,7 @@ pub(super) use self::save_store::{
 };
 pub(in crate::services::discord) use self::save_store::{
     GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
+    mark_readopted_from_inflight_if_identity_unchanged,
     patch_restart_full_response_if_identity_unchanged,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
@@ -617,6 +618,13 @@ mod stall_recovery_tests {
     use chrono::TimeZone;
     use std::path::Path;
     use tempfile::TempDir;
+
+    // #4361: the flake-isolation regression tests live in a child file so their
+    // LoC does not count against `inflight.rs`'s frozen `parent_test_residue`
+    // ceiling (#4267/#4269 — move the tests, never raise the cap). They reach
+    // these fixtures (`build_synth_3358`, `monotonic_3358_test_mutex`, the
+    // `_in_root` helpers, …) via `use super::*`.
+    mod flake_isolation_4361;
 
     /// `inflight_state_is_stale` must flip to true once `updated_at` is
     /// older than the configured threshold and stay false for fresh state.
@@ -3214,81 +3222,6 @@ mod stall_recovery_tests {
     }
 
     #[test]
-    fn synthetic_carry_forward_keeps_reclaim_monotonic_3358() {
-        let _serialized = monotonic_3358_test_mutex()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        // FIX: birth carried up to the committed frontier → re-claim is forward/
-        // equal, ZERO invariant violations, offsets end at the frontier.
-        let temp = TempDir::new().unwrap();
-        // The refresh path records inflight-invariant observability via the
-        // PROCESS-WIDE runtime root (#3293 guard) — pin it to the tempdir so a
-        // standalone/parallel run never resolves the live release root.
-        let _env_reset = set_agentdesk_root_for_test(temp.path());
-        let relay_last_offset: u64 = 2_821_677;
-        let committed_frontier: u64 = 2_838_484;
-        // Drive the ACTUAL production carry-forward helper (not an inline copy) so
-        // this green test honestly tracks the production wiring — if the helper
-        // regressed, `carried` would no longer reach the frontier and the
-        // monotonicity assertions below would fail. The frontier is `Some(..)`
-        // because the watcher advanced it WITHIN this same wrapper generation (the
-        // claim choke-point validates that before clamping — #3358 round 2).
-        let carried =
-            crate::services::discord::tui_prompt_relay::synthetic_start_offset_carry_forward(
-                relay_last_offset,
-                Some(committed_frontier),
-            );
-        assert_eq!(
-            carried, committed_frontier,
-            "carry-forward must lift birth to the frontier"
-        );
-
-        let mut on_disk = build_synth_3358(carried);
-        on_disk.full_response = "X".repeat(20_000);
-        on_disk.response_sent_offset = 18_000;
-        on_disk.last_offset = committed_frontier;
-        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
-
-        // Carried-birth re-claim: turn_start_offset == last_offset == frontier,
-        // rso == 0. The rso 0 is NOT a regression because the identity key matches
-        // (same turn) and `response_sent_offset_monotonic` only flags within-turn
-        // backward moves AFTER bytes were sent — here the re-claim's last_offset
-        // equals the on-disk frontier (forward/equal) and rso reset is the
-        // documented fresh-claim seed. Assert last_offset never regresses below
-        // the committed frontier.
-        let carried_reseed = build_synth_3358(carried);
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Drive the enforcing watermark path: a carried-birth refresh writes
-            // last_offset == committed_frontier — forward/equal, accepted.
-            refresh_inflight_last_offset_if_matches_identity_in_root(
-                temp.path(),
-                &ProviderKind::Claude,
-                321,
-                &InflightTurnIdentity::from_state(&carried_reseed),
-                carried_reseed.turn_start_offset,
-                "/tmp/out.jsonl",
-                Some(carried_reseed.current_msg_id),
-                committed_frontier,
-                RelayOwnerKind::Watcher,
-            )
-        }));
-        assert!(res.is_ok(), "carried-birth refresh must not panic");
-        assert!(
-            res.unwrap(),
-            "carried-birth watermark write is forward/equal — accepted"
-        );
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(
-            loaded[0].last_offset, committed_frontier,
-            "offsets end at the committed frontier, never regressed"
-        );
-    }
-
-    #[test]
     fn synthetic_carry_forward_skipped_on_generation_mismatch_3358() {
         // #3358 round 2 — Finding 1 guard, at the production-helper level.
         //
@@ -3990,34 +3923,6 @@ mod stall_recovery_tests {
         );
 
         assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
-    }
-
-    /// Skip → the on-disk row became a planned-restart marker. The guarded save
-    /// must not clobber it (`IdentityMismatch`); restart recovery owns it.
-    #[test]
-    fn skip_save_does_not_clobber_planned_restart_marker() {
-        let temp = TempDir::new().unwrap();
-        let mut marker = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 777);
-        marker.set_restart_mode(InflightRestartMode::DrainRestart);
-        save_inflight_state_in_root(temp.path(), &marker).unwrap();
-
-        let preserved = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 777);
-        let expected = InflightTurnIdentity::from_state(&preserved);
-
-        let outcome = save_inflight_state_if_matches_identity_in_root(
-            temp.path(),
-            &preserved,
-            &expected,
-            preserved.turn_start_offset,
-        );
-
-        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
-        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].restart_mode.is_some(),
-            "the planned-restart marker must be preserved for recovery"
-        );
     }
 
     #[test]

@@ -3,6 +3,8 @@ pub mod auto_queue;
 pub mod automation_candidates;
 pub mod cancel_tombstones;
 pub mod dispatch_semaphores;
+#[path = "dispatched_sessions/rebind_override.rs"]
+pub(crate) mod dispatched_session_rebind_override;
 pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod idempotency;
@@ -13,6 +15,7 @@ pub mod meetings;
 pub mod postgres;
 pub mod prompt_manifests;
 pub mod relay_dead_letter;
+pub mod scheduled_messages;
 pub(crate) mod session_agent_resolution;
 pub mod session_observability;
 pub mod session_status;

@@ -1892,6 +1892,16 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             let finish_mailbox_on_completion =
                 reregister_active_turn_from_inflight(shared, &state).await;
 
+            // #4380 backstop: `reregister_active_turn_from_inflight` stamps
+            // `readopted_from_inflight`, which the watcher-yield escape hatch honours
+            // to resume relay for this re-adopted live turn. If that marker did NOT
+            // durably persist (IoError), the recovered watcher will still yield to
+            // the dead bridge and drop the remaining output silently — dead-letter it
+            // so the loss is observable/recoverable instead of a silent wedge. No-op
+            // on the normal path (marker present).
+            #[cfg(unix)]
+            super::guard_readopt_relay_resume_or_dead_letter(shared, provider, channel_id);
+
             let output_path = match restore_codex_rollout_output_path(provider, &state, output_path)
             {
                 RestorePersistOutcome::UseOutputPath(output_path) => output_path,
@@ -2307,37 +2317,15 @@ mod tests {
         self, GuardedSaveOutcome, InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
     };
     use crate::services::provider::ProviderKind;
-    use std::ffi::OsString;
-
-    struct EnvVarReset {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarReset {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarReset {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[test]
     fn restore_rollout_output_path_patch_preserves_concurrent_relay_fields() {
-        let _guard = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tempdir = tempfile::tempdir().expect("temp runtime root");
-        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tempdir.path(),
+        );
 
         let provider = ProviderKind::Codex;
         let channel_id = 4_111_002;

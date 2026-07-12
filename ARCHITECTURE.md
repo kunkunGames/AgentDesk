@@ -36,10 +36,12 @@ src/
 │   ├── args.rs
 │   ├── client.rs
 │   ├── dcserver.rs
+│   ├── dcserver_pg_bootstrap.rs
 │   ├── direct.rs
 │   ├── discord.rs
 │   ├── doctor.rs
 │   ├── init.rs
+│   ├── json_output.rs
 │   ├── migrate.rs
 │   ├── mod.rs
 │   ├── monitoring.rs
@@ -65,6 +67,8 @@ src/
 │   │   └── tests.rs
 │   ├── automation_candidates/
 │   │   └── verdict_tests.rs
+│   ├── dispatched_sessions/
+│   │   └── rebind_override.rs
 │   ├── dispatches/
 │   │   ├── outbox/
 │   │   │   ├── claim.rs
@@ -93,6 +97,10 @@ src/
 │   │   ├── retention.rs
 │   │   ├── storage_stats.rs
 │   │   └── tests.rs
+│   ├── scheduled_messages/
+│   │   ├── agent.rs
+│   │   ├── outbox.rs
+│   │   └── postgres_tests.rs
 │   ├── agents.rs
 │   ├── automation_candidates.rs
 │   ├── cancel_tombstones.rs
@@ -105,6 +113,7 @@ src/
 │   ├── mod.rs
 │   ├── postgres.rs
 │   ├── relay_dead_letter.rs
+│   ├── scheduled_messages.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
 │   ├── session_status.rs
@@ -175,6 +184,7 @@ src/
 │   ├── legacy_migration.rs
 │   ├── mod.rs
 │   ├── paths.rs
+│   ├── skill_refresh.rs
 │   └── skill_sync.rs
 ├── server/
 │   ├── dto/
@@ -203,7 +213,8 @@ src/
 │   │   │   │       ├── part_06.rs
 │   │   │   │       ├── part_07.rs
 │   │   │   │       ├── part_08.rs
-│   │   │   │       └── part_09.rs
+│   │   │   │       ├── part_09.rs
+│   │   │   │       └── part_10.rs
 │   │   │   ├── guides.rs
 │   │   │   ├── inventory.rs
 │   │   │   └── taxonomy.rs
@@ -211,6 +222,7 @@ src/
 │   │   │   ├── access.rs
 │   │   │   ├── admin.rs
 │   │   │   ├── agents.rs
+│   │   │   ├── analytics.rs
 │   │   │   ├── integrations.rs
 │   │   │   ├── kanban.rs
 │   │   │   ├── mod.rs
@@ -227,6 +239,8 @@ src/
 │   │   │   ├── handlers.rs
 │   │   │   ├── helpers.rs
 │   │   │   └── responses.rs
+│   │   ├── scheduled_messages/
+│   │   │   └── postgres_tests.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -259,6 +273,7 @@ src/
 │   │   ├── maintenance.rs
 │   │   ├── meetings.rs
 │   │   ├── memory_api.rs
+│   │   ├── message_outbox.rs
 │   │   ├── messages.rs
 │   │   ├── mod.rs
 │   │   ├── monitoring.rs
@@ -273,6 +288,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
+│   │   ├── scheduled_messages.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── skill_usage_analytics.rs
@@ -289,6 +305,7 @@ src/
 │   ├── mod.rs
 │   ├── multinode_regression.rs
 │   ├── outbox_delivery_alert.rs
+│   ├── outbox_gc.rs
 │   ├── resource_locks.rs
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
@@ -361,6 +378,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── warm_followup.rs
 │   │   ├── hook_bundle.rs
+│   │   ├── hook_output_guard.rs
+│   │   ├── hook_output_guard_tests.rs
 │   │   ├── hook_registry.rs
 │   │   ├── hook_relay.rs
 │   │   ├── hook_server.rs
@@ -373,6 +392,8 @@ src/
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
+│   │   ├── intake_router_hook/
+│   │   │   └── session_owner.rs
 │   │   ├── stream_relay/
 │   │   │   └── identity.rs
 │   │   ├── capability_routing.rs
@@ -397,7 +418,8 @@ src/
 │   │   ├── mod.rs
 │   │   ├── rollout_index.rs
 │   │   ├── rollout_tail.rs
-│   │   └── session.rs
+│   │   ├── session.rs
+│   │   └── warm_followup.rs
 │   ├── discord/
 │   │   ├── catch_up/
 │   │   │   ├── classification.rs
@@ -450,6 +472,7 @@ src/
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
 │   │   │   ├── provider_probe.rs
+│   │   │   ├── rebind_request.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── redaction.rs
 │   │   │   ├── relay_auto_heal.rs
@@ -458,6 +481,7 @@ src/
 │   │   │   ├── session_enrichment.rs
 │   │   │   ├── snapshot.rs
 │   │   │   ├── stall_liveness.rs
+│   │   │   ├── stall_verdict.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── idle_recap/
 │   │   │   ├── context_display.rs
@@ -469,6 +493,8 @@ src/
 │   │   │   │   └── mod.rs
 │   │   │   ├── save_store/
 │   │   │   │   └── identity_gate.rs
+│   │   │   ├── stall_recovery_tests/
+│   │   │   │   └── flake_isolation_4361.rs
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
 │   │   │   ├── finalizer_identity.rs
@@ -497,6 +523,7 @@ src/
 │   │   │   ├── send_target.rs
 │   │   │   ├── send_to_agent.rs
 │   │   │   ├── serenity_reference.rs
+│   │   │   ├── source_registry.rs
 │   │   │   ├── transport.rs
 │   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
@@ -511,6 +538,7 @@ src/
 │   │   │   ├── slot_rehydration.rs
 │   │   │   ├── status_events.rs
 │   │   │   ├── status_panel.rs
+│   │   │   ├── subagent_panel.rs
 │   │   │   ├── subagent_rollout.rs
 │   │   │   ├── subagent_summary.rs
 │   │   │   ├── task_panel.rs
@@ -532,8 +560,10 @@ src/
 │   │   │   │   └── mod.rs
 │   │   │   ├── analytics_transcript.rs
 │   │   │   ├── completion_delivery.rs
+│   │   │   ├── crash_resume_guard.rs
 │   │   │   ├── jsonl_extract.rs
 │   │   │   ├── manual_rebind_output_path.rs
+│   │   │   ├── manual_rebind_override.rs
 │   │   │   ├── output_path_detect.rs
 │   │   │   ├── phase_policy.rs
 │   │   │   ├── rebind_runtime.rs
@@ -552,13 +582,16 @@ src/
 │   │   │   ├── restart.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
+│   │   │   ├── intake_dispatch/
+│   │   │   │   ├── notice.rs
+│   │   │   │   ├── queued.rs
+│   │   │   │   ├── skill.rs
+│   │   │   │   └── tests.rs
 │   │   │   ├── intake_gate/
 │   │   │   │   ├── busy_duplicate_notice.rs
 │   │   │   │   ├── component_events.rs
 │   │   │   │   ├── gate.rs
-│   │   │   │   ├── node_override_routing.rs
 │   │   │   │   ├── queue_effects.rs
-│   │   │   │   ├── reaction_remove.rs
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── intake_turn/
@@ -580,6 +613,7 @@ src/
 │   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
 │   │   │   ├── dispatch_trigger.rs
+│   │   │   ├── intake_dispatch.rs
 │   │   │   ├── intake_gate.rs
 │   │   │   ├── intake_queue_transaction.rs
 │   │   │   ├── message_handler.rs
@@ -590,6 +624,7 @@ src/
 │   │   ├── runtime_bootstrap/
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
+│   │   │   ├── gateway_lease_tests.rs
 │   │   │   ├── gateway_runtime.rs
 │   │   │   ├── intake.rs
 │   │   │   ├── orphan_recovery.rs
@@ -616,6 +651,10 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── tmux/
+│   │   │   └── task_notification_kind_restart_roundtrip_tests.rs
+│   │   ├── tmux_output_stream/
+│   │   │   └── provider_output_guard_tests.rs
 │   │   ├── tmux_placeholder_suppression/
 │   │   │   ├── evidence.rs
 │   │   │   ├── mod.rs
@@ -637,6 +676,7 @@ src/
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── post_stream_exit.rs
 │   │   │   ├── prompt_observe.rs
+│   │   │   ├── provider_output_guard.rs
 │   │   │   ├── provider_session_persistence.rs
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
@@ -693,11 +733,20 @@ src/
 │   │   │   │   └── completion_postgres.rs
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   └── guarded_save.rs
+│   │   │   ├── stream_loop/
+│   │   │   │   ├── content_arms.rs
+│   │   │   │   └── tool_arms.rs
+│   │   │   ├── terminal_outcome_delivery/
+│   │   │   │   ├── cancel_prompt_replace.rs
+│   │   │   │   ├── delivery_epilogue.rs
+│   │   │   │   ├── empty_response_recovery.rs
+│   │   │   │   └── recovery_retry.rs
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
 │   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
+│   │   │   ├── activity_heartbeat.rs
 │   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── chunk_compose.rs
@@ -726,12 +775,14 @@ src/
 │   │   │   ├── status_panel.rs
 │   │   │   ├── status_panel_tests.rs
 │   │   │   ├── stream_loop.rs
+│   │   │   ├── stream_receiver.rs
 │   │   │   ├── stream_tick.rs
 │   │   │   ├── streaming_edit_text.rs
 │   │   │   ├── task_notification_lifecycle.rs
 │   │   │   ├── terminal_controller_cutover.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── terminal_outcome_delivery.rs
+│   │   │   ├── thinking.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
 │   │   │   ├── two_message_panel.rs
@@ -814,11 +865,14 @@ src/
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── reaction_cleanup.rs
 │   │   ├── reaction_lifecycle.rs
+│   │   ├── readopted_mailbox_ledger.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
 │   │   ├── relay_recovery.rs
+│   │   ├── relay_recovery_auto_heal_apply.rs
 │   │   ├── relay_recovery_auto_heal_attempts.rs
+│   │   ├── relay_recovery_auto_heal_confirm.rs
 │   │   ├── relay_recovery_completion_footer.rs
 │   │   ├── replace_outcome_policy.rs
 │   │   ├── response_sanitizer.rs
@@ -980,6 +1034,9 @@ src/
 │   │   ├── runtime_config.rs
 │   │   ├── session_control.rs
 │   │   └── store.rs
+│   ├── scheduled_messages/
+│   │   ├── evidence.rs
+│   │   └── postgres_tests.rs
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
@@ -1025,6 +1082,9 @@ src/
 │   ├── long_turn_watchdog.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
+│   ├── message_outbox_recovery.rs
+│   ├── message_outbox_recovery_support.rs
+│   ├── message_outbox_recovery_tests.rs
 │   ├── mod.rs
 │   ├── monitoring_store.rs
 │   ├── opencode.rs
@@ -1036,8 +1096,11 @@ src/
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_auth.rs
+│   ├── provider_error_transcript.rs
 │   ├── provider_exec.rs
 │   ├── provider_hosting.rs
+│   ├── provider_output_guard.rs
+│   ├── provider_output_guard_tests.rs
 │   ├── provider_runtime.rs
 │   ├── queue.rs
 │   ├── qwen.rs
@@ -1045,6 +1108,7 @@ src/
 │   ├── remote_stub.rs
 │   ├── retrospectives.rs
 │   ├── review_decision.rs
+│   ├── scheduled_messages.rs
 │   ├── service_error.rs
 │   ├── session_activity.rs
 │   ├── session_backend.rs
@@ -1097,7 +1161,6 @@ src/
 │   ├── prompt.rs
 │   ├── receiver.rs
 │   ├── runtime_boundary.rs
-│   ├── runtime_process.rs
 │   ├── sanitizer.rs
 │   ├── stt.rs
 │   ├── stt_streaming.rs
