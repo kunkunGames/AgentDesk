@@ -12,6 +12,7 @@ import {
   SurfaceCard,
   SurfaceSubsection,
 } from "../common/SurfacePrimitives";
+import { useFocusTrap } from "../common/overlay";
 
 const agentFormSchema = z.object({
   name: z.string().trim().min(1, "required"),
@@ -52,6 +53,7 @@ export default function AgentFormModal({
 }) {
   const { t } = useI18n();
   const overlayRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useFocusTrap(true) as React.MutableRefObject<HTMLFormElement | null>;
   const {
     register,
     handleSubmit,
@@ -105,6 +107,7 @@ export default function AgentFormModal({
       }}
     >
       <form
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="agent-modal-title"
