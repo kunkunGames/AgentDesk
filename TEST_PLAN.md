@@ -8,8 +8,9 @@
 
 ## Execution Plan Guidelines
 - **Dedicated Verification Step:** Plans for code changes must name the relevant test, lint, build, or generated-drift commands before final review and push. Keep the commands proportional to the changed surface; docs-only work may use focused document and diff checks.
-- **Finalization Step:** Describe finalization in environment-neutral terms and include a final diff/status review. Do not require an exact sentence or a provider-specific shell tool that may not exist in another agent runtime.
-- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies.
+- **Pre-Commit Step:** Execution plans must use the exact required string for the pre-commit step: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.' without any extra formatting or text.
+- **Finalization Step:** Describe finalization in environment-neutral terms and include a final diff/status review. Execution plans involving PR submission must avoid vague instructions like 'an appropriate description'. Instead, explicitly require drafting the PR body to include all mandatory sections (What changed, Why, WorkFingerprint, duplicate/overlap check, verification commands/results, skipped checks, risk, and rollback notes).
+- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. When deciding to stop and produce a no-change report, ensure the repository is left completely untouched. Clean up all temporary scratch files (e.g., plan.md, python/bash scripts, prs.json) to avoid accidentally generating a patch containing them. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies.
 
 ## PR Body Requirements
 Every PR must include:
