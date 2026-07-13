@@ -194,13 +194,17 @@ def is_scratch_file_path(path):
         "test.sh",
         "test.sql",
         "test_scratch.rs",
+        "test.py",
+        "test.js",
+        "test_script.py",
+        "scratch.js",
         "verify.sh",
     }
     if path in root_scratch_files:
         return True
     return bool(
-        re.match(r"^(?:scratch|scratchpad|test_scratch)[._-].+\.(?:md|txt|sh|sql|rs)$", path)
-        or re.match(r"^test_[A-Za-z0-9._-]+\.rs$", path)
+        re.match(r"^(?:scratch|scratchpad|test_scratch)[._-].+\.(?:md|txt|sh|sql|rs|py|js)$", path)
+        or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js)$", path)
     )
 
 def main():
