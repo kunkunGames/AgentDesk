@@ -207,7 +207,7 @@
   store-side CAS paths).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/watchers/lifecycle.rs` (2052 lines — canonical
+  - `src/services/discord/watchers/lifecycle.rs` (2077 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior; #3016 phase-5b2 dropped the `mailbox_finalize_owed`
     construction from the watcher-spawn handle; #3718 moved runtime mtime
@@ -220,7 +220,9 @@
     `watchers/lifecycle/activity.rs`; -32 from #3898 removing the false-positive
     "session ended … start a new session" tmux-death notice and its
     `should_send_session_ended_notice`/`session_ended_notice`/
-    `TmuxDeathLifecycleDecision` plumbing).
+    `TmuxDeathLifecycleDecision` plumbing; +25 from #4455 adding the explicit
+    force-replace claim action used only when Codex rebind proves that a live
+    same-output watcher still belongs to an earlier provider turn).
   - `src/services/discord/tmux.rs` (1624 lines; test-only #4253 wires the
     deterministic task-notification-kind disk-save/reload/restart roundtrip
     module, with no production-LoC or runtime behavior change; +11 from #4380 broadening the
@@ -267,7 +269,9 @@
     distinct `ActiveTurnKind::MonitorAutoTurn` marker so stale synthetic reclaim
     excludes live monitor relays while preserving background queue-yield behavior;
     +6 from #3818 sanitizing restored/orphan subagent-notification placeholders;
-    +1 from #3384 restored-seed undelivered-body discard guard;
+    +1 from #3384 restored-seed undelivered-body discard guard; +0 from #4455
+    re-exporting the force-replace claim helper while its implementation stays
+    in `watchers/lifecycle.rs`;
     +38 for suppressed-label noise, user report 2026-06-12: provider-aware
     status/footer stripping in the placeholder suppression decisions;
     -15 from #3717 footer-only placeholder target preservation plus status-strip
@@ -1116,7 +1120,12 @@
     normal long SILENT tool run (e.g. a big build) is never mistaken for an idle
     hang, with the 4h hard ceiling as the real backstop, and noted the limitation
     in the idle-kill error message + a delayed-event test).
-  - `src/services/tui_prompt_dedupe.rs` (1849 lines; +2 from #4091 r6 mandatory env-first lock-order comment at TEST_LOCK; +23 from #4091 r3
+  - `src/services/tui_prompt_dedupe.rs` (1966 lines; +117 from #4423: adopt Claude's
+    actual continuation UUID from a hook payload only through the registered
+    launch UUID and a real sibling transcript; retain the launch UUID as the
+    live hook-routing identity, register the payload alias, require newer mtime
+    for later hops, reset the cursor only on a genuine transition, and reject
+    delayed rewind payloads; +2 from #4091 r6 mandatory env-first lock-order comment at TEST_LOCK; +23 from #4091 r3
     refresh_runtime_binding_activity so live transcript activity extends the
     24h binding-mapping TTL even when the relay offset never advances (the
     exact relay-dead state the anchor protects); shared TUI prompt
@@ -1207,8 +1216,8 @@
   - `src/services/discord/recovery_engine/completion_delivery.rs` (sub-1000;
     behavior-preserving #3834 r2 extraction of recovery terminal relay,
     visible completion/status-panel completion helpers, and their tests.)
-  - `src/services/discord/recovery_engine/manual_rebind/mod.rs` (964 prod lines
-    after #4465; remains below the giant threshold. Keeps the manual rebind entrypoints,
+  - `src/services/discord/recovery_engine/manual_rebind/mod.rs` (995 prod lines
+    after #4455; remains below the giant threshold. Keeps the manual rebind entrypoints,
     rollback carrier, session refresh, active-turn re-registration hook, and
     watcher claim/spawn path. #4465's durable automatic lane performs the
     blocking exact-episode adoption on `spawn_blocking`, retains that same
@@ -1216,13 +1225,19 @@
     mutation and watcher claim/spawn, and commits the episode-scoped readoption
     marker plus in-memory ledger before releasing authority. The
     `episode_handoff.rs` child never waits for a flock while holding
-    `shared.core`.
+    `shared.core`. #4455 keeps the crossed-turn watcher selection in the
+    30-line `watcher_claim.rs` child so the parent stays below the threshold.
     `src/services/discord/recovery_engine/manual_rebind/codex_tui_replay.rs`
-    (233 prod lines) owns the Codex-TUI replay/resume helper cluster, and
-    `src/services/discord/recovery_engine/manual_rebind/adoption.rs` (77 prod
+    (363 prod lines) owns the Codex-TUI replay/resume helper cluster, and
+    `src/services/discord/recovery_engine/manual_rebind/adoption.rs` (95 prod
     lines) owns transcript-adoption offset and binding decisions. The retired
     `manual_rebind.rs` giant registration was removed from
     scripts/giant_file_registry.toml.)
+  - `src/services/discord/recovery_engine/rebind_runtime.rs` (980 prod lines
+    after #4455; below the giant threshold) owns provider runtime resolution
+    and normalized Codex relay conversion. Its 89-line
+    `rebind_runtime/codex_relay_generation.rs` child owns the per-path
+    generation registry, prepare/truncate gate, and fenced JSONL write.
   - `src/services/discord/health.rs` (417 prod lines after the #3038 Phase A
     directory decomposition; module root keeps the `HealthRegistry` core +
     re-export surface, and the former monolith body lives in flat
@@ -1733,7 +1748,7 @@
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/config.rs` (2723 lines; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease).
-  - `src/server/mod.rs` (2800 lines; -21 from #4465 moving stale outbox/expired-held GC ownership into `services::message_outbox`; scheduled messages extend that shared GC owner to preserve permanent dedupe sentinels; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
+  - `src/server/mod.rs` (2778 lines; -22 from #4449 extracting actionable-alert announce→notify delivery into `src/server/outbox_actionable_delivery.rs`; -21 from #4465 moving stale outbox/expired-held GC ownership into `services::message_outbox`; #1122 extends that shared GC owner to preserve scheduled-message permanent dedupe sentinels; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1504 lines).
   - `src/reconcile.rs` (1902 lines; +39 from #4104 standardized inflight-row

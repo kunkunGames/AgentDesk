@@ -25,16 +25,16 @@
 | `src/services/discord/relay_recovery.rs` | 1444 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/router/intake_gate.rs` | 1541 | discord-relay | 2026-10-31 | #3838 |
 | `src/services/discord/router/message_handler/intake_turn.rs` | 2834 | discord-relay | 2026-10-31 | #3837 |
-| `src/services/discord/session_relay_sink.rs` | 1681 | discord-relay | 2026-08-31 | #3405 |
+| `src/services/discord/session_relay_sink.rs` | 1676 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/tmux.rs` | 1624 | discord-relay | 2026-10-31 | #3841 |
 | `src/services/discord/tmux_watcher.rs` | 3558 | discord-relay | 2026-10-31 | #3832 |
 | `src/services/discord/tmux_watcher/turn_stream_collector.rs` | 1158 | discord-relay | 2026-10-31 | #4229 |
 | `src/services/discord/tui_direct_pending_start.rs` | 1495 | discord-relay | 2026-08-31 | #3540 |
-| `src/services/discord/tui_prompt_relay/synthetic_start.rs` | 1051 | discord-relay | 2026-10-31 | #4019 |
+| `src/services/discord/tui_prompt_relay/synthetic_start.rs` | 1078 | discord-relay | 2026-10-31 | #4019 |
 | `src/services/discord/turn_finalizer.rs` | 1048 | discord-finalizer | 2026-08-31 | #3016 |
 | `src/services/discord/turn_view_reconciler.rs` | 2213 | discord-relay | 2026-08-31 | #4049 |
 | `src/services/discord/voice_barge_in.rs` | 2905 | voice-runtime | 2026-08-31 | #3405 |
-| `src/services/discord/watchers/lifecycle.rs` | 2052 | discord-relay | 2026-10-31 | #3840 |
+| `src/services/discord/watchers/lifecycle.rs` | 2077 | discord-relay | 2026-10-31 | #3840 |
 | `src/services/tmux_common.rs` | 1099 | discord-relay | 2026-10-31 | #3924 |
 | `src/voice/announce_meta.rs` | 1001 | voice-runtime | 2026-08-31 | #3405 |
 
@@ -69,7 +69,7 @@
 | `src/pipeline.rs` | 1383 |
 | `src/receipt.rs` | 1842 |
 | `src/reconcile.rs` | 1902 |
-| `src/server/mod.rs` | 2800 |
+| `src/server/mod.rs` | 2778 |
 | `src/server/routes/agents.rs` | 1278 |
 | `src/server/routes/agents_crud.rs` | 1903 |
 | `src/server/routes/agents_setup.rs` | 1365 |
@@ -105,8 +105,8 @@
 | `src/services/qwen.rs` | 2198 |
 | `src/services/routines/agent_executor.rs` | 2021 |
 | `src/services/routines/discord_log.rs` | 1593 |
-| `src/services/routines/store.rs` | 3689 |
+| `src/services/routines/store.rs` | 3505 |
 | `src/services/settings.rs` | 1114 |
-| `src/services/tui_prompt_dedupe.rs` | 1849 |
+| `src/services/tui_prompt_dedupe.rs` | 1966 |
 | `src/services/turn_orchestrator.rs` | 3290 |
 | `src/voice/receiver.rs` | 1108 |

@@ -56,6 +56,72 @@ fn test_role_binding(role_id: &str) -> RoleBinding {
 }
 
 #[test]
+fn issue_4313_prompt_policy_contract() {
+    let built = build_prompt_with_optional_manifest_for(None, Some("implementation"));
+    let prompt = built.system_prompt;
+
+    assert!(prompt.contains(
+        "If another instruction says to plan first, write a brief plan in plain text and proceed without entering plan mode"
+    ));
+    assert_eq!(
+        prompt.matches("inspect `GET /api/docs`").count(),
+        1,
+        "the runtime prompt must have one canonical docs-first API order: {prompt}"
+    );
+    assert!(prompt.contains("docs override guessed CLI/source patterns"));
+    assert!(prompt.contains("Constrain output before invoking a tool"));
+    assert!(!prompt.contains("summarize the result instead of pasting raw output"));
+    assert!(!prompt.contains("10 lines"));
+    assert!(prompt.contains("one standalone `API_FRICTION: {...}` final-response line"));
+    assert!(prompt.contains("provider-managed automatic compaction uses its own contract"));
+    assert!(!prompt.contains("docs/memory-scope.md"));
+    assert!(
+        prompt.len() < 3_053,
+        "fixed Full prompt must shrink from the measured 3,053-byte baseline, got {}",
+        prompt.len()
+    );
+}
+
+#[test]
+fn issue_4313_agentdesk_prompt_has_single_policy_owner() {
+    let runtime_root = tempfile::tempdir().expect("runtime root");
+    let _runtime_guard = crate::config::set_agentdesk_root_for_test(runtime_root.path());
+    let binding = test_role_binding("project-agentdesk");
+    let prompt = build_system_prompt(
+        "ctx",
+        &[],
+        env!("CARGO_MANIFEST_DIR"),
+        ChannelId::new(1),
+        "tok",
+        Some(&binding),
+        false,
+        DispatchProfile::Full,
+        Some("implementation"),
+        None,
+        None,
+        None,
+        Some(&ResolvedMemorySettings {
+            backend: MemoryBackendKind::Memento,
+            ..ResolvedMemorySettings::default()
+        }),
+        true,
+    );
+
+    for (needle, owner) in [
+        ("inspect `GET /api/docs`", "ADK API Usage"),
+        ("targeted `rg`", "Tool Output Efficiency"),
+        ("docs/memory-scope.md", "Proactive Memory Guidance"),
+    ] {
+        assert_eq!(
+            prompt.matches(needle).count(),
+            1,
+            "{needle} must be owned once by {owner}: {prompt}"
+        );
+    }
+    assert!(prompt.contains("docs/source-of-truth.md"));
+}
+
+#[test]
 fn prompt_manifest_log_records_hash_metadata_without_full_content() {
     // The `info!("recorded prompt manifest", ...)` call logs the manifest's
     // `turn_id`/`channel_id`/`layer_count` plus the `?layer_hashes` field whose
@@ -84,7 +150,28 @@ fn prompt_manifest_log_records_hash_metadata_without_full_content() {
 
     // Exactly the metadata logged at info level — no full_content field exists.
     let layer_hashes = format!("{:?}", prompt_manifest_layer_hashes(&manifest));
-    assert_eq!(manifest.layers.len(), 3);
+    assert_eq!(manifest.layers.len(), 7);
+    assert_eq!(manifest.layer_count, 6);
+    assert_eq!(
+        manifest.total_input_bytes,
+        i64::try_from(built.system_prompt.len()).unwrap()
+    );
+    for required in [
+        "base_discord",
+        "tool_output_efficiency",
+        "context_compression",
+        "api_friction_guidance",
+        "current_task",
+        "dispatch_contract",
+    ] {
+        assert!(
+            manifest
+                .layers
+                .iter()
+                .any(|layer| layer.enabled && layer.layer_name == required),
+            "missing enabled layer {required}"
+        );
+    }
     assert_eq!(manifest.turn_id, "turn-current-task-test");
     assert!(layer_hashes.contains("dispatch_contract"));
     assert!(layer_hashes.contains(&dispatch_layer.content_sha256));
@@ -113,7 +200,7 @@ fn current_task_dispatch_layer_is_recorded_with_redacted_preview_only() {
 
     assert!(built.system_prompt.contains("[Current Task]"));
     let manifest = built.manifest.expect("prompt manifest");
-    assert_eq!(manifest.layers.len(), 3);
+    assert_eq!(manifest.layers.len(), 7);
     let layer = manifest
         .layers
         .iter()
@@ -132,12 +219,64 @@ fn current_task_dispatch_layer_is_recorded_with_redacted_preview_only() {
     let preview = layer.redacted_preview.as_deref().unwrap();
     assert!(preview.contains("[redacted-email]"));
     assert!(preview.contains("token=***"));
+    assert!(!preview.contains("[Dispatch Contract]"));
     assert!(!preview.contains("user@example.com"));
     assert!(!preview.contains("super-secret-123"));
 
     let serialized = serde_json::to_value(layer).unwrap();
     assert_eq!(serialized["enabled"], true);
     assert_eq!(serialized["full_content"], serde_json::Value::Null);
+}
+
+#[test]
+fn full_prompt_manifest_records_shared_knowledge_and_longterm_catalog() {
+    let binding = test_role_binding("manifest-inventory-agent");
+    let built = build_system_prompt_with_manifest(
+        "ctx",
+        &[],
+        "/tmp",
+        ChannelId::new(1),
+        "tok",
+        Some(&binding),
+        false,
+        DispatchProfile::Full,
+        None,
+        None,
+        Some("[Shared Agent Knowledge]\nimportant invariant"),
+        Some("- memory.md: durable fact"),
+        None,
+        false,
+        None,
+        None,
+        Some("turn-layer-inventory"),
+    );
+
+    let manifest = built.manifest.expect("prompt manifest");
+    for (name, expected_fragment) in [
+        (
+            "base_discord",
+            "You are chatting with a user through Discord.",
+        ),
+        ("shared_knowledge", "important invariant"),
+        ("longterm_catalog", "durable fact"),
+    ] {
+        let layer = manifest
+            .layers
+            .iter()
+            .find(|layer| layer.layer_name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(layer.enabled, "{name} should describe injected content");
+        let recorded = layer
+            .full_content
+            .as_deref()
+            .or(layer.redacted_preview.as_deref())
+            .expect("recorded content");
+        assert!(recorded.contains(expected_fragment));
+    }
+    assert_eq!(
+        manifest.layer_count as usize,
+        manifest.layers.iter().filter(|layer| layer.enabled).count()
+    );
 }
 
 #[test]
@@ -150,7 +289,7 @@ fn current_task_freeform_layer_uses_discord_message_source() {
     let built = build_prompt_with_manifest_for(&current_task, None);
 
     let manifest = built.manifest.expect("prompt manifest");
-    assert_eq!(manifest.layers.len(), 3);
+    assert_eq!(manifest.layers.len(), 7);
     let layer = manifest
         .layers
         .iter()
@@ -378,6 +517,10 @@ fn build_prompt_manifest_includes_recovery_context_layer() {
     );
 
     let manifest = built.manifest.expect("prompt manifest");
+    assert_eq!(
+        manifest.total_input_bytes,
+        i64::try_from(built.system_prompt.len() + raw_context.len()).unwrap()
+    );
     let layer = manifest
         .layers
         .iter()
@@ -794,6 +937,14 @@ fn full_memento_prompt_carries_tool_feedback_contract() {
     ));
     // Deferred-tool loading instruction.
     assert!(prompt.contains("ToolSearch `select:mcp__memento__tool_feedback`"));
+    assert_eq!(
+        prompt
+            .matches(
+                "Do not call `context` or `recall` solely because Memento server instructions mention session start"
+            )
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -801,7 +952,9 @@ fn review_lite_and_lite_prompts_omit_tool_feedback_contract() {
     // #4306: the tool_feedback contract lives inside the Full-only Proactive
     // Memory Guidance block. ReviewLite/Lite must show zero output change — the
     // whole block (and thus the contract) stays absent even with the memento
-    // backend selected and the MCP available.
+    // backend selected and the MCP available. The compact recall-ownership
+    // override is intentionally retained so MCP SessionStart instructions do
+    // not trigger a second automatic lookup.
     let settings = ResolvedMemorySettings {
         backend: MemoryBackendKind::Memento,
         ..ResolvedMemorySettings::default()
@@ -835,6 +988,15 @@ fn review_lite_and_lite_prompts_omit_tool_feedback_contract() {
         assert!(
             !prompt.contains("mcp__memento__tool_feedback"),
             "{profile:?} prompt must not carry the tool_feedback contract, got: {prompt}"
+        );
+        assert!(prompt.contains("[Memory Recall Ownership]"));
+        assert_eq!(
+            prompt
+                .matches(
+                    "Do not call `context` or `recall` solely because Memento server instructions mention session start"
+                )
+                .count(),
+            1
         );
     }
 }

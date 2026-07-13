@@ -19,6 +19,8 @@
 > uses the protected `/api/message-outbox/monitor-alerts` durable enqueue route,
 > so a crash before its local commit retries the same obligation.)
 
+> Last refreshed: 2026-07-11 (manual: scheduled-message source registration and touch gate).
+
 > Last refreshed: 2026-07-11 (#4247 S0 review follow-up — removing the sole
 > destructive reaction-removal intake route also retires the unreachable
 > `AlreadyStopping` reaction-control reply reason. The live

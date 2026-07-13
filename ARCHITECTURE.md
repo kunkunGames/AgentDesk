@@ -308,6 +308,7 @@ src/
 │   ├── maintenance.rs
 │   ├── mod.rs
 │   ├── multinode_regression.rs
+│   ├── outbox_actionable_delivery.rs
 │   ├── outbox_delivery_alert.rs
 │   ├── resource_locks.rs
 │   ├── state.rs
@@ -547,6 +548,7 @@ src/
 │   │   │   ├── freshness.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── recent_events.rs
+│   │   │   ├── session_banner_claim.rs
 │   │   │   ├── session_panel.rs
 │   │   │   ├── slot_rehydration.rs
 │   │   │   ├── status_events.rs
@@ -572,7 +574,10 @@ src/
 │   │   │   │   ├── codex_tui_replay.rs
 │   │   │   │   ├── episode_handoff.rs
 │   │   │   │   ├── mod.rs
-│   │   │   │   └── post_adoption_guard_tests.rs
+│   │   │   │   ├── post_adoption_guard_tests.rs
+│   │   │   │   └── watcher_claim.rs
+│   │   │   ├── rebind_runtime/
+│   │   │   │   └── codex_relay_generation.rs
 │   │   │   ├── analytics_transcript.rs
 │   │   │   ├── completion_delivery.rs
 │   │   │   ├── crash_resume_guard.rs
@@ -691,6 +696,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── ops.rs
 │   │   ├── tmux_watcher/
+│   │   │   ├── streaming_status_tick/
+│   │   │   │   └── types.rs
 │   │   │   ├── commit_decisions.rs
 │   │   │   ├── completion_gate.rs
 │   │   │   ├── completion_gate_tests.rs
@@ -714,6 +721,7 @@ src/
 │   │   │   ├── single_message_footer.rs
 │   │   │   ├── single_message_footer_tests.rs
 │   │   │   ├── stall_exit.rs
+│   │   │   ├── streaming_session_banner.rs
 │   │   │   ├── streaming_status_tick.rs
 │   │   │   ├── supervisor_relay.rs
 │   │   │   ├── supervisor_relay_tests.rs
@@ -1071,7 +1079,8 @@ src/
 │   │   └── store.rs
 │   ├── scheduled_messages/
 │   │   ├── evidence.rs
-│   │   └── postgres_tests.rs
+│   │   ├── postgres_tests.rs
+│   │   └── timing.rs
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
@@ -1144,6 +1153,7 @@ src/
 │   ├── retrospectives.rs
 │   ├── review_decision.rs
 │   ├── scheduled_messages.rs
+│   ├── scheduling.rs
 │   ├── service_error.rs
 │   ├── session_activity.rs
 │   ├── session_backend.rs
