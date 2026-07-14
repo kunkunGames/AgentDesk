@@ -116,6 +116,12 @@ for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; 
     FAIL=1
   fi
 done
+for scratch_file in *.diff *.patch patch.diff; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch diff/patch file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
 for scratch_file in scratch.py scratchpad.py scratch.js scratchpad.js; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch script file detected in repository root: $scratch_file"
