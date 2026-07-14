@@ -245,7 +245,7 @@
 | `server::routes::discord` | `src/server/routes/discord.rs` | 410 | 353 | 57 |  |
 | `server::routes::dispatched_sessions` | `src/server/routes/dispatched_sessions.rs` | 138 | 138 | 0 |  |
 | `server::routes::dispatches` | `src/server/routes/dispatches/mod.rs` | 29 | 29 | 0 |  |
-| `server::routes::dispatches::crud` | `src/server/routes/dispatches/crud.rs` | 1071 | 773 | 298 |  |
+| `server::routes::dispatches::crud` | `src/server/routes/dispatches/crud.rs` | 1072 | 774 | 298 |  |
 | `server::routes::dispatches::discord_delivery` | `src/server/routes/dispatches/discord_delivery.rs` | 15 | 15 | 0 |  |
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 10 | 10 | 0 |  |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 141 | 141 | 0 |  |
