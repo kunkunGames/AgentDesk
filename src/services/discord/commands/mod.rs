@@ -97,6 +97,8 @@ pub(in crate::services::discord) use command_policy::{
 pub(in crate::services::discord) use super::model_catalog::{
     provider_supports_model_override, validate_model_input,
 };
+#[cfg(unix)]
+pub(in crate::services::discord) use config::effective_provider_for_channel;
 pub(in crate::services::discord) use config::{
     ModelPickerAction, build_allowall_policy_note, build_model_picker_components_from_snapshot,
     build_model_picker_embed_from_snapshot, channel_codex_goals_setting, channel_fast_mode_setting,

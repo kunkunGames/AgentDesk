@@ -1146,21 +1146,8 @@ pub(super) async fn handle_text_message(
 
     // Resolve channel/tmux session name from current session state. We need the
     // persisted provider session_id before recall so external memory can scope by run_id.
-    let (channel_name, tmux_session_name) = {
-        let data = shared.core.lock().await;
-        let channel_name = data
-            .sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.clone());
-        let tmux_session_name = if provider.uses_managed_tmux_backend() {
-            channel_name
-                .as_ref()
-                .map(|name| provider.build_tmux_session_name(name))
-        } else {
-            None
-        };
-        (channel_name, tmux_session_name)
-    };
+    let (channel_name, tmux_session_name) =
+        resolve_channel_tmux_names(shared, &provider, channel_id).await;
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
     let turn_goal_kind = if !dispatch_reset_provider_state && !dispatch_recreate_tmux {
         classify_codex_goal_command_for_provider(
@@ -1289,13 +1276,16 @@ pub(super) async fn handle_text_message(
     // because the async gap between check and insert allows interleaving.
     // If another message won the race, queue ourselves and clean up.
     let cancel_token = Arc::new(CancelToken::new());
-    let started = mailbox_try_start_turn_with_terminal_marker_cleanup(
+    let started = try_start_turn_with_stale_busy_heal(
         shared,
         channel_id,
         cancel_token.clone(),
         request_owner,
         user_msg_id,
-        adk_session_key.as_deref(),
+        stale_busy_context(
+            &provider,
+            [adk_session_key.as_deref(), tmux_session_name.as_deref()],
+        ),
     )
     .await;
 
