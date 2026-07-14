@@ -10,6 +10,7 @@ from scripts.analyze_prs import (
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
+    _is_top_level_field_label,
 )
 
 
@@ -425,6 +426,25 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("test.js", script)
         self.assertIn("scratch[._-]*.js", script)
         self.assertIn("test_*.js", script)
+
+class PrAnalyzerRegexTests(unittest.TestCase):
+    def test_bold_label_before_colon(self):
+        body = "- **Agent**: Steward"
+        self.assertTrue(has_non_empty_body_field(body, ["agent"]))
+
+    def test_bold_label_after_colon(self):
+        body = "- **Agent:** Steward"
+        self.assertTrue(has_non_empty_body_field(body, ["agent"]))
+
+    def test_bold_label_in_field_check(self):
+        body = "- **Agent**: Steward"
+        self.assertTrue(_is_top_level_field_label(body))
+
+    def test_bold_label_in_field_check_after_colon(self):
+        body = "- **Agent:** Steward"
+        self.assertTrue(_is_top_level_field_label(body))
+
+
 
 if __name__ == "__main__":
     unittest.main()
