@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { Department } from "../../types";
@@ -69,6 +69,7 @@ export default function AgentFormModal({
   });
   const formValues = watch();
   const spriteNum = formValues.sprite_number ?? 0;
+  const emojiBtnId = useId();
 
   // ESC 키로 닫기
   useEffect(() => {
@@ -309,10 +310,11 @@ export default function AgentFormModal({
             )}
             <div className="grid grid-cols-[72px_1fr] gap-2">
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor={emojiBtnId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("이모지", "Emoji")}
                 </label>
                 <EmojiPicker
+                  id={emojiBtnId}
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={

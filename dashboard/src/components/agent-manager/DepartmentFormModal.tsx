@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { Department } from "../../types";
@@ -101,6 +101,7 @@ export default function DepartmentFormModal({
   const overlayRef = useFocusTrap(true);
   useReturnFocus(true);
   const colorButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const iconBtnId = useId();
 
   // sort_order 기반 다음 순번 계산
   const nextSortOrder = (() => {
@@ -315,10 +316,11 @@ export default function DepartmentFormModal({
             <div className="space-y-4">
               <div className="flex items-start gap-3">
                 <div>
-                  <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <label htmlFor={iconBtnId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     {tr("아이콘", "Icon")}
                   </label>
                   <EmojiPicker
+                    id={iconBtnId}
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
                     aria-label={
