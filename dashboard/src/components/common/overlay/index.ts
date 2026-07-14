@@ -8,4 +8,5 @@ export { OverlayProvider } from "./OverlayProvider";
 export { ToastProvider, useToast } from "./ToastProvider";
 export type { ToastInput, ToastItem, ToastVariant } from "./ToastProvider";
 export { useFocusTrap } from "./useFocusTrap";
+export { useReturnFocus } from "./useReturnFocus";
 export { useIsMobile } from "./useBreakpoint";

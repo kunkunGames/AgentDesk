@@ -1,4 +1,5 @@
 import { Suspense, lazy, useEffect, useRef } from "react";
+import { useFocusTrap, useReturnFocus } from "../common/overlay";
 
 const OnboardingWizard = lazy(() => import("../OnboardingWizard"));
 
@@ -15,13 +16,12 @@ export function SettingsOnboardingOverlay({
   open,
   tr,
 }: SettingsOnboardingOverlayProps) {
-  const onboardingDialogRef = useRef<HTMLDivElement | null>(null);
+  const onboardingDialogRef = useFocusTrap(open);
   const onboardingCloseButtonRef = useRef<HTMLButtonElement | null>(null);
+  const returnFocus = useReturnFocus(open);
 
   useEffect(() => {
     if (!open || typeof window === "undefined") return;
-    const previousActiveElement =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const focusCloseButton = window.setTimeout(() => {
       onboardingCloseButtonRef.current?.focus();
     }, 0);
@@ -31,33 +31,11 @@ export function SettingsOnboardingOverlay({
         onClose();
         return;
       }
-      if (event.key !== "Tab") return;
-      const dialog = onboardingDialogRef.current;
-      if (!dialog) return;
-      const focusable = Array.from(
-        dialog.querySelectorAll<HTMLElement>(
-          'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
-        ),
-      );
-      if (focusable.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.clearTimeout(focusCloseButton);
       window.removeEventListener("keydown", handleKeyDown);
-      previousActiveElement?.focus();
     };
   }, [onClose, open]);
 
