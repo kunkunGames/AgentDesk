@@ -12,7 +12,7 @@ static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // first header line is empty (`Authorization:\r\n token`). An ordinary
     // unindented next line is NOT consumed; a value-less header is NOT matched.
     Regex::new(
-        r"(?i)\b(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
+        r"(?i)\b((?:authorization|cookie|set-cookie)[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
     )
     .unwrap()
 });
@@ -188,13 +188,15 @@ mod tests {
     #[test]
     fn redact_known_secrets_masks_bearer_bot_and_assignments() {
         let redacted = redact_known_secrets(
-            "Authorization: Bearer live-token\nAuthorization: Bot discord-token\nAuthorization: Basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\"\nDATABASE_URL=postgres://u:p@h/db\nOPENAI_API_KEY=sk-live\nGITHUB_PRIVATE_KEY=gh-priv-key-secret\nPRIVATE_KEY=pk-secret",
+            "Authorization: Bearer live-token\nAuthorization: Bot discord-token\nAuthorization: Basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\"\nCookie: session_id=secret-cookie\nSet-Cookie: auth_token=secret-token; Secure; HttpOnly\nDATABASE_URL=postgres://u:p@h/db\nOPENAI_API_KEY=sk-live\nGITHUB_PRIVATE_KEY=gh-priv-key-secret\nPRIVATE_KEY=pk-secret",
         );
 
         assert!(redacted.contains("Authorization: Bearer ***"));
         assert!(redacted.contains("Authorization: Bot ***"));
         assert!(redacted.contains("Authorization: Basic ***"));
         assert!(redacted.contains("authorization: Digest ***"));
+        assert!(redacted.contains("Cookie: ***"));
+        assert!(redacted.contains("Set-Cookie: ***"));
         assert!(redacted.contains("DATABASE_URL=***"));
         assert!(redacted.contains("OPENAI_API_KEY=***"));
         assert!(redacted.contains("GITHUB_PRIVATE_KEY=***"));
