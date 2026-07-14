@@ -1087,7 +1087,7 @@
 | `utils::format` | `src/utils/format.rs` | 106 | 106 | 0 |  |
 | `utils::github_links` | `src/utils/github_links.rs` | 154 | 109 | 45 |  |
 | `utils::loopback_url` | `src/utils/loopback_url.rs` | 58 | 28 | 30 |  |
-| `utils::redact` | `src/utils/redact.rs` | 399 | 168 | 231 |  |
+| `utils::redact` | `src/utils/redact.rs` | 401 | 168 | 233 |  |
 | `utils::secret_file` | `src/utils/secret_file.rs` | 208 | 134 | 74 |  |
 | `utils::wip_detect` | `src/utils/wip_detect.rs` | 237 | 106 | 131 |  |
 | `voice` | `src/voice/mod.rs` | 20 | 20 | 0 |  |
