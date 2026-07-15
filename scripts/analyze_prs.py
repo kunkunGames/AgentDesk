@@ -201,6 +201,7 @@ def is_scratch_file_path(path):
         "test.js",
         "test_scratch.rs",
         "verify.sh",
+        "patch.txt",
     }
     if path in root_scratch_files:
         return True
