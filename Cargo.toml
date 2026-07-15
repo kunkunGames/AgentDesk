@@ -1,7 +1,140 @@
 [package]
-name = "test_dashmap"
-version = "0.1.0"
-edition = "2021"
+name = "agentdesk"
+version = "0.1.2"
+edition = "2024"
+description = "AI agent orchestration platform"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentdesk"
+path = "src/main.rs"
+
+
+[lints.clippy]
+# #2954 stage-1 hard gates. Full `-D warnings` is tracked separately because
+# the current tree still has existing clippy/rustc warning debt.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# #3034: hold-lock-across-await is a race/deadlock primitive behind much of the
+# turn-lifecycle backlog. Denied crate-wide so new occurrences fail CI; existing
+# benign sites carry a narrow `#[allow(clippy::await_holding_lock)]` + `// SAFETY:`.
+# The allow count is ratcheted (monotonic decrease) by
+# scripts/check_await_holding_lock_ratchet.py.
+await_holding_lock = "deny"
 
 [dependencies]
-dashmap = "5.5"
+# HTTP server
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate", "macros", "chrono", "json", "uuid"] }
+
+# Discord
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "rustls_backend"] }
+poise = "0.6"
+
+# Voice — 0.6.0 (Hoopoe) 부터 Discord DAVE/E2EE 프로토콜 지원. 2026-03-02 이후
+# Discord 가 non-stage voice channel 에 DAVE 강제 (close code 4017). 0.4/0.5
+# 는 거부되므로 0.6+ 필수. MSRV 1.83 (현재 1.94 사용 중 → OK).
+songbird = { version = "0.6", default-features = false, features = ["driver", "gateway", "receive", "serenity", "rustls", "tungstenite"] }
+# #2054 v5 — songbird 0.6 의 File input 은 symphonia 만으로 디코드한다 (ffmpeg
+# 의존성 0.5 에서 제거). symphonia 의 default features 에는 mp3 코덱이 빠져
+# 있어서 edge-tts 로 받은 mp3 파일이 즉시 EOF 로 끝나며 무음 트랙이 된다.
+# 여기에 직접 의존하여 mp3 codec 을 켜야 TTS 가 실제로 출력된다.
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
+hound = "3.5"
+async-trait = "0.1"
+
+# Policy engine (QuickJS)
+rquickjs = { version = "0.9", features = ["bindgen", "classes", "properties", "parallel"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+json5 = "0.4"
+
+# Utils
+futures = "0.3"
+ureq = { version = "2", features = ["json"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = "0.10"
+notify = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+dirs = "6.0.0"
+glob = "0.3"
+which = "8.0.2"
+
+# From RCC — text/formatting
+unicode-width = "0.2"
+textwrap = "0.16"
+regex = "1"
+pulldown-cmark = "0.9.6"
+unicode-normalization = "0.1"
+
+# From RCC — crypto/encoding
+base64 = "0.22"
+blake3 = "1"
+
+# From RCC — concurrency
+dashmap = "6"
+
+# From RCC — HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# From RCC — crypto
+sha2 = "0.10"
+hex = "0.4"
+# #2049 Finding 11 — constant-time bearer comparison
+subtle = "2"
+
+# From RCC — misc
+rand = "0.8"
+libc = "0.2"
+croner = "3.0.1"
+
+
+[dev-dependencies]
+filetime = "0.2"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+# #3673: do NOT strip proc-macro / build-script artifacts. Under the current
+# macOS toolchain (rustc 1.94.1, ld-27031, Darwin 27) `strip = true` on a
+# proc-macro cdylib produces a mis-aligned LINKEDIT string pool, so the compiler
+# can no longer `dlopen` it (observed: `libsqlx_macros-*.dylib` ... "mis-aligned
+# LINKEDIT string pool" -> E0432 on sqlx's Encode/Decode/Type/FromRow re-exports),
+# breaking the optimized release build that `deploy-release.sh` runs.
+# `build-override` covers build scripts, proc-macros and their deps — keeping them
+# unstripped fixes dlopen while the final delivered binary stays fully stripped
+# (size benefit retained). Verified: `cargo build --release -p sqlx` fails without
+# this override and succeeds with it on the affected toolchain.
+[profile.release.build-override]
+strip = false
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 1
+lto = false
+strip = false
