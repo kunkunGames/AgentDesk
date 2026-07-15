@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -10,7 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
-use crate::services::claude_tui::memento_feedback::PendingMementoFeedbackTracker;
+use crate::services::claude_tui::memento_feedback::{
+    PendingMementoFeedbackTracker, PendingMementoFeedbackTransition,
+};
+
+pub(crate) mod relay_receipts;
+use relay_receipts::{RelayReceiptBegin, RelayReceiptLedger, RelayReceiptPin, RelayReceiptTicket};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
 
@@ -111,6 +116,7 @@ pub struct HookEvent {
 pub struct HookServerState {
     event_tx: broadcast::Sender<HookEvent>,
     memento_feedback: PendingMementoFeedbackTracker,
+    relay_receipts: RelayReceiptLedger,
     claude_projects_root: Option<PathBuf>,
 }
 
@@ -120,6 +126,7 @@ impl HookServerState {
         Self {
             event_tx,
             memento_feedback: PendingMementoFeedbackTracker::default(),
+            relay_receipts: RelayReceiptLedger::default(),
             claude_projects_root:
                 crate::services::claude_tui::hook_output_guard::configured_claude_projects_root(),
         }
@@ -145,6 +152,8 @@ impl Default for HookServerState {
 
 pub struct HookEndpointGuard {
     endpoint: String,
+    _relay_recovery_owner:
+        Option<crate::services::claude_tui::hook_relay::OrderedHookRelayRecoveryOwner>,
 }
 
 impl Drop for HookEndpointGuard {
@@ -157,7 +166,11 @@ pub fn publish_hook_endpoint(endpoint: String) -> HookEndpointGuard {
     *HOOK_ENDPOINT
         .write()
         .unwrap_or_else(|error| error.into_inner()) = Some(endpoint.clone());
-    HookEndpointGuard { endpoint }
+    HookEndpointGuard {
+        endpoint,
+        _relay_recovery_owner: crate::services::claude_tui::hook_relay::start_relay_recovery_owner(
+        ),
+    }
 }
 
 fn clear_hook_endpoint_if_current(expected: &str) {
@@ -222,8 +235,11 @@ async fn receive_hook(
     State(state): State<HookServerState>,
     Path((provider, event)): Path<(String, String)>,
     Query(query): Query<HookQuery>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let raw_provider = provider.clone();
+    let raw_event = event.clone();
     let provider = provider.trim().to_ascii_lowercase();
     if provider.is_empty() {
         return (
@@ -231,6 +247,24 @@ async fn receive_hook(
             Json(json!({ "ok": false, "error": "missing provider" })),
         );
     }
+
+    let receipt_pin = RelayReceiptPin::new(
+        &raw_provider,
+        &raw_event,
+        query.session_id.as_deref(),
+        &payload,
+        &headers,
+    );
+    let receipt_ticket = match state
+        .relay_receipts
+        .begin(&headers, receipt_pin, Utc::now())
+    {
+        RelayReceiptBegin::Legacy => None,
+        RelayReceiptBegin::Fresh(ticket) => Some(ticket),
+        RelayReceiptBegin::Respond(response) => {
+            return (response.status, Json(response.body));
+        }
+    };
 
     let command_session_id = query.session_id.as_deref().and_then(non_empty_string);
     let observed_payload_session_id = payload_session_id(&payload);
@@ -298,9 +332,12 @@ async fn receive_hook(
         payload_is_registered,
     );
     let Some(session_id) = session_id else {
-        return (
+        return finish_hook_receipt(
+            &state,
+            receipt_ticket,
             StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": "missing session_id" })),
+            json!({ "ok": false, "error": "missing session_id" }),
+            false,
         );
     };
 
@@ -327,12 +364,15 @@ async fn receive_hook(
                         output_chars = inspection.char_len,
                         "blocked Claude completion containing harness control data"
                     );
-                    return (
+                    return finish_hook_receipt(
+                        &state,
+                        receipt_ticket,
                         StatusCode::ACCEPTED,
-                        Json(json!({
+                        json!({
                             "decision": "block",
                             "reason": crate::services::claude_tui::hook_output_guard::CLAUDE_HOOK_BLOCK_REASON,
-                        })),
+                        }),
+                        true,
                     );
                 }
             },
@@ -358,22 +398,44 @@ async fn receive_hook(
         ..event.clone()
     });
     let event_name = event.kind.as_str().to_string();
-    let memento_stop_flush = match event.kind {
+    let memento_transition = match event.kind {
         HookEventKind::PostToolUse => {
             let _ = state
                 .memento_feedback
                 .observe_post_tool_use(&event.session_id, &event.payload);
-            None
+            PendingMementoFeedbackTransition::default()
         }
         HookEventKind::Stop if event.provider == "claude" => state
             .memento_feedback
-            .take_stop_flush(&event.session_id, &event.payload),
+            .advance_stop_flush(&event.session_id, &event.payload),
+        HookEventKind::UserPromptSubmit if event.provider == "claude" => state
+            .memento_feedback
+            .advance_user_prompt_submit(&event.session_id),
+        HookEventKind::SessionStart if event.provider == "claude" => {
+            state.memento_feedback.clear_session(&event.session_id);
+            PendingMementoFeedbackTransition::default()
+        }
         HookEventKind::Stop | HookEventKind::SubagentStop => {
             state.memento_feedback.clear_session(&event.session_id);
-            None
+            PendingMementoFeedbackTransition::default()
         }
-        _ => None,
+        _ => PendingMementoFeedbackTransition::default(),
     };
+    for _ in 0..memento_transition.unsubmitted_count {
+        // #4308: this is a bounded process-lifetime observation surfaced by
+        // `/api/stats/memento`, not a synthetic #4307 per-turn PG row. The
+        // hook does not own a Discord turn_id/agent_id and must not invent one.
+        // Persisting it belongs to a future hook-to-turn identity contract.
+        crate::services::memory::note_memento_tool_feedback_trigger("unsubmitted_stop_flush");
+    }
+    if memento_transition.unsubmitted_count > 0 {
+        tracing::warn!(
+            provider,
+            session_id,
+            unsubmitted_count = memento_transition.unsubmitted_count,
+            "dropped memento feedback after the one-shot Stop flush retry"
+        );
+    }
     if matches!(event.kind, HookEventKind::Unknown(_)) {
         tracing::warn!(
             provider,
@@ -382,7 +444,12 @@ async fn receive_hook(
             "unknown tui hook event accepted for provider-scoped telemetry"
         );
     }
-    let stop_flush_injected = memento_stop_flush.is_some();
+    let memento_flush_injected = memento_transition.flush.is_some();
+    let stop_flush_injected = memento_flush_injected
+        && matches!(
+            event.kind,
+            HookEventKind::Stop | HookEventKind::SubagentStop
+        );
     if should_signal_prompt_ready(&event.provider, &event.kind) && !stop_flush_injected {
         // Wake any task currently awaiting prompt readiness. `notify_waiters`
         // is edge-triggered: signals fired with no current waiters are
@@ -527,11 +594,32 @@ async fn receive_hook(
         "event": event_name,
         "session_id": session_id
     });
-    if let Some(flush) = memento_stop_flush {
+    if let Some(flush) = memento_transition.flush {
         body["memento_tool_feedback_flush"] = flush.to_json();
     }
 
-    (StatusCode::ACCEPTED, Json(body))
+    finish_hook_receipt(&state, receipt_ticket, StatusCode::ACCEPTED, body, true)
+}
+
+fn finish_hook_receipt(
+    state: &HookServerState,
+    ticket: Option<RelayReceiptTicket>,
+    status: StatusCode,
+    body: Value,
+    accepted: bool,
+) -> (StatusCode, Json<Value>) {
+    if let Some(ticket) = ticket {
+        if accepted {
+            state
+                .relay_receipts
+                .finish_accepted(ticket, status, body.clone());
+        } else {
+            state
+                .relay_receipts
+                .finish_failed(ticket, status, body.clone());
+        }
+    }
+    (status, Json(body))
 }
 
 /// #2655: classification of the memento tool surface invoked in a hook

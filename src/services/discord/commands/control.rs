@@ -361,7 +361,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     channel_id: serenity::ChannelId,
     clear_source: &str,
     notify_mode: SoftClearNotifyMode,
-) {
+) -> anyhow::Result<()> {
     clear_channel_session_state_with_session_key(
         http,
         shared,
@@ -371,7 +371,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
         notify_mode,
         None,
     )
-    .await;
+    .await
 }
 
 pub(in crate::services::discord) async fn clear_channel_session_state_with_session_key(
@@ -382,7 +382,13 @@ pub(in crate::services::discord) async fn clear_channel_session_state_with_sessi
     clear_source: &str,
     notify_mode: SoftClearNotifyMode,
     explicit_session_key: Option<&str>,
-) {
+) -> anyhow::Result<()> {
+    crate::db::session_transcripts::record_channel_clear_boundary(
+        shared.pg_pool.as_ref(),
+        &channel_id.get().to_string(),
+    )
+    .await?;
+
     let tmux_name = {
         let data = shared.core.lock().await;
         data.sessions
@@ -475,6 +481,8 @@ pub(in crate::services::discord) async fn clear_channel_session_state_with_sessi
             &content,
         );
     }
+
+    Ok(())
 }
 
 /// /stop — Cancel in-progress AI request
@@ -503,11 +511,11 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
     match result.token {
         Some(token) => {
             if result.already_stopping {
-                ctx.say("Already stopping...").await?;
+                ctx.say(super::ALREADY_STOPPING_RESPONSE).await?;
                 return Ok(());
             }
 
-            ctx.say("Stopping...").await?;
+            ctx.say(super::STOPPING_RESPONSE).await?;
 
             // #1218: stop_active_turn keeps the abort-key-then-SIGKILL order
             // identical across every stop entrypoint.
@@ -521,7 +529,7 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
             tracing::info!("  [{ts}] ■ Cancel signal sent");
         }
         None => {
-            ctx.say("No active request to stop.").await?;
+            ctx.say(super::NO_ACTIVE_TURN_RESPONSE).await?;
         }
     }
     Ok(())
@@ -552,9 +560,9 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
         "/clear",
         SoftClearNotifyMode::Suppress,
     )
-    .await;
+    .await?;
 
-    ctx.say("Session cleared.").await?;
+    ctx.say(super::SESSION_CLEARED_RESPONSE).await?;
     tracing::info!("  [{ts}] ▶ [{user_name}] Session cleared");
     Ok(())
 }
@@ -571,7 +579,7 @@ mod soft_clear_notify_tests {
         assert_eq!(
             soft_clear_lifecycle_notify_row("/clear", SoftClearNotifyMode::Suppress),
             None,
-            "`/clear` and `!clear` already reply `Session cleared.` and must not enqueue a duplicate `lifecycle.soft_clear` notify row"
+            "`/clear` and `!clear` already reply with the shared clear response and must not enqueue a duplicate `lifecycle.soft_clear` notify row"
         );
         assert_eq!(
             soft_clear_lifecycle_notify_row("!clear", SoftClearNotifyMode::Suppress),
@@ -744,17 +752,22 @@ pub(in crate::services::discord) async fn cmd_shell(
                 parts.push(format!("```\n{}\n```", stdout.trim_end()));
             }
             if !stderr.is_empty() {
-                parts.push(format!("stderr:\n```\n{}\n```", stderr.trim_end()));
+                parts.push(super::owner_error_response(
+                    "셸 명령이 오류 출력을 반환했어요.",
+                    stderr.trim_end(),
+                ));
             }
             if parts.is_empty() {
-                parts.push(format!("(exit code: {})", exit_code));
+                parts.push(format!("(종료 코드: {})", exit_code));
             } else if exit_code != 0 {
-                parts.push(format!("(exit code: {})", exit_code));
+                parts.push(format!("(종료 코드: {})", exit_code));
             }
             parts.join("\n")
         }
-        Ok(Err(e)) => format!("Failed to execute: {}", e),
-        Err(e) => format!("Task error: {}", e),
+        Ok(Err(e)) => super::owner_error_response("셸 명령을 실행하지 못했어요.", &e.to_string()),
+        Err(e) => {
+            super::owner_error_response("셸 명령을 처리하는 중 오류가 발생했어요.", &e.to_string())
+        }
     };
 
     send_long_message_ctx(ctx, &response).await?;

@@ -3,10 +3,16 @@ use crate::services::memory::{RecallMode, RecallResponse};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct MemoryInjectionPlan<'a> {
-    pub(super) shared_knowledge_for_context: Option<&'a str>,
-    pub(super) shared_knowledge_for_system_prompt: Option<&'a str>,
+    pub(super) shared_knowledge_for_context: Option<String>,
+    pub(super) shared_knowledge_for_system_prompt: Option<String>,
     pub(super) external_recall_for_context: Option<&'a str>,
     pub(super) longterm_catalog_for_system_prompt: Option<&'a str>,
+}
+
+impl MemoryInjectionPlan<'_> {
+    pub(super) fn sak_for_system_prompt(&self) -> Option<&str> {
+        self.shared_knowledge_for_system_prompt.as_deref()
+    }
 }
 
 /// #1083: Memento recall gate decision.
@@ -32,17 +38,18 @@ pub(super) fn build_memory_injection_plan<'a>(
     dispatch_profile: DispatchProfile,
     memory_recall: &'a RecallResponse,
 ) -> MemoryInjectionPlan<'a> {
+    let shared_knowledge = crate::services::discord::shared_memory::load_shared_knowledge();
     let should_inject_shared_knowledge =
         dispatch_profile == DispatchProfile::Full && !has_session_id;
     let shared_knowledge_for_context =
         if should_inject_shared_knowledge && !matches!(provider, ProviderKind::Claude) {
-            memory_recall.shared_knowledge.as_deref()
+            shared_knowledge.as_deref().map(str::to_owned)
         } else {
             None
         };
     let shared_knowledge_for_system_prompt =
         if dispatch_profile == DispatchProfile::Full && matches!(provider, ProviderKind::Claude) {
-            memory_recall.shared_knowledge.as_deref()
+            shared_knowledge.as_deref().map(str::to_owned)
         } else {
             None
         };
@@ -317,6 +324,7 @@ pub(super) fn build_race_requeued_intervention(
     request_owner: UserId,
     user_msg_id: MessageId,
     user_text: &str,
+    preserve_on_cancel: bool,
     reply_context: Option<String>,
     has_reply_boundary: bool,
     merge_consecutive: bool,
@@ -330,13 +338,25 @@ pub(super) fn build_race_requeued_intervention(
     // degrading to plain text.
     voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Intervention {
+    let queued_generation = crate::services::discord::runtime_store::load_generation();
+    let source_generation = if preserve_on_cancel {
+        crate::services::turn_orchestrator::SourceMessageQueuedGeneration::user_instruction(
+            user_msg_id,
+            queued_generation,
+        )
+    } else {
+        crate::services::turn_orchestrator::SourceMessageQueuedGeneration::new(
+            user_msg_id,
+            queued_generation,
+        )
+    };
     Intervention {
         author_id: request_owner,
         author_is_bot: false,
         message_id: user_msg_id,
-        queued_generation: crate::services::discord::runtime_store::load_generation(),
+        queued_generation,
         source_message_ids: vec![user_msg_id],
-        source_message_queued_generations: Vec::new(),
+        source_message_queued_generations: vec![source_generation],
         source_text_segments: Vec::new(),
         text: user_text.to_string(),
         mode: super::super::InterventionMode::Soft,
@@ -371,6 +391,42 @@ mod tests {
             wrap_user_prompt_with_author("Alice", UserId::new(77), "line 1\r\nline 2".to_string());
 
         assert_eq!(prompt, "[User: Alice (ID: 77)]\nline 1\nline 2");
+    }
+
+    #[test]
+    fn race_requeue_carries_the_intake_cancel_preservation_decision() {
+        let runtime_root = tempfile::tempdir().expect("race-requeue runtime root");
+        let _root_guard = crate::config::set_agentdesk_root_for_test(runtime_root.path());
+        let message_id = MessageId::new(4_247_201);
+
+        let human = build_race_requeued_intervention(
+            UserId::new(77),
+            message_id,
+            "keep this instruction",
+            true,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+        );
+        assert!(human.preserve_on_cancel());
+        assert_eq!(human.source_message_queued_generations.len(), 1);
+        assert!(human.source_message_queued_generations[0].preserve_on_cancel);
+
+        let automation = build_race_requeued_intervention(
+            UserId::new(78),
+            MessageId::new(4_247_202),
+            "DISPATCH:automation",
+            false,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+        );
+        assert!(!automation.preserve_on_cancel());
+        assert!(!automation.source_message_queued_generations[0].preserve_on_cancel);
     }
 
     /// #4307 PR-B (a): a stashed reminder, run through the SAME assembly helpers
@@ -426,5 +482,38 @@ mod tests {
             merge_reply_contexts(None, format_voluntary_feedback_reminder("")),
             None,
         );
+    }
+
+    #[test]
+    fn issue_4310_sak_layer_is_independent_of_memento_recall_state() {
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _root_guard = crate::config::set_agentdesk_root_for_test(runtime_root.path());
+        let sak_path = crate::runtime_layout::shared_agent_knowledge_path(runtime_root.path());
+        std::fs::create_dir_all(sak_path.parent().expect("SAK parent")).expect("create SAK parent");
+        std::fs::write(&sak_path, "state-independent rules").expect("write SAK");
+        crate::services::discord::shared_memory::invalidate_shared_knowledge_cache_for_tests();
+        let expected = "[Shared Agent Knowledge]\nstate-independent rules";
+        let healthy_recall = RecallResponse {
+            external_recall: Some("memento context".to_string()),
+            memento_context_loaded: true,
+            ..RecallResponse::default()
+        };
+        let degraded_recall = RecallResponse {
+            warnings: vec!["memento unavailable; local fallback used".to_string()],
+            ..RecallResponse::default()
+        };
+
+        for recall in [&healthy_recall, &degraded_recall] {
+            let plan = build_memory_injection_plan(
+                &ProviderKind::Claude,
+                false,
+                DispatchProfile::Full,
+                recall,
+            );
+            assert_eq!(
+                plan.shared_knowledge_for_system_prompt.as_deref(),
+                Some(expected)
+            );
+        }
     }
 }

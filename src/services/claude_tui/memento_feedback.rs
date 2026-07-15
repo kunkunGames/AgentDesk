@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub(crate) const PENDING_SEARCH_TTL_SECS: i64 = 6 * 60 * 60;
 
@@ -14,12 +15,68 @@ pub(crate) struct PendingMementoFeedbackTracker {
 #[derive(Debug, Default)]
 struct PendingMementoFeedbackState {
     sessions: BTreeMap<String, PendingSessionSearches>,
+    completed: BTreeMap<String, CompletedSessionSearches>,
 }
 
 #[derive(Debug, Default)]
 struct PendingSessionSearches {
+    ids: BTreeMap<String, PendingSearch>,
+    unknown: Vec<PendingUnknownSearch>,
+}
+
+#[derive(Debug)]
+struct PendingUnknownSearch {
+    identity: UnknownSearchIdentity,
+    pending: PendingSearch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnknownSearchIdentity {
+    ToolUseId(String),
+    PayloadDigest([u8; 32]),
+}
+
+#[derive(Debug, Default)]
+struct CompletedSessionSearches {
     ids: BTreeMap<String, DateTime<Utc>>,
-    unknown_added_at: Vec<DateTime<Utc>>,
+    unknown: Vec<CompletedUnknownSearch>,
+}
+
+#[derive(Debug)]
+struct CompletedUnknownSearch {
+    identity: UnknownSearchIdentity,
+    completed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default)]
+struct CompletedSearchBatch {
+    ids: Vec<String>,
+    unknown: Vec<UnknownSearchIdentity>,
+}
+
+#[derive(Debug)]
+struct PendingSearch {
+    added_at: DateTime<Utc>,
+    reminder_stage: ReminderStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderStage {
+    Fresh,
+    InitialReminded,
+    RetryReminded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReminderBoundary {
+    Stop,
+    UserPromptSubmit,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PendingMementoFeedbackTransition {
+    pub flush: Option<PendingMementoFeedbackFlush>,
+    pub unsubmitted_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,38 +126,66 @@ impl PendingMementoFeedbackTracker {
             .inner
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        state.prune_expired(now);
         match kind {
             MementoHookToolKind::Search => {
                 let search_event_id = extract_search_event_id(payload);
-                state.track_search(session_id, search_event_id.as_deref(), now);
+                // An expired completed tombstone must not suppress this new
+                // identity lifetime. Pending replay is different: refresh its
+                // TTL before pruning so reconnect delivery keeps the consumed
+                // retry stage instead of recreating a Fresh obligation.
+                state.prune_completed(now);
+                state.track_search(session_id, search_event_id.as_deref(), payload, now);
+                state.prune_pending(now);
                 MementoPostToolUseObservation::SearchTracked { search_event_id }
             }
             MementoHookToolKind::ToolFeedback => {
+                state.prune_expired(now);
                 let search_event_id = extract_tool_feedback_search_event_id(payload);
-                state.clear_feedback(session_id, search_event_id.as_deref());
+                state.clear_feedback(session_id, search_event_id.as_deref(), now);
                 MementoPostToolUseObservation::FeedbackCleared { search_event_id }
             }
         }
     }
 
-    pub(crate) fn take_stop_flush(
+    pub(crate) fn advance_stop_flush(
         &self,
         session_id: &str,
         payload: &Value,
-    ) -> Option<PendingMementoFeedbackFlush> {
-        self.take_stop_flush_at(session_id, payload, Utc::now())
+    ) -> PendingMementoFeedbackTransition {
+        self.advance_stop_flush_at(session_id, payload, Utc::now())
     }
 
-    pub(crate) fn take_stop_flush_at(
+    pub(crate) fn advance_stop_flush_at(
         &self,
         session_id: &str,
         payload: &Value,
         now: DateTime<Utc>,
-    ) -> Option<PendingMementoFeedbackFlush> {
+    ) -> PendingMementoFeedbackTransition {
+        // A re-entrant Stop is generated while Claude is already processing a
+        // Stop hook. It must not spend the one retry, drop pending work, or
+        // inject another reminder and recurse indefinitely.
+        if stop_hook_active(payload) {
+            return PendingMementoFeedbackTransition::default();
+        }
+        self.advance_at(session_id, ReminderBoundary::Stop, now)
+    }
+
+    pub(crate) fn advance_user_prompt_submit(
+        &self,
+        session_id: &str,
+    ) -> PendingMementoFeedbackTransition {
+        self.advance_at(session_id, ReminderBoundary::UserPromptSubmit, Utc::now())
+    }
+
+    fn advance_at(
+        &self,
+        session_id: &str,
+        boundary: ReminderBoundary,
+        now: DateTime<Utc>,
+    ) -> PendingMementoFeedbackTransition {
         let session_id = session_id.trim();
         if session_id.is_empty() {
-            return None;
+            return PendingMementoFeedbackTransition::default();
         }
 
         let mut state = self
@@ -108,13 +193,7 @@ impl PendingMementoFeedbackTracker {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         state.prune_expired(now);
-        let Some(pending) = state.sessions.remove(session_id) else {
-            return None;
-        };
-        if stop_hook_active(payload) {
-            return None;
-        }
-        pending.into_flush()
+        state.advance(session_id, boundary, now)
     }
 
     pub(crate) fn clear_session(&self, session_id: &str) {
@@ -127,6 +206,7 @@ impl PendingMementoFeedbackTracker {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         state.sessions.remove(session_id);
+        state.completed.remove(session_id);
     }
 
     #[cfg(test)]
@@ -145,72 +225,294 @@ impl PendingMementoFeedbackState {
         &mut self,
         session_id: &str,
         search_event_id: Option<&str>,
+        payload: &Value,
         now: DateTime<Utc>,
     ) {
-        let session = self.sessions.entry(session_id.to_string()).or_default();
         match search_event_id.and_then(non_empty_string) {
             Some(id) => {
-                session.ids.insert(id.to_string(), now);
+                if self
+                    .completed
+                    .get(session_id)
+                    .is_some_and(|completed| completed.ids.contains_key(id))
+                {
+                    return;
+                }
+                let session = self.sessions.entry(session_id.to_string()).or_default();
+                session
+                    .ids
+                    .entry(id.to_string())
+                    .and_modify(|pending| pending.added_at = now)
+                    .or_insert(PendingSearch {
+                        added_at: now,
+                        reminder_stage: ReminderStage::Fresh,
+                    });
             }
-            None => session.unknown_added_at.push(now),
+            None => {
+                let identity = unknown_search_identity(payload);
+                if self.completed.get(session_id).is_some_and(|completed| {
+                    completed
+                        .unknown
+                        .iter()
+                        .any(|search| search.identity == identity)
+                }) {
+                    return;
+                }
+                let session = self.sessions.entry(session_id.to_string()).or_default();
+                if let Some(existing) = session
+                    .unknown
+                    .iter_mut()
+                    .find(|unknown| unknown.identity == identity)
+                {
+                    // A reconnect can replay the same PostToolUse hook. Match
+                    // known-id behavior: refresh TTL without resetting the
+                    // already-consumed reminder stage.
+                    existing.pending.added_at = now;
+                } else {
+                    session.unknown.push(PendingUnknownSearch {
+                        identity,
+                        pending: PendingSearch {
+                            added_at: now,
+                            reminder_stage: ReminderStage::Fresh,
+                        },
+                    });
+                }
+            }
         }
     }
 
-    fn clear_feedback(&mut self, session_id: &str, search_event_id: Option<&str>) {
-        let Some(session) = self.sessions.get_mut(session_id) else {
+    fn clear_feedback(
+        &mut self,
+        session_id: &str,
+        search_event_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) {
+        let Some(mut session) = self.sessions.remove(session_id) else {
             return;
         };
+        let mut completed = CompletedSearchBatch::default();
         match search_event_id.and_then(non_empty_string) {
             Some(id) => {
-                if session.ids.remove(id).is_none() && !session.unknown_added_at.is_empty() {
-                    session.unknown_added_at.pop();
-                }
-                if session.is_empty() {
-                    self.sessions.remove(session_id);
+                if session.ids.remove(id).is_some() {
+                    completed.ids.push(id.to_string());
+                } else if let Some(unknown) = session.unknown.pop() {
+                    completed.unknown.push(unknown.identity);
                 }
             }
             None => {
-                self.sessions.remove(session_id);
+                completed.ids.extend(session.ids.keys().cloned());
+                completed
+                    .unknown
+                    .extend(session.unknown.iter().map(|search| search.identity.clone()));
+                session.ids.clear();
+                session.unknown.clear();
             }
         }
+        if !session.is_empty() {
+            self.sessions.insert(session_id.to_string(), session);
+        }
+        self.record_completed(session_id, completed, now);
     }
 
     fn prune_expired(&mut self, now: DateTime<Utc>) {
         let cutoff = now - Duration::seconds(PENDING_SEARCH_TTL_SECS);
+        self.prune_pending_at_cutoff(cutoff);
+        self.prune_completed_at_cutoff(cutoff);
+    }
+
+    fn prune_pending(&mut self, now: DateTime<Utc>) {
+        self.prune_pending_at_cutoff(now - Duration::seconds(PENDING_SEARCH_TTL_SECS));
+    }
+
+    fn prune_pending_at_cutoff(&mut self, cutoff: DateTime<Utc>) {
         self.sessions.retain(|_, pending| {
-            pending.ids.retain(|_, added_at| *added_at >= cutoff);
             pending
-                .unknown_added_at
-                .retain(|added_at| *added_at >= cutoff);
+                .ids
+                .retain(|_, pending_search| pending_search.added_at >= cutoff);
+            pending
+                .unknown
+                .retain(|unknown| unknown.pending.added_at >= cutoff);
             !pending.is_empty()
         });
+    }
+
+    fn prune_completed(&mut self, now: DateTime<Utc>) {
+        self.prune_completed_at_cutoff(now - Duration::seconds(PENDING_SEARCH_TTL_SECS));
+    }
+
+    fn prune_completed_at_cutoff(&mut self, cutoff: DateTime<Utc>) {
+        self.completed.retain(|_, completed| {
+            completed
+                .ids
+                .retain(|_, completed_at| *completed_at >= cutoff);
+            completed
+                .unknown
+                .retain(|search| search.completed_at >= cutoff);
+            !completed.ids.is_empty() || !completed.unknown.is_empty()
+        });
+    }
+
+    fn advance(
+        &mut self,
+        session_id: &str,
+        boundary: ReminderBoundary,
+        now: DateTime<Utc>,
+    ) -> PendingMementoFeedbackTransition {
+        let Some(mut pending) = self.sessions.remove(session_id) else {
+            return PendingMementoFeedbackTransition::default();
+        };
+        let (transition, completed) = pending.advance(boundary);
+        if !pending.is_empty() {
+            self.sessions.insert(session_id.to_string(), pending);
+        }
+        self.record_completed(session_id, completed, now);
+        transition
+    }
+
+    fn record_completed(
+        &mut self,
+        session_id: &str,
+        batch: CompletedSearchBatch,
+        now: DateTime<Utc>,
+    ) {
+        if batch.ids.is_empty() && batch.unknown.is_empty() {
+            return;
+        }
+        let completed = self.completed.entry(session_id.to_string()).or_default();
+        for id in batch.ids {
+            completed.ids.insert(id, now);
+        }
+        for identity in batch.unknown {
+            if let Some(existing) = completed
+                .unknown
+                .iter_mut()
+                .find(|search| search.identity == identity)
+            {
+                existing.completed_at = now;
+            } else {
+                completed.unknown.push(CompletedUnknownSearch {
+                    identity,
+                    completed_at: now,
+                });
+            }
+        }
     }
 }
 
 impl PendingSessionSearches {
     fn is_empty(&self) -> bool {
-        self.ids.is_empty() && self.unknown_added_at.is_empty()
+        self.ids.is_empty() && self.unknown.is_empty()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.ids.len() + self.unknown_added_at.len()
+        self.ids.len() + self.unknown.len()
     }
 
-    fn into_flush(self) -> Option<PendingMementoFeedbackFlush> {
-        if self.is_empty() {
-            return None;
-        }
-        let search_event_ids = self.ids.into_keys().collect::<Vec<_>>();
-        let includes_unknown_searches = !self.unknown_added_at.is_empty();
-        Some(PendingMementoFeedbackFlush {
-            additional_context: stop_feedback_flush_instruction(
-                &search_event_ids,
+    fn advance(
+        &mut self,
+        boundary: ReminderBoundary,
+    ) -> (PendingMementoFeedbackTransition, CompletedSearchBatch) {
+        let mut search_event_ids = Vec::new();
+        let mut includes_unknown_searches = false;
+        let mut unsubmitted_count = 0usize;
+        let mut completed = CompletedSearchBatch::default();
+
+        self.ids
+            .retain(|search_event_id, pending| match pending.advance(boundary) {
+                PendingSearchAdvance::Preserve => true,
+                PendingSearchAdvance::Remind => {
+                    search_event_ids.push(search_event_id.clone());
+                    true
+                }
+                PendingSearchAdvance::Drop => {
+                    unsubmitted_count = unsubmitted_count.saturating_add(1);
+                    completed.ids.push(search_event_id.clone());
+                    false
+                }
+            });
+        self.unknown
+            .retain_mut(|unknown| match unknown.pending.advance(boundary) {
+                PendingSearchAdvance::Preserve => true,
+                PendingSearchAdvance::Remind => {
+                    includes_unknown_searches = true;
+                    true
+                }
+                PendingSearchAdvance::Drop => {
+                    unsubmitted_count = unsubmitted_count.saturating_add(1);
+                    completed.unknown.push(unknown.identity.clone());
+                    false
+                }
+            });
+
+        let flush = (!search_event_ids.is_empty() || includes_unknown_searches).then(|| {
+            PendingMementoFeedbackFlush {
+                additional_context: feedback_flush_instruction(
+                    &search_event_ids,
+                    includes_unknown_searches,
+                    boundary,
+                ),
+                search_event_ids,
                 includes_unknown_searches,
-            ),
-            search_event_ids,
-            includes_unknown_searches,
-        })
+            }
+        });
+        (
+            PendingMementoFeedbackTransition {
+                flush,
+                unsubmitted_count,
+            },
+            completed,
+        )
+    }
+}
+
+/// Stable identity for a search whose Memento response omitted
+/// `searchEventId`.
+///
+/// Claude's top-level `tool_use_id` is the authoritative invocation identity:
+/// replayed delivery keeps it, while two genuine invocations receive distinct
+/// ids even when their query and response are identical. Defensive aliases are
+/// accepted for captured/normalized hook payloads. If the provider omits that
+/// identity, the complete `serde_json::Value` is deterministically serialized
+/// and hashed. Two fully equivalent id-less payloads are inherently
+/// indistinguishable, so that ambiguous case is conservatively treated as a
+/// replay; any different input/response remains an independent obligation.
+fn unknown_search_identity(payload: &Value) -> UnknownSearchIdentity {
+    for key in ["tool_use_id", "toolUseId", "tool-use-id"] {
+        if let Some(tool_use_id) = payload
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(non_empty_string)
+        {
+            return UnknownSearchIdentity::ToolUseId(tool_use_id.to_string());
+        }
+    }
+    UnknownSearchIdentity::PayloadDigest(Sha256::digest(payload.to_string().as_bytes()).into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingSearchAdvance {
+    Preserve,
+    Remind,
+    Drop,
+}
+
+impl PendingSearch {
+    fn advance(&mut self, boundary: ReminderBoundary) -> PendingSearchAdvance {
+        match (boundary, self.reminder_stage) {
+            (ReminderBoundary::Stop, ReminderStage::Fresh) => {
+                self.reminder_stage = ReminderStage::InitialReminded;
+                PendingSearchAdvance::Remind
+            }
+            (ReminderBoundary::Stop, ReminderStage::InitialReminded)
+            | (ReminderBoundary::UserPromptSubmit, ReminderStage::InitialReminded) => {
+                self.reminder_stage = ReminderStage::RetryReminded;
+                PendingSearchAdvance::Remind
+            }
+            (_, ReminderStage::RetryReminded) => PendingSearchAdvance::Drop,
+            (ReminderBoundary::UserPromptSubmit, ReminderStage::Fresh) => {
+                PendingSearchAdvance::Preserve
+            }
+        }
     }
 }
 
@@ -508,9 +810,10 @@ then continue."
     )
 }
 
-fn stop_feedback_flush_instruction(
+fn feedback_flush_instruction(
     search_event_ids: &[String],
     includes_unknown_searches: bool,
+    boundary: ReminderBoundary,
 ) -> String {
     let target = if search_event_ids.is_empty() {
         "the pending search_event_id values shown under `_meta.searchEventId` in the memento search results".to_string()
@@ -525,13 +828,20 @@ fn stop_feedback_flush_instruction(
     } else {
         ""
     };
+    let (timing, continuation) = match boundary {
+        ReminderBoundary::Stop => ("before ending this turn", "Do this now, then stop."),
+        ReminderBoundary::UserPromptSubmit => (
+            "at the start of this turn",
+            "Do this now, then continue with the submitted prompt.",
+        ),
+    };
     format!(
-        "Action required before ending this turn: there are memento search results without \
+        "Action required {timing}: there are memento search results without \
 submitted feedback. Submit `mcp__memento__tool_feedback` for {target}, with `relevant` = whether \
 any returned fragment was on-topic and `sufficient` = whether the results were enough to proceed. \
 If `mcp__memento__tool_feedback` is not in your active tools (memento tools are deferred), first \
 load it with ToolSearch query `select:mcp__memento__tool_feedback`, then make the feedback call.\
-{unknown_clause} Do this now, then stop."
+{unknown_clause} {continuation}"
     )
 }
 
@@ -600,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_flush_is_one_shot_and_lists_ids() {
+    fn stop_flush_retries_once_then_drops_and_lists_ids() {
         let tracker = PendingMementoFeedbackTracker::default();
         tracker.observe_post_tool_use_at(
             "sess",
@@ -611,9 +921,8 @@ mod tests {
             Utc::now(),
         );
 
-        let flush = tracker
-            .take_stop_flush_at("sess", &json!({}), Utc::now())
-            .unwrap();
+        let first = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        let flush = first.flush.unwrap();
         assert_eq!(flush.search_event_ids, vec!["42"]);
         assert!(flush.additional_context.contains("[42]"));
         assert!(
@@ -621,15 +930,33 @@ mod tests {
                 .additional_context
                 .contains("mcp__memento__tool_feedback")
         );
+        assert!(flush.additional_context.contains("then stop"));
+        assert_eq!(first.unsubmitted_count, 0);
+        assert_eq!(tracker.pending_count("sess"), 1);
+
+        let retry = tracker.advance_user_prompt_submit("sess");
+        let retry_flush = retry.flush.unwrap();
+        assert_eq!(retry_flush.search_event_ids, vec!["42"]);
         assert!(
-            tracker
-                .take_stop_flush_at("sess", &json!({}), Utc::now())
-                .is_none()
+            retry_flush
+                .additional_context
+                .contains("continue with the submitted prompt")
         );
+        assert!(!retry_flush.additional_context.contains("then stop"));
+        assert_eq!(retry.unsubmitted_count, 0);
+        assert_eq!(tracker.pending_count("sess"), 1);
+
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert!(dropped.flush.is_none());
+        assert_eq!(dropped.unsubmitted_count, 1);
+        assert_eq!(tracker.pending_count("sess"), 0);
+
+        let after_drop = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(after_drop, PendingMementoFeedbackTransition::default());
     }
 
     #[test]
-    fn stop_hook_active_suppresses_and_clears_flush() {
+    fn stop_hook_active_suppresses_without_spending_retry() {
         let tracker = PendingMementoFeedbackTracker::default();
         tracker.observe_post_tool_use_at(
             "sess",
@@ -640,12 +967,408 @@ mod tests {
             Utc::now(),
         );
 
+        let reentrant =
+            tracker.advance_stop_flush_at("sess", &json!({"stop_hook_active": true}), Utc::now());
+        assert_eq!(reentrant, PendingMementoFeedbackTransition::default());
+        assert_eq!(tracker.pending_count("sess"), 1);
+
+        let first = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(first.flush.unwrap().search_event_ids, vec!["7"]);
+        assert_eq!(tracker.pending_count("sess"), 1);
+
+        let retry = tracker.advance_user_prompt_submit("sess");
+        assert_eq!(retry.flush.unwrap().search_event_ids, vec!["7"]);
+        let reentrant_after_retry =
+            tracker.advance_stop_flush_at("sess", &json!({"stop_hook_active": true}), Utc::now());
+        assert_eq!(
+            reentrant_after_retry,
+            PendingMementoFeedbackTransition::default()
+        );
+        assert_eq!(tracker.pending_count("sess"), 1);
+
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(dropped.unsubmitted_count, 1);
+        assert!(dropped.flush.is_none());
+    }
+
+    #[test]
+    fn prompt_before_initial_stop_preserves_the_fresh_reminder() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        tracker.observe_post_tool_use_at(
+            "sess",
+            &json!({
+                "tool_name": "mcp__memento__recall",
+                "tool_response": {"_meta":{"searchEventId":"9"}}
+            }),
+            Utc::now(),
+        );
+
+        assert_eq!(
+            tracker.advance_user_prompt_submit("sess"),
+            PendingMementoFeedbackTransition::default()
+        );
+        assert_eq!(tracker.pending_count("sess"), 1);
+        let first = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(first.flush.unwrap().search_event_ids, vec!["9"]);
+        assert_eq!(first.unsubmitted_count, 0);
+    }
+
+    #[test]
+    fn next_stop_is_retry_fallback_when_no_user_prompt_arrives() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        tracker.observe_post_tool_use_at(
+            "sess",
+            &json!({
+                "tool_name": "mcp__memento__recall",
+                "tool_response": {"_meta":{"searchEventId":"8"}}
+            }),
+            Utc::now(),
+        );
+
         assert!(
             tracker
-                .take_stop_flush_at("sess", &json!({"stop_hook_active": true}), Utc::now())
-                .is_none()
+                .advance_stop_flush_at("sess", &json!({}), Utc::now())
+                .flush
+                .is_some()
         );
+        let retry = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(retry.flush.unwrap().search_event_ids, vec!["8"]);
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(dropped.unsubmitted_count, 1);
+        assert!(dropped.flush.is_none());
+    }
+
+    #[test]
+    fn retry_and_drop_are_isolated_by_session() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        for (session_id, search_event_id) in [("a", "10"), ("b", "20")] {
+            tracker.observe_post_tool_use_at(
+                session_id,
+                &json!({
+                    "tool_name": "mcp__memento__recall",
+                    "tool_response": {"_meta":{"searchEventId":search_event_id}}
+                }),
+                Utc::now(),
+            );
+        }
+
+        tracker.advance_stop_flush_at("a", &json!({}), Utc::now());
+        tracker.advance_user_prompt_submit("a");
+        let dropped_a = tracker.advance_stop_flush_at("a", &json!({}), Utc::now());
+        assert_eq!(dropped_a.unsubmitted_count, 1);
+        assert_eq!(tracker.pending_count("a"), 0);
+        assert_eq!(tracker.pending_count("b"), 1);
+
+        let first_b = tracker.advance_stop_flush_at("b", &json!({}), Utc::now());
+        assert_eq!(first_b.flush.unwrap().search_event_ids, vec!["20"]);
+        assert_eq!(first_b.unsubmitted_count, 0);
+    }
+
+    #[test]
+    fn older_retry_drop_does_not_spend_a_newer_search_reminder() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let observe = |search_event_id: &str| {
+            tracker.observe_post_tool_use_at(
+                "sess",
+                &json!({
+                    "tool_name": "mcp__memento__recall",
+                    "tool_response": {"_meta":{"searchEventId":search_event_id}}
+                }),
+                Utc::now(),
+            );
+        };
+
+        observe("30");
+        tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        observe("31");
+
+        let retry = tracker.advance_user_prompt_submit("sess");
+        assert_eq!(retry.flush.unwrap().search_event_ids, vec!["30"]);
+        assert_eq!(retry.unsubmitted_count, 0);
+
+        let mixed = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(mixed.unsubmitted_count, 1);
+        assert_eq!(mixed.flush.unwrap().search_event_ids, vec!["31"]);
+        assert_eq!(tracker.pending_count("sess"), 1);
+    }
+
+    #[test]
+    fn duplicate_search_delivery_refreshes_ttl_without_resetting_retry_stage() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let observe = |now| {
+            tracker.observe_post_tool_use_at(
+                "sess",
+                &json!({
+                    "tool_name": "mcp__memento__recall",
+                    "tool_response": {"_meta":{"searchEventId":"32"}}
+                }),
+                now,
+            );
+        };
+        let now = Utc::now();
+        let old = now - Duration::seconds(PENDING_SEARCH_TTL_SECS + 5);
+
+        observe(old);
+        tracker.advance_stop_flush_at("sess", &json!({}), old);
+        observe(now);
+        let retry = tracker.advance_user_prompt_submit("sess");
+        assert_eq!(retry.flush.unwrap().search_event_ids, vec!["32"]);
+
+        observe(now);
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), now);
+        assert_eq!(dropped.unsubmitted_count, 1);
+        assert!(dropped.flush.is_none());
         assert_eq!(tracker.pending_count("sess"), 0);
+    }
+
+    #[test]
+    fn duplicate_unknown_search_delivery_cannot_restart_the_retry_budget() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        let old = now - Duration::seconds(PENDING_SEARCH_TTL_SECS + 5);
+        let search = json!({
+            "tool_use_id": "toolu-unknown-replay",
+            "tool_name": "mcp__memento__recall",
+            "tool_input": {"query": "bounded retry"},
+            "tool_response": {"fragments": []}
+        });
+
+        tracker.observe_post_tool_use_at("sess", &search, old);
+        let initial = tracker.advance_stop_flush_at("sess", &json!({}), old);
+        assert!(initial.flush.unwrap().includes_unknown_searches);
+
+        // The same PostToolUse observation may be replayed after reconnect.
+        // It refreshes TTL but must not append a new Fresh obligation behind
+        // the already-reminded one.
+        tracker.observe_post_tool_use_at("sess", &search, now);
+        assert_eq!(tracker.pending_count("sess"), 1);
+        let retry = tracker.advance_user_prompt_submit("sess");
+        assert!(retry.flush.unwrap().includes_unknown_searches);
+
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), now);
+        assert!(dropped.flush.is_none());
+        assert_eq!(dropped.unsubmitted_count, 1);
+        assert_eq!(tracker.pending_count("sess"), 0);
+        assert_eq!(
+            tracker.advance_stop_flush_at("sess", &json!({}), now),
+            PendingMementoFeedbackTransition::default()
+        );
+    }
+
+    #[test]
+    fn replay_after_terminal_drop_does_not_recreate_known_or_unknown_obligations() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        let known = json!({
+            "tool_use_id": "toolu-known-drop",
+            "tool_name": "mcp__memento__recall",
+            "tool_response": {"_meta":{"searchEventId":"4104"}}
+        });
+        let unknown = json!({
+            "tool_use_id": "toolu-unknown-drop",
+            "tool_name": "mcp__memento__context",
+            "tool_response": {"fragments": []}
+        });
+        tracker.observe_post_tool_use_at("sess", &known, now);
+        tracker.observe_post_tool_use_at("sess", &unknown, now);
+
+        tracker.advance_stop_flush_at("sess", &json!({}), now);
+        tracker.advance_stop_flush_at("sess", &json!({}), now);
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), now);
+        assert_eq!(dropped.unsubmitted_count, 2);
+        assert_eq!(tracker.pending_count("sess"), 0);
+
+        let replayed_at = now + Duration::seconds(1);
+        tracker.observe_post_tool_use_at("sess", &known, replayed_at);
+        tracker.observe_post_tool_use_at("sess", &unknown, replayed_at);
+        assert_eq!(tracker.pending_count("sess"), 0);
+        assert_eq!(
+            tracker.advance_stop_flush_at("sess", &json!({}), replayed_at),
+            PendingMementoFeedbackTransition::default(),
+            "replay must not recreate a reminder or another unsubmitted count"
+        );
+    }
+
+    #[test]
+    fn replay_after_successful_feedback_does_not_recreate_known_or_unknown_obligations() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        let known = json!({
+            "tool_use_id": "toolu-known-success",
+            "tool_name": "mcp__memento__recall",
+            "tool_response": {"_meta":{"searchEventId":"4308"}}
+        });
+        let unknown = json!({
+            "tool_use_id": "toolu-unknown-success",
+            "tool_name": "mcp__memento__context",
+            "tool_response": {"fragments": []}
+        });
+        tracker.observe_post_tool_use_at("known-session", &known, now);
+        tracker.observe_post_tool_use_at("unknown-session", &unknown, now);
+        tracker.observe_post_tool_use_at(
+            "known-session",
+            &json!({
+                "tool_name": "mcp__memento__tool_feedback",
+                "tool_input": {"search_event_id": 4308, "relevant": true, "sufficient": true}
+            }),
+            now,
+        );
+        tracker.observe_post_tool_use_at(
+            "unknown-session",
+            &json!({
+                "tool_name": "mcp__memento__tool_feedback",
+                "tool_input": {"relevant": true, "sufficient": true}
+            }),
+            now,
+        );
+
+        let replayed_at = now + Duration::seconds(1);
+        tracker.observe_post_tool_use_at("known-session", &known, replayed_at);
+        tracker.observe_post_tool_use_at("unknown-session", &unknown, replayed_at);
+        for session_id in ["known-session", "unknown-session"] {
+            assert_eq!(tracker.pending_count(session_id), 0);
+            assert_eq!(
+                tracker.advance_stop_flush_at(session_id, &json!({}), replayed_at),
+                PendingMementoFeedbackTransition::default()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_tombstones_allow_unrelated_searches_and_expire_for_new_identity_lifetimes() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        let completed_known = json!({
+            "tool_use_id": "toolu-known-completed",
+            "tool_name": "mcp__memento__recall",
+            "tool_response": {"_meta":{"searchEventId":"51"}}
+        });
+        let completed_unknown = json!({
+            "tool_use_id": "toolu-unknown-completed",
+            "tool_name": "mcp__memento__context",
+            "tool_response": {"fragments": []}
+        });
+        tracker.observe_post_tool_use_at("sess", &completed_known, now);
+        tracker.observe_post_tool_use_at("sess", &completed_unknown, now);
+        tracker.advance_stop_flush_at("sess", &json!({}), now);
+        tracker.advance_stop_flush_at("sess", &json!({}), now);
+        assert_eq!(
+            tracker
+                .advance_stop_flush_at("sess", &json!({}), now)
+                .unsubmitted_count,
+            2
+        );
+
+        let unrelated_at = now + Duration::seconds(1);
+        tracker.observe_post_tool_use_at(
+            "sess",
+            &json!({
+                "tool_use_id": "toolu-known-unrelated",
+                "tool_name": "mcp__memento__recall",
+                "tool_response": {"_meta":{"searchEventId":"52"}}
+            }),
+            unrelated_at,
+        );
+        tracker.observe_post_tool_use_at(
+            "sess",
+            &json!({
+                "tool_use_id": "toolu-unknown-unrelated",
+                "tool_name": "mcp__memento__context",
+                "tool_response": {"fragments": ["new"]}
+            }),
+            unrelated_at,
+        );
+        let unrelated = tracker.advance_stop_flush_at("sess", &json!({}), unrelated_at);
+        let unrelated_flush = unrelated.flush.expect("unrelated searches stay live");
+        assert_eq!(unrelated_flush.search_event_ids, vec!["52"]);
+        assert!(unrelated_flush.includes_unknown_searches);
+
+        let expired_at = now + Duration::seconds(PENDING_SEARCH_TTL_SECS + 1);
+        tracker.observe_post_tool_use_at("sess", &completed_known, expired_at);
+        tracker.observe_post_tool_use_at("sess", &completed_unknown, expired_at);
+        assert_eq!(tracker.pending_count("sess"), 4);
+        let after_expiry = tracker.advance_stop_flush_at("sess", &json!({}), expired_at);
+        let after_expiry_flush = after_expiry
+            .flush
+            .expect("expired identities may be new again");
+        assert!(
+            after_expiry_flush
+                .search_event_ids
+                .contains(&"51".to_string())
+        );
+        assert!(after_expiry_flush.includes_unknown_searches);
+    }
+
+    #[test]
+    fn distinct_unknown_search_tool_uses_keep_independent_retry_budgets() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        for tool_use_id in ["toolu-unknown-a", "toolu-unknown-b"] {
+            tracker.observe_post_tool_use_at(
+                "sess",
+                &json!({
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "mcp__memento__recall",
+                    "tool_input": {"query": "same query"},
+                    "tool_response": {"fragments": []}
+                }),
+                now,
+            );
+        }
+
+        assert_eq!(tracker.pending_count("sess"), 2);
+        assert!(
+            tracker
+                .advance_stop_flush_at("sess", &json!({}), now)
+                .flush
+                .unwrap()
+                .includes_unknown_searches
+        );
+        assert!(
+            tracker
+                .advance_user_prompt_submit("sess")
+                .flush
+                .unwrap()
+                .includes_unknown_searches
+        );
+        let dropped = tracker.advance_stop_flush_at("sess", &json!({}), now);
+        assert_eq!(dropped.unsubmitted_count, 2);
+        assert_eq!(tracker.pending_count("sess"), 0);
+    }
+
+    #[test]
+    fn equivalent_unknown_search_payload_without_tool_use_id_is_conservatively_deduped() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        let search = json!({
+            "tool_name": "mcp__memento__context",
+            "tool_input": {"query": "ambiguous hook payload"},
+            "tool_response": {"fragments": []}
+        });
+
+        tracker.observe_post_tool_use_at("sess", &search, now);
+        tracker.observe_post_tool_use_at("sess", &search, now);
+
+        assert_eq!(tracker.pending_count("sess"), 1);
+    }
+
+    #[test]
+    fn different_unknown_search_payloads_without_tool_use_id_stay_distinct() {
+        let tracker = PendingMementoFeedbackTracker::default();
+        let now = Utc::now();
+        for query in ["first ambiguous search", "second ambiguous search"] {
+            tracker.observe_post_tool_use_at(
+                "sess",
+                &json!({
+                    "tool_name": "mcp__memento__context",
+                    "tool_input": {"query": query},
+                    "tool_response": {"fragments": []}
+                }),
+                now,
+            );
+        }
+
+        assert_eq!(tracker.pending_count("sess"), 2);
     }
 
     #[test]
@@ -661,11 +1384,8 @@ mod tests {
             old,
         );
 
-        assert!(
-            tracker
-                .take_stop_flush_at("sess", &json!({}), Utc::now())
-                .is_none()
-        );
+        let expired = tracker.advance_stop_flush_at("sess", &json!({}), Utc::now());
+        assert_eq!(expired, PendingMementoFeedbackTransition::default());
     }
 
     #[test]
@@ -824,7 +1544,8 @@ mod tests {
             }
         );
         let flush = tracker
-            .take_stop_flush_at("sess", &json!({}), Utc::now())
+            .advance_stop_flush_at("sess", &json!({}), Utc::now())
+            .flush
             .unwrap();
         assert!(flush.search_event_ids.is_empty());
         assert!(flush.includes_unknown_searches);
