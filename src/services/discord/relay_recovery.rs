@@ -2930,7 +2930,7 @@ mod tests {
             response.decision.action,
             RelayRecoveryActionKind::ClearOrphanPendingToken
         );
-        assert_eq!(response.decision.evidence.tmux_alive, None);
+        assert_eq!(response.decision.evidence.tmux_alive, Some(false));
         assert!(
             response
                 .apply_result
