@@ -769,7 +769,7 @@ AgentDesk/
 │   │   └── ops/                # ~21 bridge namespaces (cards, kanban, dispatch, kv, http, runtime, quality, ...)
 │   ├── github/                 # Issue sync, auto-triage, DoD mirroring
 │   ├── server/                 # Axum HTTP server + WebSocket
-│   │   └── routes/             # 270 API route handlers
+│   │   └── routes/             # 248 API route handlers
 │   └── services/               # Provider integrations + platform abstractions
 │       ├── discord/            # Serenity/Poise gateway, router, recovery
 │       │   └── watchers/lifecycle.rs   # Tmux watcher lifecycle (extracted from tmux.rs in #1435)
