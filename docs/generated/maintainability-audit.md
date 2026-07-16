@@ -47,7 +47,7 @@ Decomposition parents whose inline test LoC exceeds 3x their production LoC (fil
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/services/discord/inflight.rs` |  | 5205 test LoC vs 608 prod LoC (ratio 8.56x > 3x, 5813 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/inflight.rs` |  | 5209 test LoC vs 608 prod LoC (ratio 8.57x > 3x, 5817 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/inflight/save_store.rs` |  | 730 test LoC vs 241 prod LoC (ratio 3.03x > 3x, 971 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 146 prod LoC (ratio 3.08x > 3x, 596 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 1048 prod LoC (ratio 3.81x > 3x, 5040 raw); migrate the stranded tests with the decomposed production code |
