@@ -1041,7 +1041,7 @@
 | `services::routines::runtime` | `src/services/routines/runtime.rs` | 1046 | 870 | 176 |  |
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 133 | 64 | 69 |  |
 | `services::routines::session_control` | `src/services/routines/session_control.rs` | 1065 | 899 | 166 |  |
-| `services::routines::store` | `src/services/routines/store.rs` | 4167 | 3505 | 662 | giant-file |
+| `services::routines::store` | `src/services/routines/store.rs` | 4209 | 3505 | 704 | giant-file |
 | `services::scheduled_messages` | `src/services/scheduled_messages.rs` | 1249 | 940 | 309 |  |
 | `services::scheduled_messages::evidence` | `src/services/scheduled_messages/evidence.rs` | 132 | 132 | 0 |  |
 | `services::scheduled_messages::timing` | `src/services/scheduled_messages/timing.rs` | 53 | 53 | 0 |  |
