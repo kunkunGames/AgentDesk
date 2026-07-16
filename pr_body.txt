@@ -1,0 +1,31 @@
+What changed:
+Translated the remaining Korean diagnostic messages in `src/cli/doctor/orchestrator.rs` to English.
+
+Why:
+To maintain consistency in diagnostic output messages. This aligns with the rule that Doctor behavior should provide clear actionable information.
+
+WorkFingerprint:
+- Agent: Doctor
+- Category Boundary: src/cli/doctor/**
+- Primary Files: src/cli/doctor/orchestrator.rs
+- Invariant Protected: Doctor behavior should inspect and report; it should not silently repair or mutate runtime state unless an existing command explicitly promises that behavior. Preserve JSON output contracts for doctor --json.
+- Public API Impact: None
+- Docs Impact: None
+- Verification Plan: git diff --check and running `cargo check --all-targets` verified compilation. Ran tests as far as environment allowed.
+- Related PRs/Issues: Checked open PRs for duplicates, none found matching this change scope.
+
+Duplicate/overlap check: Verified using `git fetch --all` and `git branch -a` logs to ensure no overlap in open PR branches for this category prior to implementation.
+
+Verification commands and results:
+- `git diff --check`: Passed, no trailing whitespace or other issues.
+- `cargo check --all-targets`: Passed, code compiles.
+
+Skipped checks with reasons:
+- `gh pr list`: `gh` CLI was not installed, fell back to `git` branch checking.
+- Extensive test suites (`cargo test`): Terminated or timed out due to environmental constraints, but local compile passed.
+
+Risk:
+Very low, purely string replacement without logic changes.
+
+Rollback notes:
+Revert the PR.
