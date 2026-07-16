@@ -535,7 +535,7 @@ async fn recover_expired_dispatch_reserving_pg(pool: &PgPool) -> Result<usize> {
             AND NOT EXISTS (
                 SELECT 1
                   FROM dispatch_delivery_events e
-                 WHERE e.dispatch_id = SUBSTRING(m.key FROM LENGTH('dispatch_reserving:') + 1)
+                 WHERE m.key = 'dispatch_reserving:' || e.dispatch_id
                    AND e.operation = 'send'
                    AND e.target_kind = 'channel'
                    AND e.status = 'reserved'
@@ -710,7 +710,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
             AND NOT EXISTS (
                 SELECT 1
                   FROM task_dispatches td
-                 WHERE td.id = SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1)
+                 WHERE m.key = 'dispatch_notified:' || td.id
             )",
     )
     .execute(pool)
@@ -931,13 +931,13 @@ async fn fetch_delivery_kv_guard_batch_pg(
                    'reserving' AS guard_kind
               FROM kv_meta
              WHERE key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) > $1
+               AND key > 'dispatch_reserving:' || $1
             UNION ALL
             SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id,
                    'notified' AS guard_kind
               FROM kv_meta
              WHERE key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) > $1
+               AND key > 'dispatch_notified:' || $1
         ),
         grouped AS (
             SELECT dispatch_id,
