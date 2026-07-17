@@ -26,8 +26,8 @@ export default function EmojiPickerLibraryPanel({
 
   // emoji-picker-react (v4) renders each emoji as `button.epr-emoji` whose
   // visible text is the native emoji. The library exposes no selected state, so
-  // we mark the current value with `aria-current="true"` for screen readers.
-  // aria-current is used (not aria-selected, which is ignored on an implicit
+  // we mark the current value with `aria-pressed="true"` for screen readers.
+  // aria-pressed is used (not aria-selected, which is ignored on an implicit
   // role=button) so the "current selection in the set" is actually announced.
   // The match is exact (ignoring the FE0F variation selector) so composed
   // sequences that merely contain the same codepoint are not tagged.
@@ -41,9 +41,9 @@ export default function EmojiPickerLibraryPanel({
     const syncSelected = () => {
       container.querySelectorAll("button.epr-emoji").forEach((button) => {
         if (normalize(button.textContent ?? "") === target) {
-          button.setAttribute("aria-current", "true");
+          button.setAttribute("aria-pressed", "true");
         } else {
-          button.removeAttribute("aria-current");
+          button.removeAttribute("aria-pressed");
         }
       });
     };
