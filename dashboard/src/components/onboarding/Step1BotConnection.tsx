@@ -171,7 +171,7 @@ export function Step1BotConnection({
             </div>
             <input
               type="password"
-              autoComplete="off"
+              autoComplete="new-password"
               spellCheck="false"
               data-1p-ignore
               aria-label={tr("명령어 봇 토큰", "Command bot token")}
@@ -244,7 +244,7 @@ export function Step1BotConnection({
         </div>
         <input
           type="password"
-          autoComplete="off"
+          autoComplete="new-password"
           spellCheck="false"
           data-1p-ignore
           aria-label={tr("통신 봇 토큰", "Communication bot token")}
@@ -301,7 +301,7 @@ export function Step1BotConnection({
         </div>
         <input
           type="password"
-          autoComplete="off"
+          autoComplete="new-password"
           spellCheck="false"
           data-1p-ignore
           aria-label={tr("알림 봇 토큰", "Notification bot token")}
