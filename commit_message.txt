@@ -1,0 +1,33 @@
+Steward: add mergeability status PR template check
+
+What changed:
+- Added a "Mergeability status" checkbox to the "Queue Hygiene & Merge-Readiness checklist" in `.github/PULL_REQUEST_TEMPLATE.md`.
+- Updated `scripts/analyze_prs.py` to enforce this new template check (`has_mergeability_status_ack`).
+- Added robust unit test coverage in `tests/test_analyze_prs.py`.
+
+Why:
+Do not claim merge-ready from partial check status; pending or UNKNOWN mergeability must be explicitly called out in PR reviews and status reports. This prevents overlapping/premature merges while ensuring visibility on lingering checks.
+
+WorkFingerprint:
+- Agent: Steward
+- Boundary: PR templates, PR hygiene scripts
+- Primary files: `.github/PULL_REQUEST_TEMPLATE.md`, `scripts/analyze_prs.py`, `tests/test_analyze_prs.py`
+- Queue hygiene invariant: Ensure authors do not bypass partial check awareness when claiming a PR is complete.
+- Related PRs/issues checked: Evaluated open queue hygiene state and stale branch policies.
+- Non-overlapping reason: Specific gap addressed for partial CI statuses; zero diff overlap with current generated inventory docs or overlapping Scribe/Refiner runs.
+
+Duplicate/overlap check:
+Executed `git fetch --all && git branch -a`. No overlapping open PRs targeting `PULL_REQUEST_TEMPLATE.md` or `analyze_prs.py` mergeability updates were found.
+
+Verification commands and results:
+- `git diff --check`: Clean.
+- `python3 -m unittest tests.test_analyze_prs`: Ran 56 tests in 0.018s (OK).
+- `./scripts/ci-script-checks.sh`: Checked all CI and script integrity paths successfully.
+
+Skipped checks with reasons:
+- `./scripts/verify-dashboard.sh` skipped: No dashboard code was touched.
+- `cargo check --all-targets` skipped: No Rust files were touched.
+
+Risk and rollback notes:
+- Risk is extremely low. The only side-effect is a more strict regex parsing for new PRs.
+- Rollback involves reverting the template line and removing the check loop from `analyze_prs.py`.
