@@ -7,6 +7,7 @@ from scripts.analyze_prs import (
     has_no_change_verification_ack,
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
+    has_mergeability_status_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -208,6 +209,23 @@ class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
         body = "- scratch file cleanup: ran git diff --check and git status."
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
+
+
+class PrAnalyzerMergeabilityStatusGuardTests(unittest.TestCase):
+    def test_unchecked_template_mergeability_status_guard_is_not_acknowledgement(self):
+        body = "- [ ] **Mergeability status:** I am not claiming merge-ready from partial check status."
+
+        self.assertFalse(has_mergeability_status_ack(body))
+
+    def test_checked_template_mergeability_status_guard_is_acknowledgement(self):
+        body = "- [X] **Mergeability status:** I am not claiming merge-ready from partial check status."
+
+        self.assertTrue(has_mergeability_status_ack(body))
+
+    def test_filled_mergeability_status_field_is_acknowledgement(self):
+        body = "- mergeability status: tests pass."
+
+        self.assertTrue(has_mergeability_status_ack(body))
 
 
 class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
