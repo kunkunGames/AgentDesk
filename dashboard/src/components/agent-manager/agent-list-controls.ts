@@ -6,7 +6,8 @@ export type AgentSortMode =
   | "xp"
   | "activity"
   | "department"
-  | "created";
+  | "created"
+  | "archived";
 
 export interface AgentListFilter {
   deptTab: string;
@@ -19,6 +20,7 @@ const STATUS_ORDER: Record<string, number> = {
   idle: 1,
   break: 2,
   offline: 3,
+  archived: 4,
 };
 
 export function filterAgents(
@@ -78,6 +80,9 @@ export function compareAgents(
     }
     if (sortMode === "created") {
       return (right.created_at ?? 0) - (left.created_at ?? 0);
+    }
+    if (sortMode === "archived") {
+      return (right.archived_at ?? 0) - (left.archived_at ?? 0);
     }
     const leftStatus = STATUS_ORDER[left.status] ?? 5;
     const rightStatus = STATUS_ORDER[right.status] ?? 5;

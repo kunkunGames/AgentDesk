@@ -37,8 +37,7 @@ impl RecentPlaceholderEvent {
         if is_internal_tool_error(content) {
             return None;
         }
-        let projected = crate::services::tool_output_guard::project_for_relay(None, true, content);
-        Self::new("[tool error]", projected.content)
+        Self::new("[tool error]", content)
     }
 
     pub(in crate::services::discord) fn task_notification(

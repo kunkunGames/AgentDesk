@@ -16,31 +16,13 @@ var _CODEX_REVIEWERS = {
   "chatgpt-codex-connector[bot]": true
 };
 
-// #4250: Review-snapshot reads are safe to abandon and retry, so keep their
-// individual timeout tight. Merge-readiness reads feed escalation decisions;
-// allow the pre-#4250 budget there and surface deadline timeouts as transient.
-var GH_EXEC_TIMEOUT_MS = 1500;
-var GH_MERGE_READINESS_TIMEOUT_MS = 30000;
-
-function execGh(args, timeoutMs) {
-  return agentdesk.exec("gh", args, {
-    timeout_ms: timeoutMs || GH_EXEC_TIMEOUT_MS
-  });
-}
-
-function isGhTimeoutError(output) {
-  return typeof output === "string" &&
-    output.indexOf("ERROR") === 0 &&
-    /timed out|timeout|bridge deadline/i.test(output);
-}
-
 function isCodexReviewer(login) {
   if (!login) return false;
   return !!_CODEX_REVIEWERS[String(login).toLowerCase()];
 }
 
 function getPrAuthor(prNumber, repo) {
-  var json = execGh([
+  var json = agentdesk.exec("gh", [
     "pr", "view", String(prNumber),
     "--json", "author",
     "--jq", ".author.login",
@@ -53,29 +35,25 @@ function getPrAuthor(prNumber, repo) {
 }
 
 function getCurrentPrHeadSha(prNumber, repo) {
-  var json = execGh([
+  var json = agentdesk.exec("gh", [
     "pr", "view", String(prNumber),
     "--json", "headRefOid",
     "--jq", ".headRefOid",
     "--repo", repo
-  ], GH_MERGE_READINESS_TIMEOUT_MS);
+  ]);
   if (json && json.indexOf("ERROR") !== 0) return json.trim();
-  if (isGhTimeoutError(json)) return undefined;
   return null;
 }
 
 function getLatestCiRunForTrackedPr(repo, branch, headSha) {
   if (!repo || !branch) return null;
-  var runsJson = execGh([
+  var runsJson = agentdesk.exec("gh", [
     "run", "list",
     "--branch", branch,
     "--repo", repo,
     "--json", "databaseId,status,conclusion,headSha,event",
     "--limit", "5"
-  ], GH_MERGE_READINESS_TIMEOUT_MS);
-  if (isGhTimeoutError(runsJson)) {
-    return { transient: true, error: runsJson };
-  }
+  ]);
   if (!runsJson || runsJson.indexOf("ERROR") === 0) return null;
   try {
     var runs = JSON.parse(runsJson);
@@ -92,7 +70,7 @@ function getLatestCiRunForTrackedPr(repo, branch, headSha) {
 }
 
 function listOpenPrs(repo) {
-  var prsJson = execGh([
+  var prsJson = agentdesk.exec("gh", [
     "pr", "list",
     "--state", "open",
     "--json", "number,headRefName,title,mergeable",
@@ -108,11 +86,11 @@ function listOpenPrs(repo) {
 }
 
 function fetchCodexReviews(repo, prNumber) {
-  var json = execGh([
+  var json = agentdesk.exec("gh", [
     "api",
     "repos/" + repo + "/pulls/" + prNumber + "/reviews"
   ]);
-  if (!json || json.indexOf("ERROR") === 0) return null;
+  if (!json || json.indexOf("ERROR") === 0) return [];
 
   try {
     var reviews = JSON.parse(json);
@@ -139,7 +117,7 @@ function fetchCodexReviews(repo, prNumber) {
     return filtered;
   } catch (e) {
     agentdesk.log.warn("[merge] Failed to parse Codex reviews for PR #" + prNumber + ": " + e);
-    return null;
+    return [];
   }
 }
 
@@ -167,14 +145,14 @@ function fetchCodexReviewThreads(repo, prNumber) {
     " }" +
     "}";
 
-  var json = execGh([
+  var json = agentdesk.exec("gh", [
     "api", "graphql",
     "-f", "query=" + query,
     "-f", "owner=" + parts[0],
     "-f", "name=" + parts[1],
     "-F", "number=" + String(prNumber)
   ]);
-  if (!json || json.indexOf("ERROR") === 0) return null;
+  if (!json || json.indexOf("ERROR") === 0) return [];
 
   try {
     var parsed = JSON.parse(json);
@@ -184,13 +162,13 @@ function fetchCodexReviewThreads(repo, prNumber) {
     return reviewThreads.nodes || [];
   } catch (e) {
     agentdesk.log.warn("[merge] Failed to parse Codex review threads for PR #" + prNumber + ": " + e);
-    return null;
+    return [];
   }
 }
 
 function ensureGitHubLabel(repo, name, color, description) {
   if (!repo || !name) return false;
-  var output = execGh([
+  var output = agentdesk.exec("gh", [
     "label", "create", name,
     "--repo", repo,
     "--force",
@@ -205,10 +183,6 @@ function ensureGitHubLabel(repo, name, color, description) {
 }
 
 module.exports = {
-  GH_EXEC_TIMEOUT_MS: GH_EXEC_TIMEOUT_MS,
-  GH_MERGE_READINESS_TIMEOUT_MS: GH_MERGE_READINESS_TIMEOUT_MS,
-  execGh: execGh,
-  isGhTimeoutError: isGhTimeoutError,
   isCodexReviewer: isCodexReviewer,
   getPrAuthor: getPrAuthor,
   getCurrentPrHeadSha: getCurrentPrHeadSha,

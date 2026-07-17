@@ -1412,7 +1412,7 @@ fn compose_codex_prompt(
     prompt.to_string()
 }
 
-pub(crate) fn compose_codex_developer_instructions(
+fn compose_codex_developer_instructions(
     system_prompt: Option<&str>,
     _allowed_tools: Option<&[String]>,
 ) -> Option<String> {

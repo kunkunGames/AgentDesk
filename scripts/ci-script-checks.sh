@@ -65,27 +65,12 @@ echo "=== Policy DB capability manifest guard (#3734) ==="
   --require-manifest policies/merge-automation.cap.yaml
 "$PYTHON" -m unittest tests.test_policy_db_capabilities
 
-echo "=== Merge automation policy tests (#4250) ==="
-node --test policies/__tests__/merge-automation.test.js
-
-echo "=== Daily log-digest routine tests (#4263) ==="
-node --test policies/__tests__/daily-log-digest.test.js
-"$PYTHON" -m unittest tests.test_daily_log_digest
-
-echo "=== Weekly regression-churn audit tests (#4265) ==="
-"$PYTHON" -m unittest tests.test_weekly_churn_audit
-
-echo "=== External toolchain draft/approval/smoke tests (#4555) ==="
-"$PYTHON" -m unittest tests.test_toolchain_update
-
 echo "=== await_holding_lock ratchet guard ==="
 "$PYTHON" scripts/check_await_holding_lock_ratchet.py
 "$PYTHON" -m unittest tests.test_await_holding_lock_ratchet
 
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
-"$PYTHON" -m unittest scripts.test_ratchet_admission
-"$PYTHON" -m unittest scripts.test_intervention_log
 
 echo "=== Discord log field-key drift guard (#4218) ==="
 "$PYTHON" scripts/check_log_key_drift.py
@@ -94,9 +79,6 @@ echo "=== Discord log field-key drift guard (#4218) ==="
 echo "=== Inflight blind-save ratchet guard (#4259) ==="
 "$PYTHON" scripts/check_inflight_blind_save_ratchet.py
 "$PYTHON" -m unittest tests.test_inflight_blind_save_ratchet
-
-# #4511 post-deploy smoke WARN post-restart scoping
-bash tests/test_deploy_smoke_warn_scope_4511.sh
 
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
@@ -131,12 +113,6 @@ done
 for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch shell file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in *.diff *.patch patch.diff; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch diff/patch file detected in repository root: $scratch_file"
     FAIL=1
   fi
 done

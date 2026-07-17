@@ -138,12 +138,10 @@ impl ProcessBackend {
     pub fn new() -> Self {
         Self
     }
+}
 
-    pub(crate) fn create_session_with_command_env(
-        &self,
-        config: &SessionConfig,
-        apply_command_env: impl FnOnce(&mut Command),
-    ) -> Result<SessionHandle, String> {
+impl SessionBackend for ProcessBackend {
+    fn create_session(&self, config: &SessionConfig) -> Result<SessionHandle, String> {
         // 1. Ensure output file exists (empty)
         std::fs::OpenOptions::new()
             .create(true)
@@ -193,7 +191,6 @@ impl ProcessBackend {
             .stdin(Stdio::piped())
             .stdout(Stdio::null()) // wrapper writes to file, not stdout
             .stderr(Stdio::inherit()); // show wrapper logs
-        apply_command_env(&mut cmd);
 
         #[cfg(unix)]
         {
@@ -228,12 +225,6 @@ impl ProcessBackend {
             child: Arc::new(Mutex::new(Some(child))),
             pid,
         })
-    }
-}
-
-impl SessionBackend for ProcessBackend {
-    fn create_session(&self, config: &SessionConfig) -> Result<SessionHandle, String> {
-        self.create_session_with_command_env(config, |_| {})
     }
 
     fn send_input(&self, handle: &SessionHandle, message: &str) -> Result<(), String> {

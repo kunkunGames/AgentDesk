@@ -21,8 +21,6 @@ This block is generated from the filesystem and is checked in CI for drift.
 ```text
 src/
 ├── cli/
-│   ├── client/
-│   │   └── runtime_config.rs
 │   ├── doctor/
 │   │   ├── contract.rs
 │   │   ├── health.rs
@@ -166,7 +164,6 @@ src/
 │   ├── loader.rs
 │   ├── mod.rs
 │   ├── ops.rs
-│   ├── slow_hook_warn.rs
 │   ├── sql_guard.rs
 │   ├── transition.rs
 │   ├── transition_executor_pg.rs
@@ -380,10 +377,6 @@ src/
 │   │   ├── process.rs
 │   │   └── spawn_queue.rs
 │   ├── claude_tui/
-│   │   ├── hook_relay/
-│   │   │   └── ordered_queue.rs
-│   │   ├── hook_server/
-│   │   │   └── relay_receipts.rs
 │   │   ├── hosting/
 │   │   │   ├── followup_support.rs
 │   │   │   ├── mod.rs
@@ -452,8 +445,6 @@ src/
 │   │   │   │   ├── render_recovery.rs
 │   │   │   │   ├── render_session.rs
 │   │   │   │   └── tests.rs
-│   │   │   ├── voice/
-│   │   │   │   └── alert.rs
 │   │   │   ├── command_policy.rs
 │   │   │   ├── config.rs
 │   │   │   ├── control.rs
@@ -496,7 +487,6 @@ src/
 │   │   │   ├── redaction.rs
 │   │   │   ├── relay_auto_heal.rs
 │   │   │   ├── relay_dead_reattach.rs
-│   │   │   ├── relay_progress.rs
 │   │   │   ├── runtime_resolve.rs
 │   │   │   ├── session_enrichment.rs
 │   │   │   ├── snapshot.rs
@@ -571,7 +561,6 @@ src/
 │   │   │   ├── turn_anchor.rs
 │   │   │   └── workflow_panel.rs
 │   │   ├── prompt_builder/
-│   │   │   ├── channel_recent_context.rs
 │   │   │   ├── dispatch_contract.rs
 │   │   │   ├── dispatch_contract_tests.rs
 │   │   │   ├── layer_rendering.rs
@@ -629,9 +618,6 @@ src/
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── intake_turn/
-│   │   │   │   │   ├── race_loss/
-│   │   │   │   │   │   ├── mailbox_reaction.rs
-│   │   │   │   │   │   └── mailbox_reaction_tests.rs
 │   │   │   │   │   ├── race_loss.rs
 │   │   │   │   │   ├── turn_watchdog.rs
 │   │   │   │   │   └── voice_intake.rs
@@ -691,19 +677,15 @@ src/
 │   │   │   └── write.rs
 │   │   ├── task_notification_delivery/
 │   │   │   ├── store/
-│   │   │   │   ├── card_claim.rs
 │   │   │   │   ├── missing_card_replacement.rs
 │   │   │   │   ├── response_chunks.rs
 │   │   │   │   ├── response_fence.rs
-│   │   │   │   ├── response_identity.rs
-│   │   │   │   ├── retention.rs
-│   │   │   │   └── terminal_footer.rs
+│   │   │   │   └── response_identity.rs
 │   │   │   ├── card_post.rs
 │   │   │   ├── gateway.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── response_chunks.rs
 │   │   │   ├── store.rs
-│   │   │   ├── terminal_identity.rs
 │   │   │   └── tests.rs
 │   │   ├── tmux/
 │   │   │   └── task_notification_kind_restart_roundtrip_tests.rs
@@ -794,18 +776,12 @@ src/
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   └── guarded_save.rs
 │   │   │   ├── stream_loop/
-│   │   │   │   ├── content_arms/
-│   │   │   │   │   ├── provider_error_presentation.rs
-│   │   │   │   │   └── tui_error_classification.rs
 │   │   │   │   ├── content_arms.rs
 │   │   │   │   └── tool_arms.rs
 │   │   │   ├── terminal_outcome_delivery/
-│   │   │   │   ├── empty_response_recovery/
-│   │   │   │   │   └── guidance.rs
 │   │   │   │   ├── cancel_prompt_replace.rs
 │   │   │   │   ├── delivery_epilogue.rs
 │   │   │   │   ├── empty_response_recovery.rs
-│   │   │   │   ├── prompt_too_long_guidance.rs
 │   │   │   │   └── recovery_retry.rs
 │   │   │   ├── tmux_runtime/
 │   │   │   │   ├── interrupt_policy.rs
@@ -866,12 +842,10 @@ src/
 │   │   │   └── watcher_backstop.rs
 │   │   ├── turn_view_reconciler/
 │   │   │   ├── orphan_sweep.rs
-│   │   │   ├── queue_repair.rs
 │   │   │   └── tests.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── tests/
 │   │   │   │   └── pcm_harness_tests.rs
-│   │   │   ├── channel_state.rs
 │   │   │   ├── final_result_playback.rs
 │   │   │   ├── foreground_decision.rs
 │   │   │   ├── live_cut_playback.rs
@@ -1066,8 +1040,6 @@ src/
 │   │   ├── mod.rs
 │   │   ├── shell.rs
 │   │   └── tmux.rs
-│   ├── provider/
-│   │   └── provider_conformance_invariant_tests.rs
 │   ├── provider_cli/
 │   │   ├── canary.rs
 │   │   ├── context.rs
@@ -1112,8 +1084,6 @@ src/
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
-│   ├── settings/
-│   │   └── runtime_config_put.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── tui_prompt_dedupe/
@@ -1126,7 +1096,6 @@ src/
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── registry_purge.rs
-│   │   ├── source_generation.rs
 │   │   └── turn_finished_signal.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
@@ -1135,7 +1104,6 @@ src/
 │   ├── automation_candidate_materializer.rs
 │   ├── claude.rs
 │   ├── claude_compact_trigger.rs
-│   ├── claude_gateway_proxy.rs
 │   ├── codex.rs
 │   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs

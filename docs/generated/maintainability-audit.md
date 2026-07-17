@@ -65,7 +65,7 @@ Files under src/server/routes/ that mix raw SQL, json!() shaping, and crate::ser
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (25), json!() (56), and crate::services calls (5) |
+| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (40), json!() (77), and crate::services calls (7) |
 | warn | `src/server/routes/agents_setup.rs` |  | route file mixes SQL (7), json!() (12), and crate::services calls (2) |
 | warn | `src/server/routes/cron_api.rs` |  | route file mixes SQL (2), json!() (12), and crate::services calls (1) |
 | warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (24), and crate::services calls (3) |

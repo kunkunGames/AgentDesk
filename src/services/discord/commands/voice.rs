@@ -7,11 +7,6 @@ use super::super::{Context, Data, Error, check_auth};
 use crate::voice::barge_in::BargeInSensitivity;
 use crate::voice::commands::{VoiceCommand, parse_voice_command};
 
-mod alert;
-pub(in crate::services::discord) use alert::notify_voice_alert;
-#[cfg(test)]
-use alert::voice_notify_should_send;
-
 #[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
 enum VoiceSensitivityChoice {
     #[name = "normal"]
@@ -88,11 +83,7 @@ async fn voice_join_impl(ctx: Context<'_>) -> Result<(), Error> {
         .voice_pairings
         .target_channel(channel_id)
         .unwrap_or(ctx.channel_id());
-    ctx.data()
-        .shared
-        .voice_barge_in
-        .voice_join_started(channel_id, guild_id);
-    let join_result = join_voice_channel(
+    join_voice_channel(
         ctx.serenity_context(),
         ctx.data().voice_receiver.clone(),
         ctx.data().provider.as_str(),
@@ -100,20 +91,18 @@ async fn voice_join_impl(ctx: Context<'_>) -> Result<(), Error> {
         channel_id,
         control_channel_id,
     )
-    .await;
-    if let Err(error) = join_result {
-        ctx.data()
-            .shared
-            .voice_barge_in
-            .voice_disconnected(channel_id);
-        return Err(error);
-    }
-    super::super::voice_lifecycle::record_join_success(
-        &ctx.data().shared.voice_barge_in,
-        ctx.data().provider.as_str(),
-        guild_id,
-        channel_id,
-        control_channel_id,
+    .await?;
+    ctx.data()
+        .shared
+        .voice_barge_in
+        .register_voice_context(control_channel_id, guild_id);
+    ctx.data()
+        .shared
+        .voice_barge_in
+        .register_voice_context(channel_id, guild_id);
+    voice_occupancy().insert(
+        (ctx.data().provider.as_str().to_string(), guild_id.get()),
+        channel_id.get(),
     );
 
     ctx.say(format!(
@@ -283,10 +272,7 @@ pub(in crate::services::discord) async fn handle_vc_text_command(
                 .voice_pairings
                 .target_channel(channel_id)
                 .unwrap_or(msg.channel_id);
-            data.shared
-                .voice_barge_in
-                .voice_join_started(channel_id, guild_id);
-            let join_result = join_voice_channel(
+            join_voice_channel(
                 ctx,
                 data.voice_receiver.clone(),
                 data.provider.as_str(),
@@ -294,17 +280,16 @@ pub(in crate::services::discord) async fn handle_vc_text_command(
                 channel_id,
                 control_channel_id,
             )
-            .await;
-            if let Err(error) = join_result {
-                data.shared.voice_barge_in.voice_disconnected(channel_id);
-                return Err(error);
-            }
-            super::super::voice_lifecycle::record_join_success(
-                &data.shared.voice_barge_in,
-                data.provider.as_str(),
-                guild_id,
-                channel_id,
-                control_channel_id,
+            .await?;
+            data.shared
+                .voice_barge_in
+                .register_voice_context(control_channel_id, guild_id);
+            data.shared
+                .voice_barge_in
+                .register_voice_context(channel_id, guild_id);
+            voice_occupancy().insert(
+                (data.provider.as_str().to_string(), guild_id.get()),
+                channel_id.get(),
             );
             let _ = msg
                 .reply(
@@ -700,12 +685,11 @@ async fn try_join_for_provider(
                 actual_channel = ?actual_channel,
                 "voice auto-join skipped: songbird call already connected for guild (#2054 idempotency)"
             );
-            super::super::voice_lifecycle::record_join_success(
-                barge_in,
-                self_provider,
-                guild_id,
-                ChannelId::new(recorded_channel),
-                control_channel_id,
+            barge_in.register_voice_context(control_channel_id, guild_id);
+            barge_in.register_voice_context(ChannelId::new(recorded_channel), guild_id);
+            voice_occupancy().insert(
+                (self_provider.to_string(), guild_id.get()),
+                recorded_channel,
             );
             return;
         }
@@ -720,7 +704,6 @@ async fn try_join_for_provider(
         );
     }
 
-    barge_in.voice_join_started(channel_id, guild_id);
     match join_voice_channel(
         ctx,
         receiver.clone(),
@@ -748,7 +731,6 @@ async fn try_join_for_provider(
             );
         }
         Err(error) => {
-            barge_in.voice_disconnected(channel_id);
             let mut chain: Vec<String> = vec![error.to_string()];
             let mut current = error.source();
             while let Some(src) = current {
@@ -967,6 +949,51 @@ pub(in crate::services::discord) fn voice_occupancy()
     static REGISTRY: std::sync::OnceLock<dashmap::DashMap<(String, u64), u64>> =
         std::sync::OnceLock::new();
     REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Track which (voice_channel, kind) auto-join notifications were already sent
+/// so a single process lifetime emits each at most once.
+fn voice_notify_dedup() -> &'static dashmap::DashSet<(u64, &'static str)> {
+    static DEDUP: std::sync::OnceLock<dashmap::DashSet<(u64, &'static str)>> =
+        std::sync::OnceLock::new();
+    DEDUP.get_or_init(dashmap::DashSet::new)
+}
+
+fn voice_notify_should_send(channel_id: ChannelId, kind: &'static str) -> bool {
+    voice_notify_dedup().insert((channel_id.get(), kind))
+}
+
+pub(in crate::services::discord) async fn notify_voice_alert(
+    channel_id: ChannelId,
+    content: String,
+    kind: &'static str,
+) {
+    if !voice_notify_should_send(channel_id, kind) {
+        return;
+    }
+    let Some(token) = crate::credential::read_bot_token("notify") else {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            kind,
+            "voice auto-join alert suppressed: notify bot token not configured"
+        );
+        return;
+    };
+    let client = reqwest::Client::new();
+    let base = crate::services::dispatches::discord_delivery::discord_api_base_url();
+    let target = channel_id.get().to_string();
+    if let Err(error) = crate::services::dispatches::discord_delivery::post_raw_message_once(
+        &client, &token, &base, &target, &content,
+    )
+    .await
+    {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            kind,
+            error = %error,
+            "voice auto-join alert delivery failed via notify bot"
+        );
+    }
 }
 
 #[cfg(test)]

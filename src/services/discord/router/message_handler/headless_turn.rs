@@ -219,21 +219,24 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let early_role_binding = routine_role_binding
         .clone()
         .or_else(|| {
-            resolve_thread_role_binding(
+            metadata_parent_channel_id(metadata.as_ref())
+                .and_then(|parent_channel_id| resolve_role_binding(parent_channel_id, None))
+        })
+        .or_else(|| {
+            resolve_role_binding(
                 channel_id,
                 early_channel_name
                     .as_deref()
                     .or(channel_name_hint.as_deref())
                     .or(early_resolved_channel_name.as_deref()),
-                early_thread_parent.as_ref(),
             )
-            .role_binding
         })
         .or_else(|| {
-            early_thread_parent.is_none().then(|| {
-                metadata_parent_channel_id(metadata.as_ref())
-                    .and_then(|parent_id| resolve_role_binding(parent_id, None))
-            })?
+            early_thread_parent
+                .as_ref()
+                .and_then(|(parent_id, parent_name)| {
+                    resolve_role_binding(*parent_id, parent_name.as_deref())
+                })
         });
     let early_provider = early_role_binding
         .as_ref()
@@ -304,7 +307,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             session.clear_provider_session();
         }
         if let Some(info) = load_session_runtime_state(&mut data.sessions, channel_id) {
-            // Existing sessions retain their child-channel runtime identity.
             if let Some(channel_name) = resolved_channel_name_for_session.as_ref()
                 && let Some(session) = data.sessions.get_mut(&channel_id)
                 && session.channel_name.is_none()
@@ -316,7 +318,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             let workspace = resolve_headless_workspace(
                 channel_id,
                 resolved_channel_name_for_session.as_deref(),
-                early_thread_parent.as_ref(),
                 metadata.as_ref(),
             )
             .ok_or_else(|| {
@@ -404,28 +405,27 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     };
 
     let turn_id = reservation.turn_id(channel_id);
-    let mut resolved_role_binding = {
+    let role_binding = {
         let data = shared.core.lock().await;
         let channel_name = data
             .sessions
             .get(&channel_id)
             .and_then(|session| session.channel_name.as_deref());
-        if let Some(binding) = routine_role_binding.clone() {
-            ResolvedThreadRoleBinding::direct(Some(binding))
-        } else {
-            let mut resolved =
-                resolve_thread_role_binding(channel_id, channel_name, early_thread_parent.as_ref());
-            if resolved.role_binding.is_none() && early_thread_parent.is_none() {
-                resolved.role_binding = metadata_parent_channel_id(metadata.as_ref())
-                    .and_then(|parent_id| resolve_role_binding(parent_id, None));
-            }
-            resolved
-        }
-    };
-    let memory_scope_channel_id = resolved_role_binding.memory_channel_id(channel_id);
-    let memory_channel_id = memory_scope_channel_id.get();
-    let inherited_memory_channel_name = resolved_role_binding.memory_channel_name(None);
-    let role_binding = resolved_role_binding.role_binding.take();
+        routine_role_binding
+            .clone()
+            .or_else(|| {
+                metadata_parent_channel_id(metadata.as_ref())
+                    .and_then(|parent_channel_id| resolve_role_binding(parent_channel_id, None))
+            })
+            .or_else(|| resolve_role_binding(channel_id, channel_name))
+    }
+    .or_else(|| {
+        early_thread_parent
+            .as_ref()
+            .and_then(|(parent_id, parent_name)| {
+                resolve_role_binding(*parent_id, parent_name.as_deref())
+            })
+    });
     let provider = role_binding
         .as_ref()
         .and_then(|binding| binding.provider.clone())
@@ -436,7 +436,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let routine_targets_resolved_role = metadata
+    if metadata
         .as_ref()
         .and_then(|value| value.get("routine_id"))
         .is_some()
@@ -446,38 +446,16 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                     .as_ref()
                     .map(|binding| binding.role_id.as_str()),
             )
-            .is_some_and(|(metadata_agent_id, role_id)| metadata_agent_id == role_id);
-    let routine_agent_identity_changed = if routine_targets_resolved_role {
-        if let Some(channel_name_hint) = channel_name_hint
+            .is_some_and(|(metadata_agent_id, role_id)| metadata_agent_id == role_id)
+        && let Some(channel_name_hint) = channel_name_hint
             .as_ref()
             .filter(|value| !value.trim().is_empty())
-        {
-            let data = shared.core.lock().await;
-            data.sessions.get(&channel_id).is_some_and(|session| {
-                session.channel_name.as_deref() != Some(channel_name_hint.as_str())
-            })
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if routine_agent_identity_changed {
-        if let Err(error) = crate::db::session_transcripts::record_channel_clear_boundary(
-            shared.pg_pool.as_ref(),
-            &channel_id.get().to_string(),
-        )
-        .await
-        {
-            let _ =
-                release_mailbox_after_placeholder_post_failure(shared, &provider, channel_id).await;
-            return Err(HeadlessTurnStartError::Internal(format!(
-                "failed to persist routine agent identity context boundary: {error}"
-            )));
-        }
+    {
         let mut data = shared.core.lock().await;
-        if let Some(session) = data.sessions.get_mut(&channel_id) {
-            session.channel_name = channel_name_hint.clone();
+        if let Some(session) = data.sessions.get_mut(&channel_id)
+            && session.channel_name.as_deref() != Some(channel_name_hint.as_str())
+        {
+            session.channel_name = Some(channel_name_hint.clone());
             session.clear_provider_session();
             session_id = None;
             memento_context_loaded = false;
@@ -524,7 +502,10 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         )
     };
 
-    let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, early_thread_parent);
+    let fast_mode_channel_id = effective_fast_mode_channel_id(
+        channel_id,
+        super::super::super::resolve_thread_parent(&ctx.http, channel_id).await,
+    );
     super::super::super::commands::reset_provider_session_if_pending(
         &ctx.http,
         shared,
@@ -633,21 +614,10 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         });
     }
     let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
-    let retry_context = session_retry_context.as_ref();
-    let reply_context = retry_context.map(|c| c.formatted_context.clone());
+    let reply_context = session_retry_context
+        .as_ref()
+        .map(|context| context.formatted_context.clone());
     let goal_fresh = matches!(headless_goal_kind, GoalCommandKind::FreshStart);
-    // Routine metadata deterministically reasserts `dm_fresh` on routine runs,
-    // but a later user-authored turn in the same DM has no routine metadata.
-    // Persist both deliberate severances so that a later plain fresh turn cannot
-    // inject transcript pairs from before either one.
-    if (goal_fresh || dm_fresh)
-        && let Err(error) = record_fresh_session_context_boundary(shared, channel_id).await
-    {
-        let _ = release_mailbox_after_placeholder_post_failure(shared, &provider, channel_id).await;
-        return Err(HeadlessTurnStartError::Internal(format!(
-            "failed to persist fresh-session context boundary: {error}"
-        )));
-    }
     // #family-profile-probe (codex review P1/R2): a fresh DM routine turn must
     // route through the SAME proven fresh-session machinery as `/goal fresh`, so
     // it (a) thoroughly clears in-memory + DB + stale provider session via
@@ -658,7 +628,8 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     // `!force_fresh_provider_session`). Clearing the in-memory id alone is
     // insufficient on all three counts. Only the `/goal fresh` PROMPT REWRITE is
     // gated separately (goal-only) — the probe prompt must be sent verbatim.
-    let force_fresh_provider_session = goal_fresh || dm_fresh || routine_agent_identity_changed;
+    let force_fresh_provider_session = goal_fresh || dm_fresh;
+    let fresh_codex_goal_session_requested = force_fresh_provider_session;
     if force_fresh_provider_session {
         clear_codex_goal_start_provider_session(
             shared,
@@ -686,12 +657,10 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         std::borrow::Cow::Borrowed(prompt)
     };
     if session_id.is_none() {
-        if force_fresh_provider_session {
+        if fresh_codex_goal_session_requested {
             let ts = chrono::Local::now().format("%H:%M:%S");
             let reason = if goal_fresh {
                 "/goal fresh session request"
-            } else if routine_agent_identity_changed {
-                "routine agent identity change"
             } else {
                 "fresh DM routine turn"
             };
@@ -802,11 +771,9 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             .recall(RecallRequest {
                 provider: provider.clone(),
                 role_id: resolve_memory_role_id(role_binding.as_ref()),
-                channel_id: memory_channel_id,
-                channel_name: inherited_memory_channel_name
-                    .clone()
-                    .or_else(|| channel_name.clone()),
-                session_id: resolve_memory_session_id(session_id.as_deref(), memory_channel_id),
+                channel_id: channel_id.get(),
+                channel_name: channel_name.clone(),
+                session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
                 dispatch_profile,
                 user_text: prompt.to_string(),
                 mode: memento_recall_gate.mode,
@@ -868,17 +835,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         dispatch_profile,
         &memory_recall,
     );
-    let channel_recent_context = load_channel_recent_context(
-        shared.pg_pool.as_ref(),
-        channel_id,
-        session_id.as_deref(),
-        force_fresh_provider_session,
-        session_was_cleared,
-        dispatch_profile,
-        None,
-        session_retry_context.as_ref(),
-    )
-    .await;
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
@@ -888,10 +844,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     if let Some(reply_context) = reply_context {
         context_chunks.push(reply_context);
     }
-    if let Some(ref recent_context) = channel_recent_context {
-        recent_context.append_rendered_context_to(&mut context_chunks);
-    }
-    if let Some(ref knowledge) = memory_injection_plan.shared_knowledge_for_context {
+    if let Some(knowledge) = memory_injection_plan.shared_knowledge_for_context {
         context_chunks.push(knowledge.to_string());
     }
     if let Some(external_recall) = memory_injection_plan.external_recall_for_context {
@@ -915,7 +868,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         true,
     );
 
-    let sak_for_system = memory_injection_plan.sak_for_system_prompt();
+    let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
     let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
     let channel_participants = shared.channel_roster(channel_id, request_owner, request_owner_name);
@@ -936,7 +889,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         &channel_participants,
         &current_path,
         channel_id,
-        memory_scope_channel_id,
         token,
         role_binding.as_ref(),
         false,
@@ -947,9 +899,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         longterm_catalog_for_prompt,
         Some(&memory_settings),
         memento_mcp_available,
-        matches!(&provider, ProviderKind::Claude),
         recovery_context_for_manifest.as_ref(),
-        channel_recent_context.as_ref(),
         Some(&memory_recall_manifest),
         Some(&turn_id),
     );
@@ -1607,26 +1557,5 @@ mod dm_fresh_routine_tests {
     #[test]
     fn absent_metadata_is_not_reset() {
         assert!(!dm_fresh_routine_turn(None));
-    }
-
-    #[test]
-    fn fresh_dm_path_records_durable_boundary_before_provider_clear() {
-        let module_src = include_str!("headless_turn.rs");
-        let branch = module_src
-            .find("if (goal_fresh || dm_fresh)")
-            .expect("fresh DM/goal durable-boundary branch exists");
-        let branch_body = &module_src[branch..];
-        let boundary_call = format!("{}{}", "record_fresh_session_", "context_boundary(");
-        let boundary = branch_body
-            .find(&boundary_call)
-            .expect("fresh DM path records a durable transcript boundary");
-        let provider_clear = branch_body
-            .find("clear_codex_goal_start_provider_session(")
-            .expect("fresh DM path clears provider state");
-
-        assert!(
-            boundary < provider_clear,
-            "fresh DM durable boundary must be recorded before provider state is cleared"
-        );
     }
 }

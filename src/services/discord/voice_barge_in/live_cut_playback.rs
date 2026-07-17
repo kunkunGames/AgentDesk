@@ -35,7 +35,7 @@ impl VoiceBargeInRuntime {
         }
 
         let player: Arc<dyn BargeInPlayerStop> = player;
-        self.channels.playbacks.insert(
+        self.playbacks.insert(
             channel_id.get(),
             Arc::new(LivePlaybackSession {
                 player,
@@ -43,20 +43,16 @@ impl VoiceBargeInRuntime {
                 owner,
             }),
         );
-        self.channels.playback_started(channel_id);
     }
 
     #[allow(dead_code)] // #3034: test-only playback clear; prod uses clear_playback_if_owner
     pub(in crate::services::discord) fn clear_playback(&self, channel_id: ChannelId) {
-        self.channels.playbacks.remove(&channel_id.get());
-        self.channels.playback_finished(channel_id);
+        self.playbacks.remove(&channel_id.get());
     }
 
     pub(super) fn clear_playback_if_owner(&self, channel_id: ChannelId, owner: u64) {
-        self.channels
-            .playbacks
+        self.playbacks
             .remove_if(&channel_id.get(), |_, session| session.owner == Some(owner));
-        self.channels.playback_finished(channel_id);
     }
 
     /// #3908: register a progress/chime playback as the live barge-in handle,
@@ -76,11 +72,7 @@ impl VoiceBargeInRuntime {
     where
         P: BargeInPlayerStop + 'static,
     {
-        if self
-            .channels
-            .spoken_result_playbacks
-            .contains_key(&channel_id.get())
-        {
+        if self.spoken_result_playbacks.contains_key(&channel_id.get()) {
             tracing::debug!(
                 channel_id = channel_id.get(),
                 playback_id,
@@ -112,7 +104,6 @@ impl VoiceBargeInRuntime {
         }
 
         let playback = self
-            .channels
             .playbacks
             .get(&channel_id.get())
             .map(|entry| entry.value().clone())?;
@@ -125,8 +116,7 @@ impl VoiceBargeInRuntime {
         let pcm = pcm_i16_to_le_bytes(samples);
         match monitor.observe_pcm(&pcm, playback.player.as_ref(), &playback.cancellation) {
             Ok(Some(cut)) => {
-                self.channels.playbacks.remove(&channel_id.get());
-                self.channels.barged_in(channel_id);
+                self.playbacks.remove(&channel_id.get());
                 Some((cut, playback_owner))
             }
             Ok(None) => None,
@@ -146,8 +136,7 @@ impl VoiceBargeInRuntime {
         channel_id: ChannelId,
         sensitivity: BargeInSensitivity,
     ) -> Arc<std::sync::Mutex<LiveBargeInMonitor>> {
-        self.channels
-            .monitors
+        self.monitors
             .entry(channel_id.get())
             .or_insert_with(|| {
                 Arc::new(std::sync::Mutex::new(LiveBargeInMonitor::new(sensitivity)))
@@ -164,7 +153,7 @@ impl VoiceBargeInRuntime {
     }
 
     pub(super) fn update_existing_monitor_sensitivity(&self, sensitivity: BargeInSensitivity) {
-        for monitor in &self.channels.monitors {
+        for monitor in &self.monitors {
             lock_monitor(monitor.value()).set_sensitivity(sensitivity);
         }
     }
