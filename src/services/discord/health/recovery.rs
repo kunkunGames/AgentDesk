@@ -6,6 +6,7 @@ use poise::serenity_prelude as serenity;
 use serde::Serialize;
 use serenity::{ChannelId, MessageId};
 
+use crate::services::discord::inflight::opt_message_id;
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::discord::turn_view_reconciler::note_intake_turn_cleared_via_shared as tv_clear;
 use crate::services::discord::{self as discord, SharedData};
@@ -1456,7 +1457,8 @@ pub(super) fn rebind_error_status_and_message(
         | discord::recovery_engine::RebindError::InflightEpisodeChanged
         | discord::recovery_engine::RebindError::StaleOutputPath { .. }
         | discord::recovery_engine::RebindError::RuntimeBindingUnavailable { .. } => "409 Conflict",
-        discord::recovery_engine::RebindError::ChannelNotBound
+        discord::recovery_engine::RebindError::ChannelIdZero
+        | discord::recovery_engine::RebindError::ChannelNotBound
         | discord::recovery_engine::RebindError::ChannelNameMissing => "400 Bad Request",
         discord::recovery_engine::RebindError::Internal(_) => "500 Internal Server Error",
     };
@@ -1481,6 +1483,14 @@ mod rebind_error_status_tests {
         assert_eq!(status, "409 Conflict");
         assert!(message.contains("codex_tui"));
         assert!(message.contains("AgentDesk-codex-adk-cdx"));
+    }
+
+    #[test]
+    fn zero_channel_id_maps_to_bad_request() {
+        let (status, message) = rebind_error_status_and_message(&RebindError::ChannelIdZero);
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(message.contains("non-zero"));
     }
 }
 
@@ -2171,7 +2181,14 @@ async fn maybe_recover_completed_stale_leak(
         return false;
     };
 
-    let current_msg_id = MessageId::new(state.current_msg_id);
+    let Some(current_msg_id) = opt_message_id(state.current_msg_id) else {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            "leak recovery skipped because persisted current message id is zero"
+        );
+        return false;
+    };
     let current_message = if confirmed_chunks == 0 {
         let current_bot_user_id = match http.get_current_user().await {
             Ok(user) => user.id.get(),
