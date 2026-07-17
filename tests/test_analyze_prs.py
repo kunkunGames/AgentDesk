@@ -70,6 +70,11 @@ Update analyzer hygiene checks.
 
         self.assertTrue(has_non_empty_body_field(body, ["agent"]))
 
+    def test_empty_bold_sublabel_is_not_parent_field_content(self):
+        body = "- **Risk**:\n  - **Impact**:"
+
+        self.assertFalse(has_non_empty_body_field(body, ["risk", "risk assessment"]))
+
     def test_skipped_checks_and_reasons_label_allows_none(self):
         body = "- Skipped checks and reasons: none"
 
@@ -145,6 +150,16 @@ class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
         body = "- [x] **Duplicate PR guard:** I have checked for overlapping open PRs."
 
         self.assertTrue(has_duplicate_guard_ack(body))
+
+    def test_checked_template_duplicate_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **Duplicate PR guard**: I have checked for overlapping open PRs."
+
+        self.assertTrue(has_duplicate_guard_ack(body))
+
+    def test_unchecked_template_duplicate_guard_with_colon_outside_is_not_ack(self):
+        body = "- [ ] **Duplicate PR guard**: I have checked for overlapping open PRs."
+
+        self.assertFalse(has_duplicate_guard_ack(body))
 
     def test_filled_duplicate_overlap_field_is_acknowledgement(self):
         body = (
@@ -257,6 +272,15 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
         body = """
 - Duplicate/overlap check:
   - #1234 on branch codex/same-scope covers this no-change PR.
+"""
+
+        self.assertTrue(has_overlap_reference(body))
+
+    def test_overlap_reference_preserves_bold_detail_fields(self):
+        body = """
+- Duplicate/overlap check:
+- **PR**: #1234
+- **Branch**: feature/foo
 """
 
         self.assertTrue(has_overlap_reference(body))
