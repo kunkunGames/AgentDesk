@@ -168,10 +168,6 @@
   thread channel, belongs to the current runtime owner marker, and exists in the
   local tmux server. Fixed/main-channel sessions are not reap candidates for
   this path.
-- 2026-07-15 audited touch (#4553): config-gated Claude gateway-proxy env is
-  injected only when launching the provider process on its owning node. This is
-  **worker-local** per-session launch state; it adds no leader, lease, durable
-  routing, or cross-node ownership authority.
 - invariants: `heartbeat_capability_registry_routing`,
   `resource_locks_before_exclusive_editor_test`.
 - allowed_changes: `bugfix`, or `new_feature` only when routed through the
@@ -436,62 +432,6 @@
   before merging.
 
 ### Audited touches
-
-- #4263 (daily log-digest routine): adds a **LEADER-ONLY/SINGLETON** scheduled
-  monitoring routine. `server::worker_registry` already runs
-  `routine_runtime_loop` through `register_leader_tokio`, and the existing
-  PostgreSQL routine claim also locks the single attached routine row with
-  `FOR UPDATE SKIP LOCKED` plus `in_flight_run_id`; no second scheduler or
-  node-local timer is introduced. Operators attach exactly one daily row on the
-  cluster leader. The routine checkpoint suppresses a second KST-day dispatch,
-  while pending issue drafts are written on the active leader's runtime root.
-  On leader failover the normal stale-run recovery and routine lease semantics
-  remain authoritative. GitHub issue reads happen in the agent turn; issue
-  creation stays default-off and requires the literal human-confirmed gate.
-- #4262 (post-deploy functional smoke): adds a **WORKER-LOCAL deploy-tooling**
-  stage after `DEPLOY_OK` in `scripts/deploy-release.sh`. Each deployed node
-  probes its own loopback API on the configured `server.port`, local
-  health/detail relay-wedge markers, and local `dcserver.stdout.log`. Wedge
-  classification is skipped while startup recovery is incomplete; after full
-  recovery, a marker must persist across two snapshots separated by a 4-second
-  settle before it is reported. The one live E-1 relay round-trip is gated by
-  that node's public `cluster_standby == false` signal, resolves its dedicated
-  E2E channel from machine-local `agentdesk.yaml`, and requires the target cell's
-  loopback health/session snapshots to be idle. A standby, a node with no E2E
-  cell, or a cell with a foreign live turn therefore never receives an injected
-  turn. The stage owns no shared queue, durable lease, or singleton and is
-  deliberately fail-open: findings only warn, alert, and write a node-local
-  issue draft before peer propagation/source-manifest work continues. Core API
-  probes and the alert POST use same-port loopback `Origin` authentication
-  without reading or exposing `server.auth_token`.
-- #4250 merge-automation gh-off-tick cache + slow-hook WARN de-noise: the
-  `merge-automation` policy 5-minute tick now reads Codex-review snapshots from a
-  `kv_meta`-backed cache (30-minute TTL) and refreshes at most one PR per tick via
-  a persistent round-robin cursor, instead of fanning out synchronous `gh` API
-  calls every tick; each `gh` exec is bounded to 1500 ms; the engine's repeating
-  "policy hook slow" WARN is rate-limited to every Nth occurrence.
-  Classification: **leader-only / singleton-tick** — the merge-automation policy
-  tick is a single control-plane owner, and the new review-snapshot cache and
-  round-robin cursor live in `kv_meta` under the same ownership as the policy's
-  existing `kv_meta` state (merge-request queue, allowed authors); no new PG
-  lease, cross-node routing rule, or leader-election authority is introduced, and
-  the WARN de-noise counter is per-process worker-local.
-
-- #4237 DAVE/E2EE voice-close observability: the existing worker-local
-  `DriverDisconnect` handler now classifies Discord voice close codes 4016/4017,
-  records a structured counter event, and routes a deduplicated operator alert
-  through the existing notify bot. Multinode class: **worker-local likely** —
-  the metric, alert dedup, Songbird connection, and rejoin supervisor remain
-  pinned to the node/provider that owns the guild voice connection; no shared
-  authority, PG lease, or leader-only side effect changes.
-- #4249 PostgreSQL bootstrap timeout hardening runs migration/reseed on an eager
-  startup pool with a 10s acquire deadline, then eagerly activates the separate
-  runtime pool with the original 3s deadline before the shared six-attempt
-  retry/alert envelope can succeed. Typed `sqlx::Error::PoolTimedOut` failures
-  get timestamped, source-attributed bootstrap diagnostics.
-  Classification: **worker-local** — every node owns its own connection pool,
-  wait budget, retry loop, and stderr; this changes no shared row, schema,
-  leader-only side effect, cross-node routing rule, or PG lease/claim authority.
 
 - #4247 S0 reaction status-only containment removes the guild and DM reaction
   gateway subscriptions plus the only destructive `ReactionRemove` intake
@@ -1430,15 +1370,3 @@
   Gated on the default-OFF flag so the OFF path is byte-identical; introduces no
   new PG lease, cross-node read, leader-only side effect, singleton assumption, or
   PG schema change.
-- #4309 codex memento contract via prompt injection + version allowlist —
-  **Worker-local**: the provider-aware guidance is assembled per turn on the node
-  that owns the provider session, and the CLI allowlist is a node-local startup
-  compatibility check. No cross-node authority, lease, singleton, or routing
-  behavior is introduced.
-- #4305 fresh-session channel recent-pairs context injection — **Shared durable
-  boundary, worker-local assembly**: `/clear` and routine-agent identity changes
-  upsert a monotonic, database-server-timestamped row in
-  `channel_session_clear_boundaries`; any worker may perform that idempotent
-  write. Per-turn prompt assembly joins the shared boundary while reading
-  `session_transcripts`, so restart or worker reassignment cannot cross a clear.
-  This adds no leader lease, singleton, or routing decision.

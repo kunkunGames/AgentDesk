@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { Department } from "../../types";
@@ -8,8 +8,6 @@ import * as api from "../../api";
 import { DEPT_BLANK, DEPT_COLORS } from "./constants";
 import EmojiPicker from "./EmojiPicker";
 import type { Translator } from "./types";
-import { useFocusTrap } from "../common/overlay/useFocusTrap";
-import { useReturnFocus } from "../common/overlay/useReturnFocus";
 import {
   SurfaceActionButton,
   SurfaceNotice,
@@ -98,10 +96,8 @@ export default function DepartmentFormModal({
   const form = watch();
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const overlayRef = useFocusTrap(true);
-  useReturnFocus(true);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const colorButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const iconBtnId = useId();
 
   // sort_order 기반 다음 순번 계산
   const nextSortOrder = (() => {
@@ -316,11 +312,10 @@ export default function DepartmentFormModal({
             <div className="space-y-4">
               <div className="flex items-start gap-3">
                 <div>
-                  <label htmlFor={iconBtnId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     {tr("아이콘", "Icon")}
                   </label>
                   <EmojiPicker
-                    id={iconBtnId}
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
                     aria-label={

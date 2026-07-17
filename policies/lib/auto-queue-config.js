@@ -23,33 +23,24 @@ function configuredStaleDispatchedGraceMinutes() {
 
 function configuredStaleDispatchedTerminalStatuses() {
   var configured = agentdesk.config.get("staleDispatchedTerminalStatuses");
-  var rawStatuses = Array.isArray(configured)
-    ? configured
-    : (typeof configured === "string" ? configured.split(",") : ["cancelled", "failed"]);
-  var seen = Object.create(null);
-  var statuses = rawStatuses
+  var raw = typeof configured === "string" ? configured : "cancelled,failed";
+  var statuses = raw
+    .split(",")
     .map(function(status) { return String(status || "").trim().toLowerCase(); })
-    .filter(function(status) {
-      if (!/^[a-z_]+$/.test(status) || seen[status]) return false;
-      seen[status] = true;
-      return true;
-    });
+    .filter(function(status) { return /^[a-z_]+$/.test(status); });
   return statuses.length > 0 ? statuses : ["cancelled", "failed"];
 }
 
-function configuredSafeRuntimeBool(key) {
-  var configured = agentdesk.config.get(key);
-  if (configured === true || configured === "true") return true;
-  if (configured === false || configured === "false") return false;
-  return true;
-}
-
 function configuredStaleDispatchedRecoverNullDispatch() {
-  return configuredSafeRuntimeBool("staleDispatchedRecoverNullDispatch");
+  var configured = agentdesk.config.get("staleDispatchedRecoverNullDispatch");
+  if (configured === null || configured === undefined) return true;
+  return configured === true || configured === "true";
 }
 
 function configuredStaleDispatchedRecoverMissingDispatch() {
-  return configuredSafeRuntimeBool("staleDispatchedRecoverMissingDispatch");
+  var configured = agentdesk.config.get("staleDispatchedRecoverMissingDispatch");
+  if (configured === null || configured === undefined) return true;
+  return configured === true || configured === "true";
 }
 
 function staleDispatchedRecoveryConditionsSql() {

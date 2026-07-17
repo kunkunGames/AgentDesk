@@ -455,26 +455,6 @@
       "path": "migrations/postgres/0088_prompt_manifest_total_input_bytes.sql",
       "sha256": "0ccba730df1a6df1efd0c0262c81aa21c0cc5607e8b0bd1aeefc6e3fe6f23821",
       "version": 88
-    },
-    {
-      "path": "migrations/postgres/0089_drop_agent_archive.sql",
-      "sha256": "6d0a9dbbcd91bfc67e44d2ffa9cdf99e6a1479e0b787d3b866cdb439384c5e78",
-      "version": 89
-    },
-    {
-      "path": "migrations/postgres/0090_task_notification_terminal_delivery_fingerprint.sql",
-      "sha256": "2d71a1a62b2b317a6e2286d089bc78e18cb6526de2ad3eaf7f61735409b80fa1",
-      "version": 90
-    },
-    {
-      "path": "migrations/postgres/0091_session_transcripts_channel_idx.sql",
-      "sha256": "db6b606aaca960d9b716f2ad4d7c583922470ee51e966be7360e30245b787275",
-      "version": 91
-    },
-    {
-      "path": "migrations/postgres/0092_session_transcript_clear_boundaries.sql",
-      "sha256": "cd8e233b2879beb11d31b6a8e35e44f3927d2ba31658e8a3965d084676ffdc06",
-      "version": 92
     }
   ],
   "version": 1

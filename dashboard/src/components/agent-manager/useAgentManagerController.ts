@@ -53,6 +53,7 @@ export function useAgentManagerController({
   const [sortMode, setSortMode] = useState<AgentSortMode>("status");
   const [search, setSearch] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [dispatchOpen, setDispatchOpen] = useState(activeTab === "dispatch");
   const [agentModal, setAgentModal] = useState<{
@@ -213,6 +214,33 @@ export function useAgentManagerController({
     }
   }, [onAgentsChange]);
 
+  const handleArchiveAgent = useCallback(async (id: string) => {
+    setSaving(true);
+    try {
+      await api.archiveAgent(id, {
+        reason: "Archived from dashboard",
+      });
+      setConfirmArchiveId(null);
+      onAgentsChange();
+    } catch (error) {
+      console.error("Agent archive failed:", error);
+    } finally {
+      setSaving(false);
+    }
+  }, [onAgentsChange]);
+
+  const handleUnarchiveAgent = useCallback(async (id: string) => {
+    setSaving(true);
+    try {
+      await api.unarchiveAgent(id);
+      onAgentsChange();
+    } catch (error) {
+      console.error("Agent unarchive failed:", error);
+    } finally {
+      setSaving(false);
+    }
+  }, [onAgentsChange]);
+
   const openCreateDept = useCallback(() => {
     setDeptModal({ open: true, editDept: null });
   }, []);
@@ -298,6 +326,7 @@ export function useAgentManagerController({
   return {
     canShowDispatch,
     confirmDeleteId,
+    confirmArchiveId,
     deptModal,
     deptOrder,
     deptOrderDirty,
@@ -309,6 +338,7 @@ export function useAgentManagerController({
     agentModal,
     handleCancelOrder,
     handleDeleteAgent,
+    handleArchiveAgent,
     handleDragEnd,
     handleDragOver,
     handleDragStart,
@@ -317,6 +347,7 @@ export function useAgentManagerController({
     handleSaveAgent,
     handleSaveOrder,
     handleTabChange,
+    handleUnarchiveAgent,
     isKo,
     locale,
     dispatchOpen,
@@ -331,6 +362,7 @@ export function useAgentManagerController({
     saving,
     search,
     setAgentModal,
+    setConfirmArchiveId,
     setConfirmDeleteId,
     setDeptModal,
     setDeptTab,

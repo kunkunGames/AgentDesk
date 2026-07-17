@@ -10,9 +10,6 @@ use sqlx::Row;
 
 use crate::services::service_error::{ErrorCode, ServiceError, ServiceResult};
 
-mod runtime_config_put;
-use runtime_config_put::with_explicit_runtime_config_keys;
-
 const RETIRED_SETTINGS_JSON_KEYS: &[&str] = &[
     "autoUpdateEnabled",
     "autoUpdateNoticePending",
@@ -54,11 +51,6 @@ const RUNTIME_CONFIG_KEYS: &[&str] = &[
     "dispatchRateLimitGateEnabled",
     "dispatchRateLimitGateDangerPct",
 ];
-
-pub(crate) fn is_runtime_config_key(key: &str) -> bool {
-    RUNTIME_CONFIG_KEYS.contains(&key)
-}
-
 pub(crate) const RUNTIME_CONFIG_EXPLICIT_KEYS_META: &str = "__runtimeConfigExplicitKeys";
 
 /// Known individual `kv_meta` config keys surfaced to the dashboard and policy helpers.
@@ -466,10 +458,10 @@ impl SettingsService {
             let marked = with_explicit_runtime_config_keys(values.clone());
             let value_str = serde_json::to_string(&Value::Object(marked.clone()))
                 .unwrap_or_else(|_| "{}".to_string());
-            write_runtime_config_pg_async(pool, &value_str).await?;
+            write_runtime_config_pg_async(pool, &value_str, &marked).await?;
         } else {
             let value_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
-            write_runtime_config_pg_async(pool, &value_str).await?;
+            upsert_runtime_config_value_pg_async(pool, &value_str).await?;
         }
         Ok(SettingsOkResponse::ok())
     }
@@ -681,63 +673,94 @@ async fn load_pg_kv_values(pool: &sqlx::PgPool) -> ServiceResult<HashMap<String,
     Ok(values)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RuntimeConfigKvWrite {
-    UpsertBlob(String),
-    DeleteScalar(&'static str),
+async fn upsert_runtime_config_value_pg_async(
+    pool: &sqlx::PgPool,
+    value_str: &str,
+) -> ServiceResult<()> {
+    sqlx::query(
+        "INSERT INTO kv_meta (key, value, expires_at)
+         VALUES ($1, $2, NULL)
+         ON CONFLICT (key) DO UPDATE
+             SET value = EXCLUDED.value,
+                 expires_at = EXCLUDED.expires_at",
+    )
+    .bind("runtime-config")
+    .bind(value_str)
+    .execute(pool)
+    .await
+    .map_err(|error| {
+        ServiceError::internal(format!("{error}"))
+            .with_code(ErrorCode::Database)
+            .with_operation("put_runtime_config.upsert_runtime_config_pg")
+    })?;
+    Ok(())
 }
 
-fn runtime_config_write_plan(value: String) -> Vec<RuntimeConfigKvWrite> {
-    std::iter::once(RuntimeConfigKvWrite::UpsertBlob(value))
-        .chain(
-            RUNTIME_CONFIG_KEYS
-                .iter()
-                .copied()
-                .map(RuntimeConfigKvWrite::DeleteScalar),
-        )
-        .collect()
-}
-
-async fn write_runtime_config_pg_async(pool: &sqlx::PgPool, value_str: &str) -> ServiceResult<()> {
+async fn write_runtime_config_pg_async(
+    pool: &sqlx::PgPool,
+    value_str: &str,
+    values: &Map<String, Value>,
+) -> ServiceResult<()> {
     let mut tx = pool.begin().await.map_err(|error| {
         ServiceError::internal(format!("begin runtime-config tx: {error}"))
             .with_code(ErrorCode::Database)
             .with_operation("put_runtime_config.begin_pg_tx")
     })?;
 
-    for write in runtime_config_write_plan(value_str.to_string()) {
-        match write {
-            RuntimeConfigKvWrite::UpsertBlob(value) => {
-                sqlx::query(
-                    "INSERT INTO kv_meta (key, value, expires_at)
-                     VALUES ($1, $2, NULL)
-                     ON CONFLICT (key) DO UPDATE
-                         SET value = EXCLUDED.value,
-                             expires_at = EXCLUDED.expires_at",
-                )
-                .bind("runtime-config")
-                .bind(value)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    ServiceError::internal(format!("{error}"))
-                        .with_code(ErrorCode::Database)
-                        .with_operation("put_runtime_config.upsert_runtime_config_pg")
-                })?;
-            }
-            RuntimeConfigKvWrite::DeleteScalar(key) => {
-                sqlx::query("DELETE FROM kv_meta WHERE key = $1")
-                    .bind(key)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|error| {
-                        ServiceError::internal(format!("{error}"))
-                            .with_code(ErrorCode::Database)
-                            .with_operation("put_runtime_config.delete_scalar_pg")
-                            .with_context("key", key)
-                    })?;
-            }
+    sqlx::query(
+        "INSERT INTO kv_meta (key, value, expires_at)
+         VALUES ($1, $2, NULL)
+         ON CONFLICT (key) DO UPDATE
+             SET value = EXCLUDED.value,
+                 expires_at = EXCLUDED.expires_at",
+    )
+    .bind("runtime-config")
+    .bind(value_str)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::internal(format!("{error}"))
+            .with_code(ErrorCode::Database)
+            .with_operation("put_runtime_config.upsert_runtime_config_pg")
+    })?;
+
+    for key in RUNTIME_CONFIG_KEYS {
+        sqlx::query("DELETE FROM kv_meta WHERE key = $1")
+            .bind(*key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                ServiceError::internal(format!("{error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("put_runtime_config.delete_scalar_pg")
+                    .with_context("key", key)
+            })?;
+    }
+
+    for (key, value) in values {
+        if !RUNTIME_CONFIG_KEYS.contains(&key.as_str()) {
+            continue;
         }
+        let Some(text) = runtime_scalar_to_string(value) else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO kv_meta (key, value, expires_at)
+             VALUES ($1, $2, NULL)
+             ON CONFLICT (key) DO UPDATE
+                 SET value = EXCLUDED.value,
+                     expires_at = EXCLUDED.expires_at",
+        )
+        .bind(key)
+        .bind(&text)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            ServiceError::internal(format!("{error}"))
+                .with_code(ErrorCode::Database)
+                .with_operation("put_runtime_config.upsert_scalar_pg")
+                .with_context("key", key)
+        })?;
     }
 
     tx.commit().await.map_err(|error| {
@@ -919,13 +942,37 @@ pub(crate) fn explicit_runtime_config_keys(values: &Map<String, Value>) -> HashS
         .collect()
 }
 
+fn with_explicit_runtime_config_keys(mut values: Map<String, Value>) -> Map<String, Value> {
+    let explicit_keys = explicit_runtime_config_keys(&values);
+    let mut keys = explicit_keys.into_iter().collect::<Vec<_>>();
+    keys.sort();
+    values.insert(
+        RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
+        Value::Array(keys.into_iter().map(Value::String).collect()),
+    );
+    values
+}
+
+fn runtime_scalar_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
 fn write_runtime_config_pg(
     pg_pool: &sqlx::PgPool,
     values: &Map<String, Value>,
 ) -> ServiceResult<()> {
     let value_str =
         serde_json::to_string(&Value::Object(values.clone())).unwrap_or_else(|_| "{}".to_string());
-    let write_plan = runtime_config_write_plan(value_str);
+    let scalar_values = values
+        .iter()
+        .filter(|(key, _)| RUNTIME_CONFIG_KEYS.contains(&key.as_str()))
+        .filter_map(|(key, value)| runtime_scalar_to_string(value).map(|text| (key.clone(), text)))
+        .collect::<Vec<_>>();
 
     crate::utils::async_bridge::block_on_pg_result(
         pg_pool,
@@ -935,32 +982,40 @@ fn write_runtime_config_pg(
                 .await
                 .map_err(|error| format!("begin runtime-config pg tx: {error}"))?;
 
-            for write in write_plan {
-                match write {
-                    RuntimeConfigKvWrite::UpsertBlob(value) => {
-                        sqlx::query(
-                            "INSERT INTO kv_meta (key, value, expires_at)
-                             VALUES ($1, $2, NULL)
-                             ON CONFLICT (key) DO UPDATE
-                                 SET value = EXCLUDED.value,
-                                     expires_at = EXCLUDED.expires_at",
-                        )
-                        .bind("runtime-config")
-                        .bind(value)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|error| format!("upsert pg runtime-config: {error}"))?;
-                    }
-                    RuntimeConfigKvWrite::DeleteScalar(key) => {
-                        sqlx::query("DELETE FROM kv_meta WHERE key = $1")
-                            .bind(key)
-                            .execute(&mut *tx)
-                            .await
-                            .map_err(|error| {
-                                format!("delete pg runtime-config scalar {key}: {error}")
-                            })?;
-                    }
-                }
+            sqlx::query(
+                "INSERT INTO kv_meta (key, value, expires_at)
+                 VALUES ($1, $2, NULL)
+                 ON CONFLICT (key) DO UPDATE
+                     SET value = EXCLUDED.value,
+                         expires_at = EXCLUDED.expires_at",
+            )
+            .bind("runtime-config")
+            .bind(&value_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("upsert pg runtime-config: {error}"))?;
+
+            for key in RUNTIME_CONFIG_KEYS {
+                sqlx::query("DELETE FROM kv_meta WHERE key = $1")
+                    .bind(*key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| format!("delete pg runtime-config scalar {key}: {error}"))?;
+            }
+
+            for (key, text) in scalar_values {
+                sqlx::query(
+                    "INSERT INTO kv_meta (key, value, expires_at)
+                     VALUES ($1, $2, NULL)
+                     ON CONFLICT (key) DO UPDATE
+                         SET value = EXCLUDED.value,
+                             expires_at = EXCLUDED.expires_at",
+                )
+                .bind(&key)
+                .bind(&text)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| format!("upsert pg runtime-config scalar {key}: {error}"))?;
             }
 
             tx.commit()
@@ -1037,7 +1092,7 @@ fn seeded_runtime_config_map(
             current.insert(key, value);
         }
     }
-    if !config.runtime.reset_overrides_on_restart && has_explicit_meta {
+    if !config.runtime.reset_overrides_on_restart && !explicit_keys.is_empty() {
         let mut keys = explicit_keys.into_iter().collect::<Vec<_>>();
         keys.sort();
         current.insert(
@@ -1061,111 +1116,6 @@ fn seeded_runtime_config_map(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    struct TestDatabase {
-        admin_url: String,
-        database_name: String,
-        database_url: String,
-    }
-
-    impl TestDatabase {
-        async fn create() -> Self {
-            let admin_url = crate::dispatch::test_support::postgres_admin_database_url();
-            let database_name = format!("agentdesk_settings_{}", uuid::Uuid::new_v4().simple());
-            let database_url = format!(
-                "{}/{}",
-                crate::dispatch::test_support::postgres_base_database_url(),
-                database_name
-            );
-            crate::db::postgres::create_test_database(
-                &admin_url,
-                &database_name,
-                "settings runtime-config pg tests",
-            )
-            .await
-            .expect("create settings postgres test db");
-            Self {
-                admin_url,
-                database_name,
-                database_url,
-            }
-        }
-
-        async fn connect(&self) -> sqlx::PgPool {
-            let pool = crate::db::postgres::connect_test_pool(
-                &self.database_url,
-                "settings runtime-config pg tests",
-            )
-            .await
-            .expect("connect settings postgres test db");
-            sqlx::query(
-                "CREATE TABLE kv_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    expires_at TIMESTAMPTZ
-                )",
-            )
-            .execute(&pool)
-            .await
-            .expect("create settings kv_meta table");
-            pool
-        }
-
-        async fn drop(self) {
-            crate::db::postgres::drop_test_database(
-                &self.admin_url,
-                &self.database_name,
-                "settings runtime-config pg tests",
-            )
-            .await
-            .expect("drop settings postgres test db");
-        }
-    }
-
-    async fn upsert_test_kv(pool: &sqlx::PgPool, key: &str, value: &str) {
-        sqlx::query(
-            "INSERT INTO kv_meta (key, value, expires_at)
-             VALUES ($1, $2, NULL)
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(pool)
-        .await
-        .unwrap_or_else(|error| panic!("upsert test kv_meta {key}: {error}"));
-    }
-
-    async fn seed_runtime_scalar_mirrors(pool: &sqlx::PgPool) {
-        for key in RUNTIME_CONFIG_KEYS {
-            upsert_test_kv(pool, key, &format!("legacy-{key}")).await;
-        }
-    }
-
-    async fn assert_runtime_blob_and_no_mirrors(pool: &sqlx::PgPool, expected: &Value) {
-        let blob = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM kv_meta WHERE key = 'runtime-config'",
-        )
-        .fetch_one(pool)
-        .await
-        .expect("load authoritative runtime-config blob");
-        assert_eq!(
-            serde_json::from_str::<Value>(&blob).expect("parse authoritative runtime-config blob"),
-            *expected
-        );
-
-        for key in RUNTIME_CONFIG_KEYS {
-            let scalar =
-                sqlx::query_scalar::<_, String>("SELECT value FROM kv_meta WHERE key = $1")
-                    .bind(key)
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap_or_else(|error| panic!("load runtime scalar {key}: {error}"));
-            assert_eq!(
-                scalar, None,
-                "legacy runtime scalar {key} must stay deleted"
-            );
-        }
-    }
 
     #[test]
     fn settings_response_dtos_serialize_existing_contract_fields() {
@@ -1295,24 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn seeded_runtime_config_preserves_intentional_empty_explicit_metadata() {
-        let mut saved_obj = runtime_config_defaults_map(&crate::config::Config::default());
-        saved_obj.insert("maxEntryRetries".to_string(), json!(8));
-        saved_obj.insert(RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(), json!([]));
-        let mut config = crate::config::Config::default();
-        config.runtime.max_entry_retries = Some(4);
-
-        let seeded = seeded_runtime_config_map(Some(saved_obj), &config);
-
-        assert_eq!(seeded.get("maxEntryRetries"), Some(&json!(4)));
-        assert_eq!(
-            seeded.get(RUNTIME_CONFIG_EXPLICIT_KEYS_META),
-            Some(&json!([])),
-            "an empty dashboard list must remain authoritative after startup"
-        );
-    }
-
-    #[test]
     fn explicit_runtime_config_keys_respects_payload_metadata() {
         let mut values = runtime_config_defaults_map(&crate::config::Config::default());
         values.insert(
@@ -1328,239 +1260,14 @@ mod tests {
     }
 
     #[test]
-    fn metadata_less_runtime_config_marks_only_known_body_keys_explicit() {
-        let values = json!({"maxEntryRetries": 7, "privateBlobField": true})
-            .as_object()
-            .cloned()
-            .expect("runtime config object");
+    fn explicit_runtime_config_keys_without_metadata_is_empty() {
+        let values = runtime_config_defaults_map(&crate::config::Config::default());
 
-        let marked = with_explicit_runtime_config_keys(values);
+        let keys = explicit_runtime_config_keys(&values);
 
-        assert_eq!(
-            marked.get(RUNTIME_CONFIG_EXPLICIT_KEYS_META),
-            Some(&json!(["maxEntryRetries"]))
-        );
-    }
-
-    #[test]
-    fn runtime_config_key_lookup_exposes_only_known_value_keys() {
-        assert!(is_runtime_config_key("maxEntryRetries"));
-        assert!(is_runtime_config_key("staleDispatchedRecoverNullDispatch"));
-        assert!(!is_runtime_config_key("runtime-config"));
-        assert!(!is_runtime_config_key(RUNTIME_CONFIG_EXPLICIT_KEYS_META));
-        assert!(!is_runtime_config_key("privateBlobField"));
-    }
-
-    #[test]
-    fn runtime_config_write_plan_has_one_blob_authority_and_cleanup_only() {
-        let plan = runtime_config_write_plan(r#"{"maxEntryRetries":7}"#.to_string());
-
-        assert_eq!(
-            plan.first(),
-            Some(&RuntimeConfigKvWrite::UpsertBlob(
-                r#"{"maxEntryRetries":7}"#.to_string()
-            ))
-        );
-        assert_eq!(plan.len(), RUNTIME_CONFIG_KEYS.len() + 1);
         assert!(
-            plan[1..]
-                .iter()
-                .all(|write| matches!(write, RuntimeConfigKvWrite::DeleteScalar(_)))
+            keys.is_empty(),
+            "full saved runtime-config values are not explicit unless the metadata says so"
         );
-        for key in RUNTIME_CONFIG_KEYS {
-            assert!(plan.contains(&RuntimeConfigKvWrite::DeleteScalar(*key)));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn put_runtime_config_object_and_non_object_keep_only_blob_authority() {
-        let database = TestDatabase::create().await;
-        let pool = database.connect().await;
-        upsert_test_kv(&pool, "runtime-config", r#"{"old":true}"#).await;
-        seed_runtime_scalar_mirrors(&pool).await;
-        let service = SettingsService::new(
-            Some(pool.clone()),
-            Arc::new(crate::config::Config::default()),
-        );
-
-        service
-            .put_runtime_config(json!({
-                "maxEntryRetries": 7,
-                "staleDispatchedRecoverNullDispatch": false,
-                "staleDispatchedTerminalStatuses": ["failed", "expired"]
-            }))
-            .await
-            .expect("write object runtime-config through SettingsService");
-        assert_runtime_blob_and_no_mirrors(
-            &pool,
-            &json!({
-                "maxEntryRetries": 7,
-                "staleDispatchedRecoverNullDispatch": false,
-                "staleDispatchedTerminalStatuses": ["failed", "expired"],
-                "__runtimeConfigExplicitKeys": [
-                    "maxEntryRetries",
-                    "staleDispatchedRecoverNullDispatch",
-                    "staleDispatchedTerminalStatuses"
-                ]
-            }),
-        )
-        .await;
-
-        service
-            .put_runtime_config(json!({
-                "maxEntryRetries": 8,
-                "__runtimeConfigExplicitKeys": []
-            }))
-            .await
-            .expect("clear dashboard runtime override through SettingsService");
-        assert_runtime_blob_and_no_mirrors(
-            &pool,
-            &json!({"maxEntryRetries": 8, "__runtimeConfigExplicitKeys": []}),
-        )
-        .await;
-
-        seed_runtime_scalar_mirrors(&pool).await;
-        service
-            .put_runtime_config(json!(["non-object", 7, false]))
-            .await
-            .expect("write non-object runtime-config through SettingsService");
-        assert_runtime_blob_and_no_mirrors(&pool, &json!(["non-object", 7, false])).await;
-
-        drop(service);
-        pool.close().await;
-        database.drop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_runtime_config_writer_keeps_blob_authority_without_mirror_reinsertion() {
-        let database = TestDatabase::create().await;
-        let pool = database.connect().await;
-        upsert_test_kv(&pool, "runtime-config", r#"{"maxEntryRetries":99}"#).await;
-        seed_runtime_scalar_mirrors(&pool).await;
-
-        seed_runtime_config_defaults_pg(&pool, &crate::config::Config::default())
-            .await
-            .expect("seed runtime-config through startup sync writer");
-
-        assert_runtime_blob_and_no_mirrors(&pool, &json!({"maxEntryRetries": 99})).await;
-
-        pool.close().await;
-        database.drop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cli_put_get_set_round_trip_survives_startup_seed() {
-        let database = TestDatabase::create().await;
-        let pool = database.connect().await;
-        let mut config = crate::config::Config::default();
-        config.runtime.max_entry_retries = Some(3);
-        let service = SettingsService::new(Some(pool.clone()), Arc::new(config.clone()));
-        let cli_put = crate::cli::client::runtime_config_payload(json!({
-            "maxEntryRetries": 7
-        }))
-        .expect("normalize CLI PUT body");
-
-        service
-            .put_runtime_config(cli_put)
-            .await
-            .expect("write metadata-less CLI runtime config");
-        let cli_get = serde_json::to_value(
-            service
-                .get_runtime_config()
-                .await
-                .expect("GET runtime config after CLI PUT"),
-        )
-        .expect("serialize runtime config response");
-        let cli_round_trip = crate::cli::client::runtime_config_payload(cli_get)
-            .expect("preserve explicit keys in CLI GET-to-SET payload");
-        service
-            .put_runtime_config(cli_round_trip)
-            .await
-            .expect("write CLI GET-to-SET runtime config");
-        seed_runtime_config_defaults_pg(&pool, &config)
-            .await
-            .expect("run startup runtime-config seed");
-
-        let seeded = service
-            .get_runtime_config()
-            .await
-            .expect("GET runtime config after startup seed");
-        assert_eq!(seeded.current.get("maxEntryRetries"), Some(&json!(7)));
-        assert_eq!(seeded.explicit_keys, vec!["maxEntryRetries"]);
-
-        drop(service);
-        pool.close().await;
-        database.drop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_config_delete_failure_rolls_back_blob_and_every_mirror() {
-        let database = TestDatabase::create().await;
-        let pool = database.connect().await;
-        let old_blob = r#"{"maxEntryRetries":4,"marker":"old"}"#;
-        upsert_test_kv(&pool, "runtime-config", old_blob).await;
-        seed_runtime_scalar_mirrors(&pool).await;
-        sqlx::query(
-            r#"
-            CREATE FUNCTION reject_runtime_scalar_delete() RETURNS trigger AS $$
-            BEGIN
-                IF OLD.key = 'maxEntryRetries' THEN
-                    RAISE EXCEPTION 'injected runtime scalar delete failure';
-                END IF;
-                RETURN OLD;
-            END;
-            $$ LANGUAGE plpgsql;
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("install runtime scalar delete fault function");
-        sqlx::query(
-            "CREATE TRIGGER reject_runtime_scalar_delete_trigger
-             BEFORE DELETE ON kv_meta
-             FOR EACH ROW EXECUTE FUNCTION reject_runtime_scalar_delete()",
-        )
-        .execute(&pool)
-        .await
-        .expect("install runtime scalar delete fault trigger");
-        let service = SettingsService::new(
-            Some(pool.clone()),
-            Arc::new(crate::config::Config::default()),
-        );
-
-        service
-            .put_runtime_config(json!({"maxEntryRetries": 12}))
-            .await
-            .expect_err("injected delete failure must abort runtime-config write");
-
-        let blob = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM kv_meta WHERE key = 'runtime-config'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("load blob after rollback");
-        assert_eq!(
-            blob, old_blob,
-            "blob upsert must roll back with mirror deletes"
-        );
-        for key in RUNTIME_CONFIG_KEYS {
-            let scalar =
-                sqlx::query_scalar::<_, String>("SELECT value FROM kv_meta WHERE key = $1")
-                    .bind(key)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or_else(|load_error| {
-                        panic!("load runtime scalar {key} after rollback: {load_error}")
-                    });
-            assert_eq!(
-                scalar,
-                format!("legacy-{key}"),
-                "runtime scalar {key} must survive transaction rollback"
-            );
-        }
-
-        drop(service);
-        pool.close().await;
-        database.drop().await;
     }
 }

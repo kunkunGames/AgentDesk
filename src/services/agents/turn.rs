@@ -372,10 +372,8 @@ fn ansi_escape_re() -> &'static Regex {
 fn auth_header_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)((?:authorization|cookie|set-cookie)\s*:\s*(?:[a-z][a-z0-9._~+/-]*\s+)?)[^\r\n]+",
-        )
-        .expect("valid auth header regex")
+        Regex::new(r"(?i)(authorization\s*:\s*(?:[a-z][a-z0-9._~+/-]*\s+)?)[^\r\n]+")
+            .expect("valid auth header regex")
     })
 }
 
@@ -779,7 +777,7 @@ mod tests {
     #[test]
     fn normalize_recent_output_masks_auth_headers_and_key_assignments() {
         let output = normalize_recent_output(
-            "\u{1b}[32mAuthorization: Bearer secret-token\u{1b}[0m\nAuthorization: Bot bot-secret\nauthorization: basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\", response=\"digest-secret\"\nauthorization: plain-secret\nCookie: session_id=cookie-secret\nSet-Cookie: auth_token=set-cookie-secret; Secure\nOPENAI_API_KEY=sk-secret\nvisible line",
+            "\u{1b}[32mAuthorization: Bearer secret-token\u{1b}[0m\nAuthorization: Bot bot-secret\nauthorization: basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\", response=\"digest-secret\"\nauthorization: plain-secret\nOPENAI_API_KEY=sk-secret\nvisible line",
         )
         .expect("normalized output");
 
@@ -788,11 +786,7 @@ mod tests {
         assert!(output.contains("authorization: basic [REDACTED]"));
         assert!(output.contains("authorization: Digest [REDACTED]"));
         assert!(output.contains("authorization: [REDACTED]"));
-        assert!(output.contains("Cookie: [REDACTED]"));
-        assert!(output.contains("Set-Cookie: [REDACTED]"));
         assert!(output.contains("OPENAI_API_KEY=[REDACTED]"));
-        assert!(!output.contains("cookie-secret"));
-        assert!(!output.contains("set-cookie-secret"));
         assert!(output.contains("visible line"));
         assert!(!output.contains("secret-token"));
         assert!(!output.contains("bot-secret"));

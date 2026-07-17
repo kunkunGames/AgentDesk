@@ -6,8 +6,6 @@ import {
   getDisplayMeetingReferenceHashes,
 } from "./meetingReferenceHash";
 import MarkdownContent from "./common/MarkdownContent";
-import { useFocusTrap } from "./common/overlay/useFocusTrap";
-import { useReturnFocus } from "./common/overlay/useReturnFocus";
 import {
   SurfaceActionButton,
   SurfaceCard,
@@ -35,8 +33,7 @@ interface Props {
 
 export default function MeetingDetailModal({ meeting, onClose }: Props) {
   const { t, locale } = useI18n();
-  const overlayRef = useFocusTrap(true);
-  useReturnFocus(true);
+  const overlayRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
