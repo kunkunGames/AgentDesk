@@ -33,14 +33,12 @@ export function StackedSpriteIcon({ sprites }: { sprites: [number, number] }) {
 }
 
 export default function EmojiPicker({
-  id,
   value,
   onChange,
   size = "md",
   "aria-label": ariaLabel,
   dialogLabel,
 }: {
-  id?: string;
   value: string;
   onChange: (emoji: string) => void;
   size?: "sm" | "md";
@@ -88,7 +86,6 @@ export default function EmojiPicker({
   return (
     <div className="relative" ref={ref}>
       <button
-        id={id}
         ref={buttonRef}
         type="button"
         onClick={() => setOpen(!open)}

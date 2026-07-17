@@ -24,6 +24,7 @@ Reference: [`docs/agent-onboarding.md`](../agent-onboarding.md).
 | Total wizard runs       | TBD |
 | Total agents created    | TBD |
 | Total duplicates run    | TBD |
+| Total archive / unarchive cycles | TBD |
 
 ---
 
@@ -108,10 +109,26 @@ configured channels.
 
 ---
 
-## 5. Duplicate Sensitive-Field Audit
+## 5. Archive / Unarchive Cycle Health
+
+| Quantity                                              | Value |
+|-------------------------------------------------------|-------|
+| Archives initiated                                    | TBD   |
+| Archives rejected (`409` due to active turn)          | TBD   |
+| Archives that snapshotted `discord_action != none`    | TBD   |
+| Unarchives initiated                                  | TBD   |
+| Unarchives whose restored config diffs from snapshot  | TBD   |
+| Median archive → unarchive interval                   | TBD   |
+
+Action threshold: any non-zero "restored config diffs from snapshot" row
+indicates `agent_archive` snapshot loss; file an immediate fix.
+
+---
+
+## 6. Duplicate Sensitive-Field Audit
 
 Verifies the duplicate-time deny-list documented in
-`docs/agent-onboarding.md` §6.
+`docs/agent-onboarding.md` §6.3.
 
 | Forbidden field in body | Times observed | Times leaked into new row |
 |-------------------------|----------------|---------------------------|
@@ -125,16 +142,17 @@ Any "Times leaked" > 0 is a security regression — file a P0.
 
 ---
 
-## 6. Findings
+## 7. Findings
 
 - TBD — headline finding on rollback rate.
 - TBD — headline finding on legacy CLI fallback frequency.
 - TBD — headline finding on time-to-first-message.
+- TBD — headline finding on archive/unarchive health.
 - TBD — headline finding on duplicate sensitive-field audit.
 
 ---
 
-## 7. Action Items
+## 8. Action Items
 
 - [ ] TBD
 - [ ] TBD
@@ -142,7 +160,7 @@ Any "Times leaked" > 0 is a security regression — file a P0.
 
 ---
 
-## 8. Appendix: Source Queries
+## 9. Appendix: Source Queries
 
 Place the SQL / shell used to compute each section here so future readers
 can reproduce the numbers exactly.
@@ -159,6 +177,6 @@ ls -1 ~/.adk/release/config/.audit/agent-setup-*.json | wc -l
 
 ```bash
 # Time-to-first-message — pseudo
-# join agents.created_at with message_outbox.first_at
+# join agent_archive (or agent created_at) with message_outbox.first_at
 # TBD
 ```

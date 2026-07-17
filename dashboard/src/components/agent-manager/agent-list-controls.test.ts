@@ -36,6 +36,7 @@ const agents: Agent[] = [
     agentdesk_working_count: 5,
     stats_tasks_done: 10,
     created_at: 1700000000,
+    archived_at: null,
   }),
   makeAgent({
     id: "b",
@@ -56,8 +57,10 @@ const agents: Agent[] = [
     alias: "CC",
     department_id: "dev",
     department_name_ko: "개발",
-    status: "offline",
+    status: "archived",
     stats_xp: 200,
+    archived_at: 1700000500,
+    archive_reason: "old",
   }),
 ];
 
@@ -74,7 +77,7 @@ describe("filterAgents", () => {
   it("filters by status", () => {
     const result = filterAgents(agents, {
       deptTab: "all",
-      statusFilter: "offline",
+      statusFilter: "archived",
       search: "",
     });
     expect(result.map((a) => a.id)).toEqual(["c"]);
@@ -99,7 +102,7 @@ describe("filterAgents", () => {
 });
 
 describe("sortAgents", () => {
-  it("sorts by status with working first and offline last", () => {
+  it("sorts by status with working first, archived last", () => {
     expect(sortAgents(agents, "status").map((a) => a.id)).toEqual([
       "b",
       "a",
@@ -135,6 +138,13 @@ describe("sortAgents", () => {
     ]);
   });
 
+  it("sorts by archived descending", () => {
+    expect(sortAgents(agents, "archived").map((a) => a.id)).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
 });
 
 describe("filterAndSortAgents", () => {

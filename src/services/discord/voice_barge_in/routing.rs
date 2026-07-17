@@ -63,11 +63,7 @@ impl VoiceBargeInRuntime {
         &self,
         source_channel_id: ChannelId,
     ) -> Option<ChannelId> {
-        if let Some(route) = self
-            .channels
-            .active_voice_routes
-            .get(&source_channel_id.get())
-        {
+        if let Some(route) = self.active_voice_routes.get(&source_channel_id.get()) {
             return Some(route.channel_id);
         }
         let config = self.cached_config().await;
@@ -83,7 +79,6 @@ impl VoiceBargeInRuntime {
         source_channel_id: ChannelId,
     ) -> Option<ChannelId> {
         let routed_channel_id = self
-            .channels
             .active_voice_routes
             .get(&source_channel_id.get())
             .map(|entry| entry.value().channel_id);
@@ -123,7 +118,6 @@ impl VoiceBargeInRuntime {
         expected_agent_id: Option<&str>,
     ) -> Option<ChannelId> {
         let active_matches: Vec<(u64, String)> = self
-            .channels
             .active_voice_routes
             .iter()
             .filter(|entry| entry.value().channel_id == background_channel_id)
@@ -227,7 +221,7 @@ impl VoiceBargeInRuntime {
                 .map(|channel_id| (agent.id.clone(), channel_id))
         }) {
             self.bind_routed_voice_context(source_channel_id, target_channel_id);
-            self.channels.active_voice_routes.insert(
+            self.active_voice_routes.insert(
                 source_channel_id.get(),
                 ActiveVoiceRoute {
                     agent_id,
@@ -258,7 +252,6 @@ impl VoiceBargeInRuntime {
         }
 
         let active_context = self
-            .channels
             .active_voice_routes
             .get(&source_channel_id.get())
             .map(|entry| VoiceActiveAgentContext {
@@ -275,7 +268,7 @@ impl VoiceBargeInRuntime {
                 }
                 let target_channel_id = ChannelId::new(route.channel_id);
                 self.bind_routed_voice_context(source_channel_id, target_channel_id);
-                self.channels.active_voice_routes.insert(
+                self.active_voice_routes.insert(
                     source_channel_id.get(),
                     ActiveVoiceRoute {
                         agent_id: route.agent_id,
@@ -295,7 +288,7 @@ impl VoiceBargeInRuntime {
             }) => {
                 let target_channel_id = ChannelId::new(channel_id);
                 self.bind_routed_voice_context(source_channel_id, target_channel_id);
-                self.channels.active_voice_routes.insert(
+                self.active_voice_routes.insert(
                     source_channel_id.get(),
                     ActiveVoiceRoute {
                         agent_id,
@@ -347,10 +340,14 @@ impl VoiceBargeInRuntime {
         source_channel_id: ChannelId,
         target_channel_id: ChannelId,
     ) {
-        let Some(guild_id) = self.channels.guild_id(source_channel_id) else {
+        let Some(guild_id) = self
+            .voice_guilds
+            .get(&source_channel_id.get())
+            .map(|entry| *entry.value())
+        else {
             return;
         };
-        self.channels.register_context(target_channel_id, guild_id);
+        self.voice_guilds.insert(target_channel_id.get(), guild_id);
     }
 
     pub(super) fn voice_turn_guild_id(
@@ -358,9 +355,14 @@ impl VoiceBargeInRuntime {
         source_channel_id: ChannelId,
         target_channel_id: ChannelId,
     ) -> Option<GuildId> {
-        self.channels
-            .guild_id(source_channel_id)
-            .or_else(|| self.channels.guild_id(target_channel_id))
+        self.voice_guilds
+            .get(&source_channel_id.get())
+            .map(|entry| *entry.value())
+            .or_else(|| {
+                self.voice_guilds
+                    .get(&target_channel_id.get())
+                    .map(|entry| *entry.value())
+            })
     }
 
     pub(super) async fn ask_for_agent(&self, shared: &Arc<SharedData>, channel_id: ChannelId) {

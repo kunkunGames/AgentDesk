@@ -84,14 +84,15 @@ pub(crate) async fn execute_intake_turn_core(
     token: &str,
     request: IntakeRequest,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deps = IntakeDeps {
+        http,
+        cache: None,
+        ctx_for_chained_dispatch: None,
+        shared,
+        token,
+    };
     handle_text_message(
-        &IntakeDeps {
-            http,
-            cache: None,
-            ctx_for_chained_dispatch: None,
-            shared,
-            token,
-        },
+        &deps,
         request.channel_id,
         request.user_msg_id,
         request.request_owner,
@@ -105,9 +106,6 @@ pub(crate) async fn execute_intake_turn_core(
         request.has_reply_boundary,
         request.dm_hint,
         request.turn_kind,
-        // The durable worker payload has no author/utility classification.
-        // Preserve fail-safe default-drop instead of guessing that it is human.
-        false,
         Vec::new(),
         // Worker dispatch has no in-process gate carry-forward; it re-resolves
         // the durable announcement row for its `user_msg_id` (#3905).
@@ -131,7 +129,6 @@ pub(super) async fn handle_text_message(
     has_reply_boundary: bool,
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
-    preserve_on_cancel: bool,
     preloaded_uploads: Vec<String>,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<(), Error> {
@@ -294,14 +291,19 @@ pub(super) async fn handle_text_message(
     } else {
         None
     };
-    let early_role_binding = resolve_thread_role_binding(
+    let early_role_binding = resolve_role_binding(
         channel_id,
         early_channel_name
             .as_deref()
             .or(early_resolved_channel_name.as_deref()),
-        early_thread_parent.as_ref(),
     )
-    .role_binding
+    .or_else(|| {
+        early_thread_parent
+            .as_ref()
+            .and_then(|(parent_id, parent_name)| {
+                resolve_role_binding(*parent_id, parent_name.as_deref())
+            })
+    })
     .or_else(|| {
         dm_default_agent
             .as_ref()
@@ -373,26 +375,27 @@ pub(super) async fn handle_text_message(
                         .and_then(|s| s.channel_name.clone())
                 };
                 let mut workspace = settings::resolve_workspace(channel_id, ch_name.as_deref());
-                if workspace.is_none()
-                    && let Some((parent_id, parent_name)) = early_thread_parent.as_ref()
-                {
-                    let parent_ch_name = parent_name.clone().or_else(|| {
-                        let data = shared.core.try_lock().ok()?;
-                        data.sessions
-                            .get(parent_id)
-                            .and_then(|session| session.channel_name.clone())
-                    });
-                    workspace = resolve_thread_workspace(
-                        channel_id,
-                        ch_name.as_deref(),
-                        Some(&(*parent_id, parent_ch_name)),
-                    );
-                    if workspace.is_some() {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] 🧵 Thread auto-start: inherited workspace from parent channel {}",
-                            parent_id
-                        );
+                // Fallback: if this is a thread, try resolving workspace from parent channel
+                if workspace.is_none() {
+                    if let Some((parent_id, parent_name)) =
+                        super::super::super::resolve_thread_parent(http, channel_id).await
+                    {
+                        // Use parent name from Discord API first, fall back to session map
+                        let parent_ch_name = parent_name.or_else(|| {
+                            let data = shared.core.try_lock().ok()?;
+                            data.sessions
+                                .get(&parent_id)
+                                .and_then(|s| s.channel_name.clone())
+                        });
+                        workspace =
+                            settings::resolve_workspace(parent_id, parent_ch_name.as_deref());
+                        if workspace.is_some() {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::info!(
+                                "  [{ts}] 🧵 Thread auto-start: resolved workspace from parent channel {}",
+                                parent_id
+                            );
+                        }
                     }
                 }
                 if workspace.is_none()
@@ -855,8 +858,6 @@ pub(super) async fn handle_text_message(
     } else {
         channel_id
     };
-    let final_thread_parent = super::super::super::resolve_thread_parent(http, channel_id).await;
-    let mut authoritative = dispatch_worktree_path.is_some() || dispatch_target_repo_path.is_some();
     if dispatch_should_recover_session_worktree(
         dispatch_id_for_thread.is_some(),
         dispatch_type_str.as_deref(),
@@ -871,7 +872,6 @@ pub(super) async fn handle_text_message(
                 .filter(|path| std::path::Path::new(path).is_dir())
         };
         if let Some(worktree_path) = session_worktree_path {
-            authoritative = true;
             if dispatch_effective_path != worktree_path {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
@@ -921,22 +921,24 @@ pub(super) async fn handle_text_message(
         "no_runtime_provider_session"
     };
 
-    // #259/#762: Keep runtime/session CWD aligned with the selected dispatch path.
-    // This also corrects reused threads whose cached path differs from target_repo.
-    // Inherited workspace applies only without an authoritative dispatch CWD;
-    // the existing update block persists that selection for later turns.
-    let final_workspace = apply_final_thread_workspace(
-        shared,
-        channel_id,
-        final_thread_parent.as_ref(),
-        (&mut dispatch_effective_path, authoritative),
-    )
-    .await;
+    // #259: Override current_path with the pre-computed dispatch worktree path.
+    // Also update the in-memory session so the worktree sticks for subsequent turns.
+    //
+    // #762 (B): Reused threads (where `bootstrap_thread_session` returned
+    // early because the thread already had a session) carry their existing
+    // `session.current_path`. Without this branch, a review dispatch that
+    // pins only `target_repo` (no `worktree_path`, e.g. because the
+    // external-repo worktree was cleaned up but `target_repo` still
+    // resolves to the external repo root) would re-execute inside the
+    // previous repo — the prompt and `adk_cwd` would both be built from
+    // the stale path. Propagate `dispatch_effective_path` into the
+    // session whenever it differs from the current path, regardless of
+    // whether `worktree_path` was supplied.
     let mut current_path = if dispatch_session_path_should_update(
         dispatch_id_for_thread.is_some(),
         dispatch_type_str.as_deref(),
         dispatch_worktree_path.is_some(),
-        bootstrapped_fresh_thread_session && !final_workspace,
+        bootstrapped_fresh_thread_session,
         &current_path,
         &dispatch_effective_path,
     ) {
@@ -993,30 +995,26 @@ pub(super) async fn handle_text_message(
     let sanitized_input =
         ai_screen::sanitize_user_input(voice_prompt_text.as_deref().unwrap_or(user_text));
 
-    let mut resolved_role_binding = {
+    let role_binding = {
         // For cross-channel dispatch reuse (e.g. review in implementation thread),
         // resolve role from the override channel instead of the thread's parent.
         if let Some(override_ch) = shared.dispatch.role_overrides.get(&channel_id) {
             let alt_ch = *override_ch;
-            ResolvedThreadRoleBinding::direct(resolve_role_binding(alt_ch, None))
+            resolve_role_binding(alt_ch, None)
         } else {
             let data = shared.core.lock().await;
             let ch_name = data
                 .sessions
                 .get(&channel_id)
                 .and_then(|s| s.channel_name.as_deref());
-            resolve_thread_role_binding(channel_id, ch_name, final_thread_parent.as_ref())
+            resolve_role_binding(channel_id, ch_name)
         }
-    };
-    if resolved_role_binding.role_binding.is_none() {
-        resolved_role_binding.role_binding = dm_default_agent
-            .as_ref()
-            .map(|resolved| resolved.role_binding.clone());
     }
-    let memory_scope_channel_id = resolved_role_binding.memory_channel_id(channel_id);
-    let memory_channel_id = memory_scope_channel_id.get();
-    let memory_channel_name = resolved_role_binding.memory_channel_name(None);
-    let role_binding = resolved_role_binding.role_binding;
+    .or_else(|| {
+        dm_default_agent
+            .as_ref()
+            .map(|resolved| resolved.role_binding.clone())
+    });
 
     // For cross-channel dispatch reuse, override the provider so the turn
     // executes via the counter-model CLI (e.g. Codex reviews Claude's work).
@@ -1127,8 +1125,8 @@ pub(super) async fn handle_text_message(
         }
     }
 
-    let fast_mode_channel_id =
-        effective_fast_mode_channel_id(channel_id, final_thread_parent.clone());
+    let thread_parent = super::super::super::resolve_thread_parent(http, channel_id).await;
+    let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, thread_parent.clone());
     super::super::super::commands::reset_provider_session_if_pending(
         http,
         shared,
@@ -1149,8 +1147,21 @@ pub(super) async fn handle_text_message(
 
     // Resolve channel/tmux session name from current session state. We need the
     // persisted provider session_id before recall so external memory can scope by run_id.
-    let (channel_name, tmux_session_name) =
-        resolve_channel_tmux_names(shared, &provider, channel_id).await;
+    let (channel_name, tmux_session_name) = {
+        let data = shared.core.lock().await;
+        let channel_name = data
+            .sessions
+            .get(&channel_id)
+            .and_then(|s| s.channel_name.clone());
+        let tmux_session_name = if provider.uses_managed_tmux_backend() {
+            channel_name
+                .as_ref()
+                .map(|name| provider.build_tmux_session_name(name))
+        } else {
+            None
+        };
+        (channel_name, tmux_session_name)
+    };
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
     let turn_goal_kind = if !dispatch_reset_provider_state && !dispatch_recreate_tmux {
         classify_codex_goal_command_for_provider(
@@ -1183,8 +1194,8 @@ pub(super) async fn handle_text_message(
         return Ok(());
     }
     let force_fresh_provider_session = matches!(turn_goal_kind, GoalCommandKind::FreshStart);
+    let fresh_codex_goal_session_requested = force_fresh_provider_session;
     if force_fresh_provider_session {
-        record_fresh_session_context_boundary(shared, channel_id).await?;
         clear_codex_goal_start_provider_session(
             shared,
             channel_id,
@@ -1201,7 +1212,7 @@ pub(super) async fn handle_text_message(
         sanitized_input
     };
     if session_id.is_none() {
-        if force_fresh_provider_session {
+        if fresh_codex_goal_session_requested {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] ↻ Skipping DB provider session restore for channel {} due to /goal fresh session request",
@@ -1279,16 +1290,13 @@ pub(super) async fn handle_text_message(
     // because the async gap between check and insert allows interleaving.
     // If another message won the race, queue ourselves and clean up.
     let cancel_token = Arc::new(CancelToken::new());
-    let started = try_start_turn_with_stale_busy_heal(
+    let started = mailbox_try_start_turn_with_terminal_marker_cleanup(
         shared,
         channel_id,
         cancel_token.clone(),
         request_owner,
         user_msg_id,
-        stale_busy_context(
-            &provider,
-            [adk_session_key.as_deref(), tmux_session_name.as_deref()],
-        ),
+        adk_session_key.as_deref(),
     )
     .await;
 
@@ -1297,7 +1305,6 @@ pub(super) async fn handle_text_message(
     let mut intake_latency = super::latency_spans::IntakeLatencySpans::turn_claimed();
 
     if started
-        && !preserve_on_cancel
         && let Some(stale) =
             super::super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)
                 .await
@@ -1478,7 +1485,6 @@ pub(super) async fn handle_text_message(
             reply_to_user_message,
             &dispatch_id_for_thread,
             turn_start_attempt,
-            preserve_on_cancel,
         )
         .await;
     }
@@ -1626,10 +1632,12 @@ pub(super) async fn handle_text_message(
         }
     };
     let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
-    let retry_reply_context = session_retry_context
-        .as_ref()
-        .map(|c| c.formatted_context.clone());
-    let reply_context = merge_reply_contexts(reply_context, retry_reply_context);
+    let reply_context = merge_reply_contexts(
+        reply_context,
+        session_retry_context
+            .as_ref()
+            .map(|context| context.formatted_context.clone()),
+    );
     // #4307 PR-B: fold the voluntary tool_feedback reminder stashed last turn
     // into `reply_context`; the owned reminder is kept for the refusal put-back.
     let (feedback_reminder, reply_context) =
@@ -1685,9 +1693,9 @@ pub(super) async fn handle_text_message(
             .recall(RecallRequest {
                 provider: provider.clone(),
                 role_id: resolve_memory_role_id(role_binding.as_ref()),
-                channel_id: memory_channel_id,
-                channel_name: memory_channel_name.clone().or(channel_name.clone()),
-                session_id: resolve_memory_session_id(session_id.as_deref(), memory_channel_id),
+                channel_id: channel_id.get(),
+                channel_name: channel_name.clone(),
+                session_id: resolve_memory_session_id(session_id.as_deref(), channel_id.get()),
                 dispatch_profile,
                 user_text: user_text.to_string(),
                 mode: memento_recall_gate.mode,
@@ -1741,6 +1749,7 @@ pub(super) async fn handle_text_message(
             warning
         );
     }
+
     // Prepend pending file uploads
     let mut context_chunks = Vec::new();
     let memory_injection_plan = build_memory_injection_plan(
@@ -1749,27 +1758,13 @@ pub(super) async fn handle_text_message(
         dispatch_profile,
         &memory_recall,
     );
-    let channel_recent_context = load_channel_recent_context(
-        shared.pg_pool.as_ref(),
-        channel_id,
-        session_id.as_deref(),
-        force_fresh_provider_session,
-        session_was_cleared,
-        dispatch_profile,
-        active_dispatch_id_for_prompt.as_deref(),
-        session_retry_context.as_ref(),
-    )
-    .await;
     if !pending_uploads.is_empty() {
         context_chunks.push(pending_uploads.join("\n"));
     }
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
     }
-    if let Some(ref recent_context) = channel_recent_context {
-        recent_context.append_rendered_context_to(&mut context_chunks);
-    }
-    if let Some(ref knowledge) = memory_injection_plan.shared_knowledge_for_context {
+    if let Some(knowledge) = memory_injection_plan.shared_knowledge_for_context {
         context_chunks.push(knowledge.to_string());
     }
     if let Some(external_recall) = memory_injection_plan.external_recall_for_context {
@@ -1785,6 +1780,7 @@ pub(super) async fn handle_text_message(
         session_id.as_deref(),
         context_chunks.join("\n\n"),
     );
+
     // Build Discord context info
     let discord_context = {
         let data = shared.core.lock().await;
@@ -1796,9 +1792,11 @@ pub(super) async fn handle_text_message(
             false,
         )
     };
+
     // Claude keeps SAK in the system prompt for prefix-cache stability.
     // Non-Claude providers receive SAK in the user context instead.
-    let sak_for_system = memory_injection_plan.sak_for_system_prompt();
+    let sak_for_system = memory_injection_plan.shared_knowledge_for_system_prompt;
+    let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
     let current_task_context = active_dispatch_info.as_ref().map(|info| {
         super::super::super::prompt_builder::CurrentTaskContext {
             dispatch_id: active_dispatch_id_for_prompt.as_deref(),
@@ -1810,11 +1808,13 @@ pub(super) async fn handle_text_message(
         }
     });
     let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
+    let channel_participants = shared.channel_roster(channel_id, request_owner, request_owner_name);
     let memory_recall_manifest = super::super::super::prompt_builder::MemoryRecallManifestInput {
         should_recall: memento_recall_gate.should_recall,
         gate_reason: memento_recall_gate.reason,
         external_recall: memory_recall.external_recall.as_deref(),
     };
+
     let recovery_context_for_manifest =
         session_retry_context
             .as_ref()
@@ -1824,10 +1824,9 @@ pub(super) async fn handle_text_message(
             });
     let built_system_prompt = build_system_prompt_with_manifest(
         &discord_context,
-        &shared.channel_roster(channel_id, request_owner, request_owner_name),
+        &channel_participants,
         &current_path,
         channel_id,
-        memory_scope_channel_id,
         token,
         role_binding.as_ref(),
         reply_to_user_message,
@@ -1835,12 +1834,10 @@ pub(super) async fn handle_text_message(
         dispatch_type_str.as_deref(),
         current_task_context.as_ref(),
         sak_for_system,
-        memory_injection_plan.longterm_catalog_for_system_prompt,
+        longterm_catalog_for_prompt,
         Some(&memory_settings),
         memento_mcp_available,
-        matches!(&provider, ProviderKind::Claude),
         recovery_context_for_manifest.as_ref(),
-        channel_recent_context.as_ref(),
         Some(&memory_recall_manifest),
         Some(&turn_id),
     );
@@ -1860,6 +1857,7 @@ pub(super) async fn handle_text_message(
     // #3813 Phase 1a: prompt prep complete — this mark sits INSIDE the
     // `[prompt-prep]` window below (overlaps it; do not sum — see latency_spans.rs).
     intake_latency.mark_prep_done();
+    let memory_backend_label = memory_settings.backend.as_str();
     let provider_label = match &provider {
         ProviderKind::Claude => "claude",
         ProviderKind::Codex => "codex",
@@ -1868,13 +1866,14 @@ pub(super) async fn handle_text_message(
         ProviderKind::Qwen => "qwen",
         ProviderKind::Unsupported(_) => "unsupported",
     };
+    let dispatch_profile_label = dispatch_profile_label(dispatch_profile);
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts}] [prompt-prep] channel={} provider={} dispatch={} memory_backend={} reused_session={} duration_ms={}",
         channel_id.get(),
         provider_label,
-        dispatch_profile_label(dispatch_profile),
-        memory_settings.backend.as_str(),
+        dispatch_profile_label,
+        memory_backend_label,
         session_id.is_some(),
         prompt_prep_duration_ms
     );
@@ -2139,12 +2138,13 @@ pub(super) async fn handle_text_message(
                 // to inject the prompt — fall into the busy-notice / cleanup branch
                 // below by surfacing the initial diagnostic. Closes a Codex-flagged
                 // HIGH on the Discord path mirroring the same fix in claude.rs.
+                let cancel_observed_after_wait = cancel_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 match (
                     wait_result,
                     post_wait_diagnostic,
-                    cancel_token
-                        .cancelled
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    cancel_observed_after_wait,
                 ) {
                     (_, _, true) => {
                         tracing::warn!(
@@ -2215,7 +2215,6 @@ pub(super) async fn handle_text_message(
             original_request_owner,
             user_msg_id,
             user_text,
-            preserve_on_cancel,
             reply_context.clone(),
             has_reply_boundary,
             merge_consecutive,
@@ -2463,7 +2462,7 @@ pub(super) async fn handle_text_message(
     }
 
     let (logical_channel_id, thread_id, thread_title) =
-        if let Some((parent_id, _parent_name)) = final_thread_parent {
+        if let Some((parent_id, _parent_name)) = thread_parent {
             let (live_thread_title, _) =
                 super::super::super::resolve_channel_category(http, cache, channel_id).await;
             (parent_id.get(), Some(channel_id.get()), live_thread_title)
@@ -2511,7 +2510,6 @@ pub(super) async fn handle_text_message(
         merge_consecutive,
         pending_uploads.clone(),
         voice_announcement.clone(),
-        preserve_on_cancel,
     );
     inflight_state.logical_channel_id = Some(logical_channel_id);
     inflight_state.thread_id = thread_id;
@@ -2607,8 +2605,8 @@ pub(super) async fn handle_text_message(
     // Pre-compute provider-specific compact config
     let compact_percent_for_claude = Some(ctx_thresholds.compact_pct_for(&provider));
     let compact_token_limit_for_codex = {
-        provider
-            .compact_cli_config(compact_percent, model_context_window)
+        let cli_config = provider.compact_cli_config(compact_percent, model_context_window);
+        cli_config
             .first()
             .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
     };
@@ -3068,99 +3066,5 @@ mod queue_pending_reaction_clear_tests {
                 "intake-gate add emoji {added:?} (merged={merged}) must be in the dequeue clear set"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod turn_start_dispatch_guard_preservation_tests {
-    // #4247 FIX 1: the turn-start DISPATCH-GUARD must gate its raw
-    // `stale_dispatch_turn_for_text` lookup on `!preserve_on_cancel`, mirroring
-    // the dequeue guard's `filter_queued_dispatch_exit(preserve, stale)` — else a
-    // preserved (marked) genuine human instruction that survives the dequeue
-    // guard is dropped anyway on re-entry just because its text carries a stale
-    // `DISPATCH:<id>` prefix, silently defeating the feature end-to-end.
-    #[test]
-    fn turn_start_guard_is_gated_on_preserve_on_cancel() {
-        let module_src = include_str!("intake_turn.rs");
-        let claim_pos = module_src
-            .find("let started = try_start_turn_with_stale_busy_heal(")
-            .expect("turn-start mailbox claim exists");
-        let stale_call_pos = module_src[claim_pos..]
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .map(|offset| claim_pos + offset)
-            .expect("turn-start dispatch-guard raw stale-text lookup exists");
-        let gate_between_claim_and_lookup =
-            module_src[claim_pos..stale_call_pos].find("!preserve_on_cancel");
-
-        assert!(
-            gate_between_claim_and_lookup.is_some(),
-            "turn-start DISPATCH-GUARD must gate the raw stale-text lookup on \
-             `!preserve_on_cancel` (#4247 FIX 1) — removing this gate lets a \
-             preserved (marked) genuine human instruction get dropped at turn \
-             start just because it carries a stale DISPATCH: prefix, silently \
-             defeating the fail-safe queue-preservation feature end-to-end"
-        );
-    }
-
-    // Companion: the gated stale lookup must still feed the SAME abort branch
-    // (finish turn, advance checkpoint, exit emoji), i.e. the gate did not get
-    // attached to some other unrelated `stale_dispatch_turn_for_text` use.
-    #[test]
-    fn gated_stale_lookup_feeds_the_turn_abort_branch() {
-        let module_src = include_str!("intake_turn.rs");
-        let claim_pos = module_src
-            .find("let started = try_start_turn_with_stale_busy_heal(")
-            .expect("turn-start mailbox claim exists");
-        let stale_call_pos = module_src[claim_pos..]
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .map(|offset| claim_pos + offset)
-            .expect("turn-start dispatch-guard raw stale-text lookup exists");
-        // Anchor on the abort log, then look for the branch's finish + early
-        // return by RELATIVE offset — no fixed byte window (multibyte-safe, and
-        // resilient to added log lines). (Fable review note.)
-        let abort_pos = module_src[stale_call_pos..]
-            .find("DISPATCH-GUARD: aborted terminal dispatch at turn start")
-            .map(|offset| stale_call_pos + offset)
-            .expect("gated stale lookup must still feed the turn-start abort log/branch");
-        let abort_region = &module_src[abort_pos..];
-        let finish = abort_region.find("mailbox_finish_turn");
-        let ret = abort_region.find("return Ok(());");
-        assert!(
-            finish.is_some_and(|f| f < 600),
-            "turn-start abort branch must still finish the mailbox turn"
-        );
-        assert!(
-            ret.is_some_and(|r| r < 1200),
-            "turn-start abort branch must still return early"
-        );
-    }
-
-    // #4247 FIX 1/FIX 4: pin the LIVE (non-queued) intake path threading
-    // `preserve_on_cancel` from the function signature into the turn-start guard
-    // unmodified — distinct from the queued path's `into_intervention`
-    // computation (already pinned by `intake_queue_transaction.rs`).
-    #[test]
-    fn preserve_on_cancel_parameter_reaches_the_turn_start_guard_unmodified() {
-        let module_src = include_str!("intake_turn.rs");
-        // Needle assembled via concat! so the exact fn-call token never appears
-        // verbatim here (would trip `intake_dispatch::tests`'s occurrence-count
-        // invariant on `intake_turn.rs`).
-        let signature_pos = module_src
-            .find(concat!("pub(super) async fn handle_text_message", "("))
-            .expect("handle_text_message signature exists");
-        let param_pos = module_src[signature_pos..]
-            .find("preserve_on_cancel: bool,")
-            .map(|offset| signature_pos + offset)
-            .expect("handle_text_message receives preserve_on_cancel as a parameter");
-        let guard_pos = module_src[param_pos..]
-            .find("&& !preserve_on_cancel")
-            .map(|offset| param_pos + offset);
-
-        assert!(
-            guard_pos.is_some(),
-            "the live-intake preserve_on_cancel parameter must flow into the \
-             FIX 1 turn-start guard; mutating either the parameter plumbing or \
-             the guard breaks this"
-        );
     }
 }
