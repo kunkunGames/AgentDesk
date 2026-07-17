@@ -533,6 +533,9 @@ src/
 │   │   │   ├── store.rs
 │   │   │   └── watcher_state.rs
 │   │   ├── outbound/
+│   │   │   ├── turn_output_controller/
+│   │   │   │   ├── fresh_send.rs
+│   │   │   │   └── fresh_send_tests.rs
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
@@ -680,6 +683,7 @@ src/
 │   │   │   ├── startup_doctor.rs
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
+│   │   │   ├── delivery_outcome_classify.rs
 │   │   │   ├── idle_jsonl.rs
 │   │   │   ├── orphan_reclaim.rs
 │   │   │   ├── relay_format.rs
