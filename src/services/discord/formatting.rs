@@ -137,7 +137,8 @@ pub(crate) fn redact_sensitive_for_placeholder(input: &str) -> String {
         Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("valid email regex")
     });
 
-    let redacted = OPENAI_KEY_RE.replace_all(input, "***");
+    let redacted = crate::utils::redact::redact_known_secrets(input);
+    let redacted = OPENAI_KEY_RE.replace_all(&redacted, "***");
     let redacted = BEARER_RE.replace_all(&redacted, "Bearer ***");
     let redacted = ASSIGNMENT_RE.replace_all(&redacted, "${1}=***");
     EMAIL_RE.replace_all(&redacted, "***@***").into_owned()

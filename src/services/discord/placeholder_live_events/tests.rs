@@ -77,9 +77,11 @@ fn events_from_json_redacts_and_normalizes_tool_use() {
 #[test]
 fn redact_sensitive_for_placeholder_masks_required_patterns() {
     let redacted = redact_sensitive_for_placeholder(
-        "sk-abcdefghijklmnopqrstuvwxyz \
-         Authorization: Bearer live-token \
-         password=hunter2 token=secret api_key=key1 api-key=key2 \
+        "sk-abcdefghijklmnopqrstuvwxyz\n\
+         Authorization: Bearer live-token\n\
+         Cookie: session_id=cookie-secret\n\
+         Set-Cookie: auth_token=set-cookie-secret; Secure\n\
+         password=hunter2 token=secret api_key=key1 api-key=key2\n\
          alice@example.com",
     );
 
@@ -89,6 +91,8 @@ fn redact_sensitive_for_placeholder_masks_required_patterns() {
     assert!(redacted.contains("token=***"));
     assert!(redacted.contains("api_key=***"));
     assert!(redacted.contains("api-key=***"));
+    assert!(redacted.contains("Cookie: ***"));
+    assert!(redacted.contains("Set-Cookie: ***"));
     assert!(redacted.contains("***@***"));
     assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(!redacted.contains("live-token"));
@@ -97,6 +101,8 @@ fn redact_sensitive_for_placeholder_masks_required_patterns() {
     assert!(!redacted.contains("secret"));
     assert!(!redacted.contains("key1"));
     assert!(!redacted.contains("key2"));
+    assert!(!redacted.contains("cookie-secret"));
+    assert!(!redacted.contains("set-cookie-secret"));
 }
 
 #[test]

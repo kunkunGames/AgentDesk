@@ -88,7 +88,7 @@
 | `src/services/codex_tmux_wrapper.rs` | 1403 |
 | `src/services/codex_tui/input.rs` | 1659 |
 | `src/services/discord/commands/text_commands.rs` | 1482 |
-| `src/services/discord/formatting.rs` | 2566 |
+| `src/services/discord/formatting.rs` | 2567 |
 | `src/services/discord/meeting_orchestrator.rs` | 3222 |
 | `src/services/discord/mod.rs` | 4168 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1387 |

@@ -334,7 +334,7 @@
 | `services::agents` | `src/services/agents/mod.rs` | 3 | 3 | 0 |  |
 | `services::agents::query` | `src/services/agents/query.rs` | 583 | 499 | 84 |  |
 | `services::agents::serialization` | `src/services/agents/serialization.rs` | 445 | 297 | 148 |  |
-| `services::agents::turn` | `src/services/agents/turn.rs` | 816 | 722 | 94 |  |
+| `services::agents::turn` | `src/services/agents/turn.rs` | 822 | 724 | 98 |  |
 | `services::analytics` | `src/services/analytics.rs` | 21 | 21 | 0 |  |
 | `services::analytics::api_usage` | `src/services/analytics/api_usage.rs` | 198 | 171 | 27 |  |
 | `services::analytics::dispatch_metrics` | `src/services/analytics/dispatch_metrics.rs` | 258 | 218 | 40 |  |
@@ -480,7 +480,7 @@
 | `services::discord::dispatch_policy` | `src/services/discord/dispatch_policy.rs` | 411 | 237 | 174 |  |
 | `services::discord::footer_view_reconciler` | `src/services/discord/footer_view_reconciler/mod.rs` | 658 | 470 | 188 |  |
 | `services::discord::footer_view_reconciler::registry` | `src/services/discord/footer_view_reconciler/registry.rs` | 624 | 624 | 0 |  |
-| `services::discord::formatting` | `src/services/discord/formatting.rs` | 3898 | 2566 | 1332 | giant-file |
+| `services::discord::formatting` | `src/services/discord/formatting.rs` | 3899 | 2567 | 1332 | giant-file |
 | `services::discord::formatting::long_send_rollback` | `src/services/discord/formatting/long_send_rollback.rs` | 481 | 481 | 0 |  |
 | `services::discord::formatting::rollback_journal` | `src/services/discord/formatting/rollback_journal.rs` | 363 | 363 | 0 |  |
 | `services::discord::gateway` | `src/services/discord/gateway.rs` | 1414 | 942 | 472 |  |
