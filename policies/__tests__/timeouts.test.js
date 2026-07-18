@@ -1449,3 +1449,65 @@ test("timeouts idle-kill module excludes thread idle rows from the main batch", 
     assert.equal(p.body.minimum_idle_minutes, 360);
   });
 });
+
+test("timeouts reconcile fallback escalates DoD wait when only DoD is incomplete", () => {
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: { pm_decision_gate_enabled: true },
+    cards: {
+      "card-dod-reconcile": {
+        id: "card-dod-reconcile",
+        status: "in_progress",
+        priority: "high",
+        assigned_agent_id: "agent-dod",
+        deferred_dod_json: {
+          items: ["test1", "test2"],
+          verified: ["test1"]
+        }
+      }
+    },
+    dbQuery: createSqlRouter([
+      {
+        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
+        result: [{ key: "reconcile_dispatch:dispatch-dod-reconcile", value: "dispatch-dod-reconcile" }]
+      },
+      {
+        match: "FROM task_dispatches WHERE id = ?",
+        result: [
+          {
+            id: "dispatch-dod-reconcile",
+            kanban_card_id: "card-dod-reconcile",
+            to_agent_id: "agent-dod",
+            dispatch_type: "implementation",
+            chain_depth: 1,
+            created_at: "2026-06-21 10:00:00",
+            result: JSON.stringify({}),
+            context: "{}",
+            status: "completed"
+          }
+        ]
+      },
+      {
+        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'pm_pending:%'",
+        result: []
+      }
+    ])
+  });
+
+  policy._section_R(); // This should trigger reconciliation
+
+  assert.deepEqual(state.reviewStatusCalls, [
+    {
+      cardId: "card-dod-reconcile",
+      reviewStatus: "awaiting_dod",
+      options: { awaiting_dod_at: "now" }
+    }
+  ]);
+  assert.deepEqual(state.reviewStateSyncs, [
+    {
+      cardId: "card-dod-reconcile",
+      status: "awaiting_dod",
+      options: {}
+    }
+  ]);
+  assert.equal(state.manualInterventions.length, 0);
+});

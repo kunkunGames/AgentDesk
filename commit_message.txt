@@ -1,0 +1,35 @@
+Verifier: improve test coverage for reconcile fallback DoD escalation
+
+What changed:
+Added a new test case `timeouts reconcile fallback escalates DoD wait when only DoD is incomplete` to `policies/__tests__/timeouts.test.js`.
+
+Why:
+To ensure the `deferred_dod_json` logic in `policies/timeouts.js` (specifically within the reconciliation fallback section `_section_R()`) is explicitly covered and prevents regressions if the DoD wait escalation logic is refactored. The `QualityKeeper decode fallback` was evaluated and found to already have extensive testing, so I selected this `deferred_dod_json` logic.
+
+WorkFingerprint:
+Agent: Verifier
+Category boundary: policies/__tests__/**
+Primary files: policies/__tests__/timeouts.test.js
+Invariant protected: The timeout reconciliation module (`_section_R()`) correctly escalates cards with incomplete `deferred_dod_json` entries to `awaiting_dod` without transitioning them out of `in_progress`.
+Public API impact: None
+Docs impact: None
+Verification plan: Run `npm run test:policies` to verify the test suite.
+Related PRs/issues: None
+
+Duplicate/overlap check:
+Executed `gh pr list` but `gh` was not available in this environment. So I evaluated the local open branches/repository history and found no overlapping work targeting the `timeouts.test.js` or `reconciliation.js` test logic.
+
+Verification commands and results:
+- `git diff --check`: Clean output.
+- `npm run test:policies`: 195 tests run successfully.
+
+Skipped checks with reasons:
+- `cargo check --all-targets`: Skipped because no Rust production code was changed.
+- `./scripts/verify-dashboard.sh`: Skipped because no dashboard code was changed.
+- `python3 scripts/generate_inventory_docs.py`: Skipped because no generated inventory docs were changed.
+
+Risk:
+None. Changes are isolated to test files.
+
+Rollback notes:
+git checkout origin/main -- policies/__tests__/timeouts.test.js
