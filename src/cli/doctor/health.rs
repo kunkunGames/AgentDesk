@@ -237,6 +237,8 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
                     "raw": reason.raw,
                     "subsystem": reason.subsystem,
                     "severity": reason.severity.as_str(),
+                    "fix_safety": reason.fix_safety.as_str(),
+                    "summary": reason.summary,
                     "next_step": reason.next_step,
                 })
             })
@@ -314,5 +316,42 @@ mod health_classification_tests {
             reason.next_step,
             "inspect global active counter tracking in dcserver logs"
         );
+    }
+
+    #[test]
+    fn reasons_evidence_json_shape_contract() {
+        use super::super::contract::SecurityExposure;
+        use super::{ClassifiedReason, reasons_evidence};
+
+        let reason = ClassifiedReason {
+            raw: "test_raw".to_string(),
+            subsystem: "test_subsystem",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::None,
+            summary: "test_summary".to_string(),
+            next_step: "test_next_step".to_string(),
+        };
+
+        let evidence = reasons_evidence(&[reason]);
+        let entry = evidence["degraded_reasons"][0]
+            .as_object()
+            .expect("degraded reason must be an object");
+        let mut keys = entry.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            [
+                "fix_safety",
+                "next_step",
+                "raw",
+                "severity",
+                "subsystem",
+                "summary",
+            ]
+        );
+        assert_eq!(entry["fix_safety"], "read_only");
+        assert_eq!(entry["summary"], "test_summary");
     }
 }

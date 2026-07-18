@@ -67,7 +67,7 @@
 | `cli::discord_thread_create_lock` | `src/cli/discord_thread_create_lock.rs` | 669 | 611 | 58 |  |
 | `cli::doctor` | `src/cli/doctor.rs` | 9 | 9 | 0 |  |
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 | 100 | 0 |  |
-| `cli::doctor::health` | `src/cli/doctor/health.rs` | 318 | 250 | 68 |  |
+| `cli::doctor::health` | `src/cli/doctor/health.rs` | 357 | 252 | 105 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 215 | 215 | 0 |  |
 | `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4498 | 4381 | 117 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 623 | 553 | 70 |  |
