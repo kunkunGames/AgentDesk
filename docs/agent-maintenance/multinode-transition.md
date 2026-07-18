@@ -445,6 +445,13 @@
 
 ### Audited touches
 
+- #4527 standby restart contract: both gateway and confirmed-standby providers
+  register the same restart marker poller before starting their intake worker.
+  The marker closes a provider-local atomic admission gate, returns an owned
+  pre-accept claim to `pending` without retry/error pollution, and waits for any
+  accepted tick to finish execution and its terminal outbox transition before
+  exposing `restart_pending` or consuming that provider's shutdown-barrier slot.
+  Indeterminate gateway-lease failures start neither worker nor poller.
 - #4550/#4604 intake preservation rolling-deploy contract: worker heartbeats
   advertise `preserve_on_cancel_v1`, and all three routing authorities
   (durable foreign session owner, explicit `/node`, and preferred labels) use the
@@ -1499,3 +1506,18 @@
   applying it, and do not restart/roll back a pre-0094 binary afterward. Its
   migration-specific CI gate activates only when the 0094 SQL file is in the
   changed-file set.
+
+- #4527 (safe-restart standby drain + standby health visibility): `runtime_bootstrap.rs`
+  now registers a **confirmed-standby** node's provider `SharedData` into the
+  `HealthRegistry` even when the gateway runtime never starts (lease held
+  elsewhere), and `runtime_bootstrap/gateway_lease.rs` splits the lease outcome
+  into `Proceed` / `Standby` (confirmed `Ok(None)`) / `Failed`. This is
+  **worker-local** health visibility (not leader-only or PG-lease): it exposes
+  the standby intake worker's own `global_active` / provider `active_turns` /
+  mailbox / relay state — previously only populated inside the gateway runtime —
+  so the safe-restart wrapper cannot mistake a live standby turn for an idle
+  node. A new provider-health `runtime_state_complete=true` flag lets the wrapper
+  reject legacy/partial health as idle evidence. Lease-acquire *errors* are
+  classified `Failed` (never `Standby`), so a restart never skips leader
+  drain-ack on an ambiguous lease result: every incomplete/failed/missing signal
+  falls back to the existing drain path (fail-closed).

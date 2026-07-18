@@ -86,6 +86,19 @@ pub use snapshot::{
 pub(super) struct ProviderEntry {
     pub(super) name: String,
     pub(super) shared: Arc<SharedData>,
+    pub(super) role: ProviderRuntimeRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProviderRuntimeRole {
+    Gateway,
+    Standby,
+}
+
+impl ProviderRuntimeRole {
+    pub(super) fn requires_gateway_connection(self) -> bool {
+        matches!(self, Self::Gateway)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -268,7 +281,38 @@ impl HealthRegistry {
         self.utility_bot_http_clone(UtilityBotRole::Announce).await
     }
 
-    pub(super) async fn register(&self, name: String, shared: Arc<SharedData>) {
+    pub(in crate::services::discord) async fn register_standby(
+        &self,
+        name: String,
+        shared: Arc<SharedData>,
+    ) {
+        self.register_with_role(name, shared, ProviderRuntimeRole::Standby)
+            .await;
+    }
+
+    pub(crate) async fn all_providers_are_standby(&self) -> bool {
+        let providers = self.providers.lock().await;
+        !providers.is_empty()
+            && providers
+                .iter()
+                .all(|entry| entry.role == ProviderRuntimeRole::Standby)
+    }
+
+    pub(in crate::services::discord) async fn register(
+        &self,
+        name: String,
+        shared: Arc<SharedData>,
+    ) {
+        self.register_with_role(name, shared, ProviderRuntimeRole::Gateway)
+            .await;
+    }
+
+    async fn register_with_role(
+        &self,
+        name: String,
+        shared: Arc<SharedData>,
+        role: ProviderRuntimeRole,
+    ) {
         let mut providers = self.providers.lock().await;
         if providers
             .iter()
@@ -288,7 +332,7 @@ impl HealthRegistry {
                 name
             );
         }
-        providers.push(ProviderEntry { name, shared });
+        providers.push(ProviderEntry { name, shared, role });
     }
 
     pub(in crate::services::discord) async fn dm_default_agent_authorizes_private_channel(

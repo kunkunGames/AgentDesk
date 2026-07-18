@@ -99,14 +99,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 
     let token_hash = settings::discord_token_hash(token);
 
-    // Phase 5.1 of intake-node-routing (issue #2007): build SharedData and
-    // spawn the intake_worker poll loop BEFORE the gateway lease check.
-    // Standby nodes (lease held elsewhere) still need a live worker to
-    // claim `intake_outbox` rows targeted at this `instance_id` — that is
-    // the entire point of routing intake to a worker node. Previously the
-    // worker spawn lived inside the poise setup callback, which only
-    // executes on the lease-holding leader, so standby workers never
-    // started.
+    // Phase 5.1 of intake-node-routing (issue #2007): build SharedData before
+    // resolving the gateway lease. Confirmed gateway and standby roles start
+    // the intake worker after the lease result is known; a failed acquisition
+    // must not leave a detached, health-blind worker behind.
     super::internal_api::init(api_port, pg_pool.clone());
 
     // Initialize debug logging from environment variable
@@ -225,28 +221,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     let voice_receiver =
         run_bot_init_voice_workers(&voice_config, &voice_barge_in, &shared, &provider);
 
-    // Phase 5.1 of intake-node-routing (issue #2007): only spawn the
-    // intake_worker poll loop when routing is explicitly enforced. In the
-    // default disabled/observe modes there are no owned rows to drain, and
-    // starting one poller per configured Discord agent can exhaust the shared
-    // Postgres pool before the HTTP server finishes booting.
-    //
-    // The worker uses `serenity::http::Http::new(token)` (REST-only,
-    // no IDENTIFY) so it never contends for the gateway lease. It
-    // only touches `shared.{core, settings, pg_pool, dispatch_thread_parents}`,
-    // none of which depend on a live gateway shard.
-    //
-    // Cancellation rides on `shared.restart.shutting_down`. On the leader, the
-    // gateway-lease loss handler and SIGTERM handler flip that flag.
-    // On standby today no signal handler is wired; the worker exits
-    // when launchd kills the process during deploy. A follow-up could
-    // add SIGTERM handling on the standby path for graceful drain.
-    run_bot_maybe_spawn_intake_worker(&shared, token, &provider);
-
-    // After optional worker setup, do the gateway lease check. Standby nodes
-    // (lease held elsewhere) early-return below; when intake routing is
-    // enforced, the detached worker task keeps polling using `Arc<SharedData>`.
-    let gateway_lease = match run_bot_acquire_gateway_lease(
+    // Resolve the gateway role before spawning the intake worker. Both gateway
+    // and confirmed-standby runtimes start it in observe/enforce mode, while an
+    // indeterminate lease failure leaves no health-blind detached worker.
+    let gateway_outcome = run_bot_acquire_gateway_lease(
         &shared,
         &token_hash,
         &provider,
@@ -255,17 +233,45 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         &health_registry,
         api_port,
     )
-    .await
-    {
+    .await;
+    if !gateway_outcome.starts_provider_runtime() {
+        // Lease ownership is unknown. No intake worker or restart poller has
+        // been spawned, so this health-blind SharedData cannot outlive run_bot.
+        shutdown_remaining.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+
+    let gateway_lease = match gateway_outcome {
         GatewayLeaseOutcome::Proceed(lease) => lease,
-        GatewayLeaseOutcome::Skip => {
-            // Standby / lease-held-elsewhere / acquire-error: the diagnostic
-            // already ran inside the helper. Decrement the shutdown barrier
-            // and abort startup exactly as the original early-returns did.
-            shutdown_remaining.fetch_sub(1, Ordering::AcqRel);
+        GatewayLeaseOutcome::Standby => {
+            // Standby can execute full turns through the intake worker. Always
+            // register its SharedData so detailed health proves either the real
+            // active state or an explicit idle provider entry. This also makes
+            // a routing/config race fail closed instead of restoring the old
+            // health-blind empty registry.
+            health_registry
+                .register_standby(provider.as_str().to_string(), shared.clone())
+                .await;
+            // Standby intake can execute a full turn, so it gets the same
+            // marker fence and acknowledgement path as a gateway runtime.
+            spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
+            run_bot_maybe_spawn_intake_worker(&shared, token, &provider);
+            // Keep this provider's shutdown-barrier slot: the marker poller
+            // consumes it exactly once after fencing and persisting state.
             return;
         }
+        GatewayLeaseOutcome::Failed => {
+            unreachable!("failed lease outcomes return before provider runtime startup")
+        }
     };
+
+    // Register and fence the gateway runtime before it can admit intake-worker
+    // work. The poise setup callback no longer owns marker-poller startup.
+    health_registry
+        .register(provider.as_str().to_string(), shared.clone())
+        .await;
+    spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
+    run_bot_maybe_spawn_intake_worker(&shared, token, &provider);
 
     run_bot_start_gateway_runtime(
         token,
