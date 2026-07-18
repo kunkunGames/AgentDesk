@@ -1,0 +1,30 @@
+Gatekeeper: fail dashboard verification on stale audit waiver
+
+What changed:
+I added an `elif` condition to the `verify-dashboard.sh` npm audit check. It now fails the script with exit code 1 if `npm audit` finds no high/critical advisories (`audit_status` is 0) but `DASHBOARD_AUDIT_WAIVER` is still set in the environment.
+
+Why:
+A waiver left in place after the underlying npm vulnerability has been fixed becomes a stale allowlist entry (guard debt). Failing CI ensures this risky drift is caught and the strict security gate is explicitly restored. This perfectly matches the PR review lesson: "stale allowlist rows are guard debt, not harmless metadata."
+
+WorkFingerprint:
+- Agent: Gatekeeper
+- Category Boundary: scripts/verify-dashboard.sh
+- Primary files: scripts/verify-dashboard.sh
+- Queue hygiene invariant: Guard against stale npm audit waivers (guard debt).
+- Related PRs/issues checked: No overlapping open PRs found.
+- Non-overlapping reason: Checked remote branches for gatekeeper PRs touching `verify-dashboard.sh` stale waiver logic and found none.
+
+Duplicate/overlap check:
+Checked open PRs (using `gh pr list` / branch inspection) and found no other PRs implementing this check.
+
+Verification commands and results:
+- Ran `DASHBOARD_AUDIT_WAIVER="test" ./scripts/verify-dashboard.sh` which correctly failed with the new error message.
+- Ran `./scripts/verify-dashboard.sh` normally which passed successfully.
+- Ran `git diff --check` with no whitespace errors.
+
+Skipped checks and reasons:
+No relevant checks skipped. Dashboard build/test and script logic was directly verified.
+
+Risk and rollback notes:
+Low risk. This only affects CI when a previously needed waiver is forgotten after a package bump fixes the issue.
+Rollback: Revert the commit to drop the `elif` branch.
