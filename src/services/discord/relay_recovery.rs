@@ -2911,7 +2911,7 @@ mod tests {
             .tmux_session
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .replace("AgentDesk-codex-3360-dead-token-session".to_string());
+            .replace("codex-3360-dead-token-session".to_string());
         shared.restart.global_active.store(1, Ordering::Relaxed);
 
         let response = auto_apply_relay_recovery_for_shared(
