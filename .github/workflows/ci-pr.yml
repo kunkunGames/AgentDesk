@@ -55,7 +55,7 @@ jobs:
       # workflow still exercises the full macOS/Windows matrix within 24h.
       # NOTE: this gates ONLY the advisory Windows lane. Required ubuntu
       # Rust/PG/dashboard mirrors still verify every matching PR.
-      cross_os_rust: ${{ steps.filter.outputs.cross_os_rust }}
+      cross_os_rust: ${{ steps.cross_os_filter.outputs.cross_os_rust }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -217,64 +217,20 @@ jobs:
               # (src/services/routines/loader.rs); a routine asset change
               # can fail the test on any OS.
               - 'routines/**'
-            # cross_os_rust mirrors `rust_compile` MINUS the relay
-            # stabilization surface. When false, the only compile-affecting
-            # changes are confined to `src/services/discord/**` and/or
-            # `tests/e2e/**`, which the nightly macOS/Windows matrix already
-            # exercises daily — so the advisory PR-time Windows lane is
-            # skipped to keep relay-only PRs fast. Any compile input outside
-            # that surface (a different crate path, Cargo/toolchain/build.rs,
-            # this CI file) flips it true and the Windows lane runs. Keep the
-            # positive list in sync with `rust_compile`.
+
+      # This filter needs `every`: with dorny/paths-filter's default `some`, a
+      # broad positive rule can make a file match despite a negative rule.
+      # Keep the brace alternatives in sync with `rust_compile` above.
+      - name: Detect cross-OS Rust changes
+        id: cross_os_filter
+        uses: dorny/paths-filter@v3
+        with:
+          predicate-quantifier: every
+          filters: |
             cross_os_rust:
-              - 'src/*'
-              - 'src/cli/**'
-              - 'src/compat/**'
-              - 'src/db/**'
-              - 'src/dispatch/**'
-              - 'src/engine/**'
-              - 'src/github/**'
-              - 'src/kanban/**'
-              - 'src/runtime_layout/**'
-              - 'src/server/**'
-              - 'src/supervisor/**'
-              - 'src/ui/**'
-              - 'src/utils/**'
-              - 'src/voice/**'
-              - 'src/services/*'
-              - 'src/services/agent_quality/**'
-              - 'src/services/agents/**'
-              - 'src/services/analytics/**'
-              - 'src/services/api_friction/**'
-              - 'src/services/auto_queue/**'
-              - 'src/services/automation_candidate_materializer/**'
-              - 'src/services/claude_e/**'
-              - 'src/services/claude_tui/**'
-              - 'src/services/cluster/**'
-              - 'src/services/codex_tui/**'
-              - 'src/services/dispatches/**'
-              - 'src/services/git/**'
-              - 'src/services/maintenance/**'
-              - 'src/services/memory/**'
-              - 'src/services/observability/**'
-              - 'src/services/onboarding/**'
-              - 'src/services/platform/**'
-              - 'src/services/provider_cli/**'
-              - 'src/services/routines/**'
-              - 'src/services/slo/**'
-              - 'src/services/turn_orchestrator/**'
-              - 'tests/*'
-              - 'tests/fixtures/**'
-              - 'migrations/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'sqlx-data.json'
-              - '.cargo/**'
-              - 'rust-toolchain*'
-              - 'build.rs'
-              - '.github/workflows/ci-pr.yml'
-              - 'defaults.json'
-              - 'routines/**'
+              - '{src/**,tests/**,migrations/**,Cargo.toml,Cargo.lock,sqlx-data.json,.cargo/**,rust-toolchain*,build.rs,.github/workflows/ci-pr.yml,defaults.json,routines/**}'
+              - '!src/services/discord/**'
+              - '!tests/e2e/**'
 
   dashboard:
     name: Dashboard (Node 22)
