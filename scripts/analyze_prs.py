@@ -51,7 +51,7 @@ def _is_markdown_heading(line):
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
         return False
-    return re.match(r"^(?:[-*]\s*)?(?:\*\*)?[a-z0-9 /_-]+\s*:(?:\*\*)?(?:\s.*)?$", line.strip(), re.I)
+    return re.match(r"^(?:[-*]\s*)?(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\*\*)?(?:\s.*)?$", line.strip(), re.I)
 
 def _meaningful_branch_ref(value):
     normalized = value.strip().strip("`").strip(".,;:)]}")
@@ -60,7 +60,7 @@ def _meaningful_branch_ref(value):
 def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_labels=True):
     for label in labels:
         pattern = re.compile(
-            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|(?:\*\*)?[ \t]*)$"
+            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|[ \t]*)$"
         )
         for match in pattern.finditer(body):
             if _meaningful_field_value(match.group(1) or "", allow_none=allow_none):
