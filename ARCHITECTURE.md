@@ -373,6 +373,7 @@ src/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
 │   ├── claude/
+│   │   ├── active_usage.rs
 │   │   └── backend_routing.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
@@ -809,8 +810,10 @@ src/
 │   │   │   ├── stream_loop/
 │   │   │   │   ├── content_arms/
 │   │   │   │   │   ├── provider_error_presentation.rs
-│   │   │   │   │   └── tui_error_classification.rs
+│   │   │   │   │   ├── tui_error_classification.rs
+│   │   │   │   │   └── types.rs
 │   │   │   │   ├── content_arms.rs
+│   │   │   │   ├── message_conversion.rs
 │   │   │   │   └── tool_arms.rs
 │   │   │   ├── terminal_outcome_delivery/
 │   │   │   │   ├── empty_response_recovery/
@@ -911,6 +914,7 @@ src/
 │   │   ├── answer_flush_barrier.rs
 │   │   ├── bot_role.rs
 │   │   ├── catch_up.rs
+│   │   ├── compact_turn_authority.rs
 │   │   ├── delivery_lease_key.rs
 │   │   ├── destructive_cancel_capture.rs
 │   │   ├── destructive_cancel_gate.rs

@@ -42,6 +42,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::services::claude_compact_context::{CompactThreshold, compact_threshold};
 use crate::services::claude_tui::input::CompactSubmitOutcome;
+use crate::services::discord::{ManagedCompactTurnIdentity, live_managed_turn_matches};
 use crate::services::provider::ProviderKind;
 
 /// Per-pane key for the once-per-fill-cycle armed flag. Keyed by both the Discord
@@ -66,6 +67,7 @@ struct PaneArmState {
     armed: bool,
     generation: u64,
     last_occupied: u64,
+    last_window_tokens: u64,
 }
 
 impl PaneArmState {
@@ -74,6 +76,7 @@ impl PaneArmState {
             armed: true,
             generation: 0,
             last_occupied: 0,
+            last_window_tokens: 0,
         }
     }
 }
@@ -131,7 +134,16 @@ fn observe_and_decide(
             .panes
             .entry(pane.clone())
             .or_insert_with(PaneArmState::fresh);
+        if entry.last_window_tokens != 0
+            && entry.last_window_tokens != threshold.actual_window_tokens
+        {
+            // A model/window switch starts a distinct fill cycle. Invalidate the
+            // prior worker before this observation can consume a fresh generation.
+            entry.armed = true;
+            entry.generation = 0;
+        }
         entry.last_occupied = occupied;
+        entry.last_window_tokens = threshold.actual_window_tokens;
         entry.armed
     };
     // Re-arm first, independent of the inject check: a post-compact occupancy
@@ -203,6 +215,30 @@ fn rearm_for_retry(pane: &CompactPaneKey, generation: u64) {
     }
 }
 
+/// Invalidate a consumed cycle when its captured Managed authority was revoked
+/// before mutation. The generation and context-window match make this a
+/// compare-and-set: a stale worker cannot re-arm or clear a newer cycle. Resetting
+/// the matched generation lets the next eligible Managed observation at already
+/// high occupancy consume a fresh globally unique generation.
+fn invalidate_after_authority_rejection(
+    pane: &CompactPaneKey,
+    generation: u64,
+    threshold: CompactThreshold,
+) {
+    let mut guard = COMPACT_TRIGGER_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(entry) = guard.panes.get_mut(pane) {
+        if !entry.armed
+            && entry.generation == generation
+            && entry.last_window_tokens == threshold.actual_window_tokens
+        {
+            entry.armed = true;
+            entry.generation = 0;
+        }
+    }
+}
+
 /// Run the observable pre-send recheck and, if the world is unchanged, the
 /// compact submit — both inside a single per-pane composer critical section. The
 /// composer lock (not the leaf state lock) is the only lock held across the tmux
@@ -214,6 +250,8 @@ fn submit_under_composer_lock(
     pane: &CompactPaneKey,
     generation: u64,
     threshold: CompactThreshold,
+    expected_turn: &ManagedCompactTurnIdentity,
+    live_turn_matches: impl FnOnce(&ManagedCompactTurnIdentity) -> bool,
     submit: impl FnOnce() -> CompactSubmitOutcome,
 ) -> Option<CompactSubmitOutcome> {
     crate::services::claude_tui::composer_lock::with_composer_mutation_lock(
@@ -222,9 +260,57 @@ fn submit_under_composer_lock(
             if !pane_still_disarmed_for_send(pane, generation, threshold) {
                 return None;
             }
+            if !live_turn_matches(expected_turn) {
+                invalidate_after_authority_rejection(pane, generation, threshold);
+                return None;
+            }
             Some(submit())
         },
     )
+}
+
+/// Validate and forward one complete active Claude usage snapshot. Missing model,
+/// launch provenance, or any usage component fails closed before pane state exists.
+pub(in crate::services) fn observe_active_usage(
+    turn_identity: ManagedCompactTurnIdentity,
+    provider: &ProviderKind,
+    model: Option<&str>,
+    input_tokens: Option<u64>,
+    cache_create_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    compact_percent: u64,
+    lower_bound_tokens: u64,
+) -> bool {
+    if !matches!(provider, ProviderKind::Claude) {
+        return false;
+    }
+    let tmux_session_name = turn_identity.tmux_session_name();
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return false;
+    };
+    let (Some(input_tokens), Some(cache_create_tokens), Some(cache_read_tokens)) =
+        (input_tokens, cache_create_tokens, cache_read_tokens)
+    else {
+        return false;
+    };
+    let actual_window_tokens = crate::services::claude_compact_context::context_window_for_turn(
+        tmux_session_name,
+        Some(model),
+    );
+    if actual_window_tokens.is_none() {
+        return false;
+    }
+    maybe_inject_compact(
+        turn_identity,
+        provider,
+        input_tokens
+            .saturating_add(cache_create_tokens)
+            .saturating_add(cache_read_tokens),
+        actual_window_tokens,
+        compact_percent,
+        lower_bound_tokens,
+    );
+    true
 }
 
 /// Claude-only: at a watcher-completed (pane-idle) turn boundary, inject
@@ -242,9 +328,8 @@ fn submit_under_composer_lock(
 /// (Codex compacts natively), an unresolvable window, or a `0`/disabled percent.
 /// A `0`/low `usage_tokens` is deliberately NOT short-circuited: it is the
 /// post-compact re-arm signal handled inside [`observe_and_decide`].
-pub(crate) fn maybe_inject_compact(
-    channel_id: u64,
-    tmux_session_name: &str,
+pub(in crate::services) fn maybe_inject_compact(
+    turn_identity: ManagedCompactTurnIdentity,
     provider: &ProviderKind,
     usage_tokens: u64,
     actual_window_tokens: Option<u64>,
@@ -254,10 +339,8 @@ pub(crate) fn maybe_inject_compact(
     if !matches!(provider, ProviderKind::Claude) {
         return;
     }
-    let tmux_session_name = tmux_session_name.trim();
-    if tmux_session_name.is_empty() {
-        return;
-    }
+    let channel_id = turn_identity.channel_id();
+    let tmux_session_name = turn_identity.tmux_session_name();
     // A window this turn could not prove is fail-closed to no-inject (the caller
     // already applied the model-aware [1m] same-family guard). Unresolvable
     // window / zero-percent degrade safely WITHOUT touching the armed flag, just
@@ -283,9 +366,14 @@ pub(crate) fn maybe_inject_compact(
     // mutation (never the leaf state lock) and performs no turn-readiness wait. It
     // carries `generation` so the pre-send recheck binds it to THIS crossing.
     tokio::task::spawn_blocking(move || {
-        let outcome = submit_under_composer_lock(&pane, generation, threshold, || {
-            crate::services::claude_tui::input::send_compact_while_busy(&pane.tmux_session_name)
-        });
+        let outcome = submit_under_composer_lock(
+            &pane,
+            generation,
+            threshold,
+            &turn_identity,
+            live_managed_turn_matches,
+            || crate::services::claude_tui::input::send_compact_while_busy(&pane.tmux_session_name),
+        );
         match outcome {
             None => tracing::debug!(
                 tmux_session_name = %pane.tmux_session_name,
@@ -399,6 +487,108 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner())
             .panes
             .is_empty()
+    }
+
+    fn last_window_tokens(pane: &CompactPaneKey) -> Option<u64> {
+        COMPACT_TRIGGER_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .panes
+            .get(pane)
+            .map(|entry| entry.last_window_tokens)
+    }
+
+    /// Mutation guard: the window-change invalidation in `observe_and_decide`.
+    /// Changing context windows must issue a distinct generation, reject the old
+    /// queued worker at the composer barrier, and ignore its later retry re-arm.
+    #[test]
+    fn window_switch_invalidates_old_worker_and_starts_a_fresh_cycle() {
+        let _guard = state_test_guard();
+        let pane = pane();
+        let old_threshold = threshold_for(1_000_000);
+        let old_generation =
+            observe_and_decide(&pane, 600_000, old_threshold).expect("old window crossing");
+
+        let new_threshold = threshold_for(800_000);
+        let new_generation =
+            observe_and_decide(&pane, 600_000, new_threshold).expect("new window crossing");
+
+        assert_ne!(old_generation, new_generation);
+        assert_eq!(last_window_tokens(&pane), Some(800_000));
+        assert!(
+            !pane_still_disarmed_for_send(&pane, old_generation, old_threshold),
+            "a worker bound to the prior window must fail the composer barrier"
+        );
+        rearm_for_retry(&pane, old_generation);
+        assert_eq!(
+            armed_state(&pane),
+            Some(false),
+            "a stale retry must not re-arm the new window's consumed cycle"
+        );
+        assert!(pane_still_disarmed_for_send(
+            &pane,
+            new_generation,
+            new_threshold
+        ));
+    }
+
+    #[test]
+    fn active_usage_missing_model_or_provenance_does_not_create_pane_state() {
+        let _guard = state_test_guard();
+        assert!(!observe_active_usage(
+            ManagedCompactTurnIdentity::test_fixture(42, "tmux-4631"),
+            &ProviderKind::Claude,
+            None,
+            Some(560_000),
+            Some(0),
+            Some(0),
+            50,
+            300_000,
+        ));
+        assert!(panes_is_empty());
+        assert!(!observe_active_usage(
+            ManagedCompactTurnIdentity::test_fixture(42, "tmux-4631"),
+            &ProviderKind::Claude,
+            Some("routed-sonnet[1m]"),
+            Some(560_000),
+            Some(0),
+            Some(0),
+            50,
+            300_000,
+        ));
+        assert!(panes_is_empty());
+    }
+
+    #[test]
+    fn active_usage_rejects_partial_usage_before_creating_pane_state() {
+        let _guard = state_test_guard();
+        assert!(!observe_active_usage(
+            ManagedCompactTurnIdentity::test_fixture(42, "tmux-4631"),
+            &ProviderKind::Claude,
+            Some("routed-sonnet[1m]"),
+            Some(560_000),
+            None,
+            Some(0),
+            50,
+            300_000,
+        ));
+        assert!(panes_is_empty());
+    }
+
+    #[test]
+    fn active_usage_non_claude_provider_does_not_create_pane_state() {
+        let _guard = state_test_guard();
+        assert!(!observe_active_usage(
+            ManagedCompactTurnIdentity::test_fixture(42, "tmux-4631"),
+            &ProviderKind::Codex,
+            Some("routed-sonnet[1m]"),
+            Some(560_000),
+            Some(0),
+            Some(0),
+            50,
+            300_000,
+        ));
+        assert!(panes_is_empty());
     }
 
     /// Mutation guard: the optimistic consume (disarm + fresh generation) in the
@@ -551,64 +741,123 @@ mod tests {
         assert!(!pane_still_disarmed_for_send(&pane, generation, threshold));
     }
 
-    /// Lock-discipline + pre-send-recheck integration. Proves (a) the composer
-    /// lock — not the leaf state lock — serializes the queued worker (it cannot
-    /// validate or send until the held composer lock releases), and (b) a teardown
-    /// that lands while the worker is queued makes the pre-send recheck bail with
-    /// zero sends. Reverting the recheck lets the worker send after teardown
-    /// (sends == 1, outcome != None). Holding the leaf lock across `submit`
-    /// instead of the composer lock would let the worker run immediately, failing
-    /// the `recv_timeout(25ms).is_err()` assertion.
+    /// The worker is parked behind the physical pane's composer lock. While it is
+    /// parked, the live turn authority changes from the captured Managed identity
+    /// to ExternalInput or ExternalAdopted. The post-lock authority recheck must
+    /// reject the stale worker before the submit closure can mutate the composer.
     #[cfg(unix)]
     #[test]
-    fn queued_worker_revalidates_under_composer_lock_and_bails_on_teardown() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn queued_worker_revalidates_live_turn_authority_after_composer_barrier() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
 
+        #[derive(Debug)]
+        enum AuthorityTransition {
+            ExternalInput,
+            ExternalAdopted,
+        }
+
+        for external_source in [
+            AuthorityTransition::ExternalInput,
+            AuthorityTransition::ExternalAdopted,
+        ] {
+            let _guard = state_test_guard();
+            let pane = pane();
+            let threshold = threshold_for(1_000_000);
+            let generation =
+                observe_and_decide(&pane, 500_000, threshold).expect("crossing injects");
+            let expected_turn =
+                ManagedCompactTurnIdentity::test_fixture(42, &pane.tmux_session_name);
+            let authority_is_managed = Arc::new(AtomicBool::new(true));
+            let sends = Arc::new(AtomicUsize::new(0));
+            let (queued_tx, queued_rx) = mpsc::channel();
+            let (outcome_tx, outcome_rx) = mpsc::channel();
+            let worker_pane = pane.clone();
+            let worker_authority = Arc::clone(&authority_is_managed);
+            let worker_sends = Arc::clone(&sends);
+
+            crate::services::claude_tui::composer_lock::with_composer_mutation_lock(
+                &pane.tmux_session_name,
+                || {
+                    let worker = std::thread::spawn(move || {
+                        queued_tx.send(()).expect("signal queued compact worker");
+                        let outcome = submit_under_composer_lock(
+                            &worker_pane,
+                            generation,
+                            threshold,
+                            &expected_turn,
+                            |_| worker_authority.load(Ordering::SeqCst),
+                            || {
+                                worker_sends.fetch_add(1, Ordering::SeqCst);
+                                CompactSubmitOutcome::AcceptedOrQueued
+                            },
+                        );
+                        outcome_tx.send(outcome).expect("return compact outcome");
+                    });
+                    queued_rx
+                        .recv_timeout(Duration::from_millis(250))
+                        .expect("worker must queue behind the held composer lock");
+                    assert!(outcome_rx.recv_timeout(Duration::from_millis(25)).is_err());
+                    authority_is_managed.store(false, Ordering::SeqCst);
+                    worker
+                },
+            )
+            .join()
+            .expect("compact worker thread");
+
+            assert_eq!(
+                outcome_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
+                None,
+                "{external_source:?} must reject the queued worker"
+            );
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                0,
+                "{external_source:?} must cause zero composer mutations"
+            );
+
+            let fresh_generation = observe_and_decide(&pane, 500_000, threshold)
+                .expect("a later Managed observation must start a fresh high-occupancy cycle");
+            assert_ne!(generation, fresh_generation);
+            assert!(
+                observe_and_decide(&pane, 500_000, threshold).is_none(),
+                "the fresh Managed cycle must schedule exactly once"
+            );
+            assert!(pane_still_disarmed_for_send(
+                &pane,
+                fresh_generation,
+                threshold
+            ));
+            clear_for_tmux(&pane.tmux_session_name);
+        }
+    }
+
+    #[test]
+    fn stale_authority_rejection_cannot_rearm_a_newer_cycle() {
         let _guard = state_test_guard();
         let pane = pane();
         let threshold = threshold_for(1_000_000);
-        let generation = observe_and_decide(&pane, 500_000, threshold).expect("crossing injects");
-        let sends = Arc::new(AtomicUsize::new(0));
-        let (queued_tx, queued_rx) = mpsc::channel();
-        let (outcome_tx, outcome_rx) = mpsc::channel();
-        let worker_pane = pane.clone();
-        let worker_sends = Arc::clone(&sends);
+        let old_generation =
+            observe_and_decide(&pane, 600_000, threshold).expect("old crossing injects");
 
-        crate::services::claude_tui::composer_lock::with_composer_mutation_lock(
-            &pane.tmux_session_name,
-            || {
-                let worker = std::thread::spawn(move || {
-                    queued_tx.send(()).expect("signal queued compact worker");
-                    let outcome =
-                        submit_under_composer_lock(&worker_pane, generation, threshold, || {
-                            worker_sends.fetch_add(1, Ordering::SeqCst);
-                            CompactSubmitOutcome::AcceptedOrQueued
-                        });
-                    outcome_tx.send(outcome).expect("return compact outcome");
-                });
-                queued_rx
-                    .recv_timeout(Duration::from_millis(250))
-                    .expect("worker must queue behind the held composer lock");
-                assert!(
-                    outcome_rx.recv_timeout(Duration::from_millis(25)).is_err(),
-                    "the queued worker must not validate or send before the composer lock releases"
-                );
-                clear_for_tmux(&pane.tmux_session_name);
-                worker
-            },
-        )
-        .join()
-        .expect("compact worker thread");
+        invalidate_after_authority_rejection(&pane, old_generation, threshold);
+        let new_generation =
+            observe_and_decide(&pane, 600_000, threshold).expect("fresh crossing injects");
+        assert_ne!(old_generation, new_generation);
 
+        invalidate_after_authority_rejection(&pane, old_generation, threshold);
+        rearm_for_retry(&pane, old_generation);
         assert_eq!(
-            outcome_rx
-                .recv_timeout(Duration::from_millis(250))
-                .expect("worker outcome"),
-            None
+            armed_state(&pane),
+            Some(false),
+            "a stale rejection or retry must not re-arm the newer consumed cycle"
         );
-        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(pane_still_disarmed_for_send(
+            &pane,
+            new_generation,
+            threshold
+        ));
     }
 
     /// Observable retry: a non-confirmed send (`PreMutationRefused` or
@@ -673,8 +922,7 @@ mod tests {
         let _guard = state_test_guard();
         let pane = pane();
         maybe_inject_compact(
-            pane.channel_id,
-            &pane.tmux_session_name,
+            ManagedCompactTurnIdentity::test_fixture(pane.channel_id, &pane.tmux_session_name),
             &ProviderKind::Codex,
             600_000,
             Some(1_000_000),
@@ -683,8 +931,7 @@ mod tests {
         );
         assert!(armed_state(&pane).is_none());
         maybe_inject_compact(
-            pane.channel_id,
-            &pane.tmux_session_name,
+            ManagedCompactTurnIdentity::test_fixture(pane.channel_id, &pane.tmux_session_name),
             &ProviderKind::Claude,
             600_000,
             None,
@@ -693,8 +940,7 @@ mod tests {
         );
         assert!(armed_state(&pane).is_none());
         maybe_inject_compact(
-            pane.channel_id,
-            &pane.tmux_session_name,
+            ManagedCompactTurnIdentity::test_fixture(pane.channel_id, &pane.tmux_session_name),
             &ProviderKind::Claude,
             600_000,
             Some(1_000_000),
@@ -702,21 +948,5 @@ mod tests {
             300_000,
         );
         assert!(armed_state(&pane).is_none());
-    }
-
-    /// Empty tmux session names are ignored (no flag entry created).
-    #[test]
-    fn blank_tmux_session_name_is_ignored() {
-        let _guard = state_test_guard();
-        maybe_inject_compact(
-            42,
-            "   ",
-            &ProviderKind::Claude,
-            600_000,
-            Some(1_000_000),
-            50,
-            300_000,
-        );
-        assert!(panes_is_empty());
     }
 }
