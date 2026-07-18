@@ -207,9 +207,9 @@ pub(crate) enum IntakeRouterDecision {
     /// with no usable preference, or an availability fallback after that
     /// ownerless state was proven). The caller MUST run the turn locally.
     RanLocal { reason: RanLocalReason },
-    /// Observe mode would have forwarded but the caller MUST still
-    /// run locally. The chosen target is reported for logging only.
-    ObservedWouldForward { target_instance_id: String },
+    /// Observe mode evaluated the same owner-aware placement path as Enforce,
+    /// but did not mutate the outbox. The caller MUST still run locally.
+    Observed { outcome: ObservedIntakeOutcome },
     /// The hook inserted a row for the worker. The caller MUST NOT
     /// run the turn locally — that would double-emit the Discord turn.
     /// `outbox_id` is the row's PK for log correlation.
@@ -231,6 +231,17 @@ pub(crate) enum IntakeRouterDecision {
     /// Ownership or placement could not be proven safe. Caller MUST NOT run
     /// the local execution body.
     Blocked { reason: IntakeBlockedReason },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObservedIntakeOutcome {
+    WouldKeepLocalExistingOwner,
+    WouldForwardLiveForeignOwner { target_instance_id: String },
+    WouldAssignNoOwnerToTarget { target_instance_id: String },
+    WouldKeepNoOwnerLocal { reason: RanLocalReason },
+    WouldSkipDuplicate,
+    WouldDeferOpenRoute { target_instance_id: String },
+    WouldBlock { reason: IntakeBlockedReason },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,19 +358,8 @@ pub(crate) async fn try_route_intake(
         };
     }
 
-    if matches!(ctx.mode, IntakeRoutingMode::Observe) {
-        if node_override.is_some() {
-            return IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::NodeOverrideRoutingDisabled,
-            };
-        }
-        if ctx.has_nonportable_uploads {
-            return IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::NoOwnerWithNonPortableAttachment,
-            };
-        }
-        return route_by_preferred_labels(pool, ctx).await;
-    }
+    // Observe and Enforce share the owner/open-route/attachment/placement path.
+    // Only the final outbox mutation is mode-dependent.
 
     // Enforce precedence: live session owner -> explicit /node -> preferred
     // labels. The owner lookup must complete before any placement fallback.
@@ -375,9 +375,12 @@ pub(crate) async fn try_route_intake(
     {
         Ok(owner) => owner,
         Err(detail) => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::OwnerLookupFailed { detail },
-            };
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::OwnerLookupFailed { detail },
+                },
+            );
         }
     };
 
@@ -387,32 +390,44 @@ pub(crate) async fn try_route_intake(
     // owner can never consume this gateway-local path.
     match &owner {
         SessionOwnerResolution::StaleOwners { instance_ids } => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::StaleSessionOwners {
-                    instance_ids: instance_ids.clone(),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::StaleSessionOwners {
+                        instance_ids: instance_ids.clone(),
+                    },
                 },
-            };
+            );
         }
         SessionOwnerResolution::ConflictingLiveOwners { instance_ids } => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::ConflictingLiveSessionOwners {
-                    instance_ids: instance_ids.clone(),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::ConflictingLiveSessionOwners {
+                        instance_ids: instance_ids.clone(),
+                    },
                 },
-            };
+            );
         }
         SessionOwnerResolution::LiveForeignIncompatible { instance_id, .. } => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::OwnerProtocolIncompatible {
-                    instance_id: instance_id.clone(),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::OwnerProtocolIncompatible {
+                        instance_id: instance_id.clone(),
+                    },
                 },
-            };
+            );
         }
         SessionOwnerResolution::LiveForeign { instance_id, .. } if ctx.has_nonportable_uploads => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::NonPortableAttachment {
-                    owner_instance_id: instance_id.clone(),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::NonPortableAttachment {
+                        owner_instance_id: instance_id.clone(),
+                    },
                 },
-            };
+            );
         }
         SessionOwnerResolution::NoOwner
         | SessionOwnerResolution::LiveLocal { .. }
@@ -426,18 +441,24 @@ pub(crate) async fn try_route_intake(
     // including a local live owner and attachment-first placement.
     match existing_open_route(pool, ctx.channel_id).await {
         Ok(Some((_, existing_user_msg_id))) if existing_user_msg_id == ctx.user_msg_id => {
-            return IntakeRouterDecision::SkippedDuplicate;
+            return apply_observe_mode(ctx.mode, IntakeRouterDecision::SkippedDuplicate);
         }
         Ok(Some((target_instance_id, _))) => {
-            return IntakeRouterDecision::DeferredOpenRoute { target_instance_id };
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::DeferredOpenRoute { target_instance_id },
+            );
         }
         Ok(None) => {}
         Err(error) => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::RoutingDependencyFailed {
-                    detail: format!("open route lookup: {error}"),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::RoutingDependencyFailed {
+                        detail: format!("open route lookup: {error}"),
+                    },
                 },
-            };
+            );
         }
     }
 
@@ -447,9 +468,12 @@ pub(crate) async fn try_route_intake(
             stale_instance_ids,
         } => {
             log_shadowed_owner_state(ctx, &instance_id, node_override, &stale_instance_ids);
-            IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::LiveSessionOwnerIsLocal,
-            }
+            apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::RanLocal {
+                    reason: RanLocalReason::LiveSessionOwnerIsLocal,
+                },
+            )
         }
         SessionOwnerResolution::LiveForeign {
             instance_id,
@@ -460,14 +484,25 @@ pub(crate) async fn try_route_intake(
                 Ok(Some((agent_id, _, _))) => agent_id,
                 Ok(None) => String::new(),
                 Err(error) => {
-                    return IntakeRouterDecision::Blocked {
-                        reason: IntakeBlockedReason::RoutingDependencyFailed {
-                            detail: format!("agent lookup for live owner: {error}"),
+                    return apply_observe_mode(
+                        ctx.mode,
+                        IntakeRouterDecision::Blocked {
+                            reason: IntakeBlockedReason::RoutingDependencyFailed {
+                                detail: format!("agent lookup for live owner: {error}"),
+                            },
                         },
-                    };
+                    );
                 }
             };
-            route_to_instance(pool, ctx, &instance_id, &[], &agent_id).await
+            route_to_instance(
+                pool,
+                ctx,
+                &instance_id,
+                &[],
+                &agent_id,
+                ObserveTargetKind::LiveForeignOwner,
+            )
+            .await
         }
         SessionOwnerResolution::StaleOwners { .. }
         | SessionOwnerResolution::ConflictingLiveOwners { .. }
@@ -476,9 +511,12 @@ pub(crate) async fn try_route_intake(
         }
         SessionOwnerResolution::NoOwner => {
             if ctx.has_nonportable_uploads {
-                return IntakeRouterDecision::RanLocal {
-                    reason: RanLocalReason::NoOwnerWithNonPortableAttachment,
-                };
+                return apply_observe_mode(
+                    ctx.mode,
+                    IntakeRouterDecision::RanLocal {
+                        reason: RanLocalReason::NoOwnerWithNonPortableAttachment,
+                    },
+                );
             }
             if let Some(target) = node_override {
                 route_node_override_without_owner(pool, ctx, target).await
@@ -515,6 +553,12 @@ fn log_shadowed_owner_state(
     }
 }
 
+fn preferred_label_dependency_fallback(detail: String) -> IntakeRouterDecision {
+    IntakeRouterDecision::RanLocal {
+        reason: RanLocalReason::DbErrorFellBackToLocal { detail },
+    }
+}
+
 async fn route_by_preferred_labels(
     pool: &PgPool,
     ctx: &IntakeRouterContext<'_>,
@@ -530,23 +574,28 @@ async fn route_by_preferred_labels(
         match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => {
-                return IntakeRouterDecision::RanLocal {
-                    reason: RanLocalReason::NoAgentForChannel,
-                };
+                return apply_observe_mode(
+                    ctx.mode,
+                    IntakeRouterDecision::RanLocal {
+                        reason: RanLocalReason::NoAgentForChannel,
+                    },
+                );
             }
             Err(error) => {
-                return IntakeRouterDecision::RanLocal {
-                    reason: RanLocalReason::DbErrorFellBackToLocal {
-                        detail: format!("agent lookup: {error}"),
-                    },
-                };
+                return apply_observe_mode(
+                    ctx.mode,
+                    preferred_label_dependency_fallback(format!("agent lookup: {error}")),
+                );
             }
         };
 
     if preferred_labels.is_empty() {
-        return IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::AgentHasNoPreference,
-        };
+        return apply_observe_mode(
+            ctx.mode,
+            IntakeRouterDecision::RanLocal {
+                reason: RanLocalReason::AgentHasNoPreference,
+            },
+        );
     }
 
     let candidates = match crate::services::cluster::node_registry::list_worker_nodes(
@@ -569,43 +618,42 @@ async fn route_by_preferred_labels(
             candidates_from_worker_nodes_json(&eligible_nodes)
         }
         Err(error) => {
-            return IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::DbErrorFellBackToLocal {
-                    detail: format!("list worker_nodes: {error}"),
-                },
-            };
+            return apply_observe_mode(
+                ctx.mode,
+                preferred_label_dependency_fallback(format!("list worker_nodes: {error}")),
+            );
         }
     };
 
     let target = match pick_intake_target(&candidates, &preferred_labels, ctx.leader_instance_id) {
         IntakeRouteTarget::Worker { instance_id } => instance_id,
         IntakeRouteTarget::Local { reason } => {
-            return IntakeRouterDecision::RanLocal {
-                reason: match reason {
-                    LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
-                    LocalRouteReason::LeaderIsOnlyEligible => RanLocalReason::LeaderIsOnlyEligible,
-                    LocalRouteReason::NoPreference => unreachable!(
-                        "pick_intake_target cannot return no-preference after non-empty preference gate"
-                    ),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::RanLocal {
+                    reason: match reason {
+                        LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
+                        LocalRouteReason::LeaderIsOnlyEligible => {
+                            RanLocalReason::LeaderIsOnlyEligible
+                        }
+                        LocalRouteReason::NoPreference => unreachable!(
+                            "pick_intake_target cannot return no-preference after non-empty preference gate"
+                        ),
+                    },
                 },
-            };
+            );
         }
     };
 
-    if matches!(ctx.mode, IntakeRoutingMode::Observe) {
-        tracing::info!(
-            target_instance_id = %target,
-            channel_id = ctx.channel_id,
-            user_msg_id = ctx.user_msg_id,
-            agent_id = %agent_id,
-            "[intake_router] OBSERVE: would forward to worker (running locally)"
-        );
-        return IntakeRouterDecision::ObservedWouldForward {
-            target_instance_id: target,
-        };
-    }
-
-    route_to_instance(pool, ctx, &target, &preferred_labels, &agent_id).await
+    route_to_instance(
+        pool,
+        ctx,
+        &target,
+        &preferred_labels,
+        &agent_id,
+        ObserveTargetKind::NoOwnerPlacement,
+    )
+    .await
 }
 
 async fn route_node_override_without_owner(
@@ -620,18 +668,24 @@ async fn route_node_override_without_owner(
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => (String::new(), String::new(), Vec::new()),
             Err(error) => {
-                return IntakeRouterDecision::Blocked {
-                    reason: IntakeBlockedReason::RoutingDependencyFailed {
-                        detail: format!("agent lookup for node override: {error}"),
+                return apply_observe_mode(
+                    ctx.mode,
+                    IntakeRouterDecision::Blocked {
+                        reason: IntakeBlockedReason::RoutingDependencyFailed {
+                            detail: format!("agent lookup for node override: {error}"),
+                        },
                     },
-                };
+                );
             }
         };
 
     if target == ctx.leader_instance_id {
-        return IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::NodeOverrideIsLeader,
-        };
+        return apply_observe_mode(
+            ctx.mode,
+            IntakeRouterDecision::RanLocal {
+                reason: RanLocalReason::NodeOverrideIsLeader,
+            },
+        );
     }
 
     let nodes = match crate::services::cluster::node_registry::list_worker_nodes(
@@ -642,11 +696,14 @@ async fn route_node_override_without_owner(
     {
         Ok(nodes) => nodes,
         Err(_) => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::OverrideUnavailable {
-                    target_instance_id: target.to_string(),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::OverrideUnavailable {
+                        target_instance_id: target.to_string(),
+                    },
                 },
-            };
+            );
         }
     };
     let target_online = nodes.iter().any(|node| {
@@ -662,15 +719,59 @@ async fn route_node_override_without_owner(
             )
     });
     if !target_online {
-        return IntakeRouterDecision::Blocked {
-            reason: IntakeBlockedReason::OverrideUnavailable {
-                target_instance_id: target.to_string(),
+        return apply_observe_mode(
+            ctx.mode,
+            IntakeRouterDecision::Blocked {
+                reason: IntakeBlockedReason::OverrideUnavailable {
+                    target_instance_id: target.to_string(),
+                },
             },
-        };
+        );
     }
 
     let required_labels: Vec<String> = Vec::new();
-    route_to_instance(pool, ctx, target, &required_labels, &agent_id).await
+    route_to_instance(
+        pool,
+        ctx,
+        target,
+        &required_labels,
+        &agent_id,
+        ObserveTargetKind::NoOwnerPlacement,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ObserveTargetKind {
+    LiveForeignOwner,
+    NoOwnerPlacement,
+}
+
+fn apply_observe_mode(
+    mode: IntakeRoutingMode,
+    decision: IntakeRouterDecision,
+) -> IntakeRouterDecision {
+    if !matches!(mode, IntakeRoutingMode::Observe) {
+        return decision;
+    }
+
+    let outcome = match decision {
+        IntakeRouterDecision::RanLocal {
+            reason: RanLocalReason::LiveSessionOwnerIsLocal,
+        } => ObservedIntakeOutcome::WouldKeepLocalExistingOwner,
+        IntakeRouterDecision::RanLocal { reason } => {
+            ObservedIntakeOutcome::WouldKeepNoOwnerLocal { reason }
+        }
+        IntakeRouterDecision::SkippedDuplicate => ObservedIntakeOutcome::WouldSkipDuplicate,
+        IntakeRouterDecision::DeferredOpenRoute { target_instance_id } => {
+            ObservedIntakeOutcome::WouldDeferOpenRoute { target_instance_id }
+        }
+        IntakeRouterDecision::Blocked { reason } => ObservedIntakeOutcome::WouldBlock { reason },
+        IntakeRouterDecision::Observed { .. } | IntakeRouterDecision::Forwarded { .. } => {
+            unreachable!("observe conversion accepts only a mutation-free routing decision")
+        }
+    };
+    IntakeRouterDecision::Observed { outcome }
 }
 
 async fn existing_open_route(
@@ -696,24 +797,54 @@ async fn route_to_instance(
     target: &str,
     required_labels: &[String],
     agent_id: &str,
+    observe_target_kind: ObserveTargetKind,
 ) -> IntakeRouterDecision {
     match existing_open_route(pool, ctx.channel_id).await {
         Ok(Some((_, existing_user_msg_id))) if existing_user_msg_id == ctx.user_msg_id => {
-            return IntakeRouterDecision::SkippedDuplicate;
+            return apply_observe_mode(ctx.mode, IntakeRouterDecision::SkippedDuplicate);
         }
         Ok(Some((existing_target, _))) => {
-            return IntakeRouterDecision::DeferredOpenRoute {
-                target_instance_id: existing_target,
-            };
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::DeferredOpenRoute {
+                    target_instance_id: existing_target,
+                },
+            );
         }
         Ok(None) => {}
         Err(error) => {
-            return IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::RoutingDependencyFailed {
-                    detail: format!("open route lookup: {error}"),
+            return apply_observe_mode(
+                ctx.mode,
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::RoutingDependencyFailed {
+                        detail: format!("open route lookup: {error}"),
+                    },
                 },
-            };
+            );
         }
+    }
+
+    if matches!(ctx.mode, IntakeRoutingMode::Observe) {
+        let outcome = match observe_target_kind {
+            ObserveTargetKind::LiveForeignOwner => {
+                ObservedIntakeOutcome::WouldForwardLiveForeignOwner {
+                    target_instance_id: target.to_string(),
+                }
+            }
+            ObserveTargetKind::NoOwnerPlacement => {
+                ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
+                    target_instance_id: target.to_string(),
+                }
+            }
+        };
+        tracing::info!(
+            ?outcome,
+            channel_id = ctx.channel_id,
+            user_msg_id = ctx.user_msg_id,
+            agent_id,
+            "[intake_router] owner-aware observe decision"
+        );
+        return IntakeRouterDecision::Observed { outcome };
     }
 
     // Live ingress is always attempt 1. Retry-family allocation belongs only
@@ -1075,8 +1206,10 @@ mod pg_tests {
         .await;
         assert_eq!(
             decision,
-            IntakeRouterDecision::ObservedWouldForward {
-                target_instance_id: "worker-mac".to_string()
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
+                    target_instance_id: "worker-mac".to_string()
+                }
             }
         );
 
@@ -1088,6 +1221,164 @@ mod pg_tests {
                 .await
                 .expect("count");
         assert_eq!(count, 0, "observe mode must not insert any rows");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observe_mode_uses_live_local_owner_without_mutation() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_session_owner(
+            &pool,
+            "claude:leader-1:ch-observe-local",
+            "claude",
+            "ch-observe-local",
+            "leader-1",
+            "turn_active",
+        )
+        .await;
+
+        let decision = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-observe-local"),
+        )
+        .await;
+        assert_eq!(
+            decision,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldKeepLocalExistingOwner
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-observe-local")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observe_mode_uses_live_foreign_owner_without_mutation() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_worker_node(&pool, "worker-owner", serde_json::json!([]), "online").await;
+        seed_session_owner(
+            &pool,
+            "claude:worker-owner:ch-observe-foreign",
+            "claude",
+            "ch-observe-foreign",
+            "worker-owner",
+            "turn_active",
+        )
+        .await;
+
+        let decision = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-observe-foreign"),
+        )
+        .await;
+        assert_eq!(
+            decision,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldForwardLiveForeignOwner {
+                    target_instance_id: "worker-owner".to_string()
+                }
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-observe-foreign")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observe_mode_reports_stale_owner_block_without_mutation() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_session_owner(
+            &pool,
+            "claude:stale-owner:ch-observe-stale",
+            "claude",
+            "ch-observe-stale",
+            "stale-owner",
+            "turn_active",
+        )
+        .await;
+
+        let decision = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-observe-stale"),
+        )
+        .await;
+        assert_eq!(
+            decision,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldBlock {
+                    reason: IntakeBlockedReason::StaleSessionOwners {
+                        instance_ids: vec!["stale-owner".to_string()]
+                    }
+                }
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-observe-stale")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observe_mode_reports_foreign_attachment_block_without_mutation() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_worker_node(&pool, "worker-owner", serde_json::json!([]), "online").await;
+        seed_session_owner(
+            &pool,
+            "claude:worker-owner:ch-observe-upload",
+            "claude",
+            "ch-observe-upload",
+            "worker-owner",
+            "turn_active",
+        )
+        .await;
+        let mut ctx = ctx_for_channel(IntakeRoutingMode::Observe, "ch-observe-upload");
+        ctx.has_nonportable_uploads = true;
+
+        let decision = try_route_intake(&pool, &ctx).await;
+        assert_eq!(
+            decision,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldBlock {
+                    reason: IntakeBlockedReason::NonPortableAttachment {
+                        owner_instance_id: "worker-owner".to_string()
+                    }
+                }
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-observe-upload")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
 
         pool.close().await;
         pg_db.drop().await;
@@ -1896,7 +2187,7 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn confirmed_no_owner_keeps_preference_lookup_availability_fallback_pg() {
+    async fn no_owner_agent_lookup_error_has_observe_enforce_parity_without_mutation_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         sqlx::query("DROP TABLE agents CASCADE")
@@ -1904,17 +2195,87 @@ mod pg_tests {
             .await
             .expect("drop agents for preference lookup error");
 
-        let decision = try_route_intake(
+        let enforce = try_route_intake(
             &pool,
             &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-preference-error"),
         )
         .await;
+        let observe = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-preference-error"),
+        )
+        .await;
+        let IntakeRouterDecision::RanLocal { reason } = enforce else {
+            panic!("expected enforce availability fallback, got {enforce:?}");
+        };
         assert!(matches!(
-            decision,
-            IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::DbErrorFellBackToLocal { .. }
-            }
+            reason,
+            RanLocalReason::DbErrorFellBackToLocal { .. }
         ));
+        assert_eq!(
+            observe,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldKeepNoOwnerLocal { reason }
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-preference-error")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0, "observe dependency fallback must not insert");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_owner_worker_lookup_error_has_observe_enforce_parity_without_mutation_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_agent_with_preference(
+            &pool,
+            "agent-worker-lookup-error",
+            "ch-worker-lookup-error",
+            serde_json::json!(["mini"]),
+        )
+        .await;
+        sqlx::query("DROP TABLE worker_nodes CASCADE")
+            .execute(&pool)
+            .await
+            .expect("drop worker_nodes for preference routing error");
+
+        let enforce = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-worker-lookup-error"),
+        )
+        .await;
+        let observe = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-worker-lookup-error"),
+        )
+        .await;
+        let IntakeRouterDecision::RanLocal { reason } = enforce else {
+            panic!("expected enforce availability fallback, got {enforce:?}");
+        };
+        assert!(matches!(
+            reason,
+            RanLocalReason::DbErrorFellBackToLocal { .. }
+        ));
+        assert_eq!(
+            observe,
+            IntakeRouterDecision::Observed {
+                outcome: ObservedIntakeOutcome::WouldKeepNoOwnerLocal { reason }
+            }
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+                .bind("ch-worker-lookup-error")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0, "observe dependency fallback must not insert");
 
         pool.close().await;
         pg_db.drop().await;
