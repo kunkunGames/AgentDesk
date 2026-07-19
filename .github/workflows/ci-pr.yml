@@ -55,7 +55,7 @@ jobs:
       # workflow still exercises the full macOS/Windows matrix within 24h.
       # NOTE: this gates ONLY the advisory Windows lane. Required ubuntu
       # Rust/PG/dashboard mirrors still verify every matching PR.
-      cross_os_rust: ${{ steps.cross_os_filter.outputs.cross_os_rust }}
+      cross_os_rust: ${{ steps.filter.outputs.cross_os_rust }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -217,20 +217,30 @@ jobs:
               # (src/services/routines/loader.rs); a routine asset change
               # can fail the test on any OS.
               - 'routines/**'
-
-      # This filter needs `every`: with dorny/paths-filter's default `some`, a
-      # broad positive rule can make a file match despite a negative rule.
-      # Keep the brace alternatives in sync with `rust_compile` above.
-      - name: Detect cross-OS Rust changes
-        id: cross_os_filter
-        uses: dorny/paths-filter@v3
-        with:
-          predicate-quantifier: every
-          filters: |
+            # cross_os_rust mirrors `rust_compile` MINUS the relay
+            # stabilization surface. When false, the only compile-affecting
+            # changes are confined to `src/services/discord/**` and/or
+            # `tests/e2e/**`, which the nightly macOS/Windows matrix already
+            # exercises daily — so the advisory PR-time Windows lane is
+            # skipped to keep relay-only PRs fast. Any compile input outside
+            # that surface (a different crate path, Cargo/toolchain/build.rs,
+            # this CI file) flips it true and the Windows lane runs. Keep the
+            # base list in sync with `rust_compile` using negative exclusions.
             cross_os_rust:
-              - '{src/**,tests/**,migrations/**,Cargo.toml,Cargo.lock,sqlx-data.json,.cargo/**,rust-toolchain*,build.rs,.github/workflows/ci-pr.yml,defaults.json,routines/**}'
+              - 'src/**'
               - '!src/services/discord/**'
+              - 'tests/**'
               - '!tests/e2e/**'
+              - 'migrations/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'sqlx-data.json'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - 'build.rs'
+              - '.github/workflows/ci-pr.yml'
+              - 'defaults.json'
+              - 'routines/**'
 
   dashboard:
     name: Dashboard (Node 22)
