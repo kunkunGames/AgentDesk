@@ -766,9 +766,7 @@ pub(super) fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
     let mut emitted = vec![false; n];
 
     while !ready.is_empty() {
-        ready.sort_unstable_by_key(|idx| {
-            std::cmp::Reverse(planning_sort_key(&cards[*idx], *idx))
-        });
+        ready.sort_unstable_by_key(|idx| std::cmp::Reverse(planning_sort_key(&cards[*idx], *idx)));
         let current = ready.pop().unwrap(); // agentdesk-audit: allow-unwrap
         if emitted[current] {
             continue;
