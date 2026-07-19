@@ -61,7 +61,7 @@
 | `cli::client::runtime_config` | `src/cli/client/runtime_config.rs` | 55 | 23 | 32 |  |
 | `cli::dcserver` | `src/cli/dcserver.rs` | 1650 | 1650 | 0 | giant-file |
 | `cli::dcserver_pg_bootstrap` | `src/cli/dcserver_pg_bootstrap.rs` | 1068 | 544 | 524 |  |
-| `cli::direct` | `src/cli/direct.rs` | 1758 | 1758 | 0 | giant-file |
+| `cli::direct` | `src/cli/direct.rs` | 1767 | 1767 | 0 | giant-file |
 | `cli::discord` | `src/cli/discord.rs` | 472 | 249 | 223 |  |
 | `cli::discord_thread_create` | `src/cli/discord_thread_create.rs` | 1468 | 415 | 1053 |  |
 | `cli::discord_thread_create_lock` | `src/cli/discord_thread_create_lock.rs` | 669 | 611 | 58 |  |
@@ -302,9 +302,9 @@
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 815 | 502 | 313 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1260 | 1260 | 0 | giant-file |
 | `server::routes::review_verdict` | `src/server/routes/review_verdict/mod.rs` | 14 | 14 | 0 |  |
-| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 26 | 26 | 0 |  |
+| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 56 | 56 | 0 |  |
 | `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 14 | 14 | 0 |  |
-| `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 688 | 624 | 64 |  |
+| `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 702 | 638 | 64 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 760 | 671 | 89 |  |
 | `server::routes::routines` | `src/server/routes/routines.rs` | 252 | 154 | 98 |  |
 | `server::routes::routines::audit` | `src/server/routes/routines/audit.rs` | 190 | 115 | 75 |  |
