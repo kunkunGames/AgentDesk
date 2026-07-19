@@ -132,8 +132,10 @@ mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
 
-pub(in crate::services::discord) use delivery_lease_key::DeliveryLeaseKey;
 pub(crate) use meeting_orchestrator as meeting;
+pub(in crate::services::discord) use {
+    delivery_lease_key::DeliveryLeaseKey, relay_health::RelayFrontierToken,
+};
 // #3479 item-2: re-export the catch-up subsystem entry points referenced
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
 // here in mod.rs and `catch_up_missed_messages` in runtime_bootstrap recovery).
@@ -1454,15 +1456,10 @@ mod tmux_watcher_registry_restore_tests {
 
 /// Per-channel coordination for watcher-to-Discord relay emission.
 ///
-/// This state is **shared across watcher-handle replacements** (unlike
-/// `TmuxWatcherHandle`, which is recreated on watcher reattach). It keeps
-/// relay emission serialized if a stale outgoing watcher overlaps with its
-/// successor, and it exposes the confirmed-output watermark used by watcher
-/// stop checks.
-///
-/// Scope: intra-process only. Persisted dedupe across dcserver restarts is
-/// still handled by `InflightTurnState::last_watcher_relayed_offset` in the
-/// inflight JSON.
+/// Shared across watcher-handle replacements, this serializes overlapping
+/// outgoing/successor relay emission and exposes the confirmed-output watermark.
+/// Scope: intra-process only; restart-persistent dedupe remains in
+/// `InflightTurnState::last_watcher_relayed_offset`.
 pub(super) struct TmuxRelayCoord {
     /// Non-zero while some watcher instance is actively emitting a relay for
     /// this channel. Holds the `data_start_offset` of the in-progress emission.
@@ -1480,13 +1477,11 @@ pub(super) struct TmuxRelayCoord {
     /// (idle-JSONL relay, session-bound sink) CONSULT this watermark so a
     /// byte-range the watcher already committed is relayed exactly once
     /// regardless of which actor observes it first (the E-13 dedup invariant).
-    /// For a normal
-    /// Discord-origin turn (inflight present) the watcher remains the sole
-    /// relay owner and relay dedupe is still scoped to the watcher instance via
-    /// its local `last_relayed_offset` — a valid owner is never suppressed
-    /// solely because another watcher advanced this watermark; only the
-    /// no-inflight wake/idle paths gate on it.
+    /// For a normal Discord-origin turn (inflight present) the watcher remains
+    /// sole relay owner; only no-inflight wake/idle paths gate on this watermark.
     pub(super) confirmed_end_offset: Arc<std::sync::atomic::AtomicU64>,
+    pub(in crate::services::discord) reset_state:
+        std::sync::Mutex<relay_health::FrontierResetState>,
     /// Wall-clock timestamp (ms since epoch) of the most recent confirmed
     /// relay. 0 = no confirmed relay observed yet. Read by the
     /// `watcher-state` observability endpoint (#964). Monotonic is NOT
@@ -1528,6 +1523,7 @@ impl TmuxRelayCoord {
         Self {
             relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reset_state: std::sync::Mutex::new(relay_health::FrontierResetState::default()),
             last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_generation_mtime_ns: Arc::new(std::sync::atomic::AtomicI64::new(0)),
