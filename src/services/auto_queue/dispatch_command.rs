@@ -692,8 +692,10 @@ pub(super) fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
             .collect();
         let mut sorted = Vec::with_capacity(members.len());
         while !available.is_empty() {
-            available.sort_by_key(|idx| planning_sort_key(&cards[*idx], *idx));
-            let current = available.remove(0);
+            available.sort_unstable_by_key(|idx| {
+                std::cmp::Reverse(planning_sort_key(&cards[*idx], *idx))
+            });
+            let current = available.pop().unwrap(); // agentdesk-audit: allow-unwrap
             sorted.push(current);
             for &next in &dependency_adj[current] {
                 if !member_set.contains(&next) {
@@ -764,8 +766,8 @@ pub(super) fn build_group_plan(cards: &[GenerateCandidate]) -> GroupPlan {
     let mut emitted = vec![false; n];
 
     while !ready.is_empty() {
-        ready.sort_by_key(|idx| planning_sort_key(&cards[*idx], *idx));
-        let current = ready.remove(0);
+        ready.sort_unstable_by_key(|idx| std::cmp::Reverse(planning_sort_key(&cards[*idx], *idx)));
+        let current = ready.pop().unwrap(); // agentdesk-audit: allow-unwrap
         if emitted[current] {
             continue;
         }

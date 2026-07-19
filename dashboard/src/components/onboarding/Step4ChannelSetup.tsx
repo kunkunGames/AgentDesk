@@ -84,7 +84,6 @@ export function Step4ChannelSetup({
             </div>
           ) : (
             <select
-              aria-label={tr("Discord 서버 선택", "Select Discord Server")}
               value={selectedGuild}
               onChange={(event) => setSelectedGuild(event.target.value)}
               className={inputStyle}
@@ -120,7 +119,6 @@ export function Step4ChannelSetup({
             <div className="flex flex-col sm:flex-row gap-2">
               {guild && guild.channels.length > 0 ? (
                 <select
-                  aria-label={tr(`${assignment.agentName} 채널 선택`, `Select channel for ${assignment.agentName}`)}
                   value={assignment.channelId}
                   onChange={(event) => {
                     const channel = guild.channels.find((candidate) => candidate.id === event.target.value);
@@ -145,7 +143,6 @@ export function Step4ChannelSetup({
               ) : (
                 <input
                   type="text"
-                  aria-label={tr(`${assignment.agentName} 채널 이름`, `Channel name for ${assignment.agentName}`)}
                   value={assignment.channelName || assignment.recommendedName}
                   readOnly
                   className="flex-1 rounded-lg px-3 py-2 text-sm bg-surface-subtle border"

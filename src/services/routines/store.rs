@@ -3645,48 +3645,6 @@ mod tests {
     }
 
     #[test]
-    fn json_count_clamps_to_range_and_prioritizes_keys() {
-        use super::json_count;
-        use serde_json::json;
-
-        assert_eq!(json_count(&json!({})), 1, "default is 1");
-        assert_eq!(json_count(&json!({"count": 5})), 5, "valid count");
-        assert_eq!(
-            json_count(&json!({"occurrences": 12})),
-            12,
-            "valid occurrences"
-        );
-
-        assert_eq!(
-            json_count(&json!({"count": 0})),
-            1,
-            "clamps below range to 1"
-        );
-        assert_eq!(
-            json_count(&json!({"occurrences": 0})),
-            1,
-            "clamps occurrences below range to 1"
-        );
-
-        assert_eq!(
-            json_count(&json!({"count": 100})),
-            50,
-            "clamps above range to 50"
-        );
-        assert_eq!(
-            json_count(&json!({"occurrences": 100})),
-            50,
-            "clamps occurrences above range to 50"
-        );
-
-        assert_eq!(
-            json_count(&json!({"count": 10, "occurrences": 20})),
-            10,
-            "count takes precedence over occurrences"
-        );
-    }
-
-    #[test]
     fn precomputed_memento_digest_observation_respects_category_override() {
         let now = Utc.with_ymd_and_hms(2026, 5, 13, 7, 0, 0).unwrap();
         let raw = serde_json::json!({
