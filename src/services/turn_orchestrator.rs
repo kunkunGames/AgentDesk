@@ -15,6 +15,7 @@ mod active_source_dedup;
 mod dispatch_reservation;
 mod overflow;
 mod pending_queue_persistence;
+mod queue_cancellation;
 pub(crate) mod registry_purge;
 mod source_generation;
 mod turn_finished_signal;
@@ -47,6 +48,11 @@ pub(crate) use pending_queue_persistence::{
 #[cfg(test)]
 use pending_queue_persistence::{
     cleanup_stale_pending_queue_tmp_files_in_dir, cleanup_stale_pending_queue_tmp_files_under_root,
+};
+pub(crate) use queue_cancellation::has_soft_intervention_at;
+use queue_cancellation::{
+    cancel_soft_intervention_by_message_id, cancel_soft_intervention_by_primary_message_id,
+    dequeue_next_soft_intervention, has_soft_intervention,
 };
 pub(crate) use source_generation::SourceMessageQueuedGeneration;
 pub(crate) use turn_finished_signal::TurnFinishedSignal;
@@ -439,72 +445,6 @@ pub(crate) fn enqueue_intervention(
         enqueued: true,
         merged: false,
         refusal_reason: None,
-        queue_exit_events,
-        persistence_error: None,
-    }
-}
-
-pub(crate) fn has_soft_intervention_at(
-    queue: &mut Vec<Intervention>,
-    now: Instant,
-) -> SoftInterventionProbe {
-    // #3177: no age-based eviction — only the overflow cap bounds the queue.
-    let _ = now;
-    // #4260 defensive refactor: surface overflow events instead of a bare
-    // drain; the only live caller is on a queue CLONE (see overflow.rs docs).
-    let queue_exit_events = drain_head_overflow(queue);
-    SoftInterventionProbe {
-        has_pending: queue.iter().any(|item| item.mode == InterventionMode::Soft),
-        queue_exit_events,
-    }
-}
-
-pub(crate) fn has_soft_intervention(queue: &mut Vec<Intervention>) -> HasPendingSoftQueueResult {
-    let queue_exit_events = prune_interventions(queue);
-    HasPendingSoftQueueResult {
-        has_pending: queue.iter().any(|item| item.mode == InterventionMode::Soft),
-        queue_exit_events,
-        persistence_error: None,
-    }
-}
-
-pub(crate) fn dequeue_next_soft_intervention(queue: &mut Vec<Intervention>) -> TakeNextSoftResult {
-    let queue_exit_events = prune_interventions(queue);
-    let intervention = queue
-        .iter()
-        .position(|item| item.mode == InterventionMode::Soft)
-        .map(|index| queue.remove(index));
-    let has_more = queue.iter().any(|item| item.mode == InterventionMode::Soft);
-    TakeNextSoftResult {
-        intervention,
-        dispatch_lease: None,
-        has_more,
-        queue_len_after: queue.len(),
-        queue_exit_events,
-        persistence_error: None,
-    }
-}
-
-pub(crate) fn cancel_soft_intervention_by_message_id(
-    queue: &mut Vec<Intervention>,
-    message_id: MessageId,
-) -> CancelQueuedMessageResult {
-    let mut queue_exit_events = prune_interventions(queue);
-    let removed = queue
-        .iter()
-        .position(|item| {
-            item.mode == InterventionMode::Soft
-                && (item.message_id == message_id || item.source_message_ids.contains(&message_id))
-        })
-        .map(|index| queue.remove(index));
-    if let Some(ref intervention) = removed {
-        queue_exit_events.push(QueueExitEvent::new(
-            intervention.clone(),
-            QueueExitKind::Cancelled,
-        ));
-    }
-    CancelQueuedMessageResult {
-        removed,
         queue_exit_events,
         persistence_error: None,
     }
@@ -1229,6 +1169,26 @@ impl ChannelMailboxHandle {
         .await
     }
 
+    pub(crate) async fn cancel_queued_primary_message(
+        &self,
+        message_id: MessageId,
+        persistence: QueuePersistenceContext,
+    ) -> CancelQueuedMessageResult {
+        self.request(
+            |reply| ChannelMailboxMsg::CancelQueuedPrimaryMessage {
+                message_id,
+                persistence,
+                reply,
+            },
+            CancelQueuedMessageResult {
+                removed: None,
+                queue_exit_events: Vec::new(),
+                persistence_error: None,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn finish_turn(
         &self,
         persistence: QueuePersistenceContext,
@@ -1859,6 +1819,11 @@ enum ChannelMailboxMsg {
         reply: oneshot::Sender<()>,
     },
     CancelQueuedMessage {
+        message_id: MessageId,
+        persistence: QueuePersistenceContext,
+        reply: oneshot::Sender<CancelQueuedMessageResult>,
+    },
+    CancelQueuedPrimaryMessage {
         message_id: MessageId,
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<CancelQueuedMessageResult>,
@@ -2917,6 +2882,36 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                             &persistence,
                             previous_queue,
                             "cancel_queued_message",
+                        ) {
+                            cancel_result = CancelQueuedMessageResult {
+                                removed: None,
+                                queue_exit_events: Vec::new(),
+                                persistence_error: Some(error),
+                            };
+                        }
+                    }
+                    let _ = reply.send(cancel_result);
+                }
+                ChannelMailboxMsg::CancelQueuedPrimaryMessage {
+                    message_id,
+                    persistence,
+                    reply,
+                } => {
+                    state.last_persistence = Some(persistence.clone());
+                    let previous_queue = state.intervention_queue.clone();
+                    let mut cancel_result = cancel_soft_intervention_by_primary_message_id(
+                        &mut state.intervention_queue,
+                        message_id,
+                    );
+                    if cancel_result.removed.is_some()
+                        || !cancel_result.queue_exit_events.is_empty()
+                    {
+                        if let Err(error) = persist_queue_or_restore(
+                            &mut state,
+                            channel_id,
+                            &persistence,
+                            previous_queue,
+                            "cancel_queued_primary_message",
                         ) {
                             cancel_result = CancelQueuedMessageResult {
                                 removed: None,
