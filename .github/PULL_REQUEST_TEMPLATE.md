@@ -26,6 +26,7 @@
 - Boundary:
 - Primary files:
 - Verification commands and results:
+- Duplicate/overlap check:
 - Skipped checks with reasons:
 - Risk:
 - Rollback notes:
