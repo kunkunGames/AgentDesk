@@ -1,3 +1,0 @@
-Steward: align PR template with duplicate-PR guard requirements
-
-Adds the missing "- Duplicate/overlap check:" field to the WorkFingerprint section in `.github/PULL_REQUEST_TEMPLATE.md` to satisfy the validation logic in `scripts/analyze_prs.py` and the guidelines in `TEST_PLAN.md`.
