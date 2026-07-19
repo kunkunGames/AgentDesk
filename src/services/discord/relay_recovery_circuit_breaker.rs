@@ -528,7 +528,7 @@ impl CircuitAlertEnqueue for PgCircuitAlertEnqueue {
             crate::services::message_outbox::OutboxMessage {
                 target: &request.target,
                 content: &request.content,
-                bot: "announce",
+                bot: crate::services::discord::bot_role::UtilityBotRole::Announce.alias(),
                 source: "stall_watchdog",
                 reason_code: Some(&request.reason_code),
                 session_key: None,
@@ -884,6 +884,7 @@ mod tests {
             bridge_current_msg_id: Some(state.current_msg_id),
             mailbox_has_cancel_token: true,
             mailbox_active_user_msg_id: Some(state.user_msg_id),
+            mailbox_turn_started_at_ms: None,
             queue_depth: 0,
             pending_discord_callback_msg_id: None,
             pending_thread_proof: false,

@@ -1,9 +1,11 @@
 use crate::services::platform::BinaryResolution;
 use crate::services::provider_auth::ProviderAuthSpec;
 use crate::utils::format::safe_prefix;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+pub(crate) mod cancel_token_claude_interrupt;
 
 /// Tmux session name prefix — always "AgentDesk".
 pub const TMUX_SESSION_PREFIX: &str = "AgentDesk";
@@ -496,9 +498,11 @@ impl ProviderKind {
     }
 
     #[allow(dead_code)]
-    pub fn resolve_runtime_path(&self) -> Option<String> {
+    pub(crate) fn resolve_runtime_path(&self) -> Option<String> {
         match self {
-            Self::Claude => crate::services::claude::resolve_claude_path(),
+            Self::Claude => {
+                crate::services::platform::resolve_provider_binary("claude").resolved_path
+            }
             Self::Codex => crate::services::codex::resolve_codex_path(),
             Self::Gemini => crate::services::gemini::resolve_gemini_path(),
             Self::OpenCode => crate::services::opencode::resolve_opencode_path(),
@@ -588,19 +592,21 @@ impl ProviderKind {
         Self::from_str(raw).unwrap_or_else(|| Self::Unsupported(raw.trim().to_string()))
     }
 
-    /// Returns provider-specific environment variables for auto-compact configuration.
-    /// - Claude: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = percent
-    /// - Codex: uses CLI args instead (see compact_cli_config)
+    /// Returns generic provider environment variables for auto-compact.
+    ///
+    /// Claude intentionally has no generic percent environment variable: its
+    /// launch path resolves a model-aware absolute
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from launch provenance instead.
     #[allow(dead_code)]
     pub fn compact_env_vars(&self, percent: u64) -> Vec<(String, String)> {
         let Some(adapter) = self.compaction_adapter() else {
             return Vec::new();
         };
         match adapter {
-            ProviderCompactionAdapter::ClaudeEnvironment => vec![(
-                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
-                percent.to_string(),
-            )],
+            ProviderCompactionAdapter::ClaudeEnvironment => {
+                let _ = percent;
+                Vec::new()
+            }
             ProviderCompactionAdapter::CodexCli
             | ProviderCompactionAdapter::GeminiDisabled
             | ProviderCompactionAdapter::OpenCodeDisabled
@@ -995,12 +1001,23 @@ pub struct CancelToken {
     /// observers; provider cancel watchdogs must not treat that as a live
     /// mid-stream cancel that should kill the child process.
     completion_cleanup: AtomicBool,
+    /// Claude turn-interrupt fence. Each `CancelToken` is a turn generation.
+    /// `0 -> 1` reserves one delivery attempt; a skipped or failed attempt
+    /// rolls it back to 0, while a successful provider write commits `1 -> 2`.
+    claude_interrupt_claim: AtomicU8,
+    /// Monotonic Claude turn identity used for diagnostics and fence observability.
+    claude_interrupt_generation: u64,
+    /// Wrapper prompt handoff completed before its JSONL user envelope appeared.
+    /// The stop path must treat this window as submitted, not as prior-turn idle.
+    claude_interrupt_submit_pending: AtomicBool,
     /// Lifecycle-aware restart/handoff mode for inflight preservation.
     pub restart_mode: AtomicU8,
 }
 
 impl CancelToken {
     pub fn new() -> Self {
+        static NEXT_CLAUDE_INTERRUPT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
         Self {
             cancelled: AtomicBool::new(false),
             child_pid: Mutex::new(None),
@@ -1012,6 +1029,10 @@ impl CancelToken {
             watchdog_max_deadline_ms: AtomicI64::new(0),
             async_managed: AtomicBool::new(false),
             completion_cleanup: AtomicBool::new(false),
+            claude_interrupt_claim: AtomicU8::new(0),
+            claude_interrupt_generation: NEXT_CLAUDE_INTERRUPT_GENERATION
+                .fetch_add(1, Ordering::Relaxed),
+            claude_interrupt_submit_pending: AtomicBool::new(false),
             restart_mode: AtomicU8::new(0),
         }
     }

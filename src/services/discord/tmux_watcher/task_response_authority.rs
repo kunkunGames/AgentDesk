@@ -6,6 +6,7 @@ use super::*;
 
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::discord::SharedData;
+use crate::services::discord::inflight::opt_message_id;
 use crate::services::discord::task_notification_delivery as task_delivery;
 use crate::services::provider::ProviderKind;
 
@@ -117,9 +118,14 @@ async fn prepare_watcher_task_response(
                 .placeholder_live_events
                 .claim_terminal_slot_for_card(channel_id, event.kind(), event.tool_use_id());
         }
+        let Some(card_message_id) = opt_message_id(existing.card_message_id) else {
+            return Err(PrepareWatcherTaskResponseError::Transient(
+                "persisted task response card message id is zero".to_string(),
+            ));
+        };
         return Ok(PreparedWatcherTaskResponse {
             claim: existing.outcome,
-            card_message_id: MessageId::new(existing.card_message_id),
+            card_message_id,
             event,
             clients,
         });
@@ -187,20 +193,26 @@ async fn watcher_card_clients(
     persisted_bot_key: Option<&str>,
 ) -> Result<task_delivery::CardDeliveryClients, PrepareWatcherTaskResponseError> {
     let provider_key = task_delivery::provider_bot_key(provider.as_str());
+    let notify_role = crate::services::discord::bot_role::UtilityBotRole::Notify;
+    let notify_alias = notify_role.alias();
     let mut bots = Vec::new();
-    let needs_notify = persisted_bot_key.is_none() || persisted_bot_key == Some("notify");
+    let needs_notify = persisted_bot_key.is_none() || persisted_bot_key == Some(notify_alias);
     if needs_notify && let Some(registry) = shared.health_registry() {
-        match crate::services::discord::health::resolve_bot_http(registry.as_ref(), "notify").await
+        match crate::services::discord::health::resolve_utility_bot_http(
+            registry.as_ref(),
+            notify_role,
+        )
+        .await
         {
-            Ok(http) => bots.push(task_delivery::CardBot::new("notify", http)),
-            Err((_status, error)) if persisted_bot_key == Some("notify") => {
+            Ok(http) => bots.push(task_delivery::CardBot::new(notify_alias, http)),
+            Err((_status, error)) if persisted_bot_key == Some(notify_alias) => {
                 return Err(PrepareWatcherTaskResponseError::Transient(format!(
                     "persisted notify task-card bot is unavailable during watcher recovery: {error}"
                 )));
             }
             Err(_) => {}
         }
-    } else if needs_notify && persisted_bot_key == Some("notify") {
+    } else if needs_notify && persisted_bot_key == Some(notify_alias) {
         return Err(PrepareWatcherTaskResponseError::Transient(
             "persisted notify task-card bot cannot be resolved without a health registry"
                 .to_string(),
@@ -213,7 +225,7 @@ async fn watcher_card_clients(
         ));
     }
     if let Some(persisted) = persisted_bot_key
-        && persisted != "notify"
+        && persisted != notify_alias
         && persisted != provider_key
     {
         return Err(PrepareWatcherTaskResponseError::Permanent(format!(

@@ -29,6 +29,7 @@ use tool_arms::{
 };
 
 mod content_arms;
+mod message_conversion;
 mod tool_arms;
 
 pub(super) struct StreamLoopContext {
@@ -149,6 +150,10 @@ pub(super) async fn run_stream_loop(
     let status_interval = ctx.status_interval;
     let context_window_tokens = ctx.context_window_tokens;
     let context_compact_percent = ctx.context_compact_percent;
+    let context_compact_lower_bound_tokens =
+        crate::services::discord::adk_session::fetch_context_thresholds(shared_owned.api_port)
+            .await
+            .compact_lower_bound_tokens;
 
     let rx = &mut *state.rx;
     let mut full_response = std::mem::take(state.full_response);
@@ -364,6 +369,7 @@ pub(super) async fn run_stream_loop(
                     }
                     match msg {
                         content_message @ (StreamMessage::RetryBoundary
+                        | StreamMessage::ActiveUsageSnapshot { .. }
                         | StreamMessage::Init { .. }
                         | StreamMessage::Text { .. }
                         | StreamMessage::Thinking { .. }
@@ -371,46 +377,8 @@ pub(super) async fn run_stream_loop(
                         | StreamMessage::Error { .. }
                         | StreamMessage::StatusUpdate { .. }
                         | StreamMessage::StatusEvents { .. }) => {
-                            let message = match content_message {
-                                StreamMessage::RetryBoundary => {
-                                    StreamContentArmMessage::RetryBoundary
-                                }
-                                StreamMessage::Init {
-                                    session_id,
-                                    raw_session_id,
-                                } => StreamContentArmMessage::Init {
-                                    session_id,
-                                    raw_session_id,
-                                },
-                                StreamMessage::Text { content } => {
-                                    StreamContentArmMessage::Text { content }
-                                }
-                                StreamMessage::Thinking { summary } => {
-                                    StreamContentArmMessage::Thinking { summary }
-                                }
-                                StreamMessage::Done { result, session_id } => {
-                                    StreamContentArmMessage::Done { result, session_id }
-                                }
-                                StreamMessage::Error {
-                                    message, stderr, ..
-                                } => StreamContentArmMessage::Error { message, stderr },
-                                StreamMessage::StatusUpdate {
-                                    input_tokens,
-                                    cache_create_tokens,
-                                    cache_read_tokens,
-                                    output_tokens,
-                                    ..
-                                } => StreamContentArmMessage::StatusUpdate {
-                                    input_tokens,
-                                    cache_create_tokens,
-                                    cache_read_tokens,
-                                    output_tokens,
-                                },
-                                StreamMessage::StatusEvents { events } => {
-                                    StreamContentArmMessage::StatusEvents { events }
-                                }
-                                _ => unreachable!("content-message pattern must stay exhaustive"),
-                            };
+                            let message = message_conversion::into_content_message(content_message)
+                                .expect("content-message pattern must stay exhaustive");
                             let outcome = handle_stream_content_message(
                                 message,
                                 StreamContentArmContext {
@@ -425,6 +393,7 @@ pub(super) async fn run_stream_loop(
                                     terminal_control_ready_observed,
                                     streaming_rollover_frozen_msg_ids:
                                         &streaming_rollover_frozen_msg_ids,
+                                    context_compact_lower_bound_tokens,
                                     context_window_tokens,
                                     context_compact_percent,
                                 },

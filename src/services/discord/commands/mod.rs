@@ -111,7 +111,7 @@ pub(in crate::services::discord) use control::{
     SoftClearNotifyMode, clear_channel_session_state, clear_channel_session_state_with_session_key,
     reset_channel_provider_state, reset_managed_process_session, reset_provider_session_if_pending,
 };
-pub(super) use control::{cmd_clear, cmd_down, cmd_shell, cmd_stop};
+pub(super) use control::{cmd_cancel_queued, cmd_clear, cmd_down, cmd_shell, cmd_stop};
 pub(in crate::services::discord) use diagnostics::{
     build_health_report, build_inflight_report, build_queue_report, build_status_report,
 };
@@ -138,7 +138,6 @@ pub(in crate::services::discord) use skill::build_provider_skill_prompt;
 pub(super) use skill::{cmd_cc, cmd_skill};
 pub(super) use steer::cmd_steer;
 pub(in crate::services::discord) use text_commands::handle_text_command_with_uploads;
-pub(in crate::services::discord) use tui_passthrough::is_local_only_slash_command_kind; // #3305
 pub(super) use tui_passthrough::{cmd_compact, cmd_context, cmd_cost, cmd_effort};
 pub(in crate::services::discord) use voice::{
     auto_join_voice_channels, handle_vc_text_command, join_voice_channel, notify_voice_alert,

@@ -85,6 +85,23 @@ async fn idle_queue_kick_hook_outcome_for_tests(
     hook?(shared, provider, channel_id, reason).await
 }
 
+pub(in crate::services::discord) async fn mailbox_cancel_queued_primary_message(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Option<Intervention> {
+    let result: CancelQueuedMessageResult = shared
+        .mailbox(channel_id)
+        .cancel_queued_primary_message(
+            message_id,
+            queue_persistence_context(shared, provider, channel_id),
+        )
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    result.removed
+}
+
 pub(super) async fn with_post_enqueue_idle_queue_kick_suppressed<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -1028,6 +1045,7 @@ mod presleep_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn event_kick_no_start_with_nonempty_queue_arms_single_backstop() {
+        let _root = scoped_runtime_root();
         let shared = make_shared_data_for_tests();
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(4_048_201);
@@ -1360,6 +1378,7 @@ mod presleep_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn enqueue_after_finalize_kicks_immediately_from_generic_helper() {
+        let _root = scoped_runtime_root();
         let shared = make_shared_data_for_tests();
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(4_048_205);
@@ -1795,6 +1814,7 @@ mod presleep_tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn dropped_completion_event_slow_backstop_rearms_if_no_start_leaves_queue() {
+        let _root = scoped_runtime_root();
         let shared = make_shared_data_for_tests();
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(4_024_290);

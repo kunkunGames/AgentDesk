@@ -6,7 +6,9 @@ use super::super::super::turn_view_reconciler::{
 use super::voice_announcement_route::route_voice_transcript_announcement_once;
 use super::*;
 
+mod claim_bootstrap;
 mod race_loss;
+mod stale_dispatch_guard;
 mod turn_watchdog;
 mod voice_intake;
 
@@ -65,6 +67,7 @@ pub(crate) struct IntakeRequest {
     pub has_reply_boundary: bool,
     pub dm_hint: Option<bool>,
     pub turn_kind: TurnKind,
+    pub preserve_on_cancel: bool,
 }
 
 /// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
@@ -105,9 +108,7 @@ pub(crate) async fn execute_intake_turn_core(
         request.has_reply_boundary,
         request.dm_hint,
         request.turn_kind,
-        // The durable worker payload has no author/utility classification.
-        // Preserve fail-safe default-drop instead of guessing that it is human.
-        false,
+        request.preserve_on_cancel,
         Vec::new(),
         // Worker dispatch has no in-process gate carry-forward; it re-resolves
         // the durable announcement row for its `user_msg_id` (#3905).
@@ -1296,90 +1297,31 @@ pub(super) async fn handle_text_message(
     // — see latency_spans.rs). Never `.log()`'d on the early returns below.
     let mut intake_latency = super::latency_spans::IntakeLatencySpans::turn_claimed();
 
-    if started
-        && !preserve_on_cancel
-        && let Some(stale) =
-            super::super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)
-                .await
+    if stale_dispatch_guard::abort_terminal_dispatch_at_turn_start(
+        http,
+        shared,
+        &provider,
+        channel_id,
+        user_msg_id,
+        user_text,
+        started,
+        preserve_on_cancel,
+    )
+    .await
     {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⏭ DISPATCH-GUARD: aborted terminal dispatch at turn start in channel {} (dispatch={}, status={})",
-            channel_id,
-            stale.dispatch_id,
-            stale.status
-        );
-        let finish =
-            super::super::super::mailbox_finish_turn(shared.as_ref(), &provider, channel_id).await;
-        super::super::super::advance_last_message_checkpoint(
-            shared,
-            &provider,
-            channel_id,
-            user_msg_id,
-        );
-        let emoji = super::super::super::queue_exit_feedback_emoji(stale.queue_exit_kind);
-        queue_marker::note_exit_feedback_added(shared, http, channel_id, user_msg_id, emoji).await;
-        if finish.has_pending {
-            super::super::super::schedule_deferred_idle_queue_kickoff(
-                shared.clone(),
-                provider.clone(),
-                channel_id,
-                "terminal dispatch skipped at turn start",
-            );
-        }
         return Ok(());
     }
 
-    // #3811: record the original-request anchor (the real Discord user_msg_id)
-    // ONLY once THIS message won the mailbox claim (`started == true`) and the
-    // stale-dispatch guard passed. A message that merely QUEUES behind an active
-    // turn (`started == false`, enqueued + returned in the `if !started` block
-    // below) must NOT touch the active turn's anchor — it records its own anchor
-    // when later dequeued/promoted and re-enters here with `started == true`.
-    // Synthetic voice ids back no real Discord message → `None` (no fake link);
-    // headless turns never reach this interactive intake path.
-    if started {
-        shared.ui.placeholder_live_events.set_turn_request_anchor(
-            channel_id,
-            (!super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id))
-                .then(|| user_msg_id.get()),
-        );
-    }
-
-    // #3148: relocated idle-recap clear (Window 2 fix). The clear (and the
-    // per-channel turn-generation bump) used to run in `intake_gate` at
-    // message-accept time, BEFORE this mailbox claim — so it was not truly
-    // capture-at-claim and a racing recap POST could persist a fresh card the
-    // old-id-keyed clear could not remove. Run it HERE, right after the claim
-    // succeeds (`started == true`) and only when THIS message won the claim,
-    // mirroring the TUI path (`tui_prompt_relay` claim → bump → clear). A
-    // queued message that lost the claim race must NOT bump/clear — the winning
-    // turn does that. The bump runs BEFORE the clear so any idle-recap POST job
-    // whose persist CAS captured the pre-bump generation fails to persist a
-    // card over this just-claimed turn; the clear then removes any card the
-    // POST already persisted before this claim.
-    if started && let Some(pool) = shared.pg_pool.as_ref().cloned() {
-        if let Err(e) = crate::services::discord::idle_recap::bump_turn_generation(
-            &pool,
-            channel_id.get(),
-            &provider,
-            adk_session_key.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %e,
-                channel_id = channel_id.get(),
-                "idle_recap: failed to bump turn generation on Discord-intake claim"
-            );
-        }
-        crate::services::discord::idle_recap::spawn_clear_captured_idle_recap_for_channel(
-            http.clone(),
-            pool,
-            channel_id.get(),
-        )
-        .await;
-    }
+    claim_bootstrap::bootstrap_claimed_turn(
+        http,
+        shared,
+        started,
+        channel_id,
+        user_msg_id,
+        &provider,
+        adk_session_key.as_deref(),
+    )
+    .await;
 
     // #1332 dispatch hand-off: if this turn was previously enqueued and is now
     // being dispatched, reuse the Queued placeholder card so the user sees a
@@ -1809,7 +1751,6 @@ pub(super) async fn handle_text_message(
             github_issue_url: info.github_issue_url.as_deref(),
         }
     });
-    let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
     let memory_recall_manifest = super::super::super::prompt_builder::MemoryRecallManifestInput {
         should_recall: memento_recall_gate.should_recall,
         gate_reason: memento_recall_gate.reason,
@@ -1831,13 +1772,13 @@ pub(super) async fn handle_text_message(
         token,
         role_binding.as_ref(),
         reply_to_user_message,
-        dispatch_profile,
+        PromptProfiles::foreground(dispatch_profile),
         dispatch_type_str.as_deref(),
         current_task_context.as_ref(),
         sak_for_system,
         memory_injection_plan.longterm_catalog_for_system_prompt,
         Some(&memory_settings),
-        memento_mcp_available,
+        crate::services::mcp_config::provider_has_memento_mcp(&provider),
         matches!(&provider, ProviderKind::Claude),
         recovery_context_for_manifest.as_ref(),
         channel_recent_context.as_ref(),
@@ -2228,117 +2169,17 @@ pub(super) async fn handle_text_message(
                 .await
                 .intervention_queue
                 .len();
-        let want_queued_card =
-            !turn_kind.is_background_trigger() && channel_id == original_channel_id;
-        let mut queued_card_rendered = false;
-        if enqueue_outcome.enqueued && want_queued_card {
-            let persist_lock = shared.queued_placeholders_persist_lock(channel_id);
-            let persist_guard = persist_lock.lock_owned().await;
-            let snapshot = super::super::super::mailbox_snapshot(shared, channel_id).await;
-            let still_queued = snapshot.intervention_queue.iter().any(|intervention| {
-                intervention.message_id == user_msg_id
-                    || intervention.source_message_ids.contains(&user_msg_id)
-            });
-            if !still_queued {
-                drop(persist_guard);
-                let _ = channel_id.delete_message(http, placeholder_msg_id).await;
-                tracing::info!(
-                    channel_id = channel_id.get(),
-                    user_msg_id = user_msg_id.get(),
-                    placeholder_msg_id = placeholder_msg_id.get(),
-                    "claude_tui busy follow-up queue entry exited before queued-card render; deleted placeholder"
-                );
-            } else {
-                shared.insert_queued_placeholder_locked(
-                    channel_id,
-                    user_msg_id,
-                    placeholder_msg_id,
-                );
-                let gateway = DiscordGateway::new(
-                    http.clone(),
-                    shared.clone(),
-                    bot_owner_provider.clone(),
-                    None,
-                );
-                let key = super::super::super::placeholder_controller::PlaceholderKey {
-                    provider: bot_owner_provider.clone(),
-                    channel_id,
-                    message_id: placeholder_msg_id,
-                };
-                let queued_input =
-                    super::super::super::placeholder_controller::PlaceholderActiveInput {
-                        reason: super::super::super::formatting::MonitorHandoffReason::Queued,
-                        started_at_unix: chrono::Utc::now().timestamp(),
-                        tool_summary: None,
-                        command_summary: None,
-                        reason_detail: Some(format!("{}_tui_busy_pre_submit", provider.as_str())),
-                        context_line: None,
-                        request_line: Some(user_text.to_string()),
-                        progress_line: None,
-                    };
-                let outcome = shared
-                    .ui
-                    .placeholder_controller
-                    .ensure_queued(&gateway, key, queued_input)
-                    .await;
-                use super::super::super::placeholder_controller::PlaceholderControllerOutcome::*;
-                match outcome {
-                    Edited | Coalesced => {
-                        drop(persist_guard);
-                        queued_card_rendered = true;
-                        let emoji = if enqueue_outcome.merged {
-                            '➕'
-                        } else {
-                            '📬'
-                        };
-                        queue_marker::note_added_current(
-                            shared,
-                            http,
-                            channel_id,
-                            user_msg_id,
-                            emoji,
-                            "tui_busy_pre_submit_queued",
-                        )
-                        .await;
-                        if !shared.queued_placeholder_still_owned(
-                            channel_id,
-                            user_msg_id,
-                            placeholder_msg_id,
-                        ) {
-                            queue_marker::note_removed_current(
-                                shared,
-                                http,
-                                channel_id,
-                                user_msg_id,
-                                emoji,
-                                "tui_busy_pre_submit_queue_self_heal",
-                            )
-                            .await;
-                        }
-                    }
-                    _ => {
-                        let still_owned_under_lock = shared.queued_placeholder_still_owned(
-                            channel_id,
-                            user_msg_id,
-                            placeholder_msg_id,
-                        );
-                        if still_owned_under_lock {
-                            shared.remove_queued_placeholder_locked(channel_id, user_msg_id);
-                        }
-                        drop(persist_guard);
-                        if still_owned_under_lock {
-                            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
-                        }
-                        tracing::warn!(
-                            channel_id = channel_id.get(),
-                            user_msg_id = user_msg_id.get(),
-                            placeholder_msg_id = placeholder_msg_id.get(),
-                            "claude_tui busy follow-up queued but queued-card render failed; dispatch will post a fresh card"
-                        );
-                    }
-                }
-            }
-        } else if enqueue_outcome.enqueued {
+        let queued_card_rendered = false;
+        if enqueue_outcome.enqueued {
+            race_loss::mailbox_reaction::note_busy_tui_pre_submit_queue_pending(
+                shared,
+                http,
+                channel_id,
+                user_msg_id,
+                enqueue_outcome.merged,
+                turn_start_attempt,
+            )
+            .await;
             let _ = channel_id.delete_message(http, placeholder_msg_id).await;
         } else {
             apply_tui_busy_enqueue_refusal(
@@ -2352,6 +2193,7 @@ pub(super) async fn handle_text_message(
                 enqueue_outcome.refusal_reason,
             )
             .await;
+            tv_clear_current(shared, http, channel_id, user_msg_id, "intake_busy_queue").await;
         }
         let queue_kickoff_scheduled =
             queue_kickoff_scheduled_by_release || enqueue_outcome.enqueued;
@@ -2403,7 +2245,6 @@ pub(super) async fn handle_text_message(
             "claude_tui_followup_busy_pre_submit",
             diagnostic_json,
         );
-        tv_clear_current(shared, http, channel_id, user_msg_id, "intake_busy_queue").await;
         super::super::super::saturating_decrement_global_active(shared);
         shared.turn_start_times.remove(&channel_id);
         post_adk_session_status(
@@ -2606,6 +2447,7 @@ pub(super) async fn handle_text_message(
 
     // Pre-compute provider-specific compact config
     let compact_percent_for_claude = Some(ctx_thresholds.compact_pct_for(&provider));
+    let compact_lower_bound_tokens = ctx_thresholds.compact_lower_bound_tokens;
     let compact_token_limit_for_codex = {
         provider
             .compact_cli_config(compact_percent, model_context_window)
@@ -2658,6 +2500,7 @@ pub(super) async fn handle_text_message(
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
                             compact_percent_for_claude,
+                            compact_lower_bound_tokens,
                             cache_ttl_minutes,
                             dispatch_type_for_mcp.as_deref(),
                         ),
@@ -2770,6 +2613,12 @@ pub(super) async fn handle_text_message(
 
     // #3813 Phase 1a: provider input is about to be handed to the turn bridge.
     intake_latency.mark_input_written();
+    super::typing_indicator::spawn_native_typing_indicator(
+        shared,
+        http.clone(),
+        channel_id,
+        inflight_state.effective_finalizer_turn_id(),
+    );
     spawn_turn_bridge(
         shared.clone(),
         cancel_token.clone(),
@@ -2831,6 +2680,52 @@ pub(super) async fn handle_text_message(
 }
 
 #[cfg(test)]
+mod tui_busy_pre_submit_queue_reaction_tests {
+    #[test]
+    fn busy_pre_submit_enqueue_keeps_the_authoritative_queue_view() {
+        let module_src = include_str!("intake_turn.rs");
+        let busy_branch_pos = module_src
+            .find("claude_tui follow-up queued because hosted TUI is busy before prompt submission")
+            .expect("hosted-TUI busy pre-submit queue branch exists");
+        let busy_branch = &module_src[..busy_branch_pos];
+        let enqueue_pos = busy_branch
+            .rfind("enqueue_busy_tui_followup_for_retry(")
+            .expect("busy pre-submit branch enqueues the follow-up");
+        let accepted_guard_pos = busy_branch[enqueue_pos..]
+            .find("if enqueue_outcome.enqueued {")
+            .map(|offset| enqueue_pos + offset)
+            .expect("busy pre-submit reaction must be gated on accepted enqueue");
+        let accepted_helper = "note_busy_tui_pre_submit_queue_pending(";
+        let refusal_guard = "} else {\n            apply_tui_busy_enqueue_refusal(";
+        let accepted_clear =
+            "tv_clear_current(shared, http, channel_id, user_msg_id, \"intake_busy_queue\")";
+        let refusal_guard_pos = busy_branch[accepted_guard_pos..]
+            .find(refusal_guard)
+            .map(|offset| accepted_guard_pos + offset)
+            .expect("busy pre-submit enqueue refusal branch exists");
+        let reaction_call_pos = busy_branch[accepted_guard_pos..refusal_guard_pos]
+            .find(accepted_helper)
+            .map(|offset| accepted_guard_pos + offset)
+            .expect("accepted busy pre-submit enqueue must apply a queue-pending reaction");
+        let accepted_branch = &busy_branch[accepted_guard_pos..refusal_guard_pos];
+        let refusal_branch = &busy_branch[refusal_guard_pos..];
+
+        assert!(
+            accepted_guard_pos < reaction_call_pos,
+            "an accepted hosted-TUI busy pre-submit enqueue must reach the shared queue-pending reaction helper"
+        );
+        assert!(
+            !accepted_branch.contains(accepted_clear),
+            "accepted busy requeue must preserve the reconciler-owned queued marker"
+        );
+        assert!(
+            refusal_branch.contains(accepted_clear),
+            "refused busy enqueue must still clear the optimistic pending view"
+        );
+    }
+}
+
+#[cfg(test)]
 mod recovery_context_take_order_tests {
     fn recovery_context_take_call() -> String {
         format!(
@@ -2841,13 +2736,41 @@ mod recovery_context_take_order_tests {
     }
 
     #[test]
+    fn discord_user_turn_keeps_user_and_streaming_placeholder_ids_separate() {
+        let module_src = include_str!("intake_turn.rs");
+        let bridge_context_pos = module_src
+            .find("TurnBridgeContext {")
+            .expect("Discord intake builds a turn-bridge context");
+        let bridge_context = &module_src[bridge_context_pos..];
+        let user_message_field = format!("{}{}", "user_msg_id: Some(", "user_msg_id),");
+        let placeholder_field = format!("{}{}", "current_msg_id: Some(", "placeholder_msg_id),");
+        let synthetic_flag = format!("{}{}", "is_external_input_tui_", "direct: false");
+
+        assert!(
+            bridge_context.contains(&user_message_field),
+            "Discord-origin user turns must retain the real user message as their request identity"
+        );
+        assert!(
+            bridge_context.contains(&placeholder_field),
+            "Discord-origin user turns must keep the posted intake placeholder as their streaming edit target"
+        );
+        assert!(
+            bridge_context.contains(&synthetic_flag),
+            "Discord-origin user turns must remain outside the synthetic TUI-direct path"
+        );
+    }
+
+    #[test]
     fn recovery_context_survives_intake_stale_dispatch_abort() {
         let root = tempfile::tempdir().expect("create temp runtime root");
         let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let module_src = include_str!("intake_turn.rs");
+        // #4552: the stale-dispatch guard body now lives in the
+        // `stale_dispatch_guard` submodule; the caller keeps the guarded early
+        // return, so anchor on the call site (still ahead of the take below).
         let stale_guard_pos = module_src
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .expect("intake stale-dispatch guard exists");
+            .find("abort_terminal_dispatch_at_turn_start(")
+            .expect("intake stale-dispatch guard call exists");
         let stale_return_pos = stale_guard_pos
             + module_src[stale_guard_pos..]
                 .find("return Ok(());")
@@ -3081,19 +3004,17 @@ mod turn_start_dispatch_guard_preservation_tests {
     // `DISPATCH:<id>` prefix, silently defeating the feature end-to-end.
     #[test]
     fn turn_start_guard_is_gated_on_preserve_on_cancel() {
-        let module_src = include_str!("intake_turn.rs");
-        let claim_pos = module_src
-            .find("let started = try_start_turn_with_stale_busy_heal(")
-            .expect("turn-start mailbox claim exists");
-        let stale_call_pos = module_src[claim_pos..]
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .map(|offset| claim_pos + offset)
+        // #4552: the guard body moved to the `stale_dispatch_guard` submodule.
+        // The invariant (gate the raw stale-text lookup on `!preserve_on_cancel`)
+        // now lives entirely inside that helper, so scan it directly.
+        let guard_src = include_str!("intake_turn/stale_dispatch_guard.rs");
+        let stale_call_pos = guard_src
+            .find("stale_dispatch_turn_for_text(")
             .expect("turn-start dispatch-guard raw stale-text lookup exists");
-        let gate_between_claim_and_lookup =
-            module_src[claim_pos..stale_call_pos].find("!preserve_on_cancel");
+        let gate_before_lookup = guard_src[..stale_call_pos].find("!preserve_on_cancel");
 
         assert!(
-            gate_between_claim_and_lookup.is_some(),
+            gate_before_lookup.is_some(),
             "turn-start DISPATCH-GUARD must gate the raw stale-text lookup on \
              `!preserve_on_cancel` (#4247 FIX 1) — removing this gate lets a \
              preserved (marked) genuine human instruction get dropped at turn \
@@ -3103,35 +3024,46 @@ mod turn_start_dispatch_guard_preservation_tests {
     }
 
     // Companion: the gated stale lookup must still feed the SAME abort branch
-    // (finish turn, advance checkpoint, exit emoji), i.e. the gate did not get
-    // attached to some other unrelated `stale_dispatch_turn_for_text` use.
+    // (finish turn, advance checkpoint, exit emoji) and signal abort back to the
+    // caller, i.e. the gate did not get attached to some other unrelated
+    // `stale_dispatch_turn_for_text` use.
     #[test]
     fn gated_stale_lookup_feeds_the_turn_abort_branch() {
-        let module_src = include_str!("intake_turn.rs");
-        let claim_pos = module_src
-            .find("let started = try_start_turn_with_stale_busy_heal(")
-            .expect("turn-start mailbox claim exists");
-        let stale_call_pos = module_src[claim_pos..]
-            .find("stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text)")
-            .map(|offset| claim_pos + offset)
+        // #4552: the abort branch body lives in the `stale_dispatch_guard`
+        // helper; the caller keeps the guarded early return.
+        let guard_src = include_str!("intake_turn/stale_dispatch_guard.rs");
+        let stale_call_pos = guard_src
+            .find("stale_dispatch_turn_for_text(")
             .expect("turn-start dispatch-guard raw stale-text lookup exists");
-        // Anchor on the abort log, then look for the branch's finish + early
-        // return by RELATIVE offset — no fixed byte window (multibyte-safe, and
-        // resilient to added log lines). (Fable review note.)
-        let abort_pos = module_src[stale_call_pos..]
+        // Anchor on the abort log, then look for the branch's finish + abort
+        // signal by RELATIVE offset — no fixed byte window (multibyte-safe, and
+        // resilient to added log lines).
+        let abort_pos = guard_src[stale_call_pos..]
             .find("DISPATCH-GUARD: aborted terminal dispatch at turn start")
             .map(|offset| stale_call_pos + offset)
             .expect("gated stale lookup must still feed the turn-start abort log/branch");
-        let abort_region = &module_src[abort_pos..];
+        let abort_region = &guard_src[abort_pos..];
         let finish = abort_region.find("mailbox_finish_turn");
-        let ret = abort_region.find("return Ok(());");
+        let ret = abort_region.find("return true;");
         assert!(
             finish.is_some_and(|f| f < 600),
             "turn-start abort branch must still finish the mailbox turn"
         );
         assert!(
             ret.is_some_and(|r| r < 1200),
-            "turn-start abort branch must still return early"
+            "turn-start abort branch must still signal abort to the caller"
+        );
+
+        // The caller must honor that abort signal with an early return.
+        let module_src = include_str!("intake_turn.rs");
+        let call_pos = module_src
+            .find("abort_terminal_dispatch_at_turn_start(")
+            .expect("live intake calls the turn-start guard");
+        assert!(
+            module_src[call_pos..]
+                .find("return Ok(());")
+                .is_some_and(|r| r < 400),
+            "the live-intake caller must return early when the guard aborts"
         );
     }
 
@@ -3152,15 +3084,27 @@ mod turn_start_dispatch_guard_preservation_tests {
             .find("preserve_on_cancel: bool,")
             .map(|offset| signature_pos + offset)
             .expect("handle_text_message receives preserve_on_cancel as a parameter");
-        let guard_pos = module_src[param_pos..]
-            .find("&& !preserve_on_cancel")
-            .map(|offset| param_pos + offset);
-
+        // #4552: the guard body moved to the `stale_dispatch_guard` submodule.
+        // The parameter must still be forwarded into the guard call unmodified,
+        // and the extracted guard must still gate on it.
+        let call_pos = module_src[param_pos..]
+            .find("abort_terminal_dispatch_at_turn_start(")
+            .map(|offset| param_pos + offset)
+            .expect("the live-intake path must call the turn-start guard");
+        let call_end = module_src[call_pos..]
+            .find(".await")
+            .map(|offset| call_pos + offset)
+            .expect("the turn-start guard call must be awaited");
         assert!(
-            guard_pos.is_some(),
+            module_src[call_pos..call_end].contains("preserve_on_cancel"),
             "the live-intake preserve_on_cancel parameter must flow into the \
-             FIX 1 turn-start guard; mutating either the parameter plumbing or \
-             the guard breaks this"
+             FIX 1 turn-start guard call; mutating the parameter plumbing breaks this"
+        );
+
+        let guard_src = include_str!("intake_turn/stale_dispatch_guard.rs");
+        assert!(
+            guard_src.contains("&& !preserve_on_cancel"),
+            "the extracted turn-start guard must still gate on `!preserve_on_cancel`"
         );
     }
 }

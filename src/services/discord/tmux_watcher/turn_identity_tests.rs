@@ -30,6 +30,9 @@ fn state_for_turn(user_msg_id: u64, tmux_session_name: &str) -> InflightTurnStat
         tmux_session_name: Some(tmux_session_name.to_string()),
         output_path: Some("/tmp/out.jsonl".to_string()),
         input_fifo_path,
+        claude_e_pid: None,
+        claude_e_process_starttime: None,
+        claude_e_macos_lstart_hash: None,
         runtime_kind: Some(crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper),
         runtime_kind_unknown_on_disk: false,
         worktree_path: None,
@@ -349,6 +352,7 @@ fn long_chunk_delivery_fingerprint_refuses_phantom_rerelay_4081() {
         (0, body.len() as u64),
         Some(9_4081),
         &body,
+        None,
     );
 
     assert_eq!(

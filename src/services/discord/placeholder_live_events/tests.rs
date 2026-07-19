@@ -376,7 +376,7 @@ fn status_panel_turn_completed_renders_foreground_completion() {
 #[test]
 fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
     // #3983 items 2 + B: the separate 신뢰도 line is retired; the freshness class is
-    // absorbed into the line-1 activity emoji, and line 2 carries the time line.
+    // absorbed into the activity emoji, and the following fields carry stable times.
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(38120);
 
@@ -391,8 +391,10 @@ fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
         "running activity: {live:?}"
     );
     assert!(
-        live.contains("마지막 업데이트 : <t:") && live.contains("턴 시작 : <t:"),
-        "time line must render: {live:?}"
+        live.contains("마지막 업데이트 : ")
+            && live.contains("턴 시작 : ")
+            && live.contains(" (<t:"),
+        "time line must include fixed KST and relative timestamps: {live:?}"
     );
     assert!(
         !live.contains("신뢰도"),
@@ -6523,7 +6525,7 @@ fn confirmed_task_notification_card_evicts_only_exact_terminal_footer_slot() {
 }
 
 #[test]
-fn task_completion_card_suppression_requires_idful_matching_subagent_slot() {
+fn success_subagent_completion_takes_card_path_symmetric_with_failure() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(3_654_002);
     events.push_status_events(
@@ -6548,9 +6550,9 @@ fn task_completion_card_suppression_requires_idful_matching_subagent_slot() {
         <tool-use-id>toolu_subagent_match</tool-use-id><status>completed</status>\
         <summary>Agent \"Scout issue #3654\" completed</summary></task-notification>";
     assert!(
-        events
+        !events
             .task_notification_completion_visible_in_footer_for_mode(channel_id, completed, true,),
-        "matching idful subagent completion should suppress the duplicate card"
+        "successful subagent completion takes the card path (CardRequired), symmetric with failures"
     );
 
     let idless = "<task-notification><task-id>sub2</task-id><status>completed</status>\
@@ -8857,30 +8859,41 @@ fn completion_footer_free_renderer_omits_anchor_and_target_when_absent() {
 }
 
 #[test]
-fn status_panel_free_renderer_leads_with_activity_and_time_lines() {
-    // #3983: the panel opens with the activity label (line 1) then the time line
-    // (line 2); the 턴 트리거 deeplink trails as the last section.
+fn status_panel_free_renderer_orders_header_fields_on_separate_lines() {
+    // #4601: activity remains first; trigger, start, and update follow in order,
+    // with the two time fields split across physical lines.
     let out = super::status_panel::render_status_panel(
         StatusPanelState::default(),
         &ProviderKind::Claude,
-        "마지막 업데이트 : <t:1700000000:R> / 턴 시작 : <t:1700000000:R>".to_string(),
+        "턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)".to_string(),
         Some("턴 트리거: https://discord.com/channels/1/2/3".to_string()),
     );
-    let mut sections = out.split("\n\n");
     assert_eq!(
-        sections.next(),
-        Some("🟢 진행 중"),
-        "line 1 = activity: {out:?}"
+        out.lines().take(4).collect::<Vec<_>>(),
+        vec![
+            "🟢 진행 중",
+            "턴 트리거: https://discord.com/channels/1/2/3",
+            "턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)",
+            "마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)",
+        ],
+        "header must render as four consecutive lines: {out:?}"
     );
-    assert_eq!(
-        sections.next(),
-        Some("마지막 업데이트 : <t:1700000000:R> / 턴 시작 : <t:1700000000:R>"),
-        "line 2 = time line: {out:?}"
+    let trigger = out.find("턴 트리거:").expect("trigger line");
+    let started = out.find("턴 시작 :").expect("turn-start line");
+    let updated = out.find("마지막 업데이트 :").expect("last-update line");
+    assert!(
+        trigger < started && started < updated,
+        "header order must be trigger -> start -> update: {out:?}"
     );
     assert!(
-        out.trim_end()
-            .ends_with("턴 트리거: https://discord.com/channels/1/2/3"),
-        "턴 트리거 must be the last footer line: {out:?}"
+        out.contains(
+            "턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)"
+        ),
+        "time fields must occupy separate consecutive lines: {out:?}"
+    );
+    assert!(
+        !out.contains(" / "),
+        "combined time line is retired: {out:?}"
     );
     assert!(
         out.chars().count() <= STATUS_PANEL_MAX_CHARS,

@@ -49,8 +49,30 @@ fn persisted_record(
     provider: &str,
     applied: &str,
 ) -> PersistedTargetState {
+    persisted_record_with_version(shared, target, provider, applied, PERSISTED_STATE_VERSION)
+}
+
+fn persisted_queue_record(
+    shared: &SharedData,
+    target: TurnViewTarget,
+    provider: &str,
+    applied: &str,
+    identity_label: &str,
+) -> PersistedTargetState {
+    let mut record = persisted_record(shared, target, provider, applied);
+    record.identity_label = identity_label.to_string();
+    record
+}
+
+fn persisted_record_with_version(
+    shared: &SharedData,
+    target: TurnViewTarget,
+    provider: &str,
+    applied: &str,
+    version: u32,
+) -> PersistedTargetState {
     PersistedTargetState {
-        version: PERSISTED_STATE_VERSION,
+        version,
         provider: provider.to_string(),
         kind: target.kind.as_str().to_string(),
         channel_id: target.channel_id.get(),
@@ -177,7 +199,7 @@ async fn sequence_start_complete_leaves_only_completed_reaction() {
 }
 
 #[tokio::test]
-async fn queued_then_started_swaps_mailbox_to_hourglass_without_residue() {
+async fn queued_then_started_swaps_queue_marker_for_new_hourglass_without_residue() {
     let _root = scoped_runtime_root();
     let reconciler = note_sequence(&[TurnViewState::Queued, TurnViewState::Pending]).await;
 
@@ -186,13 +208,69 @@ async fn queued_then_started_swaps_mailbox_to_hourglass_without_residue() {
         vec![expected('⏳', "intake-a")]
     );
     let ops = reconciler.ops();
-    assert!(ops.iter().any(|op| op.add && op.emoji == '📬'));
-    assert!(ops.iter().any(|op| !op.add && op.emoji == '📬'));
-    assert!(
-        !snapshot_reactions(&reconciler, target())
-            .iter()
-            .any(|(emoji, _)| *emoji == '📬')
+    assert_eq!(
+        ops.iter().map(|op| (op.emoji, op.add)).collect::<Vec<_>>(),
+        vec![('📬', true), ('📬', false), ('⏳', true)],
+        "queued promotion must remove the queue marker and add a fresh pending hourglass"
     );
+}
+
+#[tokio::test]
+async fn queued_started_completed_uses_one_identity_and_leaves_checkmark() {
+    let _root = scoped_runtime_root();
+    let reconciler = note_sequence(&[
+        TurnViewState::Queued,
+        TurnViewState::Pending,
+        TurnViewState::Completed,
+    ])
+    .await;
+
+    assert_eq!(
+        snapshot_reactions(&reconciler, target()),
+        vec![expected('✅', "intake-a")]
+    );
+    let ops = reconciler.ops();
+    assert!(ops.iter().any(|op| !op.add && op.emoji == '⏳'));
+    assert!(ops.iter().any(|op| op.add && op.emoji == '✅'));
+    assert!(
+        ops.iter().all(|op| op.identity == "intake-a"),
+        "the queued marker adder must also own every transition removal/addition"
+    );
+}
+
+#[tokio::test]
+async fn queued_states_are_marker_only() {
+    let _root = scoped_runtime_root();
+
+    for (index, state, emoji) in [
+        (0, TurnViewState::Queued, '📬'),
+        (1, TurnViewState::QueuedMerged, '➕'),
+        (2, TurnViewState::QueuedReconcile, '🔄'),
+    ] {
+        let reconciler = TurnViewReconciler::default();
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let target = target_with(100_000_000_000_121 + index, 100_000_000_000_125 + index);
+        clear_persisted(target);
+        reconciler
+            .note_state(
+                &shared,
+                target,
+                owner(34, "marker-only"),
+                TurnViewIdentity::Test("intake-a"),
+                state,
+                "test_marker_only_queue_state",
+            )
+            .await;
+
+        assert_eq!(
+            snapshot_reactions(&reconciler, target),
+            vec![expected(emoji, "intake-a")]
+        );
+        assert!(
+            !reconciler.ops().iter().any(|op| op.add && op.emoji == '⏳'),
+            "queued state {state:?} must not add an hourglass"
+        );
+    }
 }
 
 #[tokio::test]
@@ -260,7 +338,7 @@ async fn regression_4109_pre_migration_untracked_queue_markers_still_remove_reac
 }
 
 #[tokio::test]
-async fn regression_4049_start_rollback_to_queued_swaps_hourglass_to_mailbox_and_cancel_cleans() {
+async fn regression_4248_start_rollback_to_queued_removes_hourglass_and_cancel_cleans() {
     let _root = scoped_runtime_root();
     let reconciler = TurnViewReconciler::default();
     let shared = crate::services::discord::make_shared_data_for_tests();
@@ -297,8 +375,8 @@ async fn regression_4049_start_rollback_to_queued_swaps_hourglass_to_mailbox_and
 
     let ops = reconciler.ops();
     assert_eq!(ops.len(), 3);
-    assert!(ops[1].emoji == '⏳' && !ops[1].add);
-    assert!(ops[2].emoji == '📬' && ops[2].add);
+    assert!(!ops[1].add && ops[1].emoji == '⏳');
+    assert!(ops[2].add && ops[2].emoji == '📬');
     assert_eq!(
         snapshot_reactions(&reconciler, target),
         vec![expected('📬', "intake-a")]
@@ -608,7 +686,7 @@ async fn regression_4049_stale_clear_after_newer_rollback_keeps_queued_marker() 
     assert_eq!(
         snapshot_reactions(&reconciler, target),
         vec![expected('📬', "intake-a")],
-        "stale attempt1 clear must not remove the newer queued marker"
+        "stale attempt1 clear must not remove the newer queued state"
     );
     let current = reconciler
         .targets
@@ -618,6 +696,151 @@ async fn regression_4049_stale_clear_after_newer_rollback_keeps_queued_marker() 
     assert_eq!(current.start_attempt, None);
     assert_eq!(persisted_applied(target), TurnViewState::Queued);
     assert_eq!(persisted_start_attempt(target), None);
+}
+
+#[tokio::test]
+async fn persisted_v1_queued_state_is_invalidated_for_reapplication() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_155, 100_000_000_000_156);
+    clear_persisted(target);
+    let provider = shared.provider.as_str().to_string();
+    let record = persisted_queue_record(&shared, target, &provider, "queued", "intake-a");
+    write_persisted(&record, target);
+
+    let reconciler = TurnViewReconciler::default();
+    reconciler
+        .note_state(
+            &shared,
+            target,
+            owner(91, "persisted"),
+            TurnViewIdentity::Test("intake-a"),
+            TurnViewState::Queued,
+            "test_v1_queue_reapply",
+        )
+        .await;
+
+    assert_eq!(
+        snapshot_reactions(&reconciler, target),
+        vec![expected('📬', "intake-a")],
+        "v1 queued records must be re-applied under the marker-only contract"
+    );
+    let text = std::fs::read_to_string(persisted_path(target)).expect("rewritten v3 state");
+    let rewritten: PersistedTargetState = serde_json::from_str(&text).expect("parse v3 state");
+    assert_eq!(rewritten.version, QUEUED_MARKER_ONLY_STATE_VERSION);
+}
+
+#[tokio::test]
+async fn persisted_v2_queued_promotion_clears_legacy_set_before_pending() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_165, 100_000_000_000_166);
+    clear_persisted(target);
+    let provider = shared.provider.as_str().to_string();
+    let mut record = persisted_record_with_version(
+        &shared,
+        target,
+        &provider,
+        "queued",
+        LEGACY_QUEUED_HOURGLASS_STATE_VERSION,
+    );
+    record.identity_label = "intake-a".to_string();
+    write_persisted(&record, target);
+
+    let reconciler = TurnViewReconciler::default();
+    reconciler
+        .note_state(
+            &shared,
+            target,
+            owner(92, "persisted"),
+            TurnViewIdentity::Test("intake-a"),
+            TurnViewState::Pending,
+            "test_v2_queue_promotion",
+        )
+        .await;
+
+    assert_eq!(
+        snapshot_reactions(&reconciler, target),
+        vec![expected('⏳', "intake-a")],
+        "v2 queue promotion must remove legacy queue reactions before adding pending"
+    );
+    assert_eq!(
+        reconciler
+            .ops()
+            .iter()
+            .map(|op| (op.emoji, op.add))
+            .collect::<Vec<_>>(),
+        vec![('📬', false), ('⏳', false), ('⏳', true)]
+    );
+}
+
+#[tokio::test]
+async fn persisted_v1_queued_cancel_clears_legacy_marker_before_promotion() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_167, 100_000_000_000_168);
+    clear_persisted(target);
+    let provider = shared.provider.as_str().to_string();
+    let record = persisted_queue_record(&shared, target, &provider, "queued", "intake-a");
+    write_persisted(&record, target);
+
+    let reconciler = TurnViewReconciler::default();
+    reconciler
+        .note_queue_marker_removed(
+            &shared,
+            target,
+            owner(91, "persisted"),
+            TurnViewIdentity::Test("ignored-current-identity"),
+            '📬',
+            "test_v1_queue_cancel",
+        )
+        .await;
+
+    assert_eq!(
+        reconciler.ops(),
+        vec![TestReactionOp {
+            target,
+            emoji: '📬',
+            add: false,
+            identity: "intake-a".to_string(),
+        }],
+        "v1 cancellation before promotion must remove the legacy marker once with its persisted identity"
+    );
+    assert!(!persisted_exists(target));
+}
+
+#[tokio::test]
+async fn persisted_v1_queued_generic_clear_removes_legacy_marker() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_169, 100_000_000_000_170);
+    clear_persisted(target);
+    let provider = shared.provider.as_str().to_string();
+    let record = persisted_queue_record(&shared, target, &provider, "queued", "intake-a");
+    write_persisted(&record, target);
+
+    let reconciler = TurnViewReconciler::default();
+    reconciler
+        .note_turn_cleared(
+            &shared,
+            target,
+            owner(91, "persisted"),
+            TurnViewIdentity::Test("ignored-current-identity"),
+            "test_v1_queue_generic_clear",
+        )
+        .await;
+
+    assert_eq!(
+        reconciler.ops(),
+        vec![TestReactionOp {
+            target,
+            emoji: '📬',
+            add: false,
+            identity: "intake-a".to_string(),
+        }],
+        "v1 generic clear before promotion must remove the legacy marker once"
+    );
+    assert!(!persisted_exists(target));
 }
 
 #[tokio::test]
@@ -1344,6 +1567,84 @@ async fn regression_4041_duplicate_transitions_are_coalesced() {
 }
 
 #[tokio::test]
+async fn failed_queue_marker_apply_leaves_no_persisted_state() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_591, 100_000_000_000_592);
+    clear_persisted(target);
+    let reconciler = TurnViewReconciler::with_test_deliveries(vec![TurnViewDelivery::Failed]);
+
+    let delivery = reconciler
+        .note_state_delivery(
+            &shared,
+            target,
+            owner(29, "failed-queue-marker"),
+            TurnViewIdentity::Test("intake-a"),
+            TurnViewState::Queued,
+            "test_failed_queue_marker_apply",
+        )
+        .await;
+
+    assert_eq!(delivery, TurnViewDelivery::Failed);
+    assert_eq!(
+        reconciler
+            .ops()
+            .iter()
+            .map(|op| (op.emoji, op.add))
+            .collect::<Vec<_>>(),
+        vec![('📬', true)]
+    );
+    assert!(!persisted_exists(target));
+}
+
+#[tokio::test]
+async fn terminal_partial_failure_restores_removed_hourglass() {
+    let _root = scoped_runtime_root();
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let target = target_with(100_000_000_000_593, 100_000_000_000_594);
+    clear_persisted(target);
+    let starter = TurnViewReconciler::default();
+    starter
+        .note_state(
+            &shared,
+            target,
+            owner(30, "partial-terminal"),
+            TurnViewIdentity::Test("intake-a"),
+            TurnViewState::Pending,
+            "test_seed_partial_terminal",
+        )
+        .await;
+    let reconciler = TurnViewReconciler::with_test_deliveries(vec![
+        TurnViewDelivery::Delivered,
+        TurnViewDelivery::Failed,
+        TurnViewDelivery::Delivered,
+    ]);
+
+    let delivery = reconciler
+        .note_state_delivery(
+            &shared,
+            target,
+            owner(30, "partial-terminal"),
+            TurnViewIdentity::Test("ignored-current-caller"),
+            TurnViewState::Completed,
+            "test_partial_terminal_apply",
+        )
+        .await;
+
+    assert_eq!(delivery, TurnViewDelivery::Failed);
+    assert_eq!(
+        reconciler
+            .ops()
+            .iter()
+            .map(|op| (op.emoji, op.add))
+            .collect::<Vec<_>>(),
+        vec![('⏳', false), ('✅', true), ('⏳', true)],
+        "failed terminal add must compensate the already-removed hourglass"
+    );
+    assert_eq!(persisted_applied(target), TurnViewState::Pending);
+}
+
+#[tokio::test]
 async fn permanent_failure_deletes_persisted_pending_and_stays_cold() {
     let _root = scoped_runtime_root();
     let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1427,12 +1728,7 @@ async fn dispatch_parent_retry_transient_keeps_persisted_pending_and_retries() {
     let combined_delivery = TurnViewDelivery::from_reaction_error_status(combined_status);
     assert_ne!(combined_delivery, TurnViewDelivery::FailedPermanent);
 
-    let retrying = TurnViewReconciler::with_test_deliveries(vec![
-        combined_delivery,
-        TurnViewDelivery::Delivered,
-        TurnViewDelivery::Delivered,
-        TurnViewDelivery::Delivered,
-    ]);
+    let retrying = TurnViewReconciler::with_test_deliveries(vec![combined_delivery]);
     let delivery = retrying
         .note_state_delivery(
             &shared,
@@ -1476,7 +1772,8 @@ async fn dispatch_parent_retry_transient_keeps_persisted_pending_and_retries() {
             .iter()
             .filter(|op| op.add && op.emoji == '✅')
             .count(),
-        2
+        1,
+        "the transient failure occurs before the terminal add; retry adds completion once"
     );
 }
 

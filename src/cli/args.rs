@@ -423,6 +423,9 @@ pub(crate) enum Commands {
         issue_number: String,
     },
     /// Show auto-queue status with thread links
+    #[command(
+        after_help = "Deprecated compatibility command. For the queue-only inspector, use `agentdesk query queue`; use `agentdesk query` for the combined queue, dispatch, and phase-gate snapshot. This command preserves its legacy text and JSON output shapes."
+    )]
     Queue,
     /// Unified queue + dispatch + phase-gate inspection (issue #2651).
     ///
@@ -884,6 +887,7 @@ pub(crate) enum ConfigAction {
     /// Set runtime config (JSON string)
     Set {
         /// JSON value to set
+        #[arg(id = "config_json", value_name = "JSON")]
         json: String,
     },
     /// Audit config source-of-truth drift across yaml/DB/legacy files
@@ -1138,6 +1142,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract() {
+        let Err(error) = Cli::try_parse_from(["agentdesk", "queue", "--help"]) else {
+            panic!("queue --help must render help instead of running the command");
+        };
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        assert_eq!(error.exit_code(), 0);
+
+        let help = error
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(help.contains("Deprecated compatibility command."));
+        assert!(help.contains("`agentdesk query queue`"));
+        assert!(help.contains("`agentdesk query`"));
+        assert!(help.contains("legacy text and JSON output shapes"));
+    }
+
+    #[test]
     fn legacy_flat_discord_send_help_matches_routed_send_contract() {
         fn help_for(command: &str) -> String {
             let Err(error) = Cli::try_parse_from(["agentdesk", command, "--help"]) else {
@@ -1342,6 +1365,52 @@ mod tests {
             Commands::SendToAgent { expect_reply, .. } => assert!(!expect_reply),
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn config_set_parses_json_value() {
+        let cli = Cli::try_parse_from(["agentdesk", "config", "set", r#"{"a":1}"#])
+            .expect("config set <JSON> parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config {
+                action: ConfigAction::Set { json },
+            }) if json == r#"{"a":1}"#
+        ));
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn config_set_help_preserves_json_value_name() {
+        let mut command = Cli::command();
+        let config = command
+            .find_subcommand_mut("config")
+            .expect("config subcommand exists");
+        let set = config
+            .find_subcommand_mut("set")
+            .expect("config set subcommand exists");
+        let mut rendered = Vec::new();
+        set.write_long_help(&mut rendered)
+            .expect("config set help renders");
+        let rendered = String::from_utf8(rendered).expect("help is UTF-8");
+
+        assert!(rendered.contains("<JSON>"));
+        assert!(!rendered.contains("<CONFIG_JSON>"));
+    }
+
+    #[test]
+    fn config_set_parses_json_value_with_global_json() {
+        let cli = Cli::try_parse_from(["agentdesk", "config", "set", r#"{"a":1}"#, "--json"])
+            .expect("config set <JSON> --json parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config {
+                action: ConfigAction::Set { json },
+            }) if json == r#"{"a":1}"#
+        ));
+        assert!(cli.json);
     }
 
     #[test]

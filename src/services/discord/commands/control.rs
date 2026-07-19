@@ -1,11 +1,12 @@
 use poise::serenity_prelude as serenity;
-use serenity::CreateAttachment;
+use serenity::{CreateAttachment, MessageId};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::services::provider::ProviderKind;
 
 use super::super::formatting::{send_long_message_ctx, truncate_str};
+use super::super::queue_io::mailbox_cancel_queued_primary_message;
 use super::super::settings::cleanup_channel_uploads;
 use super::super::settings::save_bot_settings;
 use super::super::turn_bridge::stop_active_turn;
@@ -506,6 +507,49 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
     tracing::info!("  [{ts}] ◀ [{user_name}] /stop");
 
     let channel_id = ctx.channel_id();
+    let forward_context =
+        crate::services::session_forwarding::ForwardCallerContext::from_live_globals(
+            ctx.data().shared.pg_pool.clone(),
+        );
+    match crate::services::session_forwarding::forward_remote_cancel_if_needed(
+        &forward_context,
+        &axum::http::HeaderMap::new(),
+        &channel_id.get().to_string(),
+        false,
+    )
+    .await
+    {
+        Ok(Some(_)) => {
+            ctx.say(super::STOPPING_RESPONSE).await?;
+            tracing::info!("  [{ts}] ■ Remote cancel acknowledged");
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(error) if error.status() == axum::http::StatusCode::NOT_FOUND => {
+            ctx.say(super::NO_ACTIVE_TURN_RESPONSE).await?;
+            return Ok(());
+        }
+        Err(error) => {
+            tracing::error!(channel_id = channel_id.get(), error = %error, "/stop remote cancel failed closed");
+            ctx.say("중지 요청을 owner에 전달하지 못했어요. 잠시 후 다시 시도해 주세요.")
+                .await?;
+            return Ok(());
+        }
+    }
+
+    if let Err(error) = crate::services::session_forwarding::revalidate_local_cancel_owner(
+        &forward_context,
+        &channel_id.get().to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::error!(channel_id = channel_id.get(), error = %error, "/stop owner moved before local mutation");
+        ctx.say("중지 요청 중 owner가 변경됐어요. 잠시 후 다시 시도해 주세요.")
+            .await?;
+        return Ok(());
+    }
+
     let result = mailbox_cancel_active_turn(&ctx.data().shared, channel_id).await;
 
     match result.token {
@@ -531,6 +575,58 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
         None => {
             ctx.say(super::NO_ACTIVE_TURN_RESPONSE).await?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn parse_queued_message_id(raw: &str) -> Option<MessageId> {
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .map(MessageId::new)
+}
+
+/// /cancel-queued — Remove one queued message without affecting active work.
+///
+/// The target is an exact Discord message id. The mailbox actor serializes the
+/// removal against dispatch, so a queued-to-active race is reported as stale
+/// instead of cancelling the newly active turn.
+#[poise::command(slash_command, rename = "cancel-queued")]
+pub(in crate::services::discord) async fn cmd_cancel_queued(
+    ctx: Context<'_>,
+    #[description = "Queued Discord message ID"] message_id: String,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+    if !super::enforce_slash_command_policy(&ctx, "/cancel-queued").await? {
+        return Ok(());
+    }
+
+    let Some(message_id) = parse_queued_message_id(&message_id) else {
+        ctx.say("유효한 큐 메시지 ID를 입력해 주세요.").await?;
+        return Ok(());
+    };
+
+    let removed = mailbox_cancel_queued_primary_message(
+        &ctx.data().shared,
+        &ctx.data().provider,
+        ctx.channel_id(),
+        message_id,
+    )
+    .await;
+    if removed.is_some() {
+        ctx.say(format!("큐 메시지 `{}`를 취소했어요.", message_id.get()))
+            .await?;
+    } else {
+        ctx.say(format!(
+            "큐 메시지 `{}`는 이미 처리됐거나 현재 채널의 대기열에 없어요.",
+            message_id.get()
+        ))
+        .await?;
     }
     Ok(())
 }
@@ -569,9 +665,11 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
 
 #[cfg(test)]
 mod soft_clear_notify_tests {
+    use poise::serenity_prelude::MessageId;
+
     use super::{
         SOFT_CLEAR_REASON_CODE, SoftClearNotifyMode, choose_clear_session_key,
-        soft_clear_lifecycle_notify_row,
+        parse_queued_message_id, soft_clear_lifecycle_notify_row,
     };
 
     #[test]
@@ -586,6 +684,13 @@ mod soft_clear_notify_tests {
             None,
             "`!clear` should leave the provider reply as the single user-visible completion surface"
         );
+    }
+
+    #[test]
+    fn queued_cancel_parser_accepts_exact_nonzero_ids_only() {
+        assert_eq!(parse_queued_message_id(" 42 "), Some(MessageId::new(42)));
+        assert_eq!(parse_queued_message_id("0"), None);
+        assert_eq!(parse_queued_message_id("stale"), None);
     }
 
     #[test]

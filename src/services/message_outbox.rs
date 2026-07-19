@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use sqlx::PgPool;
 
-use crate::services::provider::{CancelToken, cancel_requested};
+use crate::services::{
+    discord::bot_role::UtilityBotRole,
+    provider::{CancelToken, cancel_requested},
+};
 
 pub(crate) const LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS: i64 = 5 * 60;
 pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
@@ -11,7 +14,7 @@ pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
 /// outbox worker falls back to the notify bot only when that primary delivery
 /// fails, preserving human visibility without turning informational notices
 /// into agent work (#4449).
-pub(crate) const ACTIONABLE_OPS_ALERT_BOT: &str = "announce";
+pub(crate) const ACTIONABLE_OPS_ALERT_BOT: &str = UtilityBotRole::Announce.alias();
 
 pub(crate) fn is_actionable_ops_alert(source: &str, reason_code: Option<&str>) -> bool {
     matches!(
@@ -950,7 +953,7 @@ pub(crate) async fn enqueue_lifecycle_notification_pg(
     )
     .bind(target)
     .bind(content)
-    .bind("notify")
+    .bind(UtilityBotRole::Notify.alias())
     .bind(LIFECYCLE_NOTIFIER_SOURCE)
     .bind(reason_code)
     .bind(session_key.as_deref())
@@ -1328,8 +1331,8 @@ mod stop_turn_notify_removal_tests {
     /// message is no longer enqueued by any stop entrypoint.
     const STOP_TURN_REASON_CODE: &str = "lifecycle.stop_turn";
 
-    /// Behavior model of the outbox under the four stop entrypoints
-    /// (reaction-remove ⏳, `/stop`, `!stop`, skill stop). Because
+    /// Behavior model of the outbox under the supported stop entrypoints
+    /// (`/stop`, `!stop`, and skill stop). Because
     /// `notify_turn_stop` was removed (compile-level guarantee — the function
     /// and its `commands` re-export no longer exist), simulating any stop path
     /// enqueues nothing. This in-test outbox records exactly what the stop
@@ -1407,7 +1410,7 @@ mod stop_turn_notify_removal_tests {
         );
         let key_b = dedupe_key_for_message(
             "channel:123",
-            "🛑 현재 턴 중단 (reaction remove ⏳) — tmux는 유지됩니다.",
+            "🛑 현재 턴 중단 (/stop) — tmux는 유지됩니다.",
             Some(STOP_TURN_REASON_CODE),
             Some("session-abc"),
         );

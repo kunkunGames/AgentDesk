@@ -37,6 +37,7 @@ pub(crate) struct IntakeOutboxRow {
     pub reply_to_user_message: bool,
     pub defer_watcher_resume: bool,
     pub wait_for_completion: bool,
+    pub preserve_on_cancel: Option<bool>,
     pub agent_id: String,
     /// Provider of the bot that forwarded this row (#4349). Carried through
     /// `force_fail_and_retry_as_new` so a retry stays on the same bot.
@@ -75,6 +76,7 @@ pub(crate) struct InsertPendingPayload {
     pub reply_to_user_message: bool,
     pub defer_watcher_resume: bool,
     pub wait_for_completion: bool,
+    pub preserve_on_cancel: bool,
     pub agent_id: String,
     /// Provider of the bot that forwarded this row (#4349). Claim
     /// eligibility is scoped on this, not on `agents.provider`, because a
@@ -107,15 +109,15 @@ pub(crate) async fn insert_pending(
             channel_id, user_msg_id, request_owner_id, request_owner_name,
             user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
             merge_consecutive, reply_to_user_message, defer_watcher_resume,
-            wait_for_completion, agent_id, provider,
+            wait_for_completion, preserve_on_cancel, agent_id, provider,
             status, attempt_no, parent_outbox_id
         ) VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
             $8, $9, $10, $11, $12,
             $13, $14, $15,
-            $16, $17, $18,
-            'pending', $19, $20
+            $16, $17, $18, $19,
+            'pending', $20, $21
         )
         RETURNING id
         "#,
@@ -136,6 +138,7 @@ pub(crate) async fn insert_pending(
     .bind(payload.reply_to_user_message)
     .bind(payload.defer_watcher_resume)
     .bind(payload.wait_for_completion)
+    .bind(payload.preserve_on_cancel)
     .bind(&payload.agent_id)
     .bind(&payload.provider)
     .bind(attempt_no)
@@ -270,6 +273,33 @@ pub(crate) async fn claim_pending_for_target(
 
     tx.commit().await?;
     Ok(Some(row))
+}
+
+/// Restart-admission rollback: return exactly one owned pre-accept claim to
+/// `pending` when the worker observes its shutdown fence after claiming but
+/// before accepting. This is deliberately not a failure transition: it clears
+/// only claim ownership/timing and leaves retry/error bookkeeping untouched so
+/// the next healthy worker can claim the original attempt.
+///
+/// Returns `Ok(true)` when this owner released this row; `Ok(false)` when the
+/// row or ownership changed first (for example, a stale-claim sweep won).
+pub(crate) async fn return_claimed_to_pending(
+    pool: &PgPool,
+    id: i64,
+    claim_owner: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE intake_outbox
+         SET status = 'pending',
+             claim_owner = NULL,
+             claimed_at = NULL
+         WHERE id = $1 AND status = 'claimed' AND claim_owner = $2",
+    )
+    .bind(id)
+    .bind(claim_owner)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Transition `claimed → accepted` after the worker has validated cwd
@@ -563,15 +593,15 @@ pub(crate) async fn force_fail_and_retry_as_new(
             channel_id, user_msg_id, request_owner_id, request_owner_name,
             user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
             merge_consecutive, reply_to_user_message, defer_watcher_resume,
-            wait_for_completion, agent_id, provider,
+            wait_for_completion, preserve_on_cancel, agent_id, provider,
             status, attempt_no, parent_outbox_id
         ) VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
             $8, $9, $10, $11, $12,
             $13, $14, $15,
-            $16, $17, $18,
-            'pending', $19, $20
+            $16, $17, $18, $19,
+            'pending', $20, $21
         )
         RETURNING id
         "#,
@@ -592,6 +622,7 @@ pub(crate) async fn force_fail_and_retry_as_new(
     .bind(row.reply_to_user_message)
     .bind(row.defer_watcher_resume)
     .bind(row.wait_for_completion)
+    .bind(row.preserve_on_cancel)
     .bind(&row.agent_id)
     .bind(&row.provider)
     .bind(next_attempt)
@@ -1145,7 +1176,7 @@ mod migration_tests {
 }
 
 #[cfg(test)]
-mod helper_tests {
+mod postgres_tests {
     use super::*;
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use serde_json::json;
@@ -1169,6 +1200,7 @@ mod helper_tests {
             reply_to_user_message: false,
             defer_watcher_resume: false,
             wait_for_completion: false,
+            preserve_on_cancel: false,
             agent_id: "agent-x".to_string(),
         }
     }
@@ -1210,6 +1242,58 @@ mod helper_tests {
         assert_eq!(row.status, "pending");
         assert!(row.parent_outbox_id.is_none());
         assert_eq!(row.required_labels, json!(["unreal"]));
+        assert_eq!(row.preserve_on_cancel, Some(false));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preserve_on_cancel_round_trips_true_false_and_legacy_null() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_default_test_agent(&pool).await;
+
+        let mut human = payload("ch-preserve-human", "msg-human");
+        human.preserve_on_cancel = true;
+        let human_id = insert_pending(&pool, &human, 1, None)
+            .await
+            .expect("insert human row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] postgres module
+        let automation_id = insert_pending(
+            &pool,
+            &payload("ch-preserve-automation", "msg-automation"),
+            1,
+            None,
+        )
+        .await
+        .expect("insert automation row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] postgres module
+        let legacy_id: i64 = sqlx::query_scalar(
+            "INSERT INTO intake_outbox (
+                target_instance_id, forwarded_by_instance_id, required_labels,
+                channel_id, user_msg_id, request_owner_id, user_text, turn_kind,
+                agent_id, provider, status, attempt_no
+             ) VALUES (
+                'worker-1', 'legacy-leader', '[]'::JSONB,
+                'ch-preserve-legacy', 'msg-legacy', 'user-legacy', 'legacy', 'standard',
+                'agent-x', 'claude', 'pending', 1
+             ) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert legacy row without preserve_on_cancel"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] postgres module
+
+        for (id, expected) in [
+            (human_id, Some(true)),
+            (automation_id, Some(false)),
+            (legacy_id, None),
+        ] {
+            let row: IntakeOutboxRow = sqlx::query_as("SELECT * FROM intake_outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read preservation row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] postgres module
+            assert_eq!(row.preserve_on_cancel, expected);
+        }
 
         pool.close().await;
         pg_db.drop().await;
@@ -1409,6 +1493,70 @@ mod helper_tests {
             .await
             .expect("read status");
         assert_eq!(status, "claimed", "wrong owner must NOT advance state");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_owned_claim_returns_exact_row_to_pending_without_failure_pollution() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_default_test_agent(&pool).await;
+
+        insert_pending(&pool, &payload("ch-cancel-owned", "msg-owned"), 1, None)
+            .await
+            .expect("insert owned row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        let owned = claim_pending_for_target(&pool, "worker-1", "claude", "owner-cancelled")
+            .await
+            .expect("claim owned row") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            .expect("owned row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+
+        insert_pending(&pool, &payload("ch-cancel-other", "msg-other"), 1, None)
+            .await
+            .expect("insert other row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        let other = claim_pending_for_target(&pool, "worker-1", "claude", "owner-other")
+            .await
+            .expect("claim other row") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            .expect("other row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+
+        assert!(
+            !return_claimed_to_pending(&pool, owned.id, "owner-wrong")
+                .await
+                .expect("wrong owner is a no-op"), // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            "a different worker must not release this claim"
+        );
+        assert!(
+            return_claimed_to_pending(&pool, owned.id, "owner-cancelled")
+                .await
+                .expect("release owned claim"), // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            "the cancelling worker must return its exact row to pending"
+        );
+
+        let released: (String, Option<String>, bool, i32, Option<String>, bool) = sqlx::query_as(
+            "SELECT status, claim_owner, claimed_at IS NULL, retry_count, last_error,
+                        completed_at IS NULL
+                 FROM intake_outbox WHERE id = $1",
+        )
+        .bind(owned.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read released row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        assert_eq!(released.0, "pending");
+        assert_eq!(released.1, None);
+        assert!(released.2, "claimed_at must be cleared");
+        assert_eq!(released.3, 0, "restart cancellation is not a retry");
+        assert_eq!(released.4, None, "restart cancellation is not an error");
+        assert!(released.5, "restart cancellation is not completion");
+
+        let other_state: (String, Option<String>) =
+            sqlx::query_as("SELECT status, claim_owner FROM intake_outbox WHERE id = $1")
+                .bind(other.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read other row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        assert_eq!(other_state.0, "claimed", "another row must not be reset");
+        assert_eq!(other_state.1.as_deref(), Some("owner-other"));
 
         pool.close().await;
         pg_db.drop().await;
@@ -1694,7 +1842,9 @@ mod helper_tests {
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
 
-        insert_pending(&pool, &payload("ch-stuck", "msg-stuck"), 1, None)
+        let mut retry_payload = payload("ch-stuck", "msg-stuck");
+        retry_payload.preserve_on_cancel = true;
+        insert_pending(&pool, &retry_payload, 1, None)
             .await
             .expect("seed");
         let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
@@ -1728,9 +1878,10 @@ mod helper_tests {
         );
 
         // New row → pending, attempt_no=2, parent points at stuck.
-        let new_row: (String, i32, Option<i64>, String, String) = sqlx::query_as(
-            "SELECT status, attempt_no, parent_outbox_id, channel_id, user_msg_id
-             FROM intake_outbox WHERE id = $1",
+        let new_row: (String, i32, Option<i64>, String, String, Option<bool>) = sqlx::query_as(
+            "SELECT status, attempt_no, parent_outbox_id, channel_id, user_msg_id,
+                        preserve_on_cancel
+                 FROM intake_outbox WHERE id = $1",
         )
         .bind(new_id)
         .fetch_one(&pool)
@@ -1741,6 +1892,7 @@ mod helper_tests {
         assert_eq!(new_row.2, Some(claimed.id));
         assert_eq!(new_row.3, "ch-stuck");
         assert_eq!(new_row.4, "msg-stuck");
+        assert_eq!(new_row.5, Some(true));
 
         pool.close().await;
         pg_db.drop().await;

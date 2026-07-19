@@ -51,6 +51,7 @@ mod latency_spans;
 mod provider_isolation;
 mod tui_followup;
 mod turn_lifecycle;
+pub(in crate::services::discord) mod typing_indicator;
 mod voice_announcement_route;
 mod voice_announcement_scope;
 mod watchdog;
@@ -179,6 +180,7 @@ pub(super) async fn finish_admitted_local(
         has_reply_boundary,
         dm_hint,
         turn_kind,
+        preserve_on_cancel: _,
     } = request;
     intake_turn::handle_text_message(
         deps,

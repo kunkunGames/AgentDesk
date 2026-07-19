@@ -314,6 +314,7 @@ src/
 │   ├── outbox_actionable_delivery.rs
 │   ├── outbox_delivery_alert.rs
 │   ├── resource_locks.rs
+│   ├── startup_preflight.rs
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
 │   ├── test_phase_runs.rs
@@ -372,6 +373,7 @@ src/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
 │   ├── claude/
+│   │   ├── active_usage.rs
 │   │   └── backend_routing.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
@@ -388,6 +390,7 @@ src/
 │   │   │   ├── followup_support.rs
 │   │   │   ├── mod.rs
 │   │   │   └── warm_followup.rs
+│   │   ├── composer_lock.rs
 │   │   ├── hook_bundle.rs
 │   │   ├── hook_output_guard.rs
 │   │   ├── hook_output_guard_tests.rs
@@ -404,6 +407,7 @@ src/
 │   │   └── tui_relay.rs
 │   ├── cluster/
 │   │   ├── intake_router_hook/
+│   │   │   ├── owner_record.rs
 │   │   │   └── session_owner.rs
 │   │   ├── stream_relay/
 │   │   │   └── identity.rs
@@ -436,6 +440,7 @@ src/
 │   │   │   ├── classification.rs
 │   │   │   ├── classification_order_tests.rs
 │   │   │   ├── phase2.rs
+│   │   │   ├── settled_ledger_consult.rs
 │   │   │   └── too_old_notice.rs
 │   │   ├── commands/
 │   │   │   ├── diagnostics/
@@ -488,6 +493,8 @@ src/
 │   │   │   │   ├── leak_recovery_ledger.rs
 │   │   │   │   ├── stall_alert.rs
 │   │   │   │   └── watchdog_decisions.rs
+│   │   │   ├── stall_liveness/
+│   │   │   │   └── redrive_grace.rs
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
 │   │   │   ├── provider_probe.rs
@@ -512,7 +519,10 @@ src/
 │   │   │   │   ├── abandon.rs
 │   │   │   │   └── mod.rs
 │   │   │   ├── save_store/
+│   │   │   │   ├── identity_gate/
+│   │   │   │   │   └── claude_e_stamp.rs
 │   │   │   │   ├── identity_gate.rs
+│   │   │   │   ├── post_loop_identity_guard_tests.rs
 │   │   │   │   └── rebind_adoption.rs
 │   │   │   ├── stall_recovery_tests/
 │   │   │   │   ├── flake_isolation_4361.rs
@@ -531,6 +541,10 @@ src/
 │   │   │   ├── store.rs
 │   │   │   └── watcher_state.rs
 │   │   ├── outbound/
+│   │   │   ├── turn_output_controller/
+│   │   │   │   ├── fresh_send.rs
+│   │   │   │   └── fresh_send_tests.rs
+│   │   │   ├── completed_turn_ledger.rs
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
@@ -570,6 +584,8 @@ src/
 │   │   │   ├── tests.rs
 │   │   │   ├── turn_anchor.rs
 │   │   │   └── workflow_panel.rs
+│   │   ├── placeholder_sweeper/
+│   │   │   └── abandon_guard.rs
 │   │   ├── prompt_builder/
 │   │   │   ├── channel_recent_context.rs
 │   │   │   ├── dispatch_contract.rs
@@ -612,6 +628,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── restart.rs
 │   │   │   └── shared.rs
+│   │   ├── relay_health/
+│   │   │   └── frontier.rs
 │   │   ├── relay_recovery/
 │   │   │   └── tests/
 │   │   │       └── circuit_breaker_apply.rs
@@ -632,7 +650,9 @@ src/
 │   │   │   │   │   ├── race_loss/
 │   │   │   │   │   │   ├── mailbox_reaction.rs
 │   │   │   │   │   │   └── mailbox_reaction_tests.rs
+│   │   │   │   │   ├── claim_bootstrap.rs
 │   │   │   │   │   ├── race_loss.rs
+│   │   │   │   │   ├── stale_dispatch_guard.rs
 │   │   │   │   │   ├── turn_watchdog.rs
 │   │   │   │   │   └── voice_intake.rs
 │   │   │   │   ├── attachments.rs
@@ -645,6 +665,7 @@ src/
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
 │   │   │   │   ├── turn_lifecycle.rs
+│   │   │   │   ├── typing_indicator.rs
 │   │   │   │   ├── voice_announcement_route.rs
 │   │   │   │   ├── voice_announcement_scope.rs
 │   │   │   │   └── watchdog.rs
@@ -655,6 +676,7 @@ src/
 │   │   │   ├── intake_queue_transaction.rs
 │   │   │   ├── message_handler.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── queue_status_presentation.rs
 │   │   │   ├── response_format.rs
 │   │   │   ├── thread_binding.rs
 │   │   │   └── turn_start.rs
@@ -675,6 +697,7 @@ src/
 │   │   │   ├── startup_doctor.rs
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
+│   │   │   ├── delivery_outcome_classify.rs
 │   │   │   ├── idle_jsonl.rs
 │   │   │   ├── orphan_reclaim.rs
 │   │   │   ├── relay_format.rs
@@ -780,6 +803,7 @@ src/
 │   │   │   ├── idle_transcript_scan.rs
 │   │   │   ├── injected_prompt_policy.rs
 │   │   │   ├── launch_script.rs
+│   │   │   ├── observed_prompt_decision.rs
 │   │   │   ├── rehydration.rs
 │   │   │   ├── relay_ownership.rs
 │   │   │   ├── synthetic_orphan_reclaim.rs
@@ -792,22 +816,29 @@ src/
 │   │   │   │   ├── completion_context.rs
 │   │   │   │   └── completion_postgres.rs
 │   │   │   ├── runtime_handoff_loop/
+│   │   │   │   ├── claude_e.rs
 │   │   │   │   └── guarded_save.rs
 │   │   │   ├── stream_loop/
 │   │   │   │   ├── content_arms/
 │   │   │   │   │   ├── provider_error_presentation.rs
-│   │   │   │   │   └── tui_error_classification.rs
+│   │   │   │   │   ├── tui_error_classification.rs
+│   │   │   │   │   └── types.rs
 │   │   │   │   ├── content_arms.rs
+│   │   │   │   ├── message_conversion.rs
 │   │   │   │   └── tool_arms.rs
 │   │   │   ├── terminal_outcome_delivery/
 │   │   │   │   ├── empty_response_recovery/
-│   │   │   │   │   └── guidance.rs
+│   │   │   │   │   ├── guidance.rs
+│   │   │   │   │   └── handler.rs
+│   │   │   │   ├── busy_followup_retry.rs
 │   │   │   │   ├── cancel_prompt_replace.rs
 │   │   │   │   ├── delivery_epilogue.rs
 │   │   │   │   ├── empty_response_recovery.rs
 │   │   │   │   ├── prompt_too_long_guidance.rs
+│   │   │   │   ├── queue_retry_silence.rs
 │   │   │   │   └── recovery_retry.rs
 │   │   │   ├── tmux_runtime/
+│   │   │   │   ├── claude_stop_delivery.rs
 │   │   │   │   ├── interrupt_policy.rs
 │   │   │   │   ├── pid_exit.rs
 │   │   │   │   ├── process_backend_cancel.rs
@@ -867,6 +898,7 @@ src/
 │   │   ├── turn_view_reconciler/
 │   │   │   ├── orphan_sweep.rs
 │   │   │   ├── queue_repair.rs
+│   │   │   ├── reaction_set.rs
 │   │   │   └── tests.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── tests/
@@ -891,7 +923,9 @@ src/
 │   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── answer_flush_barrier.rs
+│   │   ├── bot_role.rs
 │   │   ├── catch_up.rs
+│   │   ├── compact_turn_authority.rs
 │   │   ├── delivery_lease_key.rs
 │   │   ├── destructive_cancel_capture.rs
 │   │   ├── destructive_cancel_gate.rs
@@ -1029,6 +1063,7 @@ src/
 │   │   │   ├── memento_consolidation.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── target_sweep.rs
+│   │   │   ├── tmp_pipeline_sweep.rs
 │   │   │   ├── voice_cache_sweep.rs
 │   │   │   └── worktree_orphan_sweep.rs
 │   │   └── mod.rs
@@ -1067,6 +1102,7 @@ src/
 │   │   ├── shell.rs
 │   │   └── tmux.rs
 │   ├── provider/
+│   │   ├── cancel_token_claude_interrupt.rs
 │   │   └── provider_conformance_invariant_tests.rs
 │   ├── provider_cli/
 │   │   ├── canary.rs
@@ -1125,6 +1161,7 @@ src/
 │   │   ├── dispatch_reservation.rs
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
+│   │   ├── queue_cancellation.rs
 │   │   ├── registry_purge.rs
 │   │   ├── source_generation.rs
 │   │   └── turn_finished_signal.rs
@@ -1134,6 +1171,8 @@ src/
 │   ├── automation_candidate_contract.rs
 │   ├── automation_candidate_materializer.rs
 │   ├── claude.rs
+│   ├── claude_command.rs
+│   ├── claude_compact_context.rs
 │   ├── claude_compact_trigger.rs
 │   ├── claude_gateway_proxy.rs
 │   ├── codex.rs
@@ -1198,6 +1237,7 @@ src/
 │   ├── tmux_diagnostics.rs
 │   ├── tmux_wrapper.rs
 │   ├── tool_output_guard.rs
+│   ├── tui_prompt_control.rs
 │   ├── tui_prompt_dedupe.rs
 │   ├── tui_turn_state.rs
 │   ├── turn_cancel_finalizer.rs

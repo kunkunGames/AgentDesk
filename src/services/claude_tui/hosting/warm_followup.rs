@@ -113,11 +113,31 @@ fn recover_claude_tui_stranded_prompt_draft(
                 tmux_session_name,
                 transcript_path_string
             ));
-            let clear_result = if allow_recreate {
-                clear_claude_tui_stranded_prompt_draft(tmux_session_name, cancel_token.as_deref())
-            } else {
-                gently_clear_claude_tui_prompt_draft(tmux_session_name, cancel_token.as_deref())
-            };
+            // F1: route the stranded-draft clear through the SAME composer
+            // mutation lock `/compact` steering holds, so this clear and a
+            // busy-pane auto `/compact` can never interleave their key sends
+            // (the race that let a draft-clear mistake a just-typed `/compact`
+            // literal for a stranded draft and soak it up). This runs on the
+            // warm-followup recovery path, OUTSIDE any composer critical section
+            // (the submit lock is acquired later, inside
+            // `send_followup_prompt_or_idle_transcript`), so it is the outermost
+            // composer acquisition here — no re-entry, no deadlock.
+            let clear_result = crate::services::claude_tui::input::with_composer_cleanup_lock(
+                tmux_session_name,
+                || {
+                    if allow_recreate {
+                        clear_claude_tui_stranded_prompt_draft(
+                            tmux_session_name,
+                            cancel_token.as_deref(),
+                        )
+                    } else {
+                        gently_clear_claude_tui_prompt_draft(
+                            tmux_session_name,
+                            cancel_token.as_deref(),
+                        )
+                    }
+                },
+            );
             match clear_result {
                 Ok(post_clear_snapshot)
                     if post_clear_snapshot.tmux_pane_alive
@@ -321,7 +341,7 @@ fn run_claude_tui_warm_followup_submit_and_stream(
         // envelope is authoritative but the prompt glyph is not visible.
         match crate::services::claude_tui::input::wait_for_prompt_ready_or_idle_transcript(
             tmux_session_name,
-            crate::services::claude_tui::input::PromptReadinessKind::Followup,
+            crate::services::claude_tui::input::PromptReadinessKind::ProvenWarmFollowup,
             cancel_token.as_deref(),
             &transcript_path,
         ) {
@@ -679,8 +699,7 @@ pub(crate) fn try_claude_tui_warm_followup(
 ) -> ClaudeTuiWarmFollowupOutcome {
     debug_log("Existing Claude TUI tmux session found — sending follow-up");
     if let Some(ref token) = cancel_token {
-        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(tmux_session_name.to_string());
+        token.bind_claude_tmux_session(tmux_session_name);
     }
     let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
     let (busy_waited, recreate_before_submit, prompt_draft_cleared_before_submit) =

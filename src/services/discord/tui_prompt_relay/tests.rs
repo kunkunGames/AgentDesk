@@ -1,3 +1,5 @@
+use super::injected_prompt_policy::slash_command_control_kind;
+use super::observed_prompt_decision::is_local_only_slash_command_prompt;
 use super::*;
 use crate::services::discord::gateway::TurnGateway;
 
@@ -795,9 +797,60 @@ fn classify_injected_prompt_human_direct_input() {
     assert!(classify_injected_prompt("hi").is_human_active_turn());
 }
 
-// #3099: a `<task-notification>` auto-turn is a real provider turn (it earns
-// a `⏳`) but is not human-driven; its completion cleanup is anchored on the
-// injected message id, so it is classified distinctly from human input.
+// #4567: a `<task-notification>` is a status/card event, not positive
+// human-input provenance; it must not claim an external user-turn lifecycle.
+#[test]
+fn task_notification_lifecycle_is_not_an_external_turn() {
+    let decision = relay_observed_prompt_injected_prompt_decision(
+        "<task-notification><status>killed</status></task-notification>",
+    );
+    assert_eq!(
+        decision.injected_class,
+        InjectedPromptClass::TaskNotificationEvent
+    );
+    assert!(
+        !decision.starts_external_turn_lifecycle(),
+        "killed task status must not claim synthetic ownership"
+    );
+}
+
+#[tokio::test]
+async fn task_notification_status_only_preserves_existing_turn_request_anchor() {
+    let shared = super::super::make_shared_data_for_tests();
+    let channel_id = ChannelId::new(940_000_000_004_567);
+    let existing_anchor = 940_000_000_004_568;
+    let tmux = "AgentDesk-claude-4567-status-only-anchor";
+    shared
+        .tmux_watchers
+        .restore_owner_channel_for_tmux_session(tmux, channel_id);
+    shared
+        .ui
+        .placeholder_live_events
+        .set_turn_request_anchor(channel_id, Some(existing_anchor));
+    let prompt = ObservedTuiPrompt {
+        provider: ProviderKind::Claude.as_str().to_string(),
+        tmux_session_name: tmux.to_string(),
+        prompt: "<task-notification><status>killed</status></task-notification>".to_string(),
+        source_event_id: None,
+        observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+    };
+
+    relay_observed_prompt(&shared, prompt).await;
+
+    assert_eq!(
+        shared
+            .ui
+            .placeholder_live_events
+            .request_user_msg_id_for_test(channel_id),
+        Some(existing_anchor),
+        "status-only task notifications must not clear or replace the existing Discord turn request anchor",
+    );
+}
+
 #[test]
 fn classify_injected_prompt_task_notification_event() {
     let bare = "<task-notification><status>completed</status><task_id>codex-background-event</task_id></task-notification>";
@@ -1736,35 +1789,29 @@ fn slash_command_control_turn_dedupes_double_post_but_not_distinct_commands() {
 }
 
 #[test]
-fn compact_replay_kind_note_suppression_is_session_scoped_and_expires() {
-    let now = std::time::Instant::now();
-    let recent = now - Duration::from_secs(29);
-    let expired = now - Duration::from_secs(31);
-
-    assert!(should_suppress_local_only_kind_note_after_continuation(
-        "/compact",
-        Some(recent),
-        now,
-    ));
-    assert!(should_suppress_local_only_kind_note_after_continuation(
-        "slash",
-        Some(recent),
-        now,
-    ));
+fn local_compact_bypasses_the_two_second_external_slash_control_gate() {
+    let sess = format!("local-compact-gate-{:p}", &0u8 as *const u8);
+    let compact = relay_observed_prompt_injected_prompt_decision("/compact");
+    assert!(compact.local_only_slash);
     assert!(
-        !should_suppress_local_only_kind_note_after_continuation("/compact", None, now),
-        "a different session with no continuation timestamp must not suppress",
+        !slash_command_control_turn_is_duplicate_external_replay(&compact, &sess),
+        "the first human local /compact must not enter the external /loop time gate"
     );
-    assert!(!should_suppress_local_only_kind_note_after_continuation(
-        "/compact",
-        Some(expired),
-        now,
-    ));
-    assert!(!should_suppress_local_only_kind_note_after_continuation(
-        "/cost",
-        Some(recent),
-        now,
-    ));
+    assert!(
+        !slash_command_control_turn_is_duplicate_external_replay(&compact, &sess),
+        "a second human local /compact inside two seconds is still distinct"
+    );
+
+    let loop_control = relay_observed_prompt_injected_prompt_decision("/loop 5m inspect status");
+    assert!(!loop_control.local_only_slash);
+    assert!(
+        !slash_command_control_turn_is_duplicate_external_replay(&loop_control, &sess),
+        "the first external slash control proceeds"
+    );
+    assert!(
+        slash_command_control_turn_is_duplicate_external_replay(&loop_control, &sess),
+        "the existing external /loop raw-wrapper replay guard remains intact"
+    );
 }
 
 // #3178 (codex P2 fix): the kind is the REAL command name, so two distinct
@@ -1848,18 +1895,20 @@ fn system_continuation_suppresses_external_turn_lifecycle() {
     assert!(!subagent.still_delivers_assistant_output());
     assert!(!subagent.is_human_active_turn());
 
-    // Human + task-notification turns keep their user-turn lifecycle AND deliver
-    // output.
-    for active in [
-        InjectedPromptClass::HumanTuiDirect,
-        InjectedPromptClass::TaskNotificationEvent,
-    ] {
-        assert!(
-            !active.suppresses_user_turn_lifecycle(),
-            "{active:?} must keep its user-turn lifecycle"
-        );
-        assert!(active.still_delivers_assistant_output());
-    }
+    let human = InjectedPromptClass::HumanTuiDirect;
+    assert!(!human.suppresses_user_turn_lifecycle());
+    assert!(human.still_delivers_assistant_output());
+
+    let task = InjectedPromptClass::TaskNotificationEvent;
+    assert!(
+        task.suppresses_user_turn_lifecycle(),
+        "task lifecycle records must never claim a user-turn lifecycle"
+    );
+    assert!(
+        !task.still_delivers_assistant_output(),
+        "task lifecycle records must not spawn an output bridge tail"
+    );
+    assert!(!task.is_human_active_turn());
 }
 
 // #3100 codex re-review (P2): a human message that merely *quotes* the
@@ -2462,6 +2511,10 @@ async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
         prompt: "direct input without runtime binding".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2530,6 +2583,10 @@ fn task_notification_repeat_clears_its_recorded_external_lease() {
         prompt: "<task-notification><task-id>repeat-x</task-id><status>completed</status></task-notification>".to_string(),
         source_event_id: None,
             observed_at: chrono::Utc::now(),
+            external_input_lease_generation:
+                crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+            ssh_direct_observation_generation:
+                crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2587,6 +2644,10 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
         prompt: "<task-notification><task-id>repeat-y</task-id></task-notification>".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let repeat_lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -3383,6 +3444,81 @@ fn external_turn_test_lease(
     }
 }
 
+#[test]
+fn synthetic_lifecycle_anchor_uses_posted_placeholder() {
+    let notification_anchor = MessageId::new(940_000_000_004_180);
+    let placeholder_anchor = MessageId::new(940_000_000_004_181);
+
+    let anchor = synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+        notification_anchor,
+        &Ok(placeholder_anchor),
+    );
+    assert_eq!(
+        anchor.message_id, placeholder_anchor,
+        "successful synthetic placeholder delivery must replace the notification anchor"
+    );
+    assert!(
+        anchor.owned_placeholder,
+        "a posted placeholder must remain cleanup-owned until the synthetic claim succeeds"
+    );
+}
+
+#[test]
+fn synthetic_lifecycle_anchor_falls_back_after_placeholder_failure() {
+    let notification_anchor = MessageId::new(940_000_000_004_280);
+
+    let anchor = synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+        notification_anchor,
+        &Err("delivery failed".to_string()),
+    );
+    assert_eq!(
+        anchor.message_id, notification_anchor,
+        "failed synthetic placeholder delivery must preserve the notification anchor"
+    );
+    assert!(
+        !anchor.owned_placeholder,
+        "the fallback notification anchor must never be selected for placeholder cleanup"
+    );
+}
+
+#[test]
+fn failed_synthetic_claim_cleans_only_owned_placeholder() {
+    let anchor = MessageId::new(940_000_000_004_380);
+
+    assert_eq!(
+        synthetic_start_wiring::failed_synthetic_placeholder_cleanup_target(anchor, true),
+        Some(anchor),
+        "a freshly posted synthetic placeholder must be selected for cleanup after claim failure"
+    );
+    assert_eq!(
+        synthetic_start_wiring::failed_synthetic_placeholder_cleanup_target(anchor, false),
+        None,
+        "a fallback notification/task-card anchor must never be deleted after claim failure"
+    );
+}
+
+#[test]
+fn failed_synthetic_placeholder_delete_is_terminal_cleanup_guarded() {
+    let helper_src = include_str!("synthetic_start_wiring.rs");
+    let guard_needle = ["terminal_cleanup_", "protects_delete("].concat();
+    let delete_needle = [".delete_", "message(&http, anchor_message_id)"].concat();
+    let result_needle = ["emit_relay_delete_", "result("].concat();
+    let guard = helper_src
+        .find(&guard_needle)
+        .expect("rejected synthetic cleanup must consult terminal cleanup protection");
+    let delete = helper_src
+        .find(&delete_needle)
+        .expect("rejected synthetic cleanup must retain its owned-placeholder delete");
+    let result = helper_src
+        .find(&result_needle)
+        .expect("rejected synthetic cleanup delete result must be durably observed");
+
+    assert!(
+        guard < delete && delete < result,
+        "committed and retry-pending terminal placeholders must be skipped before delete"
+    );
+}
+
 #[tokio::test]
 async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free() {
     let temp = tempfile::tempdir().expect("temp runtime root");
@@ -3400,6 +3536,10 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
         prompt: prompt_text.to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(
@@ -3418,6 +3558,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
         channel_id,
         &prompt,
         anchor_id,
+        false,
         &decision,
         &mut lease,
     )
@@ -3464,13 +3605,18 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(940_000_000_004_083);
     let tmux = "AgentDesk-claude-4082-genuine-typed";
-    let anchor_id = MessageId::new(940_000_000_004_183);
+    let notification_anchor_id = MessageId::new(940_000_000_004_183);
+    let placeholder_anchor_id = MessageId::new(940_000_000_004_283);
     let prompt = ObservedTuiPrompt {
         provider: provider.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "please review PR #1234".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(decision.injected_class, InjectedPromptClass::HumanTuiDirect);
@@ -3493,6 +3639,12 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         },
     );
 
+    let synthetic_anchor =
+        synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+            notification_anchor_id,
+            &Ok(placeholder_anchor_id),
+        );
+    let anchor_id = synthetic_anchor.message_id;
     let mut lease = external_turn_test_lease(channel_id, tmux);
     let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
         &shared,
@@ -3500,6 +3652,7 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         channel_id,
         &prompt,
         anchor_id,
+        synthetic_anchor.owned_placeholder,
         &decision,
         &mut lease,
     )
@@ -3509,14 +3662,22 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         "no prior turn exists, so the claim should be inline"
     );
 
+    assert_eq!(
+        anchor_id, placeholder_anchor_id,
+        "the synthetic claim must receive the posted placeholder identity"
+    );
+    assert_ne!(
+        anchor_id, notification_anchor_id,
+        "the notification/task-card identity must not remain the streaming anchor after placeholder success"
+    );
     let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
-    assert_eq!(snapshot.active_user_message_id, Some(anchor_id));
+    assert_eq!(snapshot.active_user_message_id, Some(placeholder_anchor_id));
     assert!(snapshot.cancel_token.is_some());
     let state = super::super::inflight::load_inflight_state(&provider, channel_id.get())
         .expect("typed TUI prompt must create synthetic inflight");
     assert_eq!(state.turn_source, TurnSource::ExternalInput);
     assert_eq!(state.tmux_session_name.as_deref(), Some(tmux));
-    assert_eq!(state.user_msg_id, anchor_id.get());
+    assert_eq!(state.user_msg_id, placeholder_anchor_id.get());
     assert!(
         !state.relay_ownership_only,
         "human typed input must remain a full synthetic external turn"

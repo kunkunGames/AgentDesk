@@ -6,6 +6,7 @@ use poise::serenity_prelude as serenity;
 use serde::Serialize;
 use serenity::{ChannelId, MessageId};
 
+use crate::services::discord::inflight::opt_message_id;
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::discord::turn_view_reconciler::note_intake_turn_cleared_via_shared as tv_clear;
 use crate::services::discord::{self as discord, SharedData};
@@ -1456,7 +1457,8 @@ pub(super) fn rebind_error_status_and_message(
         | discord::recovery_engine::RebindError::InflightEpisodeChanged
         | discord::recovery_engine::RebindError::StaleOutputPath { .. }
         | discord::recovery_engine::RebindError::RuntimeBindingUnavailable { .. } => "409 Conflict",
-        discord::recovery_engine::RebindError::ChannelNotBound
+        discord::recovery_engine::RebindError::ChannelIdZero
+        | discord::recovery_engine::RebindError::ChannelNotBound
         | discord::recovery_engine::RebindError::ChannelNameMissing => "400 Bad Request",
         discord::recovery_engine::RebindError::Internal(_) => "500 Internal Server Error",
     };
@@ -1481,6 +1483,14 @@ mod rebind_error_status_tests {
         assert_eq!(status, "409 Conflict");
         assert!(message.contains("codex_tui"));
         assert!(message.contains("AgentDesk-codex-adk-cdx"));
+    }
+
+    #[test]
+    fn zero_channel_id_maps_to_bad_request() {
+        let (status, message) = rebind_error_status_and_message(&RebindError::ChannelIdZero);
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(message.contains("non-zero"));
     }
 }
 
@@ -2171,7 +2181,14 @@ async fn maybe_recover_completed_stale_leak(
         return false;
     };
 
-    let current_msg_id = MessageId::new(state.current_msg_id);
+    let Some(current_msg_id) = opt_message_id(state.current_msg_id) else {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            "leak recovery skipped because persisted current message id is zero"
+        );
+        return false;
+    };
     let current_message = if confirmed_chunks == 0 {
         let current_bot_user_id = match http.get_current_user().await {
             Ok(user) => user.id.get(),
@@ -4995,6 +5012,53 @@ mod stall_watchdog_auto_heal_tests {
         );
         assert!(token.cancelled.load(Ordering::Relaxed));
         assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+
+        let next_token = Arc::new(CancelToken::new());
+        assert!(
+            super::super::super::mailbox_try_start_turn(
+                &shared,
+                channel,
+                next_token.clone(),
+                UserId::new(7),
+                MessageId::new(71),
+            )
+            .await
+        );
+        let next_watcher_cancel = Arc::new(AtomicBool::new(false));
+        shared.tmux_watchers.insert(
+            channel,
+            super::super::super::TmuxWatcherHandle {
+                tmux_session_name: "AgentDesk-codex-next-watchdog".to_string(),
+                output_path: "/tmp/agentdesk-test-next-watchdog.jsonl".to_string(),
+                paused: Arc::new(AtomicBool::new(false)),
+                resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                cancel: next_watcher_cancel.clone(),
+                pause_epoch: Arc::new(AtomicU64::new(0)),
+                turn_delivered: Arc::new(AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(AtomicI64::new(0)),
+            },
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+
+        let released = super::super::relay_auto_heal::apply_watchdog_orphan_token_cleanup(
+            &registry,
+            &provider,
+            shared.clone(),
+            channel,
+        )
+        .await;
+
+        assert!(!released, "watchdog rate limit must block a second reclaim");
+        assert!(shared.tmux_watchers.contains_key(&channel));
+        assert!(!next_watcher_cancel.load(Ordering::Relaxed));
+        assert!(
+            super::super::super::mailbox_snapshot(&shared, channel)
+                .await
+                .cancel_token
+                .is_some()
+        );
+        assert!(!next_token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
     }
 }
 

@@ -142,6 +142,7 @@ pub enum RuntimeHandoff {
         output_path: String,
         session_name: String,
         last_offset: u64,
+        pid: u32,
     },
 }
 
@@ -227,6 +228,17 @@ pub enum StreamMessage {
         cache_create_tokens: Option<u64>,
         cache_read_tokens: Option<u64>,
         output_tokens: Option<u64>,
+    },
+    /// Complete per-assistant-record Claude usage for live compact steering.
+    ///
+    /// This is intentionally separate from [`Self::StatusUpdate`]: status updates
+    /// remain terminal/panel/analytics telemetry, while active snapshots preserve
+    /// the current record's model and explicit zero cache fields.
+    ActiveUsageSnapshot {
+        model: Option<String>,
+        input_tokens: u64,
+        cache_create_tokens: u64,
+        cache_read_tokens: u64,
     },
     /// tmux session is ready for background monitoring or watcher-owned relay.
     TmuxReady {

@@ -3,9 +3,11 @@ mod adk_session;
 pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
 mod answer_flush_barrier;
+pub(crate) mod bot_role;
 // #3479 item-2: restart-gap message recovery extracted to its catch-up sibling.
 mod catch_up;
 mod commands;
+mod compact_turn_authority;
 mod delivery_lease_key;
 mod destructive_cancel_gate;
 mod discord_io;
@@ -130,8 +132,10 @@ mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
 
-pub(in crate::services::discord) use delivery_lease_key::DeliveryLeaseKey;
 pub(crate) use meeting_orchestrator as meeting;
+pub(in crate::services::discord) use {
+    delivery_lease_key::DeliveryLeaseKey, relay_health::RelayFrontierToken,
+};
 // #3479 item-2: re-export the catch-up subsystem entry points referenced
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
 // here in mod.rs and `catch_up_missed_messages` in runtime_bootstrap recovery).
@@ -148,7 +152,9 @@ pub(in crate::services::discord) use recovery_engine as recovery;
 // declaration and constructor literals reference it without a module-qualified
 // path (surface freeze, #3294/#3295 pattern).
 pub(crate) use restart_mode::InflightRestartMode;
-pub(crate) use router::HeadlessTurnStartError;
+pub(crate) use router::{
+    HeadlessTurnStartError, IntakeRequest, TurnKind, execute_intake_turn_core,
+};
 #[cfg(unix)]
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
 // #3038 S4: re-export the live-placeholder cluster type so `SharedData`
@@ -164,11 +170,6 @@ pub(in crate::services) use shared_state::DispatchRoutingState;
 // #3038 S3: same scope rationale as S2 — the cluster-E members were
 // `pub(super)` on `SharedData` (visible up to `crate::services`).
 pub(in crate::services) use shared_state::RestartLifecycle;
-// Phase 2-pre.3 of intake-node-routing: worker entry point. Phase 3 will
-// add the worker polling loop that imports these names; until then they
-// are intentionally exposed but unused at the crate boundary.
-#[allow(unused_imports)]
-pub(crate) use router::{IntakeRequest, TurnKind, execute_intake_turn_core};
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
 
 use std::collections::HashMap;
@@ -199,13 +200,15 @@ use adk_session::{
     build_adk_session_key, build_session_key_candidates, derive_adk_session_info,
     lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
 };
+pub(in crate::services) use compact_turn_authority::{
+    ManagedCompactTurnIdentity, compact_eligible_turn_source, live_managed_turn_matches,
+};
 use formatting::{
     BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_tool_input,
     send_long_message_raw, truncate_str,
 };
-pub(crate) use inflight::clear_inflight_state;
-pub(crate) use inflight::lock_inflight_state_path;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
+pub(crate) use inflight::{clear_inflight_state, lock_inflight_state_path};
 pub(in crate::services::discord) use prompt_builder::load_channel_recent_context;
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 pub(in crate::services::discord) use queue_dispatch::MailboxEnqueueOutcome;
@@ -227,7 +230,7 @@ use tmux_reaper::{cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions};
 use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
 
 pub(crate) use crate::services::turn_orchestrator::has_soft_intervention_at;
-pub(crate) use prompt_builder::DispatchProfile;
+pub(crate) use prompt_builder::{DispatchProfile, PromptProfiles};
 pub(crate) use runtime_bootstrap::RunBotContext;
 pub(crate) use runtime_bootstrap::run_bot;
 
@@ -257,8 +260,7 @@ pub(crate) use inflight::latest_request_owner_user_id_for_channel;
 pub use settings::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
 };
-// #2047 Finding 5 — expose role-map resolver to the HTTP routes layer so the
-// `/api/discord/channels/{id}` proxy can deny lookups for channels that are
+// #2047 Finding 5 — expose the role-map resolver so HTTP channel lookups can deny channels that are
 // not registered with this AgentDesk instance.
 pub(crate) use settings::resolve_role_binding as resolve_channel_role_binding;
 
@@ -1454,15 +1456,10 @@ mod tmux_watcher_registry_restore_tests {
 
 /// Per-channel coordination for watcher-to-Discord relay emission.
 ///
-/// This state is **shared across watcher-handle replacements** (unlike
-/// `TmuxWatcherHandle`, which is recreated on watcher reattach). It keeps
-/// relay emission serialized if a stale outgoing watcher overlaps with its
-/// successor, and it exposes the confirmed-output watermark used by watcher
-/// stop checks.
-///
-/// Scope: intra-process only. Persisted dedupe across dcserver restarts is
-/// still handled by `InflightTurnState::last_watcher_relayed_offset` in the
-/// inflight JSON.
+/// Shared across watcher-handle replacements, this serializes overlapping
+/// outgoing/successor relay emission and exposes the confirmed-output watermark.
+/// Scope: intra-process only; restart-persistent dedupe remains in
+/// `InflightTurnState::last_watcher_relayed_offset`.
 pub(super) struct TmuxRelayCoord {
     /// Non-zero while some watcher instance is actively emitting a relay for
     /// this channel. Holds the `data_start_offset` of the in-progress emission.
@@ -1480,13 +1477,11 @@ pub(super) struct TmuxRelayCoord {
     /// (idle-JSONL relay, session-bound sink) CONSULT this watermark so a
     /// byte-range the watcher already committed is relayed exactly once
     /// regardless of which actor observes it first (the E-13 dedup invariant).
-    /// For a normal
-    /// Discord-origin turn (inflight present) the watcher remains the sole
-    /// relay owner and relay dedupe is still scoped to the watcher instance via
-    /// its local `last_relayed_offset` — a valid owner is never suppressed
-    /// solely because another watcher advanced this watermark; only the
-    /// no-inflight wake/idle paths gate on it.
+    /// For a normal Discord-origin turn (inflight present) the watcher remains
+    /// sole relay owner; only no-inflight wake/idle paths gate on this watermark.
     pub(super) confirmed_end_offset: Arc<std::sync::atomic::AtomicU64>,
+    pub(in crate::services::discord) reset_state:
+        std::sync::Mutex<relay_health::FrontierResetState>,
     /// Wall-clock timestamp (ms since epoch) of the most recent confirmed
     /// relay. 0 = no confirmed relay observed yet. Read by the
     /// `watcher-state` observability endpoint (#964). Monotonic is NOT
@@ -1528,6 +1523,7 @@ impl TmuxRelayCoord {
         Self {
             relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reset_state: std::sync::Mutex::new(relay_health::FrontierResetState::default()),
             last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_generation_mtime_ns: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -2508,6 +2504,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         restart: RestartLifecycle {
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            intake_worker_lifecycle: Default::default(),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_generation: 0,
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2761,14 +2758,14 @@ fn cleanup_retry_inflight_blocks_idle_kickoff(
     let Some(state) = inflight::load_inflight_state(provider, channel_id.get()) else {
         return false;
     };
-    if state.current_msg_id == 0 {
+    let Some(current_msg_id) = inflight::opt_message_id(state.current_msg_id) else {
         return false;
-    }
+    };
 
     shared
         .ui
         .placeholder_cleanup
-        .terminal_cleanup_retry_pending(provider, channel_id, MessageId::new(state.current_msg_id))
+        .terminal_cleanup_retry_pending(provider, channel_id, current_msg_id)
 }
 
 fn idle_queue_snapshot_has_pending_or_marker_backlog(

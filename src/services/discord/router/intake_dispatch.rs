@@ -108,6 +108,7 @@ pub(crate) async fn admit_text_intake(
         reply_to_user_message: request.reply_to_user_message,
         defer_watcher_resume: request.defer_watcher_resume,
         wait_for_completion: request.wait_for_completion,
+        preserve_on_cancel: submission.preserve_on_cancel,
         node_override_instance_id: node_override.as_deref(),
         has_nonportable_uploads: submission.has_nonportable_uploads
             || !submission.preloaded_uploads.is_empty(),
@@ -124,12 +125,12 @@ pub(crate) async fn admit_text_intake(
             );
             IntakeAdmission::Local(LocalAdmissionPermit(()))
         }
-        IntakeRouterDecision::ObservedWouldForward { target_instance_id } => {
+        IntakeRouterDecision::Observed { outcome } => {
             tracing::info!(
-                %target_instance_id,
+                ?outcome,
                 channel_id,
                 user_msg_id,
-                "[intake_dispatch] observe-only route admitted local"
+                "[intake_dispatch] owner-aware observe route admitted local"
             );
             IntakeAdmission::Local(LocalAdmissionPermit(()))
         }

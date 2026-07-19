@@ -125,6 +125,9 @@ jobs:
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
               - 'src/services/discord/outbound/source_registry.rs'
+              - 'src/services/queue.rs'
+              - 'src/services/session_forwarding.rs'
+              - 'src/server/routes/queue_api.rs'
               # #4460: recovery owns production-shaped PostgreSQL/outbox
               # tests; changes to the owner or its sidecars must run them.
               - 'src/services/discord/health/recovery.rs'
@@ -489,8 +492,10 @@ jobs:
           cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
-          env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
+          # Health must precede relay_recovery: fail-fast recipes otherwise hide
+          # health regressions whenever the earlier recovery filter also fails.
           python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
+          env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
           cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
 

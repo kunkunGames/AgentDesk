@@ -373,6 +373,14 @@
   `src/services/discord/router/message_handler.rs:1420`; MCP capability checks
   are local in `src/services/mcp_config.rs:34`; tmux watcher state is in-process
   at `src/services/discord/mod.rs:538`.
+- `intake_worker.features` advertises versioned request protocols. A preserving
+  request (`preserve_on_cancel=true`) requires `preserve_on_cancel_v1`; a
+  non-preserving request may still use a legacy provider-capable worker. The same
+  request-aware eligibility check applies to preferred-label selection, explicit
+  `/node` routing, and durable foreign session owners. A live foreign owner that
+  lacks the request protocol remains live but is fenced as incompatible rather
+  than being reclassified as stale. New workers continue decoding a legacy
+  producer's nullable preservation field as false.
 - Enablement condition: #876/#879 add worker heartbeats, capability rows, and a
   dispatcher path that rejects stale workers.
 
@@ -437,6 +445,52 @@
 
 ### Audited touches
 
+- #4568 explicit queue cancellation: `/cancel-queued` removes only the selected
+  queued item's primary Discord message ID through the existing per-channel
+  mailbox actor; `/queue` exposes those primary IDs for the same channel. This
+  is **worker-local** queue control: it changes neither the durable intake
+  schema nor the migration 0093 preserve-on-cancel rollout boundary. The
+  existing migration 0093 binary-floor contract above remains authoritative.
+- #4548 lane-1 owner-aware Observe parity — **Leader-only routing decision,
+  worker-local execution, existing PG-backed visibility (not the dormant
+  generation-fenced PG-lease authority)**: the gateway leader's
+  `src/services/cluster/intake_router_hook.rs` now sends `Observe` through the
+  same live `sessions` owner classification, `worker_nodes` capability/liveness,
+  open `intake_outbox` route, attachment portability, `/node` override, and
+  preferred-label plan used by `Enforce`. Observe returns a structured shadow
+  outcome and `src/services/discord/router/intake_dispatch.rs` still admits the
+  turn locally, so provider/tmux execution remains worker-local and no outbox or
+  owner row is written. The reads use existing shared PostgreSQL state, but this
+  slice does not activate `owner_record.rs`, acquire a PG advisory lease, stamp
+  an owner generation, or add a leader side effect beyond the already
+  leader-owned gateway admission decision.
+- #4527 standby restart contract: both gateway and confirmed-standby providers
+  register the same restart marker poller before starting their intake worker.
+  The marker closes a provider-local atomic admission gate, returns an owned
+  pre-accept claim to `pending` without retry/error pollution, and waits for any
+  accepted tick to finish execution and its terminal outbox transition before
+  exposing `restart_pending` or consuming that provider's shutdown-barrier slot.
+  Indeterminate gateway-lease failures start neither worker nor poller.
+- #4550/#4604 intake preservation rolling-deploy contract: worker heartbeats
+  advertise `preserve_on_cancel_v1`, and all three routing authorities
+  (durable foreign session owner, explicit `/node`, and preferred labels) use the
+  same request-aware capability check. Human-authored terminal-shaped text is
+  preserved before stale-dispatch suppression; known automation and unavailable
+  utility-bot identity lookups retain the fail-safe stale drop.
+- Migration 0093 is an irreversible binary-floor boundary because binaries that
+  embed only migrations 0092 or earlier fail SQLx startup validation after 0093
+  exists in the database. Pre-stage and upgrade the entire fleet before applying
+  migration 0093. After migration 0093, binaries embedding only migrations 0092
+  or earlier must not restart or roll back. Rollback requires either a
+  forward-fix, or operators must Restore a pre-0093 database backup and roll back
+  the entire fleet together. The migration-specific CI gate is activated only
+  when the migration 0093 SQL file is in the changed-file set, so unrelated PRs
+  and the pre-0093 main branch are not gated by this boundary.
+- #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
+  Discord gateway/runtime**. Queue acceptance and retry requeue states are
+  rendered only by the existing persisted `turn_view_reconciler` identity;
+  removing queue-status cards introduces no worker, lease, durable queue, or
+  cross-node side effect.
 - #4263 (daily log-digest routine): adds a **LEADER-ONLY/SINGLETON** scheduled
   monitoring routine. `server::worker_registry` already runs
   `routine_runtime_loop` through `register_leader_tokio`, and the existing
@@ -702,6 +756,15 @@
   `/node`, worker spawn gate, and `/api/health.intake_routing` read the same
   effective authority. Classification: PG-lease-backed worker-local execution;
   no new gateway owner, no extra leader election surface.
+
+- #4611 owner-targeted cancel forwarding: REST cancel and Discord `/stop` resolve
+  the canonical active `sessions.instance_id` owner and fail closed instead of
+  mutating leader-local state when ownership is remote or changes during cancel.
+  Rolling upgrade order is workers first, then leaders: a routable owner must
+  advertise `capabilities.agentdesk_api.cancel_forwarding_v1=true`; leaders do
+  not forward cancel to older workers that lack the capability. Keep old and new
+  nodes registered during rollout only after every potential owner advertises
+  the fence. No durable cancel outbox or new lease is introduced.
 
 - #4350 session-owner intake affinity: leader-only routing resolves the existing
   PG `sessions.instance_id` owner before `/node` or preferred labels, and every
@@ -1442,3 +1505,47 @@
   write. Per-turn prompt assembly joins the shared boundary while reading
   `session_transcripts`, so restart or worker reassignment cannot cross a clear.
   This adds no leader lease, singleton, or routing decision.
+- #4551 fresh routine context severance and verified start evidence — **Existing
+  leader-owned routine state, worker-local provider launch**: the routine
+  executor records turn-matched start evidence in the shared `routine_runs` row,
+  and terminal close serializes on that same row so neither interleaving loses
+  the verified flag. Fresh provider continuity is cleared only after the shared
+  transcript boundary succeeds. No new worker, queue, lease, singleton, routing
+  decision, or node-local authority is introduced.
+- #4538 PR-A durable intake placement-owner (dormant schema + owner-CAS
+  primitives) — **PG-lease-backed shared authority, dormant**: migration 0094
+  adds `intake_session_owners` (history-row registry keyed on
+  `(provider, raw_channel_id)` with a monotonic generation, one `active` row per
+  identity via `iso_unique_active`) plus `intake_outbox` owner-stamp columns
+  (`owner_generation`, `owner_instance_id`, `admission_kind`, `idempotency_key`
+  with its sparse unique index). The
+  `src/services/cluster/intake_router_hook/owner_record.rs` acquire / transfer
+  (3-way CAS) / adopt / fenced claim / stale-sweep / SAVEPOINT-admission helpers
+  serialize per channel on a deterministic `pg_advisory_xact_lock` key and fence
+  every authoritative write on `(owner_instance_id, generation)`. This is a
+  **generation-fenced PG-lease** authority in the taxonomy above
+  (`pg_lease_backed_claim`), not leader-only or worker-local. PR-A ships it
+  DORMANT: no production caller resolves ownership or routes intake through it
+  (reader flip + admission wiring are PR-C / #4548), and the schema-activation
+  CHECK (`intake_outbox_open_requires_owner`) and open-route unique re-alignment
+  are deferred to PR-C. Migration 0094 is an irreversible binary-floor boundary:
+  binaries embedding only migrations 0093 or earlier fail SQLx startup
+  validation once 0094 exists, so pre-stage and upgrade the whole fleet before
+  applying it, and do not restart/roll back a pre-0094 binary afterward. Its
+  migration-specific CI gate activates only when the 0094 SQL file is in the
+  changed-file set.
+
+- #4527 (safe-restart standby drain + standby health visibility): `runtime_bootstrap.rs`
+  now registers a **confirmed-standby** node's provider `SharedData` into the
+  `HealthRegistry` even when the gateway runtime never starts (lease held
+  elsewhere), and `runtime_bootstrap/gateway_lease.rs` splits the lease outcome
+  into `Proceed` / `Standby` (confirmed `Ok(None)`) / `Failed`. This is
+  **worker-local** health visibility (not leader-only or PG-lease): it exposes
+  the standby intake worker's own `global_active` / provider `active_turns` /
+  mailbox / relay state — previously only populated inside the gateway runtime —
+  so the safe-restart wrapper cannot mistake a live standby turn for an idle
+  node. A new provider-health `runtime_state_complete=true` flag lets the wrapper
+  reject legacy/partial health as idle evidence. Lease-acquire *errors* are
+  classified `Failed` (never `Standby`), so a restart never skips leader
+  drain-ack on an ambiguous lease result: every incomplete/failed/missing signal
+  falls back to the existing drain path (fail-closed).
