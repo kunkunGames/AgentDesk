@@ -1,4 +1,5 @@
 use crate::services::platform::BinaryResolution;
+use crate::services::provider::cancel_token_cleanup::target::CapturedProcess;
 use crate::services::provider_auth::ProviderAuthSpec;
 use crate::utils::format::safe_prefix;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
@@ -6,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 pub(crate) mod cancel_token_claude_interrupt;
+pub(crate) mod cancel_token_cleanup;
 
 /// Tmux session name prefix — always "AgentDesk".
 pub const TMUX_SESSION_PREFIX: &str = "AgentDesk";
@@ -974,14 +976,14 @@ impl CancelSource {
 /// Cooperative cancellation token shared by provider runtimes and Discord orchestration.
 pub struct CancelToken {
     pub cancelled: AtomicBool,
-    pub child_pid: Mutex<Option<u32>>,
+    child_pid: Mutex<Option<CapturedProcess>>,
     cancel_source: Mutex<Option<String>>,
     cancel_source_kind: Mutex<Option<CancelSource>>,
     /// SSH cancel flag — set to true to signal remote execution to close the channel
     #[allow(dead_code)]
     pub ssh_cancel: Mutex<Option<std::sync::Arc<AtomicBool>>>,
-    /// tmux session name for cleanup on cancel
-    pub tmux_session: Mutex<Option<String>>,
+    /// Tmux binding for cleanup on cancel.
+    pub(crate) tmux_binding: Mutex<Option<cancel_token_cleanup::authority::TmuxBinding>>,
     /// Watchdog deadline as Unix timestamp in milliseconds.
     /// The watchdog fires when `now_ms >= deadline_ms`. Extend by setting a future value.
     /// Operator extensions may move this and the max cap together within configured limits.
@@ -1024,7 +1026,7 @@ impl CancelToken {
             cancel_source: Mutex::new(None),
             cancel_source_kind: Mutex::new(None),
             ssh_cancel: Mutex::new(None),
-            tmux_session: Mutex::new(None),
+            tmux_binding: Mutex::new(None),
             watchdog_deadline_ms: AtomicI64::new(0),
             watchdog_max_deadline_ms: AtomicI64::new(0),
             async_managed: AtomicBool::new(false),
@@ -1066,14 +1068,50 @@ impl CancelToken {
         self.completion_cleanup.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn store_child_pid(&self, pid: u32) {
+        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(CapturedProcess::capture(pid));
+    }
+
+    pub(crate) fn child_pid_value(&self) -> Option<u32> {
+        self.child_pid
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|process| process.pid))
+    }
+
+    pub(crate) fn take_child_pid_value(&self) -> Option<u32> {
+        let mut guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take().map(|process| process.pid)
+    }
+
+    // Consumed in #4593 S3 (identity-gated kill).
+    #[allow(dead_code)]
+    pub(crate) fn captured_child_process(&self) -> Option<CapturedProcess> {
+        self.child_pid.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    pub(crate) fn clear_child_pid(&self) {
+        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub(crate) fn store_child_pid_if_empty(&self, pid: u32) {
+        let captured = CapturedProcess::capture(pid);
+        let mut child_pid = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        if child_pid.is_none() {
+            *child_pid = Some(captured);
+        }
+    }
+
     /// Cancel and clean up any associated tmux session.
     pub fn cancel_with_tmux_cleanup(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(name) = self
-            .tmux_session
+            .tmux_binding
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+            .map(|binding| binding.name().to_string())
         {
             #[cfg(unix)]
             {
@@ -1194,7 +1232,7 @@ fn enforce_watchdog_deadline(token: &CancelToken, now_ms: i64) -> bool {
 
 pub fn register_child_pid(token: Option<&CancelToken>, child_pid: u32) {
     if let Some(token) = token {
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(child_pid);
+        token.store_child_pid(child_pid);
     }
 }
 
@@ -2146,8 +2184,9 @@ mod cancel_token_tests {
         assert_eq!(token.cancel_source(), None);
 
         register_child_pid(Some(&token), 4242);
+        assert_eq!(token.child_pid_value(), Some(4242));
         assert_eq!(
-            *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()),
+            token.captured_child_process().map(|process| process.pid),
             Some(4242)
         );
 

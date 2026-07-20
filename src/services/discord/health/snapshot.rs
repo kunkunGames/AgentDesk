@@ -1,6 +1,7 @@
 use poise::serenity_prelude::ChannelId;
 use serde::Serialize;
 
+use super::liveness_authority::CaptureCoordinateObservation;
 use super::mailbox::MailboxHealthSnapshot;
 use super::provider_probe::{self, ProviderHealthSnapshot};
 use super::redaction;
@@ -46,6 +47,8 @@ pub struct WatcherStateSnapshot {
     /// Current tmux output JSONL length when an inflight `output_path` is known.
     /// `null` means the endpoint could not identify a capture file.
     pub last_capture_offset: Option<u64>,
+    #[serde(skip)]
+    pub(in crate::services::discord) capture_coordinate: CaptureCoordinateObservation,
     /// Bytes present in the capture file but not yet confirmed as relayed.
     /// `null` when `last_capture_offset` is unknown.
     pub unread_bytes: Option<u64>,
@@ -544,13 +547,10 @@ async fn watcher_state_snapshot_for_shared(
     let has_pending_queue = !mailbox_snapshot.intervention_queue.is_empty();
     let mailbox_engaged =
         mailbox_has_cancel_token || mailbox_active_user_msg_id.is_some() || has_pending_queue;
-    let mailbox_cancel_tmux_session = mailbox_snapshot.cancel_token.as_ref().and_then(|token| {
-        token
-            .tmux_session
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-    });
+    let mailbox_cancel_tmux_session = mailbox_snapshot
+        .cancel_token
+        .as_ref()
+        .and_then(|token| token.tmux_session_name());
     // Use one authority for both the probe target and the published identity.
     // The cancel token is the earliest turn-owned tmux proof and can exist
     // before inflight/watcher enrichment. Keeping only the probe fallback would
@@ -645,6 +645,7 @@ async fn watcher_state_snapshot_for_shared(
         inflight_state_present: session.inflight_state_present,
         last_relay_ts_ms: session.last_relay_ts_ms,
         last_capture_offset: session.last_capture_offset,
+        capture_coordinate: session.capture_coordinate.clone(),
         unread_bytes: session.unread_bytes,
         desynced,
         reconnect_count: session.reconnect_count,

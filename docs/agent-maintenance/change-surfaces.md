@@ -1138,10 +1138,9 @@
     normal long SILENT tool run (e.g. a big build) is never mistaken for an idle
     hang, with the 4h hard ceiling as the real backstop, and noted the limitation
     in the idle-kill error message + a delayed-event test).
-  - `src/services/tui_prompt_dedupe.rs` (2134 lines; +29 from #4567: classify start-anchored structured task notifications as status-only observations before generic external-input ownership, preserving task-card/status delivery while leaving the next human prompt immediately admissible; -41 from #4591 R4: remove
-    raw/envelope time-pair state so local slash-control representations may
-    duplicate rather than swallowing a later human command; local stable entry
-    IDs are now recorded only after the relay confirms its Discord session note,
+  - `src/services/tui_prompt_dedupe.rs` (2141 lines; +7 from #4693: seal a local-only raw/envelope half collapsed by the Discord marker gate so its stable entry ID remains replay-immune after a watermark reset; +29 from #4567: classify start-anchored structured task notifications as status-only observations before generic external-input ownership, preserving task-card/status delivery while leaving the next human prompt immediately admissible; -41 from #4591 R4: remove
+    observation-layer raw/envelope pairing while leaving local execution independent of Discord rendering; local stable entry
+    IDs are recorded after note delivery or when a duplicate marker half is sealed,
     while generic direct-input identity replay behavior remains eager; +4 from #4295: retain the
     stable provider source-event id on observed TUI prompts so terminal-card
     delivery can reject an exact post-compaction replay durably; +117 from #4423: adopt Claude's
@@ -1273,7 +1272,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2566 lines; +37 from #4535 restricting the provider-known hard-stop finish — both the primary path and the global-handle fallback — to only the mailbox-owning sibling runtime (with a WARN when an observed-but-unresolved actor is declined) (ownership resolved via `local_mailbox_ownership`) so a non-owning/unresolved-ownership hard-stop no longer finishes another runtime's mailbox; +1 from #4465 mapping an exact-episode rebind CAS miss to HTTP 409; #4460 follow-up extracted non-destructive branch-4 paging into `health/recovery/stall_alert.rs` (174 prod lines): alerts use canonical `channel:<id>` plus the real provider session identity so Claude/Codex DMs select their provider bot while public channels keep `notify`, owner 0 and the TUI synthetic owner 1 never render mentions, and the production liveness decision suppresses pre-backstop producer-live pages while genuine stalls still page; the parent branch never cleans/cancels/deletes turn authority. The original #4460 change removed the branch-4 "desynced force-clean" execution and dropped `preserve_resume_selector_on_force_clean` plus the test-only force-clean hook seam; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
+  - `src/services/discord/health/recovery.rs` (2567 lines; +4 from #4615 S1 routing the stall-watchdog capture-liveness decision through the process-local `ProducerLivenessVerdict` authority (`liveness_authority::observe_and_publish_from_tick` / `observe_capture_coordinate`) in place of the removed `stall_liveness::stall_watchdog_capture_offset_advancing` wrapper; +37 from #4535 restricting the provider-known hard-stop finish — both the primary path and the global-handle fallback — to only the mailbox-owning sibling runtime (with a WARN when an observed-but-unresolved actor is declined) (ownership resolved via `local_mailbox_ownership`) so a non-owning/unresolved-ownership hard-stop no longer finishes another runtime's mailbox; +1 from #4465 mapping an exact-episode rebind CAS miss to HTTP 409; #4460 follow-up extracted non-destructive branch-4 paging into `health/recovery/stall_alert.rs` (174 prod lines): alerts use canonical `channel:<id>` plus the real provider session identity so Claude/Codex DMs select their provider bot while public channels keep `notify`, owner 0 and the TUI synthetic owner 1 never render mentions, and the production liveness decision suppresses pre-backstop producer-live pages while genuine stalls still page; the parent branch never cleans/cancels/deletes turn authority. The original #4460 change removed the branch-4 "desynced force-clean" execution and dropped `preserve_resume_selector_on_force_clean` plus the test-only force-clean hook seam; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
     round 4 requiring strict provider-less stale-mailbox repair to verify a
     peeked local mailbox has an active token or queue before treating it as
     ownership evidence; +45 from #4048 round 3 scoping provider-less
@@ -1679,7 +1678,7 @@
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
   smaller route-delegation slices.
-  `src/services/auto_queue/activate_command.rs` (1506 lines, post-#1444
+  `src/services/auto_queue/activate_command.rs` (1510 lines, post-#1444
   idempotency-guard expansion + #3038 phase-helper decomposition) is the
   canonical activate/dispatch-next command surface; it is intentionally above
   the giant-file threshold and tracked here. The `activate_with_deps_pg`
@@ -1694,7 +1693,7 @@
 - legacy_modules: none; retired route fallback history is documented in
   `known-legacy.md`.
 - do_not_edit_without_migration_plan (giant-file routes):
-  - `src/server/routes/kanban.rs` (2725 lines after #3037 backflow batch
+  - `src/server/routes/kanban.rs` (2426 lines after #3037 backflow batch
     relocated the `require_explicit_bearer_token` /
     `resolve_requesting_agent_id_with_pg` auth/identity helpers to
     `crate::services::kanban`; +50 from #4038 slice-1 log-only caller
@@ -1705,8 +1704,8 @@
     ordered endpoint inventory parts under
     `src/server/routes/docs/inventory/endpoints/`; keep new API-docs data in
     those child modules and preserve `scripts/check_api_docs_coverage.py`.
-  - `src/server/routes/escalation.rs` (1379 lines; +3 from #4486 UtilityBotRole alias typing, mechanical/non-behavioral).
-  - `src/server/routes/meetings.rs` (1290 lines; SQL extracted to `src/db/meetings.rs` in #3570 slice 1; +24 from #3742 explicit shared GitHub-only issue creation outcomes).
+  - `src/server/routes/escalation.rs` (1359 lines; +3 from #4486 UtilityBotRole alias typing, mechanical/non-behavioral).
+  - `src/server/routes/meetings.rs` (1245 lines; SQL extracted to `src/db/meetings.rs` in #3570 slice 1; +24 from #3742 explicit shared GitHub-only issue creation outcomes).
   - `src/server/routes/review_verdict/decision_route.rs` was decomposed in
     #3038 slice 1 and S1-relocated into a 26-line route shim delegating to
     `src/services/review_decision.rs` plus sub-1000-line service modules under
@@ -1857,12 +1856,12 @@ Line counts are *production* LoC (the `Prod` column in `module-inventory.md`,
 which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync.
 
 - `src/services/auto_queue.rs` (1545) and
-  `src/services/auto_queue/activate_command.rs` (1506); auto-queue route
+  `src/services/auto_queue/activate_command.rs` (1510); auto-queue route
   behavior is split across `src/services/auto_queue/*` slices, with
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1031) is also giant-file territory;
   split before further non-bugfix growth.
-- `src/services/onboarding/mod.rs` (2937),
+- `src/services/onboarding/mod.rs` (2881),
   `src/services/dispatched_sessions.rs` (1650; #4091 r2 adds the two-sample
   growth-evidence selector cross-check wiring, claude_tui transcript-mtime
   runtime-activity anchors, and the flip-back window guard), and
@@ -1873,7 +1872,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   support extracted from the route layer; split before adding non-bugfix
   behavior.
 - `src/services/claude.rs` (2969; +9 net from #4553 replacing dead native cache-TTL launch wiring with guarded gateway-proxy launch decisions and covering the simple-command spawn; -21 from #4113 backend_routing/availability extraction), `src/services/gemini.rs` (1358),
-  `src/services/qwen.rs` (2198), `src/services/codex.rs` (3131),
+  `src/services/qwen.rs` (2192), `src/services/codex.rs` (3119),
   `src/services/opencode.rs` (2760), `src/services/provider.rs` (1818; +4 from #4566 publishing the session-generation registry binding as a monotonic max() guard with the token-local tmux-session name kept for SIGINT/pid tracking) —
   provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
   twins from the claude/codex/gemini adapters and a superseded

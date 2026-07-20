@@ -118,12 +118,8 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
     token: &Arc<CancelToken>,
     reason: &str,
 ) -> ProviderTurnInterruptOutcome {
-    let tmux_session = token
-        .tmux_session
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone());
-    let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    let tmux_session = token.tmux_session_name();
+    let tracked_child_pid = token.child_pid_value();
     if tmux_session.is_none() {
         return interrupt_process_backend_turn(provider, tracked_child_pid, reason);
     }
@@ -436,12 +432,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
 }
 
 pub(in crate::services::discord) fn cancel_token_has_tmux_session(token: &CancelToken) -> bool {
-    token
-        .tmux_session
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .is_some()
+    token.tmux_session_name().is_some()
 }
 
 pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
@@ -452,27 +443,14 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
 ) -> Option<u32> {
     if matches!(provider, ProviderKind::Claude) {
         token.bind_claude_tmux_session(tmux_session_name);
-    } else if let Ok(mut guard) = token.tmux_session.lock() {
-        if guard.as_deref() != Some(tmux_session_name) {
-            *guard = Some(tmux_session_name.to_string());
-        }
     } else {
-        tracing::error!(
-            "cancel token tmux rebind failed: provider={} session={} reason={} error=tmux_session_lock_poisoned",
-            provider.as_str(),
-            tmux_session_name,
-            reason
-        );
+        token.bind_unmanaged_session_name(tmux_session_name);
     }
 
-    let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    let tracked_child_pid = token.child_pid_value();
     let provider_pid = provider_cli_pid_in_tmux(tmux_session_name, provider, tracked_child_pid);
     if let Some(pid) = provider_pid {
-        if let Ok(mut guard) = token.child_pid.lock()
-            && guard.is_none()
-        {
-            *guard = Some(pid);
-        }
+        token.store_child_pid_if_empty(pid);
         tracing::info!(
             "cancel token tmux runtime rebound: provider={} session={} pid={} reason={}",
             provider.as_str(),
@@ -538,13 +516,10 @@ async fn hard_stop_unresponsive_provider_cli_turn(
         return;
     }
 
-    let tmux_session_name = interrupt_outcome.tmux_session.clone().or_else(|| {
-        token
-            .tmux_session
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-    });
+    let tmux_session_name = interrupt_outcome
+        .tmux_session
+        .clone()
+        .or_else(|| token.tmux_session_name());
     let Some(tmux_session_name) = tmux_session_name else {
         hard_stop_unresponsive_process_backend_turn(provider, token, interrupt_outcome, reason)
             .await;
@@ -573,7 +548,7 @@ async fn hard_stop_unresponsive_provider_cli_turn(
             None
         };
 
-    let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    let tracked_child_pid = token.child_pid_value();
     let provider_for_probe = provider.clone();
     let session_for_probe = tmux_session_name.clone();
     let probe = tokio::task::spawn_blocking(move || {
@@ -717,13 +692,8 @@ pub(in crate::services::discord) fn cancel_active_token(
     token.set_restart_mode(cleanup_policy.preserves_inflight());
     let mut termination_recorded = false;
 
-    let child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
-    let has_tmux_session = token
-        .tmux_session
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .is_some();
+    let child_pid = token.child_pid_value();
+    let has_tmux_session = token.tmux_session_name().is_some();
     if !has_tmux_session
         && cleanup_policy.should_cleanup_tmux()
         && let Some(pid) = child_pid
@@ -751,12 +721,7 @@ pub(in crate::services::discord) fn cancel_active_token(
     } = cleanup_policy
     {
         if child_pid.is_some() {
-            if let Some(name) = token
-                .tmux_session
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-            {
+            if let Some(name) = token.tmux_session_name() {
                 #[cfg(unix)]
                 {
                     // #145: skip kill for unified-thread sessions with active runs
@@ -792,12 +757,7 @@ pub(in crate::services::discord) fn cancel_active_token(
             }
         } else {
             #[cfg(unix)]
-            if let Some(name) = token
-                .tmux_session
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-            {
+            if let Some(name) = token.tmux_session_name() {
                 record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
             }
             token.cancel_with_tmux_cleanup();
@@ -956,7 +916,7 @@ mod tests {
             crate::services::session_backend::SessionHandle::TestProcess { pid: 4112, alive },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(4112);
+        token.store_child_pid(4112);
 
         let outcome =
             interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
@@ -989,7 +949,7 @@ mod tests {
             },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(43169);
+        token.store_child_pid(43169);
 
         let outcome = interrupt_provider_cli_turn(
             &ProviderKind::Claude,
@@ -1022,7 +982,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let _ = process_table::take_sigint_test_events();
         let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(499_112);
+        token.store_child_pid(499_112);
 
         let outcome =
             interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
@@ -1044,7 +1004,7 @@ mod tests {
             },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(44_112);
+        token.store_child_pid(44_112);
 
         let termination_recorded =
             cancel_active_token(&token, TmuxCleanupPolicy::PreserveSession, "auto_heal");
@@ -1110,7 +1070,7 @@ mod tests {
             },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(wrapper_pid);
+        token.store_child_pid(wrapper_pid);
 
         let termination_recorded = stop_active_turn(
             &ProviderKind::Claude,

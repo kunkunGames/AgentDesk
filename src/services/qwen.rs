@@ -450,9 +450,7 @@ fn execute_qwen_streaming_attempt(
         .spawn()
         .map_err(|e| format!("Failed to start Qwen: {}", e))?;
 
-    if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.id());
-    }
+    register_child_pid(cancel_token.as_deref(), child.id());
 
     let stdout = child
         .stdout
@@ -1397,8 +1395,7 @@ fn execute_streaming_local_tmux(
     }
 
     if let Some(ref token) = cancel_token {
-        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(tmux_session_name.to_string());
+        token.bind_unmanaged_session_name(tmux_session_name);
     }
 
     let read_result = match qwen_read_output_file_until_result(
@@ -1494,8 +1491,7 @@ fn send_followup_to_tmux(
     );
 
     if let Some(ref token) = cancel_token {
-        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(tmux_session_name.to_string());
+        token.bind_unmanaged_session_name(tmux_session_name);
     }
 
     let read_result = match qwen_read_output_file_until_result_tracked(
@@ -1729,9 +1725,7 @@ fn execute_streaming_local_process(
     let backend = ProcessBackend::new();
     let handle = backend.create_session(&config)?;
 
-    if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.pid());
-    }
+    register_child_pid(cancel_token.as_deref(), handle.pid());
 
     insert_process_session(session_name.to_string(), handle);
 
