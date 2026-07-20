@@ -517,7 +517,7 @@ var autoQueue = {
       []
     );
     for (var fr = 0; fr < finishedRuns.length; fr++) {
-      finalizeRunWithoutPhaseGate(finishedRuns[fr].id);
+      finalizeRunWithoutPhaseGate(finishedRuns[fr].id, true);
     }
 
     // Find active runs with pending entries.

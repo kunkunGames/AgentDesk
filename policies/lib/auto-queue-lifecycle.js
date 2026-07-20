@@ -61,29 +61,31 @@ function runHasUserCancelledEntry(runId) {
   return (rows.length > 0) && rows[0].cnt > 0;
 }
 
-function finalizeRunWithoutPhaseGate(runId) {
+function finalizeRunWithoutPhaseGate(runId, skipChecks) {
   if (!runId) return false;
 
-  if (runHasBlockingPhaseGate(runId)) return false;
-  if (remainingRunnableEntryCount(runId) > 0) return false;
-  // #815 P1: `user_cancelled` entries are operator-held terminal state.
-  // They are intentionally non-runnable, but they must still block the
-  // tick-side backstop from auto-completing the run; otherwise the next
-  // minute tick would strand a user-stopped run in `completed`.
-  if (runHasUserCancelledEntry(runId)) {
-    autoQueueLog("info", "Deferring finalize for run " + runId + " — user_cancelled entry still present", {
-      run_id: runId
-    });
-    return false;
-  }
-  // Phase-gate race guard: the main engine's `onCardTerminal` may still be
-  // in the middle of creating gate dispatches. Respect the grace window so
-  // we never mark a run completed before phase gates get registered.
-  if (runWithinPhaseGateGrace(runId)) {
-    autoQueueLog("info", "Deferring finalize for run " + runId + " — phase-gate grace window active", {
-      run_id: runId
-    });
-    return false;
+  if (!skipChecks) {
+    if (runHasBlockingPhaseGate(runId)) return false;
+    if (remainingRunnableEntryCount(runId) > 0) return false;
+    // #815 P1: `user_cancelled` entries are operator-held terminal state.
+    // They are intentionally non-runnable, but they must still block the
+    // tick-side backstop from auto-completing the run; otherwise the next
+    // minute tick would strand a user-stopped run in `completed`.
+    if (runHasUserCancelledEntry(runId)) {
+      autoQueueLog("info", "Deferring finalize for run " + runId + " — user_cancelled entry still present", {
+        run_id: runId
+      });
+      return false;
+    }
+    // Phase-gate race guard: the main engine's `onCardTerminal` may still be
+    // in the middle of creating gate dispatches. Respect the grace window so
+    // we never mark a run completed before phase gates get registered.
+    if (runWithinPhaseGateGrace(runId)) {
+      autoQueueLog("info", "Deferring finalize for run " + runId + " — phase-gate grace window active", {
+        run_id: runId
+      });
+      return false;
+    }
   }
 
   var completed = false;
