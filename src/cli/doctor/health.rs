@@ -204,7 +204,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres/SQLite availability and server logs".to_string(),
+            next_step: "check Postgres availability and server logs".to_string(),
         },
         _ => ClassifiedReason {
             raw: raw.to_string(),
