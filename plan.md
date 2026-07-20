@@ -1,3 +1,0 @@
-1. Set up an empty commit for the no-change report since the requested change (`target = spec.target` added to worker lifecycle logs) is already implemented in `main`. There are also multiple overlapping PRs open that already contain or report on this (e.g., `jules/worker-registry/add-target-tracing-17740885490826085348`).
-2. Run pre-commit instructions to ensure we pass checks.
-3. Submit the empty PR with the required `WorkerRegistry` title, `jules/worker-registry/no-change-overlap-report-...` branch name, and a PR body explicitly noting the duplicate/overlap check and listing overlapping PRs/branches.
