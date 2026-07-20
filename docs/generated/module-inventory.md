@@ -61,7 +61,7 @@
 | `cli::client::runtime_config` | `src/cli/client/runtime_config.rs` | 55 | 23 | 32 |  |
 | `cli::dcserver` | `src/cli/dcserver.rs` | 1650 | 1650 | 0 | giant-file |
 | `cli::dcserver_pg_bootstrap` | `src/cli/dcserver_pg_bootstrap.rs` | 1068 | 544 | 524 |  |
-| `cli::direct` | `src/cli/direct.rs` | 1803 | 1803 | 0 | giant-file |
+| `cli::direct` | `src/cli/direct.rs` | 1818 | 1818 | 0 | giant-file |
 | `cli::discord` | `src/cli/discord.rs` | 472 | 249 | 223 |  |
 | `cli::discord_thread_create` | `src/cli/discord_thread_create.rs` | 1468 | 415 | 1053 |  |
 | `cli::discord_thread_create_lock` | `src/cli/discord_thread_create_lock.rs` | 669 | 611 | 58 |  |
@@ -157,11 +157,11 @@
 | `dispatch::types` | `src/dispatch/types.rs` | 32 | 32 | 0 |  |
 | `engine` | `src/engine/mod.rs` | 1354 | 1278 | 76 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 | 84 | 0 |  |
-| `engine::intent` | `src/engine/intent.rs` | 525 | 504 | 21 |  |
+| `engine::intent` | `src/engine/intent.rs` | 529 | 508 | 21 |  |
 | `engine::loader` | `src/engine/loader.rs` | 2013 | 1332 | 681 | giant-file |
 | `engine::ops` | `src/engine/ops.rs` | 97 | 97 | 0 |  |
 | `engine::ops::agent_ops` | `src/engine/ops/agent_ops.rs` | 246 | 246 | 0 |  |
-| `engine::ops::auto_queue_ops` | `src/engine/ops/auto_queue_ops.rs` | 662 | 662 | 0 |  |
+| `engine::ops::auto_queue_ops` | `src/engine/ops/auto_queue_ops.rs` | 664 | 664 | 0 |  |
 | `engine::ops::cards_ops` | `src/engine/ops/cards_ops.rs` | 448 | 448 | 0 |  |
 | `engine::ops::ci_recovery_ops` | `src/engine/ops/ci_recovery_ops.rs` | 347 | 347 | 0 |  |
 | `engine::ops::config_ops` | `src/engine/ops/config_ops.rs` | 473 | 108 | 365 |  |
@@ -238,7 +238,7 @@
 | `server::routes::agents_setup` | `src/server/routes/agents_setup.rs` | 1365 | 1365 | 0 | giant-file |
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 554 | 554 | 0 |  |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 281 | 178 | 103 |  |
-| `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 195 | 195 | 0 |  |
+| `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 203 | 203 | 0 |  |
 | `server::routes::automation_candidates` | `src/server/routes/automation_candidates.rs` | 320 | 320 | 0 |  |
 | `server::routes::claude_accounts_api` | `src/server/routes/claude_accounts_api.rs` | 182 | 182 | 0 |  |
 | `server::routes::cluster` | `src/server/routes/cluster.rs` | 379 | 379 | 0 |  |
@@ -351,25 +351,25 @@
 | `services::api_friction::patterns` | `src/services/api_friction/patterns.rs` | 154 | 154 | 0 |  |
 | `services::api_friction::storage` | `src/services/api_friction/storage.rs` | 278 | 278 | 0 |  |
 | `services::auto_queue` | `src/services/auto_queue.rs` | 1928 | 1545 | 383 | giant-file |
-| `services::auto_queue::activate_command` | `src/services/auto_queue/activate_command.rs` | 2238 | 1506 | 732 | giant-file |
+| `services::auto_queue::activate_command` | `src/services/auto_queue/activate_command.rs` | 2258 | 1510 | 748 | giant-file |
 | `services::auto_queue::activate_preflight` | `src/services/auto_queue/activate_preflight.rs` | 199 | 199 | 0 |  |
 | `services::auto_queue::activate_route` | `src/services/auto_queue/activate_route.rs` | 19 | 19 | 0 |  |
 | `services::auto_queue::cancel_run` | `src/services/auto_queue/cancel_run.rs` | 1031 | 1031 | 0 | giant-file |
 | `services::auto_queue::command` | `src/services/auto_queue/command.rs` | 426 | 426 | 0 |  |
-| `services::auto_queue::control_routes` | `src/services/auto_queue/control_routes.rs` | 906 | 854 | 52 |  |
+| `services::auto_queue::control_routes` | `src/services/auto_queue/control_routes.rs` | 924 | 872 | 52 |  |
 | `services::auto_queue::dispatch_assignment_command` | `src/services/auto_queue/dispatch_assignment_command.rs` | 101 | 101 | 0 |  |
 | `services::auto_queue::dispatch_command` | `src/services/auto_queue/dispatch_command.rs` | 906 | 906 | 0 |  |
 | `services::auto_queue::dispatch_query` | `src/services/auto_queue/dispatch_query.rs` | 93 | 93 | 0 |  |
-| `services::auto_queue::fsm` | `src/services/auto_queue/fsm.rs` | 713 | 693 | 20 |  |
+| `services::auto_queue::fsm` | `src/services/auto_queue/fsm.rs` | 712 | 692 | 20 |  |
 | `services::auto_queue::order_routes` | `src/services/auto_queue/order_routes.rs` | 295 | 295 | 0 |  |
 | `services::auto_queue::phase_gate` | `src/services/auto_queue/phase_gate.rs` | 607 | 573 | 34 |  |
 | `services::auto_queue::phase_gate_catalog` | `src/services/auto_queue/phase_gate_catalog.rs` | 104 | 68 | 36 |  |
-| `services::auto_queue::phase_gate_violations` | `src/services/auto_queue/phase_gate_violations.rs` | 262 | 209 | 53 |  |
+| `services::auto_queue::phase_gate_violations` | `src/services/auto_queue/phase_gate_violations.rs` | 264 | 211 | 53 |  |
 | `services::auto_queue::planning` | `src/services/auto_queue/planning.rs` | 482 | 281 | 201 |  |
 | `services::auto_queue::query` | `src/services/auto_queue/query.rs` | 270 | 250 | 20 |  |
-| `services::auto_queue::route` | `src/services/auto_queue/route.rs` | 96 | 96 | 0 |  |
-| `services::auto_queue::route_generate` | `src/services/auto_queue/route_generate.rs` | 734 | 734 | 0 |  |
-| `services::auto_queue::route_request_generate` | `src/services/auto_queue/route_request_generate.rs` | 369 | 275 | 94 |  |
+| `services::auto_queue::route` | `src/services/auto_queue/route.rs` | 110 | 110 | 0 |  |
+| `services::auto_queue::route_generate` | `src/services/auto_queue/route_generate.rs` | 720 | 720 | 0 |  |
+| `services::auto_queue::route_request_generate` | `src/services/auto_queue/route_request_generate.rs` | 372 | 278 | 94 |  |
 | `services::auto_queue::route_types` | `src/services/auto_queue/route_types.rs` | 152 | 152 | 0 |  |
 | `services::auto_queue::runtime` | `src/services/auto_queue/runtime.rs` | 389 | 389 | 0 |  |
 | `services::auto_queue::slot_routes` | `src/services/auto_queue/slot_routes.rs` | 322 | 322 | 0 |  |

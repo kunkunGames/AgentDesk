@@ -45,7 +45,7 @@
 | --- | ---: |
 | `src/cli/client.rs` | 2464 |
 | `src/cli/dcserver.rs` | 1650 |
-| `src/cli/direct.rs` | 1803 |
+| `src/cli/direct.rs` | 1818 |
 | `src/cli/doctor/orchestrator.rs` | 4381 |
 | `src/cli/init.rs` | 1444 |
 | `src/cli/migrate/apply.rs` | 3237 |
@@ -79,7 +79,7 @@
 | `src/server/routes/resume.rs` | 1260 |
 | `src/server/routes/v1.rs` | 1866 |
 | `src/services/auto_queue.rs` | 1545 |
-| `src/services/auto_queue/activate_command.rs` | 1506 |
+| `src/services/auto_queue/activate_command.rs` | 1510 |
 | `src/services/auto_queue/cancel_run.rs` | 1031 |
 | `src/services/claude.rs` | 2951 |
 | `src/services/claude_tui/input.rs` | 2187 |
