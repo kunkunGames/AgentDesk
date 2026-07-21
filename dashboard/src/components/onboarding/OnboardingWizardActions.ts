@@ -171,6 +171,7 @@ export function useOnboardingWizardActions({
         setNotifyBotInfo(notifyInfo);
         if (!notifyInfo.valid) {
           setError(tr("알림 봇 토큰이 유효하지 않습니다.", "Notification bot token is invalid."));
+          return;
         }
       }
     } catch {
