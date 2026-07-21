@@ -28,6 +28,7 @@ const WORKER_LOCAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerLocalTerminalSignal {
     worker: &'static str,
+    target: &'static str,
     reason: &'static str,
     expected_shutdown: bool,
     observed_unix_ms: i64,
@@ -55,6 +56,7 @@ pub(crate) fn leader_only_worker_status_json() -> serde_json::Value {
     let last_worker_local_signal = worker_local_loop_owned_terminal_signal_snapshot().map(|signal| {
         serde_json::json!({
             "worker": signal.worker,
+            "target": signal.target,
             "reason": signal.reason,
             "expected_shutdown": signal.expected_shutdown,
             "observed_at": chrono::DateTime::<chrono::Utc>::from_timestamp_millis(signal.observed_unix_ms),
@@ -98,6 +100,7 @@ fn record_worker_local_loop_owned_terminal_signal(
     let reason = reason.as_doc_str();
     let signal = WorkerLocalTerminalSignal {
         worker: spec.name,
+        target: spec.target,
         reason,
         expected_shutdown,
         observed_unix_ms: chrono::Utc::now().timestamp_millis(),
@@ -1366,6 +1369,7 @@ mod worker_local_terminal_signal_tests {
         );
         let signal = &status["last_worker_local_loop_owned_terminal_signal"];
         assert_eq!(signal["worker"].as_str(), Some(spec.name));
+        assert_eq!(signal["target"].as_str(), Some(spec.target));
         assert_eq!(signal["reason"].as_str(), Some("returned"));
         assert_eq!(signal["expected_shutdown"].as_bool(), Some(false));
         assert!(signal["observed_at"].is_string());
@@ -1399,6 +1403,7 @@ mod worker_local_terminal_signal_tests {
         );
         let signal = &status["last_worker_local_loop_owned_terminal_signal"];
         assert_eq!(signal["worker"].as_str(), Some(spec.name));
+        assert_eq!(signal["target"].as_str(), Some(spec.target));
         assert_eq!(signal["reason"].as_str(), Some("panicked"));
         assert_eq!(signal["expected_shutdown"].as_bool(), Some(false));
         assert!(signal["observed_at"].is_string());
@@ -1446,6 +1451,7 @@ mod worker_local_terminal_signal_tests {
         );
         let signal = &status["last_worker_local_loop_owned_terminal_signal"];
         assert_eq!(signal["worker"].as_str(), Some(spec.name));
+        assert_eq!(signal["target"].as_str(), Some(spec.target));
         assert_eq!(signal["reason"].as_str(), Some("returned"));
         assert_eq!(signal["expected_shutdown"].as_bool(), Some(true));
     }
