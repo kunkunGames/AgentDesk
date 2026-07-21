@@ -825,14 +825,14 @@ async fn set_dispatch_status_on_pg_with_sync(
                 .map_err(|error| {
                     anyhow::anyhow!("decode postgres dispatch result for {dispatch_id}: {error}")
                 })?;
-            let result_text = result_json.clone().or(persisted_result_text);
+            let result_text = result_json.as_deref().or(persisted_result_text.as_deref());
             let outcome =
                 crate::db::auto_queue::reconcile_phase_gate_for_terminal_dispatch_on_pg_tx(
                     &mut tx,
                     dispatch_id,
                     to_status,
                     context_text.as_deref(),
-                    result_text.as_deref(),
+                    result_text,
                 )
                 .await
                 .map_err(|error| {
