@@ -111,6 +111,8 @@ export function Step5OwnerConfirm({
 
         <input
           type="text"
+          autoComplete="off"
+          spellCheck="false"
           aria-label={tr("소유자 Discord ID", "Owner Discord ID")}
           placeholder="123456789012345678"
           value={ownerId}
