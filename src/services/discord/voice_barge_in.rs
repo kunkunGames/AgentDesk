@@ -2852,20 +2852,7 @@ async fn remove_file_quietly_silent(path: &Path) {
 }
 
 fn transcript_dirs_from_config(config: &VoiceConfig) -> Vec<PathBuf> {
-    vec![expand_tilde(&config.audio.transcripts_dir)]
-}
-
-fn expand_tilde(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if raw == "~" {
-        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    path.to_path_buf()
+    vec![crate::voice::utils::expand_tilde(&config.audio.transcripts_dir)]
 }
 
 fn lock_monitor(
