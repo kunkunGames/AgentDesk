@@ -59,6 +59,10 @@ if [ "$audit_status" -ne 0 ]; then
     echo "       DASHBOARD_AUDIT_WAIVER='<reason>' ./scripts/verify-dashboard.sh" >&2
     exit "$audit_status"
   fi
+elif [ -n "${DASHBOARD_AUDIT_WAIVER:-}" ]; then
+  echo "Error: DASHBOARD_AUDIT_WAIVER is set but npm audit found no high/critical advisories." >&2
+  echo "       The waiver is stale and must be removed to restore the strict security gate." >&2
+  exit 1
 fi
 
 echo "==> Dashboard build"
