@@ -926,27 +926,32 @@ async fn fetch_delivery_kv_guard_batch_pg(
     limit: i64,
 ) -> Result<Vec<DeliveryKvGuardRow>> {
     sqlx::query_as::<_, DeliveryKvGuardRow>(
-        "WITH kv_guards AS (
-            SELECT SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) AS dispatch_id,
-                   'reserving' AS guard_kind
-              FROM kv_meta
-             WHERE key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) > $1
-            UNION ALL
-            SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id,
-                   'notified' AS guard_kind
-              FROM kv_meta
-             WHERE key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) > $1
+        "WITH candidate_ids AS (
+            SELECT dispatch_id FROM (
+                SELECT SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) AS dispatch_id
+                  FROM kv_meta
+                 WHERE key > 'dispatch_reserving:' || $1
+                   AND key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
+                 ORDER BY key
+                 LIMIT $2
+            ) r
+            UNION
+            SELECT dispatch_id FROM (
+                SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
+                  FROM kv_meta
+                 WHERE key > 'dispatch_notified:' || $1
+                   AND key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
+                 ORDER BY key
+                 LIMIT $2
+            ) n
+            ORDER BY dispatch_id
+            LIMIT $2
         ),
         grouped AS (
-            SELECT dispatch_id,
-                   SUM(CASE WHEN guard_kind = 'reserving' THEN 1 ELSE 0 END)::BIGINT AS reserving_count,
-                   SUM(CASE WHEN guard_kind = 'notified' THEN 1 ELSE 0 END)::BIGINT AS notified_count
-              FROM kv_guards
-             GROUP BY dispatch_id
-             ORDER BY dispatch_id
-             LIMIT $2
+            SELECT c.dispatch_id,
+                   (SELECT COUNT(*) FROM kv_meta WHERE key = 'dispatch_reserving:' || c.dispatch_id)::BIGINT AS reserving_count,
+                   (SELECT COUNT(*) FROM kv_meta WHERE key = 'dispatch_notified:' || c.dispatch_id)::BIGINT AS notified_count
+              FROM candidate_ids c
         )
         SELECT grouped.dispatch_id,
                grouped.reserving_count,
