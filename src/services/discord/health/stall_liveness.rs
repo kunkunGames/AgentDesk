@@ -306,6 +306,7 @@ impl StallWatchdogJudgmentBasis {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_stall_watchdog_liveness(
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -1095,6 +1096,7 @@ mod tests {
             tmux_session_alive: Some(true),
             has_pending_queue: false,
             mailbox_active_user_msg_id: Some(9001),
+            mailbox_active_turn_nonce: None,
             bound_output_path: None,
             bound_session_id: None,
             inflight_terminal_delivery_committed: false,

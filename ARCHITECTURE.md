@@ -106,8 +106,10 @@ src/
 │   ├── scheduled_messages/
 │   │   ├── agent.rs
 │   │   ├── outbox.rs
-│   │   └── postgres_tests.rs
+│   │   ├── postgres_tests.rs
+│   │   └── writes.rs
 │   ├── agents.rs
+│   ├── automation_candidate_card_program.rs
 │   ├── automation_candidates.rs
 │   ├── cancel_tombstones.rs
 │   ├── dispatch_semaphores.rs
@@ -201,6 +203,9 @@ src/
 │   │   ├── kanban.rs
 │   │   ├── mod.rs
 │   │   └── settings.rs
+│   ├── maintenance/
+│   │   ├── mod.rs
+│   │   └── storage_jobs.rs
 │   ├── routes/
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
@@ -247,7 +252,8 @@ src/
 │   │   │   ├── helpers.rs
 │   │   │   └── responses.rs
 │   │   ├── scheduled_messages/
-│   │   │   └── postgres_tests.rs
+│   │   │   ├── postgres_tests.rs
+│   │   │   └── snapshot_capture.rs
 │   │   ├── tests/
 │   │   │   ├── preflight_harness/
 │   │   │   │   ├── types.rs
@@ -308,7 +314,6 @@ src/
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
 │   ├── issue_specs.rs
-│   ├── maintenance.rs
 │   ├── mod.rs
 │   ├── multinode_regression.rs
 │   ├── outbox_actionable_delivery.rs
@@ -318,6 +323,7 @@ src/
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
 │   ├── test_phase_runs.rs
+│   ├── worker_recovery.rs
 │   ├── worker_registry.rs
 │   └── ws.rs
 ├── services/
@@ -816,6 +822,8 @@ src/
 │   │   │   ├── completion_guard/
 │   │   │   │   ├── completion_context.rs
 │   │   │   │   └── completion_postgres.rs
+│   │   │   ├── completion_postlude/
+│   │   │   │   └── channel_writeback.rs
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   ├── claude_e.rs
 │   │   │   │   └── guarded_save.rs
@@ -976,6 +984,7 @@ src/
 │   │   ├── relay_recovery_auto_heal_apply.rs
 │   │   ├── relay_recovery_auto_heal_attempts.rs
 │   │   ├── relay_recovery_auto_heal_confirm.rs
+│   │   ├── relay_recovery_circuit_alert_producer.rs
 │   │   ├── relay_recovery_circuit_breaker.rs
 │   │   ├── relay_recovery_completion_footer.rs
 │   │   ├── relay_recovery_reattach_apply.rs
@@ -1105,9 +1114,11 @@ src/
 │   ├── provider/
 │   │   ├── cancel_token_cleanup/
 │   │   │   ├── authority.rs
+│   │   │   ├── executor.rs
 │   │   │   └── target.rs
 │   │   ├── cancel_token_claude_interrupt.rs
 │   │   ├── cancel_token_cleanup.rs
+│   │   ├── cancel_watchdog.rs
 │   │   └── provider_conformance_invariant_tests.rs
 │   ├── provider_cli/
 │   │   ├── canary.rs
@@ -1147,6 +1158,7 @@ src/
 │   │   ├── session_control.rs
 │   │   └── store.rs
 │   ├── scheduled_messages/
+│   │   ├── context_snapshot.rs
 │   │   ├── evidence.rs
 │   │   ├── postgres_tests.rs
 │   │   └── timing.rs
@@ -1164,6 +1176,7 @@ src/
 │   ├── turn_orchestrator/
 │   │   ├── active_source_dedup.rs
 │   │   ├── dispatch_reservation.rs
+│   │   ├── episode_identity.rs
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── queue_cancellation.rs
@@ -1202,6 +1215,8 @@ src/
 │   ├── long_turn_watchdog.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
+│   ├── message_outbox_circuit_authority.rs
+│   ├── message_outbox_circuit_authority_tests.rs
 │   ├── message_outbox_recovery.rs
 │   ├── message_outbox_recovery_support.rs
 │   ├── message_outbox_recovery_tests.rs
