@@ -26,6 +26,7 @@
 - Agent:
 - Boundary:
 - Primary files:
+- Duplicate/overlap check:
 - Verification commands and results:
 - Skipped checks with reasons:
 - Risk:
