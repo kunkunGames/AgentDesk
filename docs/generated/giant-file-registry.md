@@ -71,8 +71,8 @@
 | `src/services/discord/recovery_engine/restore_inflight.rs` | 2328 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/relay_recovery.rs` | 1536 | shrink | discord-relay | 2026-08-31 | #4712 |  |
 | `src/services/discord/router/intake_gate.rs` | 1591 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/discord/router/message_handler/headless_turn.rs` | 1394 | shrink | discord-relay | 2027-01-31 | #4712 |  |
-| `src/services/discord/router/message_handler/intake_turn.rs` | 2688 | shrink | discord-relay | 2026-10-31 | #4712 |  |
+| `src/services/discord/router/message_handler/headless_turn.rs` | 1443 | shrink | discord-relay | 2027-01-31 | #4712 |  |
+| `src/services/discord/router/message_handler/intake_turn.rs` | 2690 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/session_relay_sink.rs` | 1682 | shrink | discord-relay | 2026-08-31 | #4712 |  |
 | `src/services/discord/tmux.rs` | 1628 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/tmux_watcher.rs` | 3558 | shrink | discord-relay | 2026-10-31 | #4712 |  |
