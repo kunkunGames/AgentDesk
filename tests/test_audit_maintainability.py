@@ -1028,6 +1028,18 @@ class HarnessCli(unittest.TestCase):
                 rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
         self.assertEqual(rc, 1)
 
+    def test_check_mode_fails_on_stale_allowlist(self) -> None:
+        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}) as root:
+            allowlist = root / "empty.toml"
+            allowlist.write_text(
+                'giant_files = ["src/nonexistent.rs"]\n', encoding="utf-8"
+            )
+            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
+                sys, "stderr", new=mock.MagicMock()
+            ):
+                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+        self.assertEqual(rc, 1)
+
     def test_allowlist_loader_scopes_per_rule(self) -> None:
         with TemporaryDirectory() as tmp:
             p = Path(tmp) / "audit_allowlist.toml"
