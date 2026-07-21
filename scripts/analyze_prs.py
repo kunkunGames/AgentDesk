@@ -194,8 +194,6 @@ def is_scratch_file_path(path):
     }
     if path in root_scratch_files:
         return True
-    if path.endswith(".diff") or path.endswith(".patch"):
-        return True
     return bool(
         re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js)$", path)
         or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js)$", path)
