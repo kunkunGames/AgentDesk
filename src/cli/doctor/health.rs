@@ -204,7 +204,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres/SQLite availability and server logs".to_string(),
+            next_step: "check PostgreSQL availability and agentdesk dcserver logs".to_string(),
         },
         _ => ClassifiedReason {
             raw: raw.to_string(),
@@ -313,6 +313,20 @@ mod health_classification_tests {
         assert_eq!(
             reason.next_step,
             "inspect global active counter tracking in dcserver logs"
+        );
+    }
+
+    #[test]
+    fn db_unavailable_reason_is_actionable() {
+        let reason = classify_degraded_reason("db_unavailable");
+
+        assert_eq!(reason.subsystem, "postgres");
+        assert_eq!(reason.severity, Severity::Error);
+        assert_eq!(reason.fix_safety, FixSafety::NotFixable);
+        assert_eq!(reason.summary, "database is unavailable");
+        assert_eq!(
+            reason.next_step,
+            "check PostgreSQL availability and agentdesk dcserver logs"
         );
     }
 }
