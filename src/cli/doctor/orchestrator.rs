@@ -3939,7 +3939,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Stale DB Files",
             "runtime root unresolved",
-            "Verify the canonical DB path first, then clean up 0-byte stale DB files in the root path.",
+            "실제 DB 경로를 먼저 확인한 뒤 root 경로의 0바이트 stale DB 파일을 정리하세요.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
@@ -4017,7 +4017,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
         "Stale DB Files",
         format!("zero-byte stale DB file(s): {listed}"),
         format!(
-            "The canonical DB is {}. Do not open sqlite3 with guessed paths; use agentdesk doctor --fix to clean up stale files if needed.",
+            "실제 DB는 {} 입니다. 추측 경로로 sqlite3를 열지 말고, 필요하면 agentdesk doctor --fix 로 stale 파일을 정리하세요.",
             canonical_db_path.display()
         ),
     )
