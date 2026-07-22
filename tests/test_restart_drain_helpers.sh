@@ -50,6 +50,7 @@ echo "== Test 1: _defaults.sh defines required helpers =="
 
 for fn in \
   request_restart_drain_mode_or_fail \
+  wait_for_restart_persistence_or_fail \
   wait_for_live_turns_to_drain_or_fail \
   clear_restart_drain_mode \
   assert_restart_helpers_loaded; do
@@ -335,15 +336,87 @@ else
   fail "marker removed when job is not running (no flap on next boot)"
 fi
 
-echo "== Test 6: clear_restart_drain_mode removes marker file =="
-touch "$TMPDIR_TEST/restart_pending"
+echo "== Test 5g: restart persistence waits for runtime marker consumption =="
+TMP_RUNTIME3=$(mktemp -d)
+trap 'rm -rf "$TMP_FIXTURE_DIR" "$TMP_RUNTIME" "$TMPDIR_TEST" "$TMP_RUNTIME2" "$TMP_RUNTIME3"' EXIT
+touch "$TMP_RUNTIME3/restart_pending"
+( sleep 1; printf 'nonce=test-nonce\n' >"$TMP_RUNTIME3/restart_persisted"; rm -f "$TMP_RUNTIME3/restart_pending" ) &
+BG_PID=$!
+set +e
+wait_for_restart_persistence_or_fail \
+  "release" "$TMP_RUNTIME3" "test-nonce" 5 >/dev/null 2>&1
+rc=$?
+set -e
+wait "$BG_PID" 2>/dev/null || true
+assert_eq "persistence helper succeeds only after matching positive acknowledgement" "0" "$rc"
+
+mkdir -p "$TMP_RUNTIME3/wrong-nonce"
+touch "$TMP_RUNTIME3/wrong-nonce/restart_pending"
+printf 'nonce=stale-nonce\n' >"$TMP_RUNTIME3/wrong-nonce/restart_persisted"
+set +e
+wait_for_restart_persistence_or_fail \
+  "release" "$TMP_RUNTIME3/wrong-nonce" "current-nonce" 1 >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "persistence helper rejects acknowledgement from another request" "1" "$rc"
+if [ -e "$TMP_RUNTIME3/wrong-nonce/restart_cancelled" ]; then
+  pass "nonce mismatch publishes restart cancellation"
+else
+  fail "nonce mismatch publishes restart cancellation"
+fi
+
+mkdir -p "$TMP_RUNTIME3/consumed-without-ack"
+touch "$TMP_RUNTIME3/consumed-without-ack/restart_pending"
+# The rm() spy defined later (Test 6) is not yet in effect here; this is a
+# real removal. shellcheck 0.9.x still reports SC2218 for the later stub even
+# with a `command` prefix, so silence it explicitly.
+# shellcheck disable=SC2218
+command rm -f "$TMP_RUNTIME3/consumed-without-ack/restart_pending"
+set +e
+wait_for_restart_persistence_or_fail \
+  "release" "$TMP_RUNTIME3/consumed-without-ack" "test-nonce" 1 >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "marker deletion without acknowledgement is not durability proof" "1" "$rc"
+
+mkdir -p "$TMP_RUNTIME3/still-pending"
+touch "$TMP_RUNTIME3/still-pending/restart_pending"
+set +e
+wait_for_restart_persistence_or_fail \
+  "release" "$TMP_RUNTIME3/still-pending" "test-nonce" 1 >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "persistence helper refuses bootout while marker remains" "1" "$rc"
+if [ ! -e "$TMP_RUNTIME3/still-pending/restart_pending" ]; then
+  pass "persistence timeout clears restart marker"
+else
+  fail "persistence timeout clears restart marker"
+fi
+
+echo "== Test 6: clear_restart_drain_mode publishes cancellation before marker removal =="
+printf 'nonce=handoff-order\n' >"$TMPDIR_TEST/restart_pending"
 # shellcheck source=/dev/null
 . "$DEFAULTS_SH"
+marker_remove_saw_cancel=0
+rm() {
+  if [ "$1" = "-f" ] && [ "$2" = "$TMPDIR_TEST/restart_pending" ] \
+    && [ -f "$TMPDIR_TEST/restart_cancelled" ]; then
+    marker_remove_saw_cancel=1
+  fi
+  command rm "$@"
+}
 clear_restart_drain_mode "$TMPDIR_TEST" >/dev/null 2>&1 || true
+unset -f rm
 if [ ! -e "$TMPDIR_TEST/restart_pending" ]; then
   pass "marker removed"
 else
   fail "marker removed"
+fi
+if [ "$marker_remove_saw_cancel" = "1" ] \
+  && grep -q '^nonce=handoff-order$' "$TMPDIR_TEST/restart_cancelled"; then
+  pass "cancellation nonce published before marker removal"
+else
+  fail "cancellation nonce published before marker removal"
 fi
 
 echo "== Test 7: #1686 — wait_for_live_turns_to_drain_or_fail self-hosted/skip semantics =="

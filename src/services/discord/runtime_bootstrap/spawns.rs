@@ -2,6 +2,59 @@ use super::*;
 
 struct DeferredRestartPermit;
 
+fn restart_request_matches(root: &std::path::Path, name: &str, nonce: &str) -> bool {
+    std::fs::read_to_string(root.join(name))
+        .ok()
+        .and_then(|request| {
+            request
+                .lines()
+                .find_map(|line| line.strip_prefix("nonce="))
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(nonce)
+}
+
+/// Rolls back a restart cycle if its request was cancelled or its task is
+/// dropped before its request has been superseded. The nonce prevents an old
+/// poller from restoring admission for a newer restart request.
+struct DeferredRestartCancellationGuard {
+    shared: Arc<SharedData>,
+    root: std::path::PathBuf,
+    nonce: String,
+    armed: bool,
+}
+
+impl DeferredRestartCancellationGuard {
+    fn new(shared: Arc<SharedData>, root: std::path::PathBuf, nonce: String) -> Self {
+        Self {
+            shared,
+            root,
+            nonce,
+            armed: true,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        restart_request_matches(&self.root, "restart_cancelled", &self.nonce)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeferredRestartCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && (self.cancelled()
+                || restart_request_matches(&self.root, "restart_pending", &self.nonce))
+        {
+            rollback_deferred_restart(&self.shared);
+        }
+    }
+}
+
 /// Publish the admission fence before health can acknowledge the marker. The
 /// per-provider CAS gives exactly one poller permission to wait, persist, and
 /// consume that provider's shutdown-barrier slot.
@@ -16,25 +69,87 @@ fn begin_deferred_restart(shared: &SharedData) -> Option<DeferredRestartPermit> 
         .map(|_| DeferredRestartPermit)
 }
 
-async fn prepare_deferred_restart(shared: &SharedData) -> Option<DeferredRestartPermit> {
+async fn prepare_deferred_restart(
+    shared: &Arc<SharedData>,
+    root: &std::path::Path,
+    nonce: String,
+) -> Option<(DeferredRestartPermit, DeferredRestartCancellationGuard)> {
     let permit = begin_deferred_restart(shared)?;
+    let guard = DeferredRestartCancellationGuard::new(shared.clone(), root.to_path_buf(), nonce);
     shared
         .restart
         .intake_worker_lifecycle
         .wait_until_drained()
         .await;
+    if guard.cancelled() {
+        return None;
+    }
     // `restart_pending` is the health-visible acknowledgement consumed by the
     // wrapper. Publish it only after an accepted tick has fully executed.
     shared.restart.restart_pending.store(true, Ordering::SeqCst);
-    Some(permit)
+    Some((permit, guard))
 }
 
 fn finish_deferred_restart(shared: &SharedData, _permit: DeferredRestartPermit) -> bool {
-    shared
+    let is_final = shared
         .restart
         .shutdown_remaining
         .fetch_sub(1, Ordering::AcqRel)
-        == 1
+        == 1;
+    shared
+        .restart
+        .shutdown_slot_consumed
+        .store(true, Ordering::Release);
+    is_final
+}
+
+/// Write the durable sentinel, then make the final cancellation decision at
+/// the closest practical point before the atomic rename. A successful rename
+/// is the point of no return: cancellation observed afterwards is intentionally
+/// ignored so persistence and process exit remain a single durable outcome.
+fn commit_deferred_restart_sentinel(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    nonce: &str,
+    guard: &DeferredRestartCancellationGuard,
+) -> std::io::Result<bool> {
+    let ack = root.join("restart_persisted");
+    let ack_tmp = root.join(format!("restart_persisted.{}.tmp", std::process::id()));
+    let ack_body = format!(
+        "nonce={nonce}\nprovider={}\ncommitted_at={}\n",
+        provider.as_str(),
+        chrono::Utc::now().to_rfc3339()
+    );
+    std::fs::write(&ack_tmp, ack_body)?;
+    if guard.cancelled() {
+        let _ = std::fs::remove_file(&ack_tmp);
+        return Ok(false);
+    }
+    std::fs::rename(ack_tmp, ack)?;
+    Ok(true)
+}
+
+fn rollback_deferred_restart(shared: &SharedData) {
+    shared.restart.intake_worker_lifecycle.unfence_admission();
+    shared.restart.shutting_down.store(false, Ordering::SeqCst);
+    shared
+        .restart
+        .restart_pending
+        .store(false, Ordering::SeqCst);
+    shared
+        .restart
+        .shutdown_counted
+        .store(false, Ordering::Release);
+    if shared
+        .restart
+        .shutdown_slot_consumed
+        .swap(false, Ordering::AcqRel)
+    {
+        shared
+            .restart
+            .shutdown_remaining
+            .fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// Background: poll for the deferred restart marker for gateway and standby
@@ -57,20 +172,42 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
             if let Some(root) = crate::agentdesk_runtime_root() {
                 let marker = root.join("restart_pending");
                 if marker.exists() {
-                    let Some(shutdown_permit) =
-                        prepare_deferred_restart(&shared_for_deferred).await
+                    let request = std::fs::read_to_string(&marker).unwrap_or_default();
+                    let nonce = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("nonce="))
+                        .unwrap_or_default()
+                        .to_owned();
+                    if nonce.is_empty() {
+                        tracing::error!("restart request lacks nonce; retaining runtime");
+                        continue;
+                    }
+                    if restart_request_matches(&root, "restart_cancelled", &nonce) {
+                        rollback_deferred_restart(&shared_for_deferred);
+                        tracing::warn!(
+                            provider = provider_for_deferred.as_str(),
+                            "restart request cancelled; intake admission restored"
+                        );
+                        continue;
+                    }
+                    let Some((shutdown_permit, mut cancellation_guard)) =
+                        prepare_deferred_restart(&shared_for_deferred, &root, nonce.clone()).await
                     else {
                         continue;
                     };
                     let drain =
                         mailbox_restart_drain_all(&shared_for_deferred, &provider_for_deferred)
                             .await;
+                    if cancellation_guard.cancelled() {
+                        continue;
+                    }
                     let queue_count = drain.queued_count;
                     if !drain.persistence_errors.is_empty() {
                         tracing::error!(
                             failures = drain.persistence_errors.len(),
-                            "restart_pending quick exit continuing after pending-queue persistence failure(s)"
+                            "restart_pending persistence failed; retaining marker and runtime"
                         );
+                        continue;
                     }
                     let ids: std::collections::HashMap<u64, u64> = shared_for_deferred
                         .last_message_ids
@@ -83,14 +220,6 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
                             &ids,
                         );
                     }
-                    // Quick-exit must preserve inflight state with
-                    // bumped mtime + DrainRestart marker. Without
-                    // this, repeated quick-exits (e.g. destructive
-                    // E2E scenarios that restart release multiple
-                    // times) leave file mtime frozen at first save,
-                    // and stale-removal trips after 1800s even
-                    // while the tmux pane is still alive. Mirrors
-                    // the graceful-shutdown preserve block below.
                     let inflight_states_qe = inflight::load_inflight_states(&provider_for_deferred);
                     if !inflight_states_qe.is_empty() {
                         let ts2 = chrono::Local::now().format("%H:%M:%S");
@@ -98,58 +227,69 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
                             "  [{ts2}] 👁 preserving {} inflight turn(s) for restart recovery",
                             inflight_states_qe.len()
                         );
-                        let marked_qe = inflight::mark_all_inflight_states_restart_mode(
-                            &provider_for_deferred,
-                            crate::services::discord::InflightRestartMode::DrainRestart,
-                        );
+                        let marked_qe =
+                            match inflight::mark_all_inflight_states_restart_mode_checked(
+                                &provider_for_deferred,
+                                crate::services::discord::InflightRestartMode::DrainRestart,
+                            ) {
+                                Ok(marked) => marked,
+                                Err(error) => {
+                                    tracing::error!(
+                                        provider = provider_for_deferred.as_str(),
+                                        error = %error,
+                                        "restart_pending inflight persistence failed; retaining marker and runtime"
+                                    );
+                                    continue;
+                                }
+                            };
                         tracing::info!(
                             "  [{ts2}] 🔖 marked {marked_qe} inflight turn(s) as drain_restart"
                         );
+                    }
+                    if cancellation_guard.cancelled() {
+                        continue;
                     }
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!(
                         "  [{ts}] 🔄 restart_pending detected — quick exit after persisting {queue_count} queued item(s)"
                     );
                     if finish_deferred_restart(&shared_for_deferred, shutdown_permit) {
+                        match commit_deferred_restart_sentinel(
+                            &root,
+                            &provider_for_deferred,
+                            &nonce,
+                            &cancellation_guard,
+                        ) {
+                            Ok(false) => continue,
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    "restart persistence acknowledgement publish failed; retaining runtime"
+                                );
+                                continue;
+                            }
+                            Ok(true) => {}
+                        }
+                        cancellation_guard.disarm();
                         let _ = std::fs::remove_file(&marker);
                         std::process::exit(0);
                     }
+
+                    // A non-final provider must keep its guard alive until the
+                    // final provider publishes the sentinel or cancellation
+                    // arrives. Returning here would strand its consumed slot.
+                    loop {
+                        tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
+                        if cancellation_guard.cancelled() {
+                            break;
+                        }
+                        if !restart_request_matches(&root, "restart_pending", &nonce) {
+                            cancellation_guard.disarm();
+                            return;
+                        }
+                    }
+                    continue;
                 }
-            }
-            // Use process-global counters so we wait for ALL providers
-            let g_active = shared_for_deferred
-                .restart
-                .global_active
-                .load(Ordering::Relaxed);
-            let g_finalizing = shared_for_deferred
-                .restart
-                .global_finalizing
-                .load(Ordering::Relaxed);
-            if g_active == 0
-                && g_finalizing == 0
-                && shared_for_deferred
-                    .restart
-                    .restart_pending
-                    .load(Ordering::Relaxed)
-            {
-                let drain =
-                    mailbox_restart_drain_all(&shared_for_deferred, &provider_for_deferred).await;
-                let queue_count = drain.queued_count;
-                if !drain.persistence_errors.is_empty() {
-                    tracing::error!(
-                        failures = drain.persistence_errors.len(),
-                        "deferred restart observed pending-queue persistence failure(s)"
-                    );
-                }
-                if queue_count > 0 {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] 📋 DRAIN: mailbox persisted {queue_count} pending queue item(s) before deferred restart"
-                    );
-                }
-                check_deferred_restart(&shared_for_deferred);
-                // This provider has saved and decremented — stop polling
-                return;
             }
         }
     });
@@ -288,73 +428,5 @@ pub(super) fn run_bot_spawn_dead_tmux_reaper(shared_clone: &Arc<SharedData>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn standby_marker_fences_intake_exposes_ack_and_counts_shutdown_once() {
-        let registry = health::HealthRegistry::new();
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        shared.restart.shutdown_remaining.store(1, Ordering::SeqCst);
-        registry
-            .register_standby("codex".to_string(), shared.clone())
-            .await;
-
-        let execute_started = Arc::new(tokio::sync::Notify::new());
-        let execute_release = Arc::new(tokio::sync::Notify::new());
-        let shared_for_worker = shared.clone();
-        let started_for_worker = execute_started.clone();
-        let release_for_worker = execute_release.clone();
-        let worker = tokio::spawn(async move {
-            let _active_tick = shared_for_worker
-                .restart
-                .intake_worker_lifecycle
-                .try_begin_tick()
-                .expect("tick admitted before restart fence");
-            started_for_worker.notify_one();
-            release_for_worker.notified().await;
-        });
-        execute_started.notified().await;
-
-        let shared_for_prepare = shared.clone();
-        let prepare =
-            tokio::spawn(async move { prepare_deferred_restart(&shared_for_prepare).await });
-        while !shared.restart.shutting_down.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-
-        assert!(
-            !shared.restart.restart_pending.load(Ordering::Acquire),
-            "health must not acknowledge while the accepted execute future is active"
-        );
-        assert_eq!(
-            shared.restart.shutdown_remaining.load(Ordering::Acquire),
-            1,
-            "the shutdown token must remain unconsumed while execute is active"
-        );
-        assert!(begin_deferred_restart(&shared).is_none());
-
-        execute_release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(1), worker)
-            .await
-            .expect("accepted execute drain")
-            .expect("worker join");
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), prepare)
-            .await
-            .expect("marker acknowledgement after execute drain")
-            .expect("prepare join")
-            .expect("first marker acknowledgement");
-
-        let snapshot = serde_json::to_value(health::build_health_snapshot(&registry).await)
-            .expect("serialize acknowledged standby health");
-        assert_eq!(snapshot["providers"][0]["restart_pending"], true);
-        assert!(shared.restart.shutting_down.load(Ordering::Acquire));
-
-        assert!(finish_deferred_restart(&shared, permit));
-        assert_eq!(
-            shared.restart.shutdown_remaining.load(Ordering::Acquire),
-            0,
-            "the standby provider consumes its barrier slot exactly once"
-        );
-    }
-}
+#[path = "spawns_tests.rs"]
+mod tests;
