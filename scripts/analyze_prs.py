@@ -89,7 +89,7 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
     return False
 
 def has_duplicate_guard_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*duplicate pr guard:\*\*", body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:duplicate pr guard|duplicate-pr guard|duplicate/overlap check|overlap check):\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
@@ -102,7 +102,7 @@ def has_duplicate_guard_ack(body):
     )
 
 def has_no_change_verification_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*no-change verification:\*\*", body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:no-change verification|no change verification):\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
@@ -113,7 +113,7 @@ def has_no_change_verification_ack(body):
     )
 
 def has_stale_branch_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*stale branch cleanup:\*\*", body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:stale branch cleanup|stale-branch cleanup):\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
@@ -124,7 +124,7 @@ def has_stale_branch_cleanup_ack(body):
     )
 
 def has_scratch_file_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*scratch file cleanup:\*\*", body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:scratch file cleanup|scratch-file cleanup):\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
