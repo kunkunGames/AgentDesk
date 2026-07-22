@@ -6,6 +6,7 @@ use super::super::super::turn_view_reconciler::{
 use super::voice_announcement_route::route_voice_transcript_announcement_once;
 use super::*;
 
+mod adk_thread;
 mod claim_bootstrap;
 mod race_loss;
 mod stale_dispatch_guard;
@@ -103,6 +104,7 @@ pub(crate) async fn execute_intake_turn_core(
         request.dm_hint,
         request.turn_kind,
         request.preserve_on_cancel,
+        false,
         Vec::new(),
         // Worker dispatch has no in-process gate carry-forward; it re-resolves
         // the durable announcement row for its `user_msg_id` (#3905).
@@ -127,6 +129,7 @@ pub(super) async fn handle_text_message(
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
     preserve_on_cancel: bool,
+    queued_drain: bool,
     preloaded_uploads: Vec<String>,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<(), Error> {
@@ -1877,16 +1880,8 @@ pub(super) async fn handle_text_message(
         channel_name.as_deref(),
         Some(&current_path),
     );
-    let adk_thread_channel_id = adk_session_name
-        .as_deref()
-        .and_then(super::super::super::adk_session::parse_thread_channel_id_from_name)
-        .or_else(|| {
-            shared
-                .dispatch
-                .thread_parents
-                .contains_key(&channel_id)
-                .then_some(channel_id.get())
-        });
+    let adk_thread_channel_id =
+        adk_thread::resolve_channel_id(adk_session_name.as_deref(), shared, channel_id);
     // #222: DB-based dispatch lookup takes priority over text parsing.
     // In unified threads, user_text may contain a stale DISPATCH: prefix
     // from a previous dispatch in the same thread. DB lookup uses the
@@ -1970,6 +1965,7 @@ pub(super) async fn handle_text_message(
             foreground: matches!(turn_kind, TurnKind::Foreground),
             local: remote_profile.is_none(),
             wait_for_completion,
+            queued_drain,
             has_dispatch: dispatch_id.is_some() || dispatch_id_for_thread.is_some(),
             is_voice_announcement,
             has_pending_uploads: !pending_uploads.is_empty(),

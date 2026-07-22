@@ -32,9 +32,36 @@ pub(super) struct IntakeSteeringContext<'a> {
     pub(super) foreground: bool,
     pub(super) local: bool,
     pub(super) wait_for_completion: bool,
+    pub(super) queued_drain: bool,
     pub(super) has_dispatch: bool,
     pub(super) is_voice_announcement: bool,
     pub(super) has_pending_uploads: bool,
+}
+
+fn steering_route_is_native(
+    selection: &crate::services::provider_hosting::ProviderSessionSelection,
+) -> bool {
+    crate::services::tui_steering::route_input_by_session_driver(selection)
+        == crate::services::tui_steering::SteeringRoute::NativeTui
+}
+
+fn steering_intake_eligible(
+    provider: &ProviderKind,
+    foreground: bool,
+    local: bool,
+    wait_for_completion: bool,
+    queued_drain: bool,
+    has_dispatch: bool,
+    is_voice_announcement: bool,
+    has_pending_uploads: bool,
+) -> bool {
+    foreground
+        && matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+        && local
+        && (!wait_for_completion || queued_drain)
+        && !has_dispatch
+        && !is_voice_announcement
+        && !has_pending_uploads
 }
 
 pub(super) async fn maybe_handle_intake_steering(
@@ -58,18 +85,22 @@ pub(super) async fn maybe_handle_intake_steering(
         foreground,
         local,
         wait_for_completion,
+        queued_drain,
         has_dispatch,
         is_voice_announcement,
         has_pending_uploads,
     } = context;
     if !crate::services::tui_steering::tui_steering_enabled()
-        || !foreground
-        || !matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
-        || !local
-        || wait_for_completion
-        || has_dispatch
-        || is_voice_announcement
-        || has_pending_uploads
+        || !steering_intake_eligible(
+            provider,
+            foreground,
+            local,
+            wait_for_completion,
+            queued_drain,
+            has_dispatch,
+            is_voice_announcement,
+            has_pending_uploads,
+        )
     {
         return None;
     }
@@ -80,8 +111,7 @@ pub(super) async fn maybe_handle_intake_steering(
             claude::is_tmux_available(),
             Some(channel_id.get()),
         );
-    if crate::services::tui_steering::route_input_by_session_driver(&selection)
-        != crate::services::tui_steering::SteeringRoute::NativeTui
+    if !steering_route_is_native(&selection)
         || !crate::services::tmux_diagnostics::tmux_session_has_live_pane(steering_tmux_name)
         || !tui_busy_followup_diagnostic(
             shared,
@@ -150,6 +180,84 @@ pub(super) async fn maybe_handle_intake_steering(
 mod tests {
     use super::*;
     use crate::services::tui_steering::SteeringOutcome;
+
+    #[test]
+    fn queued_drain_waiting_for_completion_remains_steering_eligible() {
+        assert!(steering_intake_eligible(
+            &ProviderKind::Claude,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn steering_intake_eligibility_rejects_non_drain_and_other_exclusions() {
+        let eligible = |foreground,
+                        local,
+                        wait_for_completion,
+                        queued_drain,
+                        has_dispatch,
+                        is_voice_announcement,
+                        has_pending_uploads| {
+            steering_intake_eligible(
+                &ProviderKind::Claude,
+                foreground,
+                local,
+                wait_for_completion,
+                queued_drain,
+                has_dispatch,
+                is_voice_announcement,
+                has_pending_uploads,
+            )
+        };
+
+        assert!(!eligible(true, true, true, false, false, false, false));
+        assert!(!eligible(true, true, false, false, true, false, false));
+        assert!(!eligible(true, false, false, false, false, false, false));
+        assert!(!eligible(true, true, false, false, false, true, false));
+        assert!(!eligible(true, true, false, false, false, false, true));
+        assert!(!eligible(false, true, false, false, false, false, false));
+
+        assert!(!steering_intake_eligible(
+            &ProviderKind::Gemini,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn non_native_tui_driver_is_blocked_by_the_actual_hook_route_gate() {
+        let selection = crate::services::provider_hosting::ProviderSessionSelection {
+            provider_id: "claude".to_string(),
+            requested_tui_hosting: false,
+            driver: crate::services::provider_hosting::ProviderSessionDriver::ClaudeE,
+            fallback_reason: None,
+        };
+        assert_eq!(
+            crate::services::tui_steering::route_input_by_session_driver(&selection),
+            crate::services::tui_steering::SteeringRoute::ExistingMailbox,
+        );
+
+        assert!(!steering_route_is_native(&selection));
+
+        let native_selection = crate::services::provider_hosting::ProviderSessionSelection {
+            provider_id: "claude".to_string(),
+            requested_tui_hosting: true,
+            driver: crate::services::provider_hosting::ProviderSessionDriver::TuiHosting,
+            fallback_reason: None,
+        };
+        assert!(steering_route_is_native(&native_selection));
+    }
 
     #[test]
     fn failed_or_unsafe_steering_falls_through_to_busy_followup_enqueue() {
