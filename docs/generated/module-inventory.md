@@ -1038,7 +1038,7 @@
 | `services::provider::cancel_token_claude_interrupt` | `src/services/provider/cancel_token_claude_interrupt.rs` | 366 | 169 | 197 |  |
 | `services::provider::cancel_token_cleanup` | `src/services/provider/cancel_token_cleanup.rs` | 5 | 5 | 0 |  |
 | `services::provider::cancel_token_cleanup::authority` | `src/services/provider/cancel_token_cleanup/authority.rs` | 209 | 141 | 68 |  |
-| `services::provider::cancel_token_cleanup::executor` | `src/services/provider/cancel_token_cleanup/executor.rs` | 524 | 351 | 173 |  |
+| `services::provider::cancel_token_cleanup::executor` | `src/services/provider/cancel_token_cleanup/executor.rs` | 545 | 354 | 191 |  |
 | `services::provider::cancel_token_cleanup::target` | `src/services/provider/cancel_token_cleanup/target.rs` | 17 | 17 | 0 |  |
 | `services::provider::cancel_watchdog` | `src/services/provider/cancel_watchdog.rs` | 268 | 102 | 166 |  |
 | `services::provider_auth` | `src/services/provider_auth.rs` | 628 | 400 | 228 |  |
