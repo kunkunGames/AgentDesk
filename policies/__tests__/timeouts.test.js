@@ -1495,6 +1495,13 @@ test("timeouts reconcile fallback escalates DoD wait when only DoD is incomplete
 
   policy._section_R(); // This should trigger reconciliation
 
+  assert.deepEqual(state.statusCalls, [
+    {
+      cardId: "card-dod-reconcile",
+      status: "review",
+      force: false
+    }
+  ]);
   assert.deepEqual(state.reviewStatusCalls, [
     {
       cardId: "card-dod-reconcile",
