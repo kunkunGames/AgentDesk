@@ -3769,7 +3769,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 "PostgreSQL",
                 format!("{summary} — runtime init failed"),
-                "postgres 연결 검증용 async runtime 생성에 실패했습니다.",
+                "Failed to create an async runtime for postgres connection validation.",
             )
             .with_expected_actual(
                 "postgres check runtime initializes",
@@ -3939,7 +3939,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Stale DB Files",
             "runtime root unresolved",
-            "실제 DB 경로를 먼저 확인한 뒤 root 경로의 0바이트 stale DB 파일을 정리하세요.",
+            "Check the actual DB path first, then clean up the 0-byte stale DB files in the root path.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
