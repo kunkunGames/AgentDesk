@@ -67,7 +67,7 @@ Each row is a (vector × action × job) tuple. If a vector is not in this table,
 Job source locations under `src/services/maintenance/jobs/`:
 `target_sweep.rs`, `worktree_orphan_sweep.rs`, `hang_dump_cleanup.rs`,
 `db_retention.rs`.
-Also `src/server/maintenance.rs` and `src/db/prompt_manifests/retention.rs` for `prompt_manifest_retention` (status API in `src/server/routes/prompt_manifest_retention.rs`).
+Also `src/server/maintenance/mod.rs` and `src/db/prompt_manifests/retention.rs` for `prompt_manifest_retention` (status API in `src/server/routes/prompt_manifest_retention.rs`).
 
 Config knobs (all live in `Config::default_runtime()` per job):
 
@@ -161,7 +161,7 @@ If post-rebuild size exceeds **30 GB**, something is wrong — see §6.
 ### 3.5 Enable automated maintenance
 
 The scheduler starts registering jobs automatically via
-`static_registry_with_config` on server boot (`src/server/maintenance.rs`). No
+`static_registry_with_config` on server boot (`src/server/maintenance/mod.rs`). No
 operator action required beyond restarting `dcserver` after the deploy. Verify:
 
 ```bash
