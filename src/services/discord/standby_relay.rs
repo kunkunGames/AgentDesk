@@ -38,32 +38,11 @@ use super::outbound::turn_output_controller as toc;
 use super::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
 use crate::services::provider::ProviderKind;
 
-/// #3089 A3/#3998 S1-f2: pure short-replace cut-over decision.
-/// Routes the standby short-replace branch onto the unified controller when the
-/// post-format body is non-empty. The `!formatted.is_empty()` half is
-/// LOAD-BEARING and single-sourced here: legacy
-/// `replace_long_message_raw_with_outcome` treats a zero-chunk (empty) body as
-/// `EditedOriginal` → committed → **true** (no network), whereas the controller
-/// short-circuits an empty body to `Skipped` → **false**. Dropping the empty-body
-/// exclusion would wrongly flip empty bodies true→false, so it is pinned by
-/// `standby_short_replace_should_cutover_pins_both_conditions`. Mirrors A2b's
-/// `sink_guard_lease_range` extraction.
 fn standby_short_replace_should_cutover(formatted: &str) -> bool {
     !formatted.is_empty()
 }
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// #2448 graduation: the 900s (15min) cap was the heuristic stop signal —
-/// "after this long the primary turn is presumed dead". Now that
-/// `CompletionGuard` broadcasts `InflightSignal::Completed` explicitly,
-/// the wall-clock deadline is demoted to a pure safety backstop: it only
-/// fires when neither the broadcast (same-node) nor the on-disk inflight
-/// poll (cross-node) ever observe completion. 30 min comfortably covers
-/// any sane long-running turn.
-// #3034: canonical backstop value retained as documentation; current callers
-// pass an explicit `timeout`, so no live read of this default yet.
-#[allow(dead_code)]
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
 const MAX_FILE_BYTES_PER_TICK: u64 = 1_048_576; // 1 MiB safety cap
 const INFLIGHT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const COMPLETED_SIGNAL_DRAIN_GRACE: Duration = Duration::from_secs(5);
@@ -86,6 +65,10 @@ impl StandbyRelayTurnBinding {
         }
     }
 
+    pub(in crate::services::discord) fn polling_start_offset(&self, handoff_offset: u64) -> u64 {
+        self.turn_start_offset.unwrap_or(handoff_offset)
+    }
+
     fn turn_id(&self, channel_id: ChannelId) -> Option<String> {
         if self.identity.user_msg_id == 0 {
             return None;
@@ -96,12 +79,12 @@ impl StandbyRelayTurnBinding {
             self.identity.user_msg_id
         ))
     }
+
+    fn standby_start_offset(&self, handoff_offset: u64) -> u64 {
+        self.turn_start_offset.unwrap_or(handoff_offset)
+    }
 }
 
-/// Spawned per-turn on cluster-standby nodes. Returns when:
-/// - `cancel` or `shared.restart.shutting_down` flips to true,
-/// - the JSONL emits a `{"type":"result"}` event and we deliver the response,
-/// - or `timeout` elapses.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_standby_relay(
     http: Arc<serenity::http::Http>,
@@ -115,21 +98,15 @@ pub(super) async fn run_standby_relay(
     provider: ProviderKind,
     timeout: Duration,
 ) {
+    let start_offset = turn_binding.standby_start_offset(start_offset);
     let deadline = Instant::now() + timeout;
     let mut current_offset = start_offset;
     let mut last_inflight_heartbeat = Instant::now();
-    // Buffer raw bytes for incomplete trailing lines across reads. Decoding
-    // only complete JSONL lines avoids replacing split UTF-8 scalars.
     let mut tail_buf: Vec<u8> = Vec::new();
     let mut tail_start_offset = start_offset;
     let mut pending_result_text: Option<String> = None;
     let mut pending_result_retry_offset: Option<u64> = None;
     let mut completed_signal_drain_until: Option<Instant> = None;
-    // #2448: subscribe BEFORE the first poll tick so a `Completed` broadcast
-    // emitted while we are setting up is queued instead of lost. Lag is
-    // expected on heavy load — `RecvError::Lagged` is treated as "you may
-    // have missed an exit-eligible signal" and triggers a force-poll +
-    // state re-fetch on the next tick (matches the issue pitfalls section).
     let mut inflight_signals = shared.inflight_signals.subscribe();
     let ts_start = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
@@ -164,6 +141,17 @@ pub(super) async fn run_standby_relay(
             completed_signal_drain_until,
             Instant::now(),
         ) {
+            if let Some((result_offset, response)) = resolve_expiry_delivery(
+                &output_path,
+                current_offset,
+                pending_result_text.as_deref(),
+                start_offset,
+            ) {
+                pending_result_retry_offset = Some(result_offset);
+                pending_result_text = Some(response);
+                completed_signal_drain_until = None;
+                continue;
+            }
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] 👁 standby_relay exit after Completed drain grace for channel {} (offset={})",
@@ -172,12 +160,6 @@ pub(super) async fn run_standby_relay(
             );
             return;
         }
-        // #2448: drain the broadcast queue NON-blocking before each poll
-        // tick. If we observe `Completed { channel_id: self }` before this
-        // task has parsed a result, keep polling for a short grace period.
-        // The result line may already be on disk but not yet consumed by this
-        // relay; exiting immediately leaves the placeholder without a final
-        // response.
         loop {
             use tokio::sync::broadcast::error::TryRecvError;
             match inflight_signals.try_recv() {
@@ -206,14 +188,6 @@ pub(super) async fn run_standby_relay(
                 Ok(_) => continue, // other channels — ignore
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Lagged(_)) => {
-                    // Codex review HIGH: a bursty publisher can saturate the
-                    // 256-slot broadcast and Lag us before we observe our
-                    // own `Completed`. The previous `break` here meant we
-                    // silently fell through to the 1800s backstop — the
-                    // exact regression #2448 was meant to close. Recheck
-                    // the on-disk inflight authoritatively: if terminal
-                    // (file gone or pointing at a different output), the
-                    // turn already completed and we should exit now.
                     if pending_result_text.is_none()
                         && super::inflight::load_inflight_state(&provider, channel_id.get())
                             .map(|state| {
@@ -300,35 +274,155 @@ pub(super) async fn run_standby_relay(
         };
         current_offset = read_to;
 
-        let mut found_result_text = None;
         let decoded_lines = standby_complete_lines_from_chunk(
             &mut tail_buf,
             &mut tail_start_offset,
             read_from,
             new_chunk,
         );
-        for (line_start, line) in decoded_lines.lines {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(result_text) = extract_result_text(&line) {
-                pending_result_retry_offset = Some(
-                    decoded_lines
-                        .stitched_start_offset
-                        .saturating_add(line_start as u64),
-                );
-                found_result_text = Some(result_text);
-                break;
-            }
-        }
-        if let Some(result_text) = found_result_text {
-            pending_result_text = Some(result_text);
+        if let Some((result_offset, response)) = standby_response_after_poll_scan(
+            &decoded_lines,
+            pending_result_text.as_deref(),
+            completed_signal_drain_until,
+            Instant::now(),
+            &output_path,
+            start_offset,
+        ) {
+            pending_result_retry_offset = Some(result_offset);
+            pending_result_text = Some(response);
             completed_signal_drain_until = None;
             continue;
         }
-
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+fn result_from_unread_complete_lines(output_path: &str, offset: u64) -> Option<(u64, String)> {
+    let bytes = std::fs::read(output_path).ok()?;
+    let start = usize::try_from(offset).ok()?.min(bytes.len());
+    let complete_end = bytes[start..]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| start + index + 1)?;
+    let lines = String::from_utf8_lossy(&bytes[start..complete_end]);
+    let mut line_offset = offset;
+    for line in lines.lines() {
+        if let Some(result_text) = extract_result_text(line) {
+            return Some((line_offset, result_text));
+        }
+        line_offset = line_offset.saturating_add(line.len() as u64 + 1);
+    }
+    None
+}
+
+fn resolve_expiry_delivery(
+    output_path: &str,
+    current_offset: u64,
+    pending_result_text: Option<&str>,
+    start_offset: u64,
+) -> Option<(u64, String)> {
+    resolve_standby_delivery(
+        result_from_unread_complete_lines(output_path, current_offset),
+        pending_result_text,
+        true,
+        output_path,
+        start_offset,
+    )
+}
+
+fn resolve_standby_delivery(
+    result: Option<(u64, String)>,
+    pending_result_text: Option<&str>,
+    fallback_allowed: bool,
+    output_path: &str,
+    start_offset: u64,
+) -> Option<(u64, String)> {
+    result.or_else(|| {
+        completed_drain_fallback_response(
+            pending_result_text,
+            fallback_allowed,
+            output_path,
+            start_offset,
+        )
+        .map(|response| (start_offset, response))
+    })
+}
+
+fn standby_response_after_poll_scan(
+    decoded_lines: &StandbyDecodedLines,
+    pending_result_text: Option<&str>,
+    completed_drain_until: Option<Instant>,
+    now: Instant,
+    output_path: &str,
+    start_offset: u64,
+) -> Option<(u64, String)> {
+    let result = decoded_lines.lines.iter().find_map(|(line_start, line)| {
+        extract_result_text(line).map(|text| {
+            (
+                decoded_lines
+                    .stitched_start_offset
+                    .saturating_add(*line_start as u64),
+                text,
+            )
+        })
+    });
+    resolve_standby_delivery(
+        result,
+        pending_result_text,
+        completed_drain_until.is_some_and(|until| now >= until),
+        output_path,
+        start_offset,
+    )
+}
+
+fn completed_drain_fallback_response(
+    pending_result_text: Option<&str>,
+    completed_drain_active: bool,
+    output_path: &str,
+    start_offset: u64,
+) -> Option<String> {
+    if pending_result_text.is_some() || !completed_drain_active {
+        return None;
+    }
+    let response = final_assistant_response_from_output(output_path, start_offset);
+    (!response.trim().is_empty()).then_some(response)
+}
+
+fn final_assistant_response_from_output(output_path: &str, start_offset: u64) -> String {
+    let Ok(bytes) = std::fs::read(output_path) else {
+        return String::new();
+    };
+    let start = usize::try_from(start_offset)
+        .ok()
+        .map(|offset| offset.min(bytes.len()))
+        .unwrap_or(bytes.len());
+
+    let mut final_response = String::new();
+    for line in String::from_utf8_lossy(&bytes[start..]).lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(content) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        let text = content
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        let text = super::response_sanitizer::strip_leading_tui_response_chrome(&text);
+        if !text.trim().is_empty() {
+            final_response = text;
+        }
+    }
+    final_response
 }
 
 fn read_file_range(path: &str, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
@@ -400,12 +494,12 @@ fn extract_result_text(line: &str) -> Option<String> {
     if parsed.get("type").and_then(Value::as_str) != Some("result") {
         return None;
     }
-    let result_text = parsed.get("result").and_then(Value::as_str)?;
-    let cleaned = super::response_sanitizer::strip_leading_tui_response_chrome(result_text);
-    if cleaned.trim().is_empty() {
-        return None;
-    }
-    Some(cleaned)
+    cleaned_response_text(parsed.get("result").and_then(Value::as_str)?)
+}
+
+fn cleaned_response_text(text: &str) -> Option<String> {
+    let cleaned = super::response_sanitizer::strip_leading_tui_response_chrome(text);
+    (!cleaned.trim().is_empty()).then_some(cleaned)
 }
 
 fn standby_inflight_matches(
@@ -950,6 +1044,206 @@ mod tests {
     fn extract_result_text_handles_invalid_json() {
         assert!(extract_result_text("not json").is_none());
         assert!(extract_result_text("").is_none());
+    }
+
+    #[test]
+    fn expired_drain_scans_unread_result_before_fallback() {
+        let dir = tempfile::tempdir().expect("create transcript directory");
+        let transcript = dir.path().join("transcript.jsonl");
+        let prefix = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"FALLBACK_FINAL\"}]}}\n";
+        let result = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"RESULT_FINAL\"}\n";
+        std::fs::write(&transcript, format!("{prefix}{result}")).expect("write transcript");
+
+        let response = resolve_expiry_delivery(
+            transcript.to_str().expect("UTF-8 transcript path"),
+            prefix.len() as u64,
+            None,
+            0,
+        );
+        assert_eq!(
+            response,
+            Some((prefix.len() as u64, "RESULT_FINAL".to_string()))
+        );
+    }
+
+    #[test]
+    fn poll_scan_prefers_result_before_completed_fallback() {
+        let dir = tempfile::tempdir().expect("create transcript directory");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A1 narration\"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"FALLBACK_FINAL\"}]}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"RESULT_FINAL\"}\n",
+            ),
+        )
+        .expect("write transcript");
+        let decoded_lines = StandbyDecodedLines {
+            stitched_start_offset: 0,
+            lines: std::fs::read_to_string(&transcript)
+                .expect("read transcript")
+                .lines()
+                .enumerate()
+                .map(|(index, line)| (index, line.to_string()))
+                .collect(),
+        };
+        let now = Instant::now();
+
+        let result_response = standby_response_after_poll_scan(
+            &decoded_lines,
+            None,
+            Some(now),
+            now,
+            transcript.to_str().expect("UTF-8 transcript path"),
+            0,
+        );
+        assert_eq!(
+            result_response.map(|(_, text)| text),
+            Some("RESULT_FINAL".to_string())
+        );
+
+        let no_result_lines = StandbyDecodedLines {
+            stitched_start_offset: 0,
+            lines: decoded_lines.lines[..2].to_vec(),
+        };
+        let fallback_response = standby_response_after_poll_scan(
+            &no_result_lines,
+            None,
+            Some(now),
+            now,
+            transcript.to_str().expect("UTF-8 transcript path"),
+            0,
+        );
+        assert_eq!(
+            fallback_response.map(|(_, text)| text),
+            Some("FALLBACK_FINAL".to_string())
+        );
+    }
+
+    #[test]
+    fn poll_scan_defers_fallback_until_completed_grace_expires() {
+        let dir = tempfile::tempdir().expect("create transcript directory");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A1 narration\"}]}}\n",
+        )
+        .expect("write transcript");
+        let decoded_lines = StandbyDecodedLines {
+            stitched_start_offset: 0,
+            lines: vec![(
+                0,
+                std::fs::read_to_string(&transcript).expect("read transcript"),
+            )],
+        };
+        let now = Instant::now();
+
+        assert!(
+            standby_response_after_poll_scan(
+                &decoded_lines,
+                None,
+                Some(now + Duration::from_secs(1)),
+                now,
+                transcript.to_str().expect("UTF-8 transcript path"),
+                0,
+            )
+            .is_none()
+        );
+
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A1 narration\"}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A2 final answer\"}]}}\n",
+            ),
+        )
+        .expect("write final transcript");
+        let final_response = standby_response_after_poll_scan(
+            &decoded_lines,
+            None,
+            Some(now),
+            now,
+            transcript.to_str().expect("UTF-8 transcript path"),
+            0,
+        );
+        assert_eq!(
+            final_response.map(|(_, text)| text),
+            Some("A2 final answer".to_string())
+        );
+    }
+
+    #[test]
+    fn completed_drain_fallback_prefers_full_post_tool_response_over_cached_narration() {
+        let dir = tempfile::tempdir().expect("create TUI transcript directory");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A1 narration\"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A2 final answer\"}]}}\n",
+                "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"A2 final answer\"}\n",
+            ),
+        )
+        .expect("write TUI transcript");
+
+        let response = completed_drain_fallback_response(
+            None,
+            true,
+            transcript.to_str().expect("UTF-8 transcript path"),
+            0,
+        );
+        assert_eq!(response.as_deref(), Some("A2 final answer"));
+        assert_ne!(response.as_deref(), Some("A1 narration"));
+    }
+
+    #[test]
+    fn tui_assistant_fallback_extracts_final_text_without_result_event() {
+        let dir = tempfile::tempdir().expect("create TUI transcript directory");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"draft\"},{\"type\":\"tool_use\",\"name\":\"Read\"}]}}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"final TUI response\"}]}}\n",
+            ),
+        )
+        .expect("write TUI transcript");
+
+        assert_eq!(
+            super::super::recovery_engine::extract_response_from_output_pub(
+                transcript.to_str().expect("UTF-8 transcript path"),
+                0,
+            ),
+            "draftfinal TUI response"
+        );
+    }
+
+    #[test]
+    fn standby_polling_start_offset_uses_turn_baseline() {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            1234,
+            None,
+            42,
+            100,
+            5678,
+            "test".to_string(),
+            None,
+            Some("tmux".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.turn_start_offset = Some(128);
+        let binding = StandbyRelayTurnBinding::from_state(&state);
+        assert_eq!(binding.polling_start_offset(512), 128);
+
+        state.turn_start_offset = None;
+        assert_eq!(
+            StandbyRelayTurnBinding::from_state(&state).polling_start_offset(512),
+            512
+        );
     }
 
     #[test]
