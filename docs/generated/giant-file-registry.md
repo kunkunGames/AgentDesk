@@ -14,7 +14,7 @@
 | `src/cli/client.rs` | 2464 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/dcserver.rs` | 1650 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/direct.rs` | 1819 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/cli/doctor/orchestrator.rs` | 4381 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/cli/doctor/orchestrator.rs` | 4376 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/init.rs` | 1446 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/migrate/apply.rs` | 3238 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/migrate/plan.rs` | 1513 | shrink | server-runtime | 2027-01-31 | #4710 |  |
