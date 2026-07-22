@@ -627,6 +627,7 @@ agentdesk discord-sendfile <PATH> --channel <ID> --key <HASH>
 agentdesk discord-sendmessage --channel <ID> --message <TEXT>
 agentdesk discord-senddm --user <ID> --message <TEXT>
 agentdesk send --target channel:<ID> --content <TEXT> [--bot announce|notify|<provider>]
+agentdesk send-to-agent --from <ID> --to <ID> --message <TEXT> --expect-reply true|false
 agentdesk discord read <CHANNEL_ID> [--limit <N>] [--before <ID>] [--after <ID>]
 agentdesk monitoring start --channel <ID> --key <KEY> --description <TEXT>
 agentdesk monitoring stop --channel <ID> --key <KEY>
@@ -635,6 +636,7 @@ agentdesk monitoring stop --channel <ID> --key <KEY>
 agentdesk review-verdict --dispatch <ID> --verdict pass|improve|rework|reject|approved
 agentdesk review-decision --card <CARD_ID> --decision approve|rework|escalate|accept|dispute|dismiss|requeue|resume
 agentdesk docs [CATEGORY] [--flat]
+agentdesk show session-name --channel <ID> [--provider <TEXT>]
 agentdesk force-kill --session-key <KEY> [--retry]
 
 # Kanban / dispatch / auto-queue
@@ -656,6 +658,9 @@ agentdesk auto-queue config --max-concurrent <N> [--run <ID>] [--repo <OWNER/REP
 agentdesk github-sync [--repo <OWNER/REPO>]
 agentdesk cherry-merge <BRANCH> [--close-issue]
 agentdesk status                                 # Runtime health summary
+agentdesk health                                 # Consolidated node health snapshot
+agentdesk machine-compare                        # Multinode release/dev state comparison
+agentdesk activity --since <TIME> [--until <TIME>] # Time-windowed activity report
 agentdesk config get                             # Read runtime config
 agentdesk config set '<JSON>'                    # Set runtime config
 agentdesk config audit [--dry-run]               # Reconcile yaml/DB drift
