@@ -547,7 +547,7 @@ pub(in crate::services::discord) fn resolve_reusable_worktree(
 /// checkout). Used by the auto-restore paths so a thread session that resumes
 /// after a dcserver restart regains its worktree metadata, inflight worktree
 /// context, and a stable cleanup root instead of silently dropping them (#3011).
-pub(super) fn reconstruct_managed_worktree_metadata(
+pub(in crate::services::discord) fn reconstruct_managed_worktree_metadata(
     session: &mut DiscordSession,
     provider: &ProviderKind,
     channel_id: ChannelId,

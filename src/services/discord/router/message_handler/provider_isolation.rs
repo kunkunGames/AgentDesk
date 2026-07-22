@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::discord::session_runtime::reconstruct_managed_worktree_metadata;
 
 pub(super) fn metadata_parent_channel_id(
     metadata: Option<&serde_json::Value>,
@@ -471,6 +472,20 @@ pub(super) struct ProviderWorktreeIsolationOutcome {
     stale_session_id: Option<String>,
 }
 
+fn reconstruct_unowned_managed_worktree(
+    session: &mut DiscordSession,
+    conflict: Option<&str>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    canonical: &str,
+) -> bool {
+    if conflict.is_some() {
+        return false;
+    }
+    reconstruct_managed_worktree_metadata(session, provider, channel_id, canonical);
+    session.worktree.is_some()
+}
+
 pub(super) async fn ensure_provider_worktree_isolation(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -502,21 +517,35 @@ pub(super) async fn ensure_provider_worktree_isolation(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| current_path.clone());
 
-    let (already_isolated, session_channel_name, conflict) = {
-        let data = shared.core.lock().await;
+    let (already_isolated, reconstructed, session_channel_name, conflict) = {
+        let mut data = shared.core.lock().await;
+        let conflict = detect_worktree_conflict(&data.sessions, &canonical, channel_id);
         let already_isolated = data
             .sessions
             .get(&channel_id)
             .and_then(|session| session.worktree.as_ref())
             .is_some();
+        let reconstructed = data.sessions.get_mut(&channel_id).is_some_and(|session| {
+            reconstruct_unowned_managed_worktree(
+                session,
+                conflict.as_deref(),
+                provider,
+                channel_id,
+                &canonical,
+            )
+        });
         let session_channel_name = data
             .sessions
             .get(&channel_id)
             .and_then(|session| session.channel_name.clone());
-        let conflict = detect_worktree_conflict(&data.sessions, &canonical, channel_id);
-        (already_isolated, session_channel_name, conflict)
+        (
+            already_isolated,
+            reconstructed,
+            session_channel_name,
+            conflict,
+        )
     };
-    if already_isolated {
+    if already_isolated || (conflict.is_none() && reconstructed) {
         return ProviderWorktreeIsolationOutcome::default();
     }
 
@@ -605,6 +634,88 @@ pub(super) async fn reset_provider_session_after_worktree_isolation(
 #[cfg(test)]
 mod thread_role_inheritance_tests {
     use super::*;
+
+    #[test]
+    fn managed_linked_worktree_skips_provider_reisolation_without_session_state() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let git = |args: &[&str]| {
+            crate::services::git::GitCommand::new()
+                .repo(&repo)
+                .args(args)
+                .run_output()
+                .unwrap();
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "provider-isolation@test.invalid"]);
+        git(&["config", "user.name", "Provider Isolation Test"]);
+        std::fs::write(repo.join("README"), "test").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "initial"]);
+
+        let (worktree_path, _) = create_git_worktree(
+            repo.to_str().unwrap(),
+            "restart-reisolation",
+            "test-provider",
+        )
+        .unwrap();
+
+        let mut session = DiscordSession {
+            session_id: Some("preserved-session".to_string()),
+            memento_context_loaded: true,
+            memento_reflected: false,
+            current_path: Some(worktree_path.clone()),
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            remote_profile_name: None,
+            channel_id: Some(43_170_001),
+            channel_name: Some("restart-reisolation".to_string()),
+            category_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: 0,
+        };
+        reconstruct_managed_worktree_metadata(
+            &mut session,
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_001),
+            &worktree_path,
+        );
+
+        assert!(session.worktree.is_some());
+        assert_eq!(session.session_id.as_deref(), Some("preserved-session"));
+
+        let mut conflicted_session = DiscordSession {
+            worktree: None,
+            ..session.clone()
+        };
+        assert!(!reconstruct_unowned_managed_worktree(
+            &mut conflicted_session,
+            Some("owner-channel"),
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_003),
+            &worktree_path,
+        ));
+        assert!(conflicted_session.worktree.is_none());
+
+        git(&["-C", &worktree_path, "checkout", "--detach"]);
+        let mut detached_session = DiscordSession {
+            worktree: None,
+            ..session.clone()
+        };
+        reconstruct_managed_worktree_metadata(
+            &mut detached_session,
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_002),
+            &worktree_path,
+        );
+        assert!(detached_session.worktree.is_none());
+    }
+
     fn bind_parent(
         root: &std::path::Path,
         id: ChannelId,
