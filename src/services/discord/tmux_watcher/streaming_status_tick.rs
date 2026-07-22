@@ -131,6 +131,32 @@ pub(super) async fn update_streaming_status_tick(
             }
         }
 
+        // @persist-order-guard-start #4104
+        // #4104: persist the parsed watcher snapshot on every throttled tick,
+        // independently of whether this tick needs a Discord edit. A provider can
+        // emit pre-tool text and then spend a long time inside a tool while the
+        // rendered placeholder remains unchanged; the old edit-committed-only
+        // persistence left the durable row at its initial empty snapshot for that
+        // entire hold. Silent turns suppress Discord rendering, not durable state.
+        // The helper reloads and validates the complete turn identity under the
+        // inflight sidecar lock, so a stale watcher cannot overwrite a replacement
+        // turn.
+        persist_watcher_stream_progress(
+            &watcher_provider,
+            channel_id,
+            &tmux_session_name,
+            turn_identity_for_panel.as_ref(),
+            placeholder_msg_id,
+            &full_response,
+            response_sent_offset,
+            tool_state.current_tool_line.as_deref(),
+            tool_state.prev_tool_status.as_deref(),
+            task_notification_kind,
+            tool_state.any_tool_used,
+            tool_state.has_post_tool_text,
+            &watcher_streaming_rollover_frozen_msg_ids,
+        );
+
         // Headless silent trigger (metadata.silent=true): skip both
         // status-panel and streaming-chunk edits to keep the channel
         // at zero bytes for the assistant turn.
@@ -886,6 +912,7 @@ pub(super) async fn update_streaming_status_tick(
             commit_streaming_status_tick_state!();
             return StreamingStatusTickOutcome::ContinueStreamingLoop;
         }
+        // @persist-order-guard-end #4104
         let mut display_text = build_watcher_streaming_edit_text_with_session_banner(
             &shared,
             channel_id,
