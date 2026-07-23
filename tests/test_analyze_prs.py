@@ -391,6 +391,11 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
         self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
 
+    def test_diff_and_patch_files_are_flagged(self):
+        self.assertTrue(is_scratch_file_path("patch.diff"))
+        self.assertTrue(is_scratch_file_path("my_changes.patch"))
+        self.assertTrue(is_scratch_file_path("fix.diff"))
+
 
 class CiScriptScratchGuardTests(unittest.TestCase):
     def test_ci_guard_includes_root_sql_scratch_files(self):
@@ -425,6 +430,13 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("test.js", script)
         self.assertIn("scratch[._-]*.js", script)
         self.assertIn("test_*.js", script)
+
+    def test_ci_guard_includes_diff_patch_scratch_globs(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("*.diff", script)
+        self.assertIn("*.patch", script)
+        self.assertIn("patch.diff", script)
 
 if __name__ == "__main__":
     unittest.main()
