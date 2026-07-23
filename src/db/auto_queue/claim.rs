@@ -207,31 +207,24 @@ pub async fn assigned_groups_with_pending_entries_pg(
     current_phase: Option<i64>,
 ) -> Result<Vec<i64>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT s.assigned_thread_group, COALESCE(e.batch_phase, 0)::BIGINT AS batch_phase
+        "SELECT DISTINCT s.assigned_thread_group, COALESCE(e.batch_phase, 0)::BIGINT AS batch_phase
          FROM auto_queue_slots s
          JOIN auto_queue_entries e
            ON e.run_id = $1
           AND e.agent_id = s.agent_id
           AND COALESCE(e.thread_group, 0) = COALESCE(s.assigned_thread_group, 0)
+          AND e.status = 'pending'
          WHERE s.assigned_run_id = $1
            AND s.assigned_thread_group IS NOT NULL
-           AND EXISTS (
-               SELECT 1
-               FROM auto_queue_entries e
-               WHERE e.run_id = $1
-                 AND e.agent_id = s.agent_id
-                 AND COALESCE(e.thread_group, 0) = COALESCE(s.assigned_thread_group, 0)
-                 AND e.status = 'pending'
-           )
            AND NOT EXISTS (
                SELECT 1
-               FROM auto_queue_entries e
-               WHERE e.run_id = $1
-                 AND e.agent_id = s.agent_id
-                 AND COALESCE(e.thread_group, 0) = COALESCE(s.assigned_thread_group, 0)
-                 AND e.status = 'dispatched'
+               FROM auto_queue_entries e2
+               WHERE e2.run_id = $1
+                 AND e2.agent_id = s.agent_id
+                 AND COALESCE(e2.thread_group, 0) = COALESCE(s.assigned_thread_group, 0)
+                 AND e2.status = 'dispatched'
            )
-         ORDER BY s.assigned_thread_group ASC, s.slot_index ASC, COALESCE(e.batch_phase, 0) ASC",
+         ORDER BY s.assigned_thread_group ASC, COALESCE(e.batch_phase, 0) ASC",
     )
     .bind(run_id)
     .fetch_all(pool)
