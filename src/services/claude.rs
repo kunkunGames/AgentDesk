@@ -1839,6 +1839,9 @@ fn execute_streaming_local_tui_tmux(
         resume,
         &launch_env,
     )?;
+    if let Some(channel_id) = report_channel_id {
+        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
+    }
     crate::services::platform::tmux::set_option(tmux_session_name, "remain-on-exit", "on");
 
     // #3087: stamp a per-spawn nonce on the Claude-TUI DIRECT spawn path too.
@@ -2886,7 +2889,7 @@ fn execute_streaming_local_tmux(
     // Stamp generation marker so post-restart watcher restore can detect old sessions
     let gen_marker_path =
         crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
-    let current_gen = crate::services::discord::runtime_store::load_generation();
+    let current_gen = crate::services::discord::runtime_store::process_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
 
     // #3087: stamp a per-spawn nonce in a SEPARATE marker. The status-panel

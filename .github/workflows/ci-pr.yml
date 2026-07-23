@@ -31,6 +31,9 @@ env:
   RUSTC_WRAPPER: sccache
   SCCACHE_CACHE_SIZE: 10G
   SCCACHE_GHA_ENABLED: "true"
+  # Pull requests may restore default-branch sccache entries but never write
+  # branch-local shards into the repository-wide 10GB cache budget.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
   POSTGRES_SERVICE_IMAGE: ${{ vars.AGENTDESK_POSTGRES_SERVICE_IMAGE }}
 
 jobs:
@@ -297,7 +300,7 @@ jobs:
       - name: dashboard build/test
         run: ./scripts/verify-dashboard.sh
 
-  # Ubuntu Rust lane: canonical fast check. Gated on the broad rust_or_policy
+  # Ubuntu Rust lane: canonical fast compile check. Gated on the broad rust_or_policy
   # filter so a `policies/*.js`, `scripts/*.sh`, `.github/workflows/**`, or
   # Node package change still gets a Rust check on Linux.
   #
@@ -306,7 +309,7 @@ jobs:
   # job compiles the `relay_state_contract_refs` blocks, which is the only proof
   # that each contract symbol still exists.
   check_fast:
-    name: Fast check + non-PG tests (${{ matrix.os }})
+    name: Fast compile check (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true'
     runs-on: ${{ matrix.os }}
@@ -329,22 +332,20 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
       # starves the 10GB GHA cache quota, evicting sccache shards (observed
       # Rust hit-rate collapse: 99.80% → 0.00% within hours of merges). See
       # docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -354,24 +355,11 @@ jobs:
       - name: Policy JS unit tests
         run: npm run test:policies
 
-      - name: just check
-        run: just check
-        env:
-          # Cold `cargo test --all-targets` on the 16GB ubuntu runner peaks over
-          # RAM during codegen+link (SIGTERM/143). Two step-scoped levers keep
-          # peak RSS under the ceiling; test semantics are unchanged (neither
-          # affects which tests run or their results). Step-scoped so no other
-          # Rust job's resource envelope is touched.
-          #   1. Cap parallel compile jobs at 2 (default = 4 vCPU) to bound
-          #      concurrent rustc/link.
-          CARGO_BUILD_JOBS: "2"
-          #   2. Drop debuginfo for the dev/test profiles. Linking many
-          #      `--all-targets` test binaries with full debuginfo is the
-          #      dominant peak-memory source; `-j2` alone still OOM'd on the
-          #      link phase, so strip it here. CI test failures still report
-          #      panics/asserts; only source-line debug data is omitted.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
+      # `lint` owns fmt/clippy in its independent required mirror. Keep this
+      # required Ubuntu lane to compilation and policy tests; main and nightly
+      # retain the longer non-PG test coverage outside the PR critical path.
+      - name: cargo check
+        run: just cargo-check
 
       - name: sccache stats
         if: always()
@@ -436,22 +424,20 @@ jobs:
 
       - name: Setup sccache
         if: runner.os != 'macOS'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
       # starves the 10GB GHA cache quota, evicting sccache shards (observed
       # Rust hit-rate collapse: 99.80% → 0.00% within hours of merges). See
       # docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Stage 1 keeps Windows inline and default-feature-only instead of
       # `just check`: this lane's job is cross-OS compile and targeted test
@@ -611,19 +597,17 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale: `target/` excluded to protect sccache
       # GHA cache quota.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-fast-tests-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-fast-tests-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: just test-postgres
         timeout-minutes: 20
@@ -668,18 +652,16 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-recovery-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-recovery-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: High-risk recovery lane
         run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
@@ -714,7 +696,9 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    if: needs.changes.outputs.rust_or_policy == 'true'
+    # Match check_fast's composite gate so relay-contract-only changes retain
+    # fmt/clippy coverage after duplicate linting was removed from that job.
+    if: needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -731,18 +715,16 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: just fmt-check
         run: just fmt-check
@@ -767,8 +749,8 @@ jobs:
       - name: Mirror lint result for branch protection
         env:
           CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
-          FILTER_NAME: rust_or_policy
-          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy }}
+          FILTER_NAME: rust_or_policy_or_relay_contract
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true' }}
           UPSTREAM_JOB_NAME: lint
           UPSTREAM_RESULT: ${{ needs.lint.result }}
         run: ./scripts/required-check-mirror.sh

@@ -5,6 +5,13 @@ use std::sync::Arc;
 
 use super::*;
 
+#[path = "stream_tick/guarded_persist.rs"]
+pub(super) mod guarded_persist;
+use guarded_persist::{
+    GuardedSaveOutcome, dirty_after_guarded_save, persist_stream_tick_heartbeat,
+    persist_stream_tick_state,
+};
+
 pub(super) type LongRunningPlaceholderActive = Option<(
     super::super::placeholder_controller::PlaceholderKey,
     super::super::placeholder_controller::PlaceholderActiveInput,
@@ -74,6 +81,7 @@ pub(super) struct BridgeStreamTickContext<'a> {
     pub(super) channel_id: ChannelId,
     pub(super) provider: &'a ProviderKind,
     pub(super) turn_id: &'a str,
+    pub(super) expected_identity: &'a crate::services::discord::inflight::InflightTurnIdentity,
     pub(super) status_interval: std::time::Duration,
     pub(super) single_message_panel_footer_mode: bool,
     pub(super) footer_owner: super::super::footer_view_reconciler::CompletionFooterOwner,
@@ -188,6 +196,7 @@ pub(super) async fn run_bridge_stream_tick(
     let channel_id = ctx.channel_id;
     let provider = ProviderRef(ctx.provider);
     let turn_id = TurnIdRef(ctx.turn_id);
+    let stream_tick_expected = ctx.expected_identity;
     let status_interval = ctx.status_interval;
     let single_message_panel_footer_mode = ctx.single_message_panel_footer_mode;
     let footer_owner = ctx.footer_owner;
@@ -263,10 +272,15 @@ pub(super) async fn run_bridge_stream_tick(
     );
 
     if shared_owned.ui.status_panel_v2_enabled
-        && bridge_status_panel_dirty_should_edit_separate_panel(
+        && (bridge_status_panel_dirty_should_edit_separate_panel(
             status_panel_dirty,
             single_message_panel_footer_mode,
-        )
+        ) || status_panel_msg_id.is_some_and(|status_msg_id| {
+            shared_owned
+                .ui
+                .placeholder_live_events
+                .panel_cache_invalidation_pending(channel_id, status_msg_id.get())
+        }))
         && !defer_status_panel_for_first_answer
         && last_status_panel_edit.elapsed() >= status_interval
         && let Some(status_msg_id) = status_panel_msg_id
@@ -276,7 +290,11 @@ pub(super) async fn run_bridge_stream_tick(
             &provider,
             status_panel_started_at,
         );
-        if panel_text != last_status_panel_text {
+        let panel_cache_invalidation_epoch = shared_owned
+            .ui
+            .placeholder_live_events
+            .panel_cache_invalidation_epoch(channel_id, status_msg_id.get());
+        if panel_cache_invalidation_epoch.is_some() || panel_text != last_status_panel_text {
             match TurnGateway::edit_message(
                 gateway.as_ref(),
                 channel_id,
@@ -288,6 +306,16 @@ pub(super) async fn run_bridge_stream_tick(
                 Ok(()) => {
                     last_status_panel_text = panel_text;
                     last_status_panel_edit = tokio::time::Instant::now();
+                    if let Some(epoch) = panel_cache_invalidation_epoch {
+                        shared_owned
+                            .ui
+                            .placeholder_live_events
+                            .clear_panel_cache_invalidation_if_epoch(
+                                channel_id,
+                                status_msg_id.get(),
+                                epoch,
+                            );
+                    }
                     inflight_state.status_message_id = Some(status_msg_id.get());
                     state_dirty = true;
                 }
@@ -638,8 +666,15 @@ pub(super) async fn run_bridge_stream_tick(
         inflight_state.last_tool_name = last_tool_name.clone();
         inflight_state.last_tool_summary = last_tool_summary.clone();
         inflight_state.prev_tool_status = prev_tool_status.clone();
-        match save_inflight_state(&*inflight_state) {
-            Ok(()) => {
+        let flush_outcome = persist_stream_tick_state(
+            &*inflight_state,
+            stream_tick_expected,
+            channel_id,
+            "turn_bridge::stream_tick::dirty_flush",
+        );
+        state_dirty = dirty_after_guarded_save(flush_outcome);
+        match flush_outcome {
+            GuardedSaveOutcome::Saved => {
                 if let Some((key, snapshot, close_trigger, ack_consumed)) =
                     pending_long_running_open_after_state_save.take()
                 {
@@ -658,23 +693,23 @@ pub(super) async fn run_bridge_stream_tick(
                                 Some((key, snapshot, close_trigger, ack_consumed));
                         } else {
                             inflight_state.long_running_placeholder_active = false;
-                            if let Err(error) = save_inflight_state(&*inflight_state) {
-                                tracing::warn!(
-                                    "[turn_bridge] failed to persist long-running placeholder open failure in channel {}: {}",
-                                    channel_id,
-                                    error
-                                );
-                            }
+                            let outcome = persist_stream_tick_state(
+                                &*inflight_state,
+                                stream_tick_expected,
+                                channel_id,
+                                "turn_bridge::stream_tick::placeholder_open_failure",
+                            );
+                            state_dirty |= dirty_after_guarded_save(outcome);
                         }
                     } else {
                         inflight_state.long_running_placeholder_active = false;
-                        if let Err(error) = save_inflight_state(&*inflight_state) {
-                            tracing::warn!(
-                                "[turn_bridge] failed to persist stale long-running placeholder open drop in channel {}: {}",
-                                channel_id,
-                                error
-                            );
-                        }
+                        let outcome = persist_stream_tick_state(
+                            &*inflight_state,
+                            stream_tick_expected,
+                            channel_id,
+                            "turn_bridge::stream_tick::placeholder_open_drop",
+                        );
+                        state_dirty |= dirty_after_guarded_save(outcome);
                     }
                 }
                 if let Some((old_key, snapshot, close_trigger, ack_consumed, new_key)) =
@@ -702,23 +737,28 @@ pub(super) async fn run_bridge_stream_tick(
                             // normal handling.
                             long_running_placeholder_active = None;
                             inflight_state.long_running_placeholder_active = false;
-                            if let Err(error) = save_inflight_state(&*inflight_state) {
-                                tracing::warn!(
-                                    "[turn_bridge] failed to persist long-running placeholder retarget failure in channel {}: {}",
-                                    channel_id,
-                                    error
-                                );
-                            }
+                            let outcome = persist_stream_tick_state(
+                                &*inflight_state,
+                                stream_tick_expected,
+                                channel_id,
+                                "turn_bridge::stream_tick::placeholder_retarget_failure",
+                            );
+                            state_dirty |= dirty_after_guarded_save(outcome);
                         }
                     }
                 }
             }
-            Err(error) => {
+            GuardedSaveOutcome::IoError => {
                 tracing::warn!(
-                    "[turn_bridge] failed to persist inflight state before moving placeholder pin in channel {}: {}",
-                    channel_id,
-                    error
+                    "[turn_bridge] failed to persist inflight state before moving placeholder pin in channel {}",
+                    channel_id
                 );
+            }
+            GuardedSaveOutcome::Missing | GuardedSaveOutcome::IdentityMismatch => {
+                // Ownership was lost. Discard deferred placeholder actions so a
+                // stale tick cannot edit or retarget the successor turn's card.
+                pending_long_running_open_after_state_save = None;
+                pending_long_running_retarget_after_state_save = None;
             }
         }
     }
@@ -755,9 +795,11 @@ pub(super) async fn run_bridge_stream_tick(
     if long_running_placeholder_active.is_some()
         && last_inflight_long_run_heartbeat.elapsed() >= live_long_run_heartbeat_interval
     {
-        inflight_state.updated_at = chrono::Utc::now().to_rfc3339();
-        let _ = save_inflight_state(&*inflight_state);
-        last_inflight_long_run_heartbeat = std::time::Instant::now();
+        let heartbeat_outcome =
+            persist_stream_tick_heartbeat(&provider, channel_id, stream_tick_expected);
+        if matches!(heartbeat_outcome, GuardedSaveOutcome::Saved) {
+            last_inflight_long_run_heartbeat = std::time::Instant::now();
+        }
     }
 
     *state.state_dirty = state_dirty;
@@ -843,6 +885,9 @@ mod provider_output_guard_tests {
             _intervention: &'a Intervention,
             _request_owner_name: &'a str,
             _has_more_queued_turns: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async { Ok(()) })
         }

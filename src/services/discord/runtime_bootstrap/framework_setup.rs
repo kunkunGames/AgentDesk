@@ -212,6 +212,7 @@ pub(super) async fn run_bot_framework_setup(
 pub(super) fn run_bot_build_slash_commands() -> Vec<poise::Command<Data, Error>> {
     let mut slash_commands = vec![
         commands::cmd_start(),
+        commands::cmd_resume(),
         commands::cmd_pwd(),
         commands::cmd_status(),
         commands::cmd_inflight(),
@@ -230,7 +231,6 @@ pub(super) fn run_bot_build_slash_commands() -> Vec<poise::Command<Data, Error>>
         commands::cmd_goals(),
         commands::cmd_effort(),
         commands::cmd_compact(),
-        commands::cmd_steer(),
         commands::cmd_cost(),
         commands::cmd_context(),
         commands::cmd_adk(),
@@ -318,18 +318,8 @@ async fn audit_or_prune_global_slash_commands(
 }
 
 #[cfg(test)]
-mod steer_registration_tests {
+mod slash_command_registration_tests {
     use super::*;
-
-    #[test]
-    fn steer_command_is_registered() {
-        assert!(
-            run_bot_build_slash_commands()
-                .iter()
-                .any(|command| command.name == "steer"),
-            "/steer must be present in the slash command registration vec"
-        );
-    }
 
     #[test]
     fn node_command_is_registered() {

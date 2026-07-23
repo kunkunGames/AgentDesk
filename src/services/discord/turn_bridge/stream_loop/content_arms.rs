@@ -39,6 +39,7 @@ pub(super) async fn handle_stream_content_message(
     let gateway = Arc::clone(ctx.gateway);
     let channel_id = ctx.channel_id;
     let provider = ctx.provider.clone();
+    let expected_identity = ctx.expected_identity;
     let voice_progress_playback_channel_id = ctx.voice_progress_playback_channel_id;
     let watcher_owns_assistant_relay = ctx.watcher_owns_assistant_relay;
     let watcher_relay_available_for_turn = ctx.watcher_relay_available_for_turn;
@@ -294,12 +295,15 @@ pub(super) async fn handle_stream_content_message(
                             }
                             if pending_long_running_open_after_state_save.take().is_some() {
                                 inflight_state.long_running_placeholder_active = false;
-                                let _ = save_inflight_state(inflight_state);
+                                let _ = crate::services::discord::inflight::
+                                    clear_long_running_placeholder_if_matches_identity(
+                                        &provider,
+                                        channel_id.get(),
+                                        expected_identity,
+                                        "turn_bridge::stream_loop::done_pending_placeholder_clear",
+                                    );
                             }
-                            // #1255: turn finished while a long-running placeholder
-                            // is still Active — close it now so the user does not
-                            // stare at a stale 🔄 card. Idempotent if a prior
-                            // ToolResult already fired Completed.
+                            // #1255: close an Active long-run card at turn finish; idempotent after ToolResult completion.
                             if let Some((key, snapshot, close_trigger, ack_consumed)) =
                                 long_running_placeholder_active.take()
                             {
@@ -324,12 +328,7 @@ pub(super) async fn handle_stream_content_message(
                                         .placeholder_controller
                                         .transition(gateway.as_ref(), key.clone(), target)
                                         .await;
-                                    // codex round-10/11 P2/P3: on `EditFailed`,
-                                    // re-stash the tuple so subsequent
-                                    // streaming/sweeper paths can retry the
-                                    // terminal edit. Only clear the persisted
-                                    // flag on a committed (or already-terminal)
-                                    // transition.
+                                    // Re-stash `EditFailed` for streaming/sweeper retry; clear the flag only after a committed/already-terminal transition.
                                     use super::super::super::placeholder_controller::PlaceholderControllerOutcome::*;
                                     if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
                                         inflight_state.long_running_placeholder_active = false;

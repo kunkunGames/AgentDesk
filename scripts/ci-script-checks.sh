@@ -111,6 +111,9 @@ echo "=== CI timeout wrapper tests (#4413) ==="
 echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
+echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
+"$PYTHON" -m unittest tests.test_fast_check_ci_wiring
+
 echo "=== Scheduled-message PG path-filter wiring contract ==="
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
 
@@ -205,16 +208,15 @@ echo "=== Relay watchdog + PG tunnel supervisor tests (#4381/#4378) ==="
 "$PYTHON" -m unittest tests.test_relay_watchdog tests.test_pg_tunnel
 
 echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036) ==="
-# Generic committed markdown freshness drift is warning-only for ordinary PRs
-# and is refreshed by the weekly regen-docs workflow. This CI invocation writes
-# the current generated view into the workspace so the checks below compare
-# against current source facts.
-# The generator hard-fails (exit 2) on giant-file registry drift: unregistered
-# new giants, ghost registrations left after decomposition, or deadline-less
-# [[entry]] tables in scripts/giant_file_registry.toml. Generated-docs drift
-# (exit 1) is a hard fail in PRs to prevent drift merging and spawning
-# duplicate downstream inventory refresh PRs.
-"$PYTHON" scripts/generate_inventory_docs.py --check
+# Inventory snapshots are untracked, so generate them in the CI workspace
+# before checks consume their source-of-truth data. The generator hard-fails
+# (exit 2) on giant-file registry drift: unregistered new giants, ghost
+# registrations left after decomposition, or deadline-less [[entry]] tables in
+# scripts/giant_file_registry.toml. The following git diff is the PR-time
+# drift gate: generation updates snapshots, then CI rejects changes to tracked
+# source-of-truth docs instead of comparing the generated workspace to itself.
+"$PYTHON" scripts/generate_inventory_docs.py
+git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
 
 echo "=== Inventory prod/test split regression tests (#4394) ==="
 "$PYTHON" -m unittest tests.test_inventory_giant_split

@@ -11,6 +11,9 @@ pub(in crate::services::discord) use self::activity::{
 
 #[path = "codex_tui_restore.rs"]
 mod codex_restore;
+#[path = "dispatched_origin_ghost.rs"]
+mod dispatched_origin_ghost;
+use dispatched_origin_ghost::consume_dispatched_origin_ghost_if_current;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LivenessProbeOutcome {
@@ -621,6 +624,72 @@ pub(super) async fn handle_tmux_watcher_observed_death(
         let _ =
             resume_aborted_restart_turn(channel_id, http, shared, tmux_session_name, output_path)
                 .await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreDispatchRebindOutcome {
+    NotRebound,
+    Rebound,
+}
+
+/// Rebind only an inflight dispatch that is still active. The status and blank
+/// dispatch-link predicates are the CAS guard: a concurrent new turn must not
+/// have its session link overwritten by an older restore pass.
+async fn rebind_restored_dispatch_if_missing(
+    pg_pool: Option<&sqlx::PgPool>,
+    state: &super::super::inflight::InflightTurnState,
+) -> RestoreDispatchRebindOutcome {
+    let (Some(pool), Some(session_key), Some(dispatch_id), Some(turn_nonce)) = (
+        pg_pool,
+        state.session_key.as_deref(),
+        state
+            .dispatch_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|dispatch_id| !dispatch_id.is_empty()),
+        state
+            .turn_nonce
+            .as_deref()
+            .filter(|nonce| !nonce.is_empty()),
+    ) else {
+        return RestoreDispatchRebindOutcome::NotRebound;
+    };
+    let channel_id = state.channel_id.to_string();
+
+    match sqlx::query(
+        "UPDATE sessions s
+            SET active_dispatch_id = $3,
+                session_info = 'Rebound restored dispatch link',
+                last_heartbeat = NOW()
+          WHERE s.session_key = $1
+            AND s.channel_id = $2
+            AND s.status = 'turn_active'
+            AND s.active_turn_nonce = $4
+            AND COALESCE(BTRIM(s.active_dispatch_id), '') = ''
+            AND EXISTS (
+                SELECT 1 FROM task_dispatches d
+                 WHERE d.id = $3 AND d.status IN ('pending', 'dispatched')
+            )",
+    )
+    .bind(session_key)
+    .bind(&channel_id)
+    .bind(dispatch_id)
+    .bind(turn_nonce)
+    .execute(pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 1 => RestoreDispatchRebindOutcome::Rebound,
+        Ok(_) => RestoreDispatchRebindOutcome::NotRebound,
+        Err(error) => {
+            tracing::warn!(
+                channel_id = state.channel_id,
+                dispatch_id,
+                error = %error,
+                "failed to CAS-rebind restored dispatch"
+            );
+            RestoreDispatchRebindOutcome::NotRebound
+        }
     }
 }
 
@@ -2061,7 +2130,27 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         }
     }
 
+    // Durable tmux channel bindings cover DM sessions whose channel ID cannot be
+    // reconstructed from the `dm-<user_id>` session name after restart.
+    for session_name in &agent_sessions {
+        if name_to_channel.contains_key(*session_name) {
+            continue;
+        }
+        if let Some(channel_id) =
+            crate::services::tmux_common::read_tmux_channel_binding(session_name)
+        {
+            if let Some((_, channel_name)) = parse_provider_and_channel_from_tmux_name(session_name)
+            {
+                name_to_channel.insert(
+                    session_name.to_string(),
+                    (ChannelId::new(channel_id), channel_name),
+                );
+            }
+        }
+    }
+
     // If in-memory sessions don't cover all tmux sessions, fetch from Discord API
+    // (durable bindings above intentionally handle DMs before guild-only lookup).
     let unresolved: Vec<&&str> = agent_sessions
         .iter()
         .filter(|s| !name_to_channel.contains_key(**s))
@@ -2364,7 +2453,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
-        let current_gen = super::super::runtime_store::load_generation();
+        let current_gen = super::super::runtime_store::process_generation();
         if session_gen < current_gen && current_gen > 0 {
             // Skip sessions belonging to other runtimes
             let current_owner_marker = current_tmux_owner_marker();
@@ -2438,6 +2527,18 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             if let Some(restored_tmux) =
                 restored_watcher_turn_from_inflight(&state, session_name, false)
             {
+                let rebound =
+                    rebind_restored_dispatch_if_missing(shared.pg_pool.as_ref(), &state).await;
+                if rebound == RestoreDispatchRebindOutcome::NotRebound
+                    && consume_dispatched_origin_ghost_if_current(shared.pg_pool.as_ref(), &state)
+                        .await
+                {
+                    tracing::info!(
+                        channel_id = state.channel_id,
+                        "cleared orphaned dispatched-origin turn during watcher restore"
+                    );
+                    continue;
+                }
                 let finish_mailbox_on_completion =
                     super::super::recovery::reregister_active_turn_from_inflight(&shared, &state)
                         .await;
@@ -2528,7 +2629,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
 
-                        born_generation: super::super::runtime_store::load_generation(),
+                        born_generation: super::super::runtime_store::process_generation(),
                     });
 
             if session.session_id.is_none() && persisted_session_id.is_some() {
@@ -2796,10 +2897,46 @@ mod restored_session_cwd_channel_isolation_tests {
     //! share one `session_key`, and without the `channel_id = $2` predicate the
     //! recovering channel would recover into the OTHER channel's working tree.
     //! RED before the predicate was added, GREEN after.
-    use super::load_restored_session_cwd;
+    use super::{
+        RestoreDispatchRebindOutcome, consume_dispatched_origin_ghost_if_current,
+        load_restored_session_cwd, rebind_restored_dispatch_if_missing,
+    };
     use crate::db::auto_queue::test_support::TestPostgresDb;
+    use crate::db::dispatched_sessions::{HookSessionUpsert, upsert_hook_session_pg};
     use crate::services::discord::adk_session::build_namespaced_session_key;
     use crate::services::provider::ProviderKind;
+
+    async fn write_turn_start_marker(
+        pool: &sqlx::PgPool,
+        session_key: &str,
+        channel_id: u64,
+        turn_nonce: &str,
+        dispatched_origin: bool,
+    ) {
+        upsert_hook_session_pg(
+            pool,
+            HookSessionUpsert {
+                session_key,
+                instance_id: None,
+                agent_id: None,
+                provider: "claude",
+                status: "turn_active",
+                session_info: None,
+                model: None,
+                tokens: None,
+                cwd: None,
+                active_dispatch_id: None,
+                thread_channel_id: None,
+                channel_id: Some(&channel_id.to_string()),
+                claude_session_id: None,
+                raw_provider_session_id: None,
+                turn_start_nonce: Some(turn_nonce),
+                dispatched_origin,
+            },
+        )
+        .await
+        .expect("write turn-start marker");
+    }
 
     async fn seed_session(
         pool: &sqlx::PgPool,
@@ -2817,6 +2954,234 @@ mod restored_session_cwd_channel_isolation_tests {
         .execute(pool)
         .await
         .expect("seed sessions row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_dispatch_rebinds_valid_dispatch_with_cas() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let session_key = "claude/test/ghost-rebind-4642";
+        let channel_id = 464_200_001_u64;
+        let dispatch_id = "dispatch-4642-valid";
+        sqlx::query(
+            "INSERT INTO sessions (session_key, provider, status, channel_id, last_heartbeat)
+             VALUES ($1, 'claude', 'turn_active', $2, NOW())",
+        )
+        .bind(session_key)
+        .bind(channel_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("seed ghost session");
+        sqlx::query("INSERT INTO task_dispatches (id, status) VALUES ($1, 'dispatched')")
+            .bind(dispatch_id)
+            .execute(&pool)
+            .await
+            .expect("seed active dispatch");
+
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            channel_id,
+            Some("ghost-4642".to_string()),
+            7,
+            464_200_101,
+            464_200_102,
+            "ghost restore".to_string(),
+            Some(session_key.to_string()),
+            Some("AgentDesk-claude-ghost-4642".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.session_key = Some(session_key.to_string());
+        state.dispatch_id = Some(dispatch_id.to_string());
+        state.turn_nonce = Some("rebind-valid-4642".to_string());
+        sqlx::query("UPDATE sessions SET active_turn_nonce = $2 WHERE session_key = $1")
+            .bind(session_key)
+            .bind("rebind-valid-4642")
+            .execute(&pool)
+            .await
+            .expect("seed matching rebind nonce");
+        assert_eq!(
+            rebind_restored_dispatch_if_missing(Some(&pool), &state).await,
+            RestoreDispatchRebindOutcome::Rebound,
+            "a valid inflight dispatch must CAS-rebind the missing session link"
+        );
+        let linked: Option<String> =
+            sqlx::query_scalar("SELECT active_dispatch_id FROM sessions WHERE session_key = $1")
+                .bind(session_key)
+                .fetch_one(&pool)
+                .await
+                .expect("load rebound dispatch");
+        assert_eq!(linked.as_deref(), Some(dispatch_id));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_dispatch_does_not_clobber_concurrently_linked_turn() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let session_key = "claude/test/dispatch-rebind-race-4642";
+        let channel_id = 464_200_002_u64;
+        let inflight_dispatch = "dispatch-4642-old";
+        let newer_dispatch = "dispatch-4642-new";
+        sqlx::query(
+            "INSERT INTO sessions (session_key, provider, status, channel_id, active_dispatch_id, last_heartbeat)
+             VALUES ($1, 'claude', 'turn_active', $2, $3, NOW())",
+        )
+        .bind(session_key)
+        .bind(channel_id.to_string())
+        .bind(newer_dispatch)
+        .execute(&pool)
+        .await
+        .expect("seed concurrently linked session");
+        sqlx::query("INSERT INTO task_dispatches (id, status) VALUES ($1, 'dispatched')")
+            .bind(inflight_dispatch)
+            .execute(&pool)
+            .await
+            .expect("seed restored dispatch");
+
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            channel_id,
+            Some("rebind-race-4642".to_string()),
+            7,
+            464_200_201,
+            464_200_202,
+            "restored dispatch".to_string(),
+            Some(session_key.to_string()),
+            Some("AgentDesk-claude-rebind-race-4642".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.session_key = Some(session_key.to_string());
+        state.dispatch_id = Some(inflight_dispatch.to_string());
+        assert_eq!(
+            rebind_restored_dispatch_if_missing(Some(&pool), &state).await,
+            RestoreDispatchRebindOutcome::NotRebound,
+            "the CAS must not overwrite a dispatch linked by a newer turn"
+        );
+        let linked: Option<String> =
+            sqlx::query_scalar("SELECT active_dispatch_id FROM sessions WHERE session_key = $1")
+                .bind(session_key)
+                .fetch_one(&pool)
+                .await
+                .expect("load preserved dispatch link");
+        assert_eq!(linked.as_deref(), Some(newer_dispatch));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatched_origin_ghost_marker_is_consumed_only_for_matching_turn() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let session_key = "claude/test/dispatched-origin-ghost-4642";
+        let channel_id = 464_200_004_u64;
+        let turn_nonce = "turn-nonce-4642";
+        write_turn_start_marker(&pool, session_key, channel_id, turn_nonce, true).await;
+        let marker: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT active_turn_nonce, dispatched_origin_turn_nonce FROM sessions WHERE session_key = $1",
+        )
+        .bind(session_key)
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted dispatched-origin marker");
+        assert_eq!(marker.0.as_deref(), Some(turn_nonce));
+        assert_eq!(marker.1.as_deref(), Some(turn_nonce));
+
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            channel_id,
+            Some("dispatched-origin-ghost-4642".to_string()),
+            7,
+            464_200_401,
+            464_200_402,
+            "orphaned dispatch".to_string(),
+            Some(session_key.to_string()),
+            Some("AgentDesk-claude-dispatched-origin-ghost-4642".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.session_key = Some(session_key.to_string());
+        state.turn_nonce = Some(turn_nonce.to_string());
+        // No runtime root is configured in this database mutation proof, so the
+        // identity-guarded clear reports Missing and is safe to consume.
+        assert!(consume_dispatched_origin_ghost_if_current(Some(&pool), &state).await);
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, active_dispatch_id, dispatched_origin_turn_nonce FROM sessions WHERE session_key = $1",
+        )
+        .bind(session_key)
+        .fetch_one(&pool)
+        .await
+        .expect("load consumed ghost");
+        assert_eq!(row.0, "idle");
+        assert!(row.1.is_none());
+        assert!(row.2.is_none());
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_restore_without_dispatch_is_untouched() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let session_key = "claude/test/interactive-restore-4642";
+        let channel_id = 464_200_003_u64;
+        let turn_nonce = "interactive-turn-4642";
+        write_turn_start_marker(&pool, session_key, channel_id, turn_nonce, false).await;
+        let marker: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT active_turn_nonce, dispatched_origin_turn_nonce FROM sessions WHERE session_key = $1",
+        )
+        .bind(session_key)
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted interactive marker");
+        assert_eq!(marker.0.as_deref(), Some(turn_nonce));
+        assert!(marker.1.is_none());
+
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            channel_id,
+            Some("interactive-4642".to_string()),
+            7,
+            464_200_301,
+            464_200_302,
+            "ordinary user question".to_string(),
+            Some(session_key.to_string()),
+            Some("AgentDesk-claude-interactive-4642".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.session_key = Some(session_key.to_string());
+        state.turn_nonce = Some(turn_nonce.to_string());
+        assert_eq!(
+            rebind_restored_dispatch_if_missing(Some(&pool), &state).await,
+            RestoreDispatchRebindOutcome::NotRebound,
+            "dispatch-less interactive inflight must retain ordinary restore behavior"
+        );
+        assert!(
+            !consume_dispatched_origin_ghost_if_current(Some(&pool), &state).await,
+            "dispatch-less interactive turn must fail closed without a dispatched-origin marker"
+        );
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, active_dispatch_id FROM sessions WHERE session_key = $1",
+        )
+        .bind(session_key)
+        .fetch_one(&pool)
+        .await
+        .expect("load interactive session after restore probe");
+        assert_eq!(row.0, "turn_active");
+        assert_eq!(row.1, None);
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -514,7 +514,7 @@ async fn terminal_delivery_timeout_cleanup_releases_mailbox_and_preserves_follow
             author_id: UserId::new(99),
             author_is_bot: false,
             message_id: MessageId::new(2001),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(2001)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -654,7 +654,7 @@ fn watchdog_timeout_path_releases_mailbox_via_finalizer_and_does_not_double_fina
                 author_id: UserId::new(99),
                 author_is_bot: false,
                 message_id: MessageId::new(6001),
-                queued_generation: crate::services::discord::runtime_store::load_generation(),
+                queued_generation: crate::services::discord::runtime_store::process_generation(),
                 source_message_ids: vec![MessageId::new(6001)],
                 source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -942,7 +942,7 @@ fn timeout_finalize_drains_reacquired_id_zero_wedge_for_live_pinned_turn() {
                 author_id: UserId::new(99),
                 author_is_bot: false,
                 message_id: MessageId::new(3600),
-                queued_generation: crate::services::discord::runtime_store::load_generation(),
+                queued_generation: crate::services::discord::runtime_store::process_generation(),
                 source_message_ids: vec![MessageId::new(3600)],
                 source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -4098,7 +4098,7 @@ mod delivery_lease_heartbeat {
 mod watcher_short_replace_controller {
     use super::super::terminal_long_chunks::{
         WatcherLongChunksLocals, apply_watcher_long_chunks_result,
-        deliver_long_chunks_via_controller,
+        deliver_long_chunks_via_controller, remember_ordered_long_chunks_footer_target,
     };
     use super::super::terminal_send::{
         WatcherShortReplaceLocals, WatcherShortReplaceResult, apply_watcher_short_replace_result,
@@ -4183,6 +4183,9 @@ mod watcher_short_replace_controller {
             _i: &'a crate::services::discord::Intervention,
             _o: &'a str,
             _h: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             panic!("unused on the short-replace path")
         }
@@ -4285,6 +4288,9 @@ mod watcher_short_replace_controller {
             _i: &'a crate::services::discord::Intervention,
             _o: &'a str,
             _h: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             panic!("unused on long chunks")
         }
@@ -4566,6 +4572,9 @@ mod watcher_short_replace_controller {
                 _i: &'a crate::services::discord::Intervention,
                 _o: &'a str,
                 _h: bool,
+                _dispatch_lease: Option<
+                    std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+                >,
             ) -> GatewayFuture<'a, Result<(), String>> {
                 panic!("unused")
             }
@@ -4754,6 +4763,7 @@ mod watcher_short_replace_controller {
                 run(&gw, &shared, &cell).await,
                 WatcherShortReplaceResult::DeliveredFallback {
                     edit_error: "edit failed".to_string(),
+                    replacement_anchor: None,
                 },
                 "CommitOnFallback maps SentFallbackAfterEditFailure → DeliveredFallback \
                      (advances, surfaces the replace identity + edit_error)"
@@ -4943,6 +4953,83 @@ mod watcher_short_replace_controller {
     }
 
     #[test]
+    fn ordered_long_chunks_footer_target_uses_tail_message_and_text_4822() {
+        let mut footer_target = None;
+        let relay_text = format!("{}tail", "a".repeat(2_000));
+        let expected_tail = crate::services::discord::formatting::split_message(&relay_text)
+            .pop()
+            .expect("long response has a tail chunk");
+
+        remember_ordered_long_chunks_footer_target(
+            true,
+            &mut footer_target,
+            Some(MessageId::new(9101)),
+            &relay_text,
+        );
+
+        let target = footer_target.expect("ordered chunks must register footer tail");
+        assert_eq!(target.msg_id, MessageId::new(9101));
+        assert_eq!(target.text, expected_tail);
+        assert!(target.text.ends_with("tail"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_controller_registers_tail_footer_target_4822() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let http = Arc::new(Http::new("test-token"));
+        let mut relay_ok = true;
+        let mut direct = false;
+        let mut visible = false;
+        let mut external = false;
+        let mut placeholder = Some(MessageId::new(MSG));
+        let mut restored = true;
+        let mut last_edit = String::from("streamed");
+        let mut frozen = Vec::new();
+        let mut footer_target = None;
+        let relay_text = format!("{}tail", "a".repeat(2_000));
+        let outcome = toc::DeliveryOutcome::Delivered {
+            committed_to: END,
+            replace_kind: None,
+            new_chunks: Some(toc::NewChunksDelivery {
+                first_message_id: Some(MessageId::new(9100)),
+                tail_message_id: Some(MessageId::new(9101)),
+                anchor_delete_error: None,
+            }),
+        };
+
+        apply_watcher_long_chunks_result(
+            outcome,
+            &http,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            &relay_text,
+            true,
+            &mut frozen,
+            None,
+            WatcherLongChunksLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct,
+                tui_direct_anchor_terminal_body_visible: &mut visible,
+                external_input_lease_consumed_by_relay: &mut external,
+                placeholder_msg_id: &mut placeholder,
+                placeholder_from_restored_inflight: &mut restored,
+                last_edit_text: &mut last_edit,
+                single_message_panel_footer_mode: true,
+                completion_footer_terminal_target: &mut footer_target,
+            },
+        )
+        .await;
+
+        assert!(
+            footer_target.is_some(),
+            "ordered chunks must register footer tail"
+        );
+    }
+
+    #[test]
     fn watcher_long_chunks_delete_failure_still_delivers() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
@@ -5005,6 +5092,7 @@ mod watcher_short_replace_controller {
             ch(),
             "AgentDesk-claude-8141",
             MessageId::new(MSG),
+            "ordered response",
             true,
             &mut frozen,
             None,
@@ -5016,6 +5104,8 @@ mod watcher_short_replace_controller {
                 placeholder_msg_id: &mut placeholder,
                 placeholder_from_restored_inflight: &mut restored,
                 last_edit_text: &mut last_edit,
+                single_message_panel_footer_mode: false,
+                completion_footer_terminal_target: &mut None,
             },
         )
         .await;
@@ -5212,10 +5302,20 @@ mod watcher_short_replace_controller {
         // committed — the legacy fallback arm (tmux_watcher.rs:6289-6372).
         let fb = run(WatcherShortReplaceResult::DeliveredFallback {
             edit_error: "edit failed".to_string(),
+            replacement_anchor: None,
         });
         assert!(
             !fb.footer_registered,
-            "fallback must NOT register the original as the completion-footer target (#2757)"
+            "fallback without a replacement anchor cannot register the original (#2757)"
+        );
+
+        let anchored = run(WatcherShortReplaceResult::DeliveredFallback {
+            edit_error: "edit failed".to_string(),
+            replacement_anchor: Some(MessageId::new(4_822_001)),
+        });
+        assert!(
+            anchored.footer_registered,
+            "fresh fallback must register its delivered replacement anchor"
         );
         assert!(
             !fb.committed,

@@ -29,8 +29,25 @@ use tool_arms::{
 };
 
 mod content_arms;
+#[cfg(test)]
+#[path = "stream_loop/expected_identity_tests.rs"]
+mod expected_identity_tests;
 mod message_conversion;
 mod tool_arms;
+
+fn refresh_stream_tick_expected_identity_after_handoff(
+    expected: &mut crate::services::discord::inflight::InflightTurnIdentity,
+    inflight_state: &InflightTurnState,
+    guarded_save_outcome: Option<crate::services::discord::inflight::GuardedSaveOutcome>,
+) {
+    if matches!(
+        guarded_save_outcome,
+        Some(crate::services::discord::inflight::GuardedSaveOutcome::Saved)
+    ) {
+        *expected =
+            crate::services::discord::inflight::InflightTurnIdentity::from_state(inflight_state);
+    }
+}
 
 pub(super) struct StreamLoopContext {
     pub(super) shared_owned: Arc<SharedData>,
@@ -220,21 +237,29 @@ pub(super) async fn run_stream_loop(
     let mut last_status_panel_edit = *state.last_status_panel_edit;
     let mut bridge_spans = *state.bridge_spans;
     let mut status_panel_generation = *state.status_panel_generation;
+    let mut stream_tick_expected_identity =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&inflight_state);
 
-    // #2289 cancel finalization helper. Both the pre-`try_recv` guard
-    // and the post-`try_recv` re-sample funnel through this so the
-    // cancellation bookkeeping (inflight sync, `cancelled = true`,
-    // background-child abort) stays in lock step and cannot drift.
-    // Implemented as a macro so it can mutate locals owned by the
-    // surrounding `while` body without moving them into a closure that
-    // would conflict with `&mut` borrows held elsewhere. The macro
-    // performs the bookkeeping; callers must follow with `break 'outer`
-    // (or be in a position where falling through hits the outer loop
-    // boundary) so the loop exits to the cancel post-processing path.
+    // #2289: both cancel guards share this macro to keep inflight sync, cancellation, and child abort atomic without closure borrow conflicts.
+    // Callers must then exit `'outer` (explicitly or by fallthrough) into cancel post-processing.
     macro_rules! finalize_cancel_inner {
         () => {{
+            let previous_restart_mode = inflight_state.restart_mode;
+            let previous_restart_generation = inflight_state.restart_generation;
             if sync_inflight_restart_mode_from_cancel(cancel_token.as_ref(), &mut inflight_state) {
-                let _ = save_inflight_state(&inflight_state);
+                let outcome =
+                    crate::services::discord::inflight::patch_restart_mode_if_matches_identity(
+                        &inflight_state,
+                        &stream_tick_expected_identity,
+                        previous_restart_mode,
+                        previous_restart_generation,
+                        "turn_bridge::stream_loop::cancel_restart_mode",
+                    );
+                refresh_stream_tick_expected_identity_after_handoff(
+                    &mut stream_tick_expected_identity,
+                    &inflight_state,
+                    Some(outcome),
+                );
             }
             cancelled = true;
             close_all_tracked_background_children(
@@ -386,6 +411,7 @@ pub(super) async fn run_stream_loop(
                                     gateway: &gateway,
                                     channel_id,
                                     provider: &provider,
+                                    expected_identity: &stream_tick_expected_identity,
                                     voice_progress_playback_channel_id,
                                     watcher_owns_assistant_relay,
                                     watcher_relay_available_for_turn,
@@ -673,9 +699,11 @@ pub(super) async fn run_stream_loop(
                                 },
                             )
                             .await;
-                            match outcome {
-                                RuntimeHandoffLoopOutcome::ContinueDraining => {}
-                            }
+                            refresh_stream_tick_expected_identity_after_handoff(
+                                &mut stream_tick_expected_identity,
+                                &inflight_state,
+                                outcome,
+                            );
                         }
                         StreamMessage::RuntimeReady { handoff } => {
                             let outcome = handle_runtime_handoff_loop_message(
@@ -706,9 +734,11 @@ pub(super) async fn run_stream_loop(
                                 },
                             )
                             .await;
-                            match outcome {
-                                RuntimeHandoffLoopOutcome::ContinueDraining => {}
-                            }
+                            refresh_stream_tick_expected_identity_after_handoff(
+                                &mut stream_tick_expected_identity,
+                                &inflight_state,
+                                outcome,
+                            );
                         }
                         StreamMessage::ProcessReady {
                             output_path,
@@ -747,9 +777,11 @@ pub(super) async fn run_stream_loop(
                                 },
                             )
                             .await;
-                            match outcome {
-                                RuntimeHandoffLoopOutcome::ContinueDraining => {}
-                            }
+                            refresh_stream_tick_expected_identity_after_handoff(
+                                &mut stream_tick_expected_identity,
+                                &inflight_state,
+                                outcome,
+                            );
                         }
                         StreamMessage::OutputOffset { offset } => {
                             let outcome = handle_runtime_handoff_loop_message(
@@ -780,9 +812,11 @@ pub(super) async fn run_stream_loop(
                                 },
                             )
                             .await;
-                            match outcome {
-                                RuntimeHandoffLoopOutcome::ContinueDraining => {}
-                            }
+                            refresh_stream_tick_expected_identity_after_handoff(
+                                &mut stream_tick_expected_identity,
+                                &inflight_state,
+                                outcome,
+                            );
                         }
                     }
                 }
@@ -818,6 +852,7 @@ pub(super) async fn run_stream_loop(
                 channel_id,
                 provider: &provider,
                 turn_id: turn_id.as_str(),
+                expected_identity: &stream_tick_expected_identity,
                 status_interval,
                 single_message_panel_footer_mode,
                 footer_owner,

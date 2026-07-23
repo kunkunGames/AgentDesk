@@ -84,6 +84,59 @@ async fn shared_for_provider(
         .await
 }
 
+/// #4790 `/resume` rebind (HTTP-side bridge): repoint the in-memory session for
+/// `channel_id` at a previous provider session, resolving the owning runtime via
+/// the registry. Returns `true` when a runtime owned the channel and the rebind
+/// was applied in memory (the DB rebind is done by the caller regardless, so a
+/// `false` here only means no live runtime mirror was updated — e.g. the channel
+/// is owned by another node). No-op safe when no runtime is registered.
+pub(crate) async fn rebind_channel_provider_session(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+    cwd: &str,
+    session_id: &str,
+) -> bool {
+    let Some(provider) = ProviderKind::from_str(provider_name) else {
+        return false;
+    };
+    let Some(shared) = shared_for_provider(registry, &provider, channel_id).await else {
+        return false;
+    };
+    let (previous_path, previous_session_id) =
+        discord::rebind_channel_session(&shared, &provider, channel_id, cwd, session_id).await;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        provider = provider.as_str(),
+        channel_id = channel_id.get(),
+        previous_path = previous_path.as_deref().unwrap_or("<none>"),
+        previous_session_id = previous_session_id.as_deref().unwrap_or("<none>"),
+        target_cwd = cwd,
+        target_session_id = session_id,
+        "  [{ts}] ↻ /resume: rebound in-memory session to previous provider session",
+    );
+    true
+}
+
+/// #4790 `/resume` guard: report whether `channel_id` has an active or
+/// recovery-blocking turn for `provider_name`. The rebind path refuses to
+/// repoint a channel that is mid-turn (its running tmux/provider process would
+/// keep writing to the OLD transcript). Returns `false` when no runtime owns the
+/// channel (nothing in flight here).
+pub(crate) async fn channel_has_active_turn(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+) -> bool {
+    let Some(provider) = ProviderKind::from_str(provider_name) else {
+        return false;
+    };
+    let Some(shared) = shared_for_provider(registry, &provider, channel_id).await else {
+        return false;
+    };
+    discord::mailbox_has_blocking_active_turn(&shared, channel_id).await
+}
+
 async fn owning_runtime_http_for_channel(
     registry: &HealthRegistry,
     provider: &ProviderKind,
@@ -942,11 +995,12 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ExplicitBackgroundWatchdogClear {
     clear_outcome: discord::inflight::GuardedClearOutcome,
     pending_hourglass_user_msg_id: Option<u64>,
     finalizer_turn_id: u64,
+    claim_snapshot: Option<discord::turn_finalizer::SyntheticClaimSnapshot>,
 }
 
 fn revalidate_and_clear_explicit_background_inflight(
@@ -960,6 +1014,7 @@ fn revalidate_and_clear_explicit_background_inflight(
             clear_outcome: discord::inflight::GuardedClearOutcome::Missing,
             pending_hourglass_user_msg_id: None,
             finalizer_turn_id: 0,
+            claim_snapshot: None,
         };
     };
     let finalizer_turn_id = snapshot_finalizer_turn_id.unwrap_or(snapshot_identity.user_msg_id);
@@ -968,18 +1023,24 @@ fn revalidate_and_clear_explicit_background_inflight(
             clear_outcome: discord::inflight::GuardedClearOutcome::UserMsgMismatch,
             pending_hourglass_user_msg_id: None,
             finalizer_turn_id,
+            claim_snapshot: None,
         };
     }
-    let clear_outcome = discord::inflight::clear_inflight_state_if_matches_identity(
-        provider,
-        channel_id.get(),
-        snapshot_identity,
-    );
+    let (clear_outcome, removed_row) =
+        discord::inflight::clear_inflight_state_if_matches_identity_returning_row(
+            provider,
+            channel_id.get(),
+            snapshot_identity,
+        );
+    let claim_snapshot = removed_row
+        .as_ref()
+        .map(discord::turn_finalizer::SyntheticClaimSnapshot::from_row);
     ExplicitBackgroundWatchdogClear {
         clear_outcome,
         pending_hourglass_user_msg_id: (snapshot_identity.user_msg_id != 0)
             .then_some(snapshot_identity.user_msg_id),
         finalizer_turn_id,
+        claim_snapshot,
     }
 }
 
@@ -1769,6 +1830,7 @@ pub(crate) async fn run_stall_watchdog_pass(
             let generation = shared.restart.current_generation;
             let shared_for_submit = shared.clone();
             let provider_for_submit = provider.clone();
+            let claim_snapshot = revalidated.claim_snapshot.clone();
             let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
                 &shared,
                 provider,
@@ -1778,7 +1840,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                 move || async move {
                     shared_for_submit
                         .turn_finalizer
-                        .submit_terminal(
+                        .submit_terminal_with_claim_snapshot(
                             discord::turn_finalizer::TurnKey::new(
                                 channel_id,
                                 finalizer_turn_id,
@@ -1787,6 +1849,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                             provider_for_submit,
                             discord::turn_finalizer::TerminalEvent::Cancel,
                             discord::turn_finalizer::FinalizeContext::monitor(),
+                            claim_snapshot,
                             shared_for_submit.clone(),
                         )
                         .await
@@ -3196,6 +3259,63 @@ mod stall_watchdog_pure_tests {
     }
 
     #[test]
+    fn explicit_background_watchdog_clear_returns_reanchored_removed_row_snapshot() {
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let _env = TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tempdir.path(),
+        );
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_340_101);
+        let mut state = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            None,
+            1,
+            4_340_102,
+            4_340_103,
+            "explicit background".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-4340-watchdog".to_string()),
+            Some("/tmp/issue-4340-watchdog.jsonl".to_string()),
+            None,
+            10,
+        );
+        state.status_message_id = Some(4_340_104);
+        inflight::save_inflight_state(&state).expect("save watchdog row");
+        let identity = InflightTurnIdentity::from_state(&state);
+        let stale_snapshot = inflight::load_inflight_state(&provider, channel_id.get())
+            .map(|row| {
+                crate::services::discord::turn_finalizer::SyntheticClaimSnapshot::from_row(&row)
+            })
+            .expect("load pre-reanchor snapshot");
+        assert_eq!(stale_snapshot.status_message_id, Some(4_340_104));
+
+        state.status_message_id = Some(4_340_105);
+        state.status_panel_generation = 2;
+        inflight::save_inflight_state(&state).expect("re-anchor same identity before clear");
+
+        let outcome = revalidate_and_clear_explicit_background_inflight(
+            &provider,
+            channel_id,
+            Some(&identity),
+            Some(state.effective_finalizer_turn_id()),
+        );
+
+        assert_eq!(outcome.clear_outcome, GuardedClearOutcome::Cleared);
+        assert_eq!(
+            outcome
+                .claim_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.status_message_id),
+            Some(4_340_105)
+        );
+        assert!(inflight::load_inflight_state(&provider, channel_id.get()).is_none());
+    }
+
+    #[test]
     fn idle_tmux_stale_turn_clear_preserves_fresh_inflight_after_finish_window() {
         let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -4264,7 +4384,7 @@ mod stall_watchdog_auto_heal_tests {
                 category_name: None,
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
-                born_generation: crate::services::discord::runtime_store::load_generation(),
+                born_generation: crate::services::discord::runtime_store::process_generation(),
             },
         );
     }
@@ -5176,7 +5296,7 @@ mod hard_stop_completion_event_tests {
             author_id: UserId::new(id),
             author_is_bot: false,
             message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -5745,6 +5865,7 @@ mod explicit_background_watchdog_cleanup_tests {
             clear_outcome: GuardedClearOutcome::Cleared,
             pending_hourglass_user_msg_id: Some(4_019_402_901),
             finalizer_turn_id: 4_019_402_901,
+            claim_snapshot: None,
         };
         let order = Arc::new(Mutex::new(Vec::new()));
 

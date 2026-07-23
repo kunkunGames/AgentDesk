@@ -11,6 +11,8 @@ use crate::services::provider::ProviderKind;
 pub(crate) enum QueuedAdmissionDisposition {
     Admitted(AdmittedQueuedIntake),
     Deferred,
+    RejectedNonPortableAttachment,
+    RejectedRestore,
 }
 
 pub(crate) struct AdmittedQueuedIntake {
@@ -29,6 +31,7 @@ pub(crate) async fn admit_queued_intake(
     defer_watcher_resume: bool,
     wait_for_completion: bool,
     backstop_reason: &'static str,
+    dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
 ) -> QueuedAdmissionDisposition {
     let submission = IntakeSubmission {
         provider,
@@ -58,17 +61,54 @@ pub(crate) async fn admit_queued_intake(
     let local_permit = match admission {
         IntakeAdmission::Local(permit) => Some(permit),
         IntakeAdmission::Forwarded { .. } | IntakeAdmission::SkippedDuplicate => None,
+        IntakeAdmission::Blocked {
+            reason:
+                reason @ (crate::services::cluster::intake_router_hook::IntakeBlockedReason::NonPortableAttachmentForeignOwner { .. }
+                | crate::services::cluster::intake_router_hook::IntakeBlockedReason::NonPortableAttachmentRoutedTarget { .. }),
+        } => {
+            // A queued local-path upload can never become portable through
+            // retry. Notify once and consume it instead of front-requeueing it
+            // forever without user-visible recovery guidance.
+            super::notice::notify_blocked_intake(deps, &submission, &reason).await;
+            super::super::super::mailbox_abandon_pending_dispatch(
+                deps.shared,
+                &submission.provider,
+                channel_id,
+                intervention.message_id,
+            )
+            .await;
+            return QueuedAdmissionDisposition::RejectedNonPortableAttachment;
+        }
         IntakeAdmission::DeferredOpenRoute { .. } | IntakeAdmission::Blocked { .. } => {
-            // `requeue_front` also consumes the actor's pending-dispatch
-            // reservation, matching the existing hosted-TUI pre-drain defer.
-            // Both queue entrypoints call this before marker/card teardown.
-            super::super::super::mailbox_requeue_intervention_front(
+            let Some(dispatch_lease) = dispatch_lease else {
+                tracing::error!(
+                    provider = submission.provider.as_str(),
+                    channel_id = channel_id.get(),
+                    "queued admission defer is missing its dispatch lease"
+                );
+                return QueuedAdmissionDisposition::RejectedRestore;
+            };
+            let restored = super::super::super::mailbox_restore_dequeued_head(
                 deps.shared,
                 &submission.provider,
                 channel_id,
                 intervention.clone(),
+                dispatch_lease,
             )
             .await;
+            if !restored.enqueued {
+                tracing::error!(
+                    provider = submission.provider.as_str(),
+                    channel_id = channel_id.get(),
+                    refusal_reason = restored
+                        .refusal_reason
+                        .map(|reason| reason.as_str())
+                        .unwrap_or("none"),
+                    persistence_error = restored.persistence_error.as_deref().unwrap_or("none"),
+                    "queued admission defer rejected dequeued-head restore"
+                );
+                return QueuedAdmissionDisposition::RejectedRestore;
+            }
             super::super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
                 deps.shared,
                 &submission.provider,

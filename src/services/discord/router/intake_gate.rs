@@ -338,12 +338,6 @@ pub(in crate::services::discord) async fn handle_event(
                     )
                     .await;
                 }
-                if super::super::steering::is_steer_cancel_custom_id(&component.data.custom_id) {
-                    return super::super::steering::handle_steer_cancel_interaction(
-                        ctx, component, data,
-                    )
-                    .await;
-                }
                 if super::super::commands::is_node_picker_custom_id(&component.data.custom_id) {
                     let settings_snapshot = { data.shared.settings.read().await.clone() };
                     if !super::super::provider_handles_channel(
@@ -854,7 +848,16 @@ pub(in crate::services::discord) async fn handle_event(
                         }
                     }
                 }
-                super::message_handler::handle_file_upload(ctx, new_message, &data.shared).await?
+                let attachments = super::message_handler::describe_attachments(new_message);
+                let permit = super::message_handler::LocalAttachmentPreparationPermit::preserving_existing_intake_order();
+                super::message_handler::prepare_admitted_local_attachment(
+                    ctx,
+                    channel_id,
+                    &attachments,
+                    &data.shared,
+                    &permit,
+                )
+                .await?
             } else {
                 Vec::new()
             };

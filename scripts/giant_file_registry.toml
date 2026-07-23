@@ -158,7 +158,6 @@ grandfathered_baseline_paths = [
   "src/services/settings.rs",
   "src/services/tui_prompt_dedupe.rs",
   "src/services/turn_orchestrator.rs",
-  "src/voice/receiver.rs",
 ]
 
 # All former grandfathered paths were promoted to explicit tracked decisions in #4519.
@@ -620,18 +619,21 @@ owner = "server-runtime"
 deadline = "2027-01-31"
 decompose_issue = "#4710"
 
-[[entry]]
-file = "src/voice/receiver.rs"
-decision = "shrink"
-owner = "voice-runtime"
-deadline = "2027-01-31"
-decompose_issue = "#4713"
 
 # Tracked giant decisions. `decision = "shrink"` requires owner + deadline
 # (YYYY-MM-DD) + decompose_issue; `decision = "keep"` requires owner +
 # keep_reason and must omit deadline/decompose_issue. Existing entries that omit
 # decision are legacy shrink entries. The generator renders these into the
 # registry doc and rejects ghost registrations.
+
+[[entry]]
+# Standby JSONL relay has completion draining, terminal response selection, and
+# identity-guarded delivery in one module; split its polling and delivery paths
+# without changing durable cursor or result-first semantics.
+file = "src/services/discord/standby_relay.rs"
+owner = "discord-relay"
+decision = "keep"
+keep_reason = "Completion draining, terminal response selection, and identity-guarded delivery share one durable cursor contract; preserve the cohesive verified relay boundary until a scoped split is planned."
 
 [[entry]]
 # #3721 first-batch promotion: largest relay hotfile by prod LoC, raw ratchet
@@ -708,21 +710,6 @@ file = "src/services/codex_tui/rollout_tail.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
-
-[[entry]]
-# Highest prod-LoC voice surface; flagship decomposition target from #3036.
-file = "src/services/discord/voice_barge_in.rs"
-owner = "voice-runtime"
-deadline = "2026-08-31"
-decompose_issue = "#4713"
-
-[[entry]]
-# Crossed the 1000-prod-LoC threshold when #3034 restored per-item dead_code
-# reasoning on the runtime-gated voice announcement durability helpers.
-file = "src/voice/announce_meta.rs"
-owner = "voice-runtime"
-deadline = "2026-08-31"
-decompose_issue = "#4713"
 
 [[entry]]
 # Crossed the 1000-prod-LoC threshold when #3017 re-landed the single

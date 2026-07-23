@@ -68,7 +68,6 @@ use self::rebind_reap::{
     reap_dead_watcher_rebind_origin_locked, reap_dead_watcher_rebind_origin_locked_in_root,
     reap_orphan_inflight_locks_in_root, should_reap_dead_watcher_rebind_origin,
 };
-
 mod removal;
 pub(crate) use self::removal::invalidate_stale_generation;
 use self::removal::load_inflight_states_from_root;
@@ -128,8 +127,9 @@ mod save_store;
 // `super::persist_under_lock_preserving_updated_at` and the CAS children resolve
 // `validate_inflight_state_for_save` (via `use super::*`) unchanged.
 use self::store::{
-    load_inflight_state_unlocked, persist_under_lock, persist_under_lock_preserving_updated_at,
-    validate_inflight_state_for_save, validate_inflight_state_for_save_with_delivery_rewind_reason,
+    load_inflight_state_unlocked, persist_readopted_under_lock, persist_under_lock,
+    persist_under_lock_preserving_updated_at, validate_inflight_state_for_save,
+    validate_inflight_state_for_save_with_delivery_rewind_reason,
 };
 
 // Save cluster re-exports (original visibility mirrored). The save child declares
@@ -141,8 +141,9 @@ pub(super) use self::save_store::{
 };
 pub(in crate::services::discord) use self::save_store::{
     GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
+    clear_long_running_placeholder_if_matches_identity,
     mark_readopted_from_inflight_if_identity_unchanged,
-    patch_restart_full_response_if_identity_unchanged,
+    patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
     recovery_anchor_msg_id_if_matches_identity,
@@ -152,7 +153,8 @@ pub(in crate::services::discord) use self::save_store::{
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
     save_inflight_state_if_identity_matches_allow_output_restamp,
     save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
-    stamp_claude_e_process_if_matches_identity,
+    stamp_claude_e_process_if_matches_identity, stamp_runtime_handoff_if_matches_identity,
+    touch_inflight_state_if_matches_identity,
 };
 // Explicit-root save seams reached only by the parent's / siblings' test modules.
 #[cfg(test)]
@@ -169,9 +171,11 @@ pub(crate) use self::clear_store::{
     request_inflight_abandon_if_matches_zero_owned,
 };
 pub(in crate::services::discord) use self::clear_store::{
+    archive_inflight_state_if_matches_identity_generation,
     clear_inflight_state_if_matches_identity,
     clear_inflight_state_if_matches_identity_after_delivery,
     clear_inflight_state_if_matches_identity_generation,
+    clear_inflight_state_if_matches_identity_returning_row,
     clear_inflight_state_if_matches_identity_turn_nonce,
     clear_lifecycle_inflight_state_if_matches_identity_after_death_evidence,
     clear_rebind_origin_inflight_state_if_matches_identity,
@@ -483,8 +487,15 @@ pub(super) fn mark_all_inflight_states_restart_mode(
     provider: &ProviderKind,
     restart_mode: InflightRestartMode,
 ) -> usize {
+    mark_all_inflight_states_restart_mode_checked(provider, restart_mode).unwrap_or(0)
+}
+
+pub(super) fn mark_all_inflight_states_restart_mode_checked(
+    provider: &ProviderKind,
+    restart_mode: InflightRestartMode,
+) -> Result<usize, String> {
     let Some(root) = inflight_runtime_root() else {
-        return 0;
+        return Err("runtime root unavailable".to_string());
     };
     // #3860 — set restart_mode via a per-row lock-RMW instead of blind-saving
     // the unlocked snapshot. `load_inflight_states_from_root` reads each row
@@ -504,9 +515,15 @@ pub(super) fn mark_all_inflight_states_restart_mode(
         let path = inflight_state_path(&root, provider, state.channel_id);
         if set_inflight_restart_mode_under_lock(&path, restart_mode) {
             updated += 1;
+        } else {
+            return Err(format!(
+                "failed to persist restart mode for provider={} channel_id={}",
+                provider.as_str(),
+                state.channel_id
+            ));
         }
     }
-    updated
+    Ok(updated)
 }
 
 /// #3860 — RMW the restart-mode marker on one inflight row under its flock.
@@ -4516,7 +4533,7 @@ mod wave_a_cleanup_tests {
         // With the root isolated to `temp` (no generation file → 0), the load
         // path's `stale_removal_reason` planned-restart branch hits its
         // generation-match arm and does not auto-evict.
-        let current_runtime_gen = super::super::runtime_store::load_generation();
+        let current_runtime_gen = super::super::runtime_store::process_generation();
 
         let mut planned = make_state(601, 33);
         planned.set_restart_mode(InflightRestartMode::DrainRestart);

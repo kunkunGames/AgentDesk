@@ -57,15 +57,25 @@ fn intake_dispatch_invariant_direct_execution_body_has_no_external_producer_call
 
 #[test]
 fn intake_dispatch_invariant_worker_post_claim_is_the_only_router_bypass() {
-    let worker_boundary = include_str!("../message_handler/intake_turn.rs");
-    assert!(!worker_boundary.contains("dispatch_text_intake("));
-    assert!(!worker_boundary.contains("admit_text_intake("));
-    assert!(!worker_boundary.contains("try_route_intake("));
-    assert!(!worker_boundary.contains("IntakeSubmission {"));
+    // The worker boundary spans the intake body module plus its extracted
+    // worker entry seam (intake_turn/worker_entry.rs, split out in #4743).
+    let worker_body = include_str!("../message_handler/intake_turn.rs");
+    let worker_entry = include_str!("../message_handler/intake_turn/worker_entry.rs");
+    for source in [worker_body, worker_entry] {
+        assert!(!source.contains("dispatch_text_intake("));
+        assert!(!source.contains("admit_text_intake("));
+        assert!(!source.contains("try_route_intake("));
+        assert!(!source.contains("IntakeSubmission {"));
+    }
     assert_eq!(
-        worker_boundary.matches("handle_text_message(").count(),
-        2,
-        "the worker boundary must contain only its direct call plus the body definition"
+        worker_body.matches("handle_text_message(").count(),
+        1,
+        "the worker body module must contain only the body definition"
+    );
+    assert_eq!(
+        worker_entry.matches("handle_text_message(").count(),
+        1,
+        "the extracted worker entry must contain only its direct post-claim call"
     );
     assert_eq!(
         include_str!("../message_handler.rs")
@@ -234,7 +244,7 @@ fn request(channel_id: ChannelId, message_id: u64, text: &str) -> IntakeRequest 
 }
 
 fn queued_intervention(message_id: u64, pending_uploads: Vec<String>) -> Intervention {
-    let queued_generation = crate::services::discord::runtime_store::load_generation();
+    let queued_generation = crate::services::discord::runtime_store::process_generation();
     Intervention {
         author_id: UserId::new(4350),
         author_is_bot: false,
@@ -420,11 +430,16 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
         false,
         false,
         "owner_affinity_queue_test",
+        None,
     )
     .await
     {
         QueuedAdmissionDisposition::Admitted(admitted) => admitted,
-        QueuedAdmissionDisposition::Deferred => panic!("live foreign owner should forward"),
+        QueuedAdmissionDisposition::Deferred
+        | QueuedAdmissionDisposition::RejectedNonPortableAttachment
+        | QueuedAdmissionDisposition::RejectedRestore => {
+            panic!("live foreign owner should forward")
+        }
     };
     super::finish_admitted_queued_intake(&deps, admitted, &intervention)
         .await
@@ -455,7 +470,7 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
+async fn queued_foreign_attachment_is_rejected_without_requeue_pg() {
     let _env = ScopedIntakeTestEnv::enforce();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -480,20 +495,16 @@ async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
             false,
             false,
             "owner_affinity_attachment_test",
+            None,
         )
         .await,
-        QueuedAdmissionDisposition::Deferred
+        QueuedAdmissionDisposition::RejectedNonPortableAttachment
     ));
 
     let snapshot = shared.mailbox(channel_id).snapshot().await;
-    assert_eq!(snapshot.intervention_queue.len(), 1);
-    assert_eq!(
-        snapshot.intervention_queue[0].message_id,
-        intervention.message_id
-    );
-    assert_eq!(
-        snapshot.intervention_queue[0].pending_uploads,
-        vec![local_path]
+    assert!(
+        snapshot.intervention_queue.is_empty(),
+        "a nonportable queued attachment must be consumed, not requeued forever"
     );
     assert!(
         shared.core.lock().await.sessions.is_empty(),
@@ -511,8 +522,8 @@ async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
             .restart
             .deferred_hook_backlog
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "blocked queued intake arms exactly one slow lost-wakeup backstop"
+        0,
+        "a rejected attachment must not arm a retry backstop"
     );
 
     pool.close().await;
@@ -548,17 +559,31 @@ async fn distinct_open_route_requeues_queued_successor_pg() {
     .expect("predecessor forwards");
 
     let successor = queued_intervention(4_350_412, Vec::new());
+    let persistence = crate::services::discord::queue_persistence_context(
+        &shared,
+        &ProviderKind::Claude,
+        channel_id,
+    );
+    shared
+        .mailbox(channel_id)
+        .replace_queue(vec![successor.clone()], persistence.clone())
+        .await;
+    let dequeued = shared.mailbox(channel_id).take_next_soft(persistence).await;
+    let intervention = dequeued
+        .intervention
+        .expect("queued successor must be dequeued before admission");
     assert!(matches!(
         admit_queued_intake(
             &deps,
             ProviderKind::Claude,
             channel_id,
-            &successor,
-            successor.author_id,
+            &intervention,
+            intervention.author_id,
             "successor-owner".to_string(),
             false,
             false,
             "owner_affinity_open_route_test",
+            dequeued.dispatch_lease,
         )
         .await,
         QueuedAdmissionDisposition::Deferred

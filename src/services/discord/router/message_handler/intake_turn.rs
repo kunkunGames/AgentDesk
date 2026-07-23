@@ -6,18 +6,17 @@ use super::super::super::turn_view_reconciler::{
 use super::voice_announcement_route::route_voice_transcript_announcement_once;
 use super::*;
 
+mod adk_thread;
 mod claim_bootstrap;
-mod race_loss;
+pub(crate) mod inflight_create_log;
+pub(super) mod race_loss;
 mod stale_dispatch_guard;
+mod steering_hook;
 mod turn_watchdog;
 mod voice_intake;
+mod worker_entry;
 
-/// Queue-marker reactions to strip when a queued turn is promoted to active.
-/// The promotion point only knows the head message id, so it clears every
-/// marker the queue gate can add (standalone, merged, and reconcile-gate).
-pub(super) const fn queue_pending_reactions_to_clear() -> [char; 3] {
-    super::super::super::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS
-}
+pub(crate) use worker_entry::{IntakeRequest, execute_intake_turn_core};
 
 /// Bundle of Discord-runtime dependencies that `handle_text_message`
 /// reads from outside its per-message parameters. Phase 2-pre.2 of
@@ -43,79 +42,6 @@ pub(in crate::services::discord) struct IntakeDeps<'a> {
     pub token: &'a str,
 }
 
-/// Per-message inputs of `handle_text_message` bundled into a single
-/// owned struct. Phase 2-pre.3 of intake-node-routing: lets worker-side
-/// callers (`execute_intake_turn_core`) accept a single deserialized
-/// row from `intake_outbox` instead of 13 positional parameters.
-///
-/// All fields mirror the `intake_outbox` payload columns (see
-/// migrations/postgres/0052_intake_node_routing.sql) and the per-message
-/// parameters of the legacy 13-arg `handle_text_message` signature.
-/// Adding a column to `intake_outbox` means adding a field here.
-#[derive(Clone, Debug)]
-pub(crate) struct IntakeRequest {
-    pub channel_id: ChannelId,
-    pub user_msg_id: MessageId,
-    pub request_owner: UserId,
-    pub request_owner_name: String,
-    pub user_text: String,
-    pub reply_to_user_message: bool,
-    pub defer_watcher_resume: bool,
-    pub wait_for_completion: bool,
-    pub merge_consecutive: bool,
-    pub reply_context: Option<String>,
-    pub has_reply_boundary: bool,
-    pub dm_hint: Option<bool>,
-    pub turn_kind: TurnKind,
-    pub preserve_on_cancel: bool,
-}
-
-/// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
-/// of intake-node-routing: this is the public surface a worker node will
-/// invoke after claiming an `intake_outbox` row from its target queue. Pass
-/// the runtime primitives the worker has (`Arc<Http>`, `Arc<SharedData>`,
-/// bot token) plus the deserialized message payload; the function constructs
-/// `IntakeDeps` with `cache: None` and `ctx_for_chained_dispatch: None`
-/// (workers have no live gateway shard) and delegates to the existing
-/// intake body.
-///
-/// Leader producers use `router::intake_dispatch`; a claimed worker bypasses
-/// admission so it cannot recursively create another outbox row.
-pub(crate) async fn execute_intake_turn_core(
-    http: &Arc<serenity::http::Http>,
-    shared: &Arc<SharedData>,
-    token: &str,
-    request: IntakeRequest,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    handle_text_message(
-        &IntakeDeps {
-            http,
-            cache: None,
-            ctx_for_chained_dispatch: None,
-            shared,
-            token,
-        },
-        request.channel_id,
-        request.user_msg_id,
-        request.request_owner,
-        &request.request_owner_name,
-        &request.user_text,
-        request.reply_to_user_message,
-        request.defer_watcher_resume,
-        request.wait_for_completion,
-        request.merge_consecutive,
-        request.reply_context,
-        request.has_reply_boundary,
-        request.dm_hint,
-        request.turn_kind,
-        request.preserve_on_cancel,
-        Vec::new(),
-        // Worker dispatch has no in-process gate carry-forward; it re-resolves
-        // the durable announcement row for its `user_msg_id` (#3905).
-        None,
-    )
-    .await
-}
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_text_message(
     deps: &IntakeDeps<'_>,
@@ -133,6 +59,7 @@ pub(super) async fn handle_text_message(
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
     preserve_on_cancel: bool,
+    queued_drain: bool,
     preloaded_uploads: Vec<String>,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<(), Error> {
@@ -526,27 +453,26 @@ pub(super) async fn handle_text_message(
                             .unwrap_or_else(|| canonical.clone());
                         {
                             let mut data = shared.core.lock().await;
-                            let session =
-                                data.sessions
-                                    .entry(channel_id)
-                                    .or_insert_with(|| DiscordSession {
-                                        session_id: None,
-                                        memento_context_loaded: false,
-                                        memento_reflected: false,
-                                        current_path: None,
-                                        history: Vec::new(),
-                                        pending_uploads: Vec::new(),
-                                        cleared: false,
-                                        channel_name: None,
-                                        category_name: None,
-                                        remote_profile_name: None,
-                                        channel_id: Some(channel_id.get()),
-                                        last_active: tokio::time::Instant::now(),
-                                        worktree: None,
+                            let session = data.sessions.entry(channel_id).or_insert_with(|| {
+                                DiscordSession {
+                                    session_id: None,
+                                    memento_context_loaded: false,
+                                    memento_reflected: false,
+                                    current_path: None,
+                                    history: Vec::new(),
+                                    pending_uploads: Vec::new(),
+                                    cleared: false,
+                                    channel_name: None,
+                                    category_name: None,
+                                    remote_profile_name: None,
+                                    channel_id: Some(channel_id.get()),
+                                    last_active: tokio::time::Instant::now(),
+                                    worktree: None,
 
-                                        born_generation:
-                                            super::super::super::runtime_store::load_generation(),
-                                    });
+                                    born_generation:
+                                        super::super::super::runtime_store::process_generation(),
+                                }
+                            });
                             session.current_path = Some(eff_path.clone());
                             session.channel_name = ch_name;
                             session.category_name = cat_name;
@@ -1138,20 +1064,20 @@ pub(super) async fn handle_text_message(
         fast_mode_channel_id,
     )
     .await;
-    refresh_session_strategy_after_pending_reset(
-        shared,
-        channel_id,
-        &mut session_id,
-        &mut memento_context_loaded,
-        &mut session_strategy_reason,
-    )
-    .await;
     let prompt_prep_started = std::time::Instant::now();
 
-    // Resolve channel/tmux session name from current session state. We need the
-    // persisted provider session_id before recall so external memory can scope by run_id.
-    let (channel_name, tmux_session_name) =
-        resolve_channel_tmux_names(shared, &provider, channel_id).await;
+    let state = (
+        current_path,
+        session_id,
+        memento_context_loaded,
+        session_strategy_reason,
+    );
+    let runtime = resolve_channel_runtime_for_launch(shared, &provider, channel_id, state).await;
+    current_path = runtime.0;
+    session_id = runtime.1;
+    memento_context_loaded = runtime.2;
+    session_strategy_reason = runtime.3;
+    let (channel_name, tmux_session_name) = (runtime.4, runtime.5);
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider, None).await;
     let turn_goal_kind = if !dispatch_reset_provider_state && !dispatch_recreate_tmux {
         classify_codex_goal_command_for_provider(
@@ -1286,9 +1212,14 @@ pub(super) async fn handle_text_message(
         cancel_token.clone(),
         request_owner,
         user_msg_id,
-        stale_busy_context(
+        intake_claim_context(
+            adk_session_key.as_deref(),
             &provider,
-            [adk_session_key.as_deref(), tmux_session_name.as_deref()],
+            tmux_session_name.as_deref(),
+            &mut current_path,
+            &mut session_id,
+            &mut memento_context_loaded,
+            &mut session_strategy_reason,
         ),
     )
     .await;
@@ -1374,7 +1305,7 @@ pub(super) async fn handle_text_message(
     // never reacted the user message). A redundant remove is a no-op, so this
     // composes safely with the entrypoint drains.
     if queued_placeholder_handoff.is_some() && !turn_kind.is_background_trigger() {
-        for emoji in queue_pending_reactions_to_clear() {
+        for emoji in crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS {
             queue_marker::note_removed_current(
                 shared,
                 http,
@@ -1808,14 +1739,7 @@ pub(super) async fn handle_text_message(
     // #3813 Phase 1a: prompt prep complete — this mark sits INSIDE the
     // `[prompt-prep]` window below (overlaps it; do not sum — see latency_spans.rs).
     intake_latency.mark_prep_done();
-    let provider_label = match &provider {
-        ProviderKind::Claude => "claude",
-        ProviderKind::Codex => "codex",
-        ProviderKind::Gemini => "gemini",
-        ProviderKind::OpenCode => "opencode",
-        ProviderKind::Qwen => "qwen",
-        ProviderKind::Unsupported(_) => "unsupported",
-    };
+    let provider_label = provider.as_str();
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts}] [prompt-prep] channel={} provider={} dispatch={} memory_backend={} reused_session={} duration_ms={}",
@@ -1883,16 +1807,8 @@ pub(super) async fn handle_text_message(
         channel_name.as_deref(),
         Some(&current_path),
     );
-    let adk_thread_channel_id = adk_session_name
-        .as_deref()
-        .and_then(super::super::super::adk_session::parse_thread_channel_id_from_name)
-        .or_else(|| {
-            shared
-                .dispatch
-                .thread_parents
-                .contains_key(&channel_id)
-                .then_some(channel_id.get())
-        });
+    let adk_thread_channel_id =
+        adk_thread::resolve_channel_id(adk_session_name.as_deref(), shared, channel_id);
     // #222: DB-based dispatch lookup takes priority over text parsing.
     // In unified threads, user_text may contain a stale DISPATCH: prefix
     // from a previous dispatch in the same thread. DB lookup uses the
@@ -1956,6 +1872,35 @@ pub(super) async fn handle_text_message(
     };
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
+    #[cfg(unix)]
+    if let Some(result) =
+        steering_hook::maybe_handle_intake_steering(steering_hook::IntakeSteeringContext {
+            http,
+            shared,
+            token,
+            channel_id,
+            user_msg_id,
+            placeholder_msg_id,
+            provider: &provider,
+            provider_label,
+            tmux_session_name: tmux_session_name.as_deref(),
+            current_path: &current_path,
+            session_id: session_id.as_deref(),
+            user_text,
+            cancel_token: &cancel_token,
+            intake_latency: &intake_latency,
+            foreground: matches!(turn_kind, TurnKind::Foreground),
+            local: remote_profile.is_none(),
+            wait_for_completion,
+            queued_drain,
+            has_dispatch: dispatch_id.is_some() || dispatch_id_for_thread.is_some(),
+            is_voice_announcement,
+            has_pending_uploads: !pending_uploads.is_empty(),
+        })
+        .await
+    {
+        return result;
+    }
     #[cfg(unix)]
     let mut recapture_offset_after_busy_wait = false;
     // #2416: compute claude_tui busy-followup diagnostic with a wait+retry step.
@@ -2032,16 +1977,6 @@ pub(super) async fn handle_text_message(
                         );
                     }
                 }
-                // #3813 Phase 3 (§4 / AC#6): make the safe up-to-45s readiness
-                // wait visible so it doesn't look like a stalled session start.
-                // Borrow before `wait_readiness` moves into spawn_blocking below.
-                let _ = super::super::super::http::edit_channel_message(
-                    http,
-                    channel_id,
-                    placeholder_msg_id,
-                    readiness_wait_compact_status(&wait_readiness),
-                )
-                .await;
                 let wait_result =
                     tokio::task::spawn_blocking(move || {
                         match wait_readiness {
@@ -2176,35 +2111,25 @@ pub(super) async fn handle_text_message(
                 .await
                 .intervention_queue
                 .len();
-        let queued_card_rendered = false;
-        if enqueue_outcome.enqueued {
-            race_loss::mailbox_reaction::note_busy_tui_pre_submit_queue_pending(
+        let retry_present_or_accepted = busy_retry::finalize_enqueue(
+            busy_retry::FinalizeEnqueueContext {
                 shared,
                 http,
+                provider: &provider,
                 channel_id,
                 user_msg_id,
-                enqueue_outcome.merged,
-                turn_start_attempt,
-            )
-            .await;
-            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
-        } else {
-            apply_tui_busy_enqueue_refusal(
-                shared,
-                http,
-                &provider,
-                channel_id,
                 placeholder_msg_id,
-                session_retry_context.as_ref(),
-                feedback_reminder.as_deref(),
-                wip_warning.as_deref(),
-                enqueue_outcome.refusal_reason,
-            )
-            .await;
-            tv_clear_current(shared, http, channel_id, user_msg_id, "intake_busy_queue").await;
-        }
+                turn_start_attempt,
+                session_retry_context: session_retry_context.as_ref(),
+                feedback_reminder: feedback_reminder.as_deref(),
+                wip_warning: wip_warning.as_deref(),
+            },
+            &enqueue_outcome,
+        )
+        .await;
+        let queued_card_rendered = false;
         let queue_kickoff_scheduled =
-            queue_kickoff_scheduled_by_release || enqueue_outcome.enqueued;
+            queue_kickoff_scheduled_by_release || retry_present_or_accepted;
         let mut diagnostic_json = diagnostic.to_json();
         if let Some(object) = diagnostic_json.as_object_mut() {
             object.insert(
@@ -2369,13 +2294,14 @@ pub(super) async fn handle_text_message(
     if is_voice_announcement {
         inflight_state.source = crate::dispatch::Source::Voice;
     }
-    // Persist identifiers for long-turn diagnostics (#130)
     inflight_state.session_key = adk_session_key.clone();
     inflight_state.dispatch_id = dispatch_id.clone();
-    if let Err(e) = save_inflight_state(&inflight_state) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!("  [{ts}]   ⚠ inflight state save failed: {e}");
-    }
+    inflight_create_log::record_turn_start_origin(&provider, channel_id, &inflight_state).await;
+    inflight_create_log::log_create_new_inflight_outcome(
+        super::super::super::inflight::save_inflight_state_create_new(&inflight_state),
+        &provider,
+        &inflight_state,
+    );
 
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
@@ -2697,27 +2623,29 @@ mod tui_busy_pre_submit_queue_reaction_tests {
             .find("claude_tui follow-up queued because hosted TUI is busy before prompt submission")
             .expect("hosted-TUI busy pre-submit queue branch exists");
         let busy_branch = &module_src[..busy_branch_pos];
-        let enqueue_pos = busy_branch
-            .rfind("enqueue_busy_tui_followup_for_retry(")
-            .expect("busy pre-submit branch enqueues the follow-up");
-        let accepted_guard_pos = busy_branch[enqueue_pos..]
-            .find("if enqueue_outcome.enqueued {")
-            .map(|offset| enqueue_pos + offset)
+        assert!(
+            busy_branch.contains("busy_retry::finalize_enqueue("),
+            "busy pre-submit branch must route enqueue finalization through the shared helper"
+        );
+
+        let helper_src = include_str!("busy_retry.rs");
+        let accepted_guard_pos = helper_src
+            .find("if outcome.enqueued {")
             .expect("busy pre-submit reaction must be gated on accepted enqueue");
         let accepted_helper = "note_busy_tui_pre_submit_queue_pending(";
-        let refusal_guard = "} else {\n            apply_tui_busy_enqueue_refusal(";
-        let accepted_clear =
-            "tv_clear_current(shared, http, channel_id, user_msg_id, \"intake_busy_queue\")";
-        let refusal_guard_pos = busy_branch[accepted_guard_pos..]
+        let refusal_guard =
+            "} else {\n        super::tui_followup::apply_tui_busy_enqueue_refusal(";
+        let accepted_clear = "note_intake_turn_cleared_current(";
+        let refusal_guard_pos = helper_src[accepted_guard_pos..]
             .find(refusal_guard)
             .map(|offset| accepted_guard_pos + offset)
             .expect("busy pre-submit enqueue refusal branch exists");
-        let reaction_call_pos = busy_branch[accepted_guard_pos..refusal_guard_pos]
+        let reaction_call_pos = helper_src[accepted_guard_pos..refusal_guard_pos]
             .find(accepted_helper)
             .map(|offset| accepted_guard_pos + offset)
             .expect("accepted busy pre-submit enqueue must apply a queue-pending reaction");
-        let accepted_branch = &busy_branch[accepted_guard_pos..refusal_guard_pos];
-        let refusal_branch = &busy_branch[refusal_guard_pos..];
+        let accepted_branch = &helper_src[accepted_guard_pos..refusal_guard_pos];
+        let refusal_branch = &helper_src[refusal_guard_pos..];
 
         assert!(
             accepted_guard_pos < reaction_call_pos,
@@ -2844,9 +2772,9 @@ mod recovery_context_take_order_tests {
         // The refusal else-branch must route through the sibling helper, which
         // puts the taken recovery context back BEFORE rewriting the refusal
         // notice (put-back-then-notice ordering pinned in tui_followup.rs).
-        let module_src = include_str!("intake_turn.rs");
-        module_src
-            .find("} else {\n            apply_tui_busy_enqueue_refusal(")
+        let finalize_src = include_str!("busy_retry.rs");
+        finalize_src
+            .find("} else {\n        super::tui_followup::apply_tui_busy_enqueue_refusal(")
             .expect("TUI-busy enqueue refusal routes through the put-back helper");
 
         let helper_src = include_str!("tui_followup.rs");
@@ -2925,15 +2853,13 @@ mod feedback_reminder_take_order_tests {
         // The refusal branch forwards the taken reminder to the sibling helper,
         // which puts it back BEFORE rewriting the refusal notice (mirroring the
         // recovery-context put-back-then-notice ordering).
-        let module_src = include_str!("intake_turn.rs");
+        let finalize_src = include_str!("busy_retry.rs");
         // The `\n` escape resolves to a real newline, which only the production
         // call site contains — this test's own copy of the snippet stores it as
         // the two characters `\n`, so the search does not self-match (same trick
         // the recovery-context refusal test relies on).
         assert!(
-            module_src.contains(
-                "session_retry_context.as_ref(),\n                feedback_reminder.as_deref(),"
-            ),
+            finalize_src.contains("session_retry_context,\n            feedback_reminder,"),
             "refusal call site must forward the taken reminder for put-back, right after the recovery context"
         );
 
@@ -2961,7 +2887,7 @@ mod queue_pending_reaction_clear_tests {
 
     #[test]
     fn clears_every_queue_marker_reaction() {
-        let emojis = queue_pending_reactions_to_clear();
+        let emojis = crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS;
         assert!(
             emojis.contains(&'📬'),
             "standalone queue-head 📬 must be cleared on dequeue"
@@ -2986,7 +2912,7 @@ mod queue_pending_reaction_clear_tests {
     /// emoji the dequeue path will not later remove.
     #[test]
     fn cleared_set_covers_every_intake_gate_queue_reaction() {
-        let cleared = queue_pending_reactions_to_clear();
+        let cleared = crate::services::discord::queue_reactions::QUEUE_PENDING_REACTION_EMOJIS;
         for merged in [false, true] {
             let added = crate::services::discord::router::intake_gate::queue_pending_reaction_for(
                 crate::services::discord::MailboxEnqueueOutcome {

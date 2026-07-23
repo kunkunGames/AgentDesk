@@ -50,6 +50,7 @@ from scripts.relay_watchdog import (
     Config,
     ConfigError,
     CoverageActivityProbe,
+    CoverageTranscriptProbe,
     Runtime,
     TranscriptCandidate,
     WatcherStateProbe,
@@ -80,6 +81,7 @@ from scripts.relay_watchdog import (
     select_watch_transcript_with_reason,
     selector_divergence_confirmed,
     tick_channel,
+    tick_coverage,
     tick_pg_tunnel,
 )
 
@@ -2823,6 +2825,114 @@ class TickChannelTests(unittest.TestCase):
             any("커버리지 불변식 위반" in body for body, _ in rt.alerts)
         )
         self.assertIn("last_coverage_alert", state["999"])
+
+    def test_growth_lag_with_zero_loss_and_recent_relay_suppresses_alert(self):
+        rt = self.make_rt()
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
+        probe = self.active_foreground_probe(
+            queue_depth=1,
+            last_outbound_activity_ms=None,
+            last_relay_ts_ms=int(tick_at * 1000) - 1,
+        )
+        self.arm_coverage(rt, probe)
+        state = {
+            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
+            "coverage_desync_since": self.now,
+        }
+
+        tick_coverage(
+            rt,
+            TICK_CHANNEL,
+            state,
+            tick_at,
+            CoverageTranscriptProbe(growing=True, blocks=723, lost=0),
+        )
+
+        self.assertEqual(rt.alerts, [])
+        self.assertNotIn("last_coverage_alert", state)
+        self.assertTrue(any("growth lag" in line for line in rt.log_lines))
+
+    def test_growth_with_loss_still_alerts_desync_coverage(self):
+        rt = self.make_rt()
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
+        probe = self.active_foreground_probe(
+            queue_depth=1,
+            last_outbound_activity_ms=None,
+            last_relay_ts_ms=int(tick_at * 1000) - 1,
+        )
+        self.arm_coverage(rt, probe)
+        state = {
+            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
+            "coverage_desync_since": self.now,
+        }
+
+        tick_coverage(
+            rt,
+            TICK_CHANNEL,
+            state,
+            tick_at,
+            CoverageTranscriptProbe(growing=True, blocks=723, lost=1),
+        )
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("attached_but_desynced", rt.alerts[0][0])
+
+    def test_growth_with_stale_relay_timestamp_still_alerts(self):
+        rt = self.make_rt()
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
+        stale_relay_ms = (
+            int(tick_at * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
+        )
+        probe = self.active_foreground_probe(
+            queue_depth=1,
+            last_outbound_activity_ms=None,
+            last_relay_ts_ms=stale_relay_ms,
+        )
+        self.arm_coverage(rt, probe)
+        state = {
+            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
+            "coverage_desync_since": self.now,
+        }
+
+        tick_coverage(
+            rt,
+            TICK_CHANNEL,
+            state,
+            tick_at,
+            CoverageTranscriptProbe(growing=True, blocks=723, lost=0),
+        )
+
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("attached_but_desynced", rt.alerts[0][0])
+
+    def test_tick_channel_wires_growth_lag_evidence_into_coverage(self):
+        self.write_transcript([(self.now - 30, "delivered initial")])
+        rt = self.make_rt(poll_secs=60)
+        rt.haystack = norm("delivered initial selector growth")
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
+        self.arm_coverage(
+            rt,
+            self.active_foreground_probe(
+                queue_depth=1,
+                last_outbound_activity_ms=None,
+                last_relay_ts_ms=int(tick_at * 1000) - 1,
+            ),
+        )
+        transcript = self.proj_dir / "s.jsonl"
+        state = {
+            "999": {
+                SELECTED_TRANSCRIPT_KEY: str(transcript),
+                "transcript_sizes": {str(transcript): transcript.stat().st_size},
+                "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
+                "coverage_desync_since": self.now,
+            }
+        }
+        self._grow_selected_transcript()
+
+        tick_channel(rt, TICK_CHANNEL, state, tick_at)
+
+        self.assertEqual(rt.alerts, [])
+        self.assertTrue(any("growth lag" in line for line in rt.log_lines))
 
     def test_active_foreground_evidence_cannot_suppress_detached_alert(self):
         rt = self.make_rt()
@@ -6036,9 +6146,17 @@ class DeploymentWiringTests(unittest.TestCase):
         # — never abort a healthy deploy or skip manifest/peer propagation.
         self.assertIn("_install_relay_watchdog_plist", deploy)
         self.assertIn("Relay watchdog plist write FAILED", deploy)
-        # Deploy-window suppression contract: deploy must touch the marker the
-        # watchdog checks before restarting dcserver.
-        self.assertIn("relay-watchdog.deploy-marker", deploy)
+        # Planned restarts must not hide real transcript gaps. Deploy first
+        # obtains the runtime's durable frontier acknowledgement, and it retains
+        # an unchanged watchdog process instead of resetting observation state.
+        self.assertIn("request_restart_drain_mode_or_fail", deploy)
+        self.assertIn("wait_for_restart_persistence_or_fail", deploy)
+        self.assertNotIn(
+            'touch "$ADK_REL/logs/relay-watchdog.deploy-marker"', deploy
+        )
+        self.assertIn("WATCHDOG_SCRIPT_CHANGED", deploy)
+        self.assertIn("WATCHDOG_PLIST_CHANGED", deploy)
+        self.assertIn("durable authority uninterrupted", deploy)
 
     def test_watchdog_is_portable_path_linted(self):
         checker = (REPO_ROOT / "scripts" / "check-portable-paths.py").read_text(

@@ -446,7 +446,32 @@
   before merging.
 
 ### Audited touches
+- #4756 blocking filesystem isolation: routine script reload scans remain inside the existing worker-local routine runtime and per-request validation paths, while startup dashboard provisioning and session-resume discovery retain their existing node-local paths. Moving those synchronous directory walks to Tokio's blocking pool changes no leader election, PG lease, worker placement, durable ownership, or cross-node routing authority.
+- #4340 r3 finalizer-panel ownership fencing remains worker-local: watchdog clear now returns the row removed under the existing per-channel inflight flock, and durable terminal-card records bind message IDs to turn episode plus panel/save revisions. No PostgreSQL schema, lease, leader election, cross-node routing, or owner placement authority changes.
+- #4777 PR-1 channel owner-authority rollout scope: `owner_authority_channel_ids`
+  is a live-read, raw top-level Discord channel allowlist used only to tag the
+  leader-owned intake planner's structured telemetry. It does not activate the
+  dormant owner-record authority, mutate PG ownership, alter worker placement,
+  or change Observe/Enforce admission behavior; later rollout PRs own those
+  authority changes. The environment mode override cannot populate or bypass
+  this YAML-only channel scope.
+- #4799 discrete machine-trigger markers: the watcher converts only footer-owned background terminal notifications into an idempotent lifecycle outbox marker keyed by channel plus semantic event identity; card-owned subagent notifications remain card-only, and monitor notices retain their existing offset-scoped aggregation. This adds no lease, owner, schema, or cross-node routing authority.
+- #4779 target preflight: added a pure fail-closed readiness report and transfer guard over worker-node capability evidence; owner mutation remains delegated to the generation-fenced handoff interface.
 
+- #4800 PostgreSQL pool-starvation fix: the existing `policy-tick` and
+  `github-sync` session advisory locks retain lock IDs 7,801,001 and 7,801,002
+  and the same singleton critical sections, but each lock now owns a dedicated
+  PostgreSQL connection instead of pinning a node-local runtime-pool slot across
+  nested database work or GitHub CLI network I/O. The runtime-pool acquire
+  deadline rises from 3s to 10s as burst margin. Classification:
+  **leader-only/singleton behavior unchanged, worker-local pool capacity freed**;
+  this changes no leader election, lock key, shared-row authority, routing rule,
+  or failover semantics.
+- #4781 text-only routed attachment contract: leader-side `intake_router_hook.rs` rejects gateway-local attachment paths before a foreign-owner, `/node`, or preferred-label outbox insert. Queued nonportable uploads are notice-and-drop rather than indefinitely requeued; this changes no leader election, worker lease, or durable owner authority.
+- #4785 Claude TUI readiness classification is worker-local to one session-bound
+  pane/transcript pair. Extracting foreground busy evidence and transcript-aware
+  timeout diagnostics changes no leader election, PG lease, cross-node routing,
+  durable ownership, or provider-session placement behavior.
 - #4706 structural lint debt backfill: item-level Clippy annotations and their checked-in occurrence ratchet change no runtime ownership, leader election, PG lease, or multinode routing behavior.
 - #4515 worker-local recovery supervision: `src/server/worker_recovery.rs` owns
   bounded restart handling for the worker-local dispatch-outbox and session-discovery
@@ -550,8 +575,9 @@
   authority, PG lease, or leader-only side effect changes.
 - #4249 PostgreSQL bootstrap timeout hardening runs migration/reseed on an eager
   startup pool with a 10s acquire deadline, then eagerly activates the separate
-  runtime pool with the original 3s deadline before the shared six-attempt
-  retry/alert envelope can succeed. Typed `sqlx::Error::PoolTimedOut` failures
+  runtime pool before the shared six-attempt retry/alert envelope can succeed.
+  The runtime deadline was originally 3s and became 10s in #4800. Typed
+  `sqlx::Error::PoolTimedOut` failures
   get timestamped, source-attributed bootstrap diagnostics.
   Classification: **worker-local** — every node owns its own connection pool,
   wait budget, retry loop, and stderr; this changes no shared row, schema,
@@ -561,8 +587,8 @@
   gateway subscriptions plus the only destructive `ReactionRemove` intake
   route. This narrows connection-level event intake on every node; it does not
   change gateway lease acquisition, singleton ownership, worker routing, or
-  node-local/shared-Postgres authority. Explicit authenticated `/steer` and
-  `/stop` cancellation remain on their existing owners.
+  node-local/shared-Postgres authority. Explicit authenticated `/stop`
+  cancellation remains on its existing owner.
 
 - #4424 message_outbox source-contract recovery: the protected
   `GET /api/message-outbox/failed` inspection route is read-only on any control

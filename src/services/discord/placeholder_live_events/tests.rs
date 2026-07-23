@@ -369,7 +369,7 @@ fn status_panel_turn_completed_renders_foreground_completion() {
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 완료"));
+    assert!(rendered.starts_with("-# ✅ 완료"));
     assert!(!rendered.contains("🟢 진행 중"));
 }
 
@@ -410,7 +410,7 @@ fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
         },
     );
     let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(done.starts_with("✅ 완료"), "final activity: {done:?}");
+    assert!(done.starts_with("-# ✅ 완료"), "final activity: {done:?}");
     assert!(!done.contains("신뢰도"));
 }
 
@@ -500,7 +500,7 @@ fn status_panel_turn_completed_after_monitor_wait_renders_background_completion(
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 백그라운드 완료"));
+    assert!(rendered.starts_with("-# ✅ 백그라운드 완료"));
     assert!(!rendered.contains("💤 monitor 대기"));
 }
 
@@ -531,7 +531,7 @@ fn status_panel_turn_completed_after_aborted_tool_renders_terminal_completion() 
         }
     );
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(rendered.starts_with("✅ 완료"));
+    assert!(rendered.starts_with("-# ✅ 완료"));
     assert!(!rendered.contains("🟢 진행 중"));
 }
 
@@ -3339,6 +3339,95 @@ fn carried_residual_entries_finalize_by_exact_tool_use_id_on_latest_state() {
     assert!(done_block.contains("Exact carried bash ✓"));
     assert!(done_block.contains("Exact carried agent — exact agent complete ✓"));
     assert!(!done_block.contains('⠼'));
+}
+
+#[test]
+fn panel_cache_invalidation_is_targeted_and_one_shot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_340_001);
+    let other_channel_id = ChannelId::new(4_340_002);
+
+    assert!(!events.panel_cache_invalidation_pending(channel_id, 91));
+    assert_eq!(events.panel_cache_invalidation_epoch(channel_id, 91), None);
+
+    events.invalidate_panel_cache(channel_id, 91);
+    let epoch = events
+        .panel_cache_invalidation_epoch(channel_id, 91)
+        .expect("invalidation epoch");
+    assert!(events.panel_cache_invalidation_pending(channel_id, 91));
+    assert!(!events.panel_cache_invalidation_pending(channel_id, 92));
+    assert!(!events.panel_cache_invalidation_pending(other_channel_id, 91));
+    assert!(events.clear_panel_cache_invalidation_if_epoch(channel_id, 91, epoch));
+    assert!(!events.clear_panel_cache_invalidation_if_epoch(channel_id, 91, epoch));
+}
+
+#[test]
+fn newer_panel_cache_invalidation_survives_stale_clear() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_340_004);
+    let message_id = 94;
+
+    events.invalidate_panel_cache(channel_id, message_id);
+    let first_epoch = events
+        .panel_cache_invalidation_epoch(channel_id, message_id)
+        .expect("first epoch");
+    events.invalidate_panel_cache(channel_id, message_id);
+    let second_epoch = events
+        .panel_cache_invalidation_epoch(channel_id, message_id)
+        .expect("second epoch");
+    assert_ne!(first_epoch, second_epoch);
+    assert!(!events.clear_panel_cache_invalidation_if_epoch(channel_id, message_id, first_epoch,));
+    assert_eq!(
+        events.panel_cache_invalidation_epoch(channel_id, message_id),
+        Some(second_epoch)
+    );
+}
+
+#[test]
+fn panel_cache_invalidation_forces_byte_stable_render_once() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_340_003);
+    let message_id = 93;
+    let cached = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let byte_stable = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert_eq!(byte_stable, cached);
+
+    let should_edit_without_signal = byte_stable != cached;
+    assert!(!should_edit_without_signal);
+
+    events.invalidate_panel_cache(channel_id, message_id);
+    let forced_epoch = events.panel_cache_invalidation_epoch(channel_id, message_id);
+    let should_edit_with_signal = forced_epoch.is_some() || byte_stable != cached;
+    assert!(should_edit_with_signal);
+    assert!(events.clear_panel_cache_invalidation_if_epoch(
+        channel_id,
+        message_id,
+        forced_epoch.expect("forced epoch"),
+    ));
+    assert_eq!(
+        events.panel_cache_invalidation_epoch(channel_id, message_id),
+        None
+    );
+}
+
+#[test]
+fn failed_panel_edit_keeps_invalidation_for_retry() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_340_005);
+    let message_id = 95;
+
+    events.invalidate_panel_cache(channel_id, message_id);
+    let epoch = events
+        .panel_cache_invalidation_epoch(channel_id, message_id)
+        .expect("retry epoch");
+    let edit_succeeded = false;
+    if edit_succeeded {
+        events.clear_panel_cache_invalidation_if_epoch(channel_id, message_id, epoch);
+    }
+    assert_eq!(
+        events.panel_cache_invalidation_epoch(channel_id, message_id),
+        Some(epoch)
+    );
 }
 
 #[test]
@@ -8871,10 +8960,10 @@ fn status_panel_free_renderer_orders_header_fields_on_separate_lines() {
     assert_eq!(
         out.lines().take(4).collect::<Vec<_>>(),
         vec![
-            "🟢 진행 중",
-            "턴 트리거: https://discord.com/channels/1/2/3",
-            "턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)",
-            "마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)",
+            "-# 🟢 진행 중",
+            "-# 턴 트리거: https://discord.com/channels/1/2/3",
+            "-# 턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)",
+            "-# 마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)",
         ],
         "header must render as four consecutive lines: {out:?}"
     );
@@ -8887,7 +8976,7 @@ fn status_panel_free_renderer_orders_header_fields_on_separate_lines() {
     );
     assert!(
         out.contains(
-            "턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)"
+            "-# 턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n-# 마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)"
         ),
         "time fields must occupy separate consecutive lines: {out:?}"
     );

@@ -1681,10 +1681,6 @@ fn prepare_codex_tui_launch_script(
         tmux_session_name,
         prompt,
     );
-    if let Some(channel_id) = report_channel_id {
-        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
-    }
-
     Ok(CodexTuiLaunchScript {
         script_path,
         owner_path,
@@ -1883,6 +1879,9 @@ fn execute_streaming_local_tui_tmux(
         report_provider,
         warm_followup_enabled,
     )?;
+    if let Some(channel_id) = report_channel_id {
+        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
+    }
 
     let tmux_result = crate::services::platform::tmux::create_session(
         tmux_session_name,
@@ -2422,7 +2421,7 @@ fn execute_streaming_local_tmux(
     // Stamp generation marker so post-restart watcher restore can detect old sessions
     let gen_marker_path =
         crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
-    let current_gen = crate::services::discord::runtime_store::load_generation();
+    let current_gen = crate::services::discord::runtime_store::process_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
 
     // #3087: stamp a per-spawn nonce in a SEPARATE marker (see claude.rs). The

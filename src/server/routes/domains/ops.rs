@@ -205,6 +205,14 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 post(dispatched_sessions::kill_tmux_session),
             )
             .route(
+                "/sessions/{session_key}/reconcile-stale-turn",
+                post(dispatched_sessions::reconcile_stale_turn),
+            )
+            .route(
+                "/sessions/{session_key}/resume-previous",
+                post(dispatched_sessions::resume_previous_session),
+            )
+            .route(
                 "/sessions/{session_key}/idle-recap",
                 post(idle_recap::post_idle_recap),
             )

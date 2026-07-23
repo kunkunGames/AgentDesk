@@ -1,6 +1,7 @@
 pub(crate) mod cluster;
 pub(crate) mod cluster_session_routing;
 pub(crate) mod cron_catalog;
+mod dashboard_provision;
 pub mod dto;
 pub(crate) mod issue_specs;
 pub(crate) mod maintenance;
@@ -22,8 +23,9 @@ use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
 use serde::Serialize;
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgPool, Row};
+
+use crate::db::postgres::AdvisoryLockLease;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tower_http::services::{ServeDir, ServeFile};
@@ -119,29 +121,12 @@ async fn try_acquire_pg_singleton_lock(
     pool: &PgPool,
     lock_id: i64,
     job_name: &str,
-) -> std::result::Result<Option<PoolConnection<Postgres>>, String> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|error| format!("{job_name} acquire advisory lock connection: {error}"))?;
-    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|error| format!("{job_name} try advisory lock: {error}"))?;
-    if acquired { Ok(Some(conn)) } else { Ok(None) }
+) -> std::result::Result<Option<AdvisoryLockLease>, String> {
+    AdvisoryLockLease::try_acquire(pool, lock_id, job_name).await
 }
 
-async fn release_pg_singleton_lock(
-    mut conn: PoolConnection<Postgres>,
-    lock_id: i64,
-    job_name: &str,
-) {
-    if let Err(error) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .execute(&mut *conn)
-        .await
-    {
+async fn release_pg_singleton_lock(lease: AdvisoryLockLease, lock_id: i64, job_name: &str) {
+    if let Err(error) = lease.unlock().await {
         tracing::warn!("[{job_name}] failed to release advisory lock {lock_id}: {error}");
     }
 }
@@ -391,33 +376,7 @@ pub(crate) async fn run(
         .map(|r| r.join("dashboard/dist"))
         .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
 
-    // Auto-provision: if runtime dist is missing, copy from workspace source
-    if !dashboard_dir.join("index.html").exists() {
-        let workspace_dist =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard/dist");
-        if workspace_dist.join("index.html").exists() {
-            tracing::info!(
-                "Dashboard dist missing at {:?}, copying from workspace {:?}",
-                dashboard_dir,
-                workspace_dist
-            );
-            if let Some(parent) = dashboard_dir.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Remove stale dist dir if it exists but is incomplete
-            let _ = std::fs::remove_dir_all(&dashboard_dir);
-            match copy_dir_recursive(&workspace_dist, &dashboard_dir) {
-                Ok(n) => tracing::info!("Dashboard dist copied ({n} files)"),
-                Err(e) => tracing::warn!("Failed to copy dashboard dist: {e}"),
-            }
-        } else {
-            tracing::warn!(
-                "Dashboard dist not found at {:?} or {:?} — dashboard will be unavailable",
-                dashboard_dir,
-                workspace_dist
-            );
-        }
-    }
+    dashboard_provision::provision_off_runtime(dashboard_dir.clone()).await;
 
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);
 
@@ -614,6 +573,21 @@ async fn policy_tick_loop(
         if count % 2 == 0 {
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick1min", "1min").await;
             if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
+                match crate::services::stale_turn_reconciler::reconcile_stale_turns_pg(pool).await {
+                    Ok(reconciled) if reconciled > 0 => {
+                        tracing::warn!(
+                            reconciled,
+                            "[policy-tick] reconciled stale busy sessions blocking mailbox injection"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "[policy-tick] stale busy session reconcile failed: {error}"
+                        );
+                    }
+                }
+
                 match crate::reconcile::reconcile_auto_queue_pending_delivery_orphans_pg(pool).await
                 {
                     Ok(stats) if stats.touched() => {
@@ -1994,24 +1968,6 @@ async fn github_sync_loop(pg_pool: Arc<PgPool>, interval_minutes: u64) {
     }
 }
 
-/// Recursively copy a directory tree. Returns the number of files copied.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
-    std::fs::create_dir_all(dst)?;
-    let mut count = 0;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dest_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            count += copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path)?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// Async worker that drains the message_outbox table via the in-process Discord delivery path (#120).
 /// Runs every 2 seconds, processes up to 10 messages per tick.
 #[derive(Clone, Debug)]
@@ -3120,18 +3076,28 @@ async fn routine_runtime_loop(
     let _routine_action_validator: fn(serde_json::Value) -> anyhow::Result<RoutineAction> =
         crate::services::routines::validate_routine_action;
 
-    let script_loader = match RoutineScriptLoader::new() {
-        Ok(loader) => loader,
+    let routine_script_dirs = routines_config.script_dirs();
+    let initial_script_dirs = routine_script_dirs.clone();
+    let script_loader = match tokio::task::spawn_blocking(move || {
+        let loader = Arc::new(RoutineScriptLoader::new()?);
+        let count = loader.load_dirs(&initial_script_dirs)?;
+        Ok::<_, anyhow::Error>((loader, count))
+    })
+    .await
+    {
+        Ok(Ok((loader, count))) => {
+            tracing::info!(count, "routine script registry initialized");
+            loader
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "routine runtime not started: script registry initialization failed");
+            return;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "routine runtime not started: script loader init failed");
+            tracing::warn!(error = %e, "routine runtime not started: script registry blocking task failed");
             return;
         }
     };
-    let routine_script_dirs = routines_config.script_dirs();
-    match script_loader.load_dirs(&routine_script_dirs) {
-        Ok(count) => tracing::info!(count, "routine script registry initialized"),
-        Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
-    }
 
     let store = RoutineStore::new_with_timezone_and_checkpoint_limit(
         pg_pool.clone(),
@@ -3200,12 +3166,20 @@ async fn routine_runtime_loop(
             Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
         }
         if routines_config.hot_reload {
-            match script_loader.load_dirs(&routine_script_dirs) {
-                Ok(count) if count > 0 => {
+            let reload_dirs = routine_script_dirs.clone();
+            let loader = Arc::clone(&script_loader);
+            match tokio::task::spawn_blocking(move || loader.load_dirs(&reload_dirs)).await {
+                Ok(Ok(count)) if count > 0 => {
                     tracing::debug!(count, "routine script registry hot-reload pass complete")
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "routine script registry hot-reload failed")
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "routine script registry hot-reload blocking task failed"
+                ),
             }
         }
         // #3564: surface routines that have been stuck in `paused` past the

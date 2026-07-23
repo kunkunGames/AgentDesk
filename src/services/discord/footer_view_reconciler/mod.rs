@@ -165,7 +165,7 @@ struct CompletedFooterPlan {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_turn_completed_footer(
+async fn prepare_turn_completed_footer(
     shared: &SharedData,
     channel_id: ChannelId,
     terminal_msg_id: Option<MessageId>,
@@ -191,6 +191,28 @@ fn prepare_turn_completed_footer(
     let completion_block = super::turn_end_wip_warning::merge_turn_end_wip_warning(
         rendered.block.unwrap_or_default(),
         wip_warning,
+    );
+    let inflight_started_at = super::inflight::load_inflight_state(provider, channel_id.get())
+        .filter(|state| {
+            if owner.user_msg_id != 0 {
+                state.user_msg_id == owner.user_msg_id
+            } else {
+                terminal_msg_id.is_some_and(|message_id| state.current_msg_id == message_id.get())
+                    && state.finalizer_turn_id != 0
+            }
+        })
+        .map(|state| state.started_at);
+    let metadata = super::completion_footer_metadata::load_completion_footer_metadata(
+        shared,
+        channel_id,
+        provider,
+        owner.started_at_unix,
+        inflight_started_at.as_deref(),
+    )
+    .await;
+    let completion_block = super::completion_footer_metadata::append_completion_footer_metadata(
+        completion_block,
+        &metadata,
     );
     let completion_block = (!completion_block.trim().is_empty()).then_some(completion_block);
     let Some(msg_id) = terminal_msg_id else {
@@ -258,7 +280,8 @@ pub(in crate::services::discord) async fn note_turn_completed_footer(
         background,
         background_agent_pending,
         wip_warning.as_ref(),
-    );
+    )
+    .await;
     if let Some(edit) = plan.supersede_edit
         && let Err(error) = writer
             .edit_channel_message(channel_id, edit.message_id, &edit.text, true)

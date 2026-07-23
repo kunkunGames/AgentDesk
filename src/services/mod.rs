@@ -117,15 +117,19 @@ pub(crate) mod session_selector_validity;
 #[allow(dead_code)]
 pub mod session_backend;
 pub mod session_forwarding;
+pub mod session_resume;
 pub mod settings;
 pub mod shell_guard;
 pub mod slo;
+pub(crate) mod stale_turn_reconciler;
 // #3034: 1 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during termination_audit dead-code cleanup.
+pub(crate) mod terminal_status_formatting;
 #[allow(dead_code)]
 pub mod termination_audit;
 pub mod tmux_common;
 pub mod tmux_diagnostics;
+pub(crate) mod tmux_turn_liveness;
 #[cfg(unix)]
 pub mod tmux_wrapper;
 pub mod tool_output_guard;
@@ -134,6 +138,7 @@ pub mod tool_output_guard;
 pub(crate) mod tui_prompt_control;
 #[allow(dead_code)]
 pub(crate) mod tui_prompt_dedupe;
+pub(crate) mod tui_steering;
 pub(crate) mod tui_turn_state;
 pub mod turn_cancel_finalizer;
 pub mod turn_lifecycle;

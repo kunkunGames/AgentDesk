@@ -13,9 +13,10 @@ pub(super) fn claude_tui_busy_followup_refusal_notice(
     reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>,
 ) -> &'static str {
     match reason {
-        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::AlreadyActiveTurn) => {
-            CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_ACTIVE_NOTICE
-        }
+        Some(
+            crate::services::turn_orchestrator::EnqueueRefusalReason::AlreadyActiveTurn
+            | crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdPendingOrActive,
+        ) => CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_ACTIVE_NOTICE,
         Some(crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued) => {
             CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE
         }
@@ -29,27 +30,6 @@ pub(super) fn claude_tui_busy_followup_refusal_notice(
             CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
         }
         None => CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
-    }
-}
-
-// #3813 Phase 3 (§4 / AC#6): compact operational status shown on the intake
-// placeholder while the hosted-TUI busy preflight readiness wait blocks
-// (up to ~45s). Transient — replaced by dispatch streaming on success or by the
-// queued-card / delete / refusal-notice paths on the busy branch.
-#[cfg(unix)]
-pub(super) const HOSTED_TUI_READINESS_WAIT_NOTICE: &str =
-    "⏳ TUI 준비 대기 중… 이전 터미널 턴이 끝나면 이어서 처리합니다.";
-
-#[cfg(unix)]
-pub(super) fn readiness_wait_compact_status(
-    wait: &HostedTuiBusyPreflightReadinessWait,
-) -> &'static str {
-    match wait {
-        HostedTuiBusyPreflightReadinessWait::Codex
-        | HostedTuiBusyPreflightReadinessWait::ClaudePromptMarkerOnly
-        | HostedTuiBusyPreflightReadinessWait::ClaudePromptMarkerOrIdleTranscript(_) => {
-            HOSTED_TUI_READINESS_WAIT_NOTICE
-        }
     }
 }
 
@@ -849,17 +829,32 @@ pub(in crate::services::discord) async fn defer_promoted_dispatch_if_hosted_tui_
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
     intervention: &crate::services::turn_orchestrator::Intervention,
+    dispatch_lease: Arc<crate::services::turn_orchestrator::DispatchLease>,
 ) -> bool {
     if !hosted_tui_promote_readiness_blocked(shared, provider, channel_id).await {
         return false;
     }
-    super::super::super::mailbox_requeue_intervention_front(
+    let restored = super::super::super::mailbox_restore_dequeued_head(
         shared,
         provider,
         channel_id,
         intervention.clone(),
+        dispatch_lease,
     )
     .await;
+    if !restored.enqueued {
+        tracing::error!(
+            provider = provider.as_str(),
+            channel_id = channel_id.get(),
+            refusal_reason = restored
+                .refusal_reason
+                .map(|reason| reason.as_str())
+                .unwrap_or("none"),
+            persistence_error = restored.persistence_error.as_deref().unwrap_or("none"),
+            "hosted TUI promote defer rejected dequeued-head restore"
+        );
+        return false;
+    }
     super::super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
         shared,
         provider,
@@ -876,6 +871,11 @@ pub(in crate::services::discord) async fn defer_promoted_dispatch_if_hosted_tui_
     true
 }
 
+/// Restore a dequeued hosted-TUI follow-up at the queue front.
+///
+/// The item was the earliest dispatchable soft intervention before the busy
+/// pre-submit failure. Front restoration preserves its position relative to
+/// interventions that arrived later; a tail enqueue would reverse FIFO order.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn enqueue_busy_tui_followup_for_retry(
     shared: &Arc<SharedData>,
@@ -891,7 +891,7 @@ pub(super) async fn enqueue_busy_tui_followup_for_retry(
     pending_uploads: Vec<String>,
     voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> MailboxEnqueueOutcome {
-    super::super::super::mailbox_enqueue_intervention(
+    super::super::super::mailbox_requeue_intervention_front(
         shared,
         provider,
         channel_id,
@@ -910,6 +910,226 @@ pub(super) async fn enqueue_busy_tui_followup_for_retry(
     .await
 }
 
+#[cfg(test)]
+mod busy_retry_fifo_tests {
+    use super::*;
+
+    struct RuntimeRootGuard(Option<std::ffi::OsString>);
+
+    impl Drop for RuntimeRootGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("AGENTDESK_ROOT_DIR", value),
+                    None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
+                }
+            }
+        }
+    }
+
+    fn intervention(author: u64, message: u64, text: &str, author_is_bot: bool) -> Intervention {
+        let mut intervention = build_race_requeued_intervention(
+            serenity::UserId::new(author),
+            serenity::MessageId::new(message),
+            text,
+            false,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+        );
+        intervention.author_is_bot = author_is_bot;
+        intervention
+    }
+
+    // SAFETY: holds shared_test_env_lock across await to serialize the
+    // AGENTDESK_ROOT_DIR mutation (RuntimeRootGuard tempdir) against parallel
+    // tests. Test-only; the guard is a process-wide test serializer that cannot
+    // deadlock a live task. Releasing it before the mailbox awaits would let a
+    // concurrent test stomp the runtime root while this one is mid-flight.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_retry_restores_dequeued_head_without_reversing_fifo_4795() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let _root_guard = RuntimeRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let shared = make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = serenity::ChannelId::new(4_795_100);
+        let first = intervention(4_795_101, 4_795_111, "human A", false);
+        let second = intervention(4_795_102, 4_795_112, "bot B", true);
+        let persistence =
+            crate::services::discord::queue_persistence_context(&shared, &provider, channel_id);
+        shared
+            .mailbox(channel_id)
+            .replace_queue(vec![first.clone(), second.clone()], persistence.clone())
+            .await;
+
+        let dequeued = shared
+            .mailbox(channel_id)
+            .take_next_soft(persistence.clone())
+            .await
+            .intervention
+            .expect("A is dequeued first");
+        assert_eq!(dequeued.message_id, first.message_id);
+        crate::services::discord::mailbox_clear_pending_dispatch_reservation(
+            &shared,
+            &provider,
+            channel_id,
+            dequeued.message_id,
+        )
+        .await;
+
+        let retry = enqueue_busy_tui_followup_for_retry(
+            &shared,
+            &provider,
+            channel_id,
+            dequeued.author_id,
+            dequeued.message_id,
+            &dequeued.text,
+            dequeued.preserve_on_cancel(),
+            dequeued.reply_context,
+            dequeued.has_reply_boundary,
+            dequeued.merge_consecutive,
+            dequeued.pending_uploads,
+            dequeued.voice_announcement,
+        )
+        .await;
+        assert!(retry.enqueued, "busy retry is restored at the queue front");
+
+        let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel_id).await;
+        let order: Vec<_> = snapshot
+            .intervention_queue
+            .iter()
+            .map(|item| item.message_id)
+            .collect();
+        assert_eq!(order, vec![first.message_id, second.message_id]);
+        assert!(!snapshot.intervention_queue[0].author_is_bot);
+        assert!(snapshot.intervention_queue[1].author_is_bot);
+
+        let retried_first = shared
+            .mailbox(channel_id)
+            .take_next_soft(persistence.clone())
+            .await
+            .intervention
+            .expect("A retries before B");
+        crate::services::discord::mailbox_abandon_pending_dispatch(
+            &shared,
+            &provider,
+            channel_id,
+            retried_first.message_id,
+        )
+        .await;
+        let later_second = shared
+            .mailbox(channel_id)
+            .take_next_soft(persistence.clone())
+            .await
+            .intervention
+            .expect("B remains second");
+        assert_eq!(retried_first.message_id, first.message_id);
+        assert_eq!(later_second.message_id, second.message_id);
+        crate::services::discord::mailbox_abandon_pending_dispatch(
+            &shared,
+            &provider,
+            channel_id,
+            later_second.message_id,
+        )
+        .await;
+
+        shared
+            .mailbox(channel_id)
+            .replace_queue(vec![first.clone(), second.clone()], persistence.clone())
+            .await;
+        let normal_first = shared
+            .mailbox(channel_id)
+            .take_next_soft(persistence.clone())
+            .await
+            .intervention
+            .expect("normal FIFO returns A");
+        crate::services::discord::mailbox_abandon_pending_dispatch(
+            &shared,
+            &provider,
+            channel_id,
+            normal_first.message_id,
+        )
+        .await;
+        let normal_second = shared
+            .mailbox(channel_id)
+            .take_next_soft(persistence)
+            .await
+            .intervention
+            .expect("normal FIFO returns B");
+        assert_eq!(normal_first.message_id, first.message_id);
+        assert_eq!(normal_second.message_id, second.message_id);
+    }
+
+    #[test]
+    fn busy_retry_treats_pending_or_active_source_as_already_processing_4797() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().expect("temporary runtime root");
+        let _root_guard = RuntimeRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async {
+            let shared = make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let channel_id = serenity::ChannelId::new(4_797_301);
+            let first = intervention(4_797_302, 4_797_303, "pending A", false);
+            let persistence =
+                crate::services::discord::queue_persistence_context(&shared, &provider, channel_id);
+            shared
+                .mailbox(channel_id)
+                .replace_queue(vec![first.clone()], persistence.clone())
+                .await;
+            let dequeued = shared
+                .mailbox(channel_id)
+                .take_next_soft(persistence)
+                .await
+                .intervention
+                .expect("A is pending dispatch");
+
+            let retry = enqueue_busy_tui_followup_for_retry(
+                &shared,
+                &provider,
+                channel_id,
+                dequeued.author_id,
+                dequeued.message_id,
+                &dequeued.text,
+                dequeued.preserve_on_cancel(),
+                dequeued.reply_context,
+                dequeued.has_reply_boundary,
+                dequeued.merge_consecutive,
+                dequeued.pending_uploads,
+                dequeued.voice_announcement,
+            )
+            .await;
+
+            assert!(!retry.enqueued);
+            assert_eq!(
+                retry.refusal_reason,
+                Some(
+                    crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdPendingOrActive
+                )
+            );
+            assert!(super::super::busy_retry::present_or_accepted(&retry));
+            let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel_id).await;
+            assert!(snapshot.intervention_queue.is_empty());
+            assert_eq!(snapshot.pending_user_dispatch, Some(first.message_id));
+        });
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn recapture_inflight_offset_after_successful_busy_wait(
     output_path: Option<&str>,
@@ -919,37 +1139,6 @@ pub(super) fn recapture_inflight_offset_after_successful_busy_wait(
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .unwrap_or(previous_offset)
-}
-
-// #3813 Phase 3 (AC#7 "readiness-wait status rendering"): the compact status a
-// hosted-TUI busy preflight readiness wait surfaces on the intake placeholder is
-// non-empty, user-facing ("준비 대기"), and identical across every detection
-// variant (the internal strategy difference is meaningless to the user).
-#[cfg(all(test, unix))]
-mod readiness_wait_status_tests {
-    use super::HOSTED_TUI_READINESS_WAIT_NOTICE;
-    use super::HostedTuiBusyPreflightReadinessWait;
-    use super::readiness_wait_compact_status;
-    use std::path::PathBuf;
-
-    #[test]
-    fn every_variant_renders_the_nonempty_readiness_label() {
-        for wait in [
-            HostedTuiBusyPreflightReadinessWait::Codex,
-            HostedTuiBusyPreflightReadinessWait::ClaudePromptMarkerOnly,
-            HostedTuiBusyPreflightReadinessWait::ClaudePromptMarkerOrIdleTranscript(PathBuf::from(
-                "/tmp/transcript.jsonl",
-            )),
-        ] {
-            let status = readiness_wait_compact_status(&wait);
-            assert!(!status.is_empty(), "readiness status must be non-empty");
-            assert!(
-                status.contains("준비 대기"),
-                "readiness status must surface the waiting state: {status}"
-            );
-            assert_eq!(status, HOSTED_TUI_READINESS_WAIT_NOTICE);
-        }
-    }
 }
 
 /// #4139: the enqueue-refusal branch restores the taken recovery context and

@@ -24,11 +24,9 @@ pub(super) use self::restore_cwd::{
 };
 pub(super) use self::worktree::{
     WorktreeInfo, cleanup_git_worktree, create_git_worktree, detect_worktree_conflict,
-    resolve_reusable_worktree,
+    reconstruct_managed_worktree_metadata, resolve_reusable_worktree,
 };
-use self::worktree::{
-    is_managed_worktree_path, reconstruct_managed_worktree_metadata, sync_inflight_worktree_context,
-};
+use self::worktree::{is_managed_worktree_path, sync_inflight_worktree_context};
 
 /// Per-channel session state
 #[derive(Clone)]
@@ -104,6 +102,137 @@ pub(super) fn restored_memento_context_loaded(
     next_session_id: Option<&str>,
 ) -> bool {
     previous_loaded && previous_session_id == next_session_id && next_session_id.is_some()
+}
+
+/// #4790 `/resume` rebind: repoint a channel's in-memory session at a previous
+/// provider session so the next turn resumes that conversation from the target
+/// worktree. Mirrors the DB rebind (`rebind_session_provider_pg`) into memory so
+/// the change takes effect immediately, without waiting for a restart or relying
+/// on `auto_restore_session_force` (which early-returns when the in-memory
+/// `current_path` is already set — a stale value would otherwise shadow the DB
+/// rebind). Creates the session entry when the channel has none yet.
+///
+/// Returns the previously-bound `(current_path, session_id)` for logging.
+pub(in crate::services::discord) async fn rebind_channel_session(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    cwd: &str,
+    session_id: &str,
+) -> (Option<String>, Option<String>) {
+    let mut data = shared.core.lock().await;
+    let session = data
+        .sessions
+        .entry(channel_id)
+        .or_insert_with(|| DiscordSession {
+            session_id: None,
+            memento_context_loaded: false,
+            memento_reflected: false,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            channel_id: Some(channel_id.get()),
+            channel_name: None,
+            category_name: None,
+            remote_profile_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: runtime_store::process_generation(),
+        });
+    let previous_path = session.current_path.clone();
+    let previous_session_id = session.session_id.clone();
+    session.channel_id = Some(channel_id.get());
+    session.last_active = tokio::time::Instant::now();
+    session.current_path = Some(cwd.to_string());
+    // Drop stale worktree metadata so `reconstruct_managed_worktree_metadata`
+    // (which no-ops when `worktree.is_some()`) re-derives it for the target path.
+    session.worktree = None;
+    session.restore_provider_session(Some(session_id.to_string()));
+    reconstruct_managed_worktree_metadata(session, provider, channel_id, cwd);
+    (previous_path, previous_session_id)
+}
+
+#[cfg(test)]
+mod resume_launch_binding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rebound_session_binding_reaches_claude_resume_launch_args() {
+        let shared = super::super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(4_794_001);
+        let cwd_dir = tempfile::tempdir().expect("resume cwd");
+        let cwd = cwd_dir.path().to_str().expect("utf8 cwd");
+        let session_id = "01234567-89ab-cdef-0123-456789abcdef";
+
+        rebind_channel_session(&shared, &ProviderKind::Claude, channel_id, cwd, session_id).await;
+
+        let (launch_session_id, launch_cwd) = {
+            let mut data = shared.core.lock().await;
+            let (session_id, _, current_path) =
+                crate::services::discord::router::load_session_runtime_state(
+                    &mut data.sessions,
+                    channel_id,
+                )
+                .expect("rebound runtime state");
+            (session_id.expect("provider session id"), current_path)
+        };
+        let config = crate::services::claude_tui::session::ClaudeTuiLaunchConfig {
+            tmux_session_name: "AgentDesk-claude-resume-binding".to_string(),
+            working_dir: std::path::PathBuf::from(&launch_cwd),
+            claude_bin: crate::services::claude_command::ClaudeBinary::from_tmux_wrapper_argv(
+                "claude",
+            ),
+            agentdesk_exe: std::path::PathBuf::from("agentdesk"),
+            hook_endpoint: "http://127.0.0.1:49152".to_string(),
+            session_id: launch_session_id,
+            system_prompt: None,
+            model: None,
+            resume: true,
+            launch_env: crate::services::claude_command::ClaudeLaunchEnv::scrub_for_test(),
+        };
+        let args = crate::services::claude_tui::session::build_claude_tui_args(
+            &config,
+            std::path::Path::new("/runtime/settings.json"),
+        );
+
+        assert_eq!(config.working_dir, std::path::Path::new(cwd));
+        assert!(args.windows(2).any(|pair| pair == ["--resume", session_id]));
+    }
+
+    #[test]
+    fn absent_resume_binding_keeps_existing_launch_selection() {
+        let cwd_dir = tempfile::tempdir().expect("current cwd");
+        let expected_cwd = cwd_dir.path().display().to_string();
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert(
+            ChannelId::new(4_794_002),
+            DiscordSession {
+                session_id: None,
+                memento_context_loaded: false,
+                memento_reflected: false,
+                current_path: Some(expected_cwd.clone()),
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                cleared: false,
+                remote_profile_name: None,
+                channel_id: Some(4_794_002),
+                channel_name: None,
+                category_name: None,
+                last_active: tokio::time::Instant::now(),
+                worktree: None,
+                born_generation: 0,
+            },
+        );
+
+        let (session_id, _, cwd) = crate::services::discord::router::load_session_runtime_state(
+            &mut sessions,
+            ChannelId::new(4_794_002),
+        )
+        .expect("existing runtime state");
+        assert_eq!(session_id, None);
+        assert_eq!(cwd, expected_cwd);
+    }
 }
 
 /// Auto-restore session from bot_settings.json if not in memory
@@ -347,7 +476,7 @@ pub(super) async fn auto_restore_session_force(
                 remote_profile_name: None,
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
-                born_generation: runtime_store::load_generation(),
+                born_generation: runtime_store::process_generation(),
             });
         session.channel_id = Some(channel_id.get());
         session.last_active = tokio::time::Instant::now();
@@ -410,7 +539,7 @@ pub(super) async fn bootstrap_thread_session(
             remote_profile_name: None,
             last_active: tokio::time::Instant::now(),
             worktree: None,
-            born_generation: runtime_store::load_generation(),
+            born_generation: runtime_store::process_generation(),
         });
     // Prefer restoring the worktree persisted for this thread session across a
     // dcserver restart. The in-memory `sessions` map is cleared on restart, so

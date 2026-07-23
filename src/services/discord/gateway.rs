@@ -182,6 +182,7 @@ pub(super) trait TurnGateway: Send + Sync {
         intervention: &'a Intervention,
         request_owner_name: &'a str,
         has_more_queued_turns: bool,
+        dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>>;
 
     fn validate_live_routing<'a>(
@@ -351,14 +352,9 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
             )
         })?;
         rate_limit_wait(&self.shared, channel_id).await;
-        // #740 steer / robustness: degrade to a normal (non-reply) send when the
-        // referenced message no longer exists. A queued `/steer` intervention
-        // carries the slash *interaction* id as its `message_id` (a dedup/cancel
-        // token, not a real channel message), so replying to it with the Discord
-        // default `fail_if_not_exists=true` would 10008 and bubble an Err up
-        // through `handle_text_message`, requeue-looping the steer so it never
-        // reaches the agent. `fail_if_not_exists(false)` also hardens every other
-        // reply against a since-deleted target.
+        // Degrade to a normal (non-reply) send when the referenced message no
+        // longer exists. This also hardens every reply against a since-deleted
+        // target.
         channel_id
             .send_message(
                 &self.http,
@@ -702,6 +698,7 @@ impl TurnGateway for DiscordGateway {
         intervention: &'a Intervention,
         request_owner_name: &'a str,
         has_more_queued_turns: bool,
+        dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>> {
         Box::pin(async move {
             // #4270 A — pre-drain hosted-TUI readiness gate: a busy TUI defers
@@ -713,6 +710,9 @@ impl TurnGateway for DiscordGateway {
                 &self.provider,
                 channel_id,
                 intervention,
+                dispatch_lease
+                    .clone()
+                    .ok_or_else(|| "queued dispatch is missing its dispatch lease".to_string())?,
             )
             .await
             {
@@ -744,11 +744,18 @@ impl TurnGateway for DiscordGateway {
                 has_more_queued_turns,
                 true,
                 "intake_admission_pre_drain_defer",
+                dispatch_lease.clone(),
             )
             .await
             {
                 router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
-                router::QueuedAdmissionDisposition::Deferred => return Ok(()),
+                router::QueuedAdmissionDisposition::Deferred
+                | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment => {
+                    return Ok(());
+                }
+                router::QueuedAdmissionDisposition::RejectedRestore => {
+                    return Err("queued admission failed to restore dequeued head".to_string());
+                }
             };
 
             let source_message_generations = intervention.source_message_queued_generations();
@@ -909,6 +916,7 @@ impl TurnGateway for HeadlessGateway {
         _intervention: &'a Intervention,
         _request_owner_name: &'a str,
         _has_more_queued_turns: bool,
+        _dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>> {
         Box::pin(
             async move { Err("headless turns do not dispatch queued turns locally".to_string()) },
@@ -1020,6 +1028,9 @@ mod tests {
             _intervention: &'a Intervention,
             _request_owner_name: &'a str,
             _has_more_queued_turns: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async { Ok(()) })
         }
@@ -1141,7 +1152,7 @@ mod tests {
             author_id: UserId::new(id),
             author_is_bot: false,
             message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -1227,7 +1238,13 @@ mod tests {
                 .intervention
                 .unwrap_or_else(|| panic!("cycle {cycle}: the head must still be promotable"));
             let result = gateway
-                .dispatch_queued_turn(channel_id, &intervention, "tester", false)
+                .dispatch_queued_turn(
+                    channel_id,
+                    &intervention,
+                    "tester",
+                    false,
+                    taken.dispatch_lease,
+                )
                 .await;
             assert!(
                 result.is_ok(),
@@ -1304,7 +1321,13 @@ mod tests {
 
         let gateway = DiscordGateway::new(http.clone(), shared.clone(), provider.clone(), None);
         let result = gateway
-            .dispatch_queued_turn(channel_id, &intervention, "tester", false)
+            .dispatch_queued_turn(
+                channel_id,
+                &intervention,
+                "tester",
+                false,
+                taken.dispatch_lease,
+            )
             .await;
         let error = result.expect_err(
             "gate pass-through must continue into the dispatch body, which requires live context",

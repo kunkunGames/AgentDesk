@@ -392,6 +392,10 @@ fn prompt_readiness_snapshot_from_capture(
     pane: Option<&str>,
     tmux_pane_alive: bool,
 ) -> PromptReadinessSnapshot {
+    let normalized_pane = pane.map(
+        crate::services::claude_tui::prompt_readiness::normalize_prompt_readiness_panel_in_capture,
+    );
+    let pane = normalized_pane.as_deref();
     let prompt_marker_detected = pane.is_some_and(pane_looks_ready_for_prompt);
     let prompt_draft_detected = pane
         .is_some_and(crate::services::tmux_common::tmux_capture_indicates_claude_tui_prompt_draft);
@@ -575,6 +579,45 @@ fn compact_pre_enter_modal_guard(snapshot: &PromptReadinessSnapshot) -> Result<(
         return Err("interactive modal");
     }
     Ok(())
+}
+
+pub(crate) fn steering_snapshot_decision(
+    snapshot: &PromptReadinessSnapshot,
+) -> Result<(), &'static str> {
+    if snapshot.prompt_draft_detected {
+        return Err("composer draft");
+    }
+    compact_pre_enter_modal_guard(snapshot)?;
+    if !crate::services::tmux_common::tmux_capture_indicates_claude_tui_exact_empty_composer(
+        &snapshot.pane_tail,
+    ) {
+        return Err("composer not present");
+    }
+    Ok(())
+}
+
+pub(crate) fn inject_steering_prompt(session_name: &str, prompt: &str) -> Result<(), String> {
+    let actions = plan_prompt_submit(prompt)?;
+    crate::services::claude_tui::composer_lock::with_composer_mutation_lock(session_name, || {
+        let snapshot = prompt_readiness_snapshot(session_name);
+        steering_snapshot_decision(&snapshot).map_err(str::to_string)?;
+        crate::services::tui_prompt_dedupe::record_discord_originated_prompt(
+            "claude",
+            session_name,
+            prompt,
+        );
+        match run_actions_with_submission_confirmation(session_name, &actions, None) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                crate::services::tui_prompt_dedupe::remove_discord_originated_prompt(
+                    "claude",
+                    session_name,
+                    prompt,
+                );
+                Err(error)
+            }
+        }
+    })
 }
 
 fn compact_queued_message_hint(pane_tail: &str) -> bool {
@@ -1324,9 +1367,7 @@ fn wait_for_prompt_ready_inner(
         }
         // #3889/#4528: only proven warm reuse may treat this banner as stale.
         // Every path still honors the live draft and busy state below.
-        if snapshot_allows_prompt_readiness(readiness, &snapshot)
-            && transcript_idle_confirms_prompt_ready(&snapshot, transcript_path)
-        {
+        if transcript_idle_snapshot_confirms_prompt_ready(readiness, &snapshot, transcript_path) {
             check_prompt_cancel(cancel_token)?;
             let drained_buffered_stop = claude_registry_stop_already_buffered(session_name);
             tracing::info!(
@@ -1613,9 +1654,7 @@ fn wait_for_prompt_ready_polling(
         }
         // #3889/#4528: apply the same provenance-aware auth policy to the
         // transcript-idle fallback; draft and busy state still veto every kind.
-        if snapshot_allows_prompt_readiness(readiness, &snapshot)
-            && transcript_idle_confirms_prompt_ready(&snapshot, transcript_path)
-        {
+        if transcript_idle_snapshot_confirms_prompt_ready(readiness, &snapshot, transcript_path) {
             tracing::info!(
                 tmux_session_name = session_name,
                 readiness = readiness.label(),
@@ -1638,10 +1677,10 @@ fn wait_for_prompt_ready_polling(
             // Idle/Unknown read does NOT extend), keep waiting up to the absolute
             // ceiling — the prompt returns once the turn finishes, so the
             // follow-up is delivered sequentially instead of dropped.
-            let transcript_turn_active = transcript_path.is_some_and(|path| {
+            let transcript_turn_state = transcript_path.map(|path| {
                 crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(path)
-                    .is_busy()
             });
+            let transcript_turn_active = transcript_turn_state.is_some_and(|state| state.is_busy());
             if active_turn_warrants_wait_extension(
                 snapshot.tmux_pane_alive,
                 transcript_turn_active,
@@ -1663,7 +1702,19 @@ fn wait_for_prompt_ready_polling(
                 wait_interval = std::cmp::min(wait_interval * 2, Duration::from_millis(1000));
                 continue;
             }
-            log_prompt_ready_timeout(session_name, readiness, timeout, &snapshot);
+            let previous_tui_turn_still_running =
+                crate::services::claude_tui::prompt_readiness::previous_turn_still_running(
+                    snapshot.tmux_pane_alive,
+                    snapshot.prompt_marker_detected,
+                    transcript_turn_state,
+                );
+            log_prompt_ready_timeout(
+                session_name,
+                readiness,
+                timeout,
+                &snapshot,
+                previous_tui_turn_still_running,
+            );
             if prompt_ready_timeout_should_clear_followup_draft(
                 readiness,
                 &snapshot,
@@ -1687,13 +1738,10 @@ fn wait_for_prompt_ready_polling(
                 readiness.label(),
                 timeout.as_secs(),
                 prompt_ready_timeout_reason(&snapshot),
-                // Mirror the computed value the debug log already records
-                // (`log_prompt_ready_timeout`) instead of the legacy hardcoded
-                // `true`: the pane is known alive here (a dead pane returned
-                // above), so this is `true` only when the pane never looked
-                // ready — i.e. a turn that is plausibly still running. An unsent
-                // draft means the turn ended, so it reports `false`.
-                snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+                // Mirror the transcript-aware value recorded by the debug log.
+                // A conclusive Idle state reports false even when pane marker
+                // scraping is confused by persistent background-agent chrome.
+                previous_tui_turn_still_running,
                 snapshot.prompt_marker_detected,
                 snapshot.prompt_draft_detected,
                 snapshot.capture_available
@@ -1786,8 +1834,11 @@ fn proven_warm_followup_revalidates_prompt_ready(
 ) -> bool {
     let readiness = PromptReadinessKind::ProvenWarmFollowup;
     prompt_marker_confirms_prompt_ready(readiness, snapshot)
-        || (snapshot_allows_prompt_readiness(readiness, snapshot)
-            && transcript_idle_confirms_prompt_ready(snapshot, Some(transcript_path)))
+        || transcript_idle_snapshot_confirms_prompt_ready(
+            readiness,
+            snapshot,
+            Some(transcript_path),
+        )
 }
 
 /// #3889/#4528: an MCP-auth warning blocks readiness unless the caller proves
@@ -1799,12 +1850,22 @@ fn snapshot_allows_prompt_readiness(
     readiness: PromptReadinessKind,
     snapshot: &PromptReadinessSnapshot,
 ) -> bool {
+    snapshot_allows_prompt_readiness_for_turn(readiness, snapshot, None)
+}
+
+fn snapshot_allows_prompt_readiness_for_turn(
+    readiness: PromptReadinessKind,
+    snapshot: &PromptReadinessSnapshot,
+    transcript_turn_state: Option<crate::services::tui_turn_state::TuiTurnState>,
+) -> bool {
     if snapshot.prompt_draft_detected {
         return false;
     }
-    if snapshot.capture_available
-        && crate::services::tmux_common::tmux_capture_indicates_claude_tui_busy(&snapshot.pane_tail)
-    {
+    if crate::services::claude_tui::prompt_readiness::pane_has_foreground_busy_evidence(
+        &snapshot.pane_tail,
+        snapshot.capture_available,
+        transcript_turn_state,
+    ) {
         return false;
     }
     readiness.allows_stale_mcp_auth_warning() || !snapshot_indicates_mcp_auth_block(snapshot)
@@ -1829,7 +1890,11 @@ fn snapshot_indicates_mcp_auth_block(snapshot: &PromptReadinessSnapshot) -> bool
 /// auth warning; draft or busy evidence still blocks it. A blind capture cannot
 /// assert a draft, busy frame, or auth block.
 fn pane_allows_prompt_readiness(session_name: &str, readiness: PromptReadinessKind) -> bool {
-    snapshot_allows_prompt_readiness(readiness, &prompt_readiness_snapshot(session_name))
+    snapshot_allows_prompt_readiness_for_turn(
+        readiness,
+        &prompt_readiness_snapshot(session_name),
+        Some(crate::services::tui_turn_state::TuiTurnState::Idle),
+    )
 }
 
 /// Actionable, NON-timeout error for a cold-boot stranded on the
@@ -2020,6 +2085,19 @@ fn transcript_idle_confirms_prompt_ready(
     })
 }
 
+fn transcript_idle_snapshot_confirms_prompt_ready(
+    readiness: PromptReadinessKind,
+    snapshot: &PromptReadinessSnapshot,
+    transcript_path: Option<&std::path::Path>,
+) -> bool {
+    transcript_idle_confirms_prompt_ready(snapshot, transcript_path)
+        && snapshot_allows_prompt_readiness_for_turn(
+            readiness,
+            snapshot,
+            Some(crate::services::tui_turn_state::TuiTurnState::Idle),
+        )
+}
+
 fn log_startup_dialog_dismiss(
     session_name: &str,
     readiness: PromptReadinessKind,
@@ -2068,6 +2146,7 @@ fn log_prompt_ready_timeout(
     readiness: PromptReadinessKind,
     timeout: Duration,
     snapshot: &PromptReadinessSnapshot,
+    previous_tui_turn_still_running: bool,
 ) {
     tracing::debug!(
         tmux_session_name = session_name,
@@ -2075,7 +2154,7 @@ fn log_prompt_ready_timeout(
         timeout_secs = timeout.as_secs(),
         prompt_marker_detected = snapshot.prompt_marker_detected,
         prompt_draft_detected = snapshot.prompt_draft_detected,
-        previous_tui_turn_still_running = snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+        previous_tui_turn_still_running,
         tmux_pane_alive = snapshot.tmux_pane_alive,
         capture_available = snapshot.capture_available,
         pane_tail = %snapshot.pane_tail,
@@ -2090,7 +2169,7 @@ fn log_prompt_ready_timeout(
             timeout.as_secs(),
             snapshot.prompt_marker_detected,
             snapshot.prompt_draft_detected,
-            snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+            previous_tui_turn_still_running,
             snapshot.tmux_pane_alive,
             snapshot.capture_available,
             snapshot.pane_tail
@@ -3199,13 +3278,19 @@ line 13";
         assert!(transcript_idle);
         assert!(snapshot_indicates_mcp_auth_block(&blocked));
         assert!(
-            !(snapshot_allows_prompt_readiness(PromptReadinessKind::FreshTurn, &blocked)
-                && transcript_idle),
+            !(snapshot_allows_prompt_readiness_for_turn(
+                PromptReadinessKind::FreshTurn,
+                &blocked,
+                Some(crate::services::tui_turn_state::TuiTurnState::Idle)
+            ) && transcript_idle),
             "MCP-auth welcome pane must not confirm FreshTurn via idle transcript"
         );
         assert!(
-            !(snapshot_allows_prompt_readiness(PromptReadinessKind::ProvenWarmFollowup, &blocked)
-                && transcript_idle),
+            !(snapshot_allows_prompt_readiness_for_turn(
+                PromptReadinessKind::ProvenWarmFollowup,
+                &blocked,
+                Some(crate::services::tui_turn_state::TuiTurnState::Idle)
+            ) && transcript_idle),
             "an unsent draft must block proven warm reuse despite an idle transcript"
         );
 
@@ -3214,13 +3299,19 @@ line 13";
             ..blocked.clone()
         };
         assert!(
-            !(snapshot_allows_prompt_readiness(PromptReadinessKind::Followup, &warm_idle)
-                && transcript_idle),
+            !(snapshot_allows_prompt_readiness_for_turn(
+                PromptReadinessKind::Followup,
+                &warm_idle,
+                Some(crate::services::tui_turn_state::TuiTurnState::Idle)
+            ) && transcript_idle),
             "Followup intent alone must not bypass a genuine cold auth block"
         );
         assert!(
-            snapshot_allows_prompt_readiness(PromptReadinessKind::ProvenWarmFollowup, &warm_idle,)
-                && transcript_idle,
+            snapshot_allows_prompt_readiness_for_turn(
+                PromptReadinessKind::ProvenWarmFollowup,
+                &warm_idle,
+                Some(crate::services::tui_turn_state::TuiTurnState::Idle)
+            ) && transcript_idle,
             "recorded-turn warm provenance may ignore a stale warning only when idle"
         );
 
@@ -3235,31 +3326,76 @@ line 13";
         };
         assert!(!snapshot_indicates_mcp_auth_block(&ready));
         assert!(
-            snapshot_allows_prompt_readiness(PromptReadinessKind::FreshTurn, &ready)
-                && transcript_idle_confirms_prompt_ready(&ready, Some(file.path())),
+            snapshot_allows_prompt_readiness_for_turn(
+                PromptReadinessKind::FreshTurn,
+                &ready,
+                Some(crate::services::tui_turn_state::TuiTurnState::Idle)
+            ) && transcript_idle_confirms_prompt_ready(&ready, Some(file.path())),
             "a normal recorded-turn idle pane must still confirm ready (no regression)"
         );
     }
 
     #[test]
-    fn non_idle_transcript_does_not_confirm_readiness() {
+    fn idle_terminator_with_background_agents_and_composer_allows_readiness() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"stop_hook_summary"}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","pendingBackgroundAgentCount":3}"#,
+            ),
+        )
+        .unwrap();
+        let pane = "\
+⏺ Foreground answer complete
+✻ Waiting for 3 background agents to finish
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ◆ Opus(M) │ Tools: 224 done
+  ⏵⏵ bypass permissions on · 2 shells
+
+  ⏺ main
+  ◯ reviewer       Watching CI                         6m 13s
+  ◯ implementer    Updating tests                      3m 52s";
+        let snapshot = prompt_readiness_snapshot_from_capture(Some(pane), true);
+
+        assert!(snapshot.prompt_marker_detected);
+        assert!(transcript_idle_snapshot_confirms_prompt_ready(
+            PromptReadinessKind::Followup,
+            &snapshot,
+            Some(file.path()),
+        ));
+    }
+
+    #[test]
+    fn foreground_streaming_with_background_agents_still_vetoes_readiness() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"still streaming"}]}}"#,
         )
         .unwrap();
-        let snapshot = PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            prompt_draft_detected: false,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: "streaming turn".to_string(),
-        };
+        let pane = "\
+✻ Waiting for 3 background agents to finish
+✳ Architecting… (12s · esc to interrupt)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ◯ reviewer       Watching CI                         6m 13s";
+        let snapshot = prompt_readiness_snapshot_from_capture(Some(pane), true);
 
-        assert!(!transcript_idle_confirms_prompt_ready(
+        assert!(!transcript_idle_snapshot_confirms_prompt_ready(
+            PromptReadinessKind::Followup,
             &snapshot,
-            Some(file.path())
+            Some(file.path()),
+        ));
+        assert!(!prompt_marker_confirms_prompt_ready(
+            PromptReadinessKind::Followup,
+            &snapshot,
         ));
     }
 

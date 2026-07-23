@@ -15,7 +15,7 @@ use crate::services::settings::{KvSeedAction, config_default_seed_actions};
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
-const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_PG_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const DEFAULT_PG_MAX_LIFETIME_SECS: u64 = 30 * 60;
@@ -161,8 +161,33 @@ impl AdvisoryLockLease {
         lock_id: i64,
         label: impl Into<String>,
     ) -> Result<Option<Self>, String> {
+        Self::try_acquire_with_application_name(pool, lock_id, label, None).await
+    }
+
+    /// Acquire a lease on a dedicated connection with an optional PostgreSQL
+    /// `application_name`. A stable owner identity lets recovery code distinguish
+    /// an abandoned AgentDesk lease from an unrelated or live backend.
+    pub async fn try_acquire_named(
+        pool: &PgPool,
+        lock_id: i64,
+        label: impl Into<String>,
+        application_name: impl Into<String>,
+    ) -> Result<Option<Self>, String> {
+        Self::try_acquire_with_application_name(pool, lock_id, label, Some(application_name.into()))
+            .await
+    }
+
+    async fn try_acquire_with_application_name(
+        pool: &PgPool,
+        lock_id: i64,
+        label: impl Into<String>,
+        application_name: Option<String>,
+    ) -> Result<Option<Self>, String> {
         let label = label.into();
-        let options = (*pool.connect_options()).clone();
+        let mut options = (*pool.connect_options()).clone();
+        if let Some(application_name) = application_name {
+            options = options.application_name(&application_name);
+        }
         let mut conn = PgConnection::connect_with(&options)
             .await
             .map_err(|error| format!("{label} acquire advisory lock connection: {error}"))?;
@@ -365,7 +390,7 @@ pub async fn connect(config: &Config) -> Result<Option<PgPool>, String> {
 /// The connection established here is retained and used for real bootstrap DB
 /// work. Its 10-second acquire deadline tolerates slow TCP/TLS/auth handshakes;
 /// the separate long-lived runtime pool is built only after initialization and
-/// retains the normal 3-second acquire timeout.
+/// retains the normal 10-second acquire timeout.
 pub(crate) async fn connect_for_bootstrap(
     config: &Config,
 ) -> Result<Option<PgPool>, PgConnectFailure> {
@@ -1661,7 +1686,7 @@ mod tests {
         let settings = runtime_pool_settings(&config);
 
         assert_eq!(settings.max_connections, 5);
-        assert_eq!(settings.acquire_timeout, Duration::from_secs(3));
+        assert_eq!(settings.acquire_timeout, Duration::from_secs(10));
         assert_eq!(settings.idle_timeout, Duration::from_secs(5 * 60));
         assert_eq!(settings.max_lifetime, Duration::from_secs(30 * 60));
         assert!(settings.test_before_acquire);
