@@ -92,7 +92,7 @@
 | `db` | `src/db/mod.rs` | 25 | 25 | 0 |  |
 | `db::agents` | `src/db/agents.rs` | 410 | 249 | 161 |  |
 | `db::auto_queue` | `src/db/auto_queue/mod.rs` | 21 | 21 | 0 |  |
-| `db::auto_queue::claim` | `src/db/auto_queue/claim.rs` | 734 | 734 | 0 |  |
+| `db::auto_queue::claim` | `src/db/auto_queue/claim.rs` | 727 | 727 | 0 |  |
 | `db::auto_queue::consultation` | `src/db/auto_queue/consultation.rs` | 112 | 112 | 0 |  |
 | `db::auto_queue::entries` | `src/db/auto_queue/entries.rs` | 1408 | 1408 | 0 | giant-file |
 | `db::auto_queue::entries::dispatch_failure` | `src/db/auto_queue/entries/dispatch_failure.rs` | 286 | 180 | 106 |  |
