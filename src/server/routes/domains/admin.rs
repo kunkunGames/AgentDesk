@@ -4,7 +4,7 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, analytics, departments, escalation, home_metrics, offices,
+    ApiRouter, AppState, departments, escalation, offices,
     protected_api_domain, settings, stats, voice_config,
 };
 
@@ -72,12 +72,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/internal/escalation/emit",
                 post(escalation::emit_escalation),
-            )
-            .route("/audit-logs", get(analytics::audit_logs))
-            .route("/machine-status", get(analytics::machine_status))
-            .route("/rate-limits", get(analytics::rate_limits))
-            .route("/home/kpi-trends", get(home_metrics::home_kpi_trends))
-            .route("/skills-trend", get(analytics::skills_trend)),
+            ),
         state,
     )
 }
