@@ -14,6 +14,9 @@ mod stale_dispatch_guard;
 mod steering_hook;
 mod turn_watchdog;
 mod voice_intake;
+mod worker_entry;
+
+pub(crate) use worker_entry::{IntakeRequest, execute_intake_turn_core};
 
 /// Bundle of Discord-runtime dependencies that `handle_text_message`
 /// reads from outside its per-message parameters. Phase 2-pre.2 of
@@ -39,80 +42,6 @@ pub(in crate::services::discord) struct IntakeDeps<'a> {
     pub token: &'a str,
 }
 
-/// Per-message inputs of `handle_text_message` bundled into a single
-/// owned struct. Phase 2-pre.3 of intake-node-routing: lets worker-side
-/// callers (`execute_intake_turn_core`) accept a single deserialized
-/// row from `intake_outbox` instead of 13 positional parameters.
-///
-/// All fields mirror the `intake_outbox` payload columns (see
-/// migrations/postgres/0052_intake_node_routing.sql) and the per-message
-/// parameters of the legacy 13-arg `handle_text_message` signature.
-/// Adding a column to `intake_outbox` means adding a field here.
-#[derive(Clone, Debug)]
-pub(crate) struct IntakeRequest {
-    pub channel_id: ChannelId,
-    pub user_msg_id: MessageId,
-    pub request_owner: UserId,
-    pub request_owner_name: String,
-    pub user_text: String,
-    pub reply_to_user_message: bool,
-    pub defer_watcher_resume: bool,
-    pub wait_for_completion: bool,
-    pub merge_consecutive: bool,
-    pub reply_context: Option<String>,
-    pub has_reply_boundary: bool,
-    pub dm_hint: Option<bool>,
-    pub turn_kind: TurnKind,
-    pub preserve_on_cancel: bool,
-}
-
-/// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
-/// of intake-node-routing: this is the public surface a worker node will
-/// invoke after claiming an `intake_outbox` row from its target queue. Pass
-/// the runtime primitives the worker has (`Arc<Http>`, `Arc<SharedData>`,
-/// bot token) plus the deserialized message payload; the function constructs
-/// `IntakeDeps` with `cache: None` and `ctx_for_chained_dispatch: None`
-/// (workers have no live gateway shard) and delegates to the existing
-/// intake body.
-///
-/// Leader producers use `router::intake_dispatch`; a claimed worker bypasses
-/// admission so it cannot recursively create another outbox row.
-pub(crate) async fn execute_intake_turn_core(
-    http: &Arc<serenity::http::Http>,
-    shared: &Arc<SharedData>,
-    token: &str,
-    request: IntakeRequest,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    handle_text_message(
-        &IntakeDeps {
-            http,
-            cache: None,
-            ctx_for_chained_dispatch: None,
-            shared,
-            token,
-        },
-        request.channel_id,
-        request.user_msg_id,
-        request.request_owner,
-        &request.request_owner_name,
-        &request.user_text,
-        request.reply_to_user_message,
-        request.defer_watcher_resume,
-        request.wait_for_completion,
-        request.merge_consecutive,
-        request.reply_context,
-        request.has_reply_boundary,
-        request.dm_hint,
-        request.turn_kind,
-        request.preserve_on_cancel,
-        false,
-        Vec::new(),
-        // Worker dispatch has no in-process gate carry-forward; it re-resolves
-        // the durable announcement row for its `user_msg_id` (#3905).
-        None,
-    )
-    .await
-}
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_text_message(
     deps: &IntakeDeps<'_>,
@@ -2694,27 +2623,29 @@ mod tui_busy_pre_submit_queue_reaction_tests {
             .find("claude_tui follow-up queued because hosted TUI is busy before prompt submission")
             .expect("hosted-TUI busy pre-submit queue branch exists");
         let busy_branch = &module_src[..busy_branch_pos];
-        let enqueue_pos = busy_branch
-            .rfind("enqueue_busy_tui_followup_for_retry(")
-            .expect("busy pre-submit branch enqueues the follow-up");
-        let accepted_guard_pos = busy_branch[enqueue_pos..]
-            .find("if enqueue_outcome.enqueued {")
-            .map(|offset| enqueue_pos + offset)
+        assert!(
+            busy_branch.contains("busy_retry::finalize_enqueue("),
+            "busy pre-submit branch must route enqueue finalization through the shared helper"
+        );
+
+        let helper_src = include_str!("busy_retry.rs");
+        let accepted_guard_pos = helper_src
+            .find("if outcome.enqueued {")
             .expect("busy pre-submit reaction must be gated on accepted enqueue");
         let accepted_helper = "note_busy_tui_pre_submit_queue_pending(";
-        let refusal_guard = "} else {\n            apply_tui_busy_enqueue_refusal(";
-        let accepted_clear =
-            "tv_clear_current(shared, http, channel_id, user_msg_id, \"intake_busy_queue\")";
-        let refusal_guard_pos = busy_branch[accepted_guard_pos..]
+        let refusal_guard =
+            "} else {\n        super::tui_followup::apply_tui_busy_enqueue_refusal(";
+        let accepted_clear = "note_intake_turn_cleared_current(";
+        let refusal_guard_pos = helper_src[accepted_guard_pos..]
             .find(refusal_guard)
             .map(|offset| accepted_guard_pos + offset)
             .expect("busy pre-submit enqueue refusal branch exists");
-        let reaction_call_pos = busy_branch[accepted_guard_pos..refusal_guard_pos]
+        let reaction_call_pos = helper_src[accepted_guard_pos..refusal_guard_pos]
             .find(accepted_helper)
             .map(|offset| accepted_guard_pos + offset)
             .expect("accepted busy pre-submit enqueue must apply a queue-pending reaction");
-        let accepted_branch = &busy_branch[accepted_guard_pos..refusal_guard_pos];
-        let refusal_branch = &busy_branch[refusal_guard_pos..];
+        let accepted_branch = &helper_src[accepted_guard_pos..refusal_guard_pos];
+        let refusal_branch = &helper_src[refusal_guard_pos..];
 
         assert!(
             accepted_guard_pos < reaction_call_pos,
@@ -2841,9 +2772,9 @@ mod recovery_context_take_order_tests {
         // The refusal else-branch must route through the sibling helper, which
         // puts the taken recovery context back BEFORE rewriting the refusal
         // notice (put-back-then-notice ordering pinned in tui_followup.rs).
-        let module_src = include_str!("intake_turn.rs");
-        module_src
-            .find("} else {\n            apply_tui_busy_enqueue_refusal(")
+        let finalize_src = include_str!("busy_retry.rs");
+        finalize_src
+            .find("} else {\n        super::tui_followup::apply_tui_busy_enqueue_refusal(")
             .expect("TUI-busy enqueue refusal routes through the put-back helper");
 
         let helper_src = include_str!("tui_followup.rs");
@@ -2922,15 +2853,13 @@ mod feedback_reminder_take_order_tests {
         // The refusal branch forwards the taken reminder to the sibling helper,
         // which puts it back BEFORE rewriting the refusal notice (mirroring the
         // recovery-context put-back-then-notice ordering).
-        let module_src = include_str!("intake_turn.rs");
+        let finalize_src = include_str!("busy_retry.rs");
         // The `\n` escape resolves to a real newline, which only the production
         // call site contains — this test's own copy of the snippet stores it as
         // the two characters `\n`, so the search does not self-match (same trick
         // the recovery-context refusal test relies on).
         assert!(
-            module_src.contains(
-                "session_retry_context.as_ref(),\n                feedback_reminder.as_deref(),"
-            ),
+            finalize_src.contains("session_retry_context,\n            feedback_reminder,"),
             "refusal call site must forward the taken reminder for put-back, right after the recovery context"
         );
 
