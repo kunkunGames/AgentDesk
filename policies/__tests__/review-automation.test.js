@@ -193,11 +193,8 @@ test("review-automation creates a review-decision dispatch when an auto-complete
 
 test("review-automation noop verification passes go terminal without creating a PR dispatch", () => {
   const { module, state } = loadPolicy("policies/review-automation.js", {
+    cards: { "card-5": { id: "card-5", status: "review" } },
     dbQuery: createSqlRouter([
-      {
-        match: "SELECT status FROM kanban_cards WHERE id = ?",
-        result: [{ status: "review" }]
-      },
       {
         match: "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
         result: [{ context: JSON.stringify({ review_mode: "noop_verification" }) }]
@@ -250,11 +247,8 @@ test("review-automation skips create-pr when reviewed work is already on origin 
         result: ""
       }
     ]),
+    cards: { "card-direct-push": { id: "card-direct-push", status: "review" } },
     dbQuery: createSqlRouter([
-      {
-        match: "SELECT status FROM kanban_cards WHERE id = ?",
-        result: [{ status: "review" }]
-      },
       {
         match: "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
         result: [{ context: JSON.stringify({ review_mode: "normal" }) }]
