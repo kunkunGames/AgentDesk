@@ -4,8 +4,8 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, departments, escalation, offices,
-    protected_api_domain, settings, stats, voice_config,
+    ApiRouter, AppState, departments, escalation, offices, protected_api_domain, settings, stats,
+    voice_config,
 };
 
 // Category: admin
