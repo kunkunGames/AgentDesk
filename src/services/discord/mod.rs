@@ -3665,7 +3665,7 @@ async fn mailbox_requeue_intervention_front(
     provider: &ProviderKind,
     channel_id: ChannelId,
     intervention: Intervention,
-) {
+) -> RequeueInterventionResult {
     let result: RequeueInterventionResult = shared
         .mailbox(channel_id)
         .requeue_front(
@@ -3682,6 +3682,7 @@ async fn mailbox_requeue_intervention_front(
             "mailbox requeue-front failed durable pending-queue persistence; pending dispatch marker remains the durable backstop"
         );
     }
+    result
 }
 
 pub(in crate::services::discord) async fn mailbox_abandon_pending_dispatch(
@@ -3717,10 +3718,11 @@ async fn mailbox_clear_pending_dispatch_reservation(
 /// Re-queue the inflight message that a claude TUI follow-up could not submit
 /// because the pane was busy at submit time. The follow-up busy-timeout is
 /// PRE-submit (the prompt was never delivered), so retrying cannot double-send.
-/// Enqueues to the BACK of the channel mailbox — matching
-/// `enqueue_busy_tui_followup_for_retry` — so the message is retried after the
-/// in-flight turn frees the pane rather than hot-looping. No-op for anchorless
-/// (recovery) turns or empty text.
+/// Enqueues to the BACK of the channel mailbox so the message is retried after
+/// the in-flight turn frees the pane rather than hot-looping. No-op for
+/// anchorless (recovery) turns or empty text. Unlike the dequeued-head sibling
+/// `enqueue_busy_tui_followup_for_retry` (front-requeues for FIFO, #4795), this
+/// inflight-rebuild path still tail-enqueues; FIFO parity tracked in #4797.
 pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_retry(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
