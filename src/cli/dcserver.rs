@@ -1536,7 +1536,9 @@ pub fn handle_dcserver(token: Option<String>) {
                     eprintln!(
                         "  ▸ Cluster standby : Discord gateway lease unavailable; keeping HTTP and worker heartbeat online"
                     );
-                    std::future::pending::<()>().await;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    }
                 }
             }
             None => {
@@ -1639,7 +1641,9 @@ pub fn handle_dcserver(token: Option<String>) {
                     eprintln!(
                         "  ▸ Cluster standby : Discord gateway leases unavailable; keeping HTTP and worker heartbeat online"
                     );
-                    std::future::pending::<()>().await;
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    }
                 }
             }
         }
