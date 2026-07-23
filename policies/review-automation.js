@@ -461,11 +461,8 @@ var reviewAutomation = {
       );
       var completeCfg = agentdesk.pipeline.resolveForCard(dispatch.kanban_card_id);
       var completeTerminalState = agentdesk.pipeline.terminalState(completeCfg);
-      var lifecycleRows = agentdesk.db.query(
-        "SELECT status FROM kanban_cards WHERE id = ?",
-        [dispatch.kanban_card_id]
-      );
-      var currentStatus = lifecycleRows.length > 0 ? lifecycleRows[0].status : null;
+      var card = agentdesk.cards.get(dispatch.kanban_card_id);
+      var currentStatus = card ? card.status : null;
       // Find review state by scanning for the state with a review_passed gated
       // outbound transition, rather than assuming a fixed 2-hop shape from kickoff.
       //
@@ -1125,12 +1122,9 @@ function attemptCreatePrDispatchForReviewPass(cardId, noopVerification) {
 function isCardEligibleForPrFailureTerminalize(cardId) {
   var cfg = agentdesk.pipeline.resolveForCard(cardId);
   var terminalState = agentdesk.pipeline.terminalState(cfg);
-  var rows = agentdesk.db.query(
-    "SELECT status FROM kanban_cards WHERE id = ?",
-    [cardId]
-  );
-  if (rows.length === 0) return false;
-  var currentStatus = rows[0].status;
+  var card = agentdesk.cards.get(cardId);
+  if (!card) return false;
+  var currentStatus = card.status;
   // Walk the config to find the review state (the from-state of a
   // gated transition marked with review_passed) without hardcoding the
   // pipeline shape.
@@ -1318,16 +1312,14 @@ function processVerdict(cardId, verdict, result, options) {
   var initialState = agentdesk.pipeline.kickoffState(cfg);
   var inProgressState = agentdesk.pipeline.nextGatedTarget(initialState, cfg);
 
-  var cardCheck = agentdesk.db.query(
-    "SELECT status FROM kanban_cards WHERE id = ?", [cardId]
-  );
-  if (cardCheck.length > 0 && agentdesk.pipeline.isTerminal(cardCheck[0].status, cfg)) {
+  var card = agentdesk.cards.get(cardId);
+  if (card && agentdesk.pipeline.isTerminal(card.status, cfg)) {
     agentdesk.log.info("[review] processVerdict skipped — card " + cardId + " already terminal");
     return;
   }
 
   var fallbackReviewState = agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
-  var currentState = cardCheck.length > 0 ? cardCheck[0].status : null;
+  var currentState = card ? card.status : null;
   var currentReviewPassTarget = currentState
     ? agentdesk.pipeline.nextGatedTargetWithGate(currentState, "review_passed", cfg)
     : null;
