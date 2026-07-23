@@ -23,8 +23,8 @@ db:
     markers_required: false
     rationale: broad legacy review lifecycle DB access pinned by no-silent-growth baseline
     no_silent_growth:
-      callsites: 33
-      fingerprint: sha256:3a35ba3e9f868c5b4a2f0642e42219247a2e87ba42c70e751ea8d7171fedf186
+      callsites: 30
+      fingerprint: sha256:9e7a937d22a72e6772be5bdfe922e09ab6115cb724dcbb702c38abaa16784894
 exec:
   allow:
     - gh
