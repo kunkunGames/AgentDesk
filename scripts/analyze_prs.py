@@ -185,6 +185,7 @@ def is_scratch_file_path(path):
         "pr-body.md",
         "plan.md",
         "plan.txt",
+        "prs.json",
         "test.sh",
         "test.sql",
         "test.py",
@@ -193,6 +194,8 @@ def is_scratch_file_path(path):
         "sql_test.rs",
     }
     if path in root_scratch_files:
+        return True
+    if path.endswith(".diff") or path.endswith(".patch"):
         return True
     return bool(
         re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js)$", path)
