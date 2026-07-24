@@ -504,6 +504,64 @@ test("timeouts reconcile fallback gates depth flow when an auto-queue entry is l
   assert.equal(state.autoQueueStatusUpdates[0].reason, "scope_gate_direct_reconcile");
 });
 
+test("timeouts reconcile fallback escalates DoD waits", () => {
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: { pm_decision_gate_enabled: true },
+    cards: {
+      "card-dod-test": {
+        id: "card-dod-test",
+        status: "requested",
+        priority: "medium",
+        assigned_agent_id: "agent-1",
+        deferred_dod_json: {
+          items: ["add tests", "update docs"],
+          verified: ["add tests"]
+        }
+      }
+    },
+    dbQuery: createSqlRouter([
+      {
+        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
+        result: [{ key: "reconcile_dispatch:dispatch-dod-test", value: "dispatch-dod-test" }]
+      },
+      {
+        match: "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result, context FROM task_dispatches WHERE id = ?",
+        result: [
+          {
+            id: "dispatch-dod-test",
+            kanban_card_id: "card-dod-test",
+            to_agent_id: "agent-1",
+            dispatch_type: "implementation",
+            chain_depth: 0,
+            status: "completed",
+            result: JSON.stringify({ completed_without_changes: false }),
+            context: "{}"
+          }
+        ]
+      },
+      {
+        match: "SELECT metadata FROM kanban_cards WHERE id = ?",
+        result: [{ metadata: "{}" }]
+      },
+      { match: "FROM auto_queue_entries e", result: [] }
+    ])
+  });
+
+  policy._section_R();
+
+  assert.deepEqual(state.statusCalls, [{ cardId: "card-dod-test", status: "review", force: false }]);
+  assert.deepEqual(state.reviewStatusCalls, [
+    {
+      cardId: "card-dod-test",
+      reviewStatus: "awaiting_dod",
+      options: { awaiting_dod_at: "now" }
+    }
+  ]);
+  assert.deepEqual(state.reviewStateSyncs, [
+    { cardId: "card-dod-test", status: "awaiting_dod", options: {} }
+  ]);
+});
+
 test("timeouts review timeout module escalates overdue DoD waits", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     dbQuery: createSqlRouter([
