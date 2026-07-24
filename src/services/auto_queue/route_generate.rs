@@ -335,9 +335,7 @@ pub async fn generate(
                 continue;
             }
 
-            let dep_status = if let Some(status) = dependency_status_cache.get(dep_num) {
-                status.clone()
-            } else {
+            if !dependency_status_cache.contains_key(dep_num) {
                 let status = sqlx::query_scalar::<_, String>(
                     "SELECT status
                          FROM kanban_cards
@@ -350,9 +348,9 @@ pub async fn generate(
                 .await
                 .ok()
                 .flatten();
-                dependency_status_cache.insert(*dep_num, status.clone());
-                status
-            };
+                dependency_status_cache.insert(*dep_num, status);
+            }
+            let dep_status = dependency_status_cache.get(dep_num).unwrap();
 
             if dep_status.as_deref() != Some("done") {
                 unresolved_external_dependencies.push(format!(
