@@ -409,14 +409,20 @@ mod health_classification_tests {
         assert_eq!(provider_standby.subsystem, "provider_runtime");
         assert_eq!(provider_standby.severity, Severity::Warning);
         assert_eq!(provider_standby.fix_safety, FixSafety::ReadOnly);
-        assert_eq!(provider_standby.summary, "provider codex is in gateway standby mode");
+        assert_eq!(
+            provider_standby.summary,
+            "provider codex is in gateway standby mode"
+        );
         assert_ne!(provider_standby.summary, provider_standby.raw);
 
         let cluster_standby = classify_degraded_reason("gateway_standby");
         assert_eq!(cluster_standby.subsystem, "health");
         assert_eq!(cluster_standby.severity, Severity::Warning);
         assert_eq!(cluster_standby.fix_safety, FixSafety::ReadOnly);
-        assert_eq!(cluster_standby.summary, "cluster is in standby mode without a gateway connection");
+        assert_eq!(
+            cluster_standby.summary,
+            "cluster is in standby mode without a gateway connection"
+        );
         assert_ne!(cluster_standby.summary, cluster_standby.raw);
     }
 }
