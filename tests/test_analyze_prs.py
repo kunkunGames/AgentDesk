@@ -372,6 +372,9 @@ Update analyzer hygiene checks to match the current template.
 class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_root_scratch_files_are_flagged(self):
         self.assertTrue(is_scratch_file_path("pr-body.md"))
+        self.assertTrue(is_scratch_file_path("prs.json"))
+        self.assertTrue(is_scratch_file_path("patch.diff"))
+        self.assertTrue(is_scratch_file_path("my-fix.patch"))
         self.assertTrue(is_scratch_file_path("test.sh"))
         self.assertTrue(is_scratch_file_path("scratch.sh"))
         self.assertTrue(is_scratch_file_path("scratchpad.sh"))
