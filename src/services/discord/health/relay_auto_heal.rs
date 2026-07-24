@@ -1299,11 +1299,13 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let mut cmd = std::process::Command::new("tmux");
+        crate::services::platform::binary_resolver::apply_runtime_path(&mut cmd);
+        let _ = cmd.args(["kill-session", "-t", tmux_session]).status();
+        let mut cmd = std::process::Command::new("tmux");
+        crate::services::platform::binary_resolver::apply_runtime_path(&mut cmd);
         assert!(
-            std::process::Command::new("tmux")
+            cmd
                 .args(["new-session", "-d", "-s", tmux_session])
                 .status()
                 .expect("start tmux fixture")
@@ -1424,9 +1426,9 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let mut cmd = std::process::Command::new("tmux");
+        crate::services::platform::binary_resolver::apply_runtime_path(&mut cmd);
+        let _ = cmd.args(["kill-session", "-t", tmux_session]).status();
     }
 
     #[test]
