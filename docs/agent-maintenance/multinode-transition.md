@@ -446,8 +446,35 @@
   before merging.
 
 ### Audited touches
+- 2026-07-24 — #4712 lifecycle de-giant rebase: `runtime_bootstrap.rs` changes only
+  update the restart-marker characterization fixture to the current nonce/version
+  encoding, while watcher lifecycle logic moves verbatim behind the existing facade.
+  Gateway ownership, lease ordering, worker placement, and cross-node authority are
+  unchanged.
+- 2026-07-24 — #4533 transcript clear fence: `/clear` boundary writes and watcher
+  transcript persistence serialize through the same channel-scoped PostgreSQL
+  advisory transaction lock. The persisted boundary remains cluster-wide authority;
+  this adds no leader election, worker placement, lease, schema, or routing change.
+- 2026-07-24 — #4623 confirmed fresh-delivery cutover: the session sink preserves
+  transport-confirmed fresh outcomes through the process-local exact-sequence ring
+  and watcher ACK instead of folding them into sink errors. Existing shared delivery
+  leases and durable frontier authority remain unchanged; this adds no PostgreSQL
+  schema, leader election, worker placement, or cross-node adoption rule.
+- #4488 PR-F destructive E2E controls are worker-local and opt-in: exact-message deletion and one-shot send/delete failure injection resolve the provider runtime registered on the receiving dcserver; the route subtree remains unmounted unless `AGENTDESK_E2E_CONTROL=1`, and every target must be in the boot-bound `AGENTDESK_E2E_CHANNEL_IDS` allowlist. They add no PostgreSQL authority, leader election, lease, worker placement, or cross-node routing rule; the harness targets the node-local loopback control plane for the owning E2E cell.
+- 2026-07-24 — #4508 edit-failure fallback authority: controller and legacy
+  watcher owners capture the worker-local transcript path/generation before the
+  edit await, then re-read a locked, double-validated EOF/frontier snapshot while
+  retaining the same process-local delivery lease. Committed reconciliation uses
+  delivered-anchor-aware guarded placeholder cleanup. This adds no cross-node
+  adoption authority, leader election, PG lease, or routing change; rotated or
+  otherwise unverifiable worker-local sidecars remain fail-open for delivery.
+- 2026-07-24 — #4536 idle JSONL cursor/commit boundary: temporary active/grace
+  suppression now holds uncommitted ordered ranges, and only generation/EOF-checked
+  confirmed delivery advances the durable and in-memory frontiers. No inflight
+  blind save was added; #4843 reanchor and #4847 shared lease contracts remain intact.
 - #4756 blocking filesystem isolation: routine script reload scans remain inside the existing worker-local routine runtime and per-request validation paths, while startup dashboard provisioning and session-resume discovery retain their existing node-local paths. Moving those synchronous directory walks to Tokio's blocking pool changes no leader election, PG lease, worker placement, durable ownership, or cross-node routing authority.
 - #4340 r3 finalizer-panel ownership fencing remains worker-local: watchdog clear now returns the row removed under the existing per-channel inflight flock, and durable terminal-card records bind message IDs to turn episode plus panel/save revisions. No PostgreSQL schema, lease, leader election, cross-node routing, or owner placement authority changes.
+- #4521 live-state taxonomy audit: [`../relay-live-state-taxonomy.md`](../relay-live-state-taxonomy.md) classifies PostgreSQL authority, host-local durable sidecars, in-memory projections, and transient relay work. Cross-node `instance_id + epoch` stamping/reconciliation stays P3/deferred under #876–#884 until #4414 owner-approved design decides which durable state remains authoritative; current node-local files are never cross-node adoption authority. #4847's terminal delivery lease, #4843's durable-frontier reanchor CAS, #4830's panel invalidation epoch, and #4852's confirmed-commit-only idle cursor remain worker-local; I10 is now documented as landed.
 - #4777 PR-1 channel owner-authority rollout scope: `owner_authority_channel_ids`
   is a live-read, raw top-level Discord channel allowlist used only to tag the
   leader-owned intake planner's structured telemetry. It does not activate the
@@ -655,6 +682,18 @@
   fire-and-forget session banner (`session_banner.rs`) is untouched. Delete
   failures fall back to the existing durable status-panel orphan store (also
   worker-local). OFF path is byte-identical.
+- #4488 two-message restart recovery + E2E: the restart inflight scan delegates
+  panel repair to `recovery_engine/two_message_panel.rs` before watcher/bridge
+  reattachment. The helper treats Discord message existence and snowflake order
+  only as repair evidence, then authorizes the replacement exclusively through
+  the existing full `InflightTurnIdentity` CAS and in-lock generation bump. A
+  just-sent panel is pre-registered in the worker-local orphan store, a bind loser
+  deletes or queues only its own duplicate, and an old live panel is retired only
+  after the same episode durably owns the replacement. The #4830 process-local
+  cache invalidation epoch is intentionally not copied across restart or panel
+  identities; the new panel starts uncached, while terminal reconcile remains
+  keyed to the rebound panel generation. No PG lease, leader gate, schema field,
+  or cross-node authority is added. The default-OFF flag remains unchanged.
 - #3038 (b) early TUI completion gate extraction: `turn_bridge/mod.rs` moved the
   #2293/#2780 early TUI quiescence gate (the eligibility filter + bounded
   `run_tui_completion_gate` probe + timed-out warning that compute

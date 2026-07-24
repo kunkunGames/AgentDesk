@@ -12,7 +12,7 @@ use super::status_panel::{StatusPanelState, SubagentSlot};
 use super::subagent_panel::render_subagent_slot;
 use super::task_panel::{
     TaskToolSlot, render_task_panel_line, render_task_tool_slot, task_tool_slot_identity,
-    task_tool_slot_is_terminal, task_tool_terminal_marker,
+    task_tool_slot_is_terminal, task_tool_slot_is_unfinished_background, task_tool_terminal_marker,
 };
 
 /// #3391: stable per-slot handle (NOT the rendered line). `ToolUseId`/`TaskId`
@@ -184,6 +184,7 @@ impl EvictedTerminalCounts {
 struct EmittedLine {
     text: String,
     terminal_id: Option<TerminalSlotId>,
+    unfinished_background: bool,
 }
 
 pub(super) fn render_completion_footer(
@@ -220,15 +221,6 @@ pub(super) fn render_completion_footer(
     let mut emitted: Vec<EmittedLine> = Vec::new();
     let mut has_unfinished_entries = false;
 
-    if snapshot.background_agent_pending {
-        emitted.push(EmittedLine::header("Background agents"));
-        emitted.push(EmittedLine {
-            text: format!("Waiting for background agents {indicator}"),
-            terminal_id: None,
-        });
-        has_unfinished_entries = true;
-    }
-
     if !snapshot.tasks.is_empty() {
         if !emitted.is_empty() {
             emitted.push(EmittedLine::blank());
@@ -258,6 +250,7 @@ pub(super) fn render_completion_footer(
             emitted.push(EmittedLine {
                 text: line,
                 terminal_id,
+                unfinished_background: task_tool_slot_is_unfinished_background(slot),
             });
         }
         has_unfinished_entries |= task_unfinished;
@@ -295,13 +288,23 @@ pub(super) fn render_completion_footer(
             emitted.push(EmittedLine {
                 text: line,
                 terminal_id,
+                unfinished_background: slot.is_unfinished_background(),
             });
         }
         has_unfinished_entries |= subagent_unfinished;
     }
 
+    // #4860 (관측 문제 규명): #4848 introduced TWO insertion sites for the
+    // `Background agents / Waiting …` block — a pre-clamp push into `emitted`
+    // when the task/subagent lists were empty AND the post-clamp prepend below.
+    // The pushed lines carry `unfinished_background: false`, so the post-clamp
+    // guard (`visible_detailed_background_entry`) never saw them and prepended
+    // the SAME block again → every pending completion footer rendered the
+    // waiting block twice ("턴마다 2개씩"). The post-clamp prepend is now the
+    // ONLY insertion site; the empty-list case is handled after the clamp
+    // branch below.
     if !emitted.is_empty() {
-        // #3089 completion footer: keep the Context line outside the S3 budget
+        // #3089 completion footer: keep the context-usage line outside the S3 budget
         // so usage never disappears because a task section is noisy. The same
         // 600-byte cap applies to the combined task/subagent section.
         let section = emitted
@@ -309,7 +312,23 @@ pub(super) fn render_completion_footer(
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let (clamped, kept_count) = clamp_completion_task_section(&section);
+        let (mut clamped, mut kept_count) = clamp_completion_task_section(&section);
+        let visible_detailed_background_entry = emitted
+            .iter()
+            .take(kept_count)
+            .any(|line| line.unfinished_background);
+        if snapshot.background_agent_pending && !visible_detailed_background_entry {
+            let waiting = format!("Background agents\nWaiting for background agents {indicator}");
+            let combined = format!("{waiting}\n\n{section}");
+            let clamped_combined = clamp_completion_task_section(&combined).0;
+            kept_count = clamped_combined
+                .lines()
+                .skip(waiting.lines().count() + 1)
+                .take_while(|line| *line != "…")
+                .count();
+            clamped = clamped_combined;
+            has_unfinished_entries = true;
+        }
         // #3391: a terminal mark counts as delivered iff its emitted line
         // survived the clamp by POSITION. `kept_count` is the number of leading
         // emitted lines retained (the rest are replaced by the `…` marker), so
@@ -327,6 +346,17 @@ pub(super) fn render_completion_footer(
         };
     }
 
+    // #4860: no task/subagent lines at all — the waiting block IS the section.
+    // Exactly one copy (the mutation proof for the #4848 double render: re-adding
+    // the removed pre-clamp push makes `waiting_block_renders_exactly_once_4860`
+    // count two `Background agents` headers and fail).
+    if snapshot.background_agent_pending {
+        sections.push(format!(
+            "Background agents\nWaiting for background agents {indicator}"
+        ));
+        has_unfinished_entries = true;
+    }
+
     CompletionFooterRender {
         block: (!sections.is_empty()).then(|| sections.join("\n\n")),
         has_unfinished_entries,
@@ -339,6 +369,7 @@ impl EmittedLine {
         Self {
             text: name.to_string(),
             terminal_id: None,
+            unfinished_background: false,
         }
     }
 
@@ -346,6 +377,7 @@ impl EmittedLine {
         Self {
             text: String::new(),
             terminal_id: None,
+            unfinished_background: false,
         }
     }
 }

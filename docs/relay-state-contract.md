@@ -17,6 +17,11 @@ If you change relay ownership, every invariant below must continue to hold.
 A regression here is a user-visible relay miss / duplicate, so keep the
 checks loud (debug_assert + observability record) instead of silent.
 
+The persistence and node-ownership status of these values is classified in
+[`relay-live-state-taxonomy.md`](relay-live-state-taxonomy.md). In particular,
+a durable sidecar is host-local unless a PostgreSQL-backed ownership contract
+explicitly says otherwise.
+
 ### Reference format
 
 Code anchors below are **symbol-path references**, not `file:line` (which
@@ -302,6 +307,102 @@ plan.
   can kill the successor's tmux session.
 - Invariant key: `mailbox_episode_identity_exact` (enforced by the actor predicate
   and mutation-proven regression tests rather than an observe-only hook).
+
+## I9. every session-bound terminal POST holds the shared delivery lease (#4277)
+
+- Definition: terminal deliveries parsed by
+  `SessionRelayParser::ingest_frame`
+  (`sym:session_relay_sink::turn_parser::SessionRelayParser::ingest_frame`) carry
+  either their strict turn fence, an idle/catch-up ordered JSONL range, or the
+  legacy no-range shape.
+- Producer: `SessionBoundDiscordRelaySink::deliver_response`
+  (`sym:session_relay_sink::SessionBoundDiscordRelaySink::deliver_response`)
+  derives one lease coordinate before any Discord transport. Strict fenced
+  frames use `[turn_start_offset, terminal_consumed_end)`, ordered idle/catch-up
+  frames use their carried range, and unresolvable legacy frames still contend
+  on the degenerate key and zero-width coordinate.
+- Consumer: the sink and watcher share the channel's `DeliveryLeaseCell`; a lost
+  acquire is a deterministic not-delivered result and must never fall through to
+  a markerless POST.
+- Invariant: there is no session-bound terminal POST/edit path without first
+  winning the shared delivery lease. The controller short-replace path owns its
+  own acquire; all other terminal paths use `SinkDeliveryLeaseGuard`.
+- Violation surface: an inflight-less idle-tail frame POSTs without a lease while
+  the watcher independently wins the fallback-keyed lease for the same bytes,
+  producing a duplicate Discord response.
+- Invariant key: `session_terminal_post_lease_required` (enforced structurally by
+  the mandatory acquire and production-entry regression tests).
+- Consumer rule: a confirmed fresh-message POST returned by the controller is
+  preserved as a typed exact-sequence terminal resolution through
+  `sym:cluster::stream_relay::RelaySinkOutcome::terminal_fresh_delivered` and the
+  watcher transport-confirmation predicate.
+  `committed_to=None` and `persistence_recorded=false` describe missing frontier
+  authority or retry metadata; neither erases confirmed transport or authorizes
+  the watcher to acquire the released lease and POST the same body again.
+- Violation surface: folding confirmed fresh transport into `RelaySinkError` loses
+  its provenance; §3.2 then sees `committed < end`, reacquires the shared lease,
+  and sends a duplicate full response.
+
+## I10. idle JSONL cursors consume only classified drops or confirmed commits (#4536)
+
+- Definition: the idle backstop range decision
+  (`sym:session_relay_sink::idle_jsonl::idle_jsonl_suppressed_range_action`)
+  separates intentional classification drops from temporary inflight/grace
+  deferral.
+- Producer: confirmed ranged transport commits through
+  `SessionBoundDiscordRelaySink::advance_idle_range_after_confirmed_post`
+  (`sym:session_relay_sink::SessionBoundDiscordRelaySink::advance_idle_range_after_confirmed_post`),
+  which first persists the generation-scoped frontier via
+  `commit_ordered_jsonl_range`
+  (`sym:outbound::delivery_record::commit_ordered_jsonl_range`) and then advances
+  the in-memory watermark.
+- Consumer: the idle loop advances its local cursor only when the range is an
+  intentional drop or current-generation committed coverage reaches its end;
+  enqueue acceptance alone leaves the pending range retryable.
+- Invariant: active-turn, post-inflight-grace, and new-session-grace suppression
+  never consumes an uncommitted byte. A confirmed ranged POST must match the
+  queued wrapper generation and remain EOF-bounded before either authority is
+  advanced.
+- Violation surface: enqueue followed by transport/commit failure permanently
+  skips a wake/background answer, or a delayed range commits against a replaced
+  transcript and suppresses unrelated output.
+- Invariant key: `idle_cursor_confirmed_commit_only` (enforced structurally and by
+  cursor/commit/generation regression tests).
+
+## I11. edit failure does not authorize a fresh fallback POST (#4508)
+
+- Definition: the formatting layer's edit-only replace primitive
+  (`sym:formatting::replace_long_message_raw_deferred`) returns a typed edit
+  failure without issuing a fallback POST.
+- Producer: before awaiting the edit, the range owner captures the expected
+  watcher output path and nonzero generation. After edit failure it re-reads a
+  stable path+generation+EOF+durable-frontier snapshot with
+  `range_committed_after_edit_failure`
+  (`sym:outbound::delivery_record::range_committed_after_edit_failure`) while the
+  same `DeliveryLease` is still held. The delivery-record lock serializes
+  conforming frontier writes, and post-read path/generation/file-identity checks
+  reject wrapper rotation or transcript replacement during the snapshot.
+- Consumer: controller and legacy watcher short-replace paths suppress fallback
+  delivery only when the pre-edit identity still matches and fresh,
+  generation-matching, EOF-bounded coverage reaches the range end. Missing
+  markers, path or generation changes, unstable file metadata, unknown EOF, and
+  frontier past EOF remain fail-open for delivery and retain the existing
+  one-shot fallback.
+- Invariant: an edit failure is not fresh-send authority. Confirmed committed
+  coverage yields `AlreadyCommittedAfterEditFailure` with zero fallback POSTs and
+  no transport-success commit; watcher reconciliation uses the delivered-anchor-
+  aware guarded cleanup and clears placeholder/orphan tracking only after a
+  committed stale-placeholder delete. The delivered anchor itself and any case
+  without positive delivered-elsewhere proof remain tracked and preserved.
+  Otherwise, only a confirmed fallback POST may run the existing commit/advance
+  path.
+- Violation surface: a restart leaves a stale placeholder target, another owner
+  commits the JSONL range while the edit is awaited, Discord returns Unknown
+  Message, and the stale owner duplicates the already delivered response via a
+  fresh POST.
+- Invariant key: `edit_failure_fallback_requires_fresh_frontier` (enforced by
+  controller mutation-sensitive post-count tests, delivery-record generation/EOF
+  tests, and controller/legacy owner wiring tests).
 
 ## How to add a new invariant
 

@@ -7,36 +7,6 @@ fn compact_command_name_first_stub() -> &'static str {
     "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
 }
 
-/// Scoped env-var override for inflight persistence tests. `AGENTDESK_ROOT_DIR`
-/// is process-global, so serialize it with the shared test env lock.
-struct EnvRootGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvRootGuard {
-    fn set(path: &std::path::Path) -> Self {
-        let lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for EnvRootGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-    }
-}
-
 // ====================================================================
 // #3154 P2-2 (c) — the KEY residual risk: prove there is NO relay GAP
 // (not merely no duplicate) on the deferred synthetic-start path.
@@ -2574,7 +2544,7 @@ fn claude_bridge_lease_clears_when_tail_dedup_skips_spawn() {
 #[tokio::test]
 async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -3178,7 +3148,7 @@ fn codex_external_input_relay_output_path_uses_rollout_not_wrapper() {
 #[test]
 fn codex_external_input_binding_refreshes_from_live_rollout_marker() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -3229,7 +3199,7 @@ fn codex_external_input_binding_refreshes_from_live_rollout_marker() {
 #[test]
 fn codex_ownerless_external_input_undelivered_turn_needs_rollout_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let _env = EnvRootGuard::set(dir.path());
+    let _env = crate::config::set_agentdesk_root_for_test(dir.path());
     let rollout_path = dir.path().join("rollout.jsonl");
     std::fs::write(
         &rollout_path,
@@ -3360,7 +3330,7 @@ fn idle_bridge_stands_down_for_every_resolved_non_bridge_synthetic_claim() {
     use super::synthetic_start::tui_direct_synthetic_non_bridge_owner_matches;
 
     let root = tempfile::tempdir().expect("runtime root");
-    let _env = EnvRootGuard::set(root.path());
+    let _env = crate::config::set_agentdesk_root_for_test(root.path());
     let tmux = "AgentDesk-codex-adk-cdx-4455";
     let channel = ChannelId::new(1_479_671_301_387_059_200);
     let lease = ExternalInputRelayLease::unassigned(Some(channel.get()));
@@ -3597,7 +3567,7 @@ fn failed_synthetic_placeholder_delete_is_terminal_cleanup_guarded() {
 #[tokio::test]
 async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(940_000_000_004_082);
@@ -3671,7 +3641,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
 #[tokio::test]
 async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -3825,7 +3795,7 @@ fn save_ownerless_tui_direct_inflight_for_mailbox_release_test(
 #[tokio::test]
 async fn stale_ownerless_tui_direct_mailbox_release_allows_new_synthetic_claim() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Codex;
     let channel_id = ChannelId::new(940_000_000_000_009);
@@ -3890,7 +3860,7 @@ async fn stale_ownerless_tui_direct_mailbox_release_allows_new_synthetic_claim()
 #[tokio::test]
 async fn stale_ownerless_tui_direct_mailbox_release_preserves_fresh_owner() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Codex;
     let channel_id = ChannelId::new(940_000_000_000_010);
@@ -4056,15 +4026,93 @@ fn claude_rehydrate_start_offset_uses_current_eof() {
     );
 }
 
-// #4549: `/compact` rewrites the same transcript path to a shorter historical
-// snapshot. The durable EOF-regression signal must fast-forward to the new EOF
-// instead of restarting at zero, which would mirror an old direct prompt again.
+// #4549/#4841: `/compact` rewrites the same transcript path to a shorter
+// historical snapshot. Either direct cursor regression or its same-generation
+// durable evidence must fast-forward to the new EOF instead of restarting at
+// zero, which would mirror an old direct prompt again.
 #[test]
 fn claude_idle_transcript_scan_fast_forwards_when_compaction_shrinks_file() {
     assert_eq!(
-        claude_idle_compaction_reanchor(false, 99_999, 250, true),
+        claude_idle_compaction_reanchor(false, 99_999, 250, false),
         Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset: 250 })
     );
+}
+
+#[test]
+fn claude_idle_transcript_scan_reanchors_after_restart_rehydrates_cursor_at_eof() {
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 250, true),
+        Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset: 250 })
+    );
+}
+
+#[test]
+fn claude_idle_transcript_scan_replays_full_prompt_after_mid_line_shrink() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("transcript.jsonl");
+    let compact = "{\"type\":\"system\",\"subtype\":\"compact\",\"sessionId\":\"s1\"}\n";
+    let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"prompt crossing reanchor\"}]},\"sessionId\":\"s1\"}\n";
+    let split = prompt.len() / 2;
+    std::fs::write(&transcript, format!("{compact}{}", &prompt[..split]))
+        .expect("write compacted transcript with partial prompt");
+    let mid_line_eof = std::fs::metadata(&transcript).unwrap().len();
+    let safe_offset = claude_idle_safe_reanchor_offset(&transcript, mid_line_eof)
+        .expect("resolve safe reanchor boundary");
+    assert_eq!(
+        safe_offset,
+        compact.len() as u64,
+        "partial JSONL must re-read from its own line start"
+    );
+    let anchored = match claude_idle_compaction_reanchor(false, 99_999, safe_offset, true) {
+        Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset }) => offset,
+        other => panic!("expected compaction anchor, got {other:?}"),
+    };
+
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open partial transcript")
+        .write_all(prompt[split..].as_bytes())
+        .expect("finish prompt line");
+
+    assert_eq!(
+        scan_claude_idle_transcript_for_prompt(&transcript, anchored)
+            .expect("scan completed prompt from safe boundary"),
+        ClaudeIdleTranscriptScan::Prompt {
+            prompt: "prompt crossing reanchor".to_string(),
+            prompt_start_offset: compact.len() as u64,
+            line_end_offset: (compact.len() + prompt.len()) as u64,
+            entry_id: None,
+        }
+    );
+}
+
+#[test]
+fn claude_idle_safe_reanchor_handles_exact_backward_chunk_boundaries() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("chunk-boundary.jsonl");
+    const CHUNK: usize = 8 * 1024;
+
+    for (newline_at, current_eof, expected) in [
+        (CHUNK - 2, 2 * CHUNK, CHUNK - 1),
+        (CHUNK - 1, 2 * CHUNK, CHUNK),
+        (CHUNK, 2 * CHUNK, CHUNK + 1),
+        (CHUNK - 1, CHUNK, CHUNK),
+        (CHUNK - 1, 2 * CHUNK - 1, CHUNK),
+        (CHUNK - 1, 2 * CHUNK, CHUNK),
+        (CHUNK - 1, 2 * CHUNK + 1, CHUNK),
+    ] {
+        let mut bytes = vec![b'x'; current_eof];
+        bytes[newline_at] = b'\n';
+        std::fs::write(&transcript, bytes).expect("write boundary transcript");
+        assert_eq!(
+            claude_idle_safe_reanchor_offset(&transcript, current_eof as u64)
+                .expect("resolve chunk boundary"),
+            expected as u64,
+            "newline_at={newline_at}, current_eof={current_eof}"
+        );
+    }
 }
 
 #[test]
@@ -4107,6 +4155,16 @@ fn claude_idle_transcript_scan_preserves_normal_growth() {
     assert_eq!(
         claude_idle_compaction_reanchor(false, 100, 250, false),
         None
+    );
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 400, false),
+        None,
+        "an append-only EOF advance must never re-anchor"
+    );
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 400, true),
+        None,
+        "a stale-high durable frontier must not swallow bytes appended after rehydration"
     );
 
     let dir = tempfile::tempdir().expect("temp dir");

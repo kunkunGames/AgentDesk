@@ -38,12 +38,13 @@ mod relay_format;
 mod task_notification_context;
 mod turn_parser;
 use self::idle_jsonl::{
-    IdleJsonlSessionInitRearm, IdleRelayRangeAction, idle_jsonl_apply_active_inflight_gate,
+    IdleJsonlSessionInitRearm, IdleJsonlSuppression, IdleRelayRangeAction,
+    idle_jsonl_apply_active_inflight_gate,
     idle_jsonl_clear_session_init_on_generation_signature_change, idle_jsonl_consume_offset,
-    idle_jsonl_payload_contains_init_event, idle_jsonl_payload_contains_schedule_wakeup_setup,
-    idle_jsonl_payload_contains_user_event, idle_jsonl_prepare_dedup_shared,
-    idle_jsonl_relay_source_for_matched, idle_jsonl_session_has_init,
-    idle_jsonl_should_retry_without_dedup_shared, idle_relay_range_action,
+    idle_jsonl_current_eof, idle_jsonl_payload_contains_init_event,
+    idle_jsonl_payload_contains_schedule_wakeup_setup, idle_jsonl_payload_contains_user_event,
+    idle_jsonl_prepare_dedup_shared, idle_jsonl_relay_source_for_matched,
+    idle_jsonl_session_has_init, idle_jsonl_suppressed_range_action, idle_relay_range_action,
     prune_idle_jsonl_session_state, read_jsonl_range,
 };
 use self::task_notification_context::ensure_card_and_route;
@@ -296,9 +297,9 @@ struct SinkDeliveryLeaseGuard {
 
 impl SinkDeliveryLeaseGuard {
     /// Self-heal a dead PRIOR holder, then CAS-acquire as `LeaseHolder::Sink` for
-    /// `(turn, [start,end))`. `Some` (spawning the heartbeat) only when the acquire wins; a
-    /// FAILED acquire (another holder owns the range) → `None` → markerless heartbeat-less
-    /// POST that never blocks delivery (single-winner CAS — no dup, no self-black-hole).
+    /// `(turn, [start,end))`. `Some` (spawning the heartbeat) only when the acquire wins;
+    /// `None` means another holder owns the range and the caller must return NotDelivered
+    /// without reaching transport.
     fn acquire(
         cell: &Arc<super::DeliveryLeaseCell>,
         key: super::DeliveryLeaseKey,
@@ -392,15 +393,28 @@ fn session_bound_should_send_new_chunks_for_placeholder(response_text: &str) -> 
     response_text.len() > super::DISCORD_MSG_LIMIT
 }
 
-/// #3089 A2b (review-fix Medium-1): pure `SinkDeliveryLeaseGuard` acquire decision — legacy
-/// branches acquire ONE `Leased{Sink}` marker over `cutover_range`; the cut-over short-replace
-/// branch is EXCLUDED (controller owns the single lease). Extracted so the no-double-acquire
-/// invariant is testable: dropping `!cutover` fails `cutover_skips_sink_guard_acquire`.
-fn sink_guard_lease_range(
-    cutover_range: Option<(u64, u64)>,
-    cutover_short_replace: bool,
-) -> Option<(u64, u64)> {
-    cutover_range.filter(|_| !cutover_short_replace)
+/// Pick the one ordered coordinate used by every terminal sink path. Strict
+/// commit-fenced frames take precedence; inflight-less idle/catch-up frames use
+/// their carried range; legacy no-range frames still return a degenerate
+/// zero-width coordinate so no terminal POST can bypass the shared lease.
+fn sink_delivery_lease_coordinate(delivery: &SessionRelayDelivery) -> ((u64, u64), Option<u64>) {
+    if let (Some(start), Some(end)) = (
+        delivery.frame_turn_start_offset,
+        delivery.terminal_consumed_end,
+    ) && end > start
+    {
+        return ((start, end), Some(start));
+    }
+    if let Some((start, end)) = delivery.relay_range
+        && end > start
+    {
+        return ((start, end), Some(start));
+    }
+
+    // A terminal delivery without an ordered byte range must still serialize on
+    // the channel cell. The zero-width coordinate and absent fallback retain the
+    // legacy degenerate id-0 key instead of allowing a lease-free POST.
+    ((0, 0), None)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -474,11 +488,19 @@ fn inflight_turn_id(state: &InflightTurnState) -> Option<String> {
     (state.user_msg_id != 0).then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id))
 }
 
+#[cfg(test)]
+struct SinkLeaseTestProbe {
+    acquired: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
     health_registry: Arc<HealthRegistry>,
     frames_total: AtomicU64,
     delivered_total: AtomicU64,
     by_session: Mutex<HashMap<String, SessionRelayParser>>,
+    #[cfg(test)]
+    lease_test_probe: Option<Arc<SinkLeaseTestProbe>>,
 }
 
 impl SessionBoundDiscordRelaySink {
@@ -488,7 +510,19 @@ impl SessionBoundDiscordRelaySink {
             frames_total: AtomicU64::new(0),
             delivered_total: AtomicU64::new(0),
             by_session: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            lease_test_probe: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_lease_test_probe(
+        health_registry: Arc<HealthRegistry>,
+        lease_test_probe: Arc<SinkLeaseTestProbe>,
+    ) -> Self {
+        let mut sink = Self::new(health_registry);
+        sink.lease_test_probe = Some(lease_test_probe);
+        sink
     }
 
     fn ingest_frame(&self, frame: &StreamFrame) -> Vec<SessionRelayDelivery> {
@@ -502,11 +536,97 @@ impl SessionBoundDiscordRelaySink {
             .ingest_frame(frame)
     }
 
-    /// #3041 P1-3 (Part a, B1 — FRAME-CARRIED commit fence): the post-POST wrapper around
-    /// the identity-gated advance. Re-loads inflight FRESH AFTER the POST (codex P1-3 issue
-    /// 3 — a pre-POST snapshot could authorize a wrong-turn advance if the turn was
-    /// cleared/replaced during the POST), runs the pure gate
-    /// (`advance_offset_for_confirmed_delegated_terminal`), and commits the #3151 marker.
+    /// Commit a confirmed idle/catch-up delivery in the frame's ordered JSONL
+    /// coordinate space. The wrapper generation and current EOF are rechecked
+    /// after transport before either durable or in-memory authority advances.
+    pub(in crate::services::discord) fn advance_idle_range_after_confirmed_post(
+        &self,
+        shared: &super::SharedData,
+        provider: &ProviderKind,
+        channel_id: u64,
+        session_name: &str,
+        delivery: &SessionRelayDelivery,
+    ) -> bool {
+        let Some((start, end)) = delivery.relay_range.filter(|(start, end)| end > start) else {
+            return false;
+        };
+        let Some(frame_generation) = delivery
+            .relay_generation_mtime_ns
+            .filter(|generation| *generation != 0)
+        else {
+            return false;
+        };
+        let current_generation = dr::current_generation_mtime_ns(session_name);
+        let current_eof = idle_jsonl_current_eof(provider, session_name);
+        if current_generation == 0
+            || current_generation != frame_generation
+            || current_eof.is_none_or(|eof| end > eof)
+        {
+            return false;
+        }
+        if !matches!(
+            dr::commit_ordered_jsonl_range(
+                provider,
+                ChannelId::new(channel_id),
+                (start, end),
+                frame_generation,
+            ),
+            Ok(true)
+        ) {
+            return false;
+        }
+        super::tmux::advance_watcher_confirmed_end(
+            shared,
+            provider,
+            ChannelId::new(channel_id),
+            session_name,
+            end,
+            "src/services/discord/session_relay_sink.rs:idle_range_confirmed_advance",
+        );
+        dr::record_delivered_content_fingerprint(
+            provider,
+            ChannelId::new(channel_id),
+            session_name,
+            &delivery.response_text,
+        );
+        true
+    }
+
+    pub(in crate::services::discord) fn idle_range_already_committed_before_transport(
+        &self,
+        shared: &super::SharedData,
+        provider: &ProviderKind,
+        channel_id: u64,
+        session_name: &str,
+        delivery: &SessionRelayDelivery,
+    ) -> bool {
+        let Some((_, end)) = delivery.relay_range else {
+            return false;
+        };
+        let Some(frame_generation) = delivery.relay_generation_mtime_ns else {
+            return false;
+        };
+        let current_generation = dr::current_generation_mtime_ns(session_name);
+        let current_eof = idle_jsonl_current_eof(provider, session_name);
+        if frame_generation == 0 || current_generation != frame_generation || current_eof.is_none()
+        {
+            return false;
+        }
+        dr::effective_committed_offset(
+            shared,
+            provider,
+            ChannelId::new(channel_id),
+            session_name,
+            current_eof,
+        )
+        .max(dr::delivered_frontier_end_current_generation(
+            provider,
+            ChannelId::new(channel_id),
+            session_name,
+            current_eof,
+        )) >= end
+    }
+
     fn advance_after_confirmed_post(
         &self,
         shared: &super::SharedData,
@@ -516,15 +636,25 @@ impl SessionBoundDiscordRelaySink {
         delivery: &SessionRelayDelivery,
         sink_lease_guard: Option<&SinkDeliveryLeaseGuard>,
     ) {
-        let fresh_inflight = super::inflight::load_inflight_state(provider, channel_id);
-        let advanced = self.advance_offset_for_confirmed_delegated_terminal(
-            shared,
-            provider,
-            channel_id,
-            session_name,
-            delivery,
-            fresh_inflight.as_ref(),
-        );
+        let advanced = if delivery.relay_range.is_some() {
+            self.advance_idle_range_after_confirmed_post(
+                shared,
+                provider,
+                channel_id,
+                session_name,
+                delivery,
+            )
+        } else {
+            let fresh_inflight = super::inflight::load_inflight_state(provider, channel_id);
+            self.advance_offset_for_confirmed_delegated_terminal(
+                shared,
+                provider,
+                channel_id,
+                session_name,
+                delivery,
+                fresh_inflight.as_ref(),
+            )
+        };
         // #3151 CLEAR: advance committed FIRST, THEN commit the marker. #3159 BUG 1: the
         // commit outcome MUST reflect whether the advance fired — see
         // `SinkDeliveryLeaseGuard::commit` (a refused-advance `Delivered` is a black-hole).
@@ -639,8 +769,12 @@ impl SessionBoundDiscordRelaySink {
             delivery.frame_turn_user_msg_id,
             shared.restart.current_generation,
         );
-        let sink_lease_key =
-            delivery_lease_key_for_frame(channel, shared.restart.current_generation, delivery);
+        let sink_lease_key = delivery_lease_key_for_frame(
+            channel,
+            shared.restart.current_generation,
+            delivery,
+            Some(start),
+        );
         let cell = shared.delivery_lease(channel);
         // Self-heal (`SinkDeliveryLeaseGuard::acquire`): reclaim an EXPIRED prior holder before acquire (a stale dead lease must not force a markerless POST).
         cell.reclaim_if_expired(super::lease_now_ms());
@@ -684,7 +818,7 @@ impl SessionBoundDiscordRelaySink {
                 },
                 edit_fail_policy: toc::EditFailPlaceholderPolicy::PreserveAlways,
                 fallback_commit_policy: toc::FallbackCommitPolicy::CommitOnFallback,
-                acquire_failure_mode: toc::AcquireFailureMode::ProceedMarkerless,
+                acquire_failure_mode: toc::AcquireFailureMode::Transient,
                 advance: Some(&advance),
                 heartbeat: Some(&heartbeat),
             },
@@ -737,13 +871,14 @@ impl SessionBoundDiscordRelaySink {
                 );
                 Ok(SessionRelayDeliveryOutcome::Delivered)
             }
-            // #4046 S1r-1 P2: FreshDelivered is a confirmed cross-verb POST (dormant
-            // here); its `Permanent` mapping is a non-retry INTENT marker only and does
-            // NOT itself prevent a duplicate POST — the sink consumer is
-            // error-variant-blind (see `delivery_outcome_classify` doc + #4623). Others
-            // are uncommitted → retriable. Classified out-of-line (frozen #3016 giant).
-            non_delivery @ (toc::DeliveryOutcome::FreshDelivered { .. }
-            | toc::DeliveryOutcome::Transient { .. }
+            toc::DeliveryOutcome::FreshDelivered {
+                committed_to,
+                persistence_recorded,
+            } => Ok(SessionRelayDeliveryOutcome::FreshDelivered {
+                committed_to,
+                persistence_recorded,
+            }),
+            non_delivery @ (toc::DeliveryOutcome::Transient { .. }
             | toc::DeliveryOutcome::Unknown { .. }
             | toc::DeliveryOutcome::Skipped) => Err(
                 delivery_outcome_classify::short_replace_non_delivery_error(&non_delivery),
@@ -836,16 +971,91 @@ impl SessionBoundDiscordRelaySink {
                     provider.as_str()
                 ))
             })?;
+        let (raw_response_text, relay_text) =
+            relay_format::session_bound_relay_bodies(&shared, &provider, &delivery);
+        let channel = ChannelId::new(channel_id);
+
+        let cutover_range = match (
+            delivery.frame_turn_start_offset,
+            delivery.terminal_consumed_end,
+        ) {
+            (Some(start), Some(end)) if end > start => Some((start, end)),
+            _ => None,
+        };
+        // Task-context delivery may confirm a card and then promote the response
+        // route from PlaceholderEdit to NewMessage. Keep that entire operation on
+        // the outer lease so both the card transport and the final answer remain
+        // guarded even though the route mutates inside `ensure_card_and_route`.
+        let cutover_short_replace = delivery.task_notification_context.is_none()
+            && cutover_range.is_some()
+            && !relay_text.is_empty()
+            && matches!(route, SessionBoundTerminalDeliveryRoute::PlaceholderEdit(_))
+            && !session_bound_should_send_new_chunks_for_placeholder(&relay_text);
+        let (lease_range, lease_fallback_start) = sink_delivery_lease_coordinate(&delivery);
+        let sink_lease_guard = if cutover_short_replace {
+            None
+        } else {
+            let sink_lease_key = delivery_lease_key_for_frame(
+                channel,
+                shared.restart.current_generation,
+                &delivery,
+                lease_fallback_start,
+            );
+            let cell = shared.delivery_lease(channel);
+            let Some(guard) = SinkDeliveryLeaseGuard::acquire(
+                &cell,
+                sink_lease_key,
+                lease_range.0,
+                lease_range.1,
+            ) else {
+                tracing::debug!(
+                    provider = provider.as_str(),
+                    channel_id,
+                    tmux_session = %delivery.session_name,
+                    lease_start = lease_range.0,
+                    lease_end = lease_range.1,
+                    "session-bound relay sink deferred terminal delivery because another owner holds the lease"
+                );
+                return Ok(SessionRelayDeliveryOutcome::NotDelivered);
+            };
+            #[cfg(test)]
+            if let Some(probe) = &self.lease_test_probe {
+                probe.acquired.notify_one();
+                probe.release.notified().await;
+            }
+            Some(guard)
+        };
+
+        if delivery.relay_range.is_some() {
+            if self.idle_range_already_committed_before_transport(
+                &shared,
+                &provider,
+                channel_id,
+                &delivery.session_name,
+                &delivery,
+            ) {
+                if let Some(guard) = sink_lease_guard.as_ref() {
+                    guard.commit(super::LeaseOutcome::Delivered);
+                }
+                return Ok(SessionRelayDeliveryOutcome::Delivered);
+            }
+            let frame_generation = delivery.relay_generation_mtime_ns.unwrap_or(0);
+            let current_generation = dr::current_generation_mtime_ns(&delivery.session_name);
+            let current_eof = idle_jsonl_current_eof(&provider, &delivery.session_name);
+            if frame_generation == 0
+                || current_generation != frame_generation
+                || current_eof.is_none_or(|eof| lease_range.1 > eof)
+            {
+                return Ok(SessionRelayDeliveryOutcome::NotDelivered);
+            }
+        }
+
         let http = shared.serenity_http_or_token_fallback().ok_or_else(|| {
             RelaySinkError::Transient(format!(
                 "discord http unavailable for provider {}",
                 provider.as_str()
             ))
         })?;
-
-        let (raw_response_text, relay_text) =
-            relay_format::session_bound_relay_bodies(&shared, &provider, &delivery);
-        let channel = ChannelId::new(channel_id);
         let (route, task_card_message_id, task_response_claim_outcome) =
             ensure_card_and_route(&self.health_registry, &shared, &delivery, route).await?;
         let (task_response_claim, task_response_already_delivered): (
@@ -875,44 +1085,6 @@ impl SessionBoundDiscordRelaySink {
             }
             None => (None, false),
         };
-
-        // #3089 A2b/#3998 S1-f2: structurally eligible short-replace
-        // (PlaceholderEdit + single-message body) routes to the controller
-        // unconditionally. The controller owns the single lease, so the sink skips
-        // `SinkDeliveryLeaseGuard` (no double-acquire). ONLY a real ordered
-        // `[start,end)` is eligible; degenerate stays legacy. EMPTY `relay_text`
-        // ALSO stays legacy (review-fix M2): legacy
-        // `replace_long_message_raw_with_outcome` treats zero chunks as
-        // `EditedOriginal` (delivered/advance, `formatting.rs:2063`) but the
-        // controller returns `Skipped` (no-advance) for `body.is_empty()` —
-        // diverting would flip → Transient.
-        let cutover_range = match (
-            delivery.frame_turn_start_offset,
-            delivery.terminal_consumed_end,
-        ) {
-            (Some(start), Some(end)) if end > start => Some((start, end)),
-            _ => None,
-        };
-        let cutover_short_replace = cutover_range.is_some()
-            && !relay_text.is_empty()
-            && matches!(route, SessionBoundTerminalDeliveryRoute::PlaceholderEdit(_))
-            && !session_bound_should_send_new_chunks_for_placeholder(&relay_text);
-
-        // #3151: acquire the in-flight `Leased{Sink}` marker BEFORE the POST (see
-        // `SinkDeliveryLeaseGuard`). The legacy long-chunk + new-message branches acquire
-        // ONE marker over the real ordered `cutover_range`; the cut-over short-replace branch
-        // is EXCLUDED (the CONTROLLER owns its lease — no double-acquire). The pure
-        // `sink_guard_lease_range` encodes that (review-fix Medium-1).
-        let sink_lease_guard = sink_guard_lease_range(cutover_range, cutover_short_replace)
-            .and_then(|(start, end)| {
-                let sink_lease_key = delivery_lease_key_for_frame(
-                    channel,
-                    shared.restart.current_generation,
-                    &delivery,
-                );
-                let cell = shared.delivery_lease(channel);
-                SinkDeliveryLeaseGuard::acquire(&cell, sink_lease_key, start, end)
-            });
 
         if task_response_already_delivered {
             self.advance_after_confirmed_post(
@@ -1153,6 +1325,10 @@ impl SessionBoundDiscordRelaySink {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionRelayDeliveryOutcome {
     Delivered,
+    FreshDelivered {
+        committed_to: Option<u64>,
+        persistence_recorded: bool,
+    },
     SentButUncommitted,
     NotDelivered,
 }
@@ -1168,6 +1344,7 @@ impl RelaySink for SessionBoundDiscordRelaySink {
         // (inline in `deliver_response`) — outcome and advance are decoupled.
         let deliveries = self.ingest_frame(frame);
         let mut terminal_delivered = false;
+        let mut terminal_fresh_delivered = None;
         let mut terminal_not_delivered = false;
         for delivery in deliveries {
             match self.deliver_response(delivery).await {
@@ -1175,6 +1352,12 @@ impl RelaySink for SessionBoundDiscordRelaySink {
                     // #3041 P1-3 (B1 CLOSED): the offset advance is owned INLINE by
                     // `deliver_response` — see `advance_after_confirmed_post`.
                     terminal_delivered = true;
+                }
+                Ok(SessionRelayDeliveryOutcome::FreshDelivered {
+                    committed_to,
+                    persistence_recorded,
+                }) => {
+                    terminal_fresh_delivered = Some((committed_to, persistence_recorded));
                 }
                 Ok(SessionRelayDeliveryOutcome::SentButUncommitted) => {
                     return Ok(RelaySinkOutcome::TerminalUnknown);
@@ -1191,6 +1374,11 @@ impl RelaySink for SessionBoundDiscordRelaySink {
         // #3041 P1-5: NO `TerminalUnknown` (the sink always KNOWS its result).
         if terminal_delivered {
             Ok(RelaySinkOutcome::TerminalDelivered)
+        } else if let Some((committed_to, persistence_recorded)) = terminal_fresh_delivered {
+            Ok(RelaySinkOutcome::TerminalFreshDelivered {
+                committed_to,
+                persistence_recorded,
+            })
         } else if terminal_not_delivered {
             Ok(RelaySinkOutcome::TerminalNotDelivered)
         } else {
@@ -1235,6 +1423,7 @@ async fn run_idle_jsonl_relay_loop(
     let producers =
         crate::services::cluster::relay_producer_registry::global_relay_producer_registry();
     let mut offsets: HashMap<String, u64> = HashMap::new();
+    let mut pending_ends: HashMap<String, u64> = HashMap::new();
     let mut first_seen_at: HashMap<String, Instant> = HashMap::new();
     let mut last_inflight_seen_at: HashMap<String, Instant> = HashMap::new();
     let mut session_init_seen: HashSet<String> = HashSet::new();
@@ -1260,16 +1449,46 @@ async fn run_idle_jsonl_relay_loop(
             let offset = offsets.entry(session_name.clone()).or_insert(len);
             if len < *offset {
                 *offset = 0;
+                pending_ends.remove(&session_name);
                 session_init_seen.remove(&session_name);
             }
             let current_generation_signature =
                 super::tmux::read_generation_file_mtime_ns(&session_name);
-            idle_jsonl_clear_session_init_on_generation_signature_change(
+            if idle_jsonl_clear_session_init_on_generation_signature_change(
                 &mut session_init_seen,
                 &mut session_generation_signatures,
                 &session_name,
                 current_generation_signature,
-            );
+            ) {
+                pending_ends.remove(&session_name);
+            }
+            let channel = ChannelId::new(channel_id);
+            let shared_for_dedup = idle_jsonl_prepare_dedup_shared(
+                &health_registry,
+                &matched,
+                channel,
+                &session_name,
+                len,
+                &mut session_init_seen,
+            )
+            .await;
+            let Some(shared) = shared_for_dedup else {
+                continue;
+            };
+            let committed = dr::effective_committed_offset(
+                &shared,
+                &matched.provider,
+                channel,
+                &session_name,
+                Some(len),
+            )
+            .max(dr::delivered_frontier_end_current_generation(
+                &matched.provider,
+                channel,
+                &session_name,
+                Some(len),
+            ));
+
             macro_rules! consume_idle_offset {
                 ($to:expr, $rearm:expr) => {
                     idle_jsonl_consume_offset(
@@ -1285,9 +1504,6 @@ async fn run_idle_jsonl_relay_loop(
             if let Some(mut inflight) =
                 super::inflight::load_inflight_state(&matched.provider, channel_id)
             {
-                // #3960: if a SessionBoundRelay claim lost its producer before
-                // commit, downgrade it to the ownerless backstop after fresh
-                // liveness/offset checks; the send point still re-gates delivery.
                 if orphan_reclaim::reclaim_orphaned_session_bound_relay_if_dead(
                     &health_registry,
                     &producers,
@@ -1301,39 +1517,68 @@ async fn run_idle_jsonl_relay_loop(
                     inflight.set_relay_owner_kind(super::inflight::RelayOwnerKind::None);
                 }
                 if !super::inflight::ownerless_external_input_inflight_is_stale(&inflight) {
-                    let _decision = idle_jsonl_apply_active_inflight_gate(
+                    let decision = idle_jsonl_apply_active_inflight_gate(
                         &mut last_inflight_seen_at,
                         &matched,
                         channel_id,
                         &inflight,
-                        len,
-                        offset,
                     );
+                    if matches!(
+                        decision,
+                        idle_jsonl::IdleJsonlInflightGateDecision::DeferUntilCommitted
+                    ) {
+                        let pending_end = pending_ends.entry(session_name.clone()).or_insert(len);
+                        *pending_end = (*pending_end).max(len);
+                        if matches!(
+                            idle_jsonl_suppressed_range_action(
+                                committed,
+                                *offset,
+                                *pending_end,
+                                IdleJsonlSuppression::DeferUntilCommitted,
+                            ),
+                            IdleRelayRangeAction::AdvanceCommitted
+                        ) {
+                            consume_idle_offset!(*pending_end, IdleJsonlSessionInitRearm::Keep);
+                            pending_ends.remove(&session_name);
+                        }
+                    }
                     continue;
                 }
                 last_inflight_seen_at.remove(&session_name);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    user_msg_id = inflight.user_msg_id,
-                    updated_at = %inflight.updated_at,
-                    "idle JSONL relay ignored stale ownerless TUI-direct inflight blocker"
-                );
             }
-            if last_inflight_seen_at
+
+            let in_recent_inflight_grace = last_inflight_seen_at
                 .get(&session_name)
-                .is_some_and(|seen_at| seen_at.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE)
-            {
-                consume_idle_offset!(len, IdleJsonlSessionInitRearm::Keep);
+                .is_some_and(|seen_at| seen_at.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE);
+            let in_new_session_grace =
+                first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE;
+            if in_recent_inflight_grace || in_new_session_grace {
+                let pending_end = pending_ends.entry(session_name.clone()).or_insert(len);
+                *pending_end = (*pending_end).max(len);
+                match idle_jsonl_suppressed_range_action(
+                    committed,
+                    *offset,
+                    *pending_end,
+                    IdleJsonlSuppression::DeferUntilCommitted,
+                ) {
+                    IdleRelayRangeAction::AdvanceCommitted => {
+                        consume_idle_offset!(*pending_end, IdleJsonlSessionInitRearm::Keep);
+                        pending_ends.remove(&session_name);
+                    }
+                    IdleRelayRangeAction::HoldPending => {}
+                    _ => unreachable!("deferred suppression returns only hold/advance"),
+                }
                 continue;
             }
             if len <= *offset {
+                pending_ends.remove(&session_name);
                 continue;
             }
 
             let start = *offset;
-            let end = len.min(start.saturating_add(IDLE_JSONL_RELAY_MAX_BYTES_PER_TICK));
+            let was_deferred = pending_ends.contains_key(&session_name);
+            let pending_end = pending_ends.remove(&session_name).unwrap_or(len).max(len);
+            let end = pending_end.min(start.saturating_add(IDLE_JSONL_RELAY_MAX_BYTES_PER_TICK));
             let Ok(payload) = read_jsonl_range(&relay_source.path, start, end) else {
                 continue;
             };
@@ -1341,165 +1586,59 @@ async fn run_idle_jsonl_relay_loop(
                 consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
                 continue;
             }
-            // Classify the WHOLE payload first so the dedup/trim run on an
-            // already-classified turn (mirrors `idle_relay_range_action`'s ordering;
-            // the per-reason debug logs below stay for observability).
-            let in_new_session_grace =
-                first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE;
-            if in_new_session_grace {
-                consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    bytes = payload.len(),
-                    "idle JSONL relay skipped new-session grace payload"
-                );
-                continue;
-            }
-            if idle_jsonl_payload_contains_user_event(&payload) {
-                consume_idle_offset!(end, IdleJsonlSessionInitRearm::Clear);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    bytes = payload.len(),
-                    "idle JSONL relay skipped active-turn payload with user/tool-result event"
-                );
-                continue;
-            }
             if idle_jsonl_payload_contains_schedule_wakeup_setup(&payload) {
                 consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    bytes = payload.len(),
-                    "idle JSONL relay skipped ScheduleWakeup setup payload"
-                );
                 continue;
             }
-            let channel = ChannelId::new(channel_id);
-            let shared_for_dedup = idle_jsonl_prepare_dedup_shared(
-                &health_registry,
-                &matched,
-                channel,
-                &session_name,
-                len,
-                &mut session_init_seen,
-            )
-            .await;
+            if !was_deferred && idle_jsonl_payload_contains_user_event(&payload) {
+                consume_idle_offset!(end, IdleJsonlSessionInitRearm::Clear);
+                continue;
+            }
             let session_has_init =
                 idle_jsonl_session_has_init(&mut session_init_seen, &session_name, &payload);
-            if !relay_source.allow_continued_session_without_init && !session_has_init {
-                consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    bytes = payload.len(),
-                    "idle JSONL relay skipped non-init active-session payload"
-                );
-                continue;
-            }
-            let Some(producer) = producers.get_producer(&session_name) else {
-                tracing::debug!(
-                    tmux_session = %session_name,
-                    "idle JSONL relay found new bytes but no session-bound producer"
-                );
-                continue;
-            };
-            if idle_jsonl_should_retry_without_dedup_shared(shared_for_dedup.as_ref()) {
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    range_start = start,
-                    range_end = end,
-                    "idle JSONL relay skipped range because dedup shared data is unavailable; will retry without consuming"
-                );
-                continue;
-            }
-            // #3017 single output-offset authority: this idle path and the watcher both read
-            // the SAME JSONL (E-13: an inflight-less wake relayed twice). The watcher is PRIMARY
-            // and advances `confirmed_end_offset`; this backstop only CONSULTS it read-only
-            // (committed >= range end → skip), no advance (codex P1: `try_send_frame` only QUEUES).
-            if let Some(shared) = shared_for_dedup {
-                // #3089 B2b: durable-frontier dedup authority (flag OFF → in-memory).
-                let committed = dr::effective_committed_offset(
-                    &shared,
-                    &matched.provider,
-                    channel,
-                    &session_name,
-                    Some(len),
-                );
-                // Classification passed above → consults ONLY the offset-authority dedup branch.
-                match idle_relay_range_action(
-                    &payload,
-                    start,
-                    end,
-                    committed,
-                    false,
-                    relay_source.allow_continued_session_without_init,
-                    session_has_init,
-                ) {
-                    IdleRelayRangeAction::SkipAlreadyRelayed => {
-                        // Whole range already delivered by the watcher → skip.
-                        consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                        tracing::debug!(
-                            provider = matched.provider.as_str(),
-                            channel_id,
-                            tmux_session = %session_name,
-                            committed_relay_offset = committed,
-                            end,
-                            "idle JSONL relay skipped range already relayed by watcher (offset authority dedup)"
-                        );
+            let action = idle_relay_range_action(
+                &payload,
+                start,
+                end,
+                committed,
+                relay_source.allow_continued_session_without_init,
+                session_has_init,
+                was_deferred,
+            );
+            match action {
+                IdleRelayRangeAction::DropAndConsume => {
+                    consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
+                }
+                IdleRelayRangeAction::AdvanceCommitted => {
+                    consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
+                }
+                IdleRelayRangeAction::SendPendingSuffixFrom(from) => {
+                    let Some(producer) = producers.get_producer(&session_name) else {
                         continue;
-                    }
-                    IdleRelayRangeAction::SendSuffixFrom(from) => {
-                        // Codex r5 P2 + codex r6 P1 (black-hole): PARTIAL overlap — the watcher
-                        // delivered the `[start, committed)` prefix; deliver ONLY the uncommitted
-                        // suffix THIS pass (a next-tick bounce would re-read a suffix that lost the
-                        // `system/init` event → re-classified and DROPPED). See `SendSuffixFrom`.
-                        let suffix = match read_jsonl_range(&relay_source.path, from, end) {
+                    };
+                    let suffix = if from == start {
+                        payload.clone()
+                    } else {
+                        match read_jsonl_range(&relay_source.path, from, end) {
                             Ok(suffix) => suffix,
                             Err(_) => continue,
-                        };
-                        if suffix.is_empty() {
-                            consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                            continue;
                         }
-                        if producer.try_send_frame(String::from_utf8_lossy(&suffix).into_owned()) {
-                            consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                            tracing::debug!(
-                                provider = matched.provider.as_str(),
-                                channel_id,
-                                tmux_session = %session_name,
-                                committed_relay_offset = committed,
-                                start,
-                                end,
-                                bytes = suffix.len(),
-                                "idle JSONL relay sent un-committed suffix after trimming already-relayed prefix (offset authority dedup, no black-hole)"
-                            );
-                        }
+                    };
+                    if suffix.is_empty() {
                         continue;
                     }
-                    // `committed <= start` → nothing covered → fall through to the full-range send.
-                    IdleRelayRangeAction::SendFull => {}
-                    // Unreachable here: `in_new_session_grace = false` and the payload already
-                    // passed the init gate (classification happened above).
-                    IdleRelayRangeAction::SkipClassified => {}
+                    if producer.try_send_frame_for_range(
+                        String::from_utf8_lossy(&suffix).into_owned(),
+                        from,
+                        end,
+                        current_generation_signature,
+                    ) {
+                        pending_ends.insert(session_name.clone(), end);
+                    }
                 }
-            }
-            if producer.try_send_frame(String::from_utf8_lossy(&payload).into_owned()) {
-                consume_idle_offset!(end, IdleJsonlSessionInitRearm::Keep);
-                tracing::debug!(
-                    provider = matched.provider.as_str(),
-                    channel_id,
-                    tmux_session = %session_name,
-                    bytes = payload.len(),
-                    "idle JSONL relay forwarded background session output"
-                );
+                IdleRelayRangeAction::HoldPending => {
+                    pending_ends.insert(session_name.clone(), end);
+                }
             }
         }
 
@@ -1510,6 +1649,7 @@ async fn run_idle_jsonl_relay_loop(
             &mut last_inflight_seen_at,
             &mut session_init_seen,
             &mut session_generation_signatures,
+            &mut pending_ends,
         );
         tokio::time::sleep(IDLE_JSONL_RELAY_POLL_INTERVAL).await;
     }
@@ -1520,6 +1660,11 @@ mod relay_state_contract_refs {
     #[test]
     fn relay_state_contract_symbol_references_compile() {
         let _ = super::turn_parser::SessionRelayParser::ingest_frame;
+        let _ = super::SessionBoundDiscordRelaySink::deliver_response;
+        let _ = super::SessionBoundDiscordRelaySink::advance_idle_range_after_confirmed_post;
+        let _ = crate::services::cluster::stream_relay::RelaySinkOutcome::terminal_fresh_delivered;
+        let _ = super::idle_jsonl::idle_jsonl_suppressed_range_action;
+        let _ = crate::services::discord::outbound::delivery_record::commit_ordered_jsonl_range;
     }
 }
 
@@ -1527,13 +1672,15 @@ fn delivery_lease_key_for_frame(
     channel: ChannelId,
     generation: u64,
     delivery: &SessionRelayDelivery,
+    relay_range_start: Option<u64>,
 ) -> super::DeliveryLeaseKey {
-    super::DeliveryLeaseKey::new_for_site(
+    super::DeliveryLeaseKey::new_for_site_with_fallback_offset(
         channel,
         generation,
         delivery.frame_turn_user_msg_id,
         Some(&delivery.frame_turn_started_at),
         delivery.frame_turn_start_offset,
+        relay_range_start,
         "sink",
     )
 }
@@ -1577,7 +1724,24 @@ mod tests {
             turn_user_msg_id: 0,
             turn_started_at: String::new(),
             turn_start_offset: None,
+            relay_range: None,
+            relay_generation_mtime_ns: None,
         }
+    }
+
+    fn ranged_frame(
+        binding: &MatchedChannel,
+        payload: &str,
+        sequence: u64,
+        range_start: u64,
+        range_end: u64,
+    ) -> StreamFrame {
+        let mut frame = frame(binding, payload, sequence);
+        frame.relay_range = Some((range_start, range_end));
+        frame.relay_generation_mtime_ns = Some(dr::current_generation_mtime_ns(
+            &binding.expected_session_name,
+        ));
+        frame
     }
 
     fn terminal_frame(
@@ -1618,6 +1782,8 @@ mod tests {
             turn_user_msg_id,
             turn_started_at: turn_started_at.to_string(),
             turn_start_offset,
+            relay_range: None,
+            relay_generation_mtime_ns: None,
         }
     }
 
@@ -2189,7 +2355,7 @@ mod tests {
             idle_relay_range_action(full_bytes, start, end, committed, false, false, false);
         assert_eq!(
             action,
-            super::IdleRelayRangeAction::SendSuffixFrom(committed),
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(committed),
             "the loop must deliver the uncommitted suffix in the same pass (no black-hole)"
         );
 
@@ -2212,29 +2378,34 @@ mod tests {
             idle_relay_range_action(suffix, 0, suffix.len() as u64, 0, false, false, false);
         assert_eq!(
             suffix_only_action,
-            super::IdleRelayRangeAction::SkipClassified,
+            super::IdleRelayRangeAction::DropAndConsume,
             "re-gating the init-less suffix as a fresh payload WOULD black-hole it (the old bug)"
         );
         assert_eq!(
-            idle_relay_range_action(suffix, 0, suffix.len() as u64, 0, false, true, false,),
-            super::IdleRelayRangeAction::SendFull,
+            idle_relay_range_action(suffix, 0, suffix.len() as u64, 0, true, false, false),
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(0),
             "a known continued Codex TUI runtime binding may relay assistant-only suffixes without init"
         );
 
         // Whole range uncommitted → relay the full payload (control case).
         assert_eq!(
             idle_relay_range_action(full_bytes, start, end, 0, false, false, false),
-            super::IdleRelayRangeAction::SendFull
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(start)
         );
         // Whole range already committed → skip (control case).
         assert_eq!(
             idle_relay_range_action(full_bytes, start, end, end, false, false, false),
-            super::IdleRelayRangeAction::SkipAlreadyRelayed
+            super::IdleRelayRangeAction::AdvanceCommitted
         );
-        // New-session grace still wins over everything (ordering preserved).
         assert_eq!(
-            idle_relay_range_action(full_bytes, start, end, committed, true, true, false),
-            super::IdleRelayRangeAction::SkipClassified
+            idle_jsonl_suppressed_range_action(
+                committed,
+                start,
+                end,
+                IdleJsonlSuppression::DeferUntilCommitted,
+            ),
+            super::IdleRelayRangeAction::HoldPending,
+            "new-session grace holds uncommitted bytes instead of consuming them"
         );
     }
 
@@ -2250,7 +2421,7 @@ mod tests {
 
         assert_eq!(
             idle_relay_range_action(continued_chunk, start, end, 0, false, false, false),
-            super::IdleRelayRangeAction::SkipClassified,
+            super::IdleRelayRangeAction::DropAndConsume,
             "without session-level init state, a later init-less chunk would be dropped"
         );
         assert!(idle_jsonl_session_has_init(
@@ -2276,10 +2447,10 @@ mod tests {
                 end,
                 0,
                 false,
-                false,
-                session_init_seen.contains(session_name)
+                session_init_seen.contains(session_name),
+                false
             ),
-            super::IdleRelayRangeAction::SendFull,
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(start),
             "once the session has accepted an init chunk, later chunks are not re-gated by init"
         );
         idle_jsonl_consume_offset(
@@ -2327,10 +2498,10 @@ mod tests {
                 continued_chunk.len() as u64,
                 0,
                 false,
-                false,
-                session_init_seen.contains(session_name)
+                session_init_seen.contains(session_name),
+                false
             ),
-            super::IdleRelayRangeAction::SkipClassified,
+            super::IdleRelayRangeAction::DropAndConsume,
             "after generation reset, assistant-only bytes cannot inherit the prior wrapper's init marker"
         );
     }
@@ -2424,10 +2595,10 @@ mod tests {
                 tick_a_end,
                 0,
                 false,
-                false,
                 tick_a_session_has_init,
+                false,
             ),
-            super::IdleRelayRangeAction::SendFull,
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(0),
             "tick A relays the init-only payload"
         );
         idle_jsonl_consume_offset(
@@ -2457,10 +2628,10 @@ mod tests {
                 tick_b_end,
                 0,
                 false,
-                false,
                 tick_b_session_has_init,
+                false,
             ),
-            super::IdleRelayRangeAction::SendFull,
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(tick_b_start),
             "tick B relays the assistant-only continuation without a fresh init/user event/inflight"
         );
         idle_jsonl_consume_offset(
@@ -2507,8 +2678,6 @@ mod tests {
             &background,
             42,
             &inflight,
-            end,
-            &mut offset,
         );
         assert_eq!(
             decision,
@@ -2521,8 +2690,8 @@ mod tests {
         );
 
         assert_eq!(
-            idle_relay_range_action(wake_payload.as_bytes(), offset, end, 0, false, false, false,),
-            super::IdleRelayRangeAction::SendFull,
+            idle_relay_range_action(wake_payload.as_bytes(), offset, end, 0, false, false, false),
+            super::IdleRelayRangeAction::SendPendingSuffixFrom(offset),
             "the preserved Y bytes relay on the next no-inflight tick"
         );
         offset = end;
@@ -2573,8 +2742,6 @@ mod tests {
             &matched,
             42,
             &inflight,
-            end,
-            &mut offset,
         );
         assert_eq!(
             decision,
@@ -2624,6 +2791,272 @@ mod tests {
             .expect("frame without terminal delivery should be accepted");
 
         assert_eq!(outcome, RelaySinkOutcome::FrameAccepted);
+    }
+
+    #[tokio::test]
+    async fn inflightless_ranged_frame_acquires_sink_lease_before_terminal_delivery_4277() {
+        let channel_id = 4_277_003;
+        let binding = matched(&channel_id.to_string());
+        let registry = Arc::new(HealthRegistry::new());
+        let shared = super::super::make_shared_data_for_tests();
+        shared
+            .http
+            .cached_bot_token
+            .set("test-token".to_string())
+            .expect("test token set once");
+        registry
+            .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+            .await;
+        let probe = Arc::new(SinkLeaseTestProbe {
+            acquired: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let sink = Arc::new(SessionBoundDiscordRelaySink::with_lease_test_probe(
+            registry,
+            probe.clone(),
+        ));
+        let payload = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"idle result\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"idle result\"}\n"
+        );
+        let range_start = 640;
+        let range_end = 1_024;
+        let sink_task = {
+            let sink = sink.clone();
+            let frame = ranged_frame(&binding, payload, 1, range_start, range_end);
+            tokio::spawn(async move { sink.deliver(&frame).await })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), probe.acquired.notified())
+            .await
+            .expect("production RelaySink::deliver acquired the sink lease");
+        match shared.delivery_lease(ChannelId::new(channel_id)).read() {
+            super::super::LeaseSnapshot::Leased {
+                holder,
+                key,
+                start,
+                end,
+                ..
+            } => {
+                assert_eq!(holder, super::super::LeaseHolder::Sink);
+                assert_eq!((start, end), (range_start, range_end));
+                let watcher_key =
+                    crate::services::discord::tmux::pinned_delivery_lease_key_for_test(
+                        ChannelId::new(channel_id),
+                        shared.restart.current_generation,
+                        None,
+                        &binding.expected_session_name,
+                        range_end,
+                        range_start,
+                    );
+                assert_eq!(key, watcher_key);
+            }
+            other => panic!("expected production sink lease before transport, got {other:?}"),
+        }
+
+        probe.release.notify_waiters();
+        let result = sink_task.await.expect("sink task joined");
+        assert_eq!(
+            result.expect("stale or unprovable ranged frame is declined after acquire"),
+            RelaySinkOutcome::TerminalNotDelivered,
+            "a range without a provable live generation must not reach transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_preemption_blocks_task_context_route_promotion_before_card_post_4277() {
+        let temp = tempfile::tempdir().expect("temp runtime root");
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        crate::services::tui_prompt_dedupe::reset_state_for_tests();
+
+        let channel_id = 4_277_006;
+        let channel = ChannelId::new(channel_id);
+        let binding = matched(&channel_id.to_string());
+        let registry = Arc::new(HealthRegistry::new());
+        let shared = super::super::make_shared_data_for_tests();
+        shared
+            .http
+            .cached_bot_token
+            .set("test-token".to_string())
+            .expect("test token set once");
+        registry
+            .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+            .await;
+
+        let mut rebind = inflight_for(
+            &binding.expected_session_name,
+            RelayOwnerKind::Watcher,
+            true,
+        );
+        rebind.channel_id = channel_id;
+        rebind.user_msg_id = 0;
+        rebind.current_msg_id = 9_001;
+        rebind.started_at = "2026-07-24T01:00:00Z".to_string();
+        rebind.turn_start_offset = Some(640);
+        super::super::inflight::save_inflight_state(&rebind).expect("persist rebind inflight");
+
+        let range_start = 640;
+        let range_end = 1_024;
+        let watcher_key = crate::services::discord::tmux::pinned_delivery_lease_key_for_test(
+            channel,
+            shared.restart.current_generation,
+            Some(&rebind),
+            &binding.expected_session_name,
+            range_end,
+            range_start,
+        );
+        assert!(shared.delivery_lease(channel).try_acquire(
+            watcher_key,
+            super::super::LeaseHolder::Watcher { instance_id: 91 },
+            range_start,
+            range_end,
+            super::super::lease_now_ms().saturating_add(10_000),
+        ));
+        let sink = SessionBoundDiscordRelaySink::new(registry);
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"bg-route-mutation-4277\",\"tool_use_id\":\"toolu-bg-route-mutation-4277\",\"status\":\"completed\",\"summary\":\"background work\",\"task_notification_kind\":\"background\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"task answer\"}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"task answer\"}\n"
+        );
+        let terminal = terminal_frame_offset(
+            &binding,
+            payload,
+            1,
+            range_end,
+            0,
+            &rebind.started_at,
+            Some(range_start),
+        );
+
+        let outcome = sink
+            .deliver(&terminal)
+            .await
+            .expect("lost lease is a known not-delivered outcome");
+
+        assert_eq!(outcome, RelaySinkOutcome::TerminalNotDelivered);
+        assert_eq!(sink.delivered_total.load(Ordering::Acquire), 0);
+        assert!(
+            crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
+                ProviderKind::Claude.as_str(),
+                &binding.expected_session_name,
+                channel_id,
+            )
+            .is_none(),
+            "task-card ensure must not run after the outer lease loses"
+        );
+        super::super::inflight::clear_inflight_state(&ProviderKind::Claude, channel_id);
+        crate::services::tui_prompt_dedupe::reset_state_for_tests();
+    }
+
+    #[tokio::test]
+    async fn watcher_preemption_blocks_inflightless_sink_post_4277() {
+        let channel_id = 4_277_004;
+        let channel = ChannelId::new(channel_id);
+        let binding = matched(&channel_id.to_string());
+        let registry = Arc::new(HealthRegistry::new());
+        let shared = super::super::make_shared_data_for_tests();
+        shared
+            .http
+            .cached_bot_token
+            .set("test-token".to_string())
+            .expect("test token set once");
+        registry
+            .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+            .await;
+        let sink = SessionBoundDiscordRelaySink::new(registry);
+        let range_start = 700;
+        let range_end = 900;
+        let watcher_key = crate::services::discord::tmux::pinned_delivery_lease_key_for_test(
+            channel,
+            shared.restart.current_generation,
+            None,
+            &binding.expected_session_name,
+            range_end,
+            range_start,
+        );
+        assert!(shared.delivery_lease(channel).try_acquire(
+            watcher_key,
+            super::super::LeaseHolder::Watcher { instance_id: 77 },
+            range_start,
+            range_end,
+            super::super::lease_now_ms().saturating_add(10_000),
+        ));
+        let payload = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"idle result\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"idle result\"}\n"
+        );
+
+        let outcome = sink
+            .deliver(&ranged_frame(&binding, payload, 1, range_start, range_end))
+            .await
+            .expect("lease contention is a known not-delivered outcome");
+
+        assert_eq!(outcome, RelaySinkOutcome::TerminalNotDelivered);
+        assert_eq!(sink.delivered_total.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn sink_preemption_blocks_watcher_acquire_for_same_inflightless_range_4277() {
+        let channel_id = 4_277_005;
+        let channel = ChannelId::new(channel_id);
+        let binding = matched(&channel_id.to_string());
+        let registry = Arc::new(HealthRegistry::new());
+        let shared = super::super::make_shared_data_for_tests();
+        shared
+            .http
+            .cached_bot_token
+            .set("test-token".to_string())
+            .expect("test token set once");
+        registry
+            .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+            .await;
+        let probe = Arc::new(SinkLeaseTestProbe {
+            acquired: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let sink = Arc::new(SessionBoundDiscordRelaySink::with_lease_test_probe(
+            registry,
+            probe.clone(),
+        ));
+        let range_start = 800;
+        let range_end = 1_100;
+        let payload = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"idle result\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"idle result\"}\n"
+        );
+        let sink_task = {
+            let sink = sink.clone();
+            let frame = ranged_frame(&binding, payload, 1, range_start, range_end);
+            tokio::spawn(async move { sink.deliver(&frame).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), probe.acquired.notified())
+            .await
+            .expect("sink acquired before watcher contention");
+
+        let watcher_key = crate::services::discord::tmux::pinned_delivery_lease_key_for_test(
+            channel,
+            shared.restart.current_generation,
+            None,
+            &binding.expected_session_name,
+            range_end,
+            range_start,
+        );
+        assert!(
+            !shared.delivery_lease(channel).try_acquire(
+                watcher_key,
+                super::super::LeaseHolder::Watcher { instance_id: 88 },
+                range_start,
+                range_end,
+                super::super::lease_now_ms().saturating_add(10_000),
+            ),
+            "watcher must lose after the production sink acquired the canonical range"
+        );
+
+        probe.release.notify_waiters();
+        let _ = sink_task.await.expect("sink task joined");
     }
 
     // #3041 P1-3 R5 (codex P1-3 — fence gates the ADVANCE, not the ACK): a
@@ -2698,26 +3131,85 @@ mod tests {
             frame_turn_user_msg_id: turn_user_msg_id,
             frame_turn_started_at: turn_started_at.to_string(),
             frame_turn_start_offset: turn_start_offset,
+            relay_range: None,
+            relay_generation_mtime_ns: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_range_commit_requires_current_generation_and_persists_frontier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+        let channel = ChannelId::new(45_360);
+        let session = ProviderKind::Claude.build_tmux_session_name(&channel.get().to_string());
+        let output_path =
+            crate::services::cluster::session_matcher::expected_rollout_path_for(&session);
+        let generation_path =
+            crate::services::tmux_common::session_temp_path(&session, "generation");
+        std::fs::create_dir_all(std::path::Path::new(&output_path).parent().unwrap())
+            .expect("output dir");
+        std::fs::write(&output_path, vec![b'x'; 256]).expect("output file");
+        std::fs::write(&generation_path, b"1").expect("generation marker");
+        let generation = dr::current_generation_mtime_ns(&session);
+        assert_ne!(generation, 0);
+
+        let shared = super::super::make_shared_data_for_tests();
+        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
+        let mut delivery = delivery_with_fence_offset(&session, None, 0, "", None);
+        delivery.channel_id = channel.get();
+        delivery.relay_range = Some((128, 256));
+        delivery.relay_generation_mtime_ns = Some(generation);
+
+        assert!(!sink.idle_range_already_committed_before_transport(
+            &shared,
+            &ProviderKind::Claude,
+            channel.get(),
+            &session,
+            &delivery,
+        ));
+        assert!(sink.advance_idle_range_after_confirmed_post(
+            &shared,
+            &ProviderKind::Claude,
+            channel.get(),
+            &session,
+            &delivery,
+        ));
+        assert_eq!(shared.committed_relay_offset(channel), 256);
+        assert!(sink.idle_range_already_committed_before_transport(
+            &shared,
+            &ProviderKind::Claude,
+            channel.get(),
+            &session,
+            &delivery,
+        ));
+        assert_eq!(
+            dr::delivered_frontier_end_current_generation(
+                &ProviderKind::Claude,
+                channel,
+                &session,
+                Some(256),
+            ),
+            256,
+            "confirmed ranged delivery is durable even when rollout shadow mode is off"
+        );
+
+        delivery.relay_range = Some((256, 300));
+        delivery.relay_generation_mtime_ns = Some(generation.saturating_add(1));
+        assert!(!sink.advance_idle_range_after_confirmed_post(
+            &shared,
+            &ProviderKind::Claude,
+            channel.get(),
+            &session,
+            &delivery,
+        ));
+        assert_eq!(shared.committed_relay_offset(channel), 256);
     }
 
     #[test]
     fn same_id0_turn_frame_and_inflight_derive_equal_delivery_lease_key() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let temp = tempfile::TempDir::new().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
 
         let channel = ChannelId::new(8_041);
         let generation = 17;
@@ -2738,7 +3230,8 @@ mod tests {
             Some(start_offset),
         );
 
-        let frame_key = delivery_lease_key_for_frame(channel, generation, &delivery);
+        let frame_key =
+            delivery_lease_key_for_frame(channel, generation, &delivery, Some(start_offset));
         let inflight_key =
             super::super::DeliveryLeaseKey::from_inflight_state(channel, generation, &inflight);
 
@@ -2846,7 +3339,7 @@ mod tests {
     }
 
     // #3089 A2b: drive the SAME ctx `deliver_short_replace_via_controller` builds
-    // (holder=Sink, ProceedMarkerless, Replace{Active}, PreserveAlways,
+    // (holder=Sink, Transient-on-contention, Replace{Active}, PreserveAlways,
     // CommitOnFallback, identity-gated `advance`) on a FRESH per-channel cell, and
     // assert (1) the cell is acquired EXACTLY ONCE — the no-double-acquire invariant
     // (the sink never also runs `SinkDeliveryLeaseGuard::acquire` on this branch) —
@@ -2894,7 +3387,7 @@ mod tests {
                 },
                 edit_fail_policy: toc::EditFailPlaceholderPolicy::PreserveAlways,
                 fallback_commit_policy: toc::FallbackCommitPolicy::CommitOnFallback,
-                acquire_failure_mode: toc::AcquireFailureMode::ProceedMarkerless,
+                acquire_failure_mode: toc::AcquireFailureMode::Transient,
                 advance: Some(&advance),
                 heartbeat: Some(&hb),
             },
@@ -2992,25 +3485,10 @@ mod tests {
     //  (a) advance = unconditional `true` (instead of the fresh identity gate):
     //      the MISMATCH case below would flip `NotDelivered`/no-advance into
     //      `Delivered`/advance and fail.
-    //  (b) guard-skip removed (`&& !cutover_short_replace` dropped from
-    //      `sink_guard_lease_range`): `cutover_skips_sink_guard_acquire` fails.
     #[test]
     fn cutover_short_replace_production_path_advance_is_fresh_identity_gated() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let temp = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
 
         // The sink's `SinkPostHeartbeat` spawns a `DeliveryLeaseHeartbeat` task,
         // which needs a Tokio reactor. Drive the production helper on a local
@@ -3136,7 +3614,7 @@ mod tests {
                 .replace_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "the mismatched run still POSTs once (markerless-equivalent), only the advance differs"
+            "the mismatched run still POSTs once under its held lease; only the advance differs"
         );
     }
 
@@ -3147,21 +3625,8 @@ mod tests {
     // duplicate check miss.
     #[test]
     fn session_sink_short_replace_raw_body_fingerprint_refuses_watcher_rerelay_4081() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let temp = tempfile::TempDir::new().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3252,31 +3717,23 @@ mod tests {
         );
     }
 
-    // #3089 A2b (review-fix Medium-1): the no-double-acquire invariant — a
-    // cut-over short-replace turn must SKIP the legacy `SinkDeliveryLeaseGuard`
-    // acquire so the controller owns the SINGLE lease. The pure
-    // `sink_guard_lease_range` returns `None` for any cut-over turn; dropping the
-    // `&& !cutover_short_replace` exclusion (the guard-skip mutation) makes it
-    // return `Some(..)` and fails here, while the legacy (non-cutover) branches
-    // still acquire over a real ordered range.
     #[test]
-    fn cutover_skips_sink_guard_acquire() {
-        // Cut-over ON + a real ordered range → guard MUST be skipped (no double-acquire).
+    fn terminal_lease_coordinate_prefers_fence_then_idle_range_then_degenerate() {
+        let fenced = delivery_with_fence_offset("fenced", Some(256), 0, "", Some(64));
         assert_eq!(
-            sink_guard_lease_range(Some((0, 256)), true),
-            None,
-            "a cut-over short-replace turn must NOT acquire the legacy sink guard \
-             (no double-acquire — the controller owns the single lease)"
+            sink_delivery_lease_coordinate(&fenced),
+            ((64, 256), Some(64))
         );
-        // Cut-over OFF (legacy long-chunk / new-message) → guard acquires the range.
+
+        let mut ranged = delivery_with_fence_offset("ranged", None, 0, "", None);
+        ranged.relay_range = Some((300, 512));
         assert_eq!(
-            sink_guard_lease_range(Some((0, 256)), false),
-            Some((0, 256)),
-            "the legacy branches still acquire ONE sink guard over the ordered range"
+            sink_delivery_lease_coordinate(&ranged),
+            ((300, 512), Some(300))
         );
-        // Absent range (degenerate / no fence) → no guard either way.
-        assert_eq!(sink_guard_lease_range(None, false), None);
-        assert_eq!(sink_guard_lease_range(None, true), None);
+
+        let degenerate = delivery_with_fence_offset("degenerate", None, 0, "", None);
+        assert_eq!(sink_delivery_lease_coordinate(&degenerate), ((0, 0), None));
     }
 
     // #3089 A2b (review-fix M2): an EMPTY body diverges between the controller and
@@ -3327,7 +3784,7 @@ mod tests {
                 },
                 edit_fail_policy: toc::EditFailPlaceholderPolicy::PreserveAlways,
                 fallback_commit_policy: toc::FallbackCommitPolicy::CommitOnFallback,
-                acquire_failure_mode: toc::AcquireFailureMode::ProceedMarkerless,
+                acquire_failure_mode: toc::AcquireFailureMode::Transient,
                 advance: Some(&advance),
                 heartbeat: Some(&hb),
             },
@@ -3766,21 +4223,8 @@ mod tests {
     // even though a snapshot taken before the POST would have matched.
     #[test]
     fn sink_post_post_recheck_blocks_advance_when_inflight_replaced_during_post() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let temp = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
 
         let shared = super::super::make_shared_data_for_tests();
         let channel = ChannelId::new(8_041);
@@ -4214,6 +4658,8 @@ mod tests {
             frame_turn_user_msg_id: 0,
             frame_turn_started_at: "2026-06-04T00:00:00Z".to_string(),
             frame_turn_start_offset: None,
+            relay_range: None,
+            relay_generation_mtime_ns: None,
         }
     }
 
@@ -4241,34 +4687,18 @@ mod tests {
     // RAII guard's Drop STILL released the lease, so the NEXT terminal delivery
     // is NOT blocked for up to ~10 minutes.
     //
-    // SAFETY (await_holding_lock): `shared_test_env_lock()` and the dedupe
-    // `TEST_LOCK` are std test-serialization Mutexes (NOT production locks). They
-    // are held across `deliver_response().await` only to keep this test's
-    // `AGENTDESK_ROOT_DIR` + shared dedupe state isolated from other tests; the
-    // awaited future itself never tries to re-acquire either lock, so there is no
-    // deadlock — this is the established pattern (see `src/reconcile.rs`).
+    // The canonical root guard serializes the process-wide env mutation. The
+    // dedupe lock is also held across the await because the future does not
+    // reacquire it and the lease assertion needs one uninterrupted state window.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn deliver_response_err_path_releases_external_input_lease_via_guard() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         let temp = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
 
         let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
             .lock()
-            .unwrap();
+            .unwrap_or_else(|poison| poison.into_inner());
         crate::services::tui_prompt_dedupe::reset_state_for_tests();
 
         let channel_id = 8_041_u64;
@@ -4627,8 +5057,8 @@ mod tests {
         }
 
         /// ACQUIRE FAILS when the watcher/bridge already holds the range: the guard is
-        /// `None` → the sink POSTs markerless (no double-commit, no self-black-hole),
-        /// and the existing holder's lease is untouched.
+        /// `None`, so the production caller returns NotDelivered before transport and
+        /// the existing holder's lease is untouched.
         #[test]
         fn acquire_fails_when_another_holder_owns_range() {
             let ch = ChannelId::new(7304);
@@ -4644,7 +5074,7 @@ mod tests {
                 END,
                 now.saturating_add(10_000),
             ));
-            // The sink's acquire loses → None (markerless POST; no duplicate).
+            // The sink's acquire loses → None; the caller must not POST.
             assert!(
                 SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END).is_none(),
                 "the sink acquire must lose to the watcher's existing lease"
@@ -4658,7 +5088,7 @@ mod tests {
 
         /// A STALE-EXPIRED prior holder is self-healed by `acquire`'s
         /// `reclaim_if_expired` (mirrors the watcher) so the sink's acquire still
-        /// wins — otherwise the sink would POST markerless and reintroduce the dup.
+        /// wins instead of deferring forever behind a dead holder.
         #[tokio::test]
         async fn acquire_self_heals_an_expired_prior_holder() {
             let ch = ChannelId::new(7305);

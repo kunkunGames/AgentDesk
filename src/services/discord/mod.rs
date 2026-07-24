@@ -13,6 +13,7 @@ mod delivery_lease_key;
 mod destructive_cancel_gate;
 mod discord_io;
 mod dispatch_policy;
+pub(crate) mod e2e_control;
 mod footer_view_reconciler;
 pub(crate) mod formatting;
 mod gateway;
@@ -94,6 +95,7 @@ mod single_message_panel;
 mod stall_recovery;
 mod startup_reclaim;
 mod status_panel_orphan_store;
+mod status_panel_singleton_store;
 pub(in crate::services::discord) mod streaming_finalizer;
 mod task_notification_delivery;
 pub(in crate::services::discord) mod task_supervisor;
@@ -3523,7 +3525,7 @@ async fn mailbox_take_next_soft_intervention(
                 .await
         {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
+            tracing::info!(
                 "  [{ts}] ⏭ DISPATCH-GUARD: dropped queued terminal dispatch {} in channel {} (status={})",
                 stale.dispatch_id,
                 channel_id,

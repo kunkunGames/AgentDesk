@@ -228,7 +228,7 @@
       "count": 1
     },
     {
-      "path": "src/services/discord/formatting.rs",
+      "path": "src/services/discord/formatting/streaming_status.rs",
       "lint": "too_many_arguments",
       "count": 2
     },
@@ -268,7 +268,7 @@
       "count": 2
     },
     {
-      "path": "src/services/discord/meeting_orchestrator.rs",
+      "path": "src/services/discord/meeting_orchestrator/rounds.rs",
       "lint": "too_many_arguments",
       "count": 1
     },
@@ -703,9 +703,9 @@
       "count": 1
     },
     {
-      "path": "src/services/discord/turn_view_reconciler.rs",
+      "path": "src/services/discord/turn_view_reconciler/apply.rs",
       "lint": "too_many_arguments",
-      "count": 2
+      "count": 1
     },
     {
       "path": "src/services/discord/turn_view_reconciler/orphan_sweep.rs",
@@ -713,9 +713,19 @@
       "count": 1
     },
     {
-      "path": "src/services/discord/watchers/lifecycle.rs",
+      "path": "src/services/discord/turn_view_reconciler/resolution.rs",
       "lint": "too_many_arguments",
-      "count": 2
+      "count": 1
+    },
+    {
+      "path": "src/services/discord/watchers/lifecycle/liveness.rs",
+      "lint": "too_many_arguments",
+      "count": 1
+    },
+    {
+      "path": "src/services/discord/watchers/lifecycle/output_policy.rs",
+      "lint": "too_many_arguments",
+      "count": 1
     },
     {
       "path": "src/services/dispatches/discord_delivery/orchestration.rs",

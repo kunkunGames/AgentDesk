@@ -93,12 +93,12 @@ COVERAGE_CONFIRM_TICKS = 2
 # the load-transient false positives (seconds) this suppresses, and the
 # transcript-vs-Discord gap alarm independently catches real delivery loss at
 # gap_alert_secs (~15 min) regardless of this backstop.
-COVERAGE_DESYNC_CONFIRM_SECS = 600
 # A foreground turn must show an outbound/relay write inside this window before
 # a transient watcher-state desync can be treated as covered.  Ten minutes
 # matches the watchdog's calibrated delivery grace while still letting a
 # genuinely stalled foreground turn resume normal two-tick escalation.
 COVERAGE_ACTIVITY_FRESH_SECS = 10 * 60
+COVERAGE_INFLIGHT_UPDATED_AT_KEY = "coverage_inflight_updated_at"
 
 # Independent selector-sync states (#4408 phase 2, I1).  Compares the dcserver's
 # asserted relay bind (B = watcher-state `bound_output_path`) against the
@@ -1247,6 +1247,16 @@ def parse_transcript_ts(ts: str) -> float | None:
         return None
 
 
+def parse_local_timestamp(ts: object) -> float | None:
+    """Parse dcserver's local-time ``YYYY-MM-DD HH:MM:SS`` timestamps."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return float(time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
 def is_harness_control_assistant_record(record: object) -> bool:
     """Whether an assistant JSONL row is synthetic harness control data.
 
@@ -1457,6 +1467,9 @@ class WatcherStateProbe:
     # Provider session identity is authoritative across runtime-mirror/provider-
     # project path representations. It is optional for legacy watcher-state.
     bound_session_id: str | None = None
+    # Local-time bridge heartbeat copied from the watcher-state snapshot. Missing
+    # or malformed values remain None so coverage corroboration fails closed.
+    inflight_updated_at: float | None = None
 
 
 def canonical_session_uuid(value: object) -> str | None:
@@ -1487,13 +1500,19 @@ def parse_watcher_state_probe(
     desynced = desynced_raw if isinstance(desynced_raw, bool) else None
     bound = bound_output_path if isinstance(bound_output_path, str) else None
     bound_session_id = canonical_session_uuid(bound_session_id_raw)
+    inflight_updated_at = parse_local_timestamp(payload.get("inflight_updated_at"))
 
     has_activity_schema = (
         "relay_stall_state" in payload or "relay_health" in payload
     )
     if not has_activity_schema:
         return WatcherStateProbe(
-            200, attached, desynced, bound, bound_session_id=bound_session_id
+            200,
+            attached,
+            desynced,
+            bound,
+            bound_session_id=bound_session_id,
+            inflight_updated_at=inflight_updated_at,
         )
 
     malformed = False
@@ -1518,6 +1537,7 @@ def parse_watcher_state_probe(
                 malformed=True,
             ),
             bound_session_id,
+            inflight_updated_at,
         )
 
     def string_field(key: str) -> tuple[str | None, bool]:
@@ -1601,6 +1621,7 @@ def parse_watcher_state_probe(
             malformed=malformed,
         ),
         bound_session_id,
+        inflight_updated_at,
     )
 
 
@@ -2673,6 +2694,22 @@ def tick_coverage(
         if expected_alive is True
         else WatcherStateProbe(None)
     )
+    previous_inflight_updated_at = chs.get(COVERAGE_INFLIGHT_UPDATED_AT_KEY)
+    current_inflight_updated_at = probe.inflight_updated_at
+    inflight_update_advanced = bool(
+        _is_finite_nonnegative_number(previous_inflight_updated_at)
+        and current_inflight_updated_at is not None
+        and current_inflight_updated_at > float(previous_inflight_updated_at)
+    )
+    inflight_update_recent = bool(
+        current_inflight_updated_at is not None
+        and 0
+        <= now - current_inflight_updated_at
+        < COVERAGE_ACTIVITY_FRESH_SECS
+    )
+    if current_inflight_updated_at is not None:
+        chs[COVERAGE_INFLIGHT_UPDATED_AT_KEY] = current_inflight_updated_at
+
     previous = chs.get("coverage_uncovered_ticks", 0)
     if not isinstance(previous, int) or isinstance(previous, bool):
         previous = 0
@@ -2726,10 +2763,10 @@ def tick_coverage(
             f"confirm={verdict.consecutive_uncovered}/{COVERAGE_CONFIRM_TICKS}"
         )
         return
-    # #4504: attached_but_desynced is a watcher-state desync, not proof of
-    # delivery loss. Require a corroborating real delivery gap OR much longer
-    # persistence before this alarms on its own. detached / watcher_state_404
-    # keep the 2-tick behavior (different reason strings).
+    # #4504/#4841: attached_but_desynced is a watcher-state desync, not proof
+    # of delivery loss. Alarm only with a corroborating real delivery gap;
+    # duration alone never upgrades an idle zero-loss session. detached /
+    # watcher_state_404 keep the 2-tick behavior (different reason strings).
     if verdict.reason == "attached_but_desynced":
         activity = probe.relay_activity
         relay_ts = activity.last_relay_ts_ms if activity is not None else None
@@ -2745,39 +2782,55 @@ def tick_coverage(
             recent_relay = (
                 0 <= relay_age_ms < COVERAGE_ACTIVITY_FRESH_SECS * 1000
             )
-        growing_without_loss = (
+        zero_loss_observed = bool(
             transcript_probe is not None
-            and transcript_probe.growing
             and transcript_probe.blocks > 0
             and transcript_probe.lost == 0
+        )
+        growing_without_loss = bool(
+            zero_loss_observed and transcript_probe is not None and transcript_probe.growing
         )
         transcript_loss_active = bool(
             transcript_probe is not None and transcript_probe.lost > 0
         )
-        growing_relay_stall = bool(growing_without_loss and not recent_relay)
+        inflight_progress_alive = bool(
+            inflight_update_advanced or inflight_update_recent
+        )
+        growing_relay_stall = bool(
+            growing_without_loss and not recent_relay and not inflight_progress_alive
+        )
         delivery_gap_active = bool(
             chs.get("gap_since")
             or chs.get("alerting")
             or transcript_loss_active
             or growing_relay_stall
         )
-        desync_for = (
-            max(0.0, now - desync_since) if desync_since is not None else 0.0
-        )
-        if not delivery_gap_active and growing_without_loss and recent_relay:
-            rt.log(
-                f"[{cid}] coverage desync classified as growth lag "
-                f"blocks={transcript_probe.blocks} lost=0 — not alarming"
-            )
-            return
         if (
             not delivery_gap_active
-            and desync_for < COVERAGE_DESYNC_CONFIRM_SECS
+            and growing_without_loss
+            and not recent_relay
+            and inflight_progress_alive
         ):
+            evidence = "advanced" if inflight_update_advanced else "recent"
+            rt.log(
+                f"[{cid}] coverage desync growth has live inflight update "
+                f"evidence={evidence} — not alarming"
+            )
+            return
+        if not delivery_gap_active and zero_loss_observed and recent_relay:
+            rt.log(
+                f"[{cid}] coverage desync has zero loss and recent relay "
+                f"blocks={transcript_probe.blocks} growing={transcript_probe.growing} "
+                "— not alarming"
+            )
+            return
+        if not delivery_gap_active:
+            desync_for = (
+                max(0.0, now - desync_since) if desync_since is not None else 0.0
+            )
             rt.log(
                 f"[{cid}] coverage desync uncorroborated "
-                f"duration={int(desync_for)}s/"
-                f"{COVERAGE_DESYNC_CONFIRM_SECS}s — not alarming"
+                f"duration={int(desync_for)}s — not alarming"
             )
             return
     if rt.in_deploy_window(now):

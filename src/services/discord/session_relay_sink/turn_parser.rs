@@ -112,6 +112,8 @@ impl SessionRelayParser {
                     frame_turn_user_msg_id: frame.turn_user_msg_id,
                     frame_turn_started_at: frame.turn_started_at.clone(),
                     frame_turn_start_offset: frame.turn_start_offset,
+                    relay_range: frame.relay_range,
+                    relay_generation_mtime_ns: frame.relay_generation_mtime_ns,
                 });
                 break;
             } else {
@@ -148,4 +150,6 @@ pub(in crate::services::discord) struct SessionRelayDelivery {
     pub(super) frame_turn_user_msg_id: u64,
     pub(super) frame_turn_started_at: String,
     pub(super) frame_turn_start_offset: Option<u64>,
+    pub(super) relay_range: Option<(u64, u64)>,
+    pub(super) relay_generation_mtime_ns: Option<i64>,
 }

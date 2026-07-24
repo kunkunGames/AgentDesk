@@ -18,6 +18,12 @@ NIGHTLY_WORKFLOW = REPO_ROOT / ".github/workflows/ci-nightly.yml"
 EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib source_registry -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib delivery_lease_key -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib server::routes::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib server::claude_oauth_usage_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib tui_task_card::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::message_outbox::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib discord_thread_create -- --test-threads=1",
@@ -25,9 +31,11 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib intake_queue_transaction::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib pending_reaction_failure_adapter_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib intake_dispatch_invariant_queued_entrypoints_promote_markers -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib attachment -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib mailbox_reaction_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_marker::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_status_presentation::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib status_panel_singleton_store -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::outbound::serenity_reference::tests::lifecycle_notice_nonce_is_stable_and_semantic_event_scoped -- --exact",
     "cargo test --lib services::discord::outbound::delivery::tests::v3_referenced_send_preserves_reference_and_dedupes -- --exact",
     "cargo test --lib cli::args::tests::legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract",
@@ -36,6 +44,7 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres",
     "python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres",
     "cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres",
@@ -132,6 +141,16 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"(?m)^    if: needs\.changes\.outputs\.pg_db == 'true'$",
         )
 
+    def test_pr_cross_os_lane_is_compile_only(self) -> None:
+        job = job_block(PR_WORKFLOW.read_text(encoding="utf-8"), "check_fast_cross_os")
+
+        self.assertIn("name: Fast check + non-PG tests (${{ matrix.os }})", job)
+        self.assertIn("os: [windows-latest]", job)
+        self.assertIn("- name: cargo check", job)
+        self.assertNotRegex(job, r"(?m)^\s*cargo test\b")
+        self.assertNotIn("- name: cargo test", job)
+        self.assertNotIn("Discord thread-create cross-process lock", job)
+
     def test_main_and_nightly_retain_non_pg_test_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         self.assertIn("check: fmt-check lint cargo-check test", justfile)
@@ -152,6 +171,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 self.assertIn(
                     "cargo test --all-targets -- --skip _pg_ --skip postgres_", job
                 )
+        self.assertIn(
+            "cargo test --lib discord_thread_create -- --test-threads=1",
+            job_block(nightly, "full_windows"),
+        )
 
     def test_ci_script_checks_runs_this_contract(self) -> None:
         script = (REPO_ROOT / "scripts/ci-script-checks.sh").read_text(
@@ -159,6 +182,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
         )
         self.assertIn(
             '"$PYTHON" -m unittest tests.test_fast_check_ci_wiring', script
+        )
+        self.assertIn('"$PYTHON" scripts/check_test_lane_coverage.py', script)
+        self.assertIn(
+            '"$PYTHON" -m unittest tests.test_test_lane_coverage', script
         )
 
 

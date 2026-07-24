@@ -174,6 +174,8 @@ use self::supervisor_relay::*;
 use self::terminal_abort_exits::*;
 use self::terminal_commit_epilogue::*;
 use self::terminal_readiness::*;
+#[cfg(test)]
+pub(in crate::services::discord) use self::turn_identity::pinned_delivery_lease_key as pinned_delivery_lease_key_for_test;
 use self::turn_stream_collector::*;
 use self::utf8_chunk_decoder::*;
 
@@ -1554,7 +1556,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 );
                 session_bound_ack_outcome = ack_outcome;
                 let delivered = session_bound_relay_turn_fully_mirrored
-                    && matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered);
+                    && session_bound_ack_confirms_transport(ack_outcome);
                 if !delivered {
                     tracing::warn!(
                         provider = watcher_provider.as_str(),
@@ -1857,6 +1859,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // below). Acquire is the atomic fast-path (B4); commit/advance/release run INLINE
         // (preserving the pre-P1-1 advance timing, avoiding an actor-deferral duplicate).
         // The actor CommitDelivery/ReleaseDelivery messages remain dormant.
+        let watcher_lease_start = data_start_offset;
+        let watcher_lease_end = terminal_event_consumed_offset(current_offset, &all_data);
         let (watcher_lease_turn, watcher_lease_key, watcher_lease_holder) =
             pinned_watcher_delivery_lease_identity(
                 channel_id,
@@ -1865,9 +1869,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 inflight_before_relay.as_ref(),
                 &tmux_session_name,
                 current_offset,
+                watcher_lease_start,
             );
-        let watcher_lease_start = data_start_offset;
-        let watcher_lease_end = terminal_event_consumed_offset(current_offset, &all_data);
         // #3610 PR-1d: capture the legacy long-chunk anchor here; record it only
         // after the post-advance M4 commit below.
         let mut watcher_long_chunk_anchor_msg_id: Option<MessageId> = None;
@@ -3135,6 +3138,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         assistant_message: &full_response,
                         events: &tool_state.transcript_events,
                         duration_ms: inflight_duration_ms(Some(state.started_at.as_str())),
+                        turn_started_at_millis:
+                            crate::db::session_transcripts::discord_message_started_at_millis(Some(
+                                user_msg_id,
+                            )),
                     },
                 )
                 .await

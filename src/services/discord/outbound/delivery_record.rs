@@ -365,6 +365,63 @@ pub(in crate::services::discord) fn write_delivered_frontier(
     write_delivered_frontier_at(&record_path_or_err(provider, channel_id)?, frontier)
 }
 
+fn commit_ordered_jsonl_range_at(
+    path: &Path,
+    range: (u64, u64),
+    generation_mtime_ns: i64,
+) -> Result<bool, String> {
+    if generation_mtime_ns == 0 || range.1 <= range.0 {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let _lock = lock_record_path(path)?;
+    let mut record = read_record_at(path).unwrap_or_default();
+    if let Some(frontier) = record.delivered_frontier.as_ref()
+        && frontier.generation_mtime_ns == generation_mtime_ns
+        && frontier.range.1 >= range.1
+    {
+        return Ok(true);
+    }
+    let previous_attempts = record
+        .delivered_frontier
+        .as_ref()
+        .filter(|frontier| frontier.generation_mtime_ns == generation_mtime_ns)
+        .map(|frontier| frontier.attempts)
+        .unwrap_or(0);
+    let committed_range = record
+        .delivered_frontier
+        .as_ref()
+        .filter(|frontier| frontier.generation_mtime_ns == generation_mtime_ns)
+        .map(|frontier| (frontier.range.0.min(range.0), frontier.range.1.max(range.1)))
+        .unwrap_or(range);
+    record.delivered_frontier = Some(DeliveredCommit {
+        range: committed_range,
+        generation_mtime_ns,
+        attempts: previous_attempts.saturating_add(1),
+        panel_msg_id: None,
+        panel_channel_id: None,
+    });
+    write_record_at(path, &record)?;
+    Ok(true)
+}
+
+/// Durably commit a confirmed idle/catch-up JSONL range. Unlike the rollout
+/// shadow writer, this is delivery authority and is therefore flag-independent.
+pub(in crate::services::discord) fn commit_ordered_jsonl_range(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    range: (u64, u64),
+    generation_mtime_ns: i64,
+) -> Result<bool, String> {
+    commit_ordered_jsonl_range_at(
+        &record_path_or_err(provider, channel.get())?,
+        range,
+        generation_mtime_ns,
+    )
+}
+
 fn write_watcher_owner_context_at(
     path: &Path,
     watcher_owner_channel_id: u64,
@@ -818,17 +875,18 @@ pub(in crate::services::discord) fn delivered_frontier_end_current_generation(
         .unwrap_or(0)
 }
 
-fn current_generation_frontier_exceeds_eof_at(
+fn current_generation_frontier_exceeding_eof_at(
     path: &Path,
     current_gen_mtime: i64,
     current_transcript_eof: u64,
-) -> bool {
+) -> Option<u64> {
     read_record_at(path)
         .and_then(|record| record.delivered_frontier)
-        .is_some_and(|frontier| {
+        .filter(|frontier| {
             durable_frontier_generation_current(frontier.generation_mtime_ns, current_gen_mtime)
                 && frontier.range.1 > current_transcript_eof
         })
+        .map(|frontier| frontier.range.1)
 }
 
 /// #4549: detect the exact same-generation frontier/EOF regression that the
@@ -837,19 +895,66 @@ fn current_generation_frontier_exceeds_eof_at(
 /// an in-place `/compact` rewrite. A rotated UUID/path bypasses this predicate and
 /// keeps the fresh-transcript lookback path, so replacement-file prompts are not
 /// lost.
-pub(in crate::services::discord) fn delivered_frontier_exceeds_current_eof(
+pub(in crate::services::discord) fn delivered_frontier_exceeding_current_eof(
     provider: &ProviderKind,
     channel: ChannelId,
     tmux_session_name: &str,
     current_transcript_eof: u64,
-) -> bool {
-    let Some(path) = delivery_record_path(provider, channel.get()) else {
-        return false;
-    };
-    current_generation_frontier_exceeds_eof_at(
+) -> Option<u64> {
+    let path = delivery_record_path(provider, channel.get())?;
+    current_generation_frontier_exceeding_eof_at(
         &path,
         current_generation_mtime_ns(tmux_session_name),
         current_transcript_eof,
+    )
+}
+
+fn reanchor_current_generation_frontier_at(
+    path: &Path,
+    current_gen_mtime: i64,
+    expected_frontier_end: u64,
+    reanchor_offset: u64,
+) -> Result<bool, String> {
+    let _lock = lock_record_path(path)?;
+    let Some(mut record) = read_record_at(path) else {
+        return Ok(false);
+    };
+    let Some(frontier) = record.delivered_frontier.as_mut() else {
+        return Ok(false);
+    };
+    if !durable_frontier_generation_current(frontier.generation_mtime_ns, current_gen_mtime)
+        || frontier.range.1 != expected_frontier_end
+        || frontier.range.1 <= reanchor_offset
+    {
+        return Ok(false);
+    }
+    frontier.range.1 = reanchor_offset;
+    if frontier.range.0 > reanchor_offset {
+        frontier.range.0 = reanchor_offset;
+    }
+    write_record_at(path, &record)?;
+    Ok(true)
+}
+
+/// #4841: converge a stale same-generation durable frontier after an in-place
+/// `/compact`. This is a correction of already-confirmed coordinate space, not a
+/// new delivery: it preserves the record's generation/attempt/anchor identity and
+/// only lowers the END after the caller proved the current transcript boundary.
+pub(in crate::services::discord) fn reanchor_current_generation_frontier(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    expected_frontier_end: u64,
+    reanchor_offset: u64,
+) -> Result<bool, String> {
+    let Some(path) = delivery_record_path(provider, channel.get()) else {
+        return Ok(false);
+    };
+    reanchor_current_generation_frontier_at(
+        &path,
+        current_generation_mtime_ns(tmux_session_name),
+        expected_frontier_end,
+        reanchor_offset,
     )
 }
 
@@ -924,6 +1029,138 @@ pub(in crate::services::discord) fn committed_floor_for_resend_dedup(
         tmux_session_name,
         current_transcript_eof,
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::services::discord) struct EditFailureTranscriptIdentity {
+    output_path: PathBuf,
+    generation_mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptFileSnapshot {
+    eof: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn transcript_file_snapshot(path: &Path) -> Option<TranscriptFileSnapshot> {
+    let metadata = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(TranscriptFileSnapshot {
+        eof: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+/// Capture the transcript identity before the Discord edit await. A missing
+/// watcher path or generation marker cannot establish range identity and leaves
+/// fallback delivery enabled.
+pub(in crate::services::discord) fn capture_edit_failure_transcript_identity(
+    shared: &crate::services::discord::SharedData,
+    tmux_session_name: &str,
+) -> Option<EditFailureTranscriptIdentity> {
+    let output_path = PathBuf::from(
+        shared
+            .tmux_watchers
+            .watcher_output_path(tmux_session_name)?,
+    );
+    let generation_mtime_ns = current_generation_mtime_ns(tmux_session_name);
+    if generation_mtime_ns == 0 {
+        return None;
+    }
+    Some(EditFailureTranscriptIdentity {
+        output_path,
+        generation_mtime_ns,
+    })
+}
+
+fn stable_edit_failure_frontier_at<P, G, H>(
+    record_path: &Path,
+    expected: &EditFailureTranscriptIdentity,
+    mut current_output_path: P,
+    mut current_generation: G,
+    after_first_snapshot: H,
+) -> Option<DeliveredCommit>
+where
+    P: FnMut() -> Option<PathBuf>,
+    G: FnMut() -> i64,
+    H: FnOnce(),
+{
+    let _lock = lock_record_path(record_path).ok()?;
+    if current_output_path().as_deref() != Some(expected.output_path.as_path())
+        || current_generation() != expected.generation_mtime_ns
+    {
+        return None;
+    }
+    let before = transcript_file_snapshot(&expected.output_path)?;
+    after_first_snapshot();
+
+    let frontier = read_record_at(record_path)?.delivered_frontier?;
+    if !durable_frontier_generation_current(
+        frontier.generation_mtime_ns,
+        expected.generation_mtime_ns,
+    ) || frontier.range.1 > before.eof
+    {
+        return None;
+    }
+
+    let after_path = current_output_path()?;
+    let after_generation = current_generation();
+    let after = transcript_file_snapshot(&expected.output_path)?;
+    if after_path != expected.output_path
+        || after_generation != expected.generation_mtime_ns
+        || after != before
+    {
+        return None;
+    }
+    Some(frontier)
+}
+
+/// Re-read a stable path+generation+EOF+frontier snapshot after an edit failure
+/// and decide whether a fallback POST would duplicate a confirmed JSONL range.
+/// The expected path and generation were captured before the edit await. The
+/// record lock serializes conforming frontier writers, while the post-read
+/// identity check detects wrapper rotation or transcript replacement during the
+/// snapshot. Any missing or changing component fails open for delivery.
+pub(in crate::services::discord) fn range_committed_after_edit_failure(
+    shared: &crate::services::discord::SharedData,
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    expected: Option<&EditFailureTranscriptIdentity>,
+    range_end: u64,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(record_path) = delivery_record_path(provider, channel.get()) else {
+        return false;
+    };
+    let frontier = stable_edit_failure_frontier_at(
+        &record_path,
+        expected,
+        || {
+            shared
+                .tmux_watchers
+                .watcher_output_path(tmux_session_name)
+                .map(PathBuf::from)
+        },
+        || current_generation_mtime_ns(tmux_session_name),
+        || {},
+    );
+    range_already_committed(
+        range_end,
+        frontier.map(|frontier| frontier.range.1).unwrap_or(0),
+    )
 }
 
 /// #3593 JSONL-space monotonic dedup predicate (pure, testable). `range_end` is the
@@ -1470,6 +1707,14 @@ pub(in crate::services::discord) fn record_long_chunk_terminal_delivery(
 }
 
 #[cfg(test)]
+mod relay_state_contract_refs {
+    #[test]
+    fn contract_symbols_exist() {
+        use super::range_committed_after_edit_failure as _;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::delivery_frontier_probe::{
         CurrentGenerationAnchor, current_generation_delivered_anchor_at,
@@ -1494,6 +1739,38 @@ mod tests {
             panel_msg_id: Some(999),
             panel_channel_id: Some(1234),
         }
+    }
+
+    #[test]
+    fn ordered_jsonl_commit_is_generation_scoped_and_monotonic() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("record.json");
+
+        assert!(commit_ordered_jsonl_range_at(&path, (100, 200), 7).unwrap());
+        assert!(commit_ordered_jsonl_range_at(&path, (150, 180), 7).unwrap());
+        assert_eq!(
+            read_record_at(&path).unwrap().delivered_frontier.unwrap(),
+            DeliveredCommit {
+                range: (100, 200),
+                generation_mtime_ns: 7,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            }
+        );
+
+        assert!(commit_ordered_jsonl_range_at(&path, (0, 50), 8).unwrap());
+        assert_eq!(
+            read_record_at(&path)
+                .unwrap()
+                .delivered_frontier
+                .unwrap()
+                .range,
+            (0, 50),
+            "a replacement wrapper starts a new coordinate space"
+        );
+        assert!(!commit_ordered_jsonl_range_at(&path, (50, 50), 8).unwrap());
+        assert!(!commit_ordered_jsonl_range_at(&path, (50, 60), 0).unwrap());
     }
 
     #[test]
@@ -2268,9 +2545,114 @@ mod tests {
         )
         .unwrap();
 
-        assert!(current_generation_frontier_exceeds_eof_at(&path, 700, 250));
-        assert!(!current_generation_frontier_exceeds_eof_at(&path, 701, 250));
-        assert!(!current_generation_frontier_exceeds_eof_at(&path, 700, 900));
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250),
+            Some(900)
+        );
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 701, 250),
+            None
+        );
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 900),
+            None
+        );
+    }
+
+    #[test]
+    fn same_generation_frontier_reanchor_converges_once_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4841);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (80, 900),
+                generation_mtime_ns: 700,
+                attempts: 3,
+                panel_msg_id: Some(42),
+                panel_channel_id: Some(84),
+            },
+        )
+        .unwrap();
+
+        assert!(reanchor_current_generation_frontier_at(&path, 700, 900, 250).unwrap());
+        let rewritten = read_record_at(&path).unwrap().delivered_frontier.unwrap();
+        assert_eq!(rewritten.range, (80, 250));
+        assert_eq!(rewritten.generation_mtime_ns, 700);
+        assert_eq!(rewritten.attempts, 3);
+        assert_eq!(rewritten.panel_msg_id, Some(42));
+        assert_eq!(rewritten.panel_channel_id, Some(84));
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250),
+            None
+        );
+        assert!(!reanchor_current_generation_frontier_at(&path, 700, 900, 250).unwrap());
+    }
+
+    #[test]
+    fn frontier_reanchor_defers_when_concurrent_commit_wins_lock_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 48_411);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (0, 900),
+                generation_mtime_ns: 700,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+        let observed_frontier =
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250).unwrap();
+
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (250, 400),
+                generation_mtime_ns: 700,
+                attempts: 2,
+                panel_msg_id: Some(42),
+                panel_channel_id: Some(84),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !reanchor_current_generation_frontier_at(&path, 700, observed_frontier, 250).unwrap()
+        );
+        let winner = read_record_at(&path).unwrap().delivered_frontier.unwrap();
+        assert_eq!(winner.range, (250, 400));
+        assert_eq!(winner.attempts, 2);
+        assert_eq!(winner.panel_msg_id, Some(42));
+    }
+
+    #[test]
+    fn frontier_reanchor_rejects_stale_generation_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 48_412);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (0, 900),
+                generation_mtime_ns: 700,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!reanchor_current_generation_frontier_at(&path, 701, 900, 250).unwrap());
+        assert_eq!(
+            read_record_at(&path)
+                .unwrap()
+                .delivered_frontier
+                .unwrap()
+                .range,
+            (0, 900)
+        );
     }
 
     /// I3 conservatism: an absent or malformed record yields no durable floor
@@ -2948,6 +3330,41 @@ mod tests {
         gen_ns
     }
 
+    fn seed_edit_failure_transcript(
+        root: &IsolatedRoot,
+        tmux_session_name: &str,
+        generation_mtime_ns: i64,
+        eof: u64,
+    ) -> EditFailureTranscriptIdentity {
+        let output_path = root.path().join(format!("{tmux_session_name}.jsonl"));
+        fs::write(&output_path, vec![b'x'; eof as usize]).expect("seed transcript");
+        EditFailureTranscriptIdentity {
+            output_path,
+            generation_mtime_ns,
+        }
+    }
+
+    fn stable_edit_failure_committed_at(
+        provider: &ProviderKind,
+        channel: ChannelId,
+        expected: &EditFailureTranscriptIdentity,
+        range_end: u64,
+    ) -> bool {
+        let record_path =
+            delivery_record_path(provider, channel.get()).expect("delivery record path");
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            expected,
+            || Some(expected.output_path.clone()),
+            || expected.generation_mtime_ns,
+            || {},
+        );
+        range_already_committed(
+            range_end,
+            frontier.map(|frontier| frontier.range.1).unwrap_or(0),
+        )
+    }
+
     fn shared_with_committed(
         channel: ChannelId,
         in_memory: u64,
@@ -3082,6 +3499,185 @@ mod tests {
         // Watchdog re-relay of the delivered body → suppressed (dup guard).
         assert!(range_already_committed(500_000, floor));
         assert!(range_already_committed(durable_end, floor)); // inclusive boundary
+    }
+
+    #[test]
+    fn edit_failure_recheck_suppresses_only_stable_fresh_bounded_commit_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_001);
+        let tmux = "AgentDesk-claude-4508";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+
+        assert!(stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end + 1,
+        ));
+
+        fs::write(
+            &expected.output_path,
+            vec![b'x'; (committed_end - 1) as usize],
+        )
+        .expect("truncate transcript");
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_distrusts_prior_generation_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_002);
+        let tmux = "AgentDesk-claude-4508-stale";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+        write_delivered_frontier_at(
+            &record_path,
+            DeliveredCommit {
+                range: (0, committed_end),
+                generation_mtime_ns: generation.saturating_add(1),
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_requires_durable_proof_despite_high_memory_floor_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_003);
+        let tmux = "AgentDesk-claude-4508-unverifiable";
+        let committed_end = 900_u64;
+        let shared = shared_with_committed(channel, committed_end);
+
+        assert!(!range_committed_after_edit_failure(
+            shared.as_ref(),
+            &provider,
+            channel,
+            tmux,
+            None,
+            committed_end,
+        ));
+
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let missing_output = EditFailureTranscriptIdentity {
+            output_path: root.path().join("missing.jsonl"),
+            generation_mtime_ns: generation,
+        };
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &missing_output,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_detects_rotate_between_eof_and_frontier_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_004);
+        let tmux = "AgentDesk-claude-4508-rotate";
+        let committed_end = 900_u64;
+        let old_generation =
+            seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, old_generation, committed_end);
+        let new_path = root.path().join("replacement.jsonl");
+        fs::write(&new_path, vec![b'n'; committed_end as usize]).expect("seed replacement");
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+        let current_path = std::cell::RefCell::new(expected.output_path.clone());
+        let current_generation = std::cell::Cell::new(old_generation);
+
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            &expected,
+            || Some(current_path.borrow().clone()),
+            || current_generation.get(),
+            || {
+                current_path.replace(new_path.clone());
+                current_generation.set(old_generation.saturating_add(1));
+                write_record_at(
+                    &record_path,
+                    &DeliveryRecord {
+                        delivery_lease: None,
+                        delivered_frontier: Some(DeliveredCommit {
+                            range: (0, committed_end),
+                            generation_mtime_ns: old_generation.saturating_add(1),
+                            attempts: 1,
+                            panel_msg_id: None,
+                            panel_channel_id: None,
+                        }),
+                        recent_delivered_contents: Vec::new(),
+                    },
+                )
+                .expect("seed unrelated new frontier");
+            },
+        );
+        assert!(
+            frontier.is_none(),
+            "wrapper rotation after EOF sampling must fail open for fallback delivery"
+        );
+    }
+
+    /// Same-name transcript truncate/replace WITHOUT a generation-marker bump:
+    /// the durable frontier still carries the expected generation and stays
+    /// within the pre-truncate EOF, so ONLY the post-read file-identity check
+    /// can detect the race. Mutation-sensitive for the second snapshot
+    /// comparison in `stable_edit_failure_frontier_at`.
+    #[test]
+    fn edit_failure_recheck_detects_same_generation_truncate_during_snapshot_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_005);
+        let tmux = "AgentDesk-claude-4508-truncate-race";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            &expected,
+            || Some(expected.output_path.clone()),
+            || expected.generation_mtime_ns,
+            || {
+                fs::write(
+                    &expected.output_path,
+                    vec![b't'; (committed_end - 1) as usize],
+                )
+                .expect("truncate transcript during snapshot");
+            },
+        );
+        assert!(
+            frontier.is_none(),
+            "same-generation transcript truncation during the snapshot must fail open"
+        );
     }
 
     /// Even with authority ON, a STALE prior-generation durable frontier is

@@ -459,6 +459,39 @@ fn status_panel_truncates_long_body_without_processing_tail() {
 }
 
 #[test]
+fn status_panel_subtext_exactly_fits_discord_character_limit_4848() {
+    let first = "x".repeat(1_000 - "-# ".chars().count());
+    let second = "y".repeat(STATUS_PANEL_MAX_CHARS - 1_000 - 1 - "-# ".chars().count());
+    let rendered = format_and_truncate_status_panel_sections(vec![format!("{first}\n{second}")]);
+
+    assert_eq!(rendered.chars().count(), STATUS_PANEL_MAX_CHARS);
+    assert!(
+        rendered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("-# ")),
+        "every boundary line must remain subtext: {rendered:?}"
+    );
+}
+
+#[test]
+fn status_panel_subtext_overflow_clamps_after_prefixing_4848() {
+    let rendered = format_and_truncate_status_panel_sections(vec![format!(
+        "Header\n{}",
+        "x".repeat(STATUS_PANEL_MAX_CHARS)
+    )]);
+
+    assert_eq!(rendered.chars().count(), STATUS_PANEL_MAX_CHARS);
+    assert!(
+        rendered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("-# ")),
+        "clamped output must preserve the subtext contract: {rendered:?}"
+    );
+}
+
+#[test]
 fn status_panel_heartbeat_without_new_events_is_stable() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(176);
@@ -2129,7 +2162,7 @@ fn status_panel_renders_context_usage_severity_levels() {
     assert!(events.set_context_panel_usage(normal_channel_id, None, 740, 0, 0, 1000, 90));
     let normal =
         events.render_status_panel(normal_channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(normal.contains("Context   📦 740 / 1.0k tokens (74%) · auto-compact 90%"));
+    assert!(normal.contains("-# 📦 740 / 1.0k (74%) · auto-compact 90%"));
     assert!(!normal.contains("임박"));
     assert!(!normal.contains("자동 압축 직전"));
 
@@ -2137,16 +2170,13 @@ fn status_panel_renders_context_usage_severity_levels() {
     events.set_context_panel_usage(approaching_channel_id, None, 700, 40, 10, 1000, 90);
     let approaching =
         events.render_status_panel(approaching_channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(approaching.contains("Context   📦 750 / 1.0k tokens (75%) · auto-compact 90% (임박)"));
+    assert!(approaching.contains("📦 750 / 1.0k (75%) · auto-compact 90% (임박)"));
 
     let critical_channel_id = ChannelId::new(184);
     events.set_context_panel_usage(critical_channel_id, None, 700, 100, 50, 1000, 90);
     let critical =
         events.render_status_panel(critical_channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert!(
-        critical
-            .contains("Context   ⚠️ 850 / 1.0k tokens (85%) · auto-compact 90% — 자동 압축 직전")
-    );
+    assert!(critical.contains("⚠️ 850 / 1.0k (85%) · auto-compact 90% — 자동 압축 직전"));
 }
 
 #[test]
@@ -2157,7 +2187,7 @@ fn status_panel_caps_context_usage_display_at_100_percent() {
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
 
-    assert!(rendered.contains("Context   ⚠️ 4.1k / 1.0k tokens (100%) · auto-compact 60%"));
+    assert!(rendered.contains("⚠️ 4.1k / 1.0k (100%) · auto-compact 60%"));
     assert!(!rendered.contains("(409%)"));
 }
 
@@ -2169,8 +2199,89 @@ fn status_panel_clamps_codex_context_usage_display_to_window() {
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Codex, 1_700_000_000);
 
-    assert!(rendered.contains("Context   ⚠️ 272.0k / 272.0k tokens (100%) · auto-compact 60%"));
+    assert!(rendered.contains("⚠️ 272.0k / 272.0k (100%) · auto-compact 60%"));
     assert!(!rendered.contains("2.3M"));
+}
+
+// #4860 (e): the (singleton) status panel shows only what is RUNNING. A
+// finished subagent and a finished background task must not appear on the
+// completed-state panel render — no `Agent … finished`-style residue.
+#[test]
+fn completed_panel_shows_running_only_and_drops_finished_entries_4860() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(4_860_301);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some("finished review".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu-4860-done".to_string()),
+            background: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            agent_id: None,
+            desc: None,
+            tool_use_id: Some("toolu-4860-done".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("builder".to_string()),
+            desc: Some("still running".to_string()),
+            agent_id: None,
+            tool_use_id: Some("toolu-4860-live".to_string()),
+            background: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::BackgroundTaskStart {
+            name: "Bash".to_string(),
+            summary: "finished shell".to_string(),
+            tool_use_id: "toolu-4860-shell".to_string(),
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::BackgroundTaskEnd {
+            tool_use_id: "toolu-4860-shell".to_string(),
+            success: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+
+    let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    assert!(
+        panel.contains("still running"),
+        "running entries stay: {panel:?}"
+    );
+    assert!(
+        !panel.contains("finished review"),
+        "a finished subagent must not render on the panel: {panel:?}"
+    );
+    assert!(
+        !panel.contains("finished shell"),
+        "a finished background task must not render on the panel: {panel:?}"
+    );
+    assert!(
+        !panel.contains('✓'),
+        "no terminal marks on the panel: {panel:?}"
+    );
 }
 
 #[test]
@@ -2182,7 +2293,7 @@ fn completion_footer_context_only_has_no_spinner_and_stops_scheduling() {
     let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
     let block = rendered.block.expect("context line should render");
 
-    assert!(block.contains("Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%"));
+    assert!(block.contains("📦 154.6k / 1.0M (15%) · auto-compact 60%"));
     assert!(!block.contains('⠸'));
     assert!(!rendered.has_unfinished_entries);
 }
@@ -2212,6 +2323,226 @@ fn completion_footer_keeps_background_agent_pending_payload_open() {
     assert!(rendered.has_unfinished_entries);
     assert!(block.contains("Background agents"));
     assert!(block.contains("Waiting for background agents ⠸"));
+}
+
+// #4860 관측 문제 해소 + 뮤테이션 증명: #4848 rendered the waiting block from
+// TWO insertion sites (a pre-clamp `emitted` push AND the post-clamp prepend),
+// so every pending footer carried the block twice ("턴마다 2개씩"). These pins
+// fail if either duplicate site is reintroduced (the mutant: restoring the
+// removed pre-clamp push makes the counts read 2).
+#[test]
+fn waiting_block_renders_exactly_once_4860() {
+    // Case 1: no task/subagent lines at all — the waiting block is the ONLY
+    // section, exactly once.
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(1904);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("pending-only footer");
+    assert!(rendered.has_unfinished_entries);
+    assert_eq!(
+        block.matches("Background agents").count(),
+        1,
+        "pending-only footer must carry exactly one waiting header: {block:?}"
+    );
+    assert_eq!(block.matches("Waiting for background agents").count(), 1);
+}
+
+#[test]
+fn waiting_block_above_tasks_renders_exactly_once_4860() {
+    // Case 2: a terminal (non-background) task section is present but shows no
+    // unfinished background entry — the waiting block is prepended ABOVE the
+    // Tasks section exactly once.
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(1905);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TaskToolUpdate {
+            name: "TaskUpdate".to_string(),
+            task_id: Some("t-4860".to_string()),
+            summary: Some("done work".to_string()),
+            status: Some("completed".to_string()),
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("pending footer with tasks");
+    assert!(rendered.has_unfinished_entries);
+    assert_eq!(
+        block.matches("Waiting for background agents").count(),
+        1,
+        "the waiting block must not be double-inserted around the clamp: {block:?}"
+    );
+    assert_eq!(block.matches("Background agents").count(), 1);
+    assert!(block.contains("Tasks"));
+}
+
+// #4860 round 2 mutation proof: clamping the detail section before prepending
+// Waiting exceeds the 600-byte section budget. The budget must cover the final
+// Waiting + Tasks + Subagents combination while preserving Waiting at the head.
+#[test]
+fn waiting_task_subagent_combined_section_stays_within_budget_4860() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(1906);
+    for index in 0..STATUS_PANEL_TASK_LIMIT {
+        events.push_status_event(
+            channel_id,
+            StatusEvent::BackgroundTaskStart {
+                name: "Bash".to_string(),
+                summary: format!("task-{index}-{}", "x".repeat(EVENT_LINE_MAX_CHARS)),
+                tool_use_id: format!("tool-{index}"),
+            },
+        );
+        events.push_status_event(
+            channel_id,
+            StatusEvent::BackgroundTaskEnd {
+                tool_use_id: format!("tool-{index}"),
+                success: true,
+            },
+        );
+    }
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some(format!("subagent-{}", "y".repeat(EVENT_LINE_MAX_CHARS))),
+            agent_id: None,
+            tool_use_id: Some("toolu-terminal-subagent".to_string()),
+            background: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            agent_id: None,
+            desc: None,
+            tool_use_id: Some("toolu-terminal-subagent".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let combined = rendered.block.expect("waiting and detail section");
+    assert!(combined.starts_with("Background agents\nWaiting for background agents ⠸\n\nTasks"));
+    assert!(combined.contains("Subagents") || combined.ends_with('…'));
+    assert!(
+        combined.len()
+            <= crate::services::discord::single_message_panel::SINGLE_MESSAGE_PANEL_FOOTER_BUDGET_BYTES,
+        "Waiting plus task/subagent details exceeded the shared budget: {} bytes",
+        combined.len()
+    );
+}
+
+#[test]
+fn completion_footer_prefers_detailed_background_entry_over_generic_waiting_line_4846() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(1902);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "reviewer",
+                "description": "Review footer",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_bg_detailed"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_bg_detailed")),
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("detailed background entry");
+
+    assert!(rendered.has_unfinished_entries);
+    assert!(block.contains("reviewer Review footer ⠸"));
+    assert!(!block.contains("Waiting for background agents"));
+}
+
+#[test]
+fn completion_footer_falls_back_to_generic_waiting_when_details_are_clamped_4846() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(1903);
+    for index in 0..STATUS_PANEL_TASK_LIMIT {
+        events.push_status_event(
+            channel_id,
+            StatusEvent::BackgroundTaskStart {
+                name: "Bash".to_string(),
+                summary: format!("job-{index}-{}", "x".repeat(EVENT_LINE_MAX_CHARS)),
+                tool_use_id: format!("tool-{index}"),
+            },
+        );
+        events.push_status_event(
+            channel_id,
+            StatusEvent::BackgroundTaskEnd {
+                tool_use_id: format!("tool-{index}"),
+                success: true,
+            },
+        );
+    }
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "reviewer",
+                "description": "Review footer",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu-bg-clamped"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu-bg-clamped")),
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::TurnCompleted {
+            background: false,
+            background_agent_pending: true,
+        },
+    );
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("generic pending fallback");
+
+    assert!(rendered.has_unfinished_entries);
+    assert!(block.contains("Waiting for background agents ⠸"));
+    assert!(!block.contains("reviewer Review footer ⠸"));
 }
 
 #[test]
@@ -3234,7 +3565,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
     let deduped = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     let slot_lines = deduped
         .lines()
-        .filter(|line| line.starts_with("└ "))
+        .filter(|line| line.starts_with("-# └ "))
         .collect::<Vec<_>>();
     assert_eq!(deduped.matches("toolu_carry_bash").count(), 0);
     assert_eq!(
@@ -3559,7 +3890,7 @@ fn completion_footer_budget_clamps_task_section_but_keeps_context_line() {
         .map(|(_, task_section)| task_section)
         .expect("context and task sections should be separated");
 
-    assert!(block.contains("Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%"));
+    assert!(block.contains("📦 154.6k / 1.0M (15%) · auto-compact 60%"));
     assert!(task_section.len() <= crate::services::discord::single_message_panel::SINGLE_MESSAGE_PANEL_FOOTER_BUDGET_BYTES);
     assert!(task_section.ends_with('…'));
     assert!(rendered.has_unfinished_entries);
@@ -8108,6 +8439,13 @@ fn live_panel_hides_completed_tasks_keeping_running_and_header() {
         "the running entry is always shown: {panel}"
     );
     assert!(
+        panel
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("-# ")),
+        "separate live-panel output must keep every Tasks line in subtext: {panel}"
+    );
+    assert!(
         !panel.contains("Completed job"),
         "no completed task line renders in the live panel: {panel}"
     );
@@ -8167,6 +8505,13 @@ fn live_panel_hides_completed_subagents_keeping_running_and_header() {
     assert!(
         panel.contains("Live inspection"),
         "the running subagent stays visible: {panel}"
+    );
+    assert!(
+        panel
+            .lines()
+            .filter(|line| !line.is_empty())
+            .all(|line| line.starts_with("-# ")),
+        "separate live-panel output must keep every Subagents line in subtext: {panel}"
     );
     assert_eq!(
         panel.matches('✓').count(),
