@@ -1282,6 +1282,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping test: tmux is not available");
+            return;
+        }
+
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1301,12 +1306,13 @@ mod tests {
         let output_path = output_path.to_string_lossy().into_owned();
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
-            .status();
+            .output();
         assert!(
             std::process::Command::new("tmux")
                 .args(["new-session", "-d", "-s", tmux_session])
-                .status()
+                .output()
                 .expect("start tmux fixture")
+                .status
                 .success(),
             "production snapshot must observe a live producer tmux session"
         );
