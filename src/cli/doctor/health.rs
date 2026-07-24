@@ -60,6 +60,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("provider {provider} is disconnected"),
             next_step: format!("check {provider} Discord token, gateway status, and dcserver logs"),
         },
+        ["provider", provider, "gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "provider_runtime",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("provider {provider} is in gateway standby mode"),
+            next_step: "verify primary gateway node is healthy".to_string(),
+        },
         ["provider", provider, "restart_pending"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_runtime",
@@ -169,6 +178,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "no providers are currently registered".to_string(),
             next_step: "register a provider via the dashboard or check agentdesk.yaml".to_string(),
+        },
+        ["gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: "cluster is in standby mode without a gateway connection".to_string(),
+            next_step: "verify cluster configuration and gateway node health".to_string(),
         },
         ["startup_doctor_failed", count] => ClassifiedReason {
             raw: raw.to_string(),
@@ -383,5 +401,28 @@ mod health_classification_tests {
             reason.next_step,
             "inspect global active counter tracking in dcserver logs"
         );
+    }
+
+    #[test]
+    fn gateway_standby_reason_codes_classify() {
+        let provider_standby = classify_degraded_reason("provider:codex:gateway_standby");
+        assert_eq!(provider_standby.subsystem, "provider_runtime");
+        assert_eq!(provider_standby.severity, Severity::Warning);
+        assert_eq!(provider_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            provider_standby.summary,
+            "provider codex is in gateway standby mode"
+        );
+        assert_ne!(provider_standby.summary, provider_standby.raw);
+
+        let cluster_standby = classify_degraded_reason("gateway_standby");
+        assert_eq!(cluster_standby.subsystem, "health");
+        assert_eq!(cluster_standby.severity, Severity::Warning);
+        assert_eq!(cluster_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            cluster_standby.summary,
+            "cluster is in standby mode without a gateway connection"
+        );
+        assert_ne!(cluster_standby.summary, cluster_standby.raw);
     }
 }
