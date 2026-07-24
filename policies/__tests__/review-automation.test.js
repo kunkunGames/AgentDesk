@@ -146,6 +146,7 @@ test("review-automation carries the completed work slot into review dispatch con
 
 test("review-automation creates a review-decision dispatch when an auto-completed review has no verdict", () => {
   const { policy, state } = loadPolicy("policies/review-automation.js", {
+    cards: { "card-4": { id: "card-4", assigned_agent_id: "agent-4", title: "Needs decision", github_issue_number: 925, status: "review" } },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -357,6 +358,7 @@ test("loadLatestReviewDispatchContext falls back to newest and warns when no rou
 // for the card, an auto-completed review fallback must NOT spawn another one.
 test("review-automation dedupes review-decision dispatches when one is already pending", () => {
   const { policy, state } = loadPolicy("policies/review-automation.js", {
+    cards: { "card-dup": { id: "card-dup", assigned_agent_id: "agent-dup", title: "Dup decision card", github_issue_number: 999, status: "review" } },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
