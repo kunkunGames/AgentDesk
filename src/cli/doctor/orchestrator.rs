@@ -798,7 +798,7 @@ fn check_qwen_runtime_artifacts(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen은 ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, <workspace>/.qwen/.env 같은 로컬 자산을 그대로 사용합니다. headless 환경에서는 project .qwen/.env 우선 여부를 함께 확인하세요.";
+    let guidance = "Qwen uses local assets like ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, and <workspace>/.qwen/.env. In headless environments, check if the project .qwen/.env is prioritized.";
     if configured {
         Check::warn(
             "provider_qwen_runtime",
@@ -1253,7 +1253,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             detail.clone(),
-            "agentdesk.yaml/legacy role map/bot settings drift summary를 확인하세요. public health에는 raw source path를 노출하지 않습니다.",
+            "Check the drift summary for agentdesk.yaml, legacy role map, or bot settings. Public health does not expose the raw source path.",
         )
         .with_subsystem("config_audit")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1561,7 +1561,7 @@ fn check_credential_permissions(cfg: &config::Config) -> Check {
             CheckGroup::ProviderRuntime,
             "Credential Permissions",
             format!("{detail}; {}", risks.join("; ")),
-            "credential/config 파일 내용은 읽거나 출력하지 않고 권한/owner metadata만 점검했습니다.",
+            "Checked permissions and owner metadata only; credential/config file contents are not read or output.",
         )
         .with_subsystem("security")
         .with_expected_actual("credential files owned by current user with private permissions", detail)
@@ -2884,7 +2884,7 @@ fn check_runtime_path() -> Check {
             CheckGroup::ProviderRuntime,
             "Runtime PATH",
             "unable to resolve provider runtime PATH",
-            "login shell PATH를 읽지 못했습니다. 서비스 환경 PATH와 shell PATH를 비교하세요.",
+            "Failed to read the login shell PATH. Compare the service environment PATH with the shell PATH.",
         )
         .with_expected_actual("runtime PATH resolved", "runtime PATH resolution failed")
         .with_next_steps(vec!["echo $PATH".to_string()]),
@@ -2970,7 +2970,7 @@ fn check_server_running(snapshot: &HealthSnapshot) -> Check {
                 (
                     "blocked_remote_token",
                     Severity::Critical,
-                    "non-loopback URL에 token을 보내려면 명시적으로 --allow-remote를 사용하세요.",
+                    "Use --allow-remote explicitly to send tokens to non-loopback URLs.",
                 )
             } else {
                 (
@@ -3190,7 +3190,7 @@ fn check_data_dir(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Data Directory",
             format!("{} — missing", cfg.data.dir.display()),
-            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
+            "You can create the data directory and DB using 'agentdesk doctor --fix'.",
         )
         .with_path(cfg.data.dir.display().to_string())
         .with_expected_actual("data directory exists", "data directory missing")
@@ -3229,7 +3229,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             format!("launchd — {label} not loaded"),
-            "launchd로 운영 중이면 plist 로드 상태를 확인하세요. 수동 실행 환경이면 무시해도 됩니다.",
+            "If operating with launchd, check the plist load status. You can ignore this if running manually.",
         )
         .with_expected_actual(
             "launchd job loaded or tmux fallback active",
@@ -3556,7 +3556,7 @@ fn check_file_descriptor_headroom() -> Check {
             CheckGroup::Core,
             "File Descriptor Headroom",
             "launchctl maxfiles limit unavailable",
-            "macOS launchd 한도를 읽을 수 없어 tmux/dcserver FD 사용량을 한도와 비교하지 못했습니다.",
+            "Unable to read the macOS launchd limit, so tmux/dcserver FD usage could not be compared with the limit.",
         )
         .with_expected_actual("launchctl limit maxfiles readable", "unavailable")
         .with_evidence(evidence)
@@ -3654,7 +3654,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "systemd --user — agentdesk-dcserver not enabled",
-            "서비스로 운영할 계획이면 systemd user service 등록 여부를 확인하세요.",
+            "Check if the systemd user service is registered if you plan to operate it as a service.",
         )
         .with_expected_actual(
             "systemd user service enabled",
@@ -3769,7 +3769,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 "PostgreSQL",
                 format!("{summary} — runtime init failed"),
-                "postgres 연결 검증용 async runtime 생성에 실패했습니다.",
+                "Failed to create an async runtime for postgres connection validation.",
             )
             .with_expected_actual(
                 "postgres check runtime initializes",
@@ -3939,7 +3939,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Stale DB Files",
             "runtime root unresolved",
-            "실제 DB 경로를 먼저 확인한 뒤 root 경로의 0바이트 stale DB 파일을 정리하세요.",
+            "Check the actual DB path first, then clean up any 0-byte stale DB files in the root path.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
@@ -4017,7 +4017,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
         "Stale DB Files",
         format!("zero-byte stale DB file(s): {listed}"),
         format!(
-            "실제 DB는 {} 입니다. 추측 경로로 sqlite3를 열지 말고, 필요하면 agentdesk doctor --fix 로 stale 파일을 정리하세요.",
+            "The actual DB is {}. Do not open sqlite3 with a guessed path. If necessary, use 'agentdesk doctor --fix' to clean up stale files.",
             canonical_db_path.display()
         ),
     )
@@ -4194,7 +4194,7 @@ fn check_disk_usage() -> Check {
                 CheckGroup::Core,
                 "Disk Usage",
                 format!("{} — unreadable ({e})", path.display()),
-                "runtime root 권한을 확인하세요.",
+                "Check the permissions of the runtime root.",
             )
             .with_path(path.display().to_string())
             .with_expected_actual(
