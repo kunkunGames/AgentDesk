@@ -1580,7 +1580,7 @@ function processVerdict(cardId, verdict, result, options) {
       }
     } else {
       // No more stages — clear pipeline_stage_id and mark terminal.
-      if (cardInfo.length > 0 && cardInfo[0].pipeline_stage_id) {
+      if (cardInfo && cardInfo.pipeline_stage_id) {
         agentdesk.db.execute(
           "UPDATE kanban_cards SET pipeline_stage_id = NULL, updated_at = datetime('now') WHERE id = ?",
           [cardId]
