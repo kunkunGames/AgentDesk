@@ -69,7 +69,7 @@ targets = {
     "runs_on" => '${{ matrix.os }}',
     # #4466 formally admits the non-advisory Windows named-mutex runtime proof.
     # #4747 (opt.3) re-pins after making PR cache access restore-only.
-    "job_sha256" => "7040d0cb8412f30c878bc1357c28c7dd9ad6483d315d83cacddfb1382cc66011",
+    "job_sha256" => "304e075d8cd99baab733e5dccc0fcb8919e7ad4a7516f8574c5d8b62018c3e7e",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
