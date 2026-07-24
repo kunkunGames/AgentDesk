@@ -191,13 +191,8 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
-if grep -rn 'env!("HOME")' --include='*.rs' \
-  --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
-else
-  echo "OK: No env!(\"HOME\") found"
-fi
+echo "=== Checking hardcoded home paths (hard gate; see #100) ==="
+"$PYTHON" scripts/check-portable-paths.py --rust-env-home-only
 
 echo "=== Path integrity check ==="
 FAIL=0
