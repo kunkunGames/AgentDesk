@@ -397,18 +397,26 @@ mod health_classification_tests {
         assert_ne!(flapping.summary, flapping.raw);
     }
 
-
     #[test]
     fn dispatch_outbox_oldest_pending_age_formats_duration() {
         let reason = classify_degraded_reason("dispatch_outbox_oldest_pending_age:130");
         assert_eq!(reason.subsystem, "dispatch_outbox");
-        assert_eq!(reason.summary, "dispatch outbox oldest pending age is 2m 10s");
+        assert_eq!(
+            reason.summary,
+            "dispatch outbox oldest pending age is 2m 10s"
+        );
 
         let reason_large = classify_degraded_reason("dispatch_outbox_oldest_pending_age:3660");
-        assert_eq!(reason_large.summary, "dispatch outbox oldest pending age is 1h 1m");
+        assert_eq!(
+            reason_large.summary,
+            "dispatch outbox oldest pending age is 1h 1m"
+        );
 
         let reason_invalid = classify_degraded_reason("dispatch_outbox_oldest_pending_age:invalid");
-        assert_eq!(reason_invalid.summary, "dispatch outbox oldest pending age is invalids");
+        assert_eq!(
+            reason_invalid.summary,
+            "dispatch outbox oldest pending age is invalids"
+        );
     }
 
     #[test]
