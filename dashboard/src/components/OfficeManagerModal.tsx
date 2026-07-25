@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { X, Plus, Trash2, UserPlus, UserMinus, Settings2 } from "lucide-react";
 import type { Office, Agent } from "../types";
 import AgentAvatar from "./AgentAvatar";
@@ -14,6 +14,8 @@ import {
   SurfaceNotice,
   SurfaceSubsection,
 } from "./common/SurfacePrimitives";
+import { useFocusTrap } from "./common/overlay/useFocusTrap";
+import { useReturnFocus } from "./common/overlay/useReturnFocus";
 
 interface OfficeManagerModalProps {
   offices: Office[];
@@ -46,6 +48,18 @@ export default function OfficeManagerModal({
     setDraft,
     toggleMember,
   } = useOfficeManager({ allAgents, onChanged });
+
+  const containerRef = useFocusTrap(true);
+  useReturnFocus(true);
+
+  // ESC 키로 닫기
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
 
   const tr = useCallback(
     (ko: string, en: string) => (isKo ? ko : en),
@@ -107,6 +121,7 @@ export default function OfficeManagerModal({
       onClick={(e) => e.target === e.currentTarget && onClose()}
     >
       <div
+        ref={containerRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="office-manager-title"
