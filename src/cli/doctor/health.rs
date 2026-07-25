@@ -18,6 +18,35 @@ fn startup_doctor_report_next_step() -> String {
     format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}")
 }
 
+fn format_duration_secs(secs_str: &str) -> String {
+    secs_str
+        .parse::<u64>()
+        .ok()
+        .map(|secs| {
+            if secs < 60 {
+                return format!("{secs}s");
+            }
+            let minutes = secs / 60;
+            if minutes < 60 {
+                let remainder = secs % 60;
+                if remainder == 0 {
+                    format!("{minutes}m")
+                } else {
+                    format!("{minutes}m {remainder}s")
+                }
+            } else {
+                let hours = minutes / 60;
+                let remainder_mins = minutes % 60;
+                if remainder_mins == 0 {
+                    format!("{hours}h")
+                } else {
+                    format!("{hours}h {remainder_mins}m")
+                }
+            }
+        })
+        .unwrap_or_else(|| format!("{secs_str}s"))
+}
+
 fn format_bytes(bytes_str: &str) -> String {
     bytes_str
         .parse::<u64>()
@@ -124,7 +153,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             severity: Severity::Warning,
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
-            summary: format!("dispatch outbox oldest pending age is {age}s"),
+            summary: format!("dispatch outbox oldest pending age is {}", format_duration_secs(age)),
             next_step: "inspect dispatch outbox retry worker and delivery failures".to_string(),
         },
         ["pipeline_override_warnings", count] => ClassifiedReason {
@@ -366,6 +395,20 @@ mod health_classification_tests {
         assert!(flapping.summary.contains("session_discovery"));
         assert!(flapping.summary.contains('3'));
         assert_ne!(flapping.summary, flapping.raw);
+    }
+
+
+    #[test]
+    fn dispatch_outbox_oldest_pending_age_formats_duration() {
+        let reason = classify_degraded_reason("dispatch_outbox_oldest_pending_age:130");
+        assert_eq!(reason.subsystem, "dispatch_outbox");
+        assert_eq!(reason.summary, "dispatch outbox oldest pending age is 2m 10s");
+
+        let reason_large = classify_degraded_reason("dispatch_outbox_oldest_pending_age:3660");
+        assert_eq!(reason_large.summary, "dispatch outbox oldest pending age is 1h 1m");
+
+        let reason_invalid = classify_degraded_reason("dispatch_outbox_oldest_pending_age:invalid");
+        assert_eq!(reason_invalid.summary, "dispatch outbox oldest pending age is invalids");
     }
 
     #[test]
