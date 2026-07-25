@@ -1,0 +1,442 @@
+   Compiling agentdesk v0.1.2 (/app)
+warning: unused import: `LaunchdPlistFlavorArg`
+ --> src/cli/init.rs:9:34
+  |
+9 |     args::{EmitLaunchdPlistArgs, LaunchdPlistFlavorArg},
+  |                                  ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `create_child_candidate_card_pg`, `load_card_final_gate_pg`, `load_card_repo_dir_pg`, `transition_card_status_pg`, and `update_card_program_current_iteration_pg`
+  --> src/db/automation_candidates.rs:8:32
+   |
+ 8 |     approve_candidate_card_pg, create_child_candidate_card_pg, load_active_...
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 9 |     load_card_final_gate_pg, load_card_program_pg, load_card_repo_dir_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^                        ^^^^^^^^^^^^^^^^^^^^^
+10 |     transition_card_status_pg, update_card_program_current_iteration_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::dispatches::outbox_route::parse_channel_id`
+ --> src/server/routes/dispatches/mod.rs:6:16
+  |
+6 | pub(crate) use crate::services::dispatches::outbox_route::parse_channel_id;
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `outbox::use_counter_model_channel`
+  --> src/server/routes/dispatches/mod.rs:23:16
+   |
+23 | pub(crate) use outbox::use_counter_model_channel;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `serde_json::json`
+  --> src/services/auto_queue/phase_gate_violations.rs:22:5
+   |
+22 | use serde_json::json;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `classify_catch_up_message`
+   --> src/services/discord/catch_up.rs:223:5
+    |
+223 |     classify_catch_up_message, classify_catch_up_message_with_utility_r...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS` and `catch_up_too_old_snippet`
+   --> src/services/discord/catch_up.rs:234:5
+    |
+234 |     CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS, CatchUpTooOldDrop, CatchUpTooOldOu...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+235 |     actionable_drop as catch_up_too_old_drop, catch_up_too_old_snippet,
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::snapshot::WatcherStateSnapshot`
+  --> src/services/discord/health/recovery.rs:17:5
+   |
+17 | use super::snapshot::WatcherStateSnapshot;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `InflightEpisodeLockError`
+  --> src/services/discord/inflight.rs:34:5
+   |
+34 |     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `WatcherProgressOutcome` and `WatcherRelayWatermarkOutcome`
+  --> src/services/discord/inflight.rs:82:5
+   |
+82 |     WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayWa...
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `clear_inflight_state_if_matches_identity_in_root`
+  --> src/services/discord/inflight/clear_store/mod.rs:25:5
+   |
+25 |     clear_inflight_state_if_matches_identity_in_root,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `save_inflight_state_if_matches_identity`
+   --> src/services/discord/inflight.rs:155:48
+    |
+155 | ...ty_unchanged, save_inflight_state_if_matches_identity,
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `delete_inflight_state_file`
+  --> src/services/discord/placeholder_sweeper.rs:33:24
+   |
+33 |     InflightTurnState, delete_inflight_state_file, emit_reap_abandoned_r...
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `idle_jsonl_payload_contains_init_event`
+  --> src/services/discord/session_relay_sink.rs:43:5
+   |
+43 |     idle_jsonl_payload_contains_init_event, idle_jsonl_payload_contains_...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `rebind_initial_offset_with_floor` and `rebind_output_paths_same`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:34:58
+   |
+34 | ...ter_runtime_binding, rebind_initial_offset_with_floor,
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+35 | ..._unless_forced, rebind_output_paths_same,
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `codex_tui_existing_inflight_raw_cursor`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:39:56
+   |
+39 | ...s_raw_rollout, codex_tui_existing_inflight_raw_cursor,
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `claude_rebind_transcript_path`
+   --> src/services/discord/recovery_engine.rs:143:5
+    |
+143 |     claude_rebind_transcript_path, resolve_rebind_runtime_state,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_try_start_turn_with_terminal_marker_cleanup`
+  --> src/services/discord/router/mod.rs:22:5
+   |
+22 |     mailbox_try_start_turn_with_terminal_marker_cleanup, start_headless_...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `HeadlessTurnStartStatus`
+  --> src/services/discord/router/mod.rs:32:5
+   |
+32 |     HeadlessTurnStartStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `guarded_cleanup_delivered_elsewhere_signal` and `guarded_nonterminal_delete_decision`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:22:5
+   |
+22 |     guarded_cleanup_delivered_elsewhere_signal, guarded_nonterminal_delete_decision,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_rollover_prefixes_to_delete_on_terminal`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:30:33
+   |
+30 | ...r_cleanup, watcher_rollover_prefixes_to_delete_on_terminal,
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `edit_channel_message` and `send_channel_message`
+ --> src/services/discord/tmux_watcher.rs:3:38
+  |
+3 | ...scord::http::{edit_channel_message, send_channel_message};
+  |                  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_send_failure_retry_plan`
+ --> src/services/discord/tmux_watcher.rs:7:41
+  |
+7 |     watcher_rewind_attempt_disposition, watcher_send_failure_retry_plan,
+  |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `LiveInflightProbe`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:221:5
+    |
+221 |     LiveInflightProbe, ensure_marker_for_own_synthetic_turn, record_for...
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `drain_on_terminal_commit_with_applier_and_offset`, `drain_on_terminal_commit_with_applier`, `drain_on_terminal_commit_with_offset`, and `drain_on_terminal_commit`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:226:5
+    |
+226 |     drain_on_terminal_commit, drain_on_terminal_commit_with_applier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+227 |     drain_on_terminal_commit_with_applier_and_offset, drain_on_terminal_commit_with_offset,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `load_commit_tombstones` and `record_commit_tombstone`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:238:70
+    |
+238 | ..., gc_expired_commit_tombstones, load_all, load_commit_tombstones,
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^
+239 | ...d, record_commit_tombstone, record_commit_tombstone_with_offset,
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sweep_expired_with_applier`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:244:61
+    |
+244 | ...eep::{sweep_expired, sweep_expired_with_applier};
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_requeue_intervention_front`
+ --> src/services/discord/tui_prompt_relay/bridge_gateway.rs:4:5
+  |
+4 |     mailbox_requeue_intervention_front, schedule_deferred_idle_queue_kick...
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RuntimeHandoffLoopOutcome`
+  --> src/services/discord/turn_bridge/stream_loop.rs:13:59
+   |
+13 | ...meHandoffLoopMessage, RuntimeHandoffLoopOutcome,
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `mailbox_cancel_active_turn_if_handoff_user_message_with_reason` and `record_voice_handoff_cancel_tombstone`
+  --> src/services/discord/voice_barge_in.rs:48:5
+   |
+48 |     mailbox_cancel_active_turn_if_handoff_user_message_with_reason,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+49 |     mailbox_cancel_active_turn_with_reason, mailbox_has_active_t...
+50 |     record_voice_handoff_cancel_tombstone, settings,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `turn_dispatch::voice_background_handoff_ack`
+  --> src/services/discord/voice_barge_in.rs:92:5
+   |
+92 | use turn_dispatch::voice_background_handoff_ack;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `QueuePersistenceContext` and `RequeueInterventionResult`
+   --> src/services/discord/mod.rs:242:5
+    |
+242 |     QueuePersistenceContext, RecoveryKickoffResult, RequeueInterventionResult, T...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `resolve_notify_bot_user_id`
+   --> src/services/discord/mod.rs:256:5
+    |
+256 |     resolve_notify_bot_user_id, should_phase2_recover_message,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MementoToolFeedbackRequest`
+  --> src/services/memory/mod.rs:20:45
+   |
+20 | ...entoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agen...
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `LazyLock` and `Mutex`
+  --> src/services/platform/tmux.rs:11:17
+   |
+11 | use std::sync::{LazyLock, Mutex};
+   |                 ^^^^^^^^  ^^^^^
+
+warning: unused import: `Instant`
+  --> src/services/platform/tmux.rs:12:27
+   |
+12 | use std::time::{Duration, Instant};
+   |                           ^^^^^^^
+
+warning: unused import: `CancelSource`
+ --> src/services/provider/cancel_watchdog.rs:2:13
+  |
+2 | use super::{CancelSource, CancelToken};
+  |             ^^^^^^^^^^^^
+
+warning: unused import: `CancelWatchdog`
+  --> src/services/provider.rs:11:27
+   |
+11 | pub use cancel_watchdog::{CancelWatchdog, spawn_cancel_watchdog};
+   |                           ^^^^^^^^^^^^^^
+
+warning: unused import: `drain_head_overflow`
+ --> src/services/turn_orchestrator/front_requeue.rs:7:36
+  |
+7 |     QueueExitEvent, QueueExitKind, drain_head_overflow, ensure_source_mes...
+  |                                    ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::clear_store::refresh_inflight_last_offset_if_matches_identity as _`
+   --> src/services/discord/inflight/store.rs:418:13
+    |
+418 | ...se super::super::clear_store::refresh_inflight_last_offset_if_matches_identity as _;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::clear_store::refresh_inflight_last_offset_if_matches_identity_in_root as _`
+   --> src/services/discord/inflight/store.rs:419:13
+    |
+419 | ...se super::super::clear_store::refresh_inflight_last_offset_if_matches_identity_in_root as _;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::save_store::save_inflight_state as _`
+   --> src/services/discord/inflight/store.rs:420:13
+    |
+420 |         use super::super::save_store::save_inflight_state as _;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::validate_inflight_state_for_save as _`
+   --> src/services/discord/inflight/store.rs:421:13
+    |
+421 |         use super::validate_inflight_state_for_save as _;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `reap_dead_watcher_rebind_origin_locked`
+  --> src/services/discord/inflight.rs:68:5
+   |
+68 |     reap_dead_watcher_rebind_origin_locked, reap_dead_watcher_rebind_ori...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `clear_inflight_state_if_matches_identity_turn_nonce_in_root`
+   --> src/services/discord/inflight.rs:197:5
+    |
+197 |     clear_inflight_state_if_matches_identity_turn_nonce_in_root,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `EpisodeAuthorityHeldBarrier`, `PostAdoptionClaimBarrier`, `install_episode_authority_held_barrier`, and `install_post_adoption_claim_barrier`
+   --> src/services/discord/recovery_engine.rs:159:5
+    |
+159 |     EpisodeAuthorityHeldBarrier, PostAdoptionClaimBarrier, install_episode_authority_held_barrier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+160 |     install_post_adoption_claim_barrier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+    --> src/services/discord/router/message_handler/intake_turn.rs:2886:9
+     |
+2886 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `super::attach_paused_turn_watcher_inner as _`
+   --> src/services/discord/router/message_handler/watchdog.rs:993:13
+    |
+993 |         use super::attach_paused_turn_watcher_inner as _;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `GATEWAY_LEASE_APPLICATION_PREFIX`
+ --> src/services/discord/runtime_bootstrap/gateway_lease_recovery_tests.rs:6:5
+  |
+6 |     GATEWAY_LEASE_APPLICATION_PREFIX, GatewayLeaseHolder, PromotionHandof...
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `guarded_cleanup_delivered_elsewhere_signal`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:22:5
+   |
+22 |     guarded_cleanup_delivered_elsewhere_signal, guarded_nonterminal_dele...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::loop_poll_prologue::poll_watcher_output_or_continue as _`
+   --> src/services/discord/tmux_watcher/liveness.rs:674:13
+    |
+674 | ...se super::super::loop_poll_prologue::poll_watcher_output_or_continue as _;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::tmux_output_watcher_with_restore as _`
+   --> src/services/discord/tmux_watcher/liveness.rs:675:13
+    |
+675 |         use super::super::tmux_output_watcher_with_restore as _;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::reacquire_watcher_inflight_for_active_stream as _`
+   --> src/services/discord/tmux_watcher/liveness.rs:676:13
+    |
+676 |         use super::reacquire_watcher_inflight_for_active_stream as _;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::discord::tmux::advance_watcher_confirmed_end as _`
+   --> src/services/discord/tmux_watcher/liveness.rs:677:13
+    |
+677 | ...se crate::services::discord::tmux::advance_watcher_confirmed_end as _;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::terminal_commit_epilogue::run_terminal_commit_epilogue as _`
+   --> src/services/discord/tmux_watcher/liveness.rs:679:13
+    |
+679 | ...se super::super::terminal_commit_epilogue::run_terminal_commit_epilogue as _;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `drain_on_terminal_commit_with_offset` and `drain_on_terminal_commit`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:226:5
+    |
+226 |     drain_on_terminal_commit, drain_on_terminal_commit_with_applier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+227 |     drain_on_terminal_commit_with_applier_and_offset, drain_on_terminal_commit_with_offset,
+    |                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `record_commit_tombstone`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:239:31
+    |
+239 |     load_for_channel, record, record_commit_tombstone, record_commit_to...
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::spawn_turn_bridge as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2002:13
+     |
+2002 |         use super::super::spawn_turn_bridge as _;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::advance_tmux_relay_confirmed_end as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2003:13
+     |
+2003 |         use super::advance_tmux_relay_confirmed_end as _;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::terminal_controller_cutover::deliver_long_chunks_via_controller as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2005:13
+     |
+2005 | ...se super::super::terminal_controller_cutover::deliver_long_chunks_via_controller as _;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::terminal_controller_cutover::deliver_short_replace_via_controller as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2006:13
+     |
+2006 | ...se super::super::terminal_controller_cutover::deliver_short_replace_via_controller as _;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::terminal_outcome_delivery::run_terminal_outcome_delivery as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2008:13
+     |
+2008 | ...se super::super::terminal_outcome_delivery::run_terminal_outcome_delivery as _;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::completion_postlude::run_completion_postlude as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2010:13
+     |
+2010 | ...se super::super::completion_postlude::run_completion_postlude as _;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::super::runtime_handoff_loop::handle_runtime_handoff_loop_message as _`
+    --> src/services/discord/turn_bridge/terminal_delivery.rs:2011:13
+     |
+2011 | ...se super::super::runtime_handoff_loop::handle_runtime_handoff_loop_message as _;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/tmux_runtime/claude_stop_delivery.rs:340:14
+    |
+340 |     let Some(mut reservation) = ClaudeStopDeliveryReservation::claim(to...
+    |              ----^^^^^^^^^^^
+    |              |
+    |              help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> src/services/cluster/intake_router_hook.rs:297:9
+    |
+274 | ...   SessionOwnerResolution::LiveForeignIncompatible { instance_id, .. } => {
+    |       ------------------------------------------------------------------- matches all the relevant values
+...
+297 | ...   SessionOwnerResolution::LiveForeignIncompatible { .. } => {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:366:9
+    |
+366 |     let mut monitor_auto_turn_finished = false;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:367:9
+    |
+367 |     let mut completion_footer_terminal_target = None;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
