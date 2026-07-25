@@ -80,7 +80,7 @@ pub(crate) fn queue_message(
         );
     }
 
-    Err("sqlite backend is unavailable".to_string())
+    Err("postgres backend is required for message.queue".to_string())
 }
 
 fn message_queue_raw(
