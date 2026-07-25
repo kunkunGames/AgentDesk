@@ -171,10 +171,11 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
+echo "=== Checking hardcoded home paths ==="
 if grep -rn 'env!("HOME")' --include='*.rs' \
   --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
+  echo "ERROR: env!(\"HOME\") found in Rust files. Use robust runtime path expansion instead."
+  exit 1
 else
   echo "OK: No env!(\"HOME\") found"
 fi
