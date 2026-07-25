@@ -171,12 +171,18 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
+echo "=== Checking hardcoded home paths (#100) ==="
+FAIL=0
 if grep -rn 'env!("HOME")' --include='*.rs' \
   --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
+  echo "ERROR: Hardcoded env!(\"HOME\") paths are forbidden in Rust files. Use robust runtime path expansion instead."
+  FAIL=1
 else
   echo "OK: No env!(\"HOME\") found"
+fi
+
+if [ "$FAIL" -ne 0 ]; then
+  exit "$FAIL"
 fi
 
 echo "=== Path integrity check ==="
