@@ -677,7 +677,7 @@ agentdesk reset-tmux                             # Kill AgentDesk-* tmux session
 
 ## API Overview
 
-AgentDesk exposes 292 HTTP API routes. Key groups:
+AgentDesk exposes 248 REST API endpoints. Key groups:
 
 | Group | Endpoints | Description |
 |-------|-----------|-------------|
