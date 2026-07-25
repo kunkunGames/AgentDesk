@@ -1299,6 +1299,15 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
+
+        match std::process::Command::new("tmux").arg("-V").status() {
+            Ok(status) if status.success() => {}
+            _ => {
+                println!("Skipping test: tmux not available");
+                return;
+            }
+        }
+
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
