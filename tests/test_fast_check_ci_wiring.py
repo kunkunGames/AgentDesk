@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 MAIN_WORKFLOW = REPO_ROOT / ".github/workflows/ci-main.yml"
 NIGHTLY_WORKFLOW = REPO_ROOT / ".github/workflows/ci-nightly.yml"
+MACOS_TRUSTED_WORKFLOW = REPO_ROOT / ".github/workflows/ci-macos-trusted.yml"
 
 # This manifest is intentionally exact: changing the retained test recipe must also
 # update this test deliberately. The duplication is a drift-prevention gate, not an
@@ -23,6 +26,7 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib server::routes::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::watcher_lifecycle::tests::tests::turn_starts_reuse_healthy_runtime_path_incumbent_after_handoff -- --exact",
     "cargo test --lib server::claude_oauth_usage_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib tui_task_card::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::message_outbox::tests -- --skip _pg --skip pg_ --skip postgres",
@@ -36,6 +40,8 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib queue_marker::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_status_presentation::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib status_panel_singleton_store -- --skip _pg --skip pg_ --skip postgres",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::outbound::serenity_reference::tests::lifecycle_notice_nonce_is_stable_and_semantic_event_scoped -- --exact",
     "cargo test --lib services::discord::outbound::delivery::tests::v3_referenced_send_preserves_reference_and_dedupes -- --exact",
     "cargo test --lib cli::args::tests::legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract",
@@ -61,6 +67,13 @@ def job_block(workflow: str, job_name: str) -> str:
         workflow, match.end()
     )
     return workflow[match.start() : next_job.start() if next_job else len(workflow)]
+
+
+def workflow_paths(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    workflows = root / ".github/workflows"
+    return tuple(
+        sorted((*workflows.glob("*.yml"), *workflows.glob("*.yaml")))
+    )
 
 
 def just_recipe_commands(justfile: str, recipe_name: str) -> tuple[str, ...]:
@@ -140,6 +153,13 @@ class FastCheckCiWiringTests(unittest.TestCase):
             test_job,
             r"(?m)^    if: needs\.changes\.outputs\.pg_db == 'true'$",
         )
+        command = (
+            "env -u AGENTDESK_ROOT_DIR cargo test --lib "
+            "services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"
+        )
+        self.assertEqual(test_job.count("- name: Trusted session forwarding tests"), 1)
+        self.assertEqual(test_job.count(command), 1)
+        self.assertNotIn(command, job_block(workflow, "scripts"))
 
     def test_pr_cross_os_lane_is_compile_only(self) -> None:
         job = job_block(PR_WORKFLOW.read_text(encoding="utf-8"), "check_fast_cross_os")
@@ -150,6 +170,22 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertNotRegex(job, r"(?m)^\s*cargo test\b")
         self.assertNotIn("- name: cargo test", job)
         self.assertNotIn("Discord thread-create cross-process lock", job)
+
+    def test_macos_pr_lane_runs_single_message_panel_tests(self) -> None:
+        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        command = (
+            "env -u AGENTDESK_ROOT_DIR cargo test --lib "
+            "single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres"
+        )
+        self.assertEqual(workflow.count(command), 2)
+
+    def test_macos_pr_lane_runs_placeholder_live_events_tests(self) -> None:
+        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        command = (
+            "env -u AGENTDESK_ROOT_DIR cargo test --lib "
+            "placeholder_live_events -- --skip _pg --skip pg_ --skip postgres"
+        )
+        self.assertEqual(workflow.count(command), 2)
 
     def test_main_and_nightly_retain_non_pg_test_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -176,6 +212,276 @@ class FastCheckCiWiringTests(unittest.TestCase):
             job_block(nightly, "full_windows"),
         )
 
+    def test_test_lane_baseline_uses_candidate_snapshot_refs(self) -> None:
+        pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        main_workflow = MAIN_WORKFLOW.read_text(encoding="utf-8")
+        pr_job = job_block(pr_workflow, "scripts")
+        main_job = job_block(main_workflow, "scripts")
+
+        for job in (pr_job, main_job):
+            self.assertIn("fetch-depth: 0", job)
+            self.assertNotIn("origin/main", job)
+            self.assertNotIn("github.event.pull_request.base.sha", job)
+        self.assertNotIn("workflow_dispatch:", pr_workflow)
+        self.assertRegex(
+            pr_job, r"(?m)^          TEST_LANE_BASELINE_REF: HEAD\^1$"
+        )
+        self.assertNotIn("github.event_name", pr_job)
+        self.assertNotIn("inputs.", pr_job)
+        self.assertRegex(
+            main_job, r"(?m)^          TEST_LANE_BASELINE_REF: HEAD$"
+        )
+        self.assertNotRegex(
+            main_job, r"(?m)^          TEST_LANE_BASELINE_REF: HEAD\^1$"
+        )
+
+    def test_required_script_context_is_pr_only(self) -> None:
+        pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("pull_request:", pr_workflow)
+        self.assertNotIn("workflow_dispatch:", pr_workflow)
+        self.assertNotRegex(pr_workflow, r"(?m)^  push:")
+        self.assertEqual(pr_workflow.count("name: Script checks"), 1)
+        self.assertRegex(
+            job_block(pr_workflow, "scripts"),
+            r"(?m)^          TEST_LANE_BASELINE_REF: HEAD\^1$",
+        )
+        for workflow_path in workflow_paths():
+            workflow = workflow_path.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow_path.name):
+                if workflow_path != PR_WORKFLOW:
+                    self.assertNotRegex(workflow, r"(?m)^    name: Script checks$")
+        main_job = job_block(
+            MAIN_WORKFLOW.read_text(encoding="utf-8"), "scripts"
+        )
+        self.assertIn("name: Main script checks", main_job)
+        self.assertNotRegex(main_job, r"(?m)^    name: Script checks$")
+        self.assertFalse(
+            (REPO_ROOT / ".github/workflows/test-lane-baseline-main.yml").exists()
+        )
+
+    def run_hardening_fixture(
+        self,
+        pr_workflow: str,
+        extra_workflows: dict[str, str] | None = None,
+        workflow_symlinks: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workflows = root / ".github/workflows"
+            workflows.mkdir(parents=True)
+            (root / "scripts").mkdir()
+            (workflows / "ci-pr.yml").write_text(pr_workflow, encoding="utf-8")
+            trusted = (REPO_ROOT / ".github/workflows/ci-macos-trusted.yml").read_text(
+                encoding="utf-8"
+            )
+            (workflows / "ci-macos-trusted.yml").write_text(
+                trusted, encoding="utf-8"
+            )
+            for name, content in (extra_workflows or {}).items():
+                (workflows / name).write_text(content, encoding="utf-8")
+            for name, target in (workflow_symlinks or {}).items():
+                (workflows / name).symlink_to(target)
+            script = (REPO_ROOT / "scripts/check-ci-runner-hardening.sh").read_text(
+                encoding="utf-8"
+            )
+            (root / "scripts/check-ci-runner-hardening.sh").write_text(
+                script, encoding="utf-8"
+            )
+            return subprocess.run(
+                ["bash", "scripts/check-ci-runner-hardening.sh"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+    def test_hardening_rejects_flow_sequence_manual_trigger(self) -> None:
+        source = PR_WORKFLOW.read_text(encoding="utf-8")
+        mutated = re.sub(
+            r"(?ms)^on:\n.*?^concurrency:\n",
+            "on: [pull_request, workflow_dispatch]\n\nconcurrency:\n",
+            source,
+            count=1,
+        )
+        self.assertNotEqual(mutated, source)
+        result = self.run_hardening_fixture(mutated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("triggered only by pull_request", result.stderr)
+
+    def test_hardening_rejects_yaml_manual_duplicate_script_context(self) -> None:
+        duplicate = """\
+name: Duplicate required context
+on: [push, workflow_dispatch]
+jobs:
+  bypass:
+    name: "Script checks "
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"manual-bypass.yaml": duplicate},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not publish required Script checks context", result.stderr)
+        self.assertIn("manual-bypass.yaml", result.stderr)
+
+    def test_hardening_accepts_clean_yaml_workflow(self) -> None:
+        workflow = """\
+name: Clean workflow
+on: push
+jobs:
+  clean:
+    name: Documentation check
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"clean.yaml": workflow},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hardening_accepts_unrelated_matrix_job_name(self) -> None:
+        workflow = """\
+name: Matrix workflow
+on: push
+jobs:
+  matrix:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"matrix.yaml": workflow},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hardening_rejects_full_expression_script_context(self) -> None:
+        workflow = """\
+name: Dynamic bypass
+on: workflow_dispatch
+jobs:
+  bypass:
+    name: ${{ 'Script checks' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"dynamic-bypass.yaml": workflow},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dynamic job names must not be able to publish", result.stderr)
+        self.assertIn("dynamic-bypass.yaml", result.stderr)
+
+    def test_hardening_rejects_split_expression_script_context(self) -> None:
+        workflow = """\
+name: Split dynamic bypass
+on: workflow_dispatch
+jobs:
+  bypass:
+    name: Script check${{ 's' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"split-bypass.yml": workflow},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dynamic job names must not be able to publish", result.stderr)
+        self.assertIn("split-bypass.yml", result.stderr)
+
+    def test_hardening_rejects_matrix_name_with_required_static_context(self) -> None:
+        workflow = """\
+name: Matrix suffix bypass
+on: workflow_dispatch
+jobs:
+  bypass:
+    name: Script checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - run: true
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"matrix-bypass.yml": workflow},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dynamic job names must not be able to publish", result.stderr)
+        self.assertIn("matrix-bypass.yml", result.stderr)
+
+    def test_hardening_rejects_multiple_job_name_expressions(self) -> None:
+        names = (
+            "${{ matrix.a }}${{ matrix.b }}",
+            "${{ matrix.a }} ${{ matrix.b }}",
+            "${{ 'Script' }} ${{ matrix.b }}",
+            "${{ matrix.a }} ${{ github.event_name }}",
+        )
+        for index, name in enumerate(names):
+            with self.subTest(name=name):
+                workflow = f"""\
+name: Multiple expression bypass
+on: workflow_dispatch
+jobs:
+  bypass:
+    name: {name}
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+"""
+                filename = f"multiple-expression-{index}.yaml"
+                result = self.run_hardening_fixture(
+                    PR_WORKFLOW.read_text(encoding="utf-8"),
+                    {filename: workflow},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "dynamic job names must not be able to publish", result.stderr
+                )
+                self.assertIn(filename, result.stderr)
+
+    def test_hardening_rejects_yaml_aliases_by_policy(self) -> None:
+        workflow = """\
+name: Aliased workflow
+on: push
+jobs:
+  first: &shared_job
+    name: Documentation check
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+  second: *shared_job
+"""
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            {"aliased.yaml": workflow},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot parse YAML", result.stderr)
+        self.assertIn("aliased.yaml", result.stderr)
+
+    def test_hardening_rejects_workflow_symlink(self) -> None:
+        result = self.run_hardening_fixture(
+            PR_WORKFLOW.read_text(encoding="utf-8"),
+            workflow_symlinks={"linked.yaml": "ci-pr.yml"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("linked.yaml must not be a symlink", result.stderr)
+
     def test_ci_script_checks_runs_this_contract(self) -> None:
         script = (REPO_ROOT / "scripts/ci-script-checks.sh").read_text(
             encoding="utf-8"
@@ -183,7 +489,11 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertIn(
             '"$PYTHON" -m unittest tests.test_fast_check_ci_wiring', script
         )
-        self.assertIn('"$PYTHON" scripts/check_test_lane_coverage.py', script)
+        self.assertIn(
+            'scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"',
+            script,
+        )
+        self.assertNotIn("TEST_LANE_BASELINE_REF:-HEAD", script)
         self.assertIn(
             '"$PYTHON" -m unittest tests.test_test_lane_coverage', script
         )

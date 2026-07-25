@@ -65,6 +65,7 @@ src/
 │   │   ├── consultation.rs
 │   │   ├── entries.rs
 │   │   ├── mod.rs
+│   │   ├── phase_gate_verdict.rs
 │   │   ├── phase_gates.rs
 │   │   ├── queries.rs
 │   │   ├── runs.rs
@@ -599,6 +600,7 @@ src/
 │   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── status_panel/
+│   │   │   │   ├── completed_kind.rs
 │   │   │   │   └── derived_status.rs
 │   │   │   ├── background_task_events.rs
 │   │   │   ├── common.rs
@@ -1227,6 +1229,8 @@ src/
 │   │   ├── tuning_aggregate.rs
 │   │   └── worktree_stale.rs
 │   ├── routines/
+│   │   ├── loader/
+│   │   │   └── discovery.rs
 │   │   ├── action.rs
 │   │   ├── agent_executor.rs
 │   │   ├── discord_log.rs
@@ -1246,6 +1250,8 @@ src/
 │   ├── session_backend/
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
+│   ├── session_forwarding/
+│   │   └── trusted_target.rs
 │   ├── settings/
 │   │   └── runtime_config_put.rs
 │   ├── slo/
