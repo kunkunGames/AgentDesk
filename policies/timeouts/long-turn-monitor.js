@@ -163,25 +163,35 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
 
         // Clean up tier keys for inflights that no longer exist
         var tierKeys = agentdesk.db.query("SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'");
+        var tierKeysToDelete = [];
         for (var tk = 0; tk < tierKeys.length; tk++) {
           var parts = tierKeys[tk].key.split(":");
           var tkProvider = parts[1];
           var tkChannel = parts[2];
           if (!activeInflightSet[tkProvider + ":" + tkChannel]) {
-            agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [tierKeys[tk].key]);
+            tierKeysToDelete.push(tierKeys[tk].key);
           }
+        }
+        if (tierKeysToDelete.length > 0) {
+          var placeholders = tierKeysToDelete.map(function() { return "?"; }).join(",");
+          agentdesk.db.execute("DELETE FROM kv_meta WHERE key IN (" + placeholders + ")", tierKeysToDelete);
         }
         // Also clean up old cooldown keys
         agentdesk.db.execute("DELETE FROM kv_meta WHERE key LIKE 'long_turn_alert:%'");
 
         var extensionKeys = agentdesk.db.query("SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'");
+        var extensionKeysToDelete = [];
         for (var ek = 0; ek < extensionKeys.length; ek++) {
           var eParts = extensionKeys[ek].key.split(":");
           var eProvider = eParts[1];
           var eChannel = eParts[2];
           if (!activeInflightSet[eProvider + ":" + eChannel]) {
-            agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [extensionKeys[ek].key]);
+            extensionKeysToDelete.push(extensionKeys[ek].key);
           }
+        }
+        if (extensionKeysToDelete.length > 0) {
+          var extPlaceholders = extensionKeysToDelete.map(function() { return "?"; }).join(",");
+          agentdesk.db.execute("DELETE FROM kv_meta WHERE key IN (" + extPlaceholders + ")", extensionKeysToDelete);
         }
       } catch(de) {
         agentdesk.log.warn("[long-turn] inflight scan error: " + de);
