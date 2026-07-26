@@ -145,6 +145,8 @@ export function Step4ChannelSetup({
               ) : (
                 <input
                   type="text"
+                  autoComplete="off"
+                  spellCheck="false"
                   aria-label={tr(`${assignment.agentName} 채널 이름`, `Channel name for ${assignment.agentName}`)}
                   value={assignment.channelName || assignment.recommendedName}
                   readOnly
