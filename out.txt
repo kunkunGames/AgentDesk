@@ -1,0 +1,11 @@
+info: syncing channel updates for '1.94.1-x86_64-unknown-linux-gnu'
+info: latest update on 2026-03-26, rust version 1.94.1 (e408947bf 2026-03-25)
+info: downloading component 'cargo'
+info: downloading component 'clippy'
+info: downloading component 'rust-docs'
+info: downloading component 'rust-std'
+info: downloading component 'rustc'
+info: downloading component 'rustfmt'
+info: installing component 'cargo'
+info: installing component 'clippy'
+info: installing component 'rust-docs'
