@@ -17,6 +17,8 @@ agentdesk.db
 data.db
 out/e2e/
 report.*.json
+docs/generated/module-inventory.md
+docs/generated/giant-file-registry.md
 .playwright-cli/
 dist/
 output/
