@@ -149,7 +149,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite Number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected Sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -169,7 +169,8 @@ export default function AgentFormModal({
               <div className="flex flex-col items-center gap-1">
                 <button
                   type="button"
-                  aria-label={tr("다음 스프라이트", "Next sprite")}
+                  tabIndex={-1}
+                  aria-label={tr("다음 스프라이트", "Next Sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -190,7 +191,7 @@ export default function AgentFormModal({
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
+                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected Sprite preview: ${spriteNum}` })}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
                     />
@@ -209,7 +210,8 @@ export default function AgentFormModal({
                 </div>
                 <button
                   type="button"
-                  aria-label={tr("이전 스프라이트", "Previous sprite")}
+                  tabIndex={-1}
+                  aria-label={tr("이전 스프라이트", "Previous Sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
