@@ -1299,6 +1299,10 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
+        if std::process::Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux not found, skipping test");
+            return;
+        }
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
@@ -1424,6 +1428,10 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
+        if std::process::Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("tmux not found, skipping test");
+            return;
+        }
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
