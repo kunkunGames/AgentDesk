@@ -210,7 +210,10 @@ test("review-automation noop verification passes go terminal without creating a 
         match: "AND dispatch_type IN ('implementation', 'rework')",
         result: []
       }
-    ])
+    ]),
+    cards: {
+      "card-5": { id: "card-5", status: "review" }
+    }
   });
 
   module.__test.processVerdict(
@@ -282,7 +285,10 @@ test("review-automation skips create-pr when reviewed work is already on origin 
           }
         ]
       }
-    ])
+    ]),
+    cards: {
+      "card-direct-push": { id: "card-direct-push", status: "review" }
+    }
   });
 
   module.__test.processVerdict(
