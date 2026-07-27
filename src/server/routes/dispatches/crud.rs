@@ -814,7 +814,7 @@ mod tests {
 
     impl TestPostgresDb {
         async fn create() -> Self {
-            let lock = crate::db::postgres::lock_test_lifecycle();
+            let lock = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = postgres_admin_database_url();
             let database_name = format!(
                 "agentdesk_dispatch_route_events_{}",
@@ -838,7 +838,7 @@ mod tests {
         }
 
         async fn try_create() -> Option<Self> {
-            let lock = crate::db::postgres::lock_test_lifecycle();
+            let lock = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = postgres_admin_database_url();
             let database_name = format!(
                 "agentdesk_dispatch_route_events_{}",

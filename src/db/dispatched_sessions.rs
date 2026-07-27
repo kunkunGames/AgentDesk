@@ -1117,7 +1117,7 @@ mod selector_cleanup_tests {
 
     impl TestPostgresDb {
         async fn create() -> Self {
-            let lifecycle = crate::db::postgres::lock_test_lifecycle();
+            let lifecycle = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = postgres_admin_database_url();
             let database_name = format!(
                 "agentdesk_selector_cleanup_{}",

@@ -8,7 +8,7 @@ pub(crate) struct DispatchPostgresTestDb {
 
 impl DispatchPostgresTestDb {
     pub(crate) async fn try_create(prefix: &str, label: &str) -> Option<Self> {
-        let lock = crate::db::postgres::lock_test_lifecycle();
+        let lock = crate::db::postgres::lock_test_lifecycle().await;
         let admin_url = postgres_admin_database_url();
         let database_name = format!("{}_{}", prefix, uuid::Uuid::new_v4().simple());
         let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
@@ -30,7 +30,7 @@ impl DispatchPostgresTestDb {
     }
 
     pub(crate) async fn create(prefix: &str, label: &str) -> Self {
-        let lock = crate::db::postgres::lock_test_lifecycle();
+        let lock = crate::db::postgres::lock_test_lifecycle().await;
         let admin_url = postgres_admin_database_url();
         let database_name = format!("{}_{}", prefix, uuid::Uuid::new_v4().simple());
         let database_url = format!("{}/{}", postgres_base_database_url(), database_name);

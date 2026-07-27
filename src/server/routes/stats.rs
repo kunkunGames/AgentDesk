@@ -604,7 +604,7 @@ mod memento_feedback_stats_pg_tests {
 
     impl StatsPostgresDb {
         async fn try_create() -> Option<Self> {
-            let lock = crate::db::postgres::lock_test_lifecycle();
+            let lock = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = crate::dispatch::test_support::postgres_admin_database_url();
             let database_name = format!("agentdesk_pg_stats_{}", uuid::Uuid::new_v4().simple());
             let database_url = format!(

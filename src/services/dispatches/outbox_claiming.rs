@@ -532,7 +532,7 @@ mod tests {
 
     impl TestPostgresDb {
         async fn create() -> Option<Self> {
-            let lock = crate::db::postgres::lock_test_lifecycle();
+            let lock = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = postgres_admin_database_url();
             let database_name = format!("agentdesk_outbox_claiming_{}", Uuid::new_v4().simple());
             let database_url = format!("{}/{}", postgres_base_database_url(), database_name);

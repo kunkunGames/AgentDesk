@@ -393,7 +393,7 @@ fn pg_test_base_database_url() -> String {
 
 #[tokio::test]
 async fn gateway_orphan_reap_uses_production_query_and_right_parses_instance_id_pg() {
-    let _lifecycle = crate::db::postgres::lock_test_lifecycle();
+    let _lifecycle = crate::db::postgres::lock_test_lifecycle().await;
     let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
         .ok()
         .filter(|value| !value.trim().is_empty())

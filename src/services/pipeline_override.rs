@@ -344,7 +344,7 @@ mod tests {
 
     impl TestPostgresDb {
         async fn create() -> Option<Self> {
-            let lifecycle = crate::db::postgres::lock_test_lifecycle();
+            let lifecycle = crate::db::postgres::lock_test_lifecycle().await;
             let admin_url = postgres_admin_url();
             let database_name = format!(
                 "agentdesk_pipeline_override_{}",

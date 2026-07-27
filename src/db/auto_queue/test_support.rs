@@ -10,7 +10,7 @@ pub(crate) struct TestPostgresDb {
 
 impl TestPostgresDb {
     pub(crate) async fn create() -> Self {
-        let lock = crate::db::postgres::lock_test_lifecycle();
+        let lock = crate::db::postgres::lock_test_lifecycle().await;
         let admin_url = postgres_admin_database_url();
         let database_name = format!("agentdesk_db_auto_queue_{}", uuid::Uuid::new_v4().simple());
         let database_url = format!("{}/{}", postgres_base_database_url(), database_name);

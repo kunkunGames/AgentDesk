@@ -22,7 +22,7 @@ impl CanonicalIdentityPgDatabase {
         let base = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE")
             .ok()
             .filter(|value| !value.trim().is_empty())?;
-        let lifecycle = crate::db::postgres::lock_test_lifecycle();
+        let lifecycle = crate::db::postgres::lock_test_lifecycle().await;
         let base = base.trim().trim_end_matches('/').to_string();
         let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
             .ok()

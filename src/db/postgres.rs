@@ -1156,37 +1156,33 @@ const TEST_POSTGRES_POOL_MAX_CONNECTIONS: u32 = 1;
 #[cfg(test)]
 const TEST_POSTGRES_ADMIN_POOL_MAX_CONNECTIONS: u32 = 1;
 #[cfg(test)]
-static POSTGRES_TEST_SETUP_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+static POSTGRES_TEST_SETUP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 #[cfg(test)]
-static POSTGRES_TEST_LIFECYCLE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+static POSTGRES_TEST_LIFECYCLE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn lock_test_setup() -> std::sync::MutexGuard<'static, ()> {
-    let mutex = POSTGRES_TEST_SETUP_LOCK.get_or_init(|| std::sync::Mutex::new(()));
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn lock_test_setup() -> tokio::sync::MutexGuard<'static, ()> {
+    let mutex = POSTGRES_TEST_SETUP_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    mutex.lock().await
 }
 
 #[cfg(test)]
-fn lock_test_lifecycle_raw() -> std::sync::MutexGuard<'static, ()> {
-    let mutex = POSTGRES_TEST_LIFECYCLE_LOCK.get_or_init(|| std::sync::Mutex::new(()));
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn lock_test_lifecycle_raw() -> tokio::sync::MutexGuard<'static, ()> {
+    let mutex = POSTGRES_TEST_LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    mutex.lock().await
 }
 
 #[cfg(test)]
 pub(crate) struct PostgresTestLifecycleGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
-pub(crate) fn lock_test_lifecycle() -> PostgresTestLifecycleGuard {
+pub(crate) async fn lock_test_lifecycle() -> PostgresTestLifecycleGuard {
     PostgresTestLifecycleGuard {
-        _guard: lock_test_lifecycle_raw(),
+        _guard: lock_test_lifecycle_raw().await,
     }
 }
 
@@ -1254,7 +1250,7 @@ pub(crate) async fn create_test_database(
     // CI failures were caused by many PG-backed tests racing to create/drop
     // isolated databases at the same time. Serialize setup/teardown at the
     // shared helper boundary so every test module benefits from the guard.
-    let _guard = lock_test_setup();
+    let _guard = lock_test_setup().await;
     let admin_pool = connect_test_pool_with_max_connections(
         admin_url,
         &format!("{label} admin"),
@@ -1352,7 +1348,7 @@ pub(crate) async fn drop_test_database(
     database_name: &str,
     label: &str,
 ) -> Result<(), String> {
-    let _guard = lock_test_setup();
+    let _guard = lock_test_setup().await;
     let admin_pool = connect_test_pool_with_max_connections(
         admin_url,
         &format!("{label} admin"),
