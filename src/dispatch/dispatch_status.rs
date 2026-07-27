@@ -1745,7 +1745,8 @@ mod auto_queue_phase_gate_finalize_wrapper_tests {
     ) {
         sqlx::query(
             "INSERT INTO agents (id, name, provider)
-             VALUES ('agent-finalize-pg', 'Agent', 'claude')",
+             VALUES ('agent-finalize-pg', 'Agent', 'claude')
+             ON CONFLICT (id) DO NOTHING",
         )
         .execute(pool)
         .await
