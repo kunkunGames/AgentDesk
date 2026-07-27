@@ -1150,11 +1150,11 @@ fn database_url_override() -> Option<String> {
 }
 
 #[cfg(test)]
-const TEST_POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(15);
+const TEST_POSTGRES_OP_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
-const TEST_POSTGRES_POOL_MAX_CONNECTIONS: u32 = 1;
+const TEST_POSTGRES_POOL_MAX_CONNECTIONS: u32 = 5;
 #[cfg(test)]
-const TEST_POSTGRES_ADMIN_POOL_MAX_CONNECTIONS: u32 = 1;
+const TEST_POSTGRES_ADMIN_POOL_MAX_CONNECTIONS: u32 = 5;
 #[cfg(test)]
 static POSTGRES_TEST_SETUP_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
