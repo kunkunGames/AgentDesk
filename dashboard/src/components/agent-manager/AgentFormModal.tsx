@@ -191,7 +191,8 @@ export default function AgentFormModal({
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected Sprite preview: ${spriteNum}` })}
+                      alt=""
+                      aria-hidden="true"
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
                     />
@@ -199,10 +200,7 @@ export default function AgentFormModal({
                     <span
                       className="text-2xl"
                       role="img"
-                      aria-label={t({
-                        ko: `선택된 이모지 미리보기: ${formValues.avatar_emoji || "🤖"}`,
-                        en: `Selected emoji preview: ${formValues.avatar_emoji || "🤖"}`,
-                      })}
+                      aria-hidden="true"
                     >
                       {formValues.avatar_emoji || "🤖"}
                     </span>
@@ -321,10 +319,10 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected emoji: ${formValues.avatar_emoji}, change emoji` })
-                      : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
+                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected Emoji: ${formValues.avatar_emoji}, change Emoji` })
+                      : t({ ko: "이모지 선택기 열기", en: "Open Emoji picker" })
                   }
-                  dialogLabel={t({ ko: "이모지 선택", en: "Choose an emoji" })}
+                  dialogLabel={t({ ko: "이모지 선택", en: "Choose an Emoji" })}
                 />
               </div>
               <div>
