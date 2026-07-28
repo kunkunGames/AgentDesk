@@ -4166,7 +4166,7 @@ fn check_disk_usage() -> Check {
                         format!("{:.1} MB", mb),
                     )
                     .with_evidence(evidence)
-                    .with_next_steps(vec![format!("du -sh {}/*", path.display())])
+                    .with_next_steps(vec![format!("du -sh {}/* | sort -h", path.display())])
                 } else if total >= DISK_WARN_BYTES {
                     Check::warn(
                         "disk_usage",
@@ -4181,7 +4181,7 @@ fn check_disk_usage() -> Check {
                         format!("{:.1} MB", mb),
                     )
                     .with_evidence(evidence)
-                    .with_next_steps(vec![format!("du -sh {}/*", path.display())])
+                    .with_next_steps(vec![format!("du -sh {}/* | sort -h", path.display())])
                 } else {
                     Check::ok("disk_usage", CheckGroup::Core, "Disk Usage", detail)
                         .with_path(path.display().to_string())
