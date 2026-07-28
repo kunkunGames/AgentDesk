@@ -39,7 +39,7 @@ impl TestPostgresDb {
         let pool = crate::db::postgres::connect_test_pool_with_max_connections(
             &self.database_url,
             "db::auto_queue tests",
-            4,
+            8,
         )
         .await
         .expect("connect postgres auto_queue test db");
