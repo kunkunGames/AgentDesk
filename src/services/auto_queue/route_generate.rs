@@ -313,8 +313,40 @@ pub async fn generate(
     let mut excluded_count = 0usize;
     let mut skipped_due_to_dependency: Vec<serde_json::Value> = Vec::new();
     let mut dependency_status_cache: HashMap<i64, Option<String>> = HashMap::new();
+
+    let mut card_deps = Vec::with_capacity(cards.len());
+    let mut all_external_deps = std::collections::HashSet::new();
     for card in &cards {
         let dep_parse = extract_dependency_parse_result(card);
+        for dep_num in &dep_parse.numbers {
+            if !issue_to_idx.contains_key(dep_num) {
+                all_external_deps.insert(*dep_num);
+            }
+        }
+        card_deps.push(dep_parse);
+    }
+
+    if !all_external_deps.is_empty() {
+        let deps_vec: Vec<i64> = all_external_deps.into_iter().collect();
+        if let Ok(rows) = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT DISTINCT ON (github_issue_number::BIGINT)
+                 github_issue_number::BIGINT,
+                 status
+             FROM kanban_cards
+             WHERE github_issue_number::BIGINT = ANY($1)
+             ORDER BY github_issue_number::BIGINT, updated_at DESC NULLS LAST, created_at DESC, id DESC"
+        )
+        .bind(&deps_vec)
+        .fetch_all(pool)
+        .await
+        {
+            for (num, status) in rows {
+                dependency_status_cache.insert(num, status);
+            }
+        }
+    }
+
+    for (card, dep_parse) in cards.iter().zip(card_deps.into_iter()) {
         crate::auto_queue_log!(
             info,
             "generate.dependency_parse",
@@ -335,24 +367,7 @@ pub async fn generate(
                 continue;
             }
 
-            let dep_status = if let Some(status) = dependency_status_cache.get(dep_num) {
-                status.clone()
-            } else {
-                let status = sqlx::query_scalar::<_, String>(
-                    "SELECT status
-                         FROM kanban_cards
-                         WHERE github_issue_number::BIGINT = $1
-                         ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
-                         LIMIT 1",
-                )
-                .bind(*dep_num)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-                dependency_status_cache.insert(*dep_num, status.clone());
-                status
-            };
+            let dep_status = dependency_status_cache.get(dep_num).cloned().flatten();
 
             if dep_status.as_deref() != Some("done") {
                 unresolved_external_dependencies.push(format!(
