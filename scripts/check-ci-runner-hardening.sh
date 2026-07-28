@@ -85,7 +85,7 @@ targets = {
     "runs_on" => '${{ matrix.os }}',
     # #4747 (opt.2) re-pins the compile-only PR lane after moving long-pole
     # Windows runtime tests to nightly. Option 3 keeps PR cache access restore-only.
-    "job_sha256" => "d27244ced15d0bb13f89e680de42978cb74452af4b02457ab034d462f4fa103a",
+    "job_sha256" => "ef388d07681330a7e623c5181a9a85de2c62d5518c86a2c92fbe7d4eaf9e1e0e",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
