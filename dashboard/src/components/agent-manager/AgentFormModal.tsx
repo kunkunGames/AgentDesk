@@ -201,7 +201,7 @@ export default function AgentFormModal({
                       role="img"
                       aria-label={t({
                         ko: `선택된 이모지 미리보기: ${formValues.avatar_emoji || "🤖"}`,
-                        en: `Selected emoji preview: ${formValues.avatar_emoji || "🤖"}`,
+                        en: `Selected Emoji preview: ${formValues.avatar_emoji || "🤖"}`,
                       })}
                     >
                       {formValues.avatar_emoji || "🤖"}
@@ -321,10 +321,10 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected emoji: ${formValues.avatar_emoji}, change emoji` })
-                      : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
+                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected Emoji: ${formValues.avatar_emoji}, change Emoji` })
+                      : t({ ko: "이모지 선택기 열기", en: "Open Emoji picker" })
                   }
-                  dialogLabel={t({ ko: "이모지 선택", en: "Choose an emoji" })}
+                  dialogLabel={t({ ko: "이모지 선택", en: "Choose an Emoji" })}
                 />
               </div>
               <div>
@@ -373,9 +373,9 @@ export default function AgentFormModal({
             {isEdit && (
               <div>
                 <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
-                  <label className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <span className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     prompt.md
-                  </label>
+                  </span>
                   <label className="flex items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                     <input
                       type="checkbox"
