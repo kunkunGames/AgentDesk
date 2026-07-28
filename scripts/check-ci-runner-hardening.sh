@@ -102,10 +102,10 @@ targets = {
     "runs_on" => "ubuntu-latest",
     # #4913 re-pins after adding the trusted session-forwarding test to the
     # existing toolchain-provisioned targeted lane.
-    "job_sha256" => "86804b84bc35aacdf93d9f12607ec2fdf43d5c0bf1c67bb136b9b373365c16a4",
+    "job_sha256" => "4793e1836d04a7c9293accf1c7078c072204c1deb4f7652c4f401c68b880683d",
     "cargo_steps" => {
       "Trusted session forwarding tests" => {
-        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
+        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres --test-threads=1"],
         "continue_on_error" => nil,
         "timeout_minutes" => 10,
       },

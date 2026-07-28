@@ -9,7 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RELAY_RECOVERY_COMMAND = (
     "env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- "
-    "--skip _pg --skip pg_ --skip postgres"
+    "--skip _pg --skip pg_ --skip postgres --test-threads=1"
 )
 
 

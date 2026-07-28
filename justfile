@@ -68,8 +68,8 @@ test-non-pg:
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --test-threads=1
     # #4892: keep the live panel and spinner-merged latest-tool contracts in the retained lane.
-    env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres
-    env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres
+    env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     cargo test --lib services::discord::outbound::serenity_reference::tests::lifecycle_notice_nonce_is_stable_and_semantic_event_scoped -- --exact
     cargo test --lib services::discord::outbound::delivery::tests::v3_referenced_send_preserves_reference_and_dedupes -- --exact
     # #4913 GO-A1: retain canonical Discord identity validation, collision, and observability contracts.
@@ -85,7 +85,7 @@ test-non-pg:
     cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
     # Run health first so a fail-fast relay_recovery failure cannot hide it.
     python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
-    env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
+    env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     # #4875: keep the Claude catalog and picker test modules fully selected.
     cargo test --lib services::discord::model_catalog -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::commands::model_ui::tests -- --skip _pg --skip pg_ --skip postgres
