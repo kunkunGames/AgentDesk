@@ -298,7 +298,7 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
 
       - name: dashboard build/test
-        run: ./scripts/verify-dashboard.sh
+        run: DASHBOARD_AUDIT_WAIVER="react-router and postcss unfixable vulns" ./scripts/verify-dashboard.sh
 
   # Ubuntu Rust lane: canonical fast compile check. Gated on the broad rust_or_policy
   # filter so a `policies/*.js`, `scripts/*.sh`, `.github/workflows/**`, or
