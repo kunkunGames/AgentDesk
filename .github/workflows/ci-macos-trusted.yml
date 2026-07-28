@@ -135,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1
-          cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
+          cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres --test-threads=1
           cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
@@ -257,7 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           nice -n 10 cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1
-          nice -n 10 cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
+          nice -n 10 cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres --test-threads=1
           nice -n 10 cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           nice -n 10 cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           nice -n 10 cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
