@@ -21,6 +21,8 @@ import {
   useAgentSetupWizardState,
   type AgentSetupWizardProps,
 } from "./AgentSetupWizardModel";
+import { useFocusTrap } from "../common/overlay/useFocusTrap";
+import { useReturnFocus } from "../common/overlay/useReturnFocus";
 
 export default function AgentSetupWizard({
   open,
@@ -32,6 +34,9 @@ export default function AgentSetupWizard({
   onClose,
   onDone,
 }: AgentSetupWizardProps) {
+  const overlayRef = useFocusTrap(open);
+  useReturnFocus(open);
+
   const {
     stepIndex,
     setStepIndex,
@@ -80,6 +85,7 @@ export default function AgentSetupWizard({
 
   return (
     <div
+      ref={overlayRef}
       className="fixed inset-0 z-50 flex items-start justify-center overflow-hidden px-3 py-4 sm:items-center sm:p-4"
       style={{ background: "var(--th-modal-overlay)" }}
       onClick={(event) => {
