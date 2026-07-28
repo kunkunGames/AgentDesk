@@ -1,0 +1,33 @@
+fn record_leader_only_worker_started(spec: WorkerSpec) {
+    LEADER_ONLY_WORKERS_STARTED.store(true, Ordering::Release);
+    LEADER_ONLY_WORKER_ACTIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+    if spec.id == ServerWorkerId::RateLimitSync {
+        RATE_LIMIT_SYNC_ACTIVE.store(true, Ordering::Release);
+    }
+    LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS
+        .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
+    tracing::info!(
+        worker = spec.name,
+        target = spec.target,
+        kind = spec.kind.as_doc_str(),
+        stage = spec.start_stage.as_doc_str(),
+        order = spec.start_order,
+        restart = spec.restart_policy.as_doc_str(),
+        shutdown = spec.shutdown_policy.as_doc_str(),
+--
+        record_leader_only_worker_started(spec);
+        Self { spec }
+    }
+}
+
+impl Drop for LeaderOnlyWorkerEpoch {
+    fn drop(&mut self) {
+        record_leader_only_worker_stopped(self.spec, "leader worker epoch ended");
+    }
+}
+
+async fn wait_until_shutdown(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}

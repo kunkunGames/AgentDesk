@@ -1,0 +1,33 @@
+fn record_leader_only_worker_stopped(spec: WorkerSpec, reason: &str) {
+    let _ = LEADER_ONLY_WORKER_ACTIVE_COUNT.fetch_update(
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |count| Some(count.saturating_sub(1)),
+    );
+    if spec.id == ServerWorkerId::RateLimitSync {
+        RATE_LIMIT_SYNC_ACTIVE.store(false, Ordering::Release);
+    }
+    tracing::warn!(
+        worker = spec.name,
+        target = spec.target,
+        kind = spec.kind.as_doc_str(),
+        stage = spec.start_stage.as_doc_str(),
+        order = spec.start_order,
+        restart = spec.restart_policy.as_doc_str(),
+--
+        record_leader_only_worker_stopped(self.spec, "leader worker epoch ended");
+    }
+}
+
+async fn wait_until_shutdown(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_until_leader_or_shutdown(
+    cluster_runtime: &ClusterRuntime,
+    shutdown: Arc<AtomicBool>,
+) -> bool {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
