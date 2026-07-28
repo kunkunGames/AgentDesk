@@ -34,7 +34,7 @@ jobs:
       # PR-required gate: build + Vitest only (verify-dashboard.sh).
       # Playwright smoke is intentionally nightly-only — see issue #3316.
       - name: dashboard build/test (PR gate path)
-        run: ./scripts/verify-dashboard.sh
+        run: DASHBOARD_AUDIT_WAIVER="react-router and postcss unfixable vulns" ./scripts/verify-dashboard.sh
 
   # Playwright smoke is a nightly-only lane: it requires a headed Chromium
   # browser and takes longer than the fast PR gate allows.  Kept separate so
