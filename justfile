@@ -28,6 +28,8 @@ test-active-usage-4631:
 # Stage 1 keeps the existing CI-safe subset. The broad non-PG sweep currently
 # fails legacy/full integration route tests; see docs/ci/rust-quality-gates.md.
 test-non-pg:
+    # #4878: keep the generated queue docs on the canonical thread-group contract.
+    cargo test --lib server::routes::docs::inventory::endpoints::part_0 -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::task_completion_v1::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib source_registry -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres
@@ -57,6 +59,14 @@ test-non-pg:
     cargo test --lib services::tmux_common::sentinel_tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::turn_bridge::followup_requeue::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::busy_followup_retry::tests -- --skip _pg --skip pg_ --skip postgres
+    # #4259: keep exact bridge-entry and guarded stream authority modules in a curated lane.
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::bridge_entry_guard_tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::bridge_entry::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::claude_e_stamp::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::current_message_anchor::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::guards::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_loop::tool_arms::authority_tests -- --test-threads=1
     cargo test --lib services::discord::gateway::tests -- --skip _pg --skip pg_ --skip postgres
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::gateway::outbound_messages::classified_edit_tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::queued::tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
@@ -65,6 +75,7 @@ test-non-pg:
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_finalizer::completion_admission_actor::tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_finalizer::cleanup::tests::late_already_finalized_cleanup_releases_mailbox_and_rearms_once_4906 -- --exact --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_finalizer::cleanup::tests::mailbox_release_backstop_coalesces_duplicate_arms_and_eventually_fires_4906 -- --exact --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::placeholder_reclaim::redrive_reclaim_e2e_tests::live_tmux_redrive_reclaim_cycle_terminates_4299 -- --exact --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --test-threads=1
     # #4892: keep the live panel and spinner-merged latest-tool contracts in the retained lane.
@@ -86,6 +97,8 @@ test-non-pg:
     # Run health first so a fail-fast relay_recovery failure cannot hide it.
     python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
     env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
+    # #4874: keep the local-model durable-queue wake production E2E fully selected.
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     # #4875: keep the Claude catalog and picker test modules fully selected.
     cargo test --lib services::discord::model_catalog -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::commands::model_ui::tests -- --skip _pg --skip pg_ --skip postgres

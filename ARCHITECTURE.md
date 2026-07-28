@@ -68,6 +68,7 @@ src/
 │   │   ├── phase_gate_verdict.rs
 │   │   ├── phase_gates.rs
 │   │   ├── queries.rs
+│   │   ├── run_status.rs
 │   │   ├── runs.rs
 │   │   ├── slot_predicate.rs
 │   │   ├── slots.rs
@@ -546,10 +547,15 @@ src/
 │   │   │   │   └── mod.rs
 │   │   │   ├── save_store/
 │   │   │   │   ├── identity_gate/
+│   │   │   │   │   ├── bridge_entry.rs
 │   │   │   │   │   ├── claude_e_stamp.rs
+│   │   │   │   │   ├── completion_preserve.rs
+│   │   │   │   │   ├── guarded_read.rs
 │   │   │   │   │   ├── heartbeat.rs
 │   │   │   │   │   ├── runtime_stamp.rs
+│   │   │   │   │   ├── stamp_merge.rs
 │   │   │   │   │   └── stream_loop_patch.rs
+│   │   │   │   ├── bridge_entry_guard_tests.rs
 │   │   │   │   ├── delivery_rewind.rs
 │   │   │   │   ├── identity_gate.rs
 │   │   │   │   ├── post_loop_identity_guard_tests.rs
@@ -701,12 +707,15 @@ src/
 │   │   │   │   ├── intake_turn/
 │   │   │   │   │   ├── race_loss/
 │   │   │   │   │   │   ├── mailbox_reaction.rs
-│   │   │   │   │   │   └── mailbox_reaction_tests.rs
+│   │   │   │   │   │   ├── mailbox_reaction_tests.rs
+│   │   │   │   │   │   └── requeue_tests.rs
 │   │   │   │   │   ├── adk_thread.rs
 │   │   │   │   │   ├── claim_bootstrap.rs
+│   │   │   │   │   ├── dispatch_runtime.rs
 │   │   │   │   │   ├── inflight_create_log.rs
 │   │   │   │   │   ├── placeholder_handoff.rs
 │   │   │   │   │   ├── race_loss.rs
+│   │   │   │   │   ├── runtime_transition.rs
 │   │   │   │   │   ├── stale_dispatch_guard.rs
 │   │   │   │   │   ├── steering_hook.rs
 │   │   │   │   │   ├── turn_watchdog.rs
@@ -869,6 +878,7 @@ src/
 │   │   │   ├── idle_transcript_scan.rs
 │   │   │   ├── injected_prompt_policy.rs
 │   │   │   ├── launch_script.rs
+│   │   │   ├── local_model_queue_wake_e2e.rs
 │   │   │   ├── observed_prompt_decision.rs
 │   │   │   ├── rehydration.rs
 │   │   │   ├── relay_ownership.rs
@@ -887,7 +897,8 @@ src/
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   ├── claude_e.rs
 │   │   │   │   ├── guarded_save.rs
-│   │   │   │   └── tests.rs
+│   │   │   │   ├── tests.rs
+│   │   │   │   └── watcher_handoff.rs
 │   │   │   ├── status_panel/
 │   │   │   │   ├── fallback.rs
 │   │   │   │   ├── purge.rs
@@ -897,10 +908,18 @@ src/
 │   │   │   │   │   ├── provider_error_presentation.rs
 │   │   │   │   │   ├── tui_error_classification.rs
 │   │   │   │   │   └── types.rs
+│   │   │   │   ├── tool_arms/
+│   │   │   │   │   ├── authority.rs
+│   │   │   │   │   ├── authority_tests.rs
+│   │   │   │   │   ├── task_notification.rs
+│   │   │   │   │   └── types.rs
 │   │   │   │   ├── content_arms.rs
+│   │   │   │   ├── exit_reconcile.rs
+│   │   │   │   ├── expected_identity.rs
 │   │   │   │   ├── expected_identity_tests.rs
 │   │   │   │   ├── message_conversion.rs
-│   │   │   │   └── tool_arms.rs
+│   │   │   │   ├── tool_arms.rs
+│   │   │   │   └── types.rs
 │   │   │   ├── stream_tick/
 │   │   │   │   └── guarded_persist.rs
 │   │   │   ├── terminal_outcome_delivery/
@@ -922,6 +941,7 @@ src/
 │   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
 │   │   │   ├── activity_heartbeat.rs
+│   │   │   ├── bridge_entry_persist.rs
 │   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── chunk_compose.rs
@@ -929,6 +949,7 @@ src/
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── completion_postlude.rs
 │   │   │   ├── context_window.rs
+│   │   │   ├── current_message_anchor.rs
 │   │   │   ├── early_tui_completion.rs
 │   │   │   ├── finalize_epilogue.rs
 │   │   │   ├── followup_requeue.rs
@@ -1098,6 +1119,7 @@ src/
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
 │   │   ├── session_status_hook.rs
+│   │   ├── session_transition.rs
 │   │   ├── settings.rs
 │   │   ├── shared_memory.rs
 │   │   ├── shared_state.rs
@@ -1440,6 +1462,7 @@ src/
 ├── manual_intervention.rs
 ├── phase_gate.rs
 ├── pipeline.rs
+├── queue_contract.rs
 ├── receipt.rs
 └── reconcile.rs
 ```
@@ -1486,6 +1509,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/manual_intervention.rs` | Manual intervention parsing and helpers shared by Discord reply/requeue flows. |
 | `src/phase_gate.rs` | Immutable typed phase-gate declarations and snapshot compatibility checks shared by HTTP, policy dispatch, and durable reducers. |
 | `src/pipeline.rs` | Pipeline stage loading, resolution, and transition helpers. |
+| `src/queue_contract.rs` | Queue field compatibility contracts shared by planner prompts, API documentation, and runtime-facing consumers. |
 | `src/receipt.rs` | Receipt parsing and workspace attribution helpers. |
 | `src/reconcile.rs` | Boot-time reconciliation for persisted state and dispatch-runtime drift. |
 <!-- END GENERATED: TOP LEVEL MODULE MAP -->
