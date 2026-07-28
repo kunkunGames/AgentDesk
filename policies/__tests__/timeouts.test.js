@@ -321,6 +321,52 @@ test("timeouts dispatch maintenance shadows failed-dispatch retries without chan
   assert.equal(shadow.incomparable, true);
 });
 
+test("timeouts reconcile fallback marks DoD-only gate failures as awaiting_dod instead of escalating immediately", () => {
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: { pm_decision_gate_enabled: true },
+    cards: {
+      "card-reconcile-dod": {
+        id: "card-reconcile-dod",
+        status: "in_progress",
+        priority: "medium",
+        assigned_agent_id: "agent-1",
+        deferred_dod_json: {
+          items: ["add tests", "update docs"],
+          verified: ["add tests"]
+        }
+      }
+    },
+    dbQuery: createSqlRouter([
+      {
+        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
+        result: [{ key: "reconcile_dispatch:dispatch-reconcile-dod", value: "dispatch-reconcile-dod" }]
+      },
+      {
+        match: "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result, context FROM task_dispatches WHERE id = ?",
+        result: [
+          {
+            id: "dispatch-reconcile-dod",
+            kanban_card_id: "card-reconcile-dod",
+            to_agent_id: "agent-1",
+            dispatch_type: "implementation",
+            chain_depth: 1,
+            status: "completed",
+            result: "{}",
+            context: "{}"
+          }
+        ]
+      }
+    ])
+  });
+
+  policy._section_R();
+
+  assert.deepEqual(state.statusCalls, [{ cardId: "card-reconcile-dod", status: "review", force: false }]);
+  assert.deepEqual(state.reviewStatusCalls, [
+    { cardId: "card-reconcile-dod", reviewStatus: "awaiting_dod", options: { awaiting_dod_at: "now" } }
+  ]);
+});
+
 test("timeouts reconcile fallback does not advance a completed scope-assessment (#3605)", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     config: { pm_decision_gate_enabled: true },
