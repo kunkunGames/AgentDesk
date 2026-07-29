@@ -3,9 +3,7 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 
-use super::super::{
-    ApiRouter, AppState, protected_api_domain, routines,
-};
+use super::super::{ApiRouter, AppState, protected_api_domain, routines};
 
 // Category: routines
 
