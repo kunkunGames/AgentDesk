@@ -7,6 +7,7 @@ import {
   OFFICE_ICONS,
   useOfficeManager,
 } from "./office-manager/useOfficeManager";
+import { useFocusTrap, useReturnFocus } from "./common/overlay";
 import {
   SurfaceActionButton,
   SurfaceCard,
@@ -32,6 +33,8 @@ export default function OfficeManagerModal({
   onClose,
   onChanged,
 }: OfficeManagerModalProps) {
+  const overlayRef = useFocusTrap(true);
+  useReturnFocus(true);
   const [view, setView] = useState<ModalView>("list");
   const [editOffice, setEditOffice] = useState<Office | null>(null);
   const [agentsOffice, setAgentsOffice] = useState<Office | null>(null);
@@ -102,6 +105,7 @@ export default function OfficeManagerModal({
 
   return (
     <div
+      ref={overlayRef as React.RefObject<HTMLDivElement>}
       className="fixed inset-0 z-50 flex items-center justify-center"
       style={{ background: "var(--th-modal-overlay)" }}
       onClick={(e) => e.target === e.currentTarget && onClose()}
