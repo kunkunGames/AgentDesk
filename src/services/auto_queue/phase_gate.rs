@@ -607,7 +607,7 @@ mod tests {
     use crate::dispatch::sandbox_preflight_metadata_disables_external_side_effects;
 
     #[tokio::test]
-    async fn cancelled_run_rejects_dispatch_attach() {
+    async fn cancelled_run_rejects_dispatch_attach_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         sqlx::query(
