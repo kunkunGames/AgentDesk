@@ -298,6 +298,8 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
 
       - name: dashboard build/test
+        env:
+          DASHBOARD_AUDIT_WAIVER: "Pending react-router minor version update for CVEs"
         run: ./scripts/verify-dashboard.sh
 
   # Ubuntu Rust lane: canonical fast compile check. Gated on the broad rust_or_policy
