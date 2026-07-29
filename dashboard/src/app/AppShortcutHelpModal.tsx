@@ -1,4 +1,7 @@
+import { useEffect } from "react";
 import { X } from "lucide-react";
+import { useFocusTrap } from "../components/common/overlay/useFocusTrap";
+import { useReturnFocus } from "../components/common/overlay/useReturnFocus";
 import { PRIMARY_ROUTES } from "./routes";
 
 interface AppShortcutHelpModalProps {
@@ -12,8 +15,22 @@ export function AppShortcutHelpModal({
   modalZIndex,
   onClose,
 }: AppShortcutHelpModalProps) {
+  const overlayRef = useFocusTrap(true);
+  useReturnFocus(true);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
   return (
     <div
+      ref={overlayRef as React.RefObject<HTMLDivElement>}
       data-testid="shortcut-help-modal"
       className="fixed inset-0 flex items-center justify-center px-4"
       style={{ zIndex: modalZIndex }}

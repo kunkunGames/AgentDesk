@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { useFocusTrap } from "../common/overlay/useFocusTrap";
+import { useReturnFocus } from "../common/overlay/useReturnFocus";
 import { SurfaceActionButton, SurfaceCard, SurfaceNotice } from "../common/SurfacePrimitives";
 
 interface KanbanAssignIssueModalProps {
@@ -23,10 +26,24 @@ export default function KanbanAssignIssueModal({ ctx }: KanbanAssignIssueModalPr
     tr,
   } = ctx;
 
+  const overlayRef = useFocusTrap(!!assignIssue);
+  useReturnFocus(!!assignIssue);
+
+  useEffect(() => {
+    if (!assignIssue) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAssignIssue(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [assignIssue, setAssignIssue]);
+
   return (
     <>
       {assignIssue && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center p-0 sm:p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }}>
+        <div ref={overlayRef as React.RefObject<HTMLDivElement>} className="fixed inset-0 z-50 flex items-end justify-center sm:items-center p-0 sm:p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }}>
           <SurfaceCard
             role="dialog"
             aria-modal="true"

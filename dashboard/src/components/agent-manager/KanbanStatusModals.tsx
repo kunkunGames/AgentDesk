@@ -1,3 +1,6 @@
+import { useEffect } from "react";
+import { useFocusTrap } from "../common/overlay/useFocusTrap";
+import { useReturnFocus } from "../common/overlay/useReturnFocus";
 import { SurfaceActionButton, SurfaceCard } from "../common/SurfacePrimitives";
 
 interface KanbanStatusModalsProps {
@@ -21,6 +24,24 @@ export default function KanbanStatusModals({ ctx }: KanbanStatusModalsProps) {
     tr,
   } = ctx;
 
+  const assignRef = useFocusTrap(!!assignBeforeReady);
+  useReturnFocus(!!assignBeforeReady);
+
+  const cancelRef = useFocusTrap(!!cancelConfirm);
+  useReturnFocus(!!cancelConfirm);
+
+  useEffect(() => {
+    if (!assignBeforeReady && !cancelConfirm) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (assignBeforeReady) setAssignBeforeReady(null);
+        if (cancelConfirm) setCancelConfirm(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [assignBeforeReady, cancelConfirm, setAssignBeforeReady, setCancelConfirm]);
+
   return (
     <>
       {/* Assignee selection modal: shown when moving to "ready" without an assignee.
@@ -28,7 +49,7 @@ export default function KanbanStatusModals({ ctx }: KanbanStatusModalsProps) {
           fires `setAssignBeforeReady(...)` still surfaces the modal even when the
           header is collapsed. */}
       {assignBeforeReady && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }} onClick={() => setAssignBeforeReady(null)}>
+        <div ref={assignRef as React.RefObject<HTMLDivElement>} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }} onClick={() => setAssignBeforeReady(null)}>
           <SurfaceCard
             role="dialog"
             aria-modal="true"
@@ -88,7 +109,7 @@ export default function KanbanStatusModals({ ctx }: KanbanStatusModalsProps) {
           .map((id: string) => cardsById.get(id))
           .filter((c: any): c is any => !!(c?.github_repo && c.github_issue_number));
         return (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }}>
+          <div ref={cancelRef as React.RefObject<HTMLDivElement>} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ backgroundColor: "var(--th-modal-overlay)" }}>
             <SurfaceCard
               role="dialog"
               aria-label={tr("카드 취소 확인", "Cancel cards")}
