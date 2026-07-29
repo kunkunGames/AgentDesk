@@ -95,51 +95,52 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
                 break
     return False
 
-def has_duplicate_guard_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:duplicate pr guard|duplicate-pr guard|duplicate/overlap check|overlap check):\*\*", body):
-        return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "duplicate pr guard",
-            "duplicate-pr guard",
-            "duplicate/overlap check",
-            "overlap check",
-        ],
+def _has_checked_template_ack(body, labels):
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    return bool(
+        re.search(
+            rf"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:{label_pattern})(?::\*\*|\*\*[ \t]*:)",
+            body,
+        )
     )
+
+def has_duplicate_guard_ack(body):
+    labels = [
+        "duplicate pr guard",
+        "duplicate-pr guard",
+        "duplicate/overlap check",
+        "overlap check",
+    ]
+    if _has_checked_template_ack(body, labels):
+        return True
+    return has_non_empty_body_field(body, labels)
 
 def has_no_change_verification_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:no-change verification|no change verification):\*\*", body):
+    labels = [
+        "no-change verification",
+        "no change verification",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "no-change verification",
-            "no change verification",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_stale_branch_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:stale branch cleanup|stale-branch cleanup):\*\*", body):
+    labels = [
+        "stale branch cleanup",
+        "stale-branch cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "stale branch cleanup",
-            "stale-branch cleanup",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_scratch_file_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:scratch file cleanup|scratch-file cleanup):\*\*", body):
+    labels = [
+        "scratch file cleanup",
+        "scratch-file cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "scratch file cleanup",
-            "scratch-file cleanup",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
