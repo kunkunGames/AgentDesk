@@ -131,7 +131,7 @@ pub async fn list_routine_runs(
         )));
     }
     let runs = store
-        .list_runs(&routine_id, query.limit.unwrap_or(20))
+        .list_runs(&routine_id, crate::utils::api::clamp_api_limit(Some(query.limit.unwrap_or(20).max(0) as usize)) as i64)
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "runs": runs })))
