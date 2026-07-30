@@ -20,16 +20,6 @@ pub(in crate::services::discord) use model::{
     opt_message_id, optional_message_id,
 };
 
-impl InflightTurnState {
-    pub(in crate::services::discord) fn effective_busy_followup_retry_user_msg_id(&self) -> u64 {
-        if self.busy_followup_retry_user_msg_id == 0 {
-            self.user_msg_id
-        } else {
-            self.busy_followup_retry_user_msg_id
-        }
-    }
-}
-
 mod episode_guard;
 mod store;
 
@@ -46,7 +36,7 @@ pub(in crate::services::discord) use episode_guard::{
 };
 pub(in crate::services::discord) use store::InflightDeliveryRewindReason;
 use store::inflight_provider_dir;
-pub(in crate::services::discord) use store::inflight_state_path;
+pub(in crate::services::discord::inflight) use store::inflight_state_path;
 pub(crate) use store::lock_inflight_state_path;
 
 // #3715 / #3835: the rebind-origin dead-watcher/orphan-lock helpers PLUS the
@@ -145,30 +135,24 @@ use self::store::{
 // Save cluster re-exports (original visibility mirrored). The save child declares
 // these `pub(in crate::services::discord)` (the absolute spelling of the parent's
 // original `pub(super)`), so this `pub(super)` re-export does not widen the surface.
-#[cfg(test)]
-pub(super) use self::save_store::save_inflight_state;
 pub(super) use self::save_store::{
-    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity,
+    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity, save_inflight_state,
     save_inflight_state_create_new, save_inflight_state_if_absent,
 };
 pub(in crate::services::discord) use self::save_store::{
-    GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_if_matches_identity,
+    GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
     clear_long_running_placeholder_if_matches_identity,
     mark_readopted_from_inflight_if_identity_unchanged,
-    patch_bridge_entry_state_if_identity_unchanged,
-    patch_bridge_entry_state_tracking_placeholder_clear,
     patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
-    recovery_anchor_message_if_matches_identity, recovery_anchor_msg_id_if_matches_identity,
+    recovery_anchor_msg_id_if_matches_identity,
     save_existing_inflight_rebind_adoption_if_matches_episode,
     save_existing_inflight_rebind_adoption_if_matches_identity,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_episode,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
     save_inflight_state_if_identity_matches_allow_output_restamp,
     save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
-    save_stream_tick_state_if_bridge_authority,
-    save_stream_tick_state_preserving_current_message_races,
     stamp_claude_e_process_if_matches_identity, stamp_runtime_handoff_if_matches_identity,
     touch_inflight_state_if_matches_identity,
 };

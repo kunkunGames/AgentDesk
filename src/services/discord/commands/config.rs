@@ -685,7 +685,8 @@ pub(in crate::services::discord) async fn cmd_allowedtools(ctx: Context<'_>) -> 
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/allowedtools");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /allowedtools");
 
     let tools = {
         let settings = ctx.data().shared.settings.read().await;
@@ -730,7 +731,8 @@ pub(in crate::services::discord) async fn cmd_allowed(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/allowed", action = %action);
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /allowed {action}");
 
     let arg = action.trim();
     let (op, raw_name) = if let Some(name) = arg.strip_prefix('+') {
@@ -813,7 +815,8 @@ pub(in crate::services::discord) async fn cmd_adduser(
     let target_id = user.id.get();
     let target_name = &user.name;
 
-    log_command_received!(ctx.channel_id().get(), author_name, "/adduser", target_user = %target_name);
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{author_name}] /adduser {target_name}");
 
     {
         let mut settings = ctx.data().shared.settings.write().await;
@@ -828,13 +831,7 @@ pub(in crate::services::discord) async fn cmd_adduser(
 
     ctx.say(format!("Added `{}` as authorized user.", target_name))
         .await?;
-    log_info_event!(
-        "discord_user_access_added",
-        channel_id = ctx.channel_id().get(),
-        user_id = target_id,
-        user_name = %target_name,
-        status = "added",
-    );
+    tracing::info!("  [{ts}] ▶ Added user: {target_name} (id:{target_id})");
     Ok(())
 }
 
@@ -864,7 +861,8 @@ pub(in crate::services::discord) async fn cmd_removeuser(
     let target_id = user.id.get();
     let target_name = &user.name;
 
-    log_command_received!(ctx.channel_id().get(), author_name, "/removeuser", target_user = %target_name);
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{author_name}] /removeuser {target_name}");
 
     {
         let mut settings = ctx.data().shared.settings.write().await;
@@ -880,13 +878,7 @@ pub(in crate::services::discord) async fn cmd_removeuser(
 
     ctx.say(format!("Removed `{}` from authorized users.", target_name))
         .await?;
-    log_info_event!(
-        "discord_user_access_removed",
-        channel_id = ctx.channel_id().get(),
-        user_id = target_id,
-        user_name = %target_name,
-        status = "removed",
-    );
+    tracing::info!("  [{ts}] ▶ Removed user: {target_name} (id:{target_id})");
     Ok(())
 }
 
@@ -913,12 +905,8 @@ pub(in crate::services::discord) async fn cmd_allowall(
         return Ok(());
     }
 
-    log_command_received!(
-        ctx.channel_id().get(),
-        author_name,
-        "/allowall",
-        enabled = enabled
-    );
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{author_name}] /allowall {enabled}");
 
     let response = {
         let mut settings = ctx.data().shared.settings.write().await;
@@ -941,11 +929,7 @@ pub(in crate::services::discord) async fn cmd_allowall(
     let policy_note = build_allowall_policy_note();
     let combined = format!("{response}\n\n{policy_note}");
     ctx.say(&combined).await?;
-    log_info_event!(
-        "discord_public_access_changed",
-        channel_id = ctx.channel_id().get(),
-        status = if enabled { "enabled" } else { "disabled" },
-    );
+    tracing::info!("  [{ts}] ▶ {response}");
     Ok(())
 }
 

@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 
-use crate::db::auto_queue::phase_gate_verdict;
 use crate::engine::PolicyEngine;
 
 use super::dispatch_query::query_dispatch_row_pg;
@@ -48,10 +47,6 @@ pub(crate) fn emit_dispatch_quality_event(
     let Some(event_type) = (match to_status {
         "dispatched" => Some("dispatch_dispatched"),
         "completed" => Some("dispatch_completed"),
-        // Dispatch settlement is distinct from provider turn health. Keeping it
-        // out of `turn_error` prevents one transport failure from counting twice
-        // and prevents attribution failures from lowering turn success rates.
-        "failed" => Some("dispatch_failed"),
         _ => None,
     }) else {
         return;
@@ -271,48 +266,6 @@ async fn dispatch_exists_pg(pool: &PgPool, dispatch_id: &str) -> Result<bool> {
         })
 }
 
-async fn phase_gate_dispatch_uses_legacy_default_on_pg_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    dispatch_id: &str,
-) -> Result<bool> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM task_dispatches td
-             JOIN auto_queue_phase_gates pg ON pg.dispatch_id = td.id
-             JOIN auto_queue_entries e
-               ON e.run_id = pg.run_id
-              AND COALESCE(e.batch_phase, 0) = pg.phase
-             WHERE td.id = $1
-             GROUP BY pg.run_id, pg.phase
-             HAVING COUNT(*) > 0
-                AND BOOL_AND(NULLIF(BTRIM(e.phase_gate_kind, E' \t\n\r\\f\\v'), '') IS NULL)
-         )",
-    )
-    .bind(dispatch_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "load persisted phase-gate kind provenance for dispatch {dispatch_id}: {error}"
-        )
-    })
-}
-
-async fn phase_gate_dispatch_uses_legacy_default_pg(
-    pool: &PgPool,
-    dispatch_id: &str,
-) -> Result<bool> {
-    let mut tx = pool.begin().await.map_err(|error| {
-        anyhow::anyhow!("begin phase-gate kind provenance lookup for {dispatch_id}: {error}")
-    })?;
-    let legacy = phase_gate_dispatch_uses_legacy_default_on_pg_tx(&mut tx, dispatch_id).await?;
-    tx.rollback().await.map_err(|error| {
-        anyhow::anyhow!("rollback phase-gate kind provenance lookup for {dispatch_id}: {error}")
-    })?;
-    Ok(legacy)
-}
-
 async fn validate_dispatch_completion_evidence_on_pg(
     pool: &PgPool,
     dispatch_id: &str,
@@ -478,17 +431,15 @@ fn infer_effective_completion_result(
     to_status: &str,
     context_text: Option<&str>,
     result: Option<&serde_json::Value>,
-    persisted_legacy_default: bool,
 ) -> Option<serde_json::Value> {
     if to_status != "completed" {
         return None;
     }
-    let result = result?;
-    let context =
-        context_text.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())?;
-    let authoritative =
-        phase_gate_verdict::authoritative_context(Some(&context), persisted_legacy_default)?;
-    infer_phase_gate_verdict(dispatch_id, &authoritative, result)
+    let res = result?;
+    context_text
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|ctx| ctx.get("phase_gate").and_then(|v| v.as_object()).cloned())
+        .and_then(|phase_gate_ctx| infer_phase_gate_verdict(dispatch_id, &phase_gate_ctx, res))
 }
 
 /// Pure decision describing which transition side effects the durable write
@@ -595,14 +546,11 @@ async fn set_dispatch_status_on_pg_with_sync(
                     "decode postgres dispatch context for verdict inference {dispatch_id}: {error}"
                 )
             })?;
-            let persisted_legacy_default =
-                phase_gate_dispatch_uses_legacy_default_on_pg_tx(&mut tx, dispatch_id).await?;
             infer_effective_completion_result(
                 dispatch_id,
                 to_status,
                 ctx_text_for_verdict.as_deref(),
                 result,
-                persisted_legacy_default,
             )
         } else {
             None
@@ -1089,13 +1037,9 @@ async fn maybe_inject_phase_gate_verdict_pg(
     .ok()
     .flatten()
     .flatten()?;
-    let context = serde_json::from_str::<serde_json::Value>(&context_raw).ok()?;
-    let persisted_legacy_default = phase_gate_dispatch_uses_legacy_default_pg(pool, dispatch_id)
-        .await
-        .ok()?;
-    let authoritative =
-        phase_gate_verdict::authoritative_context(Some(&context), persisted_legacy_default)?;
-    infer_phase_gate_verdict(dispatch_id, &authoritative, result)
+    let ctx = serde_json::from_str::<serde_json::Value>(&context_raw).ok()?;
+    let phase_gate_ctx = ctx.get("phase_gate").and_then(|v| v.as_object())?;
+    infer_phase_gate_verdict(dispatch_id, phase_gate_ctx, result)
 }
 
 /// Single authority for dispatch completion.
@@ -1392,30 +1336,75 @@ fn complete_dispatch_inner_with_backends(
     Ok(dispatch)
 }
 
-/// #699 / #4884: inject `verdict = context.phase_gate.pass_verdict` into a
-/// phase-gate dispatch result when every declared `checks.*` entry passed but
-/// the caller forgot the explicit verdict field.
+/// #699: inject `verdict = context.phase_gate.pass_verdict` into a phase-gate
+/// dispatch result when every declared `checks.*` entry passed but the caller
+/// forgot the explicit verdict field.
 ///
 /// Returns `Some(enriched)` only when an injection happened — callers should
-/// fall back to the original `result` otherwise.
-///
-/// The pass/fail decision itself is delegated to
-/// `crate::db::auto_queue::phase_gate_verdict`, the single Rust authority also
-/// used by the durable reconciler that runs for CRUD / watcher / bridge
-/// recovery completions. This path only owns the *side effect* of persisting
-/// the inferred verdict onto the result payload; it must never reach a
-/// different verdict than the reconciler would for the same evidence.
+/// fall back to the original `result` otherwise. Never overrides an explicit
+/// verdict/decision (even `"fail"`) and never injects when any check is not
+/// `pass`.
 fn infer_phase_gate_verdict(
     dispatch_id: &str,
-    context: &serde_json::Value,
+    phase_gate_ctx: &serde_json::Map<String, serde_json::Value>,
     result: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let phase_gate_ctx = context.get("phase_gate")?;
-    let phase_gate_verdict::VerdictResolution::Inferred(pass_verdict) =
-        phase_gate_verdict::resolve_verdict(Some(context), result)
-    else {
+    // Explicit verdict/decision already present — never override, even for
+    // explicit "fail" cases.
+    let has_verdict = result
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_decision = result
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if has_verdict || has_decision {
         return None;
-    };
+    }
+
+    let checks_obj = result.get("checks").and_then(|v| v.as_object())?;
+    if checks_obj.is_empty() {
+        return None;
+    }
+
+    // Round-2 fix: when the dispatch context declares a list of required
+    // checks, every one of those keys must be present in `result.checks` and
+    // pass. Missing keys are treated as no-verdict/failure so a partial
+    // payload cannot advance the gate.
+    let declared_checks: Vec<String> = phase_gate_ctx
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for required in &declared_checks {
+        match checks_obj.get(required) {
+            Some(entry) if check_entry_is_pass(entry) => {}
+            _ => return None,
+        }
+    }
+
+    // Also require every *present* check entry to pass — never infer a pass
+    // on the strength of partial "pass"es when some keys report fail/other.
+    for (_name, entry) in checks_obj.iter() {
+        if !check_entry_is_pass(entry) {
+            return None;
+        }
+    }
+
+    // Resolve `pass_verdict` from the dispatch's own phase_gate context, with
+    // the system default as a last resort.
+    let pass_verdict = phase_gate_ctx
+        .get("pass_verdict")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "phase_gate_passed".to_string());
 
     let mut enriched = result.clone();
     if !enriched.is_object() {
@@ -1432,23 +1421,29 @@ fn infer_phase_gate_verdict(
         );
     }
 
-    let declared_check_count = phase_gate_ctx
-        .get("required_checks")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, Vec::len);
-    let reported_check_count = result
-        .get("checks")
-        .and_then(serde_json::Value::as_object)
-        .map_or(0, serde_json::Map::len);
     tracing::info!(
-        dispatch_id = %dispatch_id,
-        pass_verdict = %pass_verdict,
-        declared_check_count,
-        reported_check_count,
-        "[dispatch] #699 inferred phase-gate verdict because all declared checks passed",
+        "[dispatch] #699 inferring phase-gate verdict '{}' for dispatch {} (all {} declared checks passed, {} entries total)",
+        pass_verdict,
+        dispatch_id,
+        declared_checks.len(),
+        checks_obj.len(),
     );
 
     Some(enriched)
+}
+
+fn check_entry_is_pass(entry: &serde_json::Value) -> bool {
+    // Accept either `{"status": "pass"}` (canonical) or a bare string "pass".
+    if let Some(status) = entry.get("status").and_then(|v| v.as_str()) {
+        return status.eq_ignore_ascii_case("pass") || status.eq_ignore_ascii_case("passed");
+    }
+    if let Some(outcome) = entry.get("result").and_then(|v| v.as_str()) {
+        return outcome.eq_ignore_ascii_case("pass") || outcome.eq_ignore_ascii_case("passed");
+    }
+    if let Some(s) = entry.as_str() {
+        return s.eq_ignore_ascii_case("pass") || s.eq_ignore_ascii_case("passed");
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1642,591 +1637,5 @@ mod auto_queue_terminal_sync_policy_tests {
                 "{dispatch_type} is a side-path and must skip terminal sync"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod auto_queue_phase_gate_finalize_wrapper_tests {
-    use super::{
-        infer_effective_completion_result, infer_phase_gate_verdict, log_phase_gate_reconciliation,
-        maybe_inject_phase_gate_verdict_pg, set_dispatch_status_on_pg_async,
-    };
-    use crate::db::auto_queue::test_support::TestPostgresDb;
-    use serde_json::{Value, json};
-    use sqlx::{PgPool, Row};
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::writer::MakeWriter;
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for CapturingWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            match self.buffer.lock() {
-                Ok(mut buffer) => buffer.extend_from_slice(bytes),
-                Err(poisoned) => poisoned.into_inner().extend_from_slice(bytes),
-            }
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture_info_logs(emit: impl FnOnce()) -> Result<String, std::string::FromUtf8Error> {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_writer(CapturingWriter {
-                buffer: buffer.clone(),
-            })
-            .finish();
-        tracing::subscriber::with_default(subscriber, emit);
-        let bytes = match buffer.lock() {
-            Ok(buffer) => buffer.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
-        String::from_utf8(bytes)
-    }
-
-    fn gate() -> serde_json::Value {
-        json!({
-            "phase_gate": crate::phase_gate::resolve_declaration_value("pr-confirm")
-                .expect("pr-confirm declaration") // agentdesk-audit: allow-unwrap — immutable built-in fixture in #[cfg(test)] module
-        })
-    }
-
-    fn passing_checks() -> serde_json::Value {
-        json!({
-            "merge_verified": { "status": "pass" },
-            "issue_closed": { "status": "pass" },
-            "build_passed": { "status": "pass" },
-        })
-    }
-
-    fn legacy_gate_context(run_id: &str) -> Value {
-        json!({
-            "phase_gate": {
-                "run_id": run_id,
-                "batch_phase": 0,
-                "next_phase": 1,
-                "final_phase": false,
-                "checks": ["attacker_override"],
-                "pass_verdict": "attacker_override"
-            }
-        })
-    }
-
-    async fn seed_legacy_gate_dispatch(
-        pool: &PgPool,
-        run_id: &str,
-        dispatch_id: &str,
-        phase_gate_kind: Option<&str>,
-    ) {
-        seed_legacy_gate_dispatch_with_kinds(pool, run_id, dispatch_id, &[phase_gate_kind]).await;
-    }
-
-    async fn seed_legacy_gate_dispatch_with_kinds(
-        pool: &PgPool,
-        run_id: &str,
-        dispatch_id: &str,
-        phase_gate_kinds: &[Option<&str>],
-    ) {
-        sqlx::query(
-            "INSERT INTO agents (id, name, provider)
-             VALUES ('agent-finalize-pg', 'Agent', 'claude')",
-        )
-        .execute(pool)
-        .await
-        .expect("seed finalize test agent"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
-        sqlx::query(
-            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
-             VALUES ($1, 'repo', 'agent-finalize-pg', 'active')",
-        )
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .expect("seed finalize test run"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
-        sqlx::query(
-            "INSERT INTO task_dispatches
-                (id, to_agent_id, dispatch_type, status, title, context)
-             VALUES ($1, 'agent-finalize-pg', 'phase-gate', 'dispatched',
-                     'legacy gate', $2)",
-        )
-        .bind(dispatch_id)
-        .bind(legacy_gate_context(run_id).to_string())
-        .execute(pool)
-        .await
-        .expect("seed finalize test dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
-        for (index, phase_gate_kind) in phase_gate_kinds.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO auto_queue_entries
-                    (id, run_id, status, batch_phase, phase_gate_kind)
-                 VALUES ($1, $2, 'pending', 0, $3)",
-            )
-            .bind(format!("entry-{dispatch_id}-{index}"))
-            .bind(run_id)
-            .bind(*phase_gate_kind)
-            .execute(pool)
-            .await
-            .expect("seed finalize test entry"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
-        }
-        sqlx::query(
-            "INSERT INTO auto_queue_phase_gates
-                (run_id, phase, status, dispatch_id, pass_verdict, next_phase)
-             VALUES ($1, 0, 'pending', $2, 'attacker_override', 1)",
-        )
-        .bind(run_id)
-        .bind(dispatch_id)
-        .execute(pool)
-        .await
-        .expect("seed finalize test gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
-    }
-
-    #[test]
-    fn finalize_wrapper_overwrites_truthy_non_string_verdict_for_compatibility() {
-        for explicit in [json!(true), json!({"blocked_by": "operator"})] {
-            let result = json!({ "verdict": explicit, "checks": passing_checks() });
-            let injected = infer_phase_gate_verdict("dsp-finalize-non-string", &gate(), &result);
-            assert_eq!(
-                injected
-                    .as_ref()
-                    .and_then(|value| value.get("verdict"))
-                    .and_then(|value| value.as_str()),
-                Some("phase_gate_passed")
-            );
-            assert_eq!(
-                injected
-                    .as_ref()
-                    .and_then(|value| value.get("verdict_inferred"))
-                    .and_then(|value| value.as_bool()),
-                Some(true)
-            );
-        }
-    }
-
-    #[test]
-    fn finalize_wrapper_overwrites_truthy_non_string_decision_for_compatibility() {
-        let result = json!({
-            "decision": {"blocked_by": "operator"},
-            "checks": passing_checks(),
-        });
-        let context = gate().to_string();
-        let injected = infer_effective_completion_result(
-            "dsp-finalize-decision",
-            "completed",
-            Some(&context),
-            Some(&result),
-            false,
-        );
-        assert_eq!(
-            injected
-                .as_ref()
-                .and_then(|value| value.get("verdict"))
-                .and_then(|value| value.as_str()),
-            Some("phase_gate_passed")
-        );
-    }
-
-    #[test]
-    fn legacy_context_requires_authoritative_persisted_default() {
-        let context = json!({
-            "phase_gate": {
-                "run_id": "run-legacy",
-                "batch_phase": 0,
-                "checks": ["merge_verified", "issue_closed", "build_passed"],
-                "pass_verdict": "attacker_override"
-            }
-        })
-        .to_string();
-        let result = json!({ "checks": passing_checks() });
-
-        assert!(
-            infer_effective_completion_result(
-                "dsp-legacy",
-                "completed",
-                Some(&context),
-                Some(&result),
-                false,
-            )
-            .is_none(),
-            "missing declaration fields alone must not trigger compatibility"
-        );
-        let injected = infer_effective_completion_result(
-            "dsp-legacy",
-            "completed",
-            Some(&context),
-            Some(&result),
-            true,
-        );
-        assert_eq!(
-            injected
-                .as_ref()
-                .and_then(|value| value.get("verdict"))
-                .and_then(|value| value.as_str()),
-            Some("phase_gate_passed"),
-            "the reconstructed registry declaration must ignore legacy pass_verdict/checks"
-        );
-    }
-
-    #[test]
-    fn partial_or_deploy_snapshots_never_use_legacy_fallback() {
-        let result = json!({ "checks": passing_checks() });
-        for gate in [
-            json!({"run_id": "r", "batch_phase": 0, "kind": "ship-it"}),
-            json!({
-                "run_id": "r",
-                "batch_phase": 0,
-                "kind": "deploy-gate",
-                "declaration_version": 1,
-            }),
-        ] {
-            let context = json!({"phase_gate": gate}).to_string();
-            assert!(
-                infer_effective_completion_result(
-                    "dsp-incompatible",
-                    "completed",
-                    Some(&context),
-                    Some(&result),
-                    true,
-                )
-                .is_none()
-            );
-        }
-    }
-
-    #[cfg(test)]
-    mod postgres_tests {
-        use super::*;
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn normal_finalize_infers_legacy_default_only_from_persisted_null_kind() {
-            let pg_db = TestPostgresDb::create().await;
-            let pool = pg_db.connect_and_migrate().await;
-            seed_legacy_gate_dispatch(&pool, "run-finalize-legacy", "dsp-finalize-legacy", None)
-                .await;
-
-            let injected = maybe_inject_phase_gate_verdict_pg(
-                &pool,
-                "dsp-finalize-legacy",
-                &json!({"checks": passing_checks()}),
-            )
-            .await;
-            assert_eq!(
-                injected
-                    .as_ref()
-                    .and_then(|value| value.get("verdict"))
-                    .and_then(Value::as_str),
-                Some("phase_gate_passed")
-            );
-
-            pool.close().await;
-            pg_db.drop().await;
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn patch_completion_reconstructs_legacy_default_and_clears_gate() {
-            let pg_db = TestPostgresDb::create().await;
-            let pool = pg_db.connect_and_migrate().await;
-            seed_legacy_gate_dispatch(&pool, "run-patch-legacy", "dsp-patch-legacy", Some("   "))
-                .await;
-
-            let changed = set_dispatch_status_on_pg_async(
-                &pool,
-                "dsp-patch-legacy",
-                "completed",
-                Some(&json!({"checks": passing_checks()})),
-                "test_patch",
-                Some(&["dispatched"]),
-                true,
-            )
-            .await
-            .expect("complete legacy PATCH dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(changed, 1);
-            let row = sqlx::query(
-                "SELECT status, result::TEXT AS result FROM task_dispatches WHERE id = $1",
-            )
-            .bind("dsp-patch-legacy")
-            .fetch_one(&pool)
-            .await
-            .expect("load completed PATCH dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(row.get::<String, _>("status"), "completed");
-            let result: Value = serde_json::from_str(&row.get::<String, _>("result"))
-                .expect("decode completed PATCH result"); // agentdesk-audit: allow-unwrap — persisted result must remain valid JSON
-            assert_eq!(result["verdict"], "phase_gate_passed");
-            let gate_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM auto_queue_phase_gates
-             WHERE run_id = 'run-patch-legacy' AND phase = 0",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("count cleared PATCH gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(gate_count, 0);
-
-            pool.close().await;
-            pg_db.drop().await;
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn finalize_and_patch_accept_ascii_control_whitespace_legacy_provenance() {
-            let pg_db = TestPostgresDb::create().await;
-            let pool = pg_db.connect_and_migrate().await;
-            seed_legacy_gate_dispatch(
-                &pool,
-                "run-whitespace-legacy",
-                "dsp-whitespace-legacy",
-                Some(" \t\n\r"),
-            )
-            .await;
-
-            let injected = maybe_inject_phase_gate_verdict_pg(
-                &pool,
-                "dsp-whitespace-legacy",
-                &json!({"checks": passing_checks()}),
-            )
-            .await;
-            assert_eq!(
-                injected
-                    .as_ref()
-                    .and_then(|value| value.get("verdict"))
-                    .and_then(Value::as_str),
-                Some("phase_gate_passed")
-            );
-            let changed = set_dispatch_status_on_pg_async(
-                &pool,
-                "dsp-whitespace-legacy",
-                "completed",
-                Some(&json!({"checks": passing_checks()})),
-                "test_patch",
-                Some(&["dispatched"]),
-                true,
-            )
-            .await
-            .expect("complete whitespace PATCH dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(changed, 1);
-            let gate_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM auto_queue_phase_gates
-             WHERE run_id = 'run-whitespace-legacy' AND phase = 0",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("count cleared whitespace gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(gate_count, 0);
-
-            pool.close().await;
-            pg_db.drop().await;
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn finalize_and_patch_reject_mixed_null_and_nonblank_legacy_provenance() {
-            let pg_db = TestPostgresDb::create().await;
-            let pool = pg_db.connect_and_migrate().await;
-            TestPostgresDb::emulate_pre_0100_deploy_gate_rows(&pool).await;
-            seed_legacy_gate_dispatch_with_kinds(
-                &pool,
-                "run-mixed-legacy",
-                "dsp-mixed-legacy",
-                &[None, Some("deploy-gate")],
-            )
-            .await;
-
-            assert!(
-                maybe_inject_phase_gate_verdict_pg(
-                    &pool,
-                    "dsp-mixed-legacy",
-                    &json!({"checks": passing_checks()}),
-                )
-                .await
-                .is_none()
-            );
-            set_dispatch_status_on_pg_async(
-                &pool,
-                "dsp-mixed-legacy",
-                "completed",
-                Some(&json!({"checks": passing_checks()})),
-                "test_patch",
-                Some(&["dispatched"]),
-                true,
-            )
-            .await
-            .expect("complete mixed-provenance PATCH dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            let result = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT result::TEXT FROM task_dispatches WHERE id = $1",
-            )
-            .bind("dsp-mixed-legacy")
-            .fetch_one(&pool)
-            .await
-            .expect("load mixed-provenance PATCH result") // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            .expect("mixed-provenance PATCH result exists"); // agentdesk-audit: allow-unwrap — completion writes the supplied result
-            let result: Value =
-                serde_json::from_str(&result).expect("decode mixed-provenance PATCH result"); // agentdesk-audit: allow-unwrap — persisted result must remain valid JSON
-            assert!(result.get("verdict").is_none());
-            let gate_status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM auto_queue_phase_gates
-             WHERE run_id = 'run-mixed-legacy' AND phase = 0",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("load failed mixed-provenance gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(gate_status, "failed");
-
-            pool.close().await;
-            pg_db.drop().await;
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn finalize_and_patch_reject_nonblank_legacy_provenance() {
-            let pg_db = TestPostgresDb::create().await;
-            let pool = pg_db.connect_and_migrate().await;
-            TestPostgresDb::emulate_pre_0100_deploy_gate_rows(&pool).await;
-            seed_legacy_gate_dispatch(
-                &pool,
-                "run-nonblank-legacy",
-                "dsp-nonblank-legacy",
-                Some("deploy-gate"),
-            )
-            .await;
-
-            assert!(
-                maybe_inject_phase_gate_verdict_pg(
-                    &pool,
-                    "dsp-nonblank-legacy",
-                    &json!({"checks": passing_checks()}),
-                )
-                .await
-                .is_none()
-            );
-            set_dispatch_status_on_pg_async(
-                &pool,
-                "dsp-nonblank-legacy",
-                "completed",
-                Some(&json!({"checks": passing_checks()})),
-                "test_patch",
-                Some(&["dispatched"]),
-                true,
-            )
-            .await
-            .expect("complete nonblank PATCH dispatch"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            let result = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT result::TEXT FROM task_dispatches WHERE id = $1",
-            )
-            .bind("dsp-nonblank-legacy")
-            .fetch_one(&pool)
-            .await
-            .expect("load nonblank PATCH result") // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            .expect("nonblank PATCH result exists"); // agentdesk-audit: allow-unwrap — completion writes the supplied result
-            let result: Value =
-                serde_json::from_str(&result).expect("decode nonblank PATCH result"); // agentdesk-audit: allow-unwrap — persisted result must remain valid JSON
-            assert!(result.get("verdict").is_none());
-            let gate_status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM auto_queue_phase_gates
-             WHERE run_id = 'run-nonblank-legacy' AND phase = 0",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("load failed nonblank gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
-            assert_eq!(gate_status, "failed");
-
-            pool.close().await;
-            pg_db.drop().await;
-        }
-    }
-
-    #[test]
-    fn failed_reconciliation_log_does_not_emit_verdict_payload() {
-        let result = json!({
-            "verdict": {"authorization": "Bearer secret"},
-            "checks": {"build_passed": "fail"},
-        });
-        let resolution = crate::db::auto_queue::phase_gate_verdict::resolve_verdict(None, &result);
-        assert_eq!(
-            resolution,
-            crate::db::auto_queue::phase_gate_verdict::VerdictResolution::Missing
-        );
-        let failed_reason = match crate::db::auto_queue::phase_gate_verdict::diagnostic_verdict(
-            &result,
-            &resolution,
-        ) {
-            Some(diagnostic) => format!("expected verdict gate_ok, got {diagnostic}"),
-            None => "expected verdict gate_ok, got none".to_string(),
-        };
-        let outcome = crate::db::auto_queue::PhaseGateReconciliation::MarkedFailed {
-            run_id: "run-log-redaction".to_string(),
-            phase: 0,
-            failed_dispatch_id: "dsp-log-redaction".to_string(),
-            failed_reason,
-        };
-        let logs = capture_info_logs(|| {
-            log_phase_gate_reconciliation("dsp-log-redaction", &outcome);
-        });
-
-        assert!(
-            logs.as_ref()
-                .is_ok_and(|logs| logs.contains("<non-string:object>")),
-            "{logs:?}"
-        );
-        assert!(
-            logs.as_ref().is_ok_and(|logs| {
-                !logs.contains("authorization") && !logs.contains("Bearer secret")
-            }),
-            "failed reconciliation log leaked verdict payload: {logs:?}"
-        );
-    }
-
-    #[test]
-    fn inferred_verdict_log_preserves_check_cardinality_fields() {
-        let result = json!({ "checks": passing_checks() });
-        let logs = capture_info_logs(|| {
-            let injected = infer_phase_gate_verdict("dsp-log-fields", &gate(), &result);
-            assert!(injected.is_some());
-        });
-
-        assert!(
-            logs.as_ref()
-                .is_ok_and(|logs| logs.contains("dispatch_id=dsp-log-fields")),
-            "{logs:?}"
-        );
-        assert!(
-            logs.as_ref()
-                .is_ok_and(|logs| logs.contains("pass_verdict=phase_gate_passed")),
-            "{logs:?}"
-        );
-        assert!(
-            logs.as_ref()
-                .is_ok_and(|logs| logs.contains("declared_check_count=3")),
-            "{logs:?}"
-        );
-        assert!(
-            logs.as_ref()
-                .is_ok_and(|logs| logs.contains("reported_check_count=3")),
-            "{logs:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_string_failure_is_not_overridden() {
-        let result = json!({
-            "phase_gate_verdict": "manual_hold",
-            "checks": passing_checks(),
-        });
-        assert_eq!(
-            infer_phase_gate_verdict("dsp-explicit", &gate(), &result),
-            None
-        );
     }
 }

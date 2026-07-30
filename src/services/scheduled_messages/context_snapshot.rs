@@ -675,7 +675,6 @@ mod postgres_tests {
                 assistant_message: assistant,
                 events: &[],
                 duration_ms: None,
-                turn_started_at_millis: None,
             },
         )
         .await

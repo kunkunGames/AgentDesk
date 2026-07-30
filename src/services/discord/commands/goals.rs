@@ -28,7 +28,8 @@ pub(in crate::services::discord) async fn cmd_goals(ctx: Context<'_>) -> Result<
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/goals");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /goals");
 
     let channel_id = ctx.channel_id();
     let channel_name_hint = fallback_channel_name_for_feature_toggle(ctx, channel_id).await;

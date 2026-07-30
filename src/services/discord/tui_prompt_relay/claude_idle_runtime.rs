@@ -112,12 +112,9 @@ pub(super) fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                     RuntimeHandoffKind::ClaudeTui,
                 )
             {
-                let Some(channel_id) = owner_channel_for_tmux_session(
-                    &shared,
-                    &ProviderKind::Claude,
-                    &tmux_session_name,
-                    RelayEmissionKind::Poll,
-                ) else {
+                let Some(channel_id) =
+                    owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, &tmux_session_name)
+                else {
                     // #3018/#3306/#3656: registry miss ⇒ drop; chokepoint repairs.
                     continue;
                 };
@@ -158,26 +155,23 @@ pub(super) fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                 let transcript_eof = std::fs::metadata(&transcript_path)
                     .ok()
                     .map(|metadata| metadata.len());
-                // #4549/#4841: `/compact` rewrites the same UUID/path in place.
-                // Re-anchor only to a complete JSONL boundary: a mid-write EOF falls
-                // back to zero so the next poll re-reads the entire partial line.
-                // Durable same-generation evidence preserves restart detection; a
-                // real rotation still uses the bounded newest-prompt lookback below.
-                let mut observed_durable_frontier_end = None;
+                // #4549: `/compact` rewrites the same UUID/path in place. When the
+                // current-generation durable frontier and binding cursor are both
+                // beyond the new EOF, re-anchor at EOF instead of scanning the
+                // compacted historical snapshot from zero. A real rotation changes
+                // path/session identity and stays on the bounded newest-prompt
+                // lookback below, so fresh replacement-file content is preserved.
                 let compaction_reanchor = transcript_eof.and_then(|eof| {
-                    let reanchor_offset =
-                        claude_idle_safe_reanchor_offset(&transcript_path, eof).ok()?;
-                    observed_durable_frontier_end = dr::delivered_frontier_exceeding_current_eof(
-                        &ProviderKind::Claude,
-                        channel_id,
-                        &tmux_session_name,
-                        eof,
-                    );
                     claude_idle_compaction_reanchor(
                         path_changed,
                         binding.last_offset,
-                        reanchor_offset,
-                        observed_durable_frontier_end.is_some(),
+                        eof,
+                        dr::delivered_frontier_exceeds_current_eof(
+                            &ProviderKind::Claude,
+                            channel_id,
+                            &tmux_session_name,
+                            eof,
+                        ),
                     )
                 });
                 // #2843 (codex round-2 P1): the lookback can hold several finished
@@ -214,51 +208,6 @@ pub(super) fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                         }
                     }
                     ClaudeIdleTranscriptScan::CompactionReanchor { offset } => {
-                        let durable_reanchored = if let Some(expected_frontier_end) =
-                            observed_durable_frontier_end
-                        {
-                            match dr::reanchor_current_generation_frontier(
-                                &ProviderKind::Claude,
-                                channel_id,
-                                &tmux_session_name,
-                                expected_frontier_end,
-                                offset,
-                            ) {
-                                Ok(true) => true,
-                                Ok(false) => {
-                                    tracing::debug!(
-                                        tmux_session_name = %tmux_session_name,
-                                        channel_id = channel_id.get(),
-                                        transcript_path = %transcript_path.display(),
-                                        reanchored_offset = offset,
-                                        expected_frontier_end,
-                                        "Claude idle transcript relay deferred compaction reanchor after durable frontier changed"
-                                    );
-                                    continue;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        tmux_session_name = %tmux_session_name,
-                                        channel_id = channel_id.get(),
-                                        transcript_path = %transcript_path.display(),
-                                        reanchored_offset = offset,
-                                        expected_frontier_end,
-                                        error = %error,
-                                        "Claude idle transcript relay deferred compaction reanchor after durable frontier write failed"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else {
-                            false
-                        };
-                        super::super::tmux::reset_stale_relay_watermark_if_output_regressed(
-                            shared.as_ref(),
-                            channel_id,
-                            &tmux_session_name,
-                            offset,
-                            "claude_idle_compaction_reanchor",
-                        );
                         advance_claude_tmux_runtime_binding_offset(
                             &tmux_session_name,
                             &transcript_path,
@@ -270,8 +219,7 @@ pub(super) fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             transcript_path = %transcript_path.display(),
                             previous_offset = binding.last_offset,
                             reanchored_offset = offset,
-                            durable_reanchored,
-                            "Claude idle transcript relay fast-forwarded compacted history to a complete JSONL boundary"
+                            "Claude idle transcript relay fast-forwarded compacted history to current EOF"
                         );
                     }
                     ClaudeIdleTranscriptScan::Prompt {

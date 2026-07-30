@@ -59,10 +59,6 @@ var PHASE_GATE_AUTOCLOSE_TTL_SEC = _autoQueuePhaseGateLib.PHASE_GATE_AUTOCLOSE_T
 var PHASE_GATE_GRACE_WINDOW_MS = _autoQueuePhaseGateLib.PHASE_GATE_GRACE_WINDOW_MS;
 var _inferPhaseGatePassVerdict = _autoQueuePhaseGateLib.inferPhaseGatePassVerdict;
 var _phaseGateVerdictMatches = _autoQueuePhaseGateLib.phaseGateVerdictMatches;
-var _phaseGateDiagnosticVerdict = _autoQueuePhaseGateLib.phaseGateDiagnosticVerdict;
-var _phaseGateFailureReason = _autoQueuePhaseGateLib.phaseGateFailureReason;
-var authoritativePhaseGateContext = _autoQueuePhaseGateLib.authoritativePhaseGateContext;
-var _phaseGateGroupKey = _autoQueuePhaseGateLib.phaseGateGroupKey;
 var phaseGateFailureKey = _autoQueuePhaseGateLib.phaseGateFailureKey;
 var incrementPhaseGateFailureCount = _autoQueuePhaseGateLib.incrementPhaseGateFailureCount;
 var resetPhaseGateFailureCount = _autoQueuePhaseGateLib.resetPhaseGateFailureCount;
@@ -234,10 +230,8 @@ var autoQueue = {
       return;
     }
 
-    var authoritativeContext = authoritativePhaseGateContext(gate.run_id, phase, context);
-    var authoritativeGate = authoritativeContext && authoritativeContext.phase_gate;
     var verdict = result.verdict || result.decision || result.phase_gate_verdict || null;
-    var passVerdict = authoritativeGate ? authoritativeGate.pass_verdict : "phase_gate_passed";
+    var passVerdict = gate.pass_verdict || "phase_gate_passed";
 
     // #699 fallback: legacy callers may have persisted a phase-gate result
     // with every declared check passing but no explicit `verdict`. The
@@ -245,7 +239,7 @@ var autoQueue = {
     // rows stored before the fix shipped. Never infer "pass" when any check
     // reports fail, and never override an explicit verdict/decision.
     if (!verdict) {
-      var inferred = _inferPhaseGatePassVerdict(authoritativeContext, result);
+      var inferred = _inferPhaseGatePassVerdict(context, result);
       if (inferred) {
         verdict = inferred;
         autoQueueLog("info", "Inferred phase gate verdict '" + inferred + "' for dispatch " + dispatch.id + " (no explicit verdict)", {
@@ -257,7 +251,7 @@ var autoQueue = {
       }
     }
 
-    if (!_phaseGateVerdictMatches(verdict, passVerdict, authoritativeContext, result)) {
+    if (!_phaseGateVerdictMatches(verdict, passVerdict, context, result)) {
       // #2035: before failing this gate, try the issue_closed-only fallback.
       // Conservative entry conditions: merge_verified=pass, build_passed=pass,
       // ONLY issue_closed failing, same commit hash recorded on the card, and
@@ -266,7 +260,7 @@ var autoQueue = {
       // against fresh `issue_closed_at` state. Failures fall through to the
       // existing pauseRun path so nothing is silently swallowed.
       var fallback = _attemptPhaseGateAutoCloseFallback(
-        gate.run_id, phase, dispatch.id, authoritativeContext || context, result
+        gate.run_id, phase, dispatch.id, context, result
       );
       if (fallback.attempted) {
         autoQueueLog("info", "Phase gate autoclose fallback attempted for run " + gate.run_id + " phase " + phase + " — anyClosed=" + !!fallback.anyClosed, {
@@ -296,8 +290,8 @@ var autoQueue = {
       }
       state.status = "failed";
       state.failed_dispatch_id = dispatch.id;
-      state.failed_verdict = _phaseGateDiagnosticVerdict(result, verdict);
-      state.failed_reason = _phaseGateFailureReason(result, passVerdict, state.failed_verdict);
+      state.failed_verdict = verdict;
+      state.failed_reason = result.summary || result.reason || ("expected " + passVerdict + ", got " + (verdict || "none"));
       savePhaseGateState(gate.run_id, phase, state);
       pauseRun(gate.run_id);
       // #2035: surface verdict mismatch as a discord alert (debounced 1/hr).
@@ -362,14 +356,13 @@ var autoQueue = {
       if (gateDispatch.result && gateDispatch.result !== "{}" && gateDispatch.result !== "[]") {
         try { gateResult = JSON.parse(gateDispatch.result); } catch (e) { gateResult = {}; }
       }
-      var siblingContext = authoritativePhaseGateContext(gate.run_id, phase, gateContext);
-      var expectedVerdict = (siblingContext && siblingContext.phase_gate && siblingContext.phase_gate.pass_verdict) || "phase_gate_passed";
+      var expectedVerdict = (gateContext.phase_gate && gateContext.phase_gate.pass_verdict) || "phase_gate_passed";
       var gateVerdict = gateResult.verdict || gateResult.decision || gateResult.phase_gate_verdict || null;
       // #699 (round 2): sibling gate dispatches persisted before the server
       // fix shipped will still be missing `verdict`. Re-run the inference
       // here so the aggregate gate evaluation does not trip on legacy rows.
       if (!gateVerdict) {
-        var siblingInferred = _inferPhaseGatePassVerdict(siblingContext, gateResult);
+        var siblingInferred = _inferPhaseGatePassVerdict(gateContext, gateResult);
         if (siblingInferred) {
           gateVerdict = siblingInferred;
           autoQueueLog("info", "Inferred sibling phase gate verdict '" + siblingInferred + "' for dispatch " + gateDispatch.id + " (legacy row, no explicit verdict)", {
@@ -380,12 +373,12 @@ var autoQueue = {
           });
         }
       }
-      if (gateDispatch.status !== "completed" || !_phaseGateVerdictMatches(gateVerdict, expectedVerdict, siblingContext, gateResult)) {
+      if (gateDispatch.status !== "completed" || !_phaseGateVerdictMatches(gateVerdict, expectedVerdict, gateContext, gateResult)) {
         // #2035: sibling gate path — try the issue_closed-only autoclose
         // fallback before failing. Same one-shot guard as the primary path.
         if (gateDispatch.status === "completed") {
           var siblingFallback = _attemptPhaseGateAutoCloseFallback(
-            gate.run_id, phase, gateDispatch.id, siblingContext || gateContext, gateResult
+            gate.run_id, phase, gateDispatch.id, gateContext, gateResult
           );
           if (siblingFallback.attempted && siblingFallback.anyClosed) {
             autoQueueLog("info", "Phase gate autoclose fallback attempted for sibling dispatch " + gateDispatch.id + " — anyClosed=true", {
@@ -409,12 +402,8 @@ var autoQueue = {
         }
         state.status = "failed";
         state.failed_dispatch_id = gateDispatch.id;
-        state.failed_verdict = _phaseGateDiagnosticVerdict(gateResult, gateVerdict);
-        state.failed_reason = _phaseGateFailureReason(
-          gateResult,
-          expectedVerdict,
-          state.failed_verdict
-        );
+        state.failed_verdict = gateVerdict;
+        state.failed_reason = gateResult.summary || gateResult.reason || ("gate verdict mismatch for dispatch " + gateDispatch.id);
         savePhaseGateState(gate.run_id, phase, state);
         pauseRun(gate.run_id);
         _maybeAlertPhaseGateVerdictMismatch(
@@ -608,13 +597,8 @@ if (typeof module !== "undefined" && module.exports) {
     __test: {
       inferPhaseGatePassVerdict: _inferPhaseGatePassVerdict,
       phaseGateVerdictMatches: _phaseGateVerdictMatches,
-      phaseGateDiagnosticVerdict: _phaseGateDiagnosticVerdict,
-      phaseGateFailureReason: _phaseGateFailureReason,
-      phaseGateGroupKey: _phaseGateGroupKey,
       dispatchableTargets: _dispatchableTargets,
-      freePathToDispatchable: _freePathToDispatchable,
-      buildPhaseGateGroups: _buildPhaseGateGroups,
-      createPhaseGateDispatches: _createPhaseGateDispatches
+      freePathToDispatchable: _freePathToDispatchable
     }
   };
 }

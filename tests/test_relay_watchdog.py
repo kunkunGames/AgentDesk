@@ -26,6 +26,7 @@ import scripts.relay_watchdog as relay_watchdog
 from scripts.relay_watchdog import (
     COVERAGE_ACTIVITY_FRESH_SECS,
     COVERAGE_CONFIRM_TICKS,
+    COVERAGE_DESYNC_CONFIRM_SECS,
     COVERAGE_COVERED,
     COVERAGE_UNCOVERED,
     COVERAGE_UNKNOWN,
@@ -57,7 +58,6 @@ from scripts.relay_watchdog import (
     assistant_blocks_from_lines,
     channel_project_dirs,
     delivered,
-    delivered_flags,
     delivered_watermark_for_path,
     delivered_watermarks,
     evaluate,
@@ -74,8 +74,6 @@ from scripts.relay_watchdog import (
     parse_config,
     parse_watcher_state_probe,
     parse_transcript_ts,
-    permanent_loss_tombstones,
-    permanent_loss_total,
     project_slug,
     recheck_selected_transcript,
     save_state,
@@ -1275,25 +1273,6 @@ class WatcherStateParserTests(unittest.TestCase):
             ),
         )
 
-    def test_parses_local_inflight_updated_at(self):
-        payload = self.payload()
-        payload["inflight_updated_at"] = "2026-07-24 10:43:58"
-
-        probe = parse_watcher_state_probe(200, payload)
-
-        self.assertEqual(
-            probe.inflight_updated_at,
-            time.mktime(time.strptime("2026-07-24 10:43:58", "%Y-%m-%d %H:%M:%S")),
-        )
-
-    def test_malformed_inflight_updated_at_fails_closed(self):
-        payload = self.payload()
-        payload["inflight_updated_at"] = "2026-07-24T10:43:58Z"
-
-        probe = parse_watcher_state_probe(200, payload)
-
-        self.assertIsNone(probe.inflight_updated_at)
-
     def test_nullable_activity_timestamps_are_valid_schema(self):
         probe = parse_watcher_state_probe(
             200,
@@ -1363,10 +1342,7 @@ class WatcherStateParserTests(unittest.TestCase):
         self.assertTrue(verdict.confirmed)
 
     def test_non_mapping_and_non_200_never_invent_activity(self):
-        self.assertEqual(
-            parse_watcher_state_probe(200, []),
-            WatcherStateProbe(200, response_malformed=True),
-        )
+        self.assertEqual(parse_watcher_state_probe(200, []), WatcherStateProbe(200))
         self.assertEqual(
             parse_watcher_state_probe(404, self.payload()), WatcherStateProbe(404)
         )
@@ -2157,9 +2133,7 @@ class RuntimeCoverageProbeTests(unittest.TestCase):
         )
         with mock.patch.object(relay_watchdog.subprocess, "run", return_value=completed):
             probe = self.make_rt().watcher_state("999")
-        self.assertEqual(
-            probe, WatcherStateProbe(200, None, None, response_malformed=True)
-        )
+        self.assertEqual(probe, WatcherStateProbe(200, None, None))
 
     def test_direct_node_snapshot_does_not_report_tunnel_closed(self):
         calls: list[list[str]] = []
@@ -2210,7 +2184,6 @@ class FakeRuntime(Runtime):
         self.log_lines: list[str] = []
         self.haystack: str | None = ""
         self.issue_calls = 0
-        self.alert_succeeds = True
         self.live_sessions: set[str] | None = set()
         self.watcher_probe = WatcherStateProbe(None)
         self.watcher_calls = 0
@@ -2231,9 +2204,8 @@ class FakeRuntime(Runtime):
     def dcserver_snapshot(self) -> str:
         return "stub-snapshot"
 
-    def alert(self, ch, body: str, trigger_turn: bool = True) -> bool:
+    def alert(self, ch, body: str, trigger_turn: bool = True) -> None:
         self.alerts.append((body, trigger_turn))
-        return self.alert_succeeds
 
     def file_github_issue(self, ch, gap_min: int, lost: int) -> str:
         self.issue_calls += 1
@@ -2274,9 +2246,8 @@ class FakePgRuntime(Runtime):
     def dcserver_snapshot(self) -> str:
         return "stub-pg-snapshot"
 
-    def alert(self, ch, body: str, trigger_turn: bool = True) -> bool:
+    def alert(self, ch, body: str, trigger_turn: bool = True) -> None:
         self.alerts.append((body, trigger_turn))
-        return True
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -2413,13 +2384,12 @@ class TickChannelTests(unittest.TestCase):
 
     def write_transcript(self, blocks: list[tuple[float, str]]) -> None:
         lines = []
-        for index, (epoch, text) in enumerate(blocks):
+        for epoch, text in blocks:
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
             lines.append(
                 json.dumps(
                     {
                         "type": "assistant",
-                        "uuid": f"00000000-0000-4000-8000-{index:012d}",
                         "timestamp": ts,
                         "message": {"content": [{"type": "text", "text": text}]},
                     }
@@ -2447,7 +2417,6 @@ class TickChannelTests(unittest.TestCase):
         rt.watcher_probe = probe
 
     def active_foreground_probe(self, **overrides) -> WatcherStateProbe:
-        inflight_updated_at = overrides.pop("inflight_updated_at", None)
         fields = {
             "relay_stall_state": "active_foreground_stream",
             "active_turn": "foreground",
@@ -2466,7 +2435,6 @@ class TickChannelTests(unittest.TestCase):
             attached=True,
             desynced=True,
             relay_activity=CoverageActivityProbe(**fields),
-            inflight_updated_at=inflight_updated_at,
         )
 
     def test_metadata_only_growth_cannot_steal_live_selection(self):
@@ -2761,7 +2729,7 @@ class TickChannelTests(unittest.TestCase):
         self.assertEqual(rt.alerts, [])
         self.assertNotIn("last_coverage_alert", state["999"])
 
-    def test_stale_foreground_desync_needs_delivery_gap_not_duration(self):
+    def test_stale_foreground_desync_alarms_at_longer_backstop(self):
         rt = self.make_rt()
         stale_ms = int(self.now * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
         self.arm_coverage(
@@ -2774,15 +2742,15 @@ class TickChannelTests(unittest.TestCase):
         state = {
             "999": {
                 "coverage_uncovered_ticks": 1,
-                "coverage_desync_since": self.now - 600,
+                "coverage_desync_since": self.now - COVERAGE_DESYNC_CONFIRM_SECS,
             }
         }
 
         tick_channel(rt, TICK_CHANNEL, state, self.now)
 
-        self.assertEqual(rt.alerts, [])
-        self.assertNotIn("last_coverage_alert", state["999"])
-        self.assertTrue(any("uncorroborated" in line for line in rt.log_lines))
+        self.assertEqual(len(rt.alerts), 1)
+        self.assertIn("커버리지 불변식 위반", rt.alerts[0][0])
+        self.assertIn("attached_but_desynced", rt.alerts[0][0])
 
     def test_partial_foreground_schema_confirms_without_early_desync_alert(self):
         rt = self.make_rt()
@@ -2808,71 +2776,38 @@ class TickChannelTests(unittest.TestCase):
             state["999"]["coverage_uncovered_ticks"], COVERAGE_CONFIRM_TICKS
         )
 
-    def test_uncorroborated_idle_desync_never_alarms_on_duration_alone(self):
+    def test_uncorroborated_load_desync_alarms_only_after_duration_backstop(self):
         self.write_transcript([(self.now - 30, "delivered block")])
         rt = self.make_rt(poll_secs=60)
         rt.haystack = norm("delivered block")
-        tick_at = self.now + 600
-        self.arm_coverage(
-            rt,
-            self.active_foreground_probe(
-                queue_depth=1,
-                last_outbound_activity_ms=None,
-                last_relay_ts_ms=int(tick_at * 1000) - 1,
-            ),
-        )
-        state = {
-            "999": {
-                "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-                "coverage_desync_since": self.now,
-            }
-        }
+        self.arm_coverage(rt, self.active_foreground_probe(queue_depth=1))
+        state: dict = {}
 
-        tick_coverage(
-            rt,
-            TICK_CHANNEL,
-            state["999"],
-            tick_at,
-            CoverageTranscriptProbe(growing=False, blocks=723, lost=0),
-        )
+        for tick_index in range(COVERAGE_DESYNC_CONFIRM_SECS // rt.cfg.poll_secs):
+            tick_channel(
+                rt,
+                TICK_CHANNEL,
+                state,
+                self.now + tick_index * rt.cfg.poll_secs,
+            )
+            self.assertFalse(
+                any("커버리지 불변식 위반" in body for body, _ in rt.alerts)
+            )
 
-        self.assertEqual(rt.alerts, [])
-        self.assertNotIn("last_coverage_alert", state["999"])
-        self.assertFalse(state["999"].get("gap_since"))
-        self.assertFalse(state["999"].get("alerting"))
-        self.assertTrue(
-            any("zero loss and recent relay" in line for line in rt.log_lines)
-        )
-
-    def test_uncorroborated_desync_without_gap_stays_suppressed(self):
-        rt = self.make_rt()
-        tick_at = self.now + 600
-        self.arm_coverage(
-            rt,
-            self.active_foreground_probe(
-                queue_depth=1,
-                last_outbound_activity_ms=None,
-                last_relay_ts_ms=(
-                    int(tick_at * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
-                ),
-            ),
-        )
-        state = {
-            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-            "coverage_desync_since": self.now,
-        }
-
-        tick_coverage(
+        self.assertEqual(state["999"]["coverage_desync_since"], self.now)
+        tick_channel(
             rt,
             TICK_CHANNEL,
             state,
-            tick_at,
-            CoverageTranscriptProbe(growing=False, blocks=723, lost=0),
+            self.now + COVERAGE_DESYNC_CONFIRM_SECS,
         )
 
-        self.assertEqual(rt.alerts, [])
-        self.assertNotIn("last_coverage_alert", state)
-        self.assertTrue(any("uncorroborated" in line for line in rt.log_lines))
+        self.assertTrue(
+            any("커버리지 불변식 위반" in body for body, _ in rt.alerts)
+        )
+        self.assertIn("last_coverage_alert", state["999"])
+        self.assertFalse(state["999"].get("gap_since"))
+        self.assertFalse(state["999"].get("alerting"))
 
     def test_delivery_gap_corroborates_desync_coverage_alarm(self):
         rt = self.gap_rt()
@@ -2893,7 +2828,7 @@ class TickChannelTests(unittest.TestCase):
 
     def test_growth_lag_with_zero_loss_and_recent_relay_suppresses_alert(self):
         rt = self.make_rt()
-        tick_at = self.now + 600
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
         probe = self.active_foreground_probe(
             queue_depth=1,
             last_outbound_activity_ms=None,
@@ -2915,13 +2850,11 @@ class TickChannelTests(unittest.TestCase):
 
         self.assertEqual(rt.alerts, [])
         self.assertNotIn("last_coverage_alert", state)
-        self.assertTrue(
-            any("zero loss and recent relay" in line for line in rt.log_lines)
-        )
+        self.assertTrue(any("growth lag" in line for line in rt.log_lines))
 
     def test_growth_with_loss_still_alerts_desync_coverage(self):
         rt = self.make_rt()
-        tick_at = self.now + 600
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
         probe = self.active_foreground_probe(
             queue_depth=1,
             last_outbound_activity_ms=None,
@@ -2931,11 +2864,6 @@ class TickChannelTests(unittest.TestCase):
         state = {
             "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
             "coverage_desync_since": self.now,
-            # #4961: transcript loss no longer corroborates a desync on its own.
-            # Corroboration is delegated to `gap_since`, the delivery-gap
-            # watermark that `evaluate()` already maintains monotonically, so
-            # this fixture carries the sustained-loss evidence in that key.
-            "gap_since": tick_at - rt.cfg.gap_alert_secs,
         }
 
         tick_coverage(
@@ -2949,145 +2877,9 @@ class TickChannelTests(unittest.TestCase):
         self.assertEqual(len(rt.alerts), 1)
         self.assertIn("attached_but_desynced", rt.alerts[0][0])
 
-    def _loss_corroboration_probe(self, tick_at):
-        return self.active_foreground_probe(
-            queue_depth=1,
-            last_outbound_activity_ms=None,
-            last_relay_ts_ms=int(tick_at * 1000) - 1,
-        )
-
-    def test_isolated_transcript_loss_without_gap_since_does_not_corroborate(self):
-        # #4961 regression: two real false positives (ticks=83 gap=678s and
-        # ticks=4 gap=799s, same channel) fired off a single lost>0 tick whose
-        # neighbours both reported lost=0 — relay batching, not a dead relay.
-        # A momentary `lost > 0` carries no duration evidence, so on its own it
-        # must not corroborate the desync. Sustained loss is expressed by
-        # `gap_since`, which is absent here.
+    def test_growth_with_stale_relay_timestamp_still_alerts(self):
         rt = self.make_rt()
-        tick_at = self.now + 600
-        self.arm_coverage(rt, self._loss_corroboration_probe(tick_at))
-        state = {
-            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-            "coverage_desync_since": self.now,
-        }
-
-        tick_coverage(
-            rt,
-            TICK_CHANNEL,
-            state,
-            tick_at,
-            CoverageTranscriptProbe(growing=True, blocks=723, lost=1),
-        )
-
-        self.assertEqual(rt.alerts, [])
-        self.assertNotIn("last_coverage_alert", state)
-        # tick_coverage observes only; it must not invent a corroboration key.
-        self.assertNotIn("gap_since", state)
-        self.assertTrue(
-            any(
-                "coverage desync uncorroborated" in line for line in rt.log_lines
-            )
-        )
-
-    def test_transcript_loss_with_gap_since_corroborates_desync_coverage_alarm(self):
-        # The real signal is preserved: once `evaluate()` has opened a delivery
-        # gap (STATE_GAP -> `gap_since`), transcript loss corroborates the
-        # desync and the alarm fires. `gap_since` is owned by the gap path, so
-        # tick_coverage must read it without rewriting it.
-        rt = self.make_rt()
-        tick_at = self.now + 600
-        self.arm_coverage(rt, self._loss_corroboration_probe(tick_at))
-        gap_since = tick_at - rt.cfg.gap_alert_secs
-        state = {
-            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-            "coverage_desync_since": self.now,
-            "gap_since": gap_since,
-        }
-
-        tick_coverage(
-            rt,
-            TICK_CHANNEL,
-            state,
-            tick_at,
-            CoverageTranscriptProbe(growing=True, blocks=723, lost=1),
-        )
-
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("attached_but_desynced", rt.alerts[0][0])
-        self.assertEqual(state["gap_since"], gap_since)
-
-    def test_growth_with_stale_relay_and_advanced_inflight_update_is_suppressed(self):
-        rt = self.make_rt()
-        tick_at = self.now + 600
-        stale_relay_ms = (
-            int(tick_at * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
-        )
-        probe = self.active_foreground_probe(
-            queue_depth=1,
-            last_outbound_activity_ms=None,
-            last_relay_ts_ms=stale_relay_ms,
-            inflight_updated_at=tick_at - COVERAGE_ACTIVITY_FRESH_SECS - 1,
-        )
-        self.arm_coverage(rt, probe)
-        state = {
-            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-            "coverage_desync_since": self.now,
-            relay_watchdog.COVERAGE_INFLIGHT_UPDATED_AT_KEY: (
-                tick_at - COVERAGE_ACTIVITY_FRESH_SECS - 2
-            ),
-        }
-
-        tick_coverage(
-            rt,
-            TICK_CHANNEL,
-            state,
-            tick_at,
-            CoverageTranscriptProbe(growing=True, blocks=723, lost=0),
-        )
-
-        self.assertEqual(rt.alerts, [])
-        self.assertNotIn("last_coverage_alert", state)
-        self.assertTrue(
-            any(
-                "live inflight update evidence=advanced" in line
-                for line in rt.log_lines
-            )
-        )
-
-    def test_growth_with_stale_relay_and_stalled_inflight_update_still_alerts(self):
-        rt = self.make_rt()
-        tick_at = self.now + 600
-        stale_relay_ms = (
-            int(tick_at * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
-        )
-        stalled_inflight = tick_at - COVERAGE_ACTIVITY_FRESH_SECS - 1
-        probe = self.active_foreground_probe(
-            queue_depth=1,
-            last_outbound_activity_ms=None,
-            last_relay_ts_ms=stale_relay_ms,
-            inflight_updated_at=stalled_inflight,
-        )
-        self.arm_coverage(rt, probe)
-        state = {
-            "coverage_uncovered_ticks": COVERAGE_CONFIRM_TICKS - 1,
-            "coverage_desync_since": self.now,
-            relay_watchdog.COVERAGE_INFLIGHT_UPDATED_AT_KEY: stalled_inflight,
-        }
-
-        tick_coverage(
-            rt,
-            TICK_CHANNEL,
-            state,
-            tick_at,
-            CoverageTranscriptProbe(growing=True, blocks=723, lost=0),
-        )
-
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("attached_but_desynced", rt.alerts[0][0])
-
-    def test_growth_with_stale_relay_and_absent_inflight_update_still_alerts(self):
-        rt = self.make_rt()
-        tick_at = self.now + 600
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
         stale_relay_ms = (
             int(tick_at * 1000) - COVERAGE_ACTIVITY_FRESH_SECS * 1000
         )
@@ -3117,7 +2909,7 @@ class TickChannelTests(unittest.TestCase):
         self.write_transcript([(self.now - 30, "delivered initial")])
         rt = self.make_rt(poll_secs=60)
         rt.haystack = norm("delivered initial selector growth")
-        tick_at = self.now + 600
+        tick_at = self.now + COVERAGE_DESYNC_CONFIRM_SECS
         self.arm_coverage(
             rt,
             self.active_foreground_probe(
@@ -3140,9 +2932,7 @@ class TickChannelTests(unittest.TestCase):
         tick_channel(rt, TICK_CHANNEL, state, tick_at)
 
         self.assertEqual(rt.alerts, [])
-        self.assertTrue(
-            any("zero loss and recent relay" in line for line in rt.log_lines)
-        )
+        self.assertTrue(any("growth lag" in line for line in rt.log_lines))
 
     def test_active_foreground_evidence_cannot_suppress_detached_alert(self):
         rt = self.make_rt()
@@ -5748,7 +5538,7 @@ class TickChannelTests(unittest.TestCase):
         self.assertNotIn(relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY, chs)
         self.assertFalse(chs.get("alerting", False))
 
-        stale_tick = self.now + rt.cfg.gap_alert_secs + 2
+        stale_tick = self.now + rt.cfg.grace_secs + 2
         rt.haystack = ""
         tick_channel(rt, TICK_CHANNEL, state, stale_tick)
         save_state(state_path, state)
@@ -5760,7 +5550,6 @@ class TickChannelTests(unittest.TestCase):
         self.assertTrue(chs.get("alerting"))
 
         rt.haystack = norm("new missing B")
-        rt.watcher_probe = WatcherStateProbe(200, True, False)
         tick_channel(rt, TICK_CHANNEL, state, stale_tick + 1)
         chs = state["999"]
         self.assertFalse(chs.get("alerting", False))
@@ -6180,611 +5969,9 @@ class TickChannelTests(unittest.TestCase):
         tick_channel(rt, TICK_CHANNEL, {}, self.now)
         self.assertEqual(rt.alerts, [])
 
-    def append_transcript_block(self, epoch: float, text: str) -> None:
-        transcript = self.proj_dir / "s.jsonl"
-        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
-        record_uuid = f"00000000-0000-4000-9000-{transcript.stat().st_size:012d}"
-        with transcript.open("a", encoding="utf-8") as stream:
-            stream.write(
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "uuid": record_uuid,
-                        "timestamp": ts,
-                        "message": {"content": [{"type": "text", "text": text}]},
-                    }
-                )
-                + "\n"
-            )
-
-    def drive_distinct_delivery_advances(
-        self,
-        rt: FakeRuntime,
-        state: dict,
-        missing: tuple[float, str],
-        first: tuple[float, str],
-        second: tuple[float, str],
-    ) -> None:
-        self.write_transcript([missing, first])
-        rt.haystack = norm(first[1])
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        self.append_transcript_block(*second)
-        rt.haystack = norm(f"{first[1]} {second[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-    def test_bounded_window_rolloff_never_creates_tombstone_evidence(self):
-        old = (self.now - 3000, "delivered response rolled out of limit 100")
-        newer = (self.now - 2000, "newer delivered response still in window")
-        self.write_transcript([old, newer])
-        rt = self.make_rt()
-        state: dict = {}
-
-        rt.haystack = norm(f"{old[1]} {newer[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        rt.haystack = norm(newer[1])
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        chs = state["999"]
-        self.assertEqual(permanent_loss_total(chs), 0)
-        self.assertNotIn(relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY, chs)
-        self.assertEqual(rt.alerts, [])
-
-    def test_single_frontier_skip_surfaces_suspected_loss_without_confirming(self):
-        missing = (self.now - 3000, "missing response needs new evidence")
-        successor = (self.now - 2000, "only delivered successor")
-        self.write_transcript([missing, successor])
-        rt = self.make_rt()
-        rt.haystack = norm(successor[1])
-        state: dict = {}
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        chs = state["999"]
-        self.assertEqual(permanent_loss_total(chs), 0)
-        self.assertEqual(chs[relay_watchdog.PERMANENT_LOSS_SUSPECTED_KEY], 1)
-        self.assertTrue(
-            any("permanent-loss-suspected count=1" in line for line in rt.log_lines)
-        )
-        observations = relay_watchdog._validated_loss_observations(chs)
-        self.assertEqual(len(observations), 1)
-        self.assertEqual(
-            next(iter(observations.values()))["evidence_frontiers"],
-            [float(int(successor[0]))],
-        )
-
-    def test_bounded_rolloff_does_not_surface_suspected_loss(self):
-        old = (self.now - 3000, "delivered response rolled out of limit 100")
-        newer = (self.now - 2000, "newer delivered response still in window")
-        self.write_transcript([old, newer])
-        rt = self.make_rt()
-        state: dict = {}
-
-        rt.haystack = norm(f"{old[1]} {newer[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        rt.haystack = norm(newer[1])
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        self.assertNotIn(
-            relay_watchdog.PERMANENT_LOSS_SUSPECTED_KEY, state["999"]
-        )
-        self.assertFalse(
-            any("permanent-loss-suspected" in line for line in rt.log_lines)
-        )
-
-    def test_permanent_loss_requires_two_distinct_frontier_advances(self):
-        missing = (self.now - 4000, "permanently skipped response")
-        first = (self.now - 3000, "first delivered successor")
-        second = (self.now - 2000, "second delivered successor")
-        rt = self.make_rt(realert_secs=1)
-        state: dict = {}
-
-        self.drive_distinct_delivery_advances(rt, state, missing, first, second)
-
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("새 영구 릴레이 유실 확정", rt.alerts[0][0])
-        self.assertIn("현재 미도달 **0건**", rt.alerts[0][0])
-        self.assertIn("영구 유실 **1건 누적**", rt.alerts[0][0])
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-        self.assertEqual(len(rt.alerts), 1)
-
-    def test_late_delivery_retracts_tombstone_and_total(self):
-        missing = (self.now - 4000, "late response")
-        first = (self.now - 3000, "first successor")
-        second = (self.now - 2000, "second successor")
-        rt = self.make_rt()
-        state: dict = {}
-        self.drive_distinct_delivery_advances(rt, state, missing, first, second)
-        self.assertEqual(permanent_loss_total(state["999"]), 1)
-
-        rt.haystack = norm(f"{missing[1]} {first[1]} {second[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        self.assertEqual(permanent_loss_total(state["999"]), 0)
-        self.assertNotIn(relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY, state["999"])
-        self.assertTrue(any("permanent-loss-retracted" in line for line in rt.log_lines))
-
-    def test_new_permanent_loss_after_prior_tombstone_alerts_again(self):
-        first_missing = (self.now - 6000, "first skipped response")
-        first_success = (self.now - 5000, "first delivered successor")
-        second_success = (self.now - 4000, "second delivered successor")
-        rt = self.make_rt(realert_secs=1)
-        state: dict = {}
-        self.drive_distinct_delivery_advances(
-            rt, state, first_missing, first_success, second_success
-        )
-
-        next_missing = (self.now - 3000, "second skipped response")
-        third_success = (self.now - 2000, "third delivered successor")
-        fourth_success = (self.now - 1000, "fourth delivered successor")
-        self.append_transcript_block(*next_missing)
-        self.append_transcript_block(*third_success)
-        rt.haystack = norm(
-            f"{first_success[1]} {second_success[1]} {third_success[1]}"
-        )
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-        self.append_transcript_block(*fourth_success)
-        rt.haystack = norm(
-            f"{first_success[1]} {second_success[1]} {third_success[1]} {fourth_success[1]}"
-        )
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 3)
-
-        permanent_alerts = [
-            body for body, _ in rt.alerts if "새 영구 릴레이 유실 확정" in body
-        ]
-        self.assertEqual(len(permanent_alerts), 2)
-        self.assertIn("영구 유실 **2건 누적**", permanent_alerts[-1])
-
-    def test_tombstone_survives_state_round_trip_and_restart(self):
-        missing = (self.now - 4000, "restart-persistent skipped response")
-        first = (self.now - 3000, "restart first successor")
-        second = (self.now - 2000, "restart second successor")
-        rt = self.make_rt()
-        state: dict = {}
-        self.drive_distinct_delivery_advances(rt, state, missing, first, second)
-        save_state(rt.state_path, state)
-
-        restarted_state = load_state(rt.state_path)
-        restarted = self.make_rt()
-        restarted.haystack = norm(f"{first[1]} {second[1]}")
-        tick_channel(restarted, TICK_CHANNEL, restarted_state, self.now + 2)
-
-        self.assertEqual(restarted.alerts, [])
-        self.assertEqual(permanent_loss_total(restarted_state["999"]), 1)
-        self.assertEqual(
-            len(restarted_state["999"][relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY]),
-            1,
-        )
-
-    def test_duplicate_delivery_is_cardinality_aware(self):
-        ts = self.now - 2000
-        blocks = [(ts, "same response"), (ts + 1, "same response")]
-        verdict = evaluate(blocks, norm("same response"), self.now, 600, 900)
-        self.assertEqual(verdict.delivered_ts, ts)
-        self.assertEqual(delivered_flags(blocks, norm("same response")), [True, False])
-
-    def test_failed_permanent_loss_alert_retries_next_tick(self):
-        missing = (self.now - 4000, "alert retry skipped response")
-        first = (self.now - 3000, "alert retry first successor")
-        second = (self.now - 2000, "alert retry second successor")
-        rt = self.make_rt()
-        rt.alert_succeeds = False
-        state: dict = {}
-        self.drive_distinct_delivery_advances(rt, state, missing, first, second)
-        self.assertEqual(
-            state["999"][relay_watchdog.PERMANENT_LOSS_UNANNOUNCED_KEY], 1
-        )
-
-        rt.alert_succeeds = True
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        self.assertNotIn(
-            relay_watchdog.PERMANENT_LOSS_UNANNOUNCED_KEY, state["999"]
-        )
-        permanent_alerts = [
-            body for body, _ in rt.alerts if "새 영구 릴레이 유실 확정" in body
-        ]
-        self.assertEqual(len(permanent_alerts), 2)
-
-    def test_transport_unreachable_tombstone_preserves_gap_incident(self):
-        missing = (self.now - 4000, "transport skipped response")
-        first = (self.now - 3000, "transport first successor")
-        second = (self.now - 2000, "transport second successor")
-        rt = self.make_rt(github_repo="owner/repo")
-        rt.watcher_probe = WatcherStateProbe(None)
-        state: dict = {}
-        self.write_transcript([missing, first])
-        rt.haystack = norm(first[1])
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        chs = state["999"]
-        # Seed the exact #4947 incident established by a prior GAP tick.
-        chs["alerting"] = True
-        chs["gap_since"] = self.now - 3600
-        chs[relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY] = [
-            str(self.proj_dir / "s.jsonl")
-        ]
-        chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY] = (
-            relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON
-        )
-        chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY] = self.now
-        chs[relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY] = 0
-        self.append_transcript_block(*second)
-        rt.haystack = norm(f"{first[1]} {second[1]}")
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        chs = state["999"]
-        self.assertTrue(chs["alerting"])
-        self.assertEqual(chs["gap_since"], self.now - 3600)
-        self.assertEqual(
-            chs[relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY],
-            [str(self.proj_dir / "s.jsonl")],
-        )
-        self.assertEqual(
-            chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY],
-            relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON,
-        )
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-        chs = state["999"]
-        self.assertTrue(chs["alerting"])
-        self.assertEqual(chs["gap_since"], self.now - 3600)
-        self.assertEqual(
-            chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY],
-            relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON,
-        )
-
-    def test_duplicate_same_timestamp_text_uses_stable_record_identities(self):
-        duplicate = (self.now - 4000, "same duplicate obligation")
-        first = (self.now - 3000, "duplicate first successor")
-        second = (self.now - 2000, "duplicate second successor")
-        self.write_transcript([duplicate, duplicate, first])
-        rt = self.make_rt()
-        state: dict = {}
-        rt.haystack = norm(f"{duplicate[1]} {first[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        self.append_transcript_block(*second)
-        rt.haystack = norm(f"{duplicate[1]} {first[1]} {second[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        tombstones = permanent_loss_tombstones(state["999"])
-        self.assertEqual(len(tombstones), 1)
-        self.assertEqual(permanent_loss_total(state["999"]), 1)
-
-    def test_offset_fallback_warning_is_edge_triggered(self):
-        transcript = self.proj_dir / "s.jsonl"
-        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now - 2000))
-        transcript.write_text(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": ts,
-                    "message": {
-                        "content": [{"type": "text", "text": "uuid-less fallback"}]
-                    },
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        rt = self.make_rt()
-        state: dict = {}
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        warnings = [
-            line
-            for line in rt.log_lines
-            if "permanent-loss-identity-offset-fallback" in line
-        ]
-        self.assertEqual(len(warnings), 1)
-
-    def test_record_uuid_identity_survives_actual_head_truncation(self):
-        prefix = (self.now - 5000, "truncated delivered prefix")
-        missing = (self.now - 4000, "late block retained after truncation")
-        first = (self.now - 3000, "truncate first successor")
-        second = (self.now - 2000, "truncate second successor")
-        self.write_transcript([prefix, missing, first])
-        rt = self.make_rt()
-        state: dict = {}
-        rt.haystack = norm(f"{prefix[1]} {first[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        self.append_transcript_block(*second)
-        rt.haystack = norm(f"{prefix[1]} {first[1]} {second[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        before = set(permanent_loss_tombstones(state["999"]))
-        self.assertEqual(len(before), 1)
-        transcript = self.proj_dir / "s.jsonl"
-        raw_lines = transcript.read_bytes().splitlines(keepends=True)
-        transcript.write_bytes(b"".join(raw_lines[1:]))
-        rt.haystack = norm(f"{missing[1]} {first[1]} {second[1]}")
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        self.assertEqual(permanent_loss_total(state["999"]), 0)
-        self.assertTrue(any("permanent-loss-retracted" in line for line in rt.log_lines))
-
-    def test_legacy_actual_delivery_scalar_migrates_to_selected_path(self):
-        missing = (self.now - 4000, "legacy migration missing response")
-        successor = (self.now - 3000, "legacy migration delivered successor")
-        self.write_transcript([missing, successor])
-        rt = self.make_rt(realert_secs=1)
-        rt.haystack = norm(successor[1])
-        legacy_observed_at = self.now - 120
-        state = {
-            "999": {
-                relay_watchdog.LAST_ACTUAL_DELIVERY_AT_KEY: legacy_observed_at,
-                DELIVERED_WATERMARKS_KEY: {
-                    str(self.proj_dir / "s.jsonl"): {
-                        "delivered_ts": successor[0],
-                        "updated_at": self.now - 3000,
-                    }
-                },
-            }
-        }
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        chs = state["999"]
-        self.assertNotIn(relay_watchdog.LAST_ACTUAL_DELIVERY_AT_KEY, chs)
-        self.assertEqual(
-            chs[relay_watchdog.LAST_ACTUAL_DELIVERY_BY_PATH_KEY][
-                str(self.proj_dir / "s.jsonl")
-            ],
-            legacy_observed_at,
-        )
-
-    def test_loss_state_overflow_is_logged_and_counted(self):
-        path = str(self.proj_dir / "s.jsonl")
-        state = {
-            relay_watchdog.LOSS_OBSERVATIONS_KEY: {
-                f"{index:064x}": {
-                    "path": path,
-                    "epoch": self.now - 4000,
-                    "evidence_frontiers": [self.now - 3000],
-                    "last_observed_at": self.now - index,
-                }
-                for index in range(relay_watchdog.MAX_LOSS_OBSERVATIONS)
-            }
-        }
-        missing = (self.now - 2000, "overflow missing response")
-        successor = (self.now - 1000, "overflow delivered successor")
-        self.write_transcript([missing, successor])
-        rt = self.make_rt()
-        rt.haystack = norm(successor[1])
-
-        tick_channel(rt, TICK_CHANNEL, {"999": state}, self.now)
-
-        self.assertEqual(state[relay_watchdog.PERMANENT_LOSS_OVERFLOW_TOTAL_KEY], 1)
-        self.assertTrue(
-            any("permanent-loss-state-overflow" in line for line in rt.log_lines)
-        )
-
-    def test_corrupt_loss_state_logs_and_preserves_raw_evidence(self):
-        path = str(self.proj_dir / "s.jsonl")
-        corrupt = {"bad": "shape"}
-        state = {
-            "999": {
-                relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: corrupt.copy(),
-                relay_watchdog.PERMANENT_LOSS_TOTAL_KEY: 9,
-            }
-        }
-        self.write_transcript([(self.now - 2000, "corrupt state candidate")])
-        rt = self.make_rt()
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        chs = state["999"]
-        self.assertEqual(chs[relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY], corrupt)
-        self.assertEqual(permanent_loss_total(chs), 9)
-        self.assertTrue(
-            any("permanent-loss-state-corrupt" in line for line in rt.log_lines)
-        )
-
-    def test_corruption_warning_is_edge_triggered_by_content(self):
-        chs = {
-            relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: {"bad": "shape"},
-            relay_watchdog.PERMANENT_LOSS_TOTAL_KEY: 9,
-        }
-        state = {"999": chs}
-        self.write_transcript([(self.now - 2000, "corrupt warning candidate")])
-        rt = self.make_rt()
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        warnings = [
-            line
-            for line in rt.log_lines
-            if "permanent-loss-state-corrupt" in line
-        ]
-        self.assertEqual(len(warnings), 1)
-        chs[relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY] = {"changed": "shape"}
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        warnings = [
-            line
-            for line in rt.log_lines
-            if "permanent-loss-state-corrupt" in line
-        ]
-        self.assertEqual(len(warnings), 2)
-
-    def test_corruption_warning_refires_between_absent_and_null(self):
-        chs = {
-            relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: {"bad": "shape"},
-            relay_watchdog.PERMANENT_LOSS_TOTAL_KEY: 9,
-        }
-        state = {"999": chs}
-        self.write_transcript([(self.now - 2000, "absent null warning candidate")])
-        rt = self.make_rt()
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        chs[relay_watchdog.LOSS_OBSERVATIONS_KEY] = None
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-        chs.pop(relay_watchdog.LOSS_OBSERVATIONS_KEY)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        warnings = [
-            line
-            for line in rt.log_lines
-            if "permanent-loss-state-corrupt" in line
-        ]
-        self.assertEqual(len(warnings), 3)
-
-    def test_corrupt_tick_does_not_increment_overflow_projection(self):
-        path = str(self.proj_dir / "s.jsonl")
-        observations = {
-            f"{index:064x}": {
-                "path": path,
-                "epoch": self.now - 4000,
-                "evidence_frontiers": [self.now - 3000],
-                "last_observed_at": self.now - index,
-            }
-            for index in range(relay_watchdog.MAX_LOSS_OBSERVATIONS)
-        }
-        observations["bad"] = "shape"
-        state = {
-            "999": {
-                relay_watchdog.LOSS_OBSERVATIONS_KEY: observations,
-                relay_watchdog.PERMANENT_LOSS_OVERFLOW_TOTAL_KEY: 7,
-            }
-        }
-        self.write_transcript(
-            [
-                (self.now - 2000, "corrupt overflow candidate"),
-                (self.now - 1000, "corrupt overflow successor"),
-            ]
-        )
-        rt = self.make_rt()
-        rt.haystack = norm("corrupt overflow successor")
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        chs = state["999"]
-        self.assertEqual(chs[relay_watchdog.PERMANENT_LOSS_OVERFLOW_TOTAL_KEY], 7)
-        self.assertFalse(
-            any("permanent-loss-state-overflow" in line for line in rt.log_lines)
-        )
-
-    def test_corrupt_state_suppresses_unpersisted_loss_confirmation(self):
-        missing = (self.now - 4000, "corrupt unpersisted skipped response")
-        first = (self.now - 3000, "corrupt first successor")
-        second = (self.now - 2000, "corrupt second successor")
-        rt = self.make_rt()
-        state: dict = {}
-        self.write_transcript([missing, first])
-        rt.haystack = norm(first[1])
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        chs = state["999"]
-        raw_tombstones = {"bad": "shape"}
-        chs[relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY] = raw_tombstones.copy()
-        self.append_transcript_block(*second)
-        rt.haystack = norm(f"{first[1]} {second[1]}")
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        self.assertEqual(
-            chs[relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY], raw_tombstones
-        )
-        self.assertFalse(
-            any("permanent-loss-confirmed" in line for line in rt.log_lines)
-        )
-        self.assertFalse(any("PERMANENT LOSS ALERT" in line for line in rt.log_lines))
-        self.assertEqual(rt.alerts, [])
-        self.assertTrue(
-            any("permanent-loss-state-corrupt" in line for line in rt.log_lines)
-        )
-
-    def test_corrupt_tombstone_map_cannot_double_count_total(self):
-        state = {
-            relay_watchdog.PERMANENT_LOSS_TOTAL_KEY: 9,
-            relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: {"bad": "shape"},
-        }
-        self.assertEqual(permanent_loss_total(state), 9)
-
-    def test_lifecycle_reclaim_preserves_and_escalates_corrupt_loss_state(self):
-        target = self.proj_dir / "corrupt-reclaim.jsonl"
-        target.write_text("{}\n", encoding="utf-8")
-        path = str(target)
-        raw_observations = {"bad": "shape"}
-        raw_tombstones = {"also-bad": "shape"}
-        state = {
-            "999": {
-                relay_watchdog.RECOVERED_GAP_GUARDS_KEY: {
-                    path: {
-                        "size": target.stat().st_size,
-                        "confirmed_at": self.now,
-                        "last_seen_at": self.now,
-                        "absent_since": self.now + 1,
-                    }
-                },
-                relay_watchdog.LOSS_OBSERVATIONS_KEY: raw_observations.copy(),
-                relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: raw_tombstones.copy(),
-            }
-        }
-        target.unlink()
-        rt = self.make_rt()
-
-        tick_channel(
-            rt,
-            TICK_CHANNEL,
-            state,
-            self.now + relay_watchdog.RECOVERED_GAP_GUARD_TTL_SECS + 2,
-        )
-
-        chs = state["999"]
-        self.assertEqual(chs[relay_watchdog.LOSS_OBSERVATIONS_KEY], raw_observations)
-        self.assertEqual(
-            chs[relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY], raw_tombstones
-        )
-        self.assertTrue(
-            any(
-                "permanent-loss-state-corrupt during lifecycle reclaim"
-                in line
-                for line in rt.log_lines
-            )
-        )
-
-    def test_loss_state_is_bounded_ttl_pruned_and_lifecycle_cleaned(self):
-        path = str(self.proj_dir / "s.jsonl")
-        old = self.now - relay_watchdog.TRANSCRIPT_HISTORY_TTL_SECS - 1
-        state = {
-            relay_watchdog.LOSS_OBSERVATIONS_KEY: {
-                f"{index:064x}": {
-                    "path": path,
-                    "epoch": old,
-                    "evidence_frontiers": [old + 1],
-                    "last_observed_at": old,
-                }
-                for index in range(relay_watchdog.MAX_LOSS_OBSERVATIONS + 10)
-            },
-            relay_watchdog.PERMANENT_LOSS_TOMBSTONES_KEY: {
-                f"{index + 1000:064x}": {
-                    "path": path,
-                    "epoch": old,
-                    "confirmed_at": old,
-                }
-                for index in range(relay_watchdog.MAX_PERMANENT_LOSS_TOMBSTONES + 10)
-            },
-            relay_watchdog.LAST_ACTUAL_DELIVERY_BY_PATH_KEY: {path: self.now},
-        }
-        self.assertEqual(
-            relay_watchdog._validated_loss_observations(state, self.now), {}
-        )
-        self.assertEqual(permanent_loss_tombstones(state, self.now), {})
-        relay_watchdog._forget_reclaimed_recovered_gap_lifecycles(
-            state, [path], loss_state_corrupted=False
-        )
-        self.assertNotIn(relay_watchdog.LAST_ACTUAL_DELIVERY_BY_PATH_KEY, state)
-
     # (d) persistent-gap issue auto-filing is deduplicated
     def test_persistent_gap_files_issue_exactly_once(self):
         rt = self.gap_rt(github_repo="owner/repo")
-        rt.watcher_probe = WatcherStateProbe(200, True, False)
         state = {"999": {"gap_since": self.now - rt.cfg.issue_after_secs - 1}}
         tick_channel(rt, TICK_CHANNEL, state, self.now)
         self.assertEqual(rt.issue_calls, 1)
@@ -6800,252 +5987,6 @@ class TickChannelTests(unittest.TestCase):
         state = {"999": {"gap_since": self.now - rt.cfg.issue_after_secs - 1}}
         tick_channel(rt, TICK_CHANNEL, state, self.now)
         self.assertEqual(rt.issue_calls, 0)
-
-    def test_unreachable_gap_defers_issue_but_preserves_alert_and_evidence(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        rt.watcher_probe = WatcherStateProbe(None)
-        incident_age = rt.cfg.issue_after_secs + 60
-        transcript = self.proj_dir / "s.jsonl"
-        recovered_guard = {
-            "size": transcript.stat().st_size,
-            "confirmed_at": self.now - 120,
-            "last_seen_at": self.now - 60,
-            "absent_since": None,
-        }
-        state = {
-            "999": {
-                "gap_since": self.now - incident_age,
-                relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY: [str(transcript)],
-                relay_watchdog.RECOVERED_GAP_GUARDS_KEY: {
-                    str(transcript): recovered_guard
-                },
-            }
-        }
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        chs = state["999"]
-        self.assertEqual(rt.issue_calls, 0)
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("릴레이 갭 감지", rt.alerts[0][0])
-        self.assertEqual(chs["gap_since"], self.now - incident_age)
-        self.assertEqual(
-            chs[relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY],
-            [str(self.proj_dir / "s.jsonl")],
-        )
-        self.assertEqual(
-            chs[relay_watchdog.RECOVERED_GAP_GUARDS_KEY][str(transcript)][
-                "confirmed_at"
-            ],
-            recovered_guard["confirmed_at"],
-        )
-        self.assertTrue(chs.get("alerting"))
-        self.assertEqual(
-            chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY],
-            relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON,
-        )
-        self.assertEqual(
-            chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY], self.now
-        )
-        self.assertEqual(chs[relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY], 0)
-
-    def test_repeated_unreachable_ticks_preserve_incident_clock(self):
-        rt = self.gap_rt(github_repo="owner/repo", realert_secs=1)
-        rt.watcher_probe = WatcherStateProbe(None)
-        original_gap_since = self.now - rt.cfg.issue_after_secs - 600
-        state = {"999": {"gap_since": original_gap_since}}
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        chs = state["999"]
-        self.assertEqual(rt.issue_calls, 0)
-        self.assertEqual(len(rt.alerts), 2)
-        self.assertEqual(chs["gap_since"], original_gap_since)
-        self.assertEqual(
-            chs[relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY], self.now
-        )
-        self.assertEqual(chs[relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY], 0)
-
-    def test_two_reachable_ticks_resume_old_incident_exactly_once(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        rt.watcher_probe = WatcherStateProbe(None)
-        original_gap_since = self.now - rt.cfg.issue_after_secs - 300
-        state = {"999": {"gap_since": original_gap_since}}
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        rt.watcher_probe = WatcherStateProbe(200, True, False)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-        self.assertEqual(rt.issue_calls, 0)
-        self.assertEqual(
-            state["999"][relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY], 1
-        )
-        self.assertEqual(state["999"]["gap_since"], original_gap_since)
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-        self.assertEqual(rt.issue_calls, 1)
-        self.assertEqual(
-            state["999"]["issue_url"], "https://example.test/issues/1"
-        )
-        self.assertEqual(state["999"]["gap_since"], original_gap_since)
-        self.assertNotIn(
-            relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY, state["999"]
-        )
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 3)
-        self.assertEqual(rt.issue_calls, 1)
-
-    def test_reachable_flap_resets_two_tick_counter(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        state = {
-            "999": {
-                "gap_since": self.now - rt.cfg.issue_after_secs - 1,
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY: (
-                    relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON
-                ),
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY: self.now - 10,
-                relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY: 0,
-            }
-        }
-
-        rt.watcher_probe = WatcherStateProbe(200, True, False)
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        rt.watcher_probe = WatcherStateProbe(None)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-        rt.watcher_probe = WatcherStateProbe(404)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-        self.assertEqual(rt.issue_calls, 0)
-        self.assertEqual(
-            state["999"][relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY], 1
-        )
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 3)
-        self.assertEqual(rt.issue_calls, 1)
-
-    def test_404_counts_as_reachable_for_issue_resume(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        state = {
-            "999": {
-                "gap_since": self.now - rt.cfg.issue_after_secs - 1,
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY: (
-                    relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON
-                ),
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY: self.now - 10,
-                relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY: 0,
-            }
-        }
-        rt.watcher_probe = WatcherStateProbe(404)
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-        tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-
-        self.assertEqual(rt.issue_calls, 1)
-
-    def test_gap_owner_without_selected_transcript_still_probes_recovery(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        transcript = self.proj_dir / "s.jsonl"
-        original_gap_since = self.now - rt.cfg.issue_after_secs - 60
-        state = {
-            "999": {
-                "gap_since": original_gap_since,
-                relay_watchdog.GAP_OWNER_TRANSCRIPTS_KEY: [str(transcript)],
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY: (
-                    relay_watchdog.ISSUE_FILING_DC_UNREACHABLE_REASON
-                ),
-                relay_watchdog.ISSUE_FILING_SUPPRESSION_SINCE_KEY: self.now - 10,
-                relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY: 0,
-            }
-        }
-        rt.watcher_probe = WatcherStateProbe(200, True, False)
-
-        with mock.patch.object(
-            relay_watchdog,
-            "select_watch_transcript_with_reason",
-            return_value=(None, "no_candidates"),
-        ):
-            tick_channel(rt, TICK_CHANNEL, state, self.now)
-            self.assertEqual(rt.issue_calls, 0)
-            self.assertEqual(
-                state["999"][relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY], 1
-            )
-            tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-            tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-        self.assertGreaterEqual(rt.watcher_calls, 2)
-        self.assertEqual(rt.issue_calls, 1)
-        self.assertEqual(state["999"]["gap_since"], original_gap_since)
-
-    def test_5xx_and_malformed_200_are_not_unreachable_suppression_authority(self):
-        probes = (
-            WatcherStateProbe(503),
-            parse_watcher_state_probe(200, {"attached": "malformed"}),
-        )
-        for probe in probes:
-            with self.subTest(probe=probe):
-                rt = self.gap_rt(github_repo="owner/repo")
-                rt.watcher_probe = probe
-                state = {
-                    "999": {
-                        "gap_since": self.now - rt.cfg.issue_after_secs - 1
-                    }
-                }
-
-                tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-                self.assertEqual(rt.issue_calls, 1)
-                self.assertNotIn(
-                    relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY,
-                    state["999"],
-                )
-
-    def test_bad_responses_keep_aged_incident_suppressed_until_two_healthy_ticks(self):
-        probes = (
-            WatcherStateProbe(503),
-            parse_watcher_state_probe(200, {"attached": "malformed"}),
-        )
-        for probe in probes:
-            with self.subTest(probe=probe):
-                rt = self.gap_rt(github_repo="owner/repo")
-                original_gap_since = self.now - rt.cfg.issue_after_secs - 100
-                state = {"999": {"gap_since": original_gap_since}}
-
-                rt.watcher_probe = WatcherStateProbe(None)
-                tick_channel(rt, TICK_CHANNEL, state, self.now)
-                rt.watcher_probe = WatcherStateProbe(200, True, False)
-                tick_channel(rt, TICK_CHANNEL, state, self.now + 1)
-                rt.watcher_probe = probe
-                tick_channel(rt, TICK_CHANNEL, state, self.now + 2)
-
-                self.assertEqual(rt.issue_calls, 0)
-                self.assertEqual(
-                    state["999"][relay_watchdog.ISSUE_FILING_REACHABLE_TICKS_KEY],
-                    0,
-                )
-                self.assertEqual(state["999"]["gap_since"], original_gap_since)
-
-                rt.watcher_probe = WatcherStateProbe(200, True, False)
-                tick_channel(rt, TICK_CHANNEL, state, self.now + 3)
-                self.assertEqual(rt.issue_calls, 0)
-                tick_channel(rt, TICK_CHANNEL, state, self.now + 4)
-                self.assertEqual(rt.issue_calls, 1)
-                tick_channel(rt, TICK_CHANNEL, state, self.now + 5)
-                self.assertEqual(rt.issue_calls, 1)
-
-    def test_planned_deploy_still_returns_before_gap_incident_state(self):
-        rt = self.gap_rt(github_repo="owner/repo")
-        rt.watcher_probe = WatcherStateProbe(None)
-        rt.deploy_marker.touch()
-        state: dict = {}
-
-        tick_channel(rt, TICK_CHANNEL, state, self.now)
-
-        chs = state["999"]
-        self.assertEqual(rt.alerts, [])
-        self.assertEqual(rt.issue_calls, 0)
-        self.assertNotIn("gap_since", chs)
-        self.assertNotIn(
-            relay_watchdog.ISSUE_FILING_SUPPRESSION_REASON_KEY, chs
-        )
 
     # (e) consecutive discord-read failures escalate to an alert
     def test_read_failure_threshold_escalates(self):
@@ -7156,18 +6097,6 @@ class AlertFallbackTests(unittest.TestCase):
         calls = self._run_alert(announce_rc=0)
         self.assertEqual(len(calls), 1)
         self.assertIn("send-to-agent", calls[0])
-
-    def test_direct_fallback_nonzero_returns_failure(self):
-        ch = ChannelConfig(
-            channel_id="999", sendmessage_key="key123", worktree_root=WORKTREE_ROOT
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            rt = Runtime(Config(channels=(ch,)), Path(tmp))
-            failed = subprocess.CompletedProcess(
-                ["discord-sendmessage"], 1, stdout="", stderr="delivery failed"
-            )
-            with mock.patch.object(relay_watchdog.subprocess, "run", return_value=failed):
-                self.assertFalse(rt.alert(ch, "alert body"))
 
     def test_no_announce_target_goes_straight_to_sendmessage(self):
         ch = ChannelConfig(

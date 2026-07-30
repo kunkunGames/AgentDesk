@@ -141,14 +141,9 @@ async fn run_skill_slash_command(
         return Ok(());
     }
 
+    let ts = chrono::Local::now().format("%H:%M:%S");
     let args_str = args.as_deref().unwrap_or("");
-    log_command_received!(
-        ctx.channel_id().get(),
-        user_name,
-        invoked_as,
-        skill = %skill,
-        args = %args_str
-    );
+    tracing::info!("  [{ts}] ◀ [{user_name}] {invoked_as} {skill} {args_str}");
 
     // Handle built-in commands directly instead of sending to AI
     match skill.as_str() {
@@ -182,12 +177,7 @@ async fn run_skill_slash_command(
                         &format!("{invoked_as} stop"),
                     )
                     .await;
-                    log_info_event!(
-                        "discord_cancel_signal_sent",
-                        channel_id = ctx.channel_id().get(),
-                        provider = ctx.data().provider.as_str(),
-                        status = "sent",
-                    );
+                    tracing::info!("  [{ts}] ■ Cancel signal sent");
                 }
                 None => {
                     ctx.say(super::NO_ACTIVE_TURN_RESPONSE).await?;
@@ -295,7 +285,6 @@ async fn run_skill_slash_command(
             full_text,
             IntakeOrigin::SlashSkill,
             Vec::new(),
-            None,
         )
         .await?;
         return Ok(());
@@ -361,7 +350,6 @@ async fn run_skill_slash_command(
         skill_prompt,
         IntakeOrigin::SlashSkill,
         Vec::new(),
-        None,
     )
     .await?;
 

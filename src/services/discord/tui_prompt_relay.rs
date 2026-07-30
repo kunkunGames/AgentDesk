@@ -44,7 +44,7 @@ use self::observed_prompt_decision::{
 mod idle_transcript_scan;
 use self::idle_transcript_scan::{
     ClaudeIdleTranscriptScan, CodexIdleRolloutScan, claude_idle_compaction_reanchor,
-    claude_idle_prompt_observation_should_tail_response, claude_idle_safe_reanchor_offset,
+    claude_idle_prompt_observation_should_tail_response,
     codex_idle_prompt_observation_should_tail_response,
     scan_claude_idle_transcript_for_last_prompt, scan_claude_idle_transcript_for_prompt,
     scan_codex_idle_rollout_for_latest_prompt_matching, scan_codex_idle_rollout_for_prompt,
@@ -269,11 +269,9 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
         "tui_prompt_relay_observer",
         provider = %provider_name
     );
-    // Subscribe before spawning so callers can publish immediately after this
-    // function returns without racing the observer task's first poll.
-    let mut hook_rx = subscribe_hook_events();
-    let mut observed_rx = subscribe_observed_prompts();
     super::task_supervisor::spawn_observed("tui_prompt_relay_observer", async move {
+        let mut hook_rx = subscribe_hook_events();
+        let mut observed_rx = subscribe_observed_prompts();
         loop {
             tokio::select! {
                 hook_event = hook_rx.recv() => {
@@ -342,13 +340,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         return;
     };
     if let Some(control) = relay_prompt_decision.local_only_control.as_ref() {
-        let provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
-        super::queue_io::schedule_deferred_idle_queue_kickoff_immediate(
-            shared.clone(),
-            provider,
-            channel_id,
-            "local_only_slash_command",
-        );
         let kind = control.kind.as_str();
         let Some(note) = prepare_local_only_slash_control_note(&prompt, kind) else {
             tracing::info!(
@@ -764,18 +755,7 @@ fn owner_channel_for_prompt(
     prompt: &ObservedTuiPrompt,
 ) -> Option<ChannelId> {
     let provider = ProviderKind::from_str(&prompt.provider)?;
-    owner_channel_for_tmux_session(
-        shared,
-        &provider,
-        &prompt.tmux_session_name,
-        RelayEmissionKind::ObservedPrompt,
-    )
-}
-
-#[derive(Clone, Copy)]
-enum RelayEmissionKind {
-    Poll,
-    ObservedPrompt,
+    owner_channel_for_tmux_session(shared, &provider, &prompt.tmux_session_name)
 }
 
 /// Resolve the owner channel for a tmux session.
@@ -794,7 +774,6 @@ fn owner_channel_for_tmux_session(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     tmux_session_name: &str,
-    emission_kind: RelayEmissionKind,
 ) -> Option<ChannelId> {
     let registry_owner = shared
         .tmux_watchers
@@ -804,13 +783,7 @@ fn owner_channel_for_tmux_session(
     let resolved =
         resolve_owner_channel_authoritatively(tmux_session_name, registry_owner, dedupe_owner);
     if resolved.is_none() && registry_owner.is_none() && dedupe_owner.is_some() {
-        let emission_count = matches!(emission_kind, RelayEmissionKind::ObservedPrompt) as u64;
-        super::idle_relay_drift::on_idle_relay_drift(
-            shared,
-            provider.clone(),
-            tmux_session_name,
-            emission_count,
-        );
+        super::idle_relay_drift::on_idle_relay_drift(shared, provider.clone(), tmux_session_name);
     }
     resolved
 }
@@ -895,8 +868,5 @@ fn slash_command_control_turn_is_duplicate_external_replay(
     !slash_command_control_turn_is_first_sighting(tmux_session_name, kind)
 }
 
-#[cfg(all(test, unix))]
-#[path = "tui_prompt_relay/local_model_queue_wake_e2e.rs"]
-mod local_model_queue_wake_e2e;
 #[cfg(test)]
 mod tests;
