@@ -14,14 +14,7 @@ use crate::config::{
 };
 use crate::services::provider::ProviderKind;
 
-fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
-}
+use crate::utils::format::expand_tilde_string;
 
 fn load_agentdesk_config_with_path() -> Option<(Config, std::path::PathBuf)> {
     let root = crate::config::runtime_root()?;
@@ -343,7 +336,7 @@ fn role_binding_from_channel(
         role_id: agent.id.clone(),
         prompt_file: channel
             .prompt_file()
-            .map(|value| expand_tilde(&value))
+            .map(|value| expand_tilde_string(&value))
             .or_else(|| default_prompt_path(&agent.id))
             .unwrap_or_default(),
         provider: binding_provider(agent, provider_key, channel),
@@ -403,7 +396,7 @@ pub(super) fn resolve_dm_default_agent(provider: &ProviderKind) -> Option<Resolv
         let role_binding = role_binding_from_channel(agent, provider_key, channel);
         let workspace = channel
             .workspace()
-            .map(|value| expand_tilde(&value))
+            .map(|value| expand_tilde_string(&value))
             .or_else(|| default_workspace(&agent.id))?;
         return Some(ResolvedDmDefaultAgent {
             role_binding,
@@ -509,7 +502,7 @@ fn meeting_agent_from_entry(
                 prompt_file: def
                     .prompt_file
                     .as_deref()
-                    .map(expand_tilde)
+                    .map(expand_tilde_string)
                     .or_else(|| default_prompt_path(&def.role_id))
                     .unwrap_or_default(),
                 domain_summary: def.domain_summary.clone(),
@@ -660,13 +653,13 @@ pub(super) fn resolve_workspace(
     let (agent, _provider_key, channel) = find_channel_binding(&config, channel_id, channel_name)?;
     channel
         .workspace()
-        .map(|value| expand_tilde(&value))
+        .map(|value| expand_tilde_string(&value))
         .or_else(|| default_workspace(&agent.id))
 }
 
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     load_agentdesk_config()
-        .and_then(|config| config.shared_prompt.as_deref().map(expand_tilde))
+        .and_then(|config| config.shared_prompt.as_deref().map(expand_tilde_string))
         .or_else(shared_prompt_fallback_path)
 }
 
@@ -963,7 +956,7 @@ pub(crate) fn configured_workspaces() -> Vec<String> {
             };
             let Some(workspace) = channel
                 .workspace()
-                .map(|value| expand_tilde(&value))
+                .map(|value| expand_tilde_string(&value))
                 .or_else(|| default_workspace(&agent.id))
             else {
                 continue;

@@ -113,14 +113,7 @@ pub(super) struct SummaryRuleDef {
 
 // ─── Tilde expansion ────────────────────────────────────────────────────────
 
-fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
-}
+use crate::utils::format::expand_tilde_string;
 
 // ─── Loading ────────────────────────────────────────────────────────────────
 
@@ -203,10 +196,10 @@ pub(super) fn resolve_role_binding(
     let prompt_file = agent_def
         .prompt_file
         .as_deref()
-        .map(expand_tilde)
+        .map(expand_tilde_string)
         .or_else(|| {
             schema.prompts_root.as_deref().map(|root| {
-                let base = expand_tilde(root);
+                let base = expand_tilde_string(root);
                 format!("{}/agents/{}/IDENTITY.md", base, ch_binding.agent)
             })
         })
@@ -237,7 +230,7 @@ pub(super) fn resolve_workspace(
         .as_deref()
         .or(agent_def.workspace.as_deref())?;
 
-    Some(expand_tilde(ws))
+    Some(expand_tilde_string(ws))
 }
 
 pub(super) fn load_shared_prompt_path() -> Option<String> {
@@ -246,9 +239,9 @@ pub(super) fn load_shared_prompt_path() -> Option<String> {
     schema
         .shared_prompt
         .as_deref()
-        .map(expand_tilde)
+        .map(expand_tilde_string)
         .or_else(|| {
-            let root = expand_tilde(schema.prompts_root.as_deref()?);
+            let root = expand_tilde_string(schema.prompts_root.as_deref()?);
             let root = std::path::Path::new(&root);
             let canonical = root.join("agents").join("_shared.prompt.md");
             if canonical.exists() {
@@ -304,7 +297,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
         None => return None,
     };
 
-    let prompts_root = schema.prompts_root.as_deref().map(expand_tilde);
+    let prompts_root = schema.prompts_root.as_deref().map(expand_tilde_string);
     // Use explicit meeting.available_agents as-is when present. Only absence
     // falls back to the full registry.
     let eligible_agents: Box<dyn Iterator<Item = (&String, &AgentDef)>> =
@@ -323,7 +316,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
             let prompt_file = def
                 .prompt_file
                 .as_deref()
-                .map(expand_tilde)
+                .map(expand_tilde_string)
                 .or_else(|| {
                     prompts_root
                         .as_ref()
@@ -343,7 +336,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
                 provider: def.provider.as_deref().and_then(ProviderKind::from_str),
                 model: def.model.clone(),
                 reasoning_effort: None,
-                workspace: def.workspace.as_deref().map(expand_tilde),
+                workspace: def.workspace.as_deref().map(expand_tilde_string),
                 peer_agents_enabled: def.peer_agents.unwrap_or(true),
                 memory: resolve_memory_settings(def.memory.as_ref(), None),
             }

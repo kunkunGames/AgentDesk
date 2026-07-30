@@ -11,14 +11,7 @@ use super::settings::{
 use crate::services::provider::ProviderKind;
 
 /// Expand `~` or `~/` prefix to the user's home directory.
-fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
-}
+use crate::utils::format::expand_tilde_string;
 
 fn load_role_map_json() -> Option<serde_json::Value> {
     let path = role_map_path()?;
@@ -29,7 +22,7 @@ fn load_role_map_json() -> Option<serde_json::Value> {
 fn parse_role_binding(value: &serde_json::Value) -> Option<RoleBinding> {
     let obj = value.as_object()?;
     let role_id = obj.get("roleId")?.as_str()?.to_string();
-    let prompt_file = expand_tilde(obj.get("promptFile")?.as_str()?);
+    let prompt_file = expand_tilde_string(obj.get("promptFile")?.as_str()?);
     let provider = obj
         .get("provider")
         .and_then(|v| v.as_str())
@@ -247,7 +240,7 @@ fn meeting_agent_from_json(agent: &serde_json::Value) -> Option<MeetingAgentConf
         .and_then(|v| v.as_str())
         .or_else(|| fallback.map(|profile| profile.display_name))
         .unwrap_or(role_id);
-    let prompt_file = expand_tilde(
+    let prompt_file = expand_tilde_string(
         agent
             .get("prompt_file")
             .or_else(|| agent.get("promptFile"))
@@ -263,7 +256,7 @@ fn meeting_agent_from_json(agent: &serde_json::Value) -> Option<MeetingAgentConf
         .or_else(|| fallback.and_then(|profile| ProviderKind::from_str(profile.provider_hint)));
     let model = json_string_field(agent, &["model"]);
     let reasoning_effort = json_string_field(agent, &["reasoning_effort", "reasoningEffort"]);
-    let workspace = json_string_field(agent, &["workspace"]).map(|value| expand_tilde(&value));
+    let workspace = json_string_field(agent, &["workspace"]).map(|value| expand_tilde_string(&value));
     let peer_agents_enabled = agent
         .get("peerAgents")
         .or_else(|| agent.get("peer_agents"))
@@ -462,7 +455,7 @@ pub(super) fn resolve_workspace(
         let key = channel_id.get().to_string();
         if let Some(entry) = by_id.get(&key) {
             if let Some(ws) = entry.get("workspace").and_then(|v| v.as_str()) {
-                return Some(expand_tilde(ws));
+                return Some(expand_tilde_string(ws));
             }
         }
     }
@@ -478,14 +471,14 @@ pub(super) fn resolve_workspace(
     entry
         .get("workspace")
         .and_then(|v| v.as_str())
-        .map(|s| expand_tilde(s))
+        .map(|s| expand_tilde_string(s))
 }
 
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     let json = load_role_map_json()?;
     json.get("sharedPromptFile")
         .and_then(|v| v.as_str())
-        .map(|s| expand_tilde(s))
+        .map(|s| expand_tilde_string(s))
         .or_else(|| {
             let root = crate::config::runtime_root()?;
             let canonical = crate::runtime_layout::shared_prompt_path(&root);

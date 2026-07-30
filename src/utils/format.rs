@@ -104,3 +104,13 @@ pub fn expand_tilde_path(path: &str) -> std::path::PathBuf {
     }
     std::path::PathBuf::from(path)
 }
+
+/// `~` 또는 `~/...` 경로를 홈 디렉토리로 확장하여 문자열로 반환한다.
+pub fn expand_tilde_string(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
