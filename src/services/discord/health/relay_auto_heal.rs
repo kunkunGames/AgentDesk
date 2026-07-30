@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
+    async fn pg_redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
