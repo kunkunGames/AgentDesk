@@ -603,7 +603,11 @@ fn translate_sqlite_rowid(sql: &str) -> String {
 
                     let token = &sql[start..idx];
                     if token.eq_ignore_ascii_case("rowid") {
-                        result.push_str("ctid");
+                        if !is_quoted_identifier_alias(sql, start) {
+                            result.push_str("ctid");
+                        } else {
+                            result.push_str(token);
+                        }
                         continue;
                     }
 
@@ -1497,6 +1501,39 @@ mod tests {
 
         pool.close().await;
         test_db.drop().await;
+    }
+
+    #[test]
+    fn test_translate_sqlite_rowid_aliases() {
+        // Unquoted aliases
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid AS rowid FROM t"),
+            "SELECT ctid AS rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid as ROWID FROM t"),
+            "SELECT ctid as ROWID FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT t.rowid AS rowid FROM t"),
+            "SELECT t.ctid AS rowid FROM t"
+        );
+
+        // Quoted aliases
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid AS \"rowid\" FROM t"),
+            "SELECT ctid AS \"rowid\" FROM t"
+        );
+
+        // No aliases
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid FROM t"),
+            "SELECT ctid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid, my_rowid FROM t"),
+            "SELECT ctid, my_rowid FROM t"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
