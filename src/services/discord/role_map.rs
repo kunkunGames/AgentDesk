@@ -256,7 +256,8 @@ fn meeting_agent_from_json(agent: &serde_json::Value) -> Option<MeetingAgentConf
         .or_else(|| fallback.and_then(|profile| ProviderKind::from_str(profile.provider_hint)));
     let model = json_string_field(agent, &["model"]);
     let reasoning_effort = json_string_field(agent, &["reasoning_effort", "reasoningEffort"]);
-    let workspace = json_string_field(agent, &["workspace"]).map(|value| expand_tilde_string(&value));
+    let workspace =
+        json_string_field(agent, &["workspace"]).map(|value| expand_tilde_string(&value));
     let peer_agents_enabled = agent
         .get("peerAgents")
         .or_else(|| agent.get("peer_agents"))
