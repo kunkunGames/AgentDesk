@@ -249,20 +249,25 @@ pub(super) async fn load_activate_card_state_pg(
     entry_id: &str,
 ) -> Result<ActivateCardState, String> {
     let row = sqlx::query(
-        "SELECT status, title, latest_dispatch_id, repo_id, assigned_agent_id,
-                COALESCE(metadata->>'scope_assessment_status', '') = 'pending'
+        "SELECT kc.status, kc.title, kc.latest_dispatch_id, kc.repo_id, kc.assigned_agent_id,
+                COALESCE(kc.metadata->>'scope_assessment_status', '') = 'pending'
                     AS scope_assessment_pending,
-                metadata->>'scope_depth' AS scope_depth,
+                kc.metadata->>'scope_depth' AS scope_depth,
                 EXISTS (
                     SELECT 1 FROM task_dispatches td
-                    WHERE td.kanban_card_id = kanban_cards.id
+                    WHERE td.kanban_card_id = kc.id
                       AND td.dispatch_type = 'plan'
                       AND td.status = 'completed'
-                ) AS has_completed_plan_dispatch
-         FROM kanban_cards
-         WHERE id = $1",
+                ) AS has_completed_plan_dispatch,
+                ld.status AS latest_dispatch_status,
+                ld.dispatch_type AS latest_dispatch_type,
+                COALESCE((SELECT status FROM auto_queue_entries WHERE id = $2), 'pending') AS entry_status
+         FROM kanban_cards kc
+         LEFT JOIN task_dispatches ld ON ld.id = kc.latest_dispatch_id
+         WHERE kc.id = $1",
     )
     .bind(card_id)
+    .bind(entry_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| format!("load postgres card {card_id}: {error}"))?
@@ -274,26 +279,12 @@ pub(super) async fn load_activate_card_state_pg(
     // #3605 (codex R2): also load the dispatch_type so has_active_dispatch() can
     // exclude inert side-paths (consultation, scope-assessment) from the
     // attachable-implementation-dispatch decision.
-    let mut latest_dispatch_status: Option<String> = None;
-    let mut latest_dispatch_type: Option<String> = None;
-    if let Some(dispatch_id) = latest_dispatch_id.as_deref() {
-        if let Some(dispatch_row) =
-            sqlx::query("SELECT status, dispatch_type FROM task_dispatches WHERE id = $1")
-                .bind(dispatch_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(|error| {
-                    format!("load postgres dispatch status for {dispatch_id}: {error}")
-                })?
-        {
-            latest_dispatch_status = dispatch_row
-                .try_get("status")
-                .map_err(|error| format!("decode dispatch status for {dispatch_id}: {error}"))?;
-            latest_dispatch_type = dispatch_row
-                .try_get("dispatch_type")
-                .map_err(|error| format!("decode dispatch type for {dispatch_id}: {error}"))?;
-        }
-    }
+    let mut latest_dispatch_status: Option<String> = row
+        .try_get("latest_dispatch_status")
+        .map_err(|error| format!("decode latest_dispatch_status for {card_id}: {error}"))?;
+    let mut latest_dispatch_type: Option<String> = row
+        .try_get("latest_dispatch_type")
+        .map_err(|error| format!("decode latest_dispatch_type for {card_id}: {error}"))?;
     if !matches!(
         latest_dispatch_status.as_deref(),
         Some("pending") | Some("dispatched")
@@ -324,15 +315,9 @@ pub(super) async fn load_activate_card_state_pg(
             })?;
         }
     }
-    let entry_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM auto_queue_entries WHERE id = $1")
-            .bind(entry_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| {
-                format!("load postgres auto-queue entry status for {entry_id}: {error}")
-            })?
-            .unwrap_or_else(|| "pending".to_string());
+    let entry_status: String = row
+        .try_get("entry_status")
+        .map_err(|error| format!("decode entry_status for {card_id}: {error}"))?;
 
     Ok(ActivateCardState {
         status: row
