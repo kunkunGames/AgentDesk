@@ -135,6 +135,27 @@ jobs:
               # tests; changes to the owner or its sidecars must run them.
               - 'src/services/discord/health/recovery.rs'
               - 'src/services/discord/health/recovery/**'
+              # #5025: terminal-delivery evidence routing and every local
+              # producer/epilogue sibling run in `test_fast`, whose registered
+              # required mirror is `Fast targeted tests (ubuntu-latest)`.
+              - 'src/services/discord/inflight.rs'
+              - 'src/services/discord/inflight/**'
+              - 'src/services/discord/tmux_watcher.rs'
+              - 'src/services/discord/tmux_watcher/**'
+              - 'src/services/discord/turn_bridge/terminal_outcome_delivery.rs'
+              - 'src/services/discord/turn_bridge/terminal_outcome_delivery/**'
+              - 'src/services/scheduled_messages.rs'
+              - 'src/services/scheduled_messages/**'
+              - 'src/services/discord/outbound/source_registry.rs'
+              # #4985: footer marker changes require the protected targeted lane.
+              # Glob rather than a file list: enumerating siblings silently drops
+              # newly extracted modules (footer_only_marker.rs was created by this
+              # PR and missed the list), which skips the lane for the very file
+              # the change lives in.
+              - 'src/services/discord/task_notification_delivery/**'
+              - 'src/services/discord/tmux.rs'
+              - 'src/services/discord/tmux_watcher/discrete_trigger_marker.rs'
+              - 'src/services/discord/tui_prompt_relay/task_notification_prompt.rs'
               - 'src/services/message_outbox.rs'
               - 'src/services/message_outbox_recovery.rs'
               - 'src/services/message_outbox_recovery_support.rs'
@@ -577,6 +598,17 @@ jobs:
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Footer-only marker regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres
+          cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres
+
       - name: Trusted session forwarding tests
         timeout-minutes: 10
         shell: bash
@@ -585,6 +617,23 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres
+
+      # #5025: this job is mirrored by the branch-protected
+      # `Fast targeted tests (ubuntu-latest)` context above. Keep the router test
+      # and both real identity-gate producers together so a red WARN regression
+      # blocks merge instead of remaining advisory.
+      - name: Terminal delivery evidence regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests
+          env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row
+          env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn
 
       - name: just test-postgres
         timeout-minutes: 20
@@ -641,7 +690,16 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: High-risk recovery lane
-        run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
+        run: |
+          cargo test --lib high_risk_recovery:: -- --test-threads=1
+          cargo test --lib services::discord::recovery_engine::state_extractors::tests -- --test-threads=1
+          cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
+          cargo test --lib services::discord::terminal_ui_obligation::tests -- --test-threads=1
+
+      # #5003: this production-path E2E previously ran only in main's broad
+      # non-PG lane, so test-only fixes could merge without executing it on PRs.
+      - name: Local model durable queue wake regression
+        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1
 
       - name: Stop PostgreSQL service
         if: always()

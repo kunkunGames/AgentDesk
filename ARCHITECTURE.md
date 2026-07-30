@@ -565,6 +565,7 @@ src/
 │   │   │   │   └── flake_isolation_4422.rs
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
+│   │   │   ├── destructive_commit.rs
 │   │   │   ├── episode_guard.rs
 │   │   │   ├── finalizer_identity.rs
 │   │   │   ├── invariant_test_capture.rs
@@ -575,6 +576,7 @@ src/
 │   │   │   ├── removal.rs
 │   │   │   ├── save_store.rs
 │   │   │   ├── store.rs
+│   │   │   ├── terminal_delivery_evidence_loss.rs
 │   │   │   └── watcher_state.rs
 │   │   ├── meeting_orchestrator/
 │   │   │   ├── lifecycle.rs
@@ -796,6 +798,7 @@ src/
 │   │   │   │   └── terminal_footer.rs
 │   │   │   ├── card_post.rs
 │   │   │   ├── card_render.rs
+│   │   │   ├── footer_only_marker.rs
 │   │   │   ├── gateway.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── response_chunks.rs
@@ -868,6 +871,8 @@ src/
 │   │   │   ├── store.rs
 │   │   │   ├── sweep.rs
 │   │   │   └── tombstone.rs
+│   │   ├── tui_direct_pending_start/
+│   │   │   └── watcher_cancel.rs
 │   │   ├── tui_prompt_relay/
 │   │   │   ├── synthetic_start/
 │   │   │   │   └── stale_reclaim.rs
@@ -934,6 +939,7 @@ src/
 │   │   │   │   ├── cancel_prompt_replace.rs
 │   │   │   │   ├── contracts.rs
 │   │   │   │   ├── delivery_epilogue.rs
+│   │   │   │   ├── delivery_epilogue_tests.rs
 │   │   │   │   ├── empty_response_recovery.rs
 │   │   │   │   ├── prompt_too_long_guidance.rs
 │   │   │   │   ├── queue_retry_silence.rs

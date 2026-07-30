@@ -10,6 +10,14 @@
 >
 > Last refreshed: 2026-07-21 (against #4706 acceptance repair: structural lint allow baseline, giant-registry issue validation, and production-count sync).
 >
+> Last refreshed: 2026-07-30 (#4984 S1 records unintended cross-channel tmux
+> watcher claims through the existing WARN-level `invariant_violation` event
+> surface. Every cross-channel claim persists either an intended follow-up or an
+> unintended-claim classification; intake and headless paths use live Discord
+> parent context, while handoff and recovery paths derive parent candidates from
+> persisted inflight identity. Claim, session-name, and delivery behavior remain
+> unchanged).
+>
 > Last refreshed: 2026-07-29 (#4911/#4961 Phase A R9 — `tmux.rs` gains the
 > generation-scoped `advance_watcher_confirmed_end_for_generation` used only by the
 > guarded watcher/sink delivery funnel. The watcher surface's offset authority is
@@ -240,7 +248,7 @@
     output policy, recovery marker, and test clusters moved verbatim into
     sub-1000-LoC `watchers/lifecycle/*.rs` modules. The root remains the
     canonical facade and preserves all prior call paths through re-exports.
-  - `src/services/discord/tmux.rs` (frozen giant surface; #4895 removes untyped auth/overload terminal variants and authority-bearing outcome fields; parser diagnostics now use a fixed redacted category while generic error results remain `HardResult`; test-only #4277 re-exports
+  - `src/services/discord/tmux.rs` (frozen giant surface; current generated inventory: 1677 production LoC; #4895 removes untyped auth/overload terminal variants and authority-bearing outcome fields; parser diagnostics now use a fixed redacted category while generic error results remain `HardResult`; test-only #4277 re-exports
     the watcher delivery-lease key helper so session-sink production-entry tests
     prove bidirectional contention on the same idle JSONL range; -9 from the #4804
     Windows-compile hotfix moving `footer_background_marker_session_key` into

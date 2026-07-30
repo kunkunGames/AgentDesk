@@ -100,12 +100,32 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.pg_db == 'true'",
     "runs_on" => "ubuntu-latest",
-    # #4913 re-pins after adding the trusted session-forwarding test to the
-    # existing toolchain-provisioned targeted lane.
-    "job_sha256" => "86804b84bc35aacdf93d9f12607ec2fdf43d5c0bf1c67bb136b9b373365c16a4",
+    # #5025 re-pins after adding the production bridge-epilogue routing test to
+    # the existing toolchain-provisioned targeted lane whose mirror is required.
+    # #4985 keeps footer-marker regressions in that same branch-protected lane;
+    # both land in one job block, so the pin is recomputed for the merged content.
+    "job_sha256" => "6c60e700d0e2417135e76ae69e316fd79b94180fae74eebee672dc288e39fee5",
     "cargo_steps" => {
+      "Footer-only marker regressions" => {
+        "commands" => [
+          "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
+        ],
+        "continue_on_error" => nil,
+        "timeout_minutes" => 10,
+      },
       "Trusted session forwarding tests" => {
         "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
+        "continue_on_error" => nil,
+        "timeout_minutes" => 10,
+      },
+      "Terminal delivery evidence regressions" => {
+        "commands" => [
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn",
+        ],
         "continue_on_error" => nil,
         "timeout_minutes" => 10,
       },
