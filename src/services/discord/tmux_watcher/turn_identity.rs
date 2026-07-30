@@ -166,28 +166,6 @@ pub(super) fn matching_watcher_turn_identity(
         .map(crate::services::discord::inflight::InflightTurnIdentity::from_state)
 }
 
-/// Authenticate a soft terminal against authority that existed before this
-/// frame was parsed. The owner, resume floor, and nonce must all name the same
-/// turn so historical transcript markers cannot borrow a newer turn's anchor or
-/// mint authority while the watcher is already consuming backlog.
-pub(super) fn watcher_soft_terminal_has_turn_authority(
-    state: Option<&crate::services::discord::inflight::InflightTurnState>,
-    tmux_session_name: &str,
-    data_start_offset: u64,
-    watcher_turn_nonce: Option<&str>,
-) -> bool {
-    state.is_some_and(|state| {
-        state.tmux_session_name.as_deref() == Some(tmux_session_name)
-            && state.last_offset.max(state.turn_start_offset.unwrap_or(0)) == data_start_offset
-            && !matches!(
-                state.effective_relay_owner_kind(),
-                crate::services::discord::inflight::RelayOwnerKind::None
-            )
-            && state.turn_nonce.as_deref().is_some()
-            && state.turn_nonce.as_deref() == watcher_turn_nonce
-    })
-}
-
 pub(super) fn matching_watcher_turn_nonce(
     state: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
@@ -256,13 +234,12 @@ pub(super) fn pinned_finalizer_turn_id(
         .unwrap_or(0)
 }
 
-pub(in crate::services::discord) fn pinned_delivery_lease_key(
+pub(super) fn pinned_delivery_lease_key(
     channel_id: poise::serenity_prelude::ChannelId,
     generation: u64,
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
     current_offset: u64,
-    relay_range_start: u64,
 ) -> crate::services::discord::DeliveryLeaseKey {
     if let Some(state) = inflight_before_relay.filter(|state| {
         state.tmux_session_name.as_deref().map(str::trim) == Some(tmux_session_name.trim())
@@ -272,14 +249,8 @@ pub(in crate::services::discord) fn pinned_delivery_lease_key(
             channel_id, generation, state, "watcher",
         )
     } else {
-        crate::services::discord::DeliveryLeaseKey::new_for_site_with_fallback_offset(
-            channel_id,
-            generation,
-            0,
-            None,
-            None,
-            Some(relay_range_start),
-            "watcher",
+        crate::services::discord::DeliveryLeaseKey::new_for_site(
+            channel_id, generation, 0, None, None, "watcher",
         )
     }
 }
@@ -357,17 +328,24 @@ pub(super) fn degenerate_duplicate_refuses_delivery(
 pub(super) fn watcher_direct_terminal_response_decision(
     provider: &ProviderKind,
     channel_id: ChannelId,
-    _generation: u64,
+    generation: u64,
     tmux_session_name: &str,
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
-    _current_offset: u64,
+    current_offset: u64,
     fresh_assistant_text_in_observed_range: bool,
     response: &str,
 ) -> WatcherDirectTerminalResponseDecision {
     if response.trim().is_empty() {
         return WatcherDirectTerminalResponseDecision::Empty;
     }
-    let duplicate = inflight_before_relay.is_none()
+    let key = pinned_delivery_lease_key(
+        channel_id,
+        generation,
+        inflight_before_relay,
+        tmux_session_name,
+        current_offset,
+    );
+    let duplicate = key.is_degenerate_legacy()
         && crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
             provider,
             channel_id,
@@ -400,7 +378,7 @@ pub(super) fn watcher_direct_terminal_response_decision(
             response_len = response.len(),
             fresh_assistant_text_in_observed_range,
             pending_user_boundary,
-            "watcher: suppressed inflight-less duplicate terminal response by content fingerprint"
+            "watcher: suppressed degenerate-key duplicate terminal response by content fingerprint"
         );
         return WatcherDirectTerminalResponseDecision::RefusedDegenerateDuplicate;
     }
@@ -414,7 +392,6 @@ pub(super) fn pinned_watcher_delivery_lease_identity(
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
     current_offset: u64,
-    relay_range_start: u64,
 ) -> (
     crate::services::discord::turn_finalizer::TurnKey,
     crate::services::discord::DeliveryLeaseKey,
@@ -432,7 +409,6 @@ pub(super) fn pinned_watcher_delivery_lease_identity(
             inflight_before_relay,
             tmux_session_name,
             current_offset,
-            relay_range_start,
         ),
         crate::services::discord::LeaseHolder::Watcher {
             instance_id: watcher_instance_id,

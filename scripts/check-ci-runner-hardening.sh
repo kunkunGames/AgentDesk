@@ -60,22 +60,6 @@ unless document["concurrency"] == expected_concurrency
   exit 1
 end
 
-trigger = document[true] || document["on"]
-trigger_events = case trigger
-when Hash
-  trigger.keys.map(&:to_s)
-when Array
-  trigger.map(&:to_s)
-when String
-  [trigger]
-else
-  []
-end
-unless trigger_events == ["pull_request"]
-  warn "#{path}: required PR contexts must be triggered only by pull_request"
-  exit 1
-end
-
 targets = {
   "check_fast_cross_os" => {
     "label" => "cross-OS job",
@@ -83,13 +67,36 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
-    # #4747 (opt.2) re-pins the compile-only PR lane after moving long-pole
-    # Windows runtime tests to nightly. Option 3 keeps PR cache access restore-only.
-    "job_sha256" => "d27244ced15d0bb13f89e680de42978cb74452af4b02457ab034d462f4fa103a",
+    # #4466 formally admits the non-advisory Windows named-mutex runtime proof.
+    # #4747 (opt.3) re-pins after making PR cache access restore-only.
+    "job_sha256" => "7040d0cb8412f30c878bc1357c28c7dd9ad6483d315d83cacddfb1382cc66011",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
         "continue_on_error" => nil,
+        "timeout_minutes" => nil,
+      },
+      "Discord thread-create cross-process lock" => {
+        "commands" => ["cargo test --lib discord_thread_create -- --test-threads=1"],
+        "continue_on_error" => nil,
+        "timeout_minutes" => nil,
+      },
+      "cargo test (non-PG, targeted subset)" => {
+        "commands" => [
+          "set -euo pipefail",
+          "cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1",
+          "cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres",
+          "# Health must precede relay_recovery: fail-fast recipes otherwise hide",
+          "# health regressions whenever the earlier recovery filter also fails.",
+          "python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres",
+        ],
+        "continue_on_error" => true,
         "timeout_minutes" => nil,
       },
     },
@@ -100,35 +107,9 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.pg_db == 'true'",
     "runs_on" => "ubuntu-latest",
-    # #5025 re-pins after adding the production bridge-epilogue routing test to
-    # the existing toolchain-provisioned targeted lane whose mirror is required.
-    # #4985 keeps footer-marker regressions in that same branch-protected lane;
-    # both land in one job block, so the pin is recomputed for the merged content.
-    "job_sha256" => "6c60e700d0e2417135e76ae69e316fd79b94180fae74eebee672dc288e39fee5",
+    # #4747 (opt.3) re-pins after making PR cache access restore-only.
+    "job_sha256" => "038d897af037869047a114d10640751c62f0a7350d3748320bbabb171fadeeff",
     "cargo_steps" => {
-      "Footer-only marker regressions" => {
-        "commands" => [
-          "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
-          "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
-        ],
-        "continue_on_error" => nil,
-        "timeout_minutes" => 10,
-      },
-      "Trusted session forwarding tests" => {
-        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
-        "continue_on_error" => nil,
-        "timeout_minutes" => 10,
-      },
-      "Terminal delivery evidence regressions" => {
-        "commands" => [
-          "env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests",
-          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests",
-          "env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row",
-          "env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn",
-        ],
-        "continue_on_error" => nil,
-        "timeout_minutes" => 10,
-      },
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
         "continue_on_error" => nil,
@@ -244,92 +225,6 @@ RUBY
 trusted_workflow=".github/workflows/ci-macos-trusted.yml"
 pr_workflow=".github/workflows/ci-pr.yml"
 
-workflow_files() {
-  find .github/workflows -maxdepth 1 -type f \
-    \( -name '*.yml' -o -name '*.yaml' \) -print0
-}
-
-validate_workflow_entries() {
-  while IFS= read -r -d '' workflow; do
-    error "$workflow must not be a symlink; workflow hardening requires regular files"
-  done < <(find .github/workflows -type l -print0)
-}
-
-validate_required_context_uniqueness() {
-  if ! command -v ruby >/dev/null 2>&1; then
-    error "ruby is required to validate required workflow contexts structurally"
-    return
-  fi
-
-  while IFS= read -r -d '' workflow; do
-    if ! ruby - "$workflow" "$pr_workflow" <<'RUBY'
-require "yaml"
-
-path, pr_path = ARGV
-begin
-  # Workflow aliases are intentionally unsupported. Rejecting them keeps every
-  # audited job definition local and explicit instead of expanding YAML graphs.
-  document = YAML.safe_load(File.read(path), aliases: false, filename: path)
-rescue StandardError => error
-  warn "#{path}: cannot parse YAML: #{error.message}"
-  exit 1
-end
-jobs = document.is_a?(Hash) ? document["jobs"] : nil
-unless jobs.is_a?(Hash)
-  warn "#{path}: jobs must be a YAML mapping"
-  exit 1
-end
-required_context = "Script checks"
-required_context_jobs = []
-unsafe_dynamic_name_jobs = []
-jobs.each do |job_id, job|
-  next unless job.is_a?(Hash)
-
-  name = job["name"]
-  required_context_jobs << job_id.to_s if name.to_s.strip == required_context
-  next unless name.is_a?(String) && name.include?("${{")
-
-  # Do not evaluate Actions expressions. Permit exactly one matrix substitution
-  # whose static prefix/suffix make the required context impossible to render.
-  expression_shape_valid = name.scan("${{").length == 1 && name.scan("}}").length == 1
-  matrix_name = if expression_shape_valid
-    /\A([^{}]*)\$\{\{\s*matrix\.[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}([^{}]*)\z/.match(name)
-  end
-  can_render_required = if matrix_name
-    static_fragments = [matrix_name[1], matrix_name[2]]
-    static_fragments.any? { |fragment| fragment.include?(required_context) } ||
-      (required_context.start_with?(matrix_name[1]) && required_context.end_with?(matrix_name[2]))
-  else
-    true
-  end
-  unsafe_dynamic_name_jobs << job_id.to_s if can_render_required
-end
-if path == pr_path
-  scripts = jobs["scripts"]
-  unless scripts.is_a?(Hash) && scripts["name"] == required_context
-    warn "#{path}: required Script checks context must be the exact literal name of jobs.scripts"
-    exit 1
-  end
-  unexpected_required = required_context_jobs - ["scripts"]
-  if unexpected_required.any?
-    warn "#{path}: required Script checks context must belong only to jobs.scripts"
-    exit 1
-  end
-elsif required_context_jobs.any?
-  warn "#{path}: must not publish required Script checks context (jobs: #{required_context_jobs.join(', ')})"
-  exit 1
-end
-if unsafe_dynamic_name_jobs.any?
-  warn "#{path}: dynamic job names must not be able to publish required Script checks context (jobs: #{unsafe_dynamic_name_jobs.join(', ')})"
-  exit 1
-end
-RUBY
-    then
-      error "$workflow violates required Script checks context uniqueness"
-    fi
-  done < <(workflow_files)
-}
-
 if [ ! -f "$trusted_workflow" ]; then
   error "missing $trusted_workflow"
 fi
@@ -337,9 +232,9 @@ if [ ! -f "$pr_workflow" ]; then
   error "missing $pr_workflow"
 fi
 
-validate_workflow_entries
+for workflow in .github/workflows/*.yml; do
+  [ -f "$workflow" ] || continue
 
-while IFS= read -r -d '' workflow; do
   if grep -Eq '^[[:space:]]+pull_request(_target)?:' "$workflow"; then
     if grep -Eq 'MACOS_RUNNER|self-hosted' "$workflow"; then
       error "$workflow is pull_request-triggered and must not reference self-hosted macOS routing"
@@ -353,9 +248,7 @@ while IFS= read -r -d '' workflow; do
   if grep -q 'RUSTC_WRAPPER=' "$workflow" && ! grep -q 'SCCACHE_GHA_ENABLED=' "$workflow"; then
     error "$workflow clears RUSTC_WRAPPER but not SCCACHE_GHA_ENABLED"
   fi
-done < <(workflow_files)
-
-validate_required_context_uniqueness
+done
 
 if [ -f "$trusted_workflow" ]; then
   if grep -Eq '^[[:space:]]+pull_request(_target)?:' "$trusted_workflow"; then

@@ -9,7 +9,6 @@
 //! (`super::lease_now_ms()`) is rewritten to its absolute path; the bodies are
 //! otherwise identical.
 
-use super::completion_admission::publish_claimed_queue_eligible;
 use super::*;
 
 /// Run the deadline-elapsed backstop finalize for ONE entry: flip
@@ -41,7 +40,7 @@ async fn run_backstop_finalize(
     // `Finalizing`, and a stuck `Finalizing` entry would never be GC'd (GC reaps
     // only `Finalized`) nor re-finalized (backstops/probes gate on `Pending`),
     // leaking forever. Resetting it to `Finalized` lets GC reap it normally.
-    let finalized = AssertUnwindSafe(do_finalize(
+    if let Err(payload) = AssertUnwindSafe(do_finalize(
         turn_key,
         provider,
         &TerminalEvent::GateTimeout {
@@ -52,17 +51,8 @@ async fn run_backstop_finalize(
         shared,
     ))
     .catch_unwind()
-    .await;
-    if let Ok(FinalizeOutcome::Finalized {
-        removed_token: Some(_),
-        ..
-    }) = &finalized
-        && let Some(entry) = ledger.get_mut(&ledger_key)
+    .await
     {
-        entry.completion_admission.note_mailbox_released();
-        publish_claimed_queue_eligible(shared, entry);
-    }
-    if let Err(payload) = finalized {
         tracing::error!(
             panic = %panic_payload_summary(payload.as_ref()),
             channel_id = ledger_key.channel_id.get(),
@@ -91,7 +81,6 @@ async fn run_backstop_finalize(
 /// bounded.
 pub(super) async fn reconcile(
     ledger: &mut HashMap<LedgerKey, LedgerEntry>,
-    pending_admission: &mut HashMap<LedgerKey, PendingCompletionAdmission>,
     shared: &Arc<SharedData>,
 ) {
     let now = Instant::now();
@@ -222,13 +211,11 @@ pub(super) async fn reconcile(
         }
     }
 
-    // GC admission authority only after the longest bounded late-edge window.
+    // GC finalized entries past their TTL.
     ledger.retain(|_, entry| {
         !(entry.phase == Phase::Finalized
             && entry
                 .finalized_at
-                .is_some_and(|t| now.duration_since(t) >= COMPLETION_ADMISSION_TTL))
+                .is_some_and(|t| now.duration_since(t) >= FINALIZED_TTL))
     });
-    pending_admission
-        .retain(|_, pending| now.duration_since(pending.updated_at) < COMPLETION_ADMISSION_TTL);
 }

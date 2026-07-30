@@ -22,19 +22,15 @@ mod rebind_adoption;
 
 pub(in crate::services::discord) use self::delivery_rewind::save_inflight_delivery_rewind_if_matches_identity;
 pub(in crate::services::discord) use self::identity_gate::{
-    GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_if_matches_identity,
+    GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
     clear_long_running_placeholder_if_matches_identity,
     mark_readopted_from_inflight_if_identity_unchanged,
-    patch_bridge_entry_state_if_identity_unchanged,
-    patch_bridge_entry_state_tracking_placeholder_clear,
     patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
-    recovery_anchor_message_if_matches_identity, recovery_anchor_msg_id_if_matches_identity,
+    recovery_anchor_msg_id_if_matches_identity,
     save_inflight_state_if_identity_matches_allow_output_restamp,
     save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
-    save_stream_tick_state_if_bridge_authority,
-    save_stream_tick_state_preserving_current_message_races,
     stamp_claude_e_process_if_matches_identity, stamp_runtime_handoff_if_matches_identity,
     touch_inflight_state_if_matches_identity,
 };
@@ -46,28 +42,29 @@ pub(in crate::services::discord) use self::rebind_adoption::{
 };
 
 #[cfg(test)]
-use self::identity_gate::{
-    patch_bridge_entry_state_if_identity_unchanged_in_root,
-    save_inflight_state_if_identity_matches_allow_output_restamp_in_root,
-    save_inflight_state_if_identity_unchanged_in_root,
-};
-#[cfg(test)]
 pub(super) use self::identity_gate::{
     save_existing_inflight_rebind_adoption_if_matches_identity_in_root,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root,
     save_inflight_state_if_matches_identity_in_root,
 };
 #[cfg(test)]
-#[path = "save_store/bridge_entry_guard_tests.rs"]
-mod bridge_entry_guard_tests;
+use self::identity_gate::{
+    save_inflight_state_if_identity_matches_allow_output_restamp_in_root,
+    save_inflight_state_if_identity_unchanged_in_root,
+};
 
 /// Blind whole-blob write of `InflightTurnState`: serializes the ENTIRE row and
 /// clobbers whatever is on disk, with no compare-and-set on turn identity.
 ///
-/// TEST SEED ONLY (#4259 R4): the production symbol is compile-time absent.
-/// Runtime writers must use a create-shaped API or a lock-held narrow RMW seam;
-/// identity checking alone does not make a stale whole-row snapshot safe.
-#[cfg(test)]
+/// SEALED (#4259) — do not add new callers. A concurrent turn that legitimately
+/// re-owns the channel between a caller's snapshot and this write is silently
+/// overwritten. For any new site use the drop-in guarded variant
+/// `save_inflight_state_if_identity_unchanged` (save_store/identity_gate.rs),
+/// which refuses that race and returns a `GuardedSaveOutcome`. The remaining
+/// blind callers are tracked as a monotonically-decreasing ceiling by
+/// `scripts/check_inflight_blind_save_ratchet.py` — that ratchet is the living
+/// inventory that replaced the stale hand-maintained line-number list, and its
+/// BASELINE is lowered per track as #4259 PR-2..N convert the sites.
 pub(in crate::services::discord) fn save_inflight_state(
     state: &InflightTurnState,
 ) -> Result<(), String> {
@@ -355,13 +352,11 @@ mod tests {
         let (raw, cleaned) = api_friction_response_pair();
         let mut state = state_with_full_response(44_086, &raw, "AgentDesk-codex-normal-clean-4185");
         save_inflight_state(&state).expect("seed raw normal row");
-        state = super::super::load_inflight_state(&ProviderKind::Codex, state.channel_id)
-            .expect("load exact seeded normal row");
 
         state.full_response = cleaned.clone();
         assert_eq!(
             save_inflight_state_if_identity_unchanged(
-                &mut state,
+                &state,
                 "test::normal_cleaned_identity_refresh",
             ),
             GuardedSaveOutcome::Saved
@@ -410,11 +405,8 @@ mod tests {
                 &identity,
                 state.turn_start_offset,
                 state.current_msg_id,
-                Some(state.current_msg_len),
                 88_006,
                 11,
-                None,
-                None,
             ),
             GuardedSaveOutcome::IdentityMismatch,
             "id-0 anchor bind must fail closed when either side lacks turn_start_offset"
@@ -475,11 +467,6 @@ mod tests {
         assert_eq!(state.user_msg_id, 0);
         assert_eq!(state.turn_start_offset, Some(256));
         save_inflight_state_in_root(temp.path(), &state).expect("seed matching id-0 row");
-        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
-        state = serde_json::from_str(
-            &std::fs::read_to_string(&persisted_path).expect("reload exact seeded id-0 row"),
-        )
-        .expect("parse exact seeded id-0 row");
 
         state.full_response = "id-0 durable owner refresh".to_string();
         state.response_sent_offset = state.full_response.len();
@@ -492,6 +479,7 @@ mod tests {
             GuardedSaveOutcome::Saved
         );
 
+        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
         let persisted: InflightTurnState = serde_json::from_str(
             &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
         )
@@ -513,11 +501,6 @@ mod tests {
         let provider = ProviderKind::Codex;
         let mut state = state_with_full_response(44_090, "seeded", "AgentDesk-codex-restamp-4259");
         save_inflight_state_in_root(temp.path(), &state).expect("seed intake-path row");
-        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
-        state = serde_json::from_str(
-            &std::fs::read_to_string(&persisted_path).expect("reload exact seeded row"),
-        )
-        .expect("parse exact seeded row");
 
         let expected = InflightTurnIdentity::from_state(&state);
         let seeded_output_path = state.output_path.clone();
@@ -546,6 +529,7 @@ mod tests {
             GuardedSaveOutcome::Saved
         );
 
+        let persisted_path = inflight_state_path(temp.path(), &provider, state.channel_id);
         let persisted: InflightTurnState = serde_json::from_str(
             &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
         )
@@ -794,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_identity_save_preserves_adopted_output_and_commits_completion() {
+    fn matches_identity_save_skips_after_adoption_changes_only_output_path() {
         let temp = tempfile::TempDir::new().expect("runtime root");
         let provider = ProviderKind::Codex;
         let old_rollout_path = temp.path().join("old-rollout.jsonl");
@@ -836,7 +820,7 @@ mod tests {
             expected_turn_start_offset,
         );
 
-        assert_eq!(outcome, GuardedSaveOutcome::Saved);
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
         let persisted_path = inflight_state_path(temp.path(), &provider, channel_id);
         let persisted: InflightTurnState = serde_json::from_str(
             &std::fs::read_to_string(persisted_path).expect("read persisted inflight"),
@@ -847,7 +831,7 @@ mod tests {
             Some(adopted_rollout_path.display().to_string())
         );
         assert_eq!(persisted.full_response, "adopted durable response");
-        assert!(persisted.terminal_delivery_committed);
+        assert!(!persisted.terminal_delivery_committed);
     }
 }
 
@@ -916,7 +900,6 @@ fn save_inflight_state_create_new_in_root(
     }
 }
 
-#[cfg(test)]
 pub(super) fn save_inflight_state_in_root(
     root: &Path,
     state: &InflightTurnState,

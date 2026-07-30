@@ -7,12 +7,10 @@
 
 pub(in crate::services::discord) mod anchor_repost;
 pub(in crate::services::discord) mod budget;
-mod destructive_commit;
 mod finalizer_identity;
 #[cfg(test)]
 mod invariant_test_capture;
 mod model;
-pub(in crate::services::discord) mod terminal_delivery_evidence_loss;
 
 // #3479: the pure domain model moved to `model.rs`; re-export every public
 // item at its original visibility so existing `inflight::*` / `super::*`
@@ -21,16 +19,6 @@ pub(in crate::services::discord) use model::{
     InflightTurnIdentity, InflightTurnState, RelayOwnerKind, TurnSource, opt_channel_id,
     opt_message_id, optional_message_id,
 };
-
-impl InflightTurnState {
-    pub(in crate::services::discord) fn effective_busy_followup_retry_user_msg_id(&self) -> u64 {
-        if self.busy_followup_retry_user_msg_id == 0 {
-            self.user_msg_id
-        } else {
-            self.busy_followup_retry_user_msg_id
-        }
-    }
-}
 
 mod episode_guard;
 mod store;
@@ -42,17 +30,13 @@ mod store;
 // (root callers only) and is brought in via a plain import. `InflightStateFileLock`
 // is named nowhere outside `store` (it only flows as a return type), so it keeps
 // its module-tree visibility there without a parent re-export.
-pub(in crate::services::discord) use destructive_commit::{
-    CommitError, CommitEvidence, DestructiveCancelCommitOutcome, DestructiveCancelPinField,
-    commit_destructive_cancel_locked,
-};
 pub(in crate::services::discord) use episode_guard::{
     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
     adopt_and_lock_inflight_episode, lock_inflight_episode,
 };
 pub(in crate::services::discord) use store::InflightDeliveryRewindReason;
 use store::inflight_provider_dir;
-pub(in crate::services::discord) use store::inflight_state_path;
+pub(in crate::services::discord::inflight) use store::inflight_state_path;
 pub(crate) use store::lock_inflight_state_path;
 
 // #3715 / #3835: the rebind-origin dead-watcher/orphan-lock helpers PLUS the
@@ -151,30 +135,24 @@ use self::store::{
 // Save cluster re-exports (original visibility mirrored). The save child declares
 // these `pub(in crate::services::discord)` (the absolute spelling of the parent's
 // original `pub(super)`), so this `pub(super)` re-export does not widen the surface.
-#[cfg(test)]
-pub(super) use self::save_store::save_inflight_state;
 pub(super) use self::save_store::{
-    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity,
+    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity, save_inflight_state,
     save_inflight_state_create_new, save_inflight_state_if_absent,
 };
 pub(in crate::services::discord) use self::save_store::{
-    GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_if_matches_identity,
+    GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
     clear_long_running_placeholder_if_matches_identity,
     mark_readopted_from_inflight_if_identity_unchanged,
-    patch_bridge_entry_state_if_identity_unchanged,
-    patch_bridge_entry_state_tracking_placeholder_clear,
     patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
-    recovery_anchor_message_if_matches_identity, recovery_anchor_msg_id_if_matches_identity,
+    recovery_anchor_msg_id_if_matches_identity,
     save_existing_inflight_rebind_adoption_if_matches_episode,
     save_existing_inflight_rebind_adoption_if_matches_identity,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_episode,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
     save_inflight_state_if_identity_matches_allow_output_restamp,
     save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
-    save_stream_tick_state_if_bridge_authority,
-    save_stream_tick_state_preserving_current_message_races,
     stamp_claude_e_process_if_matches_identity, stamp_runtime_handoff_if_matches_identity,
     touch_inflight_state_if_matches_identity,
 };
@@ -1404,46 +1382,6 @@ mod stall_recovery_tests {
             persisted.response_sent_offset <= persisted.full_response.len(),
             "response_sent_offset must stay in bounds"
         );
-    }
-
-    /// A stale watcher terminal commit must exercise the real identity gate and
-    /// return `Skipped` without modifying the newer row. The separate outcome
-    /// routing tests verify the operator-visible WARN for this typed result.
-    #[test]
-    fn watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row() {
-        let temp = TempDir::new().unwrap();
-        let channel_id = 50_250_001;
-        let session = "AgentDesk-claude-5025";
-        let stale = seed_watcher_stream_state(temp.path(), channel_id, session, "old body", 100);
-        let stale_identity = InflightTurnIdentity::from_state(&stale);
-
-        let mut newer = stale.clone();
-        newer.user_msg_id = stale.user_msg_id + 1;
-        newer.current_msg_id = stale.current_msg_id + 1;
-        newer.full_response = "new turn body".to_string();
-        newer.response_sent_offset = 0;
-        newer.terminal_delivery_committed = false;
-        force_write_state(temp.path(), &newer);
-
-        let outcome = commit_watcher_terminal_delivery_locked_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            channel_id,
-            &stale_identity,
-            session,
-            WatcherTerminalCommitPatch {
-                full_response: "delivered old body".to_string(),
-                last_offset: 256,
-                last_watcher_relayed_offset: Some(64),
-                last_watcher_relayed_generation_mtime_ns: Some(9),
-            },
-        );
-
-        assert_eq!(outcome, WatcherTerminalCommitOutcome::Skipped);
-        let persisted = loaded_row(temp.path(), channel_id);
-        assert_eq!(persisted.user_msg_id, newer.user_msg_id);
-        assert_eq!(persisted.full_response, "new turn body");
-        assert!(!persisted.terminal_delivery_committed);
     }
 
     /// #3558: a forward commit (larger watermark than disk) advances normally —

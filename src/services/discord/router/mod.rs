@@ -11,10 +11,8 @@ mod turn_start;
 
 pub(crate) use authorization::TurnKind;
 pub(crate) use intake_dispatch::{
-    IntakeOrigin, IntakeSubmission, LocalAdmissionPermit, QueuedAdmissionDisposition,
-    admit_queued_intake, admit_text_intake, dispatch_skill_intake, dispatch_text_intake,
-    finish_admitted_queued_intake, finish_admitted_text_intake, finish_text_intake_admission,
-    prepare_admitted_live_attachments, resolve_attachment_admission,
+    IntakeOrigin, IntakeSubmission, QueuedAdmissionDisposition, admit_queued_intake,
+    dispatch_skill_intake, dispatch_text_intake, finish_admitted_queued_intake,
 };
 pub(super) use intake_gate::{handle_event, should_process_turn_message};
 #[cfg(test)]
@@ -26,14 +24,12 @@ pub(super) use message_handler::{
 };
 pub(crate) use message_handler::{IntakeRequest, execute_intake_turn_core};
 pub(in crate::services::discord) use queue_status_presentation::queue_status_card_enabled;
+#[cfg(test)]
+pub(super) use turn_start::load_session_runtime_state;
 pub(super) use turn_start::reserve_headless_turn;
 pub(crate) use turn_start::{
     HeadlessTurnReservation, HeadlessTurnStartError, HeadlessTurnStartOutcome,
     HeadlessTurnStartStatus,
-};
-#[cfg(test)]
-pub(crate) use turn_start::{
-    load_session_runtime_state, try_intake_runtime_transition_after_redirect,
 };
 
 // Re-export items used across submodules

@@ -266,42 +266,6 @@ class RawChromeAndEditAssertions(unittest.TestCase):
         with self.assertRaises(assertions.AssertionError):
             assertions.chrome_count(window, text="응답 완료", exact=1)
 
-    def test_status_panel_after_body(self):
-        good = _window(
-            _relay_msg(10, "body [BODY]"),
-            _raw_bot_msg(20, "Processing..."),
-        )
-        assertions.status_panel_after_body(good, body_marker="[BODY]")
-
-        stranded = _window(
-            _raw_bot_msg(10, "Processing..."),
-            _relay_msg(20, "body [BODY]"),
-        )
-        with self.assertRaises(assertions.AssertionError):
-            assertions.status_panel_after_body(stranded, body_marker="[BODY]")
-
-        missing = _window(_relay_msg(10, "body [BODY]"))
-        with self.assertRaises(assertions.AssertionError):
-            assertions.status_panel_after_body(missing, body_marker="[BODY]")
-
-    def test_single_status_panel(self):
-        good = _window(_raw_bot_msg(10, "Processing..."))
-        assertions.single_status_panel(good)
-        self.assertEqual(assertions.latest_status_panel(good)["id"], "10")
-
-        ordered = _window(
-            _raw_bot_msg(10, "Processing..."),
-            _raw_bot_msg(20, "✅ 응답 완료"),
-        )
-        self.assertEqual(assertions.latest_status_panel(ordered)["id"], "20")
-
-        duplicate = _window(
-            _raw_bot_msg(10, "Processing..."),
-            _raw_bot_msg(20, "🟢 진행 중"),
-        )
-        with self.assertRaises(assertions.AssertionError):
-            assertions.single_status_panel(duplicate)
-
     def test_completion_chrome_after_body(self):
         window = _window(
             _relay_msg(1, "body [BODY]"),
@@ -343,20 +307,6 @@ class RunAssertionDispatch(unittest.TestCase):
         with self.assertRaises(assertions.AssertionError):
             self.run_assertion({"ordered_text_present": ["b", "a"]}, window=window)
 
-    def test_feature_required_assertion_is_skipped_until_enabled(self):
-        spec = {
-            "requires_feature": "two_message_panel",
-            "status_panel_after_body": {"body_marker": "[BODY]"},
-        }
-        empty = _window(_relay_msg(1, "body [BODY]"))
-        self.run_assertion(spec, window=empty)
-        with self.assertRaises(assertions.AssertionError):
-            self.run_assertion(
-                spec,
-                window=empty,
-                enabled_features=frozenset({"two_message_panel"}),
-            )
-
     def test_no_duplicate_marker_dispatch(self):
         window = _window(_relay_msg(1, "x [M]"), _relay_msg(2, "y [M]"))
         with self.assertRaises(assertions.AssertionError):
@@ -389,19 +339,6 @@ class RunAssertionDispatch(unittest.TestCase):
         self.run_assertion({"raw_text_absent": "[LATE]"}, window=window)
         self.run_assertion({"marker_absent": {"marker": "[LATE]"}}, window=window)
         self.run_assertion({"chrome_count": {"text": "응답 완료", "exact": 1}}, window=window)
-        self.run_assertion(
-            {
-                "status_panel_after_body": {
-                    "body_marker": "[BODY]",
-                    "panel_regex": r"^✅",
-                }
-            },
-            window=window,
-        )
-        self.run_assertion(
-            {"single_status_panel": {"panel_regex": r"^✅"}},
-            window=window,
-        )
         self.run_assertion(
             {"completion_chrome_after_body": {"body_marker": "[BODY]"}},
             window=window,

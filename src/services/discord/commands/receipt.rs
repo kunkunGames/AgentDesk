@@ -20,7 +20,8 @@ pub(in crate::services::discord) async fn cmd_receipt(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/receipt");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] \u{25c0} [{user_name}] /receipt");
 
     ctx.defer().await?;
 
@@ -116,13 +117,7 @@ pub(in crate::services::discord) async fn cmd_receipt(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(
-                event = "discord_receipt_render_failed",
-                channel_id = ctx.channel_id().get(),
-                provider = %label,
-                reason = %stderr,
-                "discord_receipt_render_failed"
-            );
+            tracing::warn!("  [{ts}] \u{2716} Playwright error for {label}: {stderr}");
             continue;
         }
 
@@ -149,13 +144,10 @@ pub(in crate::services::discord) async fn cmd_receipt(
         let _ = std::fs::remove_file(f);
     }
 
-    log_info_event!(
-        "discord_receipt_sent",
-        channel_id = ctx.channel_id().get(),
-        user_name = %user_name,
-        provider_count = to_render.len(),
-        total_cost = %receipt_fmt_cost(data.total),
-        status = "completed",
+    tracing::info!(
+        "  [{ts}] \u{25b6} [{user_name}] Receipt sent ({} providers, total: {})",
+        to_render.len(),
+        receipt_fmt_cost(data.total)
     );
     Ok(())
 }
@@ -172,7 +164,8 @@ pub(in crate::services::discord) async fn cmd_usage(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/usage");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] \u{25c0} [{user_name}] /usage");
 
     ctx.defer().await?;
 

@@ -19,9 +19,11 @@ pub(super) const STALL_WATCHDOG_POSITIVE_LIVENESS_SECS: u64 = 120;
 /// liveness keeps being observed. A deferral only ever fires when
 /// `has_positive_liveness` is true: fresh bytes are demonstrably flowing (pane or
 /// relay offset advanced cross-tick, transcript/runtime jsonl mtime inside
-/// `POSITIVE_LIVENESS_SECS`, or a fresh background-synthetic anchor). An
-/// undelivered backlog remains diagnostic telemetry but never self-justifies a
-/// deferral without independent producer or delivery progress.
+/// `POSITIVE_LIVENESS_SECS`, or a fresh background-synthetic anchor), or an
+/// undelivered backlog is still inside the short no-progress observation grace
+/// used to prove whether it is draining. Once that backlog grace expires without
+/// relay-offset progress, `reason_codes == none` and the first eligible cleanup
+/// tick proceeds instead of waiting for the absolute backstop.
 ///
 /// #3582: raised 3 -> 20. At the old value a *live* turn that kept emitting output
 /// for longer than `THRESHOLD_SECS + 3 * INTERVAL_SECS` (~600s + ~90s) was killed
@@ -248,8 +250,8 @@ impl StallWatchdogLivenessEvidence {
     }
 
     pub(super) fn has_positive_liveness(&self, freshness_secs: u64) -> bool {
-        let progress = self.composite_progress(freshness_secs);
-        progress.source_recent || progress.delivery_recent
+        self.composite_progress(freshness_secs).class
+            != super::relay_progress::RelayProgressClass::NoObservedProgress
     }
 }
 
@@ -1347,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_undelivered_backlog_never_self_justifies_liveness() {
+    fn frozen_undelivered_backlog_cleans_after_no_progress_grace() {
         let provider = ProviderKind::Codex;
         let channel = ChannelId::new(4178_002);
         let tmux_session = "AgentDesk-codex-frozen-backlog-liveness";
@@ -1374,8 +1376,8 @@ mod tests {
         );
         assert_eq!(
             first.action,
-            StallWatchdogLivenessAction::ProceedNoEvidence,
-            "backlog existence without producer or delivery progress cannot defer cleanup"
+            StallWatchdogLivenessAction::Defer { deferral_count: 0 },
+            "first backlog observation gets only the short no-progress grace"
         );
         assert!(first.evidence.has_undelivered_backlog);
         assert_eq!(
@@ -1397,8 +1399,8 @@ mod tests {
         );
         assert_eq!(
             still_inside_grace.action,
-            StallWatchdogLivenessAction::ProceedNoEvidence,
-            "bounded backlog observation remains telemetry, not positive liveness"
+            StallWatchdogLivenessAction::Defer { deferral_count: 0 },
+            "a frozen backlog may defer only inside the bounded grace"
         );
 
         let expired = evaluate_stall_watchdog_liveness(
@@ -1452,11 +1454,7 @@ mod tests {
             STALL_WATCHDOG_MAX_LIVENESS_DEFERRALS,
             Some(0),
         );
-        assert_eq!(
-            first.action,
-            StallWatchdogLivenessAction::ProceedNoEvidence,
-            "the initial backlog observation has no independent progress evidence"
-        );
+        assert!(first.should_defer());
         assert!(first.evidence.has_undelivered_backlog);
 
         for (tick, delivered_offset) in [(1, 64), (2, 128), (3, 192)] {

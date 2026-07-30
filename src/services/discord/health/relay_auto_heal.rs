@@ -13,15 +13,13 @@ use crate::services::discord::relay_recovery::{
 use crate::services::discord::{RelayFrontierToken, SharedData};
 use crate::services::provider::ProviderKind;
 
-// Delay after each admitted attempt. The six initial action times are
-// cumulative +0/+30/+90/+210/+450/+930. The hard placeholder shield expires at
-// +900, so the sixth action intentionally runs under the reclaim semantics
-// restored by that bound. A still-stalled episode then enters a one-hour
-// degraded backoff before a new bounded attempt cycle is admitted; it is never
-// permanently abandoned solely because the first cycle reached its cap.
+// Delay after each admitted attempt. The sixth (960s) is the terminal capped
+// horizon from the issue contract; no seventh action is admitted. Consequently
+// the six actual action times are cumulative +0/+30/+90/+210/+450/+930. The
+// hard placeholder shield expires at +900, so the final action intentionally
+// runs under the reclaim semantics restored by that bound.
 const REDRIVE_BACKOFF_SECS: [i64; 6] = [30, 60, 120, 240, 480, 960];
 const REDRIVE_MAX_NO_PROGRESS_ATTEMPTS: u8 = 6;
-const REDRIVE_CAPPED_REARM_SECS: i64 = 3600;
 const _: () = assert!(REDRIVE_BACKOFF_SECS.len() == REDRIVE_MAX_NO_PROGRESS_ATTEMPTS as usize);
 
 type RedriveKey = (String, String, u64);
@@ -156,15 +154,10 @@ impl SharedData {
             debug_assert_eq!(REDRIVE_BACKOFF_SECS[REDRIVE_BACKOFF_SECS.len() - 1], 960);
             let emit_capped_alarm = !state.capped_alarm_emitted;
             state.capped_alarm_emitted = true;
-            if now_unix.saturating_sub(state.last_attempt_unix).max(0) < REDRIVE_CAPPED_REARM_SECS {
-                return RedriveAttemptDecision {
-                    attempt: None,
-                    emit_capped_alarm,
-                };
-            }
-            state.attempts = 0;
-            state.capped_alarm_emitted = false;
-            state.retry_not_before_unix = None;
+            return RedriveAttemptDecision {
+                attempt: None,
+                emit_capped_alarm,
+            };
         }
         if state
             .retry_not_before_unix
@@ -534,8 +527,7 @@ fn trace_redrive_cap_if_needed(
             channel_id = channel_id.get(),
             last_relay_offset = snapshot.last_relay_offset,
             attempts = REDRIVE_MAX_NO_PROGRESS_ATTEMPTS,
-            rearm_after_secs = REDRIVE_CAPPED_REARM_SECS,
-            "redrive entered degraded long backoff after the no-progress attempt cap"
+            "redrive stopped after the no-progress attempt cap"
         );
     }
 }
@@ -651,24 +643,7 @@ fn nudge_watcher_handle_for_backlog(
     {
         return false;
     }
-    let requested_frontier = snapshot.last_relay_offset.max(token.committed_offset);
-    if resume_offset
-        .as_ref()
-        .is_some_and(|pending| *pending <= token.committed_offset || *pending == requested_frontier)
-    {
-        tracing::error!(
-            target: "agentdesk::discord::relay_recovery",
-            event = "redrive_frontier_no_progress",
-            channel_id = channel_id.get(),
-            requested_frontier,
-            pending_frontier = ?*resume_offset,
-            committed_frontier = token.committed_offset,
-            unread_bytes = ?snapshot.unread_bytes,
-            "redrive refused to enqueue the same non-progressing frontier twice"
-        );
-        return false;
-    }
-    *resume_offset = Some(requested_frontier);
+    *resume_offset = Some(snapshot.last_relay_offset);
     watcher.turn_delivered.store(false, Ordering::Release);
     true
 }
@@ -1172,20 +1147,6 @@ mod tests {
             *resume_offset.lock().unwrap(),
             Some(snapshot.last_relay_offset)
         );
-        assert!(
-            !nudge_watcher_handle_for_backlog(
-                &shared,
-                &snapshot,
-                shared.tmux_watchers.get(&channel_id).unwrap().value(),
-                channel_id,
-                shared.relay_frontier_token(channel_id),
-            ),
-            "a still-pending identical frontier must not be enqueued again"
-        );
-        assert_eq!(
-            *resume_offset.lock().unwrap(),
-            Some(snapshot.last_relay_offset)
-        );
 
         stall_liveness::clear_stall_watchdog_liveness_state(
             &provider,
@@ -1445,7 +1406,6 @@ mod tests {
                     .expect("production redrive entrypoint"),
                 "producer liveness must not suppress admitted relay recovery attempt at +{elapsed}s"
             );
-            *resume_offset.lock().expect("resume offset") = None;
         }
         assert!(
             !registry
@@ -1460,11 +1420,7 @@ mod tests {
             capped_alarm_count, 1,
             "a vouched producer must neither suppress nor duplicate the capped relay alarm"
         );
-        assert_eq!(
-            *resume_offset.lock().unwrap(),
-            None,
-            "the fixture consumes each admitted request before the next health pass"
-        );
+        assert_eq!(*resume_offset.lock().unwrap(), Some(128));
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
@@ -1487,12 +1443,7 @@ mod tests {
         let turn_delivered = Arc::new(AtomicBool::new(true));
         shared.tmux_watchers.insert(
             channel_id,
-            watcher_handle(
-                tmux_session,
-                output_path,
-                resume_offset.clone(),
-                turn_delivered,
-            ),
+            watcher_handle(tmux_session, output_path, resume_offset, turn_delivered),
         );
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
 
@@ -1522,7 +1473,6 @@ mod tests {
                 if nudged {
                     nudge_times.push(elapsed);
                     attempts.push(attempt.expect("a successful nudge is an admitted attempt"));
-                    *resume_offset.lock().expect("resume offset") = None;
                 }
             }
             (nudge_times, attempts)
@@ -1532,27 +1482,15 @@ mod tests {
         if sixth_nudge {
             nudge_times.push(930);
             attempts.push(sixth_attempt.expect("sixth nudge must carry attempt ordinal"));
-            *resume_offset.lock().expect("resume offset") = None;
         }
         let (_, capped_logs) = capture_errors(|| {
-            for elapsed in [960, 1_890, 930 + REDRIVE_CAPPED_REARM_SECS - 1] {
+            for elapsed in [960, 1_890, 86_400] {
                 assert_eq!(
                     gated_nudge(&shared, &provider, &snapshot, channel_id, base + elapsed),
                     (false, None),
-                    "the capped episode must remain dormant during its long backoff"
+                    "time alone must never re-arm a capped episode"
                 );
             }
-            assert_eq!(
-                gated_nudge(
-                    &shared,
-                    &provider,
-                    &snapshot,
-                    channel_id,
-                    base + 930 + REDRIVE_CAPPED_REARM_SECS,
-                ),
-                (true, Some(1)),
-                "a still-stalled capped episode must re-arm at the long-backoff boundary"
-            );
         });
         let alarm_count = logs.matches("redrive_no_progress_capped").count()
             + sixth_logs.matches("redrive_no_progress_capped").count()
@@ -1798,33 +1736,13 @@ mod tests {
             base + stall_liveness::STALL_LIVENESS_STATE_TTL_SECS as i64 + 1,
         );
         assert_eq!(
-            shared.redrive_attempt_decision(
-                &provider,
-                channel_id,
-                &snapshot,
-                base + 930 + REDRIVE_CAPPED_REARM_SECS - 1,
-            ),
+            shared.redrive_attempt_decision(&provider, channel_id, &snapshot, base + 10 * 86_400,),
             RedriveAttemptDecision {
                 attempt: None,
                 emit_capped_alarm: false,
             },
-            "the capped episode must respect its degraded long backoff"
+            "elapsed time and liveness-state GC must not re-arm capped redrive"
         );
-        assert_eq!(
-            shared.redrive_attempt_decision(
-                &provider,
-                channel_id,
-                &snapshot,
-                base + 930 + REDRIVE_CAPPED_REARM_SECS,
-            ),
-            RedriveAttemptDecision {
-                attempt: Some(1),
-                emit_capped_alarm: false,
-            },
-            "a still-stalled capped episode must re-arm after the long backoff"
-        );
-        clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        drive_attempt_state_to_cap(&shared, &provider, channel_id, &snapshot, base + 100_000);
         let mut missing_identity = snapshot.clone();
         missing_identity.inflight_identity = None;
         assert_eq!(
@@ -1833,11 +1751,11 @@ mod tests {
                     &provider,
                     channel_id,
                     &missing_identity,
-                    base + 100_930 + REDRIVE_CAPPED_REARM_SECS - 1,
+                    base + 11 * 86_400,
                 )
                 .attempt,
             None,
-            "identity disappearance alone does not bypass the capped backoff"
+            "identity disappearance is not a replacement and must not re-arm"
         );
 
         let mut progressed = snapshot.clone();
@@ -2074,13 +1992,12 @@ mod tests {
         let tmux_session = "AgentDesk-codex-4299-owner-shield";
         let output_path = "/tmp/agentdesk-4299-owner-shield.jsonl";
         let shared = crate::services::discord::make_shared_data_for_tests();
-        let resume_offset = Arc::new(Mutex::new(None));
         shared.tmux_watchers.insert(
             owner_channel_id,
             watcher_handle(
                 tmux_session,
                 output_path,
-                resume_offset.clone(),
+                Arc::new(Mutex::new(None)),
                 Arc::new(AtomicBool::new(true)),
             ),
         );
@@ -2161,7 +2078,6 @@ mod tests {
             gated_nudge(&shared, &provider, &snapshot, channel_id, base),
             (true, Some(1))
         );
-        *resume_offset.lock().expect("resume offset") = None;
         let episode_started = shared
             .redrive_placeholder_shield_context(&provider, owner_channel_id)
             .expect("first attempt re-arms the owner shield")

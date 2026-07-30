@@ -98,6 +98,7 @@ grandfathered_baseline_paths = [
   # `grandfathered` (win-locked: a re-expanded diagnostics cannot be
   # re-grandfathered — it would have to land as a full [[entry]] or shrink).
   "src/services/discord/commands/text_commands.rs",
+  "src/services/discord/formatting.rs",
   # health.rs was decomposed in #3038 Phase A (2293 prod LoC -> 402-line module
   # root + 6 sub-1000-LoC directory modules under health/); no longer a
   # prod-giant. Removed from the frozen baseline as well as `grandfathered`
@@ -111,10 +112,7 @@ grandfathered_baseline_paths = [
   # prod-giant, so it is removed from the frozen baseline as well as the
   # [[entry]] below (win-locked: a re-expanded inflight cannot be
   # re-grandfathered — it would have to land as a full [[entry]] or shrink).
-  # meeting_orchestrator.rs was decomposed in #4712 (selection, lifecycle,
-  # rounds, records, and selection-runtime clusters moved verbatim into
-  # meeting_orchestrator/ children); no longer a prod-giant. Removed from the
-  # frozen baseline and [[entry]] so a re-expansion cannot be grandfathered.
+  "src/services/discord/meeting_orchestrator.rs",
   "src/services/discord/mod.rs",
   "src/services/discord/recovery_engine.rs",
   "src/services/discord/router/intake_gate.rs",
@@ -140,6 +138,7 @@ grandfathered_baseline_paths = [
   # as well as `grandfathered` below (win-locked: a re-expanded tmux_runtime
   # cannot be re-grandfathered — it would have to land as a full [[entry]] or
   # shrink). The split outputs stay sub-threshold and are not ratcheted.
+  "src/services/discord/watchers/lifecycle.rs",
   "src/services/discord_config_audit.rs",
   "src/services/dispatched_sessions.rs",
   "src/services/dispatches/discord_delivery/orchestration.rs",
@@ -157,6 +156,7 @@ grandfathered_baseline_paths = [
   "src/services/routines/migrated.rs",
   "src/services/routines/store.rs",
   "src/services/settings.rs",
+  "src/services/tui_prompt_dedupe.rs",
   "src/services/turn_orchestrator.rs",
 ]
 
@@ -472,11 +472,19 @@ owner = "discord-relay"
 deadline = "2027-01-31"
 decompose_issue = "#4712"
 
-# RETIRED 2026-07-24 (#4712): meeting_orchestrator.rs dropped below the
-# production giant threshold after cohesive selection, lifecycle, meeting-round,
-# record-persistence, and selection-runtime clusters moved verbatim into
-# `meeting_orchestrator/` child modules. Remove the [[entry]] to avoid a ghost
-# registration; all resulting production modules remain below 1000 lines.
+[[entry]]
+file = "src/services/discord/formatting.rs"
+decision = "shrink"
+owner = "discord-relay"
+deadline = "2027-01-31"
+decompose_issue = "#4712"
+
+[[entry]]
+file = "src/services/discord/meeting_orchestrator.rs"
+decision = "shrink"
+owner = "discord-relay"
+deadline = "2027-01-31"
+decompose_issue = "#4712"
 
 [[entry]]
 file = "src/services/discord/mod.rs"
@@ -597,11 +605,12 @@ owner = "server-runtime"
 deadline = "2027-01-31"
 decompose_issue = "#4710"
 
-# RETIRED 2026-07-24 (#4712): tui_prompt_dedupe.rs dropped below the production
-# giant threshold after runtime bindings, observation/lease handling, extraction,
-# state maintenance, and inline tests moved verbatim into focused child modules.
-# Remove the frozen baseline path and [[entry]] so future re-expansion cannot be
-# grandfathered and a stale registration cannot survive as a ghost.
+[[entry]]
+file = "src/services/tui_prompt_dedupe.rs"
+decision = "shrink"
+owner = "discord-relay"
+deadline = "2027-01-31"
+decompose_issue = "#4712"
 
 [[entry]]
 file = "src/services/turn_orchestrator.rs"
@@ -678,11 +687,13 @@ owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
 
-# RETIRED 2026-07-24 (#4712): watchers/lifecycle.rs dropped below the production
-# giant threshold after the restore scan, liveness, dispatch failure,
-# claim/reuse ownership, output policy, recovery marker, and test clusters moved
-# verbatim into `watchers/lifecycle/` child modules. Remove the [[entry]] and
-# frozen baseline path so future growth cannot be re-grandfathered.
+[[entry]]
+# #3721 first-batch promotion: watcher lifecycle root still mixes restore scan,
+# liveness, heartbeat, dispatch failure, and claim/reuse ownership.
+file = "src/services/discord/watchers/lifecycle.rs"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#4712"
 
 [[entry]]
 # #3721 first-batch promotion: residual tmux relay helper root remains giant
@@ -723,9 +734,20 @@ deadline = "2026-08-31"
 decompose_issue = "#4712"
 
 # NOTE: src/services/discord/relay_recovery.rs previously had an [[entry]] here;
-# #4712 extracted decision, idle-tmux repair, and action apply clusters into
-# child modules, dropping the root below the prod-giant threshold. Its entry and
-# ratchet baseline are removed to avoid a ghost registration.
+# #3779 extracted auto-heal attempt accounting into a sibling module, dropping
+# the root below the prod-giant threshold. Its entry and ratchet baseline are
+# removed to avoid a ghost registration.
+
+[[entry]]
+# Re-crossed the 1000-prod-LoC threshold in #4030: watcher-cancel recovery now
+# routes the owning turn through the finalizer Cancel path, and the paired
+# FOREIGN-inflight stale cutoff is covered from the pending-start backstop. Keep
+# future relay recovery orchestration growth honest; split action apply/finalizer
+# glue into child modules once this P0 wedge recovery path stabilizes.
+file = "src/services/discord/relay_recovery.rs"
+owner = "discord-relay"
+deadline = "2026-08-31"
+decompose_issue = "#4712"
 
 [[entry]]
 # Crossed the 1000-prod-LoC threshold in #3739: worker-local LoopOwned Tokio
@@ -750,15 +772,32 @@ owner = "discord-finalizer"
 deadline = "2026-08-31"
 decompose_issue = "#4712"
 
-# RETIRED 2026-07-24 (#4712 D5): turn_view_reconciler.rs dropped below the
-# 1000-production-LoC giant threshold after its API, reaction application,
-# state resolution, and durable target store moved to cohesive child modules.
-# The registry entry is removed to avoid a ghost registration.
+[[entry]]
+# Crossed the 1000-prod-LoC threshold in #4049 S4-a1: the notification-only
+# turn lifecycle reaction reconciler now owns per-target serialization plus
+# durable adder-identity sidecar state. Split persistence/test-heavy support
+# into narrower modules in slice a2 once the reconciler contract is stable.
+file = "src/services/discord/turn_view_reconciler.rs"
+owner = "discord-relay"
+deadline = "2026-08-31"
+decompose_issue = "#4712"
 
-# RETIRED 2026-07-24 (#4712 D6): idle_recap.rs dropped below the production
-# giant threshold after the card compose/post/delete/persist cluster moved
-# verbatim to `idle_recap/card.rs`. Remove the [[entry]] to avoid a ghost
-# registration; keep future card lifecycle growth in the child module.
+# NOTE: src/services/discord/idle_recap.rs previously had an [[entry]] here; #3479
+# extracted the scrollback-capture/Haiku-summarizer and token-context-display
+# clusters into `idle_recap/scrollback.rs` and `idle_recap/context_display.rs`,
+# dropping its production LoC below the giant threshold. Its entry (and ratchet
+# baseline) were removed to avoid a ghost registration.
+
+[[entry]]
+# Re-crossed the 1000-prod-LoC threshold in #3809 when idle recap gained the
+# deterministic relay-integrity probe wiring, suspect-only diagnostic action,
+# and suggested-reply action plan. Keep any further relay-probe/reporting
+# growth in `idle_recap/` child modules and decompose the recap interaction
+# orchestration once the card-action contract stabilizes.
+file = "src/services/discord/idle_recap.rs"
+owner = "discord-relay"
+deadline = "2026-08-31"
+decompose_issue = "#4712"
 
 # NOTE: src/services/discord/turn_bridge/terminal_delivery.rs previously had an
 # [[entry]] here; the #3028 splitter fix dropped its production LoC below the
@@ -771,16 +810,6 @@ decompose_issue = "#4712"
 # 460 inline test LoC moved to capped/natural child modules. The #3038-tagged
 # Of the production decrease, -7 is blank-line compaction (imports 3 + spawn_turn_bridge body 4); the remainder is helper-move contribution.
 # registry entry is retired; the root is below the 1000-prod-LoC giant threshold.
-
-[[entry]]
-# Crossed the 1000-prod-LoC threshold in #4259 while stream persistence gained
-# guarded durable-winner reconciliation and identity-aware exit handling.
-# Decomposition should lift guarded persistence/reconciliation orchestration
-# into the existing stream_tick child modules once the authority rollout lands.
-file = "src/services/discord/turn_bridge/stream_tick.rs"
-owner = "discord-relay"
-deadline = "2026-10-31"
-decompose_issue = "#4712"
 
 # RETIRED 2026-07-10 (#4230 S10): terminal_outcome_delivery.rs dropped from
 # 1370 to 882 production LoC after recovery fallback, post-commit epilogue, and
@@ -836,6 +865,15 @@ decompose_issue = "#4712"
 # clusters into sibling modules, leaving the shared `trim_prompt_line`/marker
 # constants in the root.
 file = "src/services/tmux_common.rs"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#4712"
+
+[[entry]]
+# Crossed the giant threshold while #4706 backfilled explicit decision metadata.
+# Keep the manual-rebind authority cohesive until #3405 extracts the recovery
+# admission and execution halves behind one typed plan boundary.
+file = "src/services/discord/recovery_engine/manual_rebind/mod.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"

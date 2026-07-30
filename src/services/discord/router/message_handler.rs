@@ -24,9 +24,8 @@ use super::turn_start::{
     load_session_runtime_state, log_session_strategy_diagnostic, put_back_session_retry_context,
     put_back_turn_end_wip_warning, put_back_voluntary_feedback_reminder,
     refresh_session_strategy_after_pending_reset, release_mailbox_after_hosted_tui_busy_pre_submit,
-    release_mailbox_after_placeholder_post_failure, take_and_merge_feedback_reminder,
-    take_and_merge_wip_warning, take_session_retry_context,
-    try_intake_runtime_transition_after_redirect,
+    release_mailbox_after_placeholder_post_failure, session_runtime_state_after_redirect,
+    take_and_merge_feedback_reminder, take_and_merge_wip_warning, take_session_retry_context,
 };
 #[cfg(test)]
 use super::turn_start::{session_strategy_lifecycle_event, should_emit_session_strategy_lifecycle};
@@ -252,8 +251,7 @@ async fn refresh_claimed_runtime_for_launch(
 }
 
 pub(super) use self::attachments::{
-    AttachmentDescriptor, LocalAttachmentPreparationPermit, describe_attachments,
-    prepare_admitted_local_attachment,
+    LocalAttachmentPreparationPermit, describe_attachments, prepare_admitted_local_attachment,
 };
 pub(super) use self::control::{handle_shell_command_raw, handle_text_command};
 #[allow(unused_imports)]
@@ -282,7 +280,6 @@ pub(super) async fn finish_admitted_local(
     let IntakeRequest {
         channel_id,
         user_msg_id,
-        busy_followup_retry_user_msg_id,
         request_owner,
         request_owner_name,
         user_text,
@@ -300,7 +297,6 @@ pub(super) async fn finish_admitted_local(
         deps,
         channel_id,
         user_msg_id,
-        busy_followup_retry_user_msg_id,
         request_owner,
         &request_owner_name,
         &user_text,

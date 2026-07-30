@@ -131,17 +131,6 @@ pub(super) fn discord_status_panel_orphans_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_status_panel_orphans"))
 }
 
-/// #4860: durable current-panel binding for the two-message singleton. Unlike
-/// the orphan store, this record intentionally survives normal turn completion.
-pub(super) fn discord_status_panel_singletons_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_status_panel_singletons"))
-}
-
-/// #4888: durable per-input busy-notice binding and aggregate retry budget.
-pub(super) fn discord_busy_followup_retries_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_busy_followup_retries"))
-}
-
 /// #3859: durable abandon-request store. A SYNC failure-path site (turn-task
 /// `InflightCleanupGuard` Drop, heartbeat-gap sweeper) that evicts an inflight
 /// row with a live "🔄 처리 중" placeholder cannot drive the async Discord edit

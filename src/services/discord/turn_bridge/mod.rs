@@ -1,12 +1,10 @@
 mod activity_heartbeat;
-mod bridge_entry_persist;
 mod bridge_latency_spans;
 mod cancel_finalize_policy;
 mod chunk_compose;
 mod completion_guard;
 mod completion_postlude;
 mod context_window;
-mod current_message_anchor;
 #[cfg(unix)]
 mod early_tui_completion;
 mod finalize_epilogue;
@@ -19,7 +17,6 @@ mod panel_lifecycle;
 mod post_loop_finalize;
 mod recall_feedback;
 pub(in crate::services::discord) mod recovery_text;
-mod response_delivery;
 mod retry_state;
 mod runtime_handoff_loop;
 mod single_message_footer;
@@ -37,10 +34,22 @@ mod terminal_outcome_delivery;
 mod thinking;
 mod tmux_runtime;
 mod turn_analytics;
+// #3805 P2 (PR-B): two-message sink creation order (answer-first, panel below)
+// + the pure generation-epoch staleness guard. Isolated sibling so the EXTREME
+// turn_bridge/mod.rs giant and the 700-capped status_panel.rs stay lean; the
+// call sites here and in single_message_footer.rs are thin.
 mod two_message_panel;
 mod voice_completion;
 mod watcher_handoff;
 mod watcher_orphan_cleanup;
+// #3479: the pure response-delivery + transcript-event helpers (the transcript
+// event-recording filter, the response-after-offset slice, the terminal delivery
+// sanitization+fallback builder, and the full-terminal-replay predicate) moved
+// verbatim to a capped sibling module. All four are `pub(super)` and re-imported
+// below so this parent's call sites (and the inline test modules) stay
+// byte-identical; deps are reached via `use super::*;` (the two discord-level
+// `super::` refs become `super::super::` from the child).
+mod response_delivery;
 use super::gateway::TurnGateway;
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::turn_view_reconciler::{
@@ -132,21 +141,14 @@ pub(super) use watcher_orphan_cleanup::{
 };
 // Re-export pub(crate) items
 pub(crate) use tmux_runtime::tmux_runtime_paths;
-
 // Items used by spawn_turn_bridge from submodules
 use super::watcher_lifecycle_decision::should_resume_watcher_after_turn;
 use crate::db::session_status::{AWAITING_BG, IDLE, TURN_ACTIVE};
-use bridge_entry_persist::bridge_stream_relay_suppressed;
 use completion_guard::complete_work_dispatch_on_turn_end;
 use context_window::{apply_context_token_update, persisted_context_tokens, resolve_done_response};
-use current_message_anchor::{
-    cleanup_unbound_bridge_anchor, detached_current_msg_id_from_durable,
-    durable_current_msg_id_from_detached, edit_bound_current_message,
-    ensure_bridge_current_message_anchor, optional_durable_current_msg_id_from_detached,
-    unbound_current_message_candidate,
-};
-use guards::{make_bridge_guards, resolve_guard_owner_channel};
+use guards::{CompletionGuard, InflightCleanupGuard};
 use headless_delivery::{
+    SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID,
     cleanup_headless_streaming_placeholder_after_delivery, enqueue_headless_delivery,
     is_synthetic_headless_message_id,
 };
@@ -254,7 +256,7 @@ pub(super) fn spawn_turn_bridge(
     shared_owned: Arc<SharedData>,
     cancel_token: Arc<CancelToken>,
     rx: mpsc::Receiver<StreamMessage>,
-    mut bridge: TurnBridgeContext,
+    bridge: TurnBridgeContext,
 ) {
     use tracing::Instrument;
     let bridge_turn_id = discord_turn_id(
@@ -354,8 +356,27 @@ pub(super) fn spawn_turn_bridge(
                 provider.as_str(),
             );
         }
-        let resolved_watcher_owner_channel_id =
-            resolve_guard_owner_channel(shared_owned.as_ref(), &bridge);
+        // #3041 P1-2 (codex P1-a): resolve the AUTHORITATIVE owner channel for
+        // this turn's tmux session BEFORE the watcher availability check and the
+        // bridge delivery-lease acquisition. A RECOVERED/restored bridge that
+        // REUSES an existing watcher (without going through the
+        // `TmuxReady`/`RuntimeReady` claim paths, which set
+        // `watcher_owner_channel_id = claim.owner_channel_id()`) would otherwise
+        // keep `watcher_owner_channel_id == channel_id` (the bridge's dispatch
+        // channel Y) while the reused watcher leases + advances on its owner
+        // channel X — different cells, so both could acquire and deliver
+        // (duplicate). Resolving the session's owner channel here makes EVERY
+        // path (normal, claim, recovered/restored) key the availability check
+        // AND the lease acquire+advance on the SAME channel the watcher uses.
+        // When no reused watcher owns the session, this falls back to
+        // `channel_id` (the bridge owns its own channel). The claim paths below
+        // still re-assert `claim.owner_channel_id()` (which equals this resolved
+        // value for the same session) so live truth always wins.
+        let resolved_watcher_owner_channel_id = resolve_bridge_owner_channel(
+            &shared_owned.tmux_watchers,
+            bridge.inflight_state.tmux_session_name.as_deref(),
+            channel_id,
+        );
         let mut watcher_owns_assistant_relay =
             matches!(initial_relay_owner_kind, super::inflight::RelayOwnerKind::Watcher);
         let mut watcher_relay_available_for_turn = watcher_owns_assistant_relay
@@ -394,6 +415,17 @@ pub(super) fn spawn_turn_bridge(
         let (status_panel_started_at, footer_owner) = make_owner_now(user_msg_id);
         let single_message_panel_footer_mode =
             bridge_single_message_panel_footer_enabled(shared_owned.ui.status_panel_v2_enabled);
+        if shared_owned.ui.placeholder_live_events_enabled || shared_owned.ui.status_panel_v2_enabled {
+            if single_message_panel_footer_mode {
+                supersede_bridge_footer(shared_owned.as_ref(), channel_id, footer_owner).await;
+                shared_owned
+                    .ui
+                    .placeholder_live_events
+                    .clear_channel_preserving_footer_residuals(channel_id);
+            } else {
+                shared_owned.ui.placeholder_live_events.clear_channel(channel_id);
+            }
+        }
         let mut transport_error = false;
         let mut api_friction_reports = Vec::new();
         let mut transcript_events = Vec::<SessionTranscriptEvent>::new();
@@ -430,11 +462,33 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_control_ready_observed = false;
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
         let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
-        // Durable absence stays an in-memory sentinel until bridge-entry
-        // authority is proven. The bridge must never send/adopt a spinner first.
-        let mut current_msg_id = bridge
-            .current_msg_id
-            .unwrap_or_else(|| detached_current_msg_id_from_durable(0));
+        // Recovery turns without an anchored placeholder create one up front;
+        // on failure the synthetic sentinel lets the first streaming edit retry.
+        let mut current_msg_id = match bridge.current_msg_id {
+            Some(id) => id,
+            None => {
+                let placeholder =
+                    super::formatting::build_processing_status_block(SPINNER[0]).to_string();
+                match gateway.send_message(channel_id, &placeholder).await {
+                    Ok(created) => {
+                        bridge_created_response_placeholder_msg_id = Some(created);
+                        created
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            channel_id = channel_id.get(),
+                            "[turn_bridge] recovery turn has no anchored placeholder and creating one failed: {error}; continuing — streaming will retry placeholder creation"
+                        );
+                        // No placeholder yet. Use a synthetic-headless sentinel
+                        // so the established `is_synthetic_headless_message_id`
+                        // path (which already means "no real Discord message to
+                        // edit") drives placeholder (re)creation on first output
+                        // instead of editing a nonexistent message.
+                        MessageId::new(SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID)
+                    }
+                }
+            }
+        };
         let mut response_sent_offset = bridge.response_sent_offset;
         let mut bridge_confirmed_response_sent_offset =
             bridge_confirmed_response_sent_offset_seed(initial_relay_owner_kind, response_sent_offset);
@@ -442,17 +496,49 @@ pub(super) fn spawn_turn_bridge(
         let mut streaming_rollover_frozen_msg_ids: Vec<MessageId> = Vec::new();
         let mut terminal_full_replay_cleanup_msg_ids: Vec<MessageId> = Vec::new();
         let mut tmux_last_offset = bridge.tmux_last_offset;
-        // #3041: seed the authoritative watcher owner channel so recovered
-        // bridges and reused watchers lease the same cell.
+        // #3041 P1-2 (codex P1-a): seed from the session's AUTHORITATIVE owner
+        // channel (resolved above) so a recovered/restored bridge reusing an
+        // existing watcher leases on the SAME cell the watcher leases+advances
+        // on — not its dispatch `channel_id`. The claim paths below still
+        // overwrite this with `claim.owner_channel_id()` (equal for the same
+        // session) when they run.
         let mut watcher_owner_channel_id = resolved_watcher_owner_channel_id;
         let mut new_session_id = bridge.new_session_id.clone();
         let mut new_raw_provider_session_id: Option<String> = None;
         let defer_watcher_resume = bridge.defer_watcher_resume;
         let is_external_input_tui_direct = bridge.is_external_input_tui_direct;
+        let _completion_guard = CompletionGuard {
+            tx: bridge.completion_tx,
+            broadcaster: shared_owned.inflight_signals.clone(),
+            channel_id,
+            turn_id: bridge.inflight_state.effective_finalizer_turn_id(),
+        };
+        let mut inflight_guard = InflightCleanupGuard {
+            provider: Some(provider.clone()),
+            channel_id: channel_id.get(),
+            user_msg_id: user_msg_id.map(|id| id.get()).unwrap_or(0),
+            token_hash: shared_owned.token_hash.clone(),
+        };
         let mut inflight_state = bridge.inflight_state.clone();
         inflight_state.set_watcher_owner_channel_id(resolved_watcher_owner_channel_id.get());
+        // Codex P2: a no-anchor recovery turn (bridge.current_msg_id == None)
+        // had a fresh placeholder created above into the working `current_msg_id`,
+        // but the cloned inflight still carries `current_msg_id == 0`. Mirror the
+        // real id back NOW so the `save_inflight_state` below persists it; without
+        // this, a restart before the first streaming edit would see id 0 again,
+        // re-create a placeholder, and orphan the spinner we just sent. The
+        // synthetic-headless fallback (creation failed) is intentionally NOT
+        // persisted — it is not a real Discord message and the streaming path
+        // re-creates a placeholder on first output.
+        if bridge.current_msg_id.is_none()
+            && !is_synthetic_headless_message_id(current_msg_id)
+            && inflight_state.current_msg_id == 0
+        {
+            inflight_state.current_msg_id = current_msg_id.get();
+        }
         let mut last_status_edit = tokio::time::Instant::now();
-        // #3813: first non-empty answer may bypass the status interval once.
+        // #3813 Phase 1b fast-lane: the first non-empty assistant text chunk may
+        // bypass the status interval once, then normal throttling resumes.
         let mut first_answer_relayed = false;
         let status_interval = super::status_update_interval();
         let mut last_session_panel_lifecycle_refresh = tokio::time::Instant::now() - status_interval;
@@ -460,94 +546,11 @@ pub(super) fn spawn_turn_bridge(
             &mut inflight_state,
             bridge.reuse_status_panel_message,
         );
-        let mut last_status_panel_text = String::new();
-        let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
-        let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
-        let turn_start = std::time::Instant::now();
-        // #3813: observation-only bridge latency spans share `turn_start`.
-        let mut bridge_spans = BridgeLatencySpans::starting_at(turn_start);
-        // #3805: pinned panel epoch; create bumps it and completion proves it.
-        let mut status_panel_generation = inflight_state.status_panel_generation;
-        inflight_state.long_running_placeholder_active = false;
-        let mut resumed_placeholder_clear_applied = false;
-
-        let anchor_text =
-            super::formatting::build_processing_status_block(SPINNER[0]).to_string();
-        if !bridge_entry_persist::establish_bridge_entry_authority(
-            bridge_entry_persist::BridgeEntryAuthorityContext {
-                bridge: &mut bridge,
-                shared: shared_owned.as_ref(),
-                bridge_created_placeholder: &mut bridge_created_response_placeholder_msg_id,
-                last_edit_text: &mut last_edit_text,
-                resumed_placeholder_clear_applied: &mut resumed_placeholder_clear_applied,
-            },
-            bridge_entry_persist::BridgeEntryRuntimeState {
-                inflight_state: &mut inflight_state,
-                full_response: &mut full_response,
-                response_sent_offset: &mut response_sent_offset,
-                bridge_confirmed_response_sent_offset:
-                    &mut bridge_confirmed_response_sent_offset,
-                current_msg_id: &mut current_msg_id,
-                current_tool_line: &mut current_tool_line,
-                prev_tool_status: &mut prev_tool_status,
-                last_tool_name: &mut last_tool_name,
-                last_tool_summary: &mut last_tool_summary,
-                any_tool_used: &mut any_tool_used,
-                has_post_tool_text: &mut has_post_tool_text,
-                streaming_rollover_frozen_msg_ids: &mut streaming_rollover_frozen_msg_ids,
-                tmux_last_offset: &mut tmux_last_offset,
-                watcher_owner_channel_id: &mut watcher_owner_channel_id,
-                watcher_owns_assistant_relay: &mut watcher_owns_assistant_relay,
-                watcher_relay_available_for_turn: &mut watcher_relay_available_for_turn,
-                standby_relay_owns_output: &mut standby_relay_owns_output,
-                status_panel_msg_id: &mut status_panel_msg_id,
-                status_panel_generation: &mut status_panel_generation,
-            },
-            &anchor_text,
-        )
-        .await
-        {
-            return;
-        }
-        let mut bridge_entry_watcher_owner_epoch_current = inflight_state
-            .effective_relay_owner_kind()
-            == crate::services::discord::inflight::RelayOwnerKind::Watcher;
-        let entry_msg_id = inflight_state.current_msg_id;
-        let mut expected_current_message = (entry_msg_id, inflight_state.current_msg_len);
-        let (mut completion_guard, mut inflight_guard) =
-            make_bridge_guards(&mut bridge, &inflight_state, &shared_owned, &provider);
-        let resumed_long_running_placeholder_notice_msg_id =
-            bridge_entry_persist::resumed_long_running_placeholder_notice_message_id(
-                resumed_placeholder_clear_applied,
-                &bridge.inflight_state,
-                &inflight_state,
-            );
-        if let Some(resumed_msg_id) = resumed_long_running_placeholder_notice_msg_id {
-            let resumed_notice =
-                "🛑 백그라운드 카드 종료됨 — 서버 재시작으로 이전 흐름이 끊겨 새 응답으로 이어집니다.";
-            let _ = TurnGateway::edit_message(
-                gateway.as_ref(),
-                channel_id,
-                resumed_msg_id,
-                resumed_notice,
-            )
-            .await;
-        }
-
-        if shared_owned.ui.placeholder_live_events_enabled || shared_owned.ui.status_panel_v2_enabled {
-            if single_message_panel_footer_mode {
-                supersede_bridge_footer(shared_owned.as_ref(), channel_id, footer_owner).await;
-                shared_owned
-                    .ui
-                    .placeholder_live_events
-                    .clear_channel_preserving_footer_residuals(channel_id);
-            } else {
-                shared_owned.ui.placeholder_live_events.clear_channel(channel_id);
-            }
-        }
-
         if single_message_panel_footer_mode {
-            // #3560: authority is proven before touching the old Discord panel.
+            // #3560 codex review: a turn that created a *separate* status panel
+            // under default-OFF can be resumed here under footer mode. Clearing
+            // the handle alone would orphan that Discord message, so reconcile
+            // it (edit to a migration notice) before dropping it.
             migrate_separate_status_panel_to_footer(
                 gateway.as_ref(),
                 channel_id,
@@ -556,6 +559,18 @@ pub(super) fn spawn_turn_bridge(
             .await;
             status_panel_msg_id = None;
         }
+        let mut last_status_panel_text = String::new();
+        let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
+        let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
+        let turn_start = std::time::Instant::now();
+        // #3813 AC#1 tail: bridge-side latency spans (observation-only), anchored
+        // on `turn_start` above. See bridge_latency_spans.rs for the invariants.
+        let mut bridge_spans = BridgeLatencySpans::starting_at(turn_start);
+        // #3805 P2 (PR-B): this turn's status-panel epoch. Seeded from the pinned
+        // inflight snapshot and threaded through the two-message create (which
+        // bumps it) and the terminal completion edit (which proves it against the
+        // on-disk epoch). Inert on the default-OFF path (stays 0).
+        let mut status_panel_generation = inflight_state.status_panel_generation;
 
         maybe_create_bridge_separate_status_panel_response(
             shared_owned.ui.two_message_panel_enabled,
@@ -589,6 +604,29 @@ pub(super) fn spawn_turn_bridge(
             .await;
         }
 
+        // codex round-5 P2 on PR #1308: a dcserver restart resumed an inflight
+        // turn whose persisted state still flags `long_running_placeholder_active`.
+        // The in-memory controller is empty here and the original
+        // `PlaceholderActiveInput` snapshot was never persisted, so we cannot
+        // reconstruct the Active entry. Edit the stale 🔄 card to a generic
+        // resumed-aborted notice and clear the flag so subsequent streaming /
+        // sweeper logic treats this turn as a fresh resume.
+        if inflight_state.long_running_placeholder_active {
+            let resumed_notice =
+                "🛑 백그라운드 카드 종료됨 — 서버 재시작으로 이전 흐름이 끊겨 새 응답으로 이어집니다.";
+            let _ = gateway
+                .edit_message(channel_id, current_msg_id, resumed_notice)
+                .await;
+            inflight_state.long_running_placeholder_active = false;
+        }
+
+        if let Err(error) = save_inflight_state(&inflight_state) {
+            tracing::warn!(
+                "[turn_bridge] failed to persist inflight state in channel {}: {}",
+                channel_id,
+                error
+            );
+        }
         crate::services::observability::emit_turn_started(
             provider.as_str(),
             channel_id.get(),
@@ -676,9 +714,6 @@ pub(super) fn spawn_turn_bridge(
                 terminal_control_ready_observed: &mut terminal_control_ready_observed,
                 terminal_control_drain_until: &mut terminal_control_drain_until,
                 current_msg_id: &mut current_msg_id,
-                expected_current_message: &mut expected_current_message,
-                bridge_created_response_placeholder_msg_id:
-                    &mut bridge_created_response_placeholder_msg_id,
                 response_sent_offset: &mut response_sent_offset,
                 bridge_confirmed_response_sent_offset: &mut bridge_confirmed_response_sent_offset,
                 streamed_assistant_text_this_turn: &mut streamed_assistant_text_this_turn,
@@ -698,17 +733,11 @@ pub(super) fn spawn_turn_bridge(
                 last_status_panel_edit: &mut last_status_panel_edit,
                 bridge_spans: &mut bridge_spans,
                 status_panel_generation: &mut status_panel_generation,
-                entry_watcher_epoch_current: &mut bridge_entry_watcher_owner_epoch_current,
             },
         )
         .await;
         match stream_loop_output.outcome {
             stream_loop::StreamLoopOutcome::Completed => {}
-            stream_loop::StreamLoopOutcome::AuthorityLost => {
-                completion_guard.relinquish_bridge_authority();
-                inflight_guard.defuse();
-                return;
-            }
         }
         let pending_long_running_open_after_state_save =
             stream_loop_output.pending_long_running_open_after_state_save;
@@ -738,7 +767,7 @@ pub(super) fn spawn_turn_bridge(
                 standby_relay_owns_output,
                 watcher_owns_assistant_relay,
                 watcher_relay_available_for_turn,
-                bridge_entry_watcher_owner_epoch_current,
+                initial_relay_owner_kind,
                 response_sent_offset,
                 tmux_last_offset,
                 watcher_owner_channel_id,
@@ -892,6 +921,7 @@ pub(super) fn spawn_turn_bridge(
             terminal_outcome_delivery_output.terminal_full_replay_cleanup_msg_ids;
         let _response_sent_offset = terminal_outcome_delivery_output.response_sent_offset;
         let turn_start = terminal_outcome_delivery_output.turn_start;
+
         completion_postlude::run_completion_postlude(
             completion_postlude::CompletionPostludeContext {
                 shared_owned,
@@ -931,7 +961,6 @@ pub(super) fn spawn_turn_bridge(
                 status_panel_msg_id,
                 last_status_panel_text,
                 completion_footer_terminal_text,
-                busy_requeue_outcome: terminal_outcome_delivery_output.busy_requeue_outcome,
                 spin_idx,
                 status_panel_generation,
                 preserve_inflight_for_cleanup_retry,
@@ -958,7 +987,7 @@ pub(super) fn spawn_turn_bridge(
                 cancelled,
                 restart_followup_pending,
                 bridge_skip_holder_owns_inflight,
-                completion_guard, inflight_guard,
+                inflight_guard,
                 inflight_state,
             },
         )

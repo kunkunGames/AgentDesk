@@ -1397,84 +1397,6 @@ fn pane_looks_ready_for_codex_prompt_with_ansi(pane: &str) -> bool {
 }
 
 fn pane_has_codex_active_turn_in_pane(pane: &str) -> bool {
-    recent_codex_active_turn_marker(pane).is_some()
-}
-
-const CODEX_ACTIVE_TURN_SIGNAL_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(90);
-const CODEX_ACTIVE_TURN_CAPTURE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_millis(500);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodexPaneBusySignal {
-    Fresh,
-    Idle,
-    Expired,
-    Unavailable,
-}
-
-#[derive(Debug)]
-pub(crate) struct CodexPaneBusySignalTracker {
-    last_marker: Option<String>,
-    last_marker_changed_at: Option<std::time::Instant>,
-    freshness: std::time::Duration,
-}
-
-impl Default for CodexPaneBusySignalTracker {
-    fn default() -> Self {
-        Self::with_freshness(CODEX_ACTIVE_TURN_SIGNAL_FRESHNESS)
-    }
-}
-
-impl CodexPaneBusySignalTracker {
-    pub(crate) fn with_freshness(freshness: std::time::Duration) -> Self {
-        Self {
-            last_marker: None,
-            last_marker_changed_at: None,
-            freshness,
-        }
-    }
-
-    pub(crate) fn probe_tmux(&mut self, session_name: &str) -> CodexPaneBusySignal {
-        let Some(pane) = crate::services::platform::tmux::capture_pane_timeout(
-            session_name,
-            -80,
-            CODEX_ACTIVE_TURN_CAPTURE_TIMEOUT,
-        ) else {
-            return CodexPaneBusySignal::Unavailable;
-        };
-        self.observe_capture_at(&pane, std::time::Instant::now())
-    }
-
-    pub(crate) fn observe_capture_at(
-        &mut self,
-        pane: &str,
-        observed_at: std::time::Instant,
-    ) -> CodexPaneBusySignal {
-        let Some(marker) = recent_codex_active_turn_marker(pane) else {
-            self.last_marker = None;
-            self.last_marker_changed_at = None;
-            return CodexPaneBusySignal::Idle;
-        };
-        let marker = normalize_codex_active_turn_marker(&marker);
-
-        if self.last_marker.as_deref() != Some(marker.as_str()) {
-            self.last_marker = Some(marker);
-            self.last_marker_changed_at = Some(observed_at);
-            return CodexPaneBusySignal::Fresh;
-        }
-
-        if self
-            .last_marker_changed_at
-            .is_some_and(|changed_at| observed_at.duration_since(changed_at) <= self.freshness)
-        {
-            CodexPaneBusySignal::Fresh
-        } else {
-            CodexPaneBusySignal::Expired
-        }
-    }
-}
-
-fn recent_codex_active_turn_marker(pane: &str) -> Option<String> {
     let recent: Vec<&str> = pane
         .lines()
         .map(str::trim_end)
@@ -1482,53 +1404,7 @@ fn recent_codex_active_turn_marker(pane: &str) -> Option<String> {
         .rev()
         .take(PROMPT_READY_SCAN_LINES)
         .collect();
-    recent
-        .iter()
-        .take(6)
-        .find(|line| line_is_codex_active_turn_marker(line))
-        .map(|line| line.trim().to_string())
-}
-
-fn normalize_codex_active_turn_marker(marker: &str) -> String {
-    let Some(open_paren) = marker.find('(') else {
-        return marker.to_string();
-    };
-    let elapsed_start = open_paren + 1;
-    let Some(separator_offset) = marker[elapsed_start..].find('•') else {
-        return marker.to_string();
-    };
-    let elapsed_end = elapsed_start + separator_offset;
-    let elapsed = marker[elapsed_start..elapsed_end].trim();
-    if !codex_elapsed_time_component(elapsed) {
-        return marker.to_string();
-    }
-
-    format!(
-        "{}(<elapsed> {}",
-        &marker[..open_paren],
-        &marker[elapsed_end..]
-    )
-}
-
-fn codex_elapsed_time_component(candidate: &str) -> bool {
-    let mut rest = candidate;
-    let mut components = 0;
-    for suffix in ['h', 'm', 's'] {
-        let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
-        if digits == 0 {
-            continue;
-        }
-        let (number, after_number) = rest.split_at(digits);
-        let Some(after_suffix) = after_number.strip_prefix(suffix) else {
-            continue;
-        };
-        if number.parse::<u64>().is_err() {
-            return false;
-        }
-        components += 1;
-        rest = after_suffix.trim_start();
-    }
-    components > 0 && rest.is_empty()
+    recent_has_codex_active_turn(&recent)
 }
 
 fn pane_has_dim_legacy_codex_prompt_in_pane(pane: &str) -> bool {
@@ -1610,13 +1486,11 @@ fn recent_has_codex_active_turn(recent_bottom_up: &[&str]) -> bool {
     recent_bottom_up
         .iter()
         .take(ACTIVE_TURN_BOTTOM_WINDOW)
-        .any(|line| line_is_codex_active_turn_marker(line))
-}
-
-fn line_is_codex_active_turn_marker(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    (trimmed.starts_with('•') || trimmed.starts_with('◦'))
-        && (trimmed.contains("esc to interrupt") || trimmed.contains("Esc to interrupt"))
+        .any(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with('•') || trimmed.starts_with('◦'))
+                && (trimmed.contains("esc to interrupt") || trimmed.contains("Esc to interrupt"))
+        })
 }
 
 fn line_is_codex_status_with_ansi(line: &str) -> bool {
@@ -2531,67 +2405,6 @@ more output\n\
     fn codex_pane_with_composer_and_footer_is_ready() {
         assert!(pane_looks_ready_for_codex_prompt(CODEX_TUI_READY_PANE));
         assert!(!pane_has_codex_prompt_draft(CODEX_TUI_READY_PANE));
-    }
-
-    #[test]
-    fn codex_pane_busy_signal_expires_when_marker_stops_changing() {
-        let started_at = std::time::Instant::now();
-        let mut tracker =
-            CodexPaneBusySignalTracker::with_freshness(std::time::Duration::from_millis(100));
-        let busy = "• Working (5m 00s • esc to interrupt)";
-
-        assert_eq!(
-            tracker.observe_capture_at(busy, started_at),
-            CodexPaneBusySignal::Fresh
-        );
-        assert_eq!(
-            tracker.observe_capture_at(busy, started_at + std::time::Duration::from_millis(50)),
-            CodexPaneBusySignal::Fresh
-        );
-        assert_eq!(
-            tracker.observe_capture_at(busy, started_at + std::time::Duration::from_millis(101)),
-            CodexPaneBusySignal::Expired
-        );
-        assert_eq!(
-            tracker.observe_capture_at(
-                "• Working (5m 01s • esc to interrupt)",
-                started_at + std::time::Duration::from_millis(102),
-            ),
-            CodexPaneBusySignal::Expired,
-            "elapsed-only marker changes must not reset freshness"
-        );
-        assert_eq!(
-            tracker.observe_capture_at(
-                "• Running tests (5m 02s • esc to interrupt)",
-                started_at + std::time::Duration::from_millis(103),
-            ),
-            CodexPaneBusySignal::Fresh,
-            "meaningful marker changes must reset freshness"
-        );
-        assert_eq!(
-            tracker.observe_capture_at(CODEX_TUI_READY_PANE, started_at),
-            CodexPaneBusySignal::Idle
-        );
-    }
-
-    #[test]
-    fn codex_pane_busy_signal_normalizes_supported_elapsed_formats() {
-        assert_eq!(
-            normalize_codex_active_turn_marker("• Working (12s • esc to interrupt)"),
-            "• Working (<elapsed> • esc to interrupt)"
-        );
-        assert_eq!(
-            normalize_codex_active_turn_marker("• Working (1m03s • esc to interrupt)"),
-            "• Working (<elapsed> • esc to interrupt)"
-        );
-        assert_eq!(
-            normalize_codex_active_turn_marker("• Working (1h 02m 03s • esc to interrupt)"),
-            "• Working (<elapsed> • esc to interrupt)"
-        );
-        assert_eq!(
-            normalize_codex_active_turn_marker("• Working (phase 12s • esc to interrupt)"),
-            "• Working (phase 12s • esc to interrupt)"
-        );
     }
 
     #[test]

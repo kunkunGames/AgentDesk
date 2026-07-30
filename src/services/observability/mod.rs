@@ -167,7 +167,6 @@ pub(super) const AGENT_QUALITY_EVENT_TYPES: &[&str] = &[
     "review_fail",
     "dispatch_dispatched",
     "dispatch_completed",
-    "dispatch_failed",
     "recovery_fired",
     "escalation",
     "card_transitioned",

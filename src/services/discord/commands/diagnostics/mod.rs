@@ -67,7 +67,8 @@ pub(in crate::services::discord) async fn cmd_metrics(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/metrics");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /metrics");
 
     let data = match &date {
         Some(d) => metrics::load_date(d),
@@ -88,7 +89,8 @@ pub(in crate::services::discord) async fn cmd_health(ctx: Context<'_>) -> Result
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/health");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /health");
 
     let text =
         build_health_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
@@ -105,7 +107,8 @@ pub(in crate::services::discord) async fn cmd_sessions(ctx: Context<'_>) -> Resu
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/sessions");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /sessions");
 
     if ctx.data().provider != ProviderKind::Gemini {
         ctx.say("`/sessions` is currently supported only when the active provider is Gemini.")
@@ -149,7 +152,8 @@ pub(in crate::services::discord) async fn cmd_status(ctx: Context<'_>) -> Result
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/status");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /status");
 
     let text =
         build_status_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
@@ -174,11 +178,10 @@ pub(in crate::services::discord) async fn cmd_deletesession(
         return Ok(());
     }
 
-    log_command_received!(
-        ctx.channel_id().get(),
-        user_name,
-        "/deletesession",
-        session_identifier = %identifier
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] ◀ [{user_name}] /deletesession identifier={}",
+        identifier
     );
 
     if ctx.data().provider != ProviderKind::Gemini {
@@ -255,7 +258,8 @@ pub(in crate::services::discord) async fn cmd_inflight(ctx: Context<'_>) -> Resu
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/inflight");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /inflight");
 
     let text =
         build_inflight_report(&ctx.data().shared, &ctx.data().provider, ctx.channel_id()).await;
@@ -275,7 +279,8 @@ pub(in crate::services::discord) async fn cmd_queue(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/queue");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /queue");
 
     let show_all = all.unwrap_or(false);
     let text = build_queue_report(
@@ -306,7 +311,8 @@ pub(in crate::services::discord) async fn cmd_adk_phase(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/adk-phase");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /adk-phase");
 
     let detailed = details.unwrap_or(false);
     let text = build_adk_phase_report(&ctx.data().shared, detailed).await;
@@ -372,15 +378,12 @@ pub(in crate::services::discord) async fn cmd_debug(ctx: Context<'_>) -> Result<
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/debug");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /debug");
 
     let new_state = claude::toggle_debug();
     let status = if new_state { "ON" } else { "OFF" };
     ctx.say(format!("Debug logging: **{}**", status)).await?;
-    log_info_event!(
-        "discord_debug_logging_changed",
-        channel_id = ctx.channel_id().get(),
-        status = status,
-    );
+    tracing::info!("  [{ts}] ▶ Debug logging toggled to {status}");
     Ok(())
 }

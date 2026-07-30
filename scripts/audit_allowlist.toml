@@ -37,8 +37,8 @@ direct_discord_sends = [
   "src/services/discord/gateway.rs#direct_discord_sends:b61365ed28b915b2",
   "src/services/discord/gateway.rs#direct_discord_sends:60a609bdefcf51c2",
   "src/services/discord/gateway.rs#direct_discord_sends:a78022596f453395",
-  "src/services/discord/meeting_orchestrator/selection_runtime.rs#direct_discord_sends:64c7fa00eace25a9",
-  "src/services/discord/meeting_orchestrator/selection_runtime.rs#direct_discord_sends:5e0310b8b9e373ff",
+  "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:64c7fa00eace25a9",
+  "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:5e0310b8b9e373ff",
   "src/services/discord/monitoring_status.rs#direct_discord_sends:6911fe26869c481d",
   "src/services/discord/monitoring_status.rs#direct_discord_sends:9ea6e87eaf2dcfcb",
   "src/services/discord/placeholder_controller.rs#direct_discord_sends:94892504c53d1b42",
@@ -46,6 +46,10 @@ direct_discord_sends = [
   # announce-token fallback is removed; deliver_outbound currently collapses
   # HTTP status / Discord error code into a string on edit failures.
   "src/services/issue_announcements.rs#direct_discord_sends:c953e696eec38deb",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:40a1288799a3f040",
+  # #4230 S7: existing ToolUse restart-handoff direct gateway edit moved verbatim from
+  # turn_bridge/stream_loop.rs to turn_bridge/stream_loop/tool_arms.rs.
+  "src/services/discord/turn_bridge/stream_loop/tool_arms.rs#direct_discord_sends:49054cadcdb1b240",
   # #4230 S10: existing recovery-notice direct gateway edit moved verbatim from
   # terminal_outcome_delivery.rs to the recovery_retry child handler.
   "src/services/discord/turn_bridge/terminal_outcome_delivery/recovery_retry.rs#direct_discord_sends:912eabdb5dce46d2",
@@ -66,10 +70,7 @@ direct_discord_sends = [
   # gated on `two_message_panel_enabled` and ordered answer-first (the panel is
   # the NEW message BELOW the answer). Retires with the #1436 outbound v3
   # extraction alongside the other bridge panel sends.
-  # 2026-07-24 #4860 re-fingerprint: same PR-B `gateway.send_message` panel
-  # create; context hash shifted by the singleton re-anchor sequence (prior-
-  # binding load + durable persist + old-panel retire) around the send.
-  "src/services/discord/turn_bridge/two_message_panel.rs#direct_discord_sends:c4e8a3a063c75061",
+  "src/services/discord/turn_bridge/two_message_panel.rs#direct_discord_sends:dd70d6753b664c07",
   # #3805 P2 PR-D: the sink rollover re-anchor sends the NEW status panel BELOW
   # the new tail answer chunk via the same TurnGateway used elsewhere in this
   # module. Retires with the #1436 outbound v3 extraction alongside the create.
@@ -77,9 +78,11 @@ direct_discord_sends = [
   # #3038 turn_bridge S1: status-panel completion direct gateway calls moved
   # verbatim from turn_bridge/mod.rs to turn_bridge/status_panel.rs.
 
-  # 2026-07-24 #4860 size-cap relief: the completion fallback send moved verbatim
-  # from status_panel.rs to status_panel/fallback.rs (same call, same hash).
-  "src/services/discord/turn_bridge/status_panel/fallback.rs#direct_discord_sends:c4f1e0c4fddb4380",
+  "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:c4f1e0c4fddb4380",
+  # #3016 msg_id==0 recovery: bridge creates a fresh placeholder / posts a recovery
+  # notice for turns with no anchored Discord message. Consistent with the bridge's
+  # existing pre-migration direct sends; retire with the #1436 outbound v3 extraction.
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:d77122f8dd3466ba",
 ]
 
 # Footer view writes: #4049 S4-b1 intentionally centralizes only the completion
@@ -88,9 +91,7 @@ direct_discord_sends = [
 # footer_view_reconciler.
 footer_view_writes = [
   "src/services/discord/tmux_watcher/two_message_panel.rs#footer_view_writes:5337251a73d4d11f",
-  # 2026-07-24 #4860 re-fingerprint: same S4-b2-owned live panel write (create);
-  # context hash shifted by the singleton re-anchor sequence around the send.
-  "src/services/discord/turn_bridge/two_message_panel.rs#footer_view_writes:1e52b256e43e9a29",
+  "src/services/discord/turn_bridge/two_message_panel.rs#footer_view_writes:a9ce6b67175262d4",
   "src/services/discord/turn_bridge/two_message_panel.rs#footer_view_writes:86e7bb20f9b34ca7"
 ]
 

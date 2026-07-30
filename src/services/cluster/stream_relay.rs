@@ -55,9 +55,7 @@ use tokio::task::JoinHandle;
 use super::session_matcher::MatchedChannel;
 
 mod identity;
-mod terminal_resolution;
 pub use identity::{RelayDroppedFrame, RelayTurnIdentity};
-pub use terminal_resolution::{DeliveryOutcome, RelaySinkOutcome};
 
 /// Default size of the producer → relay queue. Generous enough to absorb a
 /// burst of provider output (e.g. a long planning block dumping thousands of
@@ -75,6 +73,33 @@ pub const DEFAULT_RELAY_BUFFER: usize = 1024;
 /// (treated by the watcher as "not yet resolved" → it keeps waiting / eventually
 /// times out → reconciles, never a false ACK).
 pub const TERMINAL_OUTCOME_RING_CAPACITY: usize = 64;
+
+/// #3041 P1-3 R5 / P1-5: the EXACT, per-frame terminal resolution recorded for a
+/// single terminal (result-bearing) frame's sequence. Distinct from the
+/// high-water-mark fields (`last_terminal_committed/skipped_sequence`), which a
+/// LATER, higher-sequence terminal can bump — this is keyed to ONE sequence so a
+/// watcher resolves its ACK on ITS OWN terminal frame's outcome, decoupled from
+/// any other turn sharing the same physical chunk.
+///
+/// #3041 P1-5: the CANONICAL cross-actor 3-way delivery outcome. The sink-local
+/// enum stays 2-way (the sink always KNOWS: confirmed POST → `Delivered`;
+/// deterministic decline → `NotDelivered`; failure → `Err`). `Unknown` is a
+/// CROSS-ACTOR state that arises in the relay ring + watcher when the terminal
+/// resolution cannot be confirmed (the watcher's ACK timed out / target was
+/// missing / the frame was dropped or hit a sink error, or the sink POSTed but
+/// could not confirm the commit). Both `NotDelivered` AND `Unknown` MUST flow
+/// through the watcher's committed-offset reconciliation (§3.2) — there is NO
+/// blind skip for `NotDelivered` and NO blind 10s re-send for `Unknown`.
+///
+/// A NEVER-recorded sequence reads back `None` (distinct from `Some(Unknown)`):
+/// `None` means "not yet resolved" (keep waiting), `Some(Unknown)` is an explicit
+/// "resolved but unconfirmed → reconcile NOW" signal the sink/watcher can record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Delivered,
+    NotDelivered,
+    Unknown,
+}
 
 /// An opaque stream frame emitted by a provider. Carries enough metadata for
 /// the sink to route + format without re-reading the rollout file.
@@ -130,12 +155,6 @@ pub struct StreamFrame {
     /// identity for backpressure attribution, but only frames with
     /// `terminal_consumed_end` can advance the sink commit fence.
     pub turn_start_offset: Option<u64>,
-    /// Idle/catch-up ordered JSONL range. The range is a commit candidate only
-    /// when `relay_generation_mtime_ns` still matches the live wrapper.
-    pub relay_range: Option<(u64, u64)>,
-    /// Wrapper generation captured with `relay_range`. A queued range from a
-    /// replaced wrapper must never commit against the replacement transcript.
-    pub relay_generation_mtime_ns: Option<i64>,
 }
 
 /// Per-session counters. Exposed via the supervisor for diagnostics.
@@ -328,13 +347,53 @@ pub trait RelaySink: Send + Sync + 'static {
     async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError>;
 }
 
+/// Result of accepting a relay frame into the sink. This deliberately
+/// distinguishes "the sink accepted/parsing-counted this frame" from "a
+/// terminal Discord response was actually committed". Watchers must use only
+/// `TerminalDelivered` as delegation success.
+///
+/// #3041 P1-5: the three terminal variants mirror the cross-actor 3-way
+/// `DeliveryOutcome`. `TerminalDelivered` (confirmed POST/edit) → the watcher
+/// treats the turn as delivered. `TerminalNotDelivered` (a deterministic
+/// route-decision decline — foreign-owner lease block, or bridge-owned /
+/// mismatched inflight) and `TerminalUnknown` (the sink POSTed but could not
+/// confirm the commit) BOTH route the watcher through committed-offset
+/// reconciliation (§3.2): NO blind skip for `NotDelivered`, NO blind re-send for
+/// `Unknown`. The session-bound sink itself emits only `Delivered`/`NotDelivered`
+/// (it always knows); `TerminalUnknown` is reserved for a future/optional sink
+/// site that POSTs-without-confirm and for cross-actor symmetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaySinkOutcome {
+    FrameAccepted,
+    TerminalDelivered,
+    TerminalNotDelivered,
+    // #3041 P1-5: reserved for a future POST-without-confirm sink + cross-actor
+    // symmetry (see enum doc); the session-bound sink never emits it today.
+    #[allow(dead_code)]
+    TerminalUnknown,
+}
+
+impl RelaySinkOutcome {
+    pub fn terminal_delivered(self) -> bool {
+        matches!(self, Self::TerminalDelivered)
+    }
+
+    pub fn terminal_not_delivered(self) -> bool {
+        matches!(self, Self::TerminalNotDelivered)
+    }
+
+    pub fn terminal_unknown(self) -> bool {
+        matches!(self, Self::TerminalUnknown)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RelaySinkError {
     #[error("transient sink failure: {0}")]
     Transient(String),
-    // Permanent means non-transient failure, not confirmed transport. Card/history
-    // paths can produce it before a Discord POST, so consumers must not treat the
-    // variant itself as delivery evidence.
+    // Documented permanent-failure arm of the sink error taxonomy; no sink site
+    // produces it yet but it is part of the public RelaySinkError contract.
+    #[allow(dead_code)]
     #[error("permanent sink failure: {0}")]
     Permanent(String),
 }
@@ -416,45 +475,6 @@ impl RelayProducer {
         self.try_send_frame_with_sequence_and_identity(payload, None)
     }
 
-    pub fn try_send_frame_for_range(
-        &self,
-        payload: String,
-        start: u64,
-        end: u64,
-        generation_mtime_ns: i64,
-    ) -> bool {
-        self.enqueue(
-            payload,
-            None,
-            None,
-            Some((start, end)),
-            Some(generation_mtime_ns),
-        )
-        .is_alive()
-    }
-
-    fn enqueue(
-        &self,
-        payload: String,
-        terminal: Option<TerminalCommitFence>,
-        identity: Option<RelayTurnIdentity>,
-        range: Option<(u64, u64)>,
-        relay_generation_mtime_ns: Option<i64>,
-    ) -> RelaySendOutcome {
-        try_send_frame_inner(
-            &self.matched,
-            &self.queue,
-            &self.shutdown,
-            &self.metrics,
-            &self.sequence,
-            payload,
-            terminal,
-            identity,
-            range,
-            relay_generation_mtime_ns,
-        )
-    }
-
     /// Non-blocking enqueue for a non-terminal frame with optional turn identity.
     /// The identity is inert for sink commits (`terminal_consumed_end` stays None)
     /// but lets a later backpressure eviction degrade the affected turn's mirror
@@ -464,21 +484,15 @@ impl RelayProducer {
         payload: String,
         frame_identity: Option<RelayTurnIdentity>,
     ) -> RelaySendOutcome {
-        self.enqueue(payload, None, frame_identity, None, None)
-    }
-
-    pub fn try_send_frame_with_sequence_identity_and_generation(
-        &self,
-        payload: String,
-        frame_identity: Option<RelayTurnIdentity>,
-        relay_generation_mtime_ns: i64,
-    ) -> RelaySendOutcome {
-        self.enqueue(
+        try_send_frame_inner(
+            &self.matched,
+            &self.queue,
+            &self.shutdown,
+            &self.metrics,
+            &self.sequence,
             payload,
             None,
             frame_identity,
-            None,
-            (relay_generation_mtime_ns != 0).then_some(relay_generation_mtime_ns),
         )
     }
 
@@ -492,21 +506,15 @@ impl RelayProducer {
         payload: String,
         terminal: TerminalCommitFence,
     ) -> RelaySendOutcome {
-        self.enqueue(payload, Some(terminal), None, None, None)
-    }
-
-    pub fn try_send_terminal_frame_with_sequence_and_generation(
-        &self,
-        payload: String,
-        terminal: TerminalCommitFence,
-        relay_generation_mtime_ns: i64,
-    ) -> RelaySendOutcome {
-        self.enqueue(
+        try_send_frame_inner(
+            &self.matched,
+            &self.queue,
+            &self.shutdown,
+            &self.metrics,
+            &self.sequence,
             payload,
             Some(terminal),
             None,
-            None,
-            (relay_generation_mtime_ns != 0).then_some(relay_generation_mtime_ns),
         )
     }
 }
@@ -645,8 +653,6 @@ fn try_send_frame_inner(
     payload: String,
     terminal: Option<TerminalCommitFence>,
     frame_identity: Option<RelayTurnIdentity>,
-    relay_range: Option<(u64, u64)>,
-    relay_generation_mtime_ns: Option<i64>,
 ) -> RelaySendOutcome {
     if shutdown.load(Ordering::Acquire) {
         return RelaySendOutcome::closed();
@@ -672,8 +678,6 @@ fn try_send_frame_inner(
         turn_user_msg_id: frame_identity.turn_user_msg_id,
         turn_started_at: frame_identity.turn_started_at,
         turn_start_offset: frame_identity.turn_start_offset,
-        relay_range,
-        relay_generation_mtime_ns,
     };
     metrics.frames_received.fetch_add(1, Ordering::AcqRel);
     match queue.push_drop_oldest(frame) {
@@ -733,8 +737,6 @@ impl StreamRelayHandle {
             &self.metrics,
             &self.sequence,
             payload,
-            None,
-            None,
             None,
             None,
         )
@@ -943,29 +945,28 @@ async fn deliver_frame(
                 metrics
                     .last_terminal_committed_sequence_plus_one
                     .fetch_max(encode_sequence_marker(frame.sequence), Ordering::AcqRel);
+                // #3041 P1-3 R5: record THIS frame's exact-sequence outcome so the
+                // watcher resolves its ACK on its own terminal frame (decoupled
+                // from any co-chunked higher-sequence terminal).
                 metrics.record_terminal_outcome(frame.sequence, DeliveryOutcome::Delivered);
-            }
-            if let Some((committed_to, persistence_recorded)) = outcome.terminal_fresh_delivered() {
-                metrics.terminal_commits.fetch_add(1, Ordering::AcqRel);
-                metrics
-                    .last_terminal_committed_sequence_plus_one
-                    .fetch_max(encode_sequence_marker(frame.sequence), Ordering::AcqRel);
-                metrics.record_terminal_outcome(
-                    frame.sequence,
-                    DeliveryOutcome::FreshDelivered {
-                        committed_to,
-                        persistence_recorded,
-                    },
-                );
             }
             if outcome.terminal_not_delivered() {
                 metrics.terminal_skips.fetch_add(1, Ordering::AcqRel);
                 metrics
                     .last_terminal_skipped_sequence_plus_one
                     .fetch_max(encode_sequence_marker(frame.sequence), Ordering::AcqRel);
+                // #3041 P1-5: a deterministic route-decision decline — recorded as
+                // `NotDelivered` so the watcher reconciles against the committed
+                // offset (§3.2 SendFull-or-Skip), never a blind skip.
                 metrics.record_terminal_outcome(frame.sequence, DeliveryOutcome::NotDelivered);
             }
             if outcome.terminal_unknown() {
+                // #3041 P1-5: the sink POSTed but could not confirm the commit. We
+                // do NOT bump the commit/skip high-water-marks (the outcome is, by
+                // definition, unconfirmed) but DO record the per-sequence `Unknown`
+                // so the watcher's per-sequence ACK resolves immediately to
+                // committed-offset reconciliation instead of waiting out the 10s
+                // ACK timeout. Both `NotDelivered` and `Unknown` flow through §3.2.
                 metrics.record_terminal_outcome(frame.sequence, DeliveryOutcome::Unknown);
             }
         }
@@ -1048,21 +1049,6 @@ mod tests {
         }
     }
 
-    struct FreshOutcomeSink {
-        committed_to: Option<u64>,
-        persistence_recorded: bool,
-    }
-
-    #[async_trait]
-    impl RelaySink for FreshOutcomeSink {
-        async fn deliver(&self, _frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
-            Ok(RelaySinkOutcome::TerminalFreshDelivered {
-                committed_to: self.committed_to,
-                persistence_recorded: self.persistence_recorded,
-            })
-        }
-    }
-
     fn matched_for(channel: &str) -> MatchedChannel {
         let session = ProviderKind::Claude.build_tmux_session_name(channel);
         MatchedChannel {
@@ -1111,24 +1097,6 @@ mod tests {
         }
         assert_eq!(handle.metrics().snapshot().frames_delivered, 5);
         assert_eq!(handle.metrics().snapshot().dropped_frames, 0);
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn session_relay_ordered_range_frame_carries_idle_delivery_coordinate() {
-        let sink = Arc::new(CapturingSink::default());
-        let handle = spawn_stream_relay(matched_for("c-range"), sink.clone());
-        let producer = handle.producer();
-
-        assert!(producer.try_send_frame_for_range("idle-result".into(), 640, 1_024, 77));
-        flush_pending().await;
-
-        let delivered = sink.delivered();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].relay_range, Some((640, 1_024)));
-        assert_eq!(delivered[0].relay_generation_mtime_ns, Some(77));
-        assert_eq!(delivered[0].terminal_consumed_end, None);
-        assert_eq!(delivered[0].turn_start_offset, None);
         handle.shutdown().await;
     }
 
@@ -1421,78 +1389,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_fresh_outcome_records_exact_terminal_resolution_not_sink_error() {
-        for (committed_to, persistence_recorded) in [
-            (Some(200), true),
-            (Some(200), false),
-            (None, true),
-            (None, false),
-        ] {
-            let sink: Arc<dyn RelaySink> = Arc::new(FreshOutcomeSink {
-                committed_to,
-                persistence_recorded,
-            });
-            let handle = spawn_stream_relay(matched_for("c-fresh-resolution"), sink);
-            let outcome = handle.try_send_frame_with_sequence("fresh".into());
-            let sequence = outcome.sequence.expect("fresh frame sequence");
-            wait_until(
-                || {
-                    handle
-                        .metrics()
-                        .terminal_outcome_for_sequence(sequence)
-                        .is_some()
-                },
-                "fresh outcome recorded",
-            )
-            .await;
-
-            assert_eq!(
-                handle.metrics().terminal_outcome_for_sequence(sequence),
-                Some(DeliveryOutcome::FreshDelivered {
-                    committed_to,
-                    persistence_recorded,
-                })
-            );
-            let snapshot = handle.metrics().snapshot();
-            assert_eq!(snapshot.sink_errors, 0);
-            assert_eq!(snapshot.terminal_commits, 1);
-            handle.shutdown().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn permanent_sink_error_is_not_misclassified_as_confirmed_fresh() {
-        struct PermanentFailureSink;
-        #[async_trait]
-        impl RelaySink for PermanentFailureSink {
-            async fn deliver(
-                &self,
-                _frame: &StreamFrame,
-            ) -> Result<RelaySinkOutcome, RelaySinkError> {
-                Err(RelaySinkError::Permanent("card/history failure".into()))
-            }
-        }
-
-        let handle = spawn_stream_relay(
-            matched_for("c-permanent-failure"),
-            Arc::new(PermanentFailureSink),
-        );
-        let outcome = handle.try_send_frame_with_sequence("failed".into());
-        let sequence = outcome.sequence.expect("failed frame sequence");
-        wait_until(
-            || handle.metrics().snapshot().sink_errors == 1,
-            "permanent sink error recorded",
-        )
-        .await;
-        assert_eq!(
-            handle.metrics().terminal_outcome_for_sequence(sequence),
-            None,
-            "a Permanent error is not transport confirmation"
-        );
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn frames_carry_full_binding_snapshot_without_reparsing_session_name() {
         let sink = Arc::new(CapturingSink::default());
         let mut m = matched_for("short-session-key");
@@ -1732,18 +1628,6 @@ mod tests {
             assert!(!accepted.terminal_delivered());
             assert!(!accepted.terminal_not_delivered());
             assert!(!accepted.terminal_unknown());
-        }
-
-        #[test]
-        fn a0_fresh_delivered_preserves_confirmation_metadata() {
-            assert_eq!(
-                RelaySinkOutcome::TerminalFreshDelivered {
-                    committed_to: None,
-                    persistence_recorded: false,
-                }
-                .terminal_fresh_delivered(),
-                Some((None, false))
-            );
         }
 
         #[test]

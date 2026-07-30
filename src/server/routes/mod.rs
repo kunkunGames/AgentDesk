@@ -15,7 +15,6 @@ pub mod dispatches;
 pub mod dm_reply;
 pub mod docs;
 mod domains;
-pub(crate) mod e2e_control;
 pub mod escalation;
 pub mod github;
 pub mod github_dashboard;

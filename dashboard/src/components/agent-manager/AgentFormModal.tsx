@@ -169,8 +169,7 @@ export default function AgentFormModal({
               >
                 <button
                   type="button"
-                  tabIndex={-1}
-                  aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-label={tr("다음 스프라이트", "Next sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -191,7 +190,7 @@ export default function AgentFormModal({
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected Sprite preview: ${spriteNum}` })}
+                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
                     />
@@ -210,8 +209,7 @@ export default function AgentFormModal({
                 </div>
                 <button
                   type="button"
-                  tabIndex={-1}
-                  aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-label={tr("이전 스프라이트", "Previous sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",

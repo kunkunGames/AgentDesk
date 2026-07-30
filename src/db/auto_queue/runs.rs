@@ -162,10 +162,10 @@ pub(crate) async fn maybe_finalize_run_if_ready_pg(
         return Ok(false);
     }
 
-    // The status transition is the release authority. In particular, a run in
-    // the restore hand-off window must retain its slot until restore finalizes;
-    // releasing first and then discovering the status is ineligible creates a
-    // restoring-run / unowned-slot split brain.
+    release_run_slots_on_pg_tx(tx, run_id)
+        .await
+        .map_err(|error| format!("release auto-queue slots for run {run_id}: {error}"))?;
+
     let updated = sqlx::query(
         "UPDATE auto_queue_runs
          SET status = 'completed',
@@ -182,9 +182,6 @@ pub(crate) async fn maybe_finalize_run_if_ready_pg(
         return Ok(false);
     }
 
-    release_run_slots_on_pg_tx(tx, run_id)
-        .await
-        .map_err(|error| format!("release auto-queue slots for run {run_id}: {error}"))?;
     queue_run_completion_notify_on_pg(tx, run_id).await?;
     Ok(true)
 }

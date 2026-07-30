@@ -3,16 +3,13 @@ use crate::services::cluster::intake_router_hook::{
     IntakeBlockedReason, IntakeRouterContext, IntakeRouterDecision, try_route_intake,
 };
 use crate::services::provider::ProviderKind;
-use poise::serenity_prelude as serenity;
 
-mod attachment;
 mod notice;
 mod queued;
 mod skill;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use attachment::{prepare_admitted_live_attachments, resolve_attachment_admission};
 use notice::notify_blocked_intake;
 pub(crate) use queued::{
     QueuedAdmissionDisposition, admit_queued_intake, finish_admitted_queued_intake,
@@ -25,7 +22,6 @@ pub(crate) enum IntakeOrigin {
     QueuedDrain,
     SlashSkill,
     TextSkill,
-    RawAttachment,
 }
 
 impl IntakeOrigin {
@@ -45,30 +41,12 @@ pub(crate) struct IntakeSubmission {
     pub(crate) origin: IntakeOrigin,
     pub(crate) preserve_on_cancel: bool,
     pub(crate) has_nonportable_uploads: bool,
-    pub(crate) attachments: Vec<message_handler::AttachmentDescriptor>,
     pub(crate) preloaded_uploads: Vec<String>,
     pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 }
 
 #[derive(Debug)]
-pub(crate) struct LocalAdmissionPermit {
-    channel_id: serenity::ChannelId,
-    request_owner: serenity::UserId,
-}
-
-impl LocalAdmissionPermit {
-    fn for_submission(submission: &IntakeSubmission) -> Self {
-        Self {
-            channel_id: submission.request.channel_id,
-            request_owner: submission.request.request_owner,
-        }
-    }
-
-    fn permits_submission(&self, submission: &IntakeSubmission) -> bool {
-        self.channel_id == submission.request.channel_id
-            && self.request_owner == submission.request.request_owner
-    }
-}
+pub(crate) struct LocalAdmissionPermit(());
 
 #[derive(Debug)]
 pub(crate) enum IntakeAdmission {
@@ -130,7 +108,7 @@ pub(crate) async fn admit_text_intake(
         return match decision {
             IntakeRouterDecision::Blocked { reason } => IntakeAdmission::Blocked { reason },
             IntakeRouterDecision::RanLocal { .. } => {
-                IntakeAdmission::Local(LocalAdmissionPermit::for_submission(submission))
+                IntakeAdmission::Local(LocalAdmissionPermit(()))
             }
             _ => unreachable!("dependency-free admission creates only blocked or local decisions"),
         };
@@ -166,7 +144,6 @@ pub(crate) async fn admit_text_intake(
         preserve_on_cancel: submission.preserve_on_cancel,
         node_override_instance_id: node_override.as_deref(),
         has_nonportable_uploads: submission.has_nonportable_uploads
-            || !submission.attachments.is_empty()
             || !submission.preloaded_uploads.is_empty(),
     };
 
@@ -180,7 +157,7 @@ pub(crate) async fn admit_text_intake(
     );
     let admission = match decision {
         IntakeRouterDecision::RanLocal { .. } | IntakeRouterDecision::Observed { .. } => {
-            IntakeAdmission::Local(LocalAdmissionPermit::for_submission(submission))
+            IntakeAdmission::Local(LocalAdmissionPermit(()))
         }
         IntakeRouterDecision::Forwarded {
             target_instance_id,
@@ -208,25 +185,9 @@ pub(crate) async fn dispatch_text_intake(
     submission: IntakeSubmission,
 ) -> Result<(), super::super::Error> {
     let admission = admit_text_intake(deps, &submission).await;
-    finish_text_intake_admission(deps, admission, submission).await
-}
-
-pub(crate) async fn finish_text_intake_admission(
-    deps: &IntakeDeps<'_>,
-    admission: IntakeAdmission,
-    submission: IntakeSubmission,
-) -> Result<(), super::super::Error> {
     match admission {
         IntakeAdmission::Local(permit) => {
             finish_admitted_local(deps, permit, submission).await?;
-        }
-        IntakeAdmission::DeferredOpenRoute {
-            ref target_instance_id,
-        } if matches!(submission.origin, IntakeOrigin::RawAttachment) => {
-            let reason = IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
-                target_instance_id: target_instance_id.clone(),
-            };
-            notify_blocked_intake(deps, &submission, &reason).await;
         }
         IntakeAdmission::DeferredOpenRoute { .. } => {
             defer_live_submission(deps, submission).await;
@@ -243,29 +204,11 @@ pub(crate) async fn finish_text_intake_admission(
     Ok(())
 }
 
-pub(crate) async fn finish_admitted_text_intake(
-    deps: &IntakeDeps<'_>,
-    permit: LocalAdmissionPermit,
-    submission: IntakeSubmission,
-) -> Result<(), super::super::Error> {
-    finish_admitted_local(deps, permit, submission).await
-}
-
 pub(crate) async fn finish_admitted_local(
     deps: &IntakeDeps<'_>,
-    permit: LocalAdmissionPermit,
+    _permit: LocalAdmissionPermit,
     submission: IntakeSubmission,
 ) -> Result<(), super::super::Error> {
-    if !permit.permits_submission(&submission) {
-        tracing::error!(
-            admitted_channel_id = permit.channel_id.get(),
-            submitted_channel_id = submission.request.channel_id.get(),
-            admitted_request_owner = permit.request_owner.get(),
-            submitted_request_owner = submission.request.request_owner.get(),
-            "local admission permit does not match intake submission"
-        );
-        return Ok(());
-    }
     let preserve_on_cancel = submission.preserve_on_cancel;
     let queued_drain = matches!(submission.origin, IntakeOrigin::QueuedDrain);
     message_handler::finish_admitted_local(

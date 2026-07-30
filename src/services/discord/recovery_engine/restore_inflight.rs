@@ -10,22 +10,51 @@
 use super::terminal_watcher::restart_report_watcher_start;
 use super::*;
 
-use super::tmux_probe::{tmux_has_session_with_retry, tmux_session_alive_with_retry};
+/// Retry-aware tmux session check for recovery after dcserver restart.
+/// The first check can false-negative if tmux CLI hasn't fully initialized yet.
+pub(super) fn tmux_session_alive_with_retry(name: &str) -> bool {
+    if tmux_session_has_live_pane(name) {
+        return true;
+    }
+    // #2428 H5: retry up to 2 more times with exponential backoff + jitter
+    // (was a fixed 1s gap; see `recovery_retry_backoff`).
+    for attempt in 1..=2u32 {
+        std::thread::sleep(recovery_retry_backoff(attempt));
+        if tmux_session_has_live_pane(name) {
+            tracing::info!(
+                "  [recovery] tmux pane alive on retry {} for {}",
+                attempt,
+                name
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Retry-aware tmux has_session check.
+fn tmux_has_session_with_retry(name: &str) -> bool {
+    if crate::services::platform::tmux::has_session(name) {
+        return true;
+    }
+    // #2428 H5: see `recovery_retry_backoff`.
+    for attempt in 1..=2u32 {
+        std::thread::sleep(recovery_retry_backoff(attempt));
+        if crate::services::platform::tmux::has_session(name) {
+            tracing::info!(
+                "  [recovery] tmux session found on retry {} for {}",
+                attempt,
+                name
+            );
+            return true;
+        }
+    }
+    false
+}
 
 #[cfg(not(unix))]
 fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Option<String> {
     None
-}
-
-fn recovery_output_path_with_tmux_fallback(
-    state: &inflight::InflightTurnState,
-    fallback_output: String,
-) -> Option<String> {
-    state
-        .output_path
-        .clone()
-        .filter(|path| !path.is_empty())
-        .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output))
 }
 
 pub(in crate::services::discord) async fn finish_recovered_turn_mailbox(
@@ -126,7 +155,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
 
     let settings_snapshot = shared.settings.read().await.clone();
 
-    for mut state in states {
+    for state in states {
         // #897 round-4 High: rebind_origin inflights are synthetic
         // placeholders owned by `/api/inflight/rebind` and do NOT carry
         // a real user message, dispatch context, or placeholder Discord
@@ -705,10 +734,6 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     restore_recovered_session_worktree(session, &state);
                 }
 
-                super::recovery_two_message_panel::recover_two_message_panel(
-                    http, shared, provider, &mut state,
-                )
-                .await;
                 let finish_mailbox_on_completion =
                     reregister_active_turn_from_inflight(shared, &state).await;
 
@@ -741,17 +766,12 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         let watcher_claimed = {
                             #[cfg(unix)]
                             {
-                                let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
+                                let claim = super::tmux::claim_or_reuse_watcher(
                                     &shared.tmux_watchers,
                                     channel_id,
                                     handle,
                                     provider,
                                     "restart_report_recovery",
-                                    super::tmux::thread_follow_up_parent_channel_id(
-                                        channel_id,
-                                        state.logical_channel_id,
-                                        state.thread_id,
-                                    ),
                                 );
                                 claim.should_spawn()
                             }
@@ -887,7 +907,17 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             .map(tmux_runtime_paths)
             .unwrap_or_else(|| (String::new(), String::new()));
         let runtime_kind = state.runtime_kind_for_recovery();
-        let output_path = recovery_output_path_with_tmux_fallback(&state, fallback_output);
+        let output_path = state
+            .output_path
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if !fallback_output.is_empty() {
+                    Some(fallback_output.clone())
+                } else {
+                    None
+                }
+            });
         let input_fifo_path = if runtime_kind.requires_input_fifo() {
             state
                 .input_fifo_path
@@ -1716,7 +1746,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 continue;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
+            tracing::warn!(
                 provider = %provider.as_str(),
                 channel_id = state.channel_id,
                 user_msg_id = state.user_msg_id,
@@ -1741,10 +1771,6 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             recovery_phase_after_tmux_probe(true, Some(pane_alive)),
             RecoveryPhase::WatcherReattach
         ) {
-            super::recovery_two_message_panel::recover_two_message_panel(
-                http, shared, provider, &mut state,
-            )
-            .await;
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] ↻ inflight recovery: pane alive for channel {}, spawning watcher immediately",
@@ -1868,10 +1894,6 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 restore_recovered_session_worktree(session, &state);
             }
 
-            super::recovery_two_message_panel::recover_two_message_panel(
-                http, shared, provider, &mut state,
-            )
-            .await;
             let finish_mailbox_on_completion =
                 reregister_active_turn_from_inflight(shared, &state).await;
 
@@ -1916,17 +1938,12 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 let watcher_claimed = {
                     #[cfg(unix)]
                     {
-                        let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
+                        let claim = super::tmux::claim_or_reuse_watcher(
                             &shared.tmux_watchers,
                             channel_id,
                             handle,
                             provider,
                             "inflight_recovery",
-                            super::tmux::thread_follow_up_parent_channel_id(
-                                channel_id,
-                                state.logical_channel_id,
-                                state.thread_id,
-                            ),
                         );
                         claim.should_spawn()
                     }
@@ -2210,7 +2227,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     if pane_alive {
                         // Session is alive but idle — hand off to watcher instead of retrying
-                        tracing::info!(
+                        tracing::warn!(
                             "  [{ts}] ↻ Recovery: session idle but pane alive — handing off to watcher (channel {})",
                             retry_channel_id
                         );
@@ -2436,34 +2453,6 @@ mod tests {
         assert_eq!(
             persisted.effective_relay_owner_kind(),
             RelayOwnerKind::Watcher
-        );
-    }
-
-    #[test]
-    fn restore_claude_tui_without_runtime_output_uses_tmux_fallback_path() {
-        let mut state = InflightTurnState::new(
-            ProviderKind::Claude,
-            4_997_002,
-            None,
-            1,
-            2,
-            3,
-            "pending ClaudeTui recovery".to_string(),
-            None,
-            Some("AgentDesk-claude-4997".to_string()),
-            None,
-            Some("/runtime/input.fifo".to_string()),
-            0,
-        );
-        state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
-        let output_path = super::recovery_output_path_with_tmux_fallback(
-            &state,
-            "/runtime/AgentDesk-claude-4997.output".to_string(),
-        );
-        assert_eq!(
-            output_path.as_deref(),
-            Some("/runtime/AgentDesk-claude-4997.output"),
-            "ClaudeTui None must take the tmux fallback instead of recovery_missing_output_path"
         );
     }
 

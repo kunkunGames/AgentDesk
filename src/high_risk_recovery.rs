@@ -10,7 +10,6 @@ use crate::services::dispatches::discord_delivery::{
     send_dispatch_with_delivery_guard,
 };
 use crate::services::dispatches::outbox_queue::{OutboxNotifier, process_outbox_batch_with_pg};
-use crate::services::observability;
 
 struct PgRecoveryTestDatabase {
     _lifecycle: crate::db::postgres::PostgresTestLifecycleGuard,
@@ -68,89 +67,6 @@ impl PgRecoveryTestDatabase {
         .await
         .expect("drop postgres recovery test db");
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn cross_channel_tmux_claim_observability_distinguishes_thread_follow_up_4984() {
-    let _guard = observability::test_runtime_lock();
-    observability::reset_for_tests();
-    let parent_channel_id = poise::serenity_prelude::ChannelId::new(4_984_001);
-    let thread_channel_id = poise::serenity_prelude::ChannelId::new(4_984_002);
-    let unrelated_channel_id = poise::serenity_prelude::ChannelId::new(4_984_003);
-
-    crate::services::discord::claim_cross_channel_tmux_watcher_for_high_risk_test(
-        unrelated_channel_id,
-        parent_channel_id,
-        None,
-    );
-    crate::services::discord::claim_cross_channel_tmux_watcher_for_high_risk_test(
-        thread_channel_id,
-        parent_channel_id,
-        Some(parent_channel_id),
-    );
-
-    let cross_channel_events: Vec<_> = observability::events::recent(20)
-        .into_iter()
-        .filter(|event| {
-            event.event_type == "invariant_violation"
-                && event.payload["invariant"] == "watcher_cross_channel_tmux_claim_observed"
-        })
-        .collect();
-    assert_eq!(
-        cross_channel_events.len(),
-        2,
-        "both intended and unintended cross-channel tmux claims must persist classifications"
-    );
-    let unintended = cross_channel_events
-        .iter()
-        .find(|event| {
-            event.payload["details"]["claim_classification"] == "unintended_cross_channel_claim"
-        })
-        .expect("unintended cross-channel claim event");
-    assert_eq!(unintended.channel_id, Some(unrelated_channel_id.get()));
-    assert_eq!(unintended.provider.as_deref(), Some("claude"));
-    assert_eq!(
-        unintended.payload["details"]["requested_channel_id"],
-        unrelated_channel_id.get()
-    );
-    assert_eq!(
-        unintended.payload["details"]["existing_channel_id"],
-        parent_channel_id.get()
-    );
-    assert_eq!(
-        unintended.payload["details"]["tmux_session_name"],
-        "AgentDesk-claude-4984-cross-channel-claim"
-    );
-    assert_eq!(
-        unintended.payload["details"]["intention_basis"],
-        "existing owner does not match the requesting thread parent"
-    );
-    assert!(unintended.payload["details"]["thread_parent_channel_id"].is_null());
-    assert_eq!(
-        unintended.payload["details"]["thread_parent_provenance"],
-        "none"
-    );
-
-    let intended = cross_channel_events
-        .iter()
-        .find(|event| {
-            event.payload["details"]["claim_classification"] == "intended_thread_follow_up"
-        })
-        .expect("intended thread follow-up classification event");
-    assert_eq!(intended.channel_id, Some(thread_channel_id.get()));
-    assert_eq!(
-        intended.payload["details"]["thread_parent_channel_id"],
-        parent_channel_id.get()
-    );
-    assert_eq!(
-        intended.payload["details"]["thread_parent_provenance"],
-        "live_discord"
-    );
-    assert_eq!(
-        intended.payload["details"]["intention_basis"],
-        "requesting thread parent matches the existing watcher owner"
-    );
 }
 
 fn pg_test_base_database_url() -> String {
@@ -482,68 +398,6 @@ async fn boot_reconcile_pg_resets_stale_runtime_rows() {
     crate::db::postgres::close_test_pool(pool, "pg-only high_risk_recovery")
         .await
         .expect("close pg-only high_risk_recovery pool");
-    pg_db.drop().await;
-}
-
-#[tokio::test]
-async fn boot_reconcile_terminalizes_cancelled_run_entry_after_partial_legacy_cancel_pg() {
-    let Some(pg_db) = PgRecoveryTestDatabase::create().await else {
-        return;
-    };
-    let Some(pool) = pg_db.migrate().await else {
-        pg_db.drop().await;
-        return;
-    };
-    seed_agent_pg(&pool).await;
-    seed_card_pg(&pool, "card-cancelled-reconcile", "in_progress").await;
-    sqlx::query(
-        "INSERT INTO auto_queue_runs (id, agent_id, status, completed_at)
-         VALUES ('run-cancelled-reconcile', 'agent-1', 'cancelled', NOW())",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed cancelled run");
-    sqlx::query(
-        "INSERT INTO task_dispatches
-            (id, kanban_card_id, to_agent_id, dispatch_type, status, title)
-         VALUES (
-            'dispatch-cancelled-reconcile', 'card-cancelled-reconcile', 'agent-1',
-            'implementation', 'cancelled', 'Cancelled dispatch'
-         )",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed cancelled dispatch");
-    sqlx::query(
-        "INSERT INTO auto_queue_entries
-            (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, dispatched_at)
-         VALUES (
-            'entry-cancelled-reconcile', 'run-cancelled-reconcile',
-            'card-cancelled-reconcile', 'agent-1', 'dispatched',
-            'dispatch-cancelled-reconcile', 0, NOW()
-         )",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed stranded cancelled entry");
-
-    let stats = crate::reconcile::reconcile_boot_db_pg(&pool, "cancel-reconcile-test")
-        .await
-        .expect("boot reconcile cancelled run entry");
-    assert_eq!(stats.broken_auto_queue_entries_reset, 1);
-    let entry = sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
-        "SELECT status, dispatch_id, slot_index
-         FROM auto_queue_entries
-         WHERE id = 'entry-cancelled-reconcile'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("load reconciled cancelled entry");
-    assert_eq!(entry, ("skipped".to_string(), None, None));
-
-    crate::db::postgres::close_test_pool(pool, "cancelled run reconcile")
-        .await
-        .expect("close cancelled run reconcile pool");
     pg_db.drop().await;
 }
 

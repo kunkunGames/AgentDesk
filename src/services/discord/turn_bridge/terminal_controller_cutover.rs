@@ -318,7 +318,6 @@ pub(super) async fn deliver_short_replace_via_controller(
         shared,
         provider,
         watcher_owner_channel_id,
-        tmux_session_name,
         (start, end),
         dr::outcome_is_shadow_delivered(&outcome),
         Some(msg_id.get()),
@@ -410,7 +409,6 @@ pub(super) async fn deliver_long_chunks_via_controller(
             provider,
             watcher_owner_channel_id,
             channel_id,
-            tmux_session_name,
             (start, end),
             chunks.tail_message_id.map(|m| m.get()),
             delivered_body,
@@ -516,7 +514,7 @@ pub(super) async fn apply_bridge_long_chunks_legacy(
 ) {
     if matches!(lease_acquire, BridgeLeaseAcquire::Skip) {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
+        tracing::warn!(
             channel_id = channel_id.get(),
             "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate long terminal send (channel {})",
             channel_id
@@ -565,7 +563,6 @@ pub(super) async fn apply_bridge_long_chunks_legacy(
                         provider,
                         watcher_owner_channel_id,
                         channel_id,
-                        tmux_session_name,
                         lease_range,
                         last_chunk_msg_id.map(|m| m.get()),
                         delivered_body,

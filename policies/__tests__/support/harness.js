@@ -32,7 +32,7 @@ function defaultPipelineConfig() {
   };
 }
 
-function createPipeline(config, phaseGateDeclaration) {
+function createPipeline(config) {
   const resolved = clone(config || defaultPipelineConfig());
   const transitions = resolved.transitions || [];
   const states = resolved.states || [];
@@ -67,18 +67,12 @@ function createPipeline(config, phaseGateDeclaration) {
     isTerminal(status) {
       return status === this.terminalState();
     },
-    resolvePhaseGateDeclaration(kind) {
-      return typeof phaseGateDeclaration === "function"
-        ? clone(phaseGateDeclaration(kind))
-        : null;
-    },
-    resolvePhaseGateForCard(_cardId, kind) {
-      const declaration = this.resolvePhaseGateDeclaration(kind);
-      if (!declaration) return null;
+    resolvePhaseGateForCard() {
       return {
         dispatch_to: "self",
         dispatch_type: "phase-gate",
-        declaration
+        pass_verdict: "phase_gate_passed",
+        checks: []
       };
     }
   };
@@ -119,10 +113,7 @@ function createExecRouter(routes) {
 
 function createAgentdeskMock(options) {
   const settings = options || {};
-  const pipeline = settings.pipeline || createPipeline(
-    settings.pipelineConfig,
-    settings.phaseGateDeclaration
-  );
+  const pipeline = settings.pipeline || createPipeline(settings.pipelineConfig);
   const state = {
     registeredPolicies: [],
     logs: { debug: [], info: [], warn: [], error: [] },

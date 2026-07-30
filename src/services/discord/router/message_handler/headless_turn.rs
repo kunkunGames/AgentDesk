@@ -302,16 +302,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             status: HeadlessTurnStartStatus::Consumed,
         });
     }
-    let session_transition_guard = shared
-        .acquire_session_transition(channel_id)
-        .await
-        .map_err(|_| {
-            HeadlessTurnStartError::Conflict(format!(
-                "session transition stayed busy for {} seconds on channel {}",
-                super::super::super::SESSION_TRANSITION_LOCK_WAIT_TIMEOUT.as_secs(),
-                channel_id.get()
-            ))
-        })?;
     let cancel_token = Arc::new(CancelToken::new());
     let started = super::super::super::mailbox_try_start_turn(
         shared,
@@ -545,8 +535,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         )
     };
 
-    let fast_mode_channel_id =
-        effective_fast_mode_channel_id(channel_id, early_thread_parent.clone());
+    let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, early_thread_parent);
     super::super::super::commands::reset_provider_session_if_pending(
         &ctx.http,
         shared,
@@ -594,7 +583,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     // label so they never share (and thus never overwrite) the channel's live
     // session_key row.
     let scheduled_snapshot_label = scheduled_snapshot_session_label(metadata.as_ref());
-    let scheduled_snapshot_turn = scheduled_snapshot_label.is_some();
     let adk_session_key = build_adk_session_key(
         shared,
         channel_id,
@@ -602,8 +590,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         scheduled_snapshot_label.as_deref(),
     )
     .await;
-    if !scheduled_snapshot_turn
-        && valid_routine_metadata(metadata.as_ref()).is_some()
+    if valid_routine_metadata(metadata.as_ref()).is_some()
         && let (Some(pool), Some(binding), Some(session_key)) = (
             shared.pg_pool.as_ref(),
             role_binding.as_ref(),
@@ -678,6 +665,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     // writeback is keyed by session_key, so it never touches the channel row.
     // Its cold start + live-context suppression are handled separately below,
     // WITHOUT disturbing the channel (F1: non-disruption is the design contract).
+    let scheduled_snapshot_turn = scheduled_snapshot_label.is_some();
     let fresh_context_severance = goal_fresh || fresh_routine;
     // Fresh routines use the same provider-severance machinery as `/goal fresh`:
     // clear in-memory, DB, stale IDs, and live-TUI bindings; skip restoration;
@@ -843,8 +831,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         recovery_message_count,
     )
     .await;
-
-    drop(session_transition_guard);
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
     let memento_recall_gate = memento_recall_gate_decision(
@@ -1088,7 +1074,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let adk_thread_channel_id = adk_session_name
         .as_deref()
         .and_then(super::super::super::adk_session::parse_thread_channel_id_from_name);
-    post_adk_session_status_with_canonical_identity(
+    post_adk_session_status(
         adk_session_key.as_deref(),
         adk_session_name.as_deref(),
         model_for_turn.as_deref(),
@@ -1103,19 +1089,42 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         role_binding
             .as_ref()
             .map(|binding| binding.role_id.as_str()),
-        &shared.token_hash,
-        scheduled_snapshot_turn,
         shared.api_port,
     )
     .await;
 
-    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) =
-        prelaunch_inflight_runtime_seed(
-            &provider,
-            remote_profile.is_none(),
-            tmux_session_name.as_deref(),
-            prelaunch_runtime_kind,
-        );
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) = {
+        #[cfg(unix)]
+        {
+            if remote_profile.is_none()
+                && provider.uses_managed_tmux_backend()
+                && claude::is_tmux_available()
+            {
+                if let Some(ref tmux_name) = tmux_session_name {
+                    let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
+                    let session_exists =
+                        crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
+                    let last_offset = std::fs::metadata(&output_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    (
+                        Some(tmux_name.clone()),
+                        Some(output_path),
+                        Some(input_fifo_path),
+                        if session_exists { last_offset } else { 0 },
+                    )
+                } else {
+                    (None, None, None, 0)
+                }
+            } else {
+                (None, None, None, 0)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            (None, None, None, 0u64)
+        }
+    };
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
 
@@ -1170,7 +1179,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         watcher_output_path,
         inflight_offset,
         "turn_start_headless",
-        early_thread_parent.map(|(parent_channel_id, _)| parent_channel_id),
         &mut inflight_state,
     );
     let (tx, rx) = mpsc::channel();
@@ -1373,7 +1381,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                 } else {
                     "unknown panic".to_string()
                 };
-                tracing::error!("  [headless streaming] PANIC: {}", msg);
+                tracing::warn!("  [headless streaming] PANIC: {}", msg);
                 let _ = tx.send(StreamMessage::Error {
                     message: format!("Internal error (panic): {}", msg),
                     stdout: String::new(),
@@ -1782,24 +1790,6 @@ mod fresh_routine_tests {
         assert!(
             src.contains(&local_cold_start),
             "snapshot cold-start must null the LOCAL session_id, not wipe the channel"
-        );
-    }
-
-    // #4913 GO-A1: snapshot metadata must gate the legacy channel-key refresh.
-    // Mutation proof: remove `!scheduled_snapshot_turn &&` from the production
-    // guard and this source-contract test fails before a snapshot can rewrite the
-    // live channel row by channel_id.
-    #[test]
-    fn scheduled_snapshot_skips_channel_session_key_refresh() {
-        let src = include_str!("headless_turn.rs");
-        let guarded_refresh = format!(
-            "{}{}",
-            "if !scheduled_snapshot_turn\n        && ",
-            "valid_routine_metadata(metadata.as_ref()).is_some()"
-        );
-        assert!(
-            src.contains(&guarded_refresh),
-            "scheduled snapshots must not enter the channel-scoped session_key refresh"
         );
     }
 

@@ -100,7 +100,7 @@ pub(super) async fn handle_cancel_prompt_replace(
         if pending_long_running_open_after_state_save.take().is_some() {
             inflight_state.long_running_placeholder_active = false;
             let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                &mut *inflight_state,
+                &inflight_state,
                 "turn_bridge::cancel_longrun_open_after_state_save@4500",
             );
         }
@@ -127,7 +127,7 @@ pub(super) async fn handle_cancel_prompt_replace(
                 inflight_state.long_running_placeholder_active = false;
                 let _ =
                     crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                        &mut *inflight_state,
+                        &inflight_state,
                         "turn_bridge::cancel_longrun_retarget_detach@4524",
                     );
             } else {
@@ -144,7 +144,7 @@ pub(super) async fn handle_cancel_prompt_replace(
                 if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
                     inflight_state.long_running_placeholder_active = false;
                     let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                        &mut *inflight_state,
+                        &inflight_state,
                         "turn_bridge::cancel_longrun_placeholder_abort_committed@4537",
                     );
                 } else {
@@ -159,7 +159,7 @@ pub(super) async fn handle_cancel_prompt_replace(
                     // pass can finish the teardown.
                     let _ = (key, snapshot, close_trigger, ack_consumed);
                     let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                        &mut *inflight_state,
+                        &inflight_state,
                         "turn_bridge::cancel_longrun_placeholder_abort_edit_failed@4549",
                     );
                     preserve_inflight_for_cleanup_retry = true;
@@ -245,7 +245,7 @@ pub(super) async fn handle_cancel_prompt_replace(
         );
         if matches!(stop_lease_acquire, BridgeLeaseAcquire::Skip) {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
+            tracing::warn!(
                 channel_id = channel_id.get(),
                 "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate cancel/stop terminal replace (channel {})",
                 channel_id
@@ -282,7 +282,8 @@ pub(super) async fn handle_cancel_prompt_replace(
                 status_panel_terminal_committed = true;
             }
             // B6: the ONLY confirmed_end advance is via a successful lease
-            // `Held` commits; `NoRange` has no new bytes and never advances (codex
+            // commit. `Held` → commit (Delivered advances, NotDelivered not).
+            // `NoRange` has NO new bytes → no advance outside a lease (codex
             // P1-b: a degenerate equal-nonzero range must not advance).
             if let Some(lease) = stop_lease {
                 let lease_range = lease.range();
@@ -302,7 +303,6 @@ pub(super) async fn handle_cancel_prompt_replace(
                         shared_owned.as_ref(),
                         &provider,
                         watcher_owner_channel_id,
-                        inflight_state.tmux_session_name.as_deref(),
                         lease_range,
                         current_msg_id,
                         channel_id,
@@ -351,7 +351,7 @@ pub(super) async fn handle_cancel_prompt_replace(
         );
         if matches!(plt_lease_acquire, BridgeLeaseAcquire::Skip) {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
+            tracing::warn!(
                 channel_id = channel_id.get(),
                 "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate prompt-too-long terminal replace (channel {})",
                 channel_id
@@ -383,7 +383,8 @@ pub(super) async fn handle_cancel_prompt_replace(
             if replace_committed {
                 status_panel_terminal_committed = true;
             }
-            // B6: advance only through a successful lease; NoRange never advances.
+            // B6 (codex P1-b): advance ONLY via a successful lease commit.
+            // NoRange has no new bytes → no advance outside the lease.
             if let Some(lease) = plt_lease {
                 let lease_range = lease.range();
                 let outcome = if replace_committed {
@@ -402,7 +403,6 @@ pub(super) async fn handle_cancel_prompt_replace(
                         shared_owned.as_ref(),
                         &provider,
                         watcher_owner_channel_id,
-                        inflight_state.tmux_session_name.as_deref(),
                         lease_range,
                         current_msg_id.get(),
                         channel_id.get(),

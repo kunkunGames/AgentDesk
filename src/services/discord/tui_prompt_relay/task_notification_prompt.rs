@@ -204,13 +204,12 @@ fn enqueue_footer_only_background_marker(
             channel_id,
             event.event_key(),
         );
-    let content = event.footer_only_marker_content();
     let _ = crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
         shared.pg_pool.as_ref(),
         target.as_str(),
         Some(session_key.as_str()),
         "lifecycle.background_task_complete",
-        content.as_str(),
+        "⚙️ Background complete",
     );
 }
 

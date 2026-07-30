@@ -179,7 +179,8 @@ async fn run_restart(ctx: Context<'_>, command_name: &'static str) -> Result<(),
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, command_name);
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] {command_name}");
     ctx.say("♻ 세션 재시작 중...").await?;
 
     let channel_id = ctx.channel_id();
@@ -227,13 +228,9 @@ async fn run_restart(ctx: Context<'_>, command_name: &'static str) -> Result<(),
         &seed_status,
     ))
     .await?;
-    log_info_event!(
-        "discord_restart_triggered",
-        channel_id = channel_id.get(),
-        user_name = %user_name,
-        command = %command_name,
-        provider = ctx.data().provider.as_str(),
-        status = ?seed_status,
+    tracing::info!(
+        "  [{ts}] ▶ [{user_name}] {command_name} triggered (provider={}, seed_status={seed_status:?})",
+        ctx.data().provider.as_str()
     );
     Ok(())
 }

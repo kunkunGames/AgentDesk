@@ -520,9 +520,6 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: MigrateAction,
     },
-    /// Apply pending PostgreSQL migrations before release activation
-    #[command(hide = true)]
-    ReleaseMigratePostgres,
     /// Provider CLI safe migration management
     ProviderCli(super::provider_cli::ProviderCliArgs),
     /// Inspect deterministic session-binding values (epic #2285 E1).

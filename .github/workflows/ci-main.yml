@@ -98,7 +98,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version-file: ".nvmrc"
+          node-version: "22"
 
       - name: Policy JS unit tests
         run: npm run test:policies
@@ -223,7 +223,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: High-risk recovery lane
-        run: "cargo test --lib high_risk_recovery:: -- --test-threads=1"
+        run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
 
       - name: Stop PostgreSQL service
         if: always()
@@ -234,9 +234,7 @@ jobs:
         run: sccache --show-stats || true
 
   scripts:
-    # Distinct from the protected PR `Script checks` context. Main-push CI
-    # cannot enforce pre-merge anti-growth after a commit has already landed.
-    name: Main script checks
+    name: Script checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -253,10 +251,6 @@ jobs:
 
       - name: Run script checks
         run: ./scripts/ci-script-checks.sh
-        env:
-          # Main-push CI verifies current coverage drift, but relative anti-growth
-          # authority lives in the protected PR candidate's required context.
-          TEST_LANE_BASELINE_REF: HEAD
 
       - name: Upload maintainability audit artifact
         if: always()

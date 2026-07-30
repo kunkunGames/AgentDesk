@@ -287,7 +287,8 @@ pub(in crate::services::discord) async fn cmd_node(ctx: Context<'_>) -> Result<(
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, "/node");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!("  [{ts}] ◀ [{user_name}] /node");
 
     let intake_routing = effective_intake_routing_config();
     if !intake_routing_enforced(&intake_routing) {
