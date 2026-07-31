@@ -58,7 +58,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ExplicitRestartRequired,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("provider {provider} is disconnected"),
-            next_step: format!("check {provider} Discord token, gateway status, and dcserver logs"),
+            next_step: format!("check {provider} credentials, connection status, and dcserver logs"),
         },
         ["provider", provider, "restart_pending"] => ClassifiedReason {
             raw: raw.to_string(),
@@ -383,5 +383,20 @@ mod health_classification_tests {
             reason.next_step,
             "inspect global active counter tracking in dcserver logs"
         );
+    }
+
+    #[test]
+    fn provider_disconnected_reason_is_provider_agnostic() {
+        let tmux_reason = classify_degraded_reason("provider:tmux:disconnected");
+        assert_eq!(tmux_reason.subsystem, "provider_runtime");
+        assert_eq!(tmux_reason.severity, Severity::Error);
+        assert_eq!(tmux_reason.fix_safety, FixSafety::ExplicitRestartRequired);
+        assert_eq!(tmux_reason.summary, "provider tmux is disconnected");
+        assert_eq!(tmux_reason.next_step, "check tmux credentials, connection status, and dcserver logs");
+
+        let discord_reason = classify_degraded_reason("provider:discord:disconnected");
+        assert_eq!(discord_reason.subsystem, "provider_runtime");
+        assert_eq!(discord_reason.summary, "provider discord is disconnected");
+        assert_eq!(discord_reason.next_step, "check discord credentials, connection status, and dcserver logs");
     }
 }
