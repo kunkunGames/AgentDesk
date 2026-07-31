@@ -2,3 +2,8 @@
 # Format: test:<fully-qualified-test> # reason and tracking issue
 #     or: file:<repository-relative-path> # reason and tracking issue
 # Every active entry requires an inline reason. Prefer fixing the classifier.
+test:server::multinode_regression::tests::multinode_dispatch_claims_exactly_once_then_reclaims_expired_lease # End to end regression tests interact with DB
+test:server::multinode_regression::tests::multinode_dispatch_claims_prefer_label_but_fallback_when_preferred_node_offline # End to end regression tests interact with DB
+test:server::multinode_regression::tests::multinode_dispatch_claims_route_mixed_required_and_preferred_to_best_online_node # End to end regression tests interact with DB
+test:server::multinode_regression::tests::multinode_single_leader_lock_allows_one_holder # End to end regression tests interact with DB
+test:server::multinode_regression::tests::multinode_unreal_resource_lock_is_exclusive # End to end regression tests interact with DB
