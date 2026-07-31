@@ -1341,12 +1341,17 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
+        let tmux_status = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", tmux_session])
+            .status();
+        if let Err(e) = &tmux_status {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("skipping test: tmux not found");
+                return;
+            }
+        }
         assert!(
-            std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", tmux_session])
-                .status()
-                .expect("start tmux fixture")
-                .success(),
+            tmux_status.expect("start tmux fixture").success(),
             "production snapshot must observe a live producer tmux session"
         );
 
