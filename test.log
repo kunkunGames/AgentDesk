@@ -1,0 +1,1692 @@
+   Compiling agentdesk v0.1.2 (/app)
+warning: unused import: `LaunchdPlistFlavorArg`
+ --> src/cli/init.rs:9:34
+  |
+9 |     args::{EmitLaunchdPlistArgs, LaunchdPlistFlavorArg},
+  |                                  ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `create_child_candidate_card_pg`, `load_card_final_gate_pg`, `load_card_repo_dir_pg`, `transition_card_status_pg`, and `update_card_program_current_iteration_pg`
+  --> src/db/automation_candidates.rs:8:32
+   |
+ 8 |     approve_candidate_card_pg, create_child_candidate_card_pg, load_active_...
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 9 |     load_card_final_gate_pg, load_card_program_pg, load_card_repo_dir_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^                        ^^^^^^^^^^^^^^^^^^^^^
+10 |     transition_card_status_pg, update_card_program_current_iteration_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::dispatches::outbox_route::parse_channel_id`
+ --> src/server/routes/dispatches/mod.rs:6:16
+  |
+6 | pub(crate) use crate::services::dispatches::outbox_route::parse_channel_id;
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `outbox::use_counter_model_channel`
+  --> src/server/routes/dispatches/mod.rs:23:16
+   |
+23 | pub(crate) use outbox::use_counter_model_channel;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `serde_json::json`
+  --> src/services/auto_queue/phase_gate_violations.rs:22:5
+   |
+22 | use serde_json::json;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `classify_catch_up_message`
+   --> src/services/discord/catch_up.rs:223:5
+    |
+223 |     classify_catch_up_message, classify_catch_up_message_with_utility_r...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS` and `catch_up_too_old_snippet`
+   --> src/services/discord/catch_up.rs:234:5
+    |
+234 |     CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS, CatchUpTooOldDrop, CatchUpTooOldOu...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+235 |     actionable_drop as catch_up_too_old_drop, catch_up_too_old_snippet,
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::snapshot::WatcherStateSnapshot`
+  --> src/services/discord/health/recovery.rs:17:5
+   |
+17 | use super::snapshot::WatcherStateSnapshot;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `RecordedRecapCard` and `lookup_recorded_recaps_for_channel`
+  --> src/services/discord/idle_recap.rs:36:52
+   |
+36 |     PersistRecapMessageIdResult, RecapCardActions, RecordedRecapCard, co...
+   |                                                    ^^^^^^^^^^^^^^^^^
+37 |     delete_older_recorded_recaps_for_channel, delete_previous_card,
+38 |     lookup_recorded_recaps_for_channel, persist_recap_message_id, post_r...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CommitError` and `DestructiveCancelPinField`
+  --> src/services/discord/inflight.rs:46:5
+   |
+46 |     CommitError, CommitEvidence, DestructiveCancelCommitOutcome, DestructiveCancelPinField,
+   |     ^^^^^^^^^^^                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `InflightEpisodeLockError`
+  --> src/services/discord/inflight.rs:50:5
+   |
+50 |     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `WatcherProgressOutcome` and `WatcherRelayWatermarkOutcome`
+  --> src/services/discord/inflight.rs:98:5
+   |
+98 |     WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayWa...
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `clear_inflight_state_if_matches_identity_in_root`
+  --> src/services/discord/inflight/clear_store/mod.rs:25:5
+   |
+25 |     clear_inflight_state_if_matches_identity_in_root,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `delete_inflight_state_file`
+  --> src/services/discord/placeholder_sweeper.rs:33:24
+   |
+33 |     InflightTurnState, delete_inflight_state_file, emit_reap_abandoned_r...
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: glob import doesn't reexport anything with visibility `pub(in crate::services::discord)` because no imported item is public enough
+  --> src/services/discord/relay_recovery.rs:68:16
+   |
+68 | pub(super) use apply::*;
+   |                ^^^^^^^^
+   |
+note: the most public imported item is `pub(self)`
+  --> src/services/discord/relay_recovery.rs:68:16
+   |
+68 | pub(super) use apply::*;
+   |                ^^^^^^^^
+   = help: reduce the glob import's visibility or increase visibility of imported items
+
+warning: unused import: `idle_jsonl_payload_contains_init_event`
+  --> src/services/discord/session_relay_sink.rs:54:29
+   |
+54 |     idle_jsonl_current_eof, idle_jsonl_payload_contains_init_event,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `rebind_initial_offset_with_floor` and `rebind_output_paths_same`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:35:58
+   |
+35 | ...ter_runtime_binding, rebind_initial_offset_with_floor,
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+36 | ..._unless_forced, rebind_output_paths_same,
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `codex_tui_existing_inflight_raw_cursor`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:40:56
+   |
+40 | ...s_raw_rollout, codex_tui_existing_inflight_raw_cursor,
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `claude_rebind_transcript_path`
+   --> src/services/discord/recovery_engine.rs:147:5
+    |
+147 |     claude_rebind_transcript_path, resolve_rebind_runtime_state,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_try_start_turn_with_terminal_marker_cleanup`
+  --> src/services/discord/router/mod.rs:24:5
+   |
+24 |     mailbox_try_start_turn_with_terminal_marker_cleanup, start_headless_...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `HeadlessTurnStartStatus`
+  --> src/services/discord/router/mod.rs:32:5
+   |
+32 |     HeadlessTurnStartStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskNotificationContext`
+ --> src/services/discord/task_notification_delivery/footer_only_marker.rs:3:28
+  |
+3 | use super::{TaskCardEvent, TaskNotificationContext};
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `guarded_cleanup_delivered_elsewhere_signal` and `guarded_nonterminal_delete_decision`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:22:5
+   |
+22 |     guarded_cleanup_delivered_elsewhere_signal, guarded_nonterminal_delete_decision,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_rollover_prefixes_to_delete_on_terminal`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:30:33
+   |
+30 | ...r_cleanup, watcher_rollover_prefixes_to_delete_on_terminal,
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+ --> src/services/discord/watchers/lifecycle/tests.rs:1:5
+  |
+1 | use super::*;
+  |     ^^^^^^^^
+
+warning: unused import: `self::tests::*`
+  --> src/services/discord/watchers/lifecycle.rs:56:16
+   |
+56 | pub(super) use self::tests::*;
+   |                ^^^^^^^^^^^^^^
+
+warning: unused import: `self::ready_failure::*`
+  --> src/services/discord/watchers/lifecycle.rs:61:16
+   |
+61 | pub(super) use self::ready_failure::*;
+   |                ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::restore::*`
+  --> src/services/discord/watchers/lifecycle.rs:88:16
+   |
+88 | pub(super) use self::restore::*;
+   |                ^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+  --> src/services/discord/watchers/lifecycle/restore_tests.rs:1:5
+   |
+ 1 | use super::*;
+   |     ^^^^^^^^
+   |
+help: if this is a test module, consider adding a `#[cfg(test)]` to the containing module
+  --> src/services/discord/watchers/lifecycle.rs:94:1
+   |
+94 | mod restore_tests;
+   | ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::restore_tests::*`
+  --> src/services/discord/watchers/lifecycle.rs:95:16
+   |
+95 | pub(super) use self::restore_tests::*;
+   |                ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `claim_or_replace_watcher`, `claim_or_reuse_watcher`, and `try_claim_watcher_with_thread_parent`
+  --> src/services/discord/tmux.rs:73:27
+   |
+73 |     ThreadFollowUpParent, claim_or_replace_watcher, claim_or_replace_wat...
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^
+74 |     claim_or_reuse_watcher, claim_or_reuse_watcher_with_thread_parent,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+...
+79 |     try_claim_watcher_with_thread_parent,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `edit_channel_message` and `send_channel_message`
+ --> src/services/discord/tmux_watcher.rs:3:38
+  |
+3 | ...scord::http::{edit_channel_message, send_channel_message};
+  |                  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_send_failure_retry_plan`
+ --> src/services/discord/tmux_watcher.rs:7:41
+  |
+7 |     watcher_rewind_attempt_disposition, watcher_send_failure_retry_plan,
+  |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `LiveInflightProbe`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:221:5
+    |
+221 |     LiveInflightProbe, ensure_marker_for_own_synthetic_turn, record_for...
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `drain_on_terminal_commit_with_applier_and_offset`, `drain_on_terminal_commit_with_applier`, `drain_on_terminal_commit_with_offset`, and `drain_on_terminal_commit`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:226:5
+    |
+226 |     drain_on_terminal_commit, drain_on_terminal_commit_with_applier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+227 |     drain_on_terminal_commit_with_applier_and_offset, drain_on_terminal_commit_with_offset,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `load_commit_tombstones` and `record_commit_tombstone`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:238:70
+    |
+238 | ..., gc_expired_commit_tombstones, load_all, load_commit_tombstones,
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^
+239 | ...d, record_commit_tombstone, record_commit_tombstone_with_offset,
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sweep_expired_with_applier`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:244:61
+    |
+244 | ...eep::{sweep_expired, sweep_expired_with_applier};
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_requeue_intervention_front`
+ --> src/services/discord/tui_prompt_relay/bridge_gateway.rs:4:5
+  |
+4 |     mailbox_requeue_intervention_front, schedule_deferred_idle_queue_kick...
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `fail_dispatch_auth_expired`
+  --> src/services/discord/turn_bridge/mod.rs:88:5
+   |
+88 |     fail_dispatch_auth_expired, fail_dispatch_tmux_session_died, fail_di...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `mailbox_cancel_active_turn_if_handoff_user_message_with_reason` and `record_voice_handoff_cancel_tombstone`
+  --> src/services/discord/voice_barge_in.rs:48:5
+   |
+48 |     mailbox_cancel_active_turn_if_handoff_user_message_with_reason,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+49 |     mailbox_cancel_active_turn_with_reason, mailbox_has_active_t...
+50 |     record_voice_handoff_cancel_tombstone, settings,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `turn_dispatch::voice_background_handoff_ack`
+  --> src/services/discord/voice_barge_in.rs:92:5
+   |
+92 | use turn_dispatch::voice_background_handoff_ack;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_take_next_soft_intervention`
+   --> src/services/discord/mod.rs:245:5
+    |
+245 |     mailbox_take_next_soft_intervention,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `QueuePersistenceContext` and `RequeueInterventionResult`
+   --> src/services/discord/mod.rs:275:5
+    |
+275 |     QueuePersistenceContext, RecoveryKickoffResult, RequeueInterventionResult, T...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `resolve_notify_bot_user_id`
+   --> src/services/discord/mod.rs:289:5
+    |
+289 |     resolve_notify_bot_user_id, should_phase2_recover_message,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MementoToolFeedbackRequest`
+  --> src/services/memory/mod.rs:20:45
+   |
+20 | ...entoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agen...
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `LazyLock` and `Mutex`
+  --> src/services/platform/tmux.rs:11:17
+   |
+11 | use std::sync::{LazyLock, Mutex};
+   |                 ^^^^^^^^  ^^^^^
+
+warning: unused import: `Instant`
+  --> src/services/platform/tmux.rs:12:27
+   |
+12 | use std::time::{Duration, Instant};
+   |                           ^^^^^^^
+
+warning: unused import: `CancelSource`
+ --> src/services/provider/cancel_watchdog.rs:2:13
+  |
+2 | use super::{CancelSource, CancelToken};
+  |             ^^^^^^^^^^^^
+
+warning: unused import: `CancelWatchdog`
+  --> src/services/provider.rs:11:27
+   |
+11 | pub use cancel_watchdog::{CancelWatchdog, spawn_cancel_watchdog};
+   |                           ^^^^^^^^^^^^^^
+
+warning: unused import: `drain_head_overflow`
+ --> src/services/turn_orchestrator/front_requeue.rs:7:36
+  |
+7 |     QueueExitEvent, QueueExitKind, drain_head_overflow, ensure_source_mes...
+  |                                    ^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/tmux_runtime/claude_stop_delivery.rs:340:14
+    |
+340 |     let Some(mut reservation) = ClaudeStopDeliveryReservation::claim(token) else {
+    |              ----^^^^^^^^^^^
+    |              |
+    |              help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> src/services/cluster/intake_router_hook.rs:297:9
+    |
+274 |         SessionOwnerResolution::LiveForeignIncompatible { instance_id, .. } => {
+    |         ------------------------------------------------------------------- matches all the relevant values
+...
+297 |         SessionOwnerResolution::LiveForeignIncompatible { .. } => {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:365:9
+    |
+365 |     let mut monitor_auto_turn_finished = false;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:366:9
+    |
+366 |     let mut completion_footer_terminal_target = None;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused import: `std::fmt::Write`
+ --> src/cli/init.rs:3:5
+  |
+3 | use std::fmt::Write as FmtWrite;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused variable: `reservation`
+   --> src/services/discord/turn_bridge/tmux_runtime/claude_stop_delivery.rs:340:14
+    |
+340 |     let Some(mut reservation) = ClaudeStopDeliveryReservation::claim(token) else {
+    |              ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_reservation`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `now_unix_secs`
+   --> src/services/discord/health/relay_auto_heal.rs:588:5
+    |
+588 |     now_unix_secs: i64,
+    |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_now_unix_secs`
+
+warning: value assigned to `placeholder_from_restored_inflight` is never read
+    --> src/services/discord/tmux_watcher.rs:1319:21
+     |
+1319 |                     placeholder_from_restored_inflight = false;
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `placeholder_from_restored_inflight` is never read
+    --> src/services/discord/tmux_watcher.rs:1314:25
+     |
+1314 |                         placeholder_from_restored_inflight = false;
+     |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `last_status_update` is never read
+  --> src/services/discord/tmux_watcher/streaming_status_tick.rs:46:38
+   |
+46 |         let mut last_status_update = *render.last_status_update;
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: value assigned to `bridge_should_emit_completion` is never read
+   --> src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue.rs:103:45
+    |
+103 |     let mut bridge_should_emit_completion = *state.bridge_should_emit_completion;
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `status_panel_terminal_committed` is never read
+   --> src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue.rs:104:47
+    |
+104 |     let mut status_panel_terminal_committed = *state.status_panel_terminal_committed;
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `full_response` is never read
+  --> src/services/discord/turn_bridge/terminal_outcome_delivery/recovery_retry.rs:49:29
+   |
+49 |     let mut full_response = std::mem::take(state.full_response);
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:321:13
+    |
+321 |         let mut terminal_empty_response_notice: Option<String> = None;
+    |             ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:334:13
+    |
+334 |         let mut accumulated_memory_input_tokens: u64 = bridge.memory_recall_usage.input_tokens;
+    |             ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:335:13
+    |
+335 |         let mut accumulated_memory_output_tokens: u64 = bridge.memory_recall_usage.output_tokens;
+    |             ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:398:13
+    |
+398 |         let mut api_friction_reports = Vec::new();
+    |             ----^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `active_background_child_session_ids`
+   --> src/services/discord/turn_bridge/mod.rs:866:13
+    |
+866 |         let active_background_child_session_ids =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_active_background_child_session_ids`
+
+warning: unused variable: `pending_long_running_open_after_state_save`
+   --> src/services/discord/turn_bridge/mod.rs:868:13
+    |
+868 |         let pending_long_running_open_after_state_save =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pending_long_running_open_after_state_save`
+
+warning: unused variable: `pending_long_running_retarget_after_state_save`
+   --> src/services/discord/turn_bridge/mod.rs:870:13
+    |
+870 |         let pending_long_running_retarget_after_state_save =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pending_long_running_retarget_after_state_save`
+
+warning: unused variable: `long_running_placeholder_active`
+   --> src/services/discord/turn_bridge/mod.rs:872:13
+    |
+872 |         let long_running_placeholder_active =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_long_running_placeholder_active`
+
+warning: unused variable: `macos_lstart_hash`
+   --> src/services/process.rs:258:59
+    |
+258 |     pub(crate) fn from_persisted(starttime: Option<u128>, macos_lstart_hash: Option<u128>) -> Self {
+    |                                                           ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_macos_lstart_hash`
+
+warning: type `services::discord::inflight::model::TurnSource` is more private than the item `compact_eligible_turn_source`
+   --> src/services/discord/compact_turn_authority.rs:19:1
+    |
+ 19 | pub(in crate::services) fn compact_eligible_turn_source(source: TurnSource) -> bool {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `compact_eligible_turn_source` is reachable at visibility `pub(in crate::services)`
+    |
+note: but type `services::discord::inflight::model::TurnSource` is only usable at visibility `pub(in crate::services::discord)`
+   --> src/services/discord/inflight/model.rs:521:1
+    |
+521 | pub(in crate::services::discord) enum TurnSource {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `services::discord::inflight::model::InflightTurnState` is more private than the item `idle_tmux::idle_tmux_repair_has_unrelayed_tail_answer`
+   --> src/services/discord/relay_recovery/idle_tmux.rs:355:1
+    |
+355 | / pub(crate) fn idle_tmux_repair_has_unrelayed_tail_answer(
+356 | |     state: &super::inflight::InflightTurnState,
+357 | | ) -> bool {
+    | |_________^ function `idle_tmux::idle_tmux_repair_has_unrelayed_tail_answer` is reachable at visibility `pub(crate)`
+    |
+note: but type `services::discord::inflight::model::InflightTurnState` is only usable at visibility `pub(in crate::services::discord)`
+   --> src/services/discord/inflight/model.rs:98:1
+    |
+ 98 | pub(in crate::services::discord) struct InflightTurnState {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AttachmentDescriptor` is more private than the item `IntakeSubmission::attachments`
+  --> src/services/discord/router/intake_dispatch.rs:48:5
+   |
+48 |     pub(crate) attachments: Vec<message_handler::AttachmentDescriptor>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `IntakeSubmission::attachments` is reachable at visibility `pub(in crate::services::discord)`
+   |
+note: but type `AttachmentDescriptor` is only usable at visibility `pub(in crate::services::discord::router)`
+  --> src/services/discord/router/message_handler/attachments.rs:34:1
+   |
+34 | pub(in crate::services::discord::router) struct AttachmentDescriptor {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AttachmentDescriptor` is more private than the item `prepare_admitted_live_attachments`
+  --> src/services/discord/router/intake_dispatch/attachment.rs:44:1
+   |
+44 | / pub(crate) async fn prepare_admitted_live_attachments(
+45 | |     deps: &super::super::message_handler::IntakeDeps<'_>,
+46 | |     _local_permit: &LocalAdmissionPermit,
+47 | |     channel_id: serenity::ChannelId,
+...  |
+50 | |     attachments: &[super::super::message_handler::AttachmentDescriptor],
+51 | | ) -> Result<Vec<String>, super::super::super::Error> {
+   | |____________________________________________________^ function `prepare_admitted_live_attachments` is reachable at visibility `pub(in crate::services::discord)`
+   |
+note: but type `AttachmentDescriptor` is only usable at visibility `pub(in crate::services::discord::router)`
+  --> src/services/discord/router/message_handler/attachments.rs:34:1
+   |
+34 | pub(in crate::services::discord::router) struct AttachmentDescriptor {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `DeferredRestartCancellationGuard` is more private than the item `commit_deferred_restart_sentinel`
+   --> src/services/discord/runtime_bootstrap/spawns.rs:110:1
+    |
+110 | / pub(super) fn commit_deferred_restart_sentinel(
+111 | |     root: &std::path::Path,
+112 | |     provider: &ProviderKind,
+113 | |     nonce: &str,
+114 | |     guard: &DeferredRestartCancellationGuard,
+115 | | ) -> std::io::Result<bool> {
+    | |__________________________^ function `commit_deferred_restart_sentinel` is reachable at visibility `pub(in crate::services::discord::runtime_bootstrap)`
+    |
+note: but type `DeferredRestartCancellationGuard` is only usable at visibility `pub(self)`
+   --> src/services/discord/runtime_bootstrap/spawns.rs:21:1
+    |
+ 21 | struct DeferredRestartCancellationGuard {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `loop_poll_prologue::WatcherSourceAuthority` is more private than the item `tmux_watcher::terminal_long_chunks::deliver_long_chunks_via_controller`
+   --> src/services/discord/tmux_watcher/terminal_long_chunks.rs:228:1
+    |
+228 | / pub(in crate::services::discord) async fn deliver_long_chunks_via_controller<
+229 | |     G: TurnGateway + ?Sized,
+230 | | >(
+231 | |     gateway: &G,
+...   |
+245 | |     end: u64,
+246 | | ) -> WatcherLongChunksResult {
+    | |____________________________^ function `tmux_watcher::terminal_long_chunks::deliver_long_chunks_via_controller` is reachable at visibility `pub(in crate::services::discord)`
+    |
+note: but type `loop_poll_prologue::WatcherSourceAuthority` is only usable at visibility `pub(in crate::services::discord::tmux::tmux_watcher)`
+   --> src/services/discord/tmux_watcher/loop_poll_prologue.rs:7:1
+    |
+  7 | pub(super) struct WatcherSourceAuthority {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `tmux_watcher::single_message_footer::WatcherCompletionFooterTerminalTarget` is more private than the item `WatcherLongChunksLocals::completion_footer_terminal_target`
+   --> src/services/discord/tmux_watcher/terminal_long_chunks.rs:381:5
+    |
+381 | /     pub(in crate::services::discord) completion_footer_terminal_target:
+382 | |         &'a mut Option<super::WatcherCompletionFooterTerminalTarget>,
+    | |____________________________________________________________________^ field `WatcherLongChunksLocals::completion_footer_terminal_target` is reachable at visibility `pub(in crate::services::discord)`
+    |
+note: but type `tmux_watcher::single_message_footer::WatcherCompletionFooterTerminalTarget` is only usable at visibility `pub(in crate::services::discord::tmux::tmux_watcher)`
+   --> src/services/discord/tmux_watcher/single_message_footer.rs:173:1
+    |
+173 | pub(super) struct WatcherCompletionFooterTerminalTarget {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `loop_poll_prologue::WatcherSourceAuthority` is more private than the item `apply_watcher_long_chunks_controller`
+   --> src/services/discord/tmux_watcher/terminal_long_chunks.rs:386:1
+    |
+386 | / pub(in crate::services::discord) async fn apply_watcher_long_chunks_controller(
+387 | |     http: &Arc<serenity::Http>,
+388 | |     shared: &Arc<SharedData>,
+389 | |     provider: &ProviderKind,
+...   |
+404 | |     locals: WatcherLongChunksLocals<'_>,
+405 | | ) {
+    | |_^ function `apply_watcher_long_chunks_controller` is reachable at visibility `pub(in crate::services::discord)`
+    |
+note: but type `loop_poll_prologue::WatcherSourceAuthority` is only usable at visibility `pub(in crate::services::discord::tmux::tmux_watcher)`
+   --> src/services/discord/tmux_watcher/loop_poll_prologue.rs:7:1
+    |
+  7 | pub(super) struct WatcherSourceAuthority {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `actor_state::LedgerEntry` is more private than the item `services::discord::turn_finalizer::resolve_ledger_key`
+   --> src/services/discord/turn_finalizer.rs:165:1
+    |
+165 | / pub(super) fn resolve_ledger_key(
+166 | |     ledger: &HashMap<LedgerKey, LedgerEntry>,
+167 | |     key: TurnKey,
+168 | | ) -> LedgerKey {
+    | |______________^ function `services::discord::turn_finalizer::resolve_ledger_key` is reachable at visibility `pub(in crate::services::discord)`
+    |
+note: but type `actor_state::LedgerEntry` is only usable at visibility `pub(in crate::services::discord::turn_finalizer)`
+   --> src/services/discord/turn_finalizer/actor_state.rs:11:1
+    |
+ 11 | pub(super) struct LedgerEntry {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `current_launchd_domain` is never used
+  --> src/cli/dcserver.rs:46:8
+   |
+46 | pub fn current_launchd_domain() -> Option<String> {
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_tmux_fallback_session_loaded` is never used
+   --> src/cli/dcserver.rs:100:15
+    |
+100 | pub(crate) fn is_tmux_fallback_session_loaded(session_name: &str) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `permits_force_kill` is never used
+  --> src/cli/dcserver_restart_marker.rs:62:19
+   |
+61 | impl MarkerOwnership {
+   | -------------------- method in this implementation
+62 |     pub(crate) fn permits_force_kill(&self) -> bool {
+   |                   ^^^^^^^^^^^^^^^^^^
+
+warning: function `read_launchd_env_entries` is never used
+   --> src/cli/init.rs:560:4
+    |
+560 | fn read_launchd_env_entries(env_file: &Path) -> Vec<(String, String)> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_launchd_env_line` is never used
+   --> src/cli/init.rs:571:4
+    |
+571 | fn parse_launchd_env_line(line: &str) -> Option<(String, String)> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `xml_escape` is never used
+   --> src/cli/init.rs:603:4
+    |
+603 | fn xml_escape(value: &str) -> String {
+    |    ^^^^^^^^^^
+
+warning: field `pass_verdict` is never read
+    --> src/db/auto_queue/phase_gates.rs:1175:9
+     |
+1172 | pub(crate) struct ParsedPhaseGateContext {
+     |                   ---------------------- field in this struct
+...
+1175 |     pub pass_verdict: String,
+     |         ^^^^^^^^^^^^
+     |
+     = note: `ParsedPhaseGateContext` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `upsert_legacy_hook_session_pg` is never used
+   --> src/db/dispatched_sessions/canonical_identity.rs:167:21
+    |
+167 | pub(crate) async fn upsert_legacy_hook_session_pg(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `resolved_session_key` is never read
+   --> src/db/dispatched_sessions.rs:185:16
+    |
+184 | pub(crate) struct SessionRebindContext {
+    |                   -------------------- field in this struct
+185 |     pub(crate) resolved_session_key: String,
+    |                ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `rebind_session_provider_pg` is never used
+   --> src/db/dispatched_sessions.rs:278:21
+    |
+278 | pub(crate) async fn rebind_session_provider_pg(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `upsert_hook_session_pg` is never used
+    --> src/db/dispatched_sessions.rs:2501:21
+     |
+2501 | pub(crate) async fn upsert_hook_session_pg(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clear_session_for_turn_target_pg` is never used
+  --> src/db/kanban_cards/transitions.rs:70:14
+   |
+70 | pub async fn clear_session_for_turn_target_pg(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `health_check` is never used
+   --> src/db/postgres.rs:609:14
+    |
+609 | pub async fn health_check(pool: &PgPool) -> Result<(), String> {
+    |              ^^^^^^^^^^^^
+
+warning: struct `SettingsErrorResponse` is never constructed
+  --> src/server/dto/settings.rs:14:12
+   |
+14 | pub struct SettingsErrorResponse<'a> {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `load_dispatched_card_ids_for_runs_pg` is never used
+   --> src/services/auto_queue/cancel_run.rs:166:10
+    |
+166 | async fn load_dispatched_card_ids_for_runs_pg(
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `for_wrapper` is never used
+   --> src/services/claude_command.rs:365:19
+    |
+312 | impl ClaudeCommandBuilder {
+    | ------------------------- associated function in this implementation
+...
+365 |     pub(crate) fn for_wrapper(program: impl AsRef<OsStr>, intent: ClaudeLaunchIntent) -> Self {
+    |                   ^^^^^^^^^^^
+
+warning: function `observe_and_decide` is never used
+   --> src/services/claude_compact_trigger.rs:140:4
+    |
+140 | fn observe_and_decide(
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: enum `AttachmentReadiness` is never used
+  --> src/services/cluster/intake_preflight.rs:15:17
+   |
+15 | pub(crate) enum AttachmentReadiness {
+   |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `TargetPreflightPolicy` is never constructed
+  --> src/services/cluster/intake_preflight.rs:28:19
+   |
+28 | pub(crate) struct TargetPreflightPolicy {
+   |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `TargetProbeSnapshot` is never constructed
+  --> src/services/cluster/intake_preflight.rs:41:19
+   |
+41 | pub(crate) struct TargetProbeSnapshot {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: enum `PreflightReasonCode` is never used
+  --> src/services/cluster/intake_preflight.rs:65:17
+   |
+65 | pub(crate) enum PreflightReasonCode {
+   |                 ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `PreflightFailure` is never constructed
+  --> src/services/cluster/intake_preflight.rs:95:19
+   |
+95 | pub(crate) struct PreflightFailure {
+   |                   ^^^^^^^^^^^^^^^^
+
+warning: enum `PreflightVerdict` is never used
+   --> src/services/cluster/intake_preflight.rs:102:17
+    |
+102 | pub(crate) enum PreflightVerdict {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: struct `TargetPreflightReport` is never constructed
+   --> src/services/cluster/intake_preflight.rs:108:19
+    |
+108 | pub(crate) struct TargetPreflightReport {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `require_ready` is never used
+   --> src/services/cluster/intake_preflight.rs:119:19
+    |
+118 | impl TargetPreflightReport {
+    | -------------------------- method in this implementation
+119 |     pub(crate) fn require_ready(&self) -> Result<(), PreflightBlocked> {
+    |                   ^^^^^^^^^^^^^
+
+warning: struct `PreflightBlocked` is never constructed
+   --> src/services/cluster/intake_preflight.rs:132:19
+    |
+132 | pub(crate) struct PreflightBlocked {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: function `push_failure` is never used
+   --> src/services/cluster/intake_preflight.rs:137:4
+    |
+137 | fn push_failure(
+    |    ^^^^^^^^^^^^
+
+warning: function `nonempty_equal` is never used
+   --> src/services/cluster/intake_preflight.rs:151:4
+    |
+151 | fn nonempty_equal(actual: &str, expected: &str) -> bool {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `equal_when_expected` is never used
+   --> src/services/cluster/intake_preflight.rs:155:4
+    |
+155 | fn equal_when_expected(actual: &str, expected: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `supported_provider` is never used
+   --> src/services/cluster/intake_preflight.rs:159:4
+    |
+159 | fn supported_provider(provider: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_target_preflight` is never used
+   --> src/services/cluster/intake_preflight.rs:168:15
+    |
+168 | pub(crate) fn evaluate_target_preflight(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `try_send_frame`, `try_send_frame_with_sequence`, `try_send_frame_with_sequence_and_identity`, and `try_send_terminal_frame_with_sequence` are never used
+   --> src/services/cluster/stream_relay.rs:408:12
+    |
+391 | impl RelayProducer {
+    | ------------------ methods in this implementation
+...
+408 |     pub fn try_send_frame(&self, payload: String) -> bool {
+    |            ^^^^^^^^^^^^^^
+...
+415 |     pub fn try_send_frame_with_sequence(&self, payload: String) -> RelaySendOutcome {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+462 |     pub fn try_send_frame_with_sequence_and_identity(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+490 |     pub fn try_send_terminal_frame_with_sequence(
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tail_rollout_file_from_offset` is never used
+   --> src/services/codex_tui/rollout_tail.rs:283:8
+    |
+283 | pub fn tail_rollout_file_from_offset(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_deferred_restart` is never used
+   --> src/services/discord/mod.rs:713:15
+    |
+713 | pub(super) fn check_deferred_restart(shared: &SharedData) {
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `mailbox_cancel_soft_intervention` is never used
+    --> src/services/discord/mod.rs:3968:10
+     |
+3968 | async fn mailbox_cancel_soft_intervention(
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `abandon_drain_defers_for_live_anchor` is never used
+   --> src/services/discord/abandon_request_store.rs:394:4
+    |
+394 | fn abandon_drain_defers_for_live_anchor(current_msg_id: Option<u64>, msg_id: u64) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_capped` is never used
+   --> src/services/discord/busy_followup_retry_store.rs:269:37
+    |
+269 | pub(in crate::services::discord) fn is_capped(
+    |                                     ^^^^^^^^^
+
+warning: constant `LOCAL_ONLY_SLASH_COMMANDS` is never used
+   --> src/services/discord/commands/tui_passthrough.rs:131:40
+    |
+131 | pub(in crate::services::discord) const LOCAL_ONLY_SLASH_COMMANDS: [&str; 4] =
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS` is never used
+   --> src/services/discord/commands/tui_passthrough.rs:145:40
+    |
+145 | pub(in crate::services::discord) const OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS: [&str; 1] =
+    |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `COMPLETED_FOOTER_PREFIX` is never used
+  --> src/services/discord/completion_footer_metadata.rs:14:7
+   |
+14 | const COMPLETED_FOOTER_PREFIX: &str = "-# ";
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `COMPLETED_FOOTER_SEPARATOR` is never used
+  --> src/services/discord/completion_footer_metadata.rs:15:7
+   |
+15 | const COMPLETED_FOOTER_SEPARATOR: &str = " · ";
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_MODEL_LABEL_CHARS` is never used
+  --> src/services/discord/completion_footer_metadata.rs:16:7
+   |
+16 | const MAX_MODEL_LABEL_CHARS: usize = 48;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_HOST_LABEL_CHARS` is never used
+  --> src/services/discord/completion_footer_metadata.rs:17:7
+   |
+17 | const MAX_HOST_LABEL_CHARS: usize = 63;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CompletedTurnFooterSnapshot` is never constructed
+  --> src/services/discord/completion_footer_metadata.rs:20:41
+   |
+20 | pub(in crate::services::discord) struct CompletedTurnFooterSnapshot {
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `render_completed_turn_footer` is never used
+  --> src/services/discord/completion_footer_metadata.rs:29:37
+   |
+29 | pub(in crate::services::discord) fn render_completed_turn_footer(
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `format_compact_elapsed` is never used
+  --> src/services/discord/completion_footer_metadata.rs:64:4
+   |
+64 | fn format_compact_elapsed(total_secs: u64) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `format_compact_tokens` is never used
+  --> src/services/discord/completion_footer_metadata.rs:81:4
+   |
+81 | fn format_compact_tokens(tokens: u128) -> String {
+   |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `context_percent_floor` is never used
+   --> src/services/discord/completion_footer_metadata.rs:102:4
+    |
+102 | fn context_percent_floor(used: u128, window: u128) -> Option<u8> {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `approved_model_label` is never used
+   --> src/services/discord/completion_footer_metadata.rs:117:4
+    |
+117 | fn approved_model_label(value: &str, approved_model_ids: &[String]) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_valid_approved_model_id` is never used
+   --> src/services/discord/completion_footer_metadata.rs:127:4
+    |
+127 | fn is_valid_approved_model_id(value: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_host_label` is never used
+   --> src/services/discord/completion_footer_metadata.rs:134:4
+    |
+134 | fn sanitize_host_label(value: &str) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `sanitize_bounded_label` is never used
+   --> src/services/discord/completion_footer_metadata.rs:142:4
+    |
+142 | fn sanitize_bounded_label(value: &str, max_chars: usize, allow_model_dots: bool) -> Option<String> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `contains_private_identity_label` is never used
+   --> src/services/discord/completion_footer_metadata.rs:164:4
+    |
+164 | fn contains_private_identity_label(value: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `looks_like_uuid` is never used
+   --> src/services/discord/completion_footer_metadata.rs:172:4
+    |
+172 | fn looks_like_uuid(value: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `looks_like_fqdn` is never used
+   --> src/services/discord/completion_footer_metadata.rs:179:4
+    |
+179 | fn looks_like_fqdn(value: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `resolve_notify_bot_user_id` is never used
+   --> src/services/discord/dispatch_policy.rs:341:43
+    |
+341 | pub(in crate::services::discord) async fn resolve_notify_bot_user_id(
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `RequiredReferenceRollbackError` is never used
+  --> src/services/discord/formatting/long_send_rollback.rs:21:39
+   |
+21 | pub(in crate::services::discord) enum RequiredReferenceRollbackError {
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `as_error` is never used
+  --> src/services/discord/formatting/long_send_rollback.rs:29:41
+   |
+28 | impl RequiredReferenceRollbackError {
+   | ----------------------------------- method in this implementation
+29 |     pub(in crate::services::discord) fn as_error(&self) -> &(dyn std::error::Error + 'static) {
+   |                                         ^^^^^^^^
+
+warning: function `send_long_message_raw_with_required_reference_rollback` is never used
+  --> src/services/discord/formatting/long_send_rollback.rs:72:43
+   |
+72 | pub(in crate::services::discord) async fn send_long_message_raw_with_required_reference_rollback(
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `advanced_at_unix_secs` is never read
+   --> src/services/discord/health/liveness_authority.rs:105:38
+    |
+101 | pub(in crate::services::discord) struct CaptureAssessment {
+    |                                         ----------------- field in this struct
+...
+105 |     pub(in crate::services::discord) advanced_at_unix_secs: Option<i64>,
+    |                                      ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `CaptureAssessment` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `coordinate` and `published_at_unix_secs` are never read
+   --> src/services/discord/health/liveness_authority.rs:177:38
+    |
+173 | pub(in crate::services::discord) struct ProducerLivenessVerdict {
+    |                                         ----------------------- fields in this struct
+...
+177 |     pub(in crate::services::discord) coordinate: CaptureCoordinateObservation,
+    |                                      ^^^^^^^^^^
+...
+181 |     pub(in crate::services::discord) published_at_unix_secs: i64,
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `ProducerLivenessVerdict` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `force_clean_should_preserve_resume_selector` is never used
+  --> src/services/discord/health/recovery/watchdog_decisions.rs:40:15
+   |
+40 | pub(crate) fn force_clean_should_preserve_resume_selector(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `apply_watchdog_orphan_token_cleanup` is never used
+   --> src/services/discord/health/relay_auto_heal.rs:310:21
+    |
+310 | pub(super) async fn apply_watchdog_orphan_token_cleanup(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `relay_offset_unchanged_past_backlog_grace` is never used
+   --> src/services/discord/health/stall_liveness.rs:856:4
+    |
+856 | fn relay_offset_unchanged_past_backlog_grace(relay_observation: &OffsetObservationResult) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `complete_force_clean_watcher_recovery` is never used
+   --> src/services/discord/health/watcher_respawn.rs:144:21
+    |
+144 | pub(super) async fn complete_force_clean_watcher_recovery(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `release_stale_mailbox_ownership_after_force_clean` is never used
+   --> src/services/discord/health/watcher_respawn.rs:253:21
+    |
+253 | pub(super) async fn release_stale_mailbox_ownership_after_force_clean(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `remember_watcher_absence_offset_floor` is never used
+   --> src/services/discord/health/watcher_respawn.rs:434:4
+    |
+434 | fn remember_watcher_absence_offset_floor(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `bound_status_panel_generation` is never used
+  --> src/services/discord/inflight/ownership_ops.rs:87:41
+   |
+82 | impl StatusPanelBindOutcome {
+   | --------------------------- method in this implementation
+...
+87 |     pub(in crate::services::discord) fn bound_status_panel_generation(self) -> Option<u64> {
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clear_inflight_state_if_matches_identity_in_root` is never used
+ --> src/services/discord/inflight/clear_store/identity.rs:3:37
+  |
+3 | pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_in_root(
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `save_stream_tick_state_preserving_current_message_races_in_root` is never used
+   --> src/services/discord/inflight/save_store/identity_gate/stream_loop_patch.rs:117:47
+    |
+117 | pub(in crate::services::discord::inflight) fn save_stream_tick_state_preserving_current_message_races_in_root(
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `save_stream_tick_state_if_bridge_authority_in_root` is never used
+   --> src/services/discord/inflight/save_store/identity_gate/stream_loop_patch.rs:137:47
+    |
+137 | pub(in crate::services::discord::inflight) fn save_stream_tick_state_if_bridge_authority_in_root(
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `catalog_from_raw_sources` is never used
+   --> src/services/discord/model_catalog/claude.rs:353:4
+    |
+353 | fn catalog_from_raw_sources(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_confirmed_frontier_guarded_at` is never used
+   --> src/services/discord/outbound/delivery_record.rs:610:4
+    |
+610 | fn write_confirmed_frontier_guarded_at(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_confirmed_delivery_at` is never used
+   --> src/services/discord/outbound/delivery_record.rs:696:4
+    |
+696 | fn write_confirmed_delivery_at(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_confirmed_delivery` is never used
+   --> src/services/discord/outbound/delivery_record.rs:733:37
+    |
+733 | pub(in crate::services::discord) fn write_confirmed_delivery(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `shadow_mirror_same_channel_frontier_with_body` is never used
+    --> src/services/discord/outbound/delivery_record.rs:2198:37
+     |
+2198 | pub(in crate::services::discord) fn shadow_mirror_same_channel_frontier_with_body(
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `ensure_active_incarnation` is never used
+   --> src/services/discord/placeholder_controller.rs:373:25
+    |
+282 | impl PlaceholderController {
+    | -------------------------- method in this implementation
+...
+373 |     pub(super) async fn ensure_active_incarnation<G: TurnGateway + ?Sized>(
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `render_activity_line` is never used
+  --> src/services/discord/placeholder_live_events/freshness.rs:77:15
+   |
+77 | pub(super) fn render_activity_line(status: &DerivedStatus) -> String {
+   |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `should_inject` is never used
+  --> src/services/discord/prompt_builder/channel_recent_context.rs:95:15
+   |
+95 | pub(super) fn should_inject<T>(
+   |               ^^^^^^^^^^^^^
+
+warning: function `workspace_has_agentdesk_docs` is never used
+  --> src/services/discord/prompt_builder/layer_rendering.rs:48:15
+   |
+48 | pub(super) fn workspace_has_agentdesk_docs(current_path: &str) -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `mailbox_take_next_soft_intervention` is never used
+   --> src/services/discord/queue_dispatch.rs:124:21
+    |
+124 | pub(super) async fn mailbox_take_next_soft_intervention(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `mark_readopted_mailbox_owner_finished` is never used
+   --> src/services/discord/readopted_mailbox_ledger.rs:143:41
+    |
+ 91 | impl SharedData {
+    | --------------- method in this implementation
+...
+143 |     pub(in crate::services::discord) fn mark_readopted_mailbox_owner_finished(
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `queue_open_alert_once` is never used
+   --> src/services/discord/relay_recovery_circuit_breaker.rs:556:21
+    |
+556 | pub(super) async fn queue_open_alert_once(
+    |                     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `queue_open_alert_once_with_enqueue` is never used
+   --> src/services/discord/relay_recovery_circuit_breaker.rs:576:21
+    |
+576 | pub(super) async fn queue_open_alert_once_with_enqueue(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `idle_jsonl_should_retry_without_dedup_shared` is never used
+  --> src/services/discord/session_relay_sink/idle_jsonl.rs:42:15
+   |
+42 | pub(super) fn idle_jsonl_should_retry_without_dedup_shared<T>(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `codex_tui_rebind_prompt_replay_start_offset` is never used
+   --> src/services/discord/recovery_engine/manual_rebind/codex_tui_replay.rs:151:15
+    |
+151 | pub(crate) fn codex_tui_rebind_prompt_replay_start_offset(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clear_if_current_in_root` is never used
+   --> src/services/discord/status_panel_singleton_store.rs:142:4
+    |
+142 | fn clear_if_current_in_root(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clear_if_current` is never used
+   --> src/services/discord/status_panel_singleton_store.rs:173:37
+    |
+173 | pub(in crate::services::discord) fn clear_if_current(
+    |                                     ^^^^^^^^^^^^^^^^
+
+warning: struct `Candidate` is never constructed
+ --> src/services/discord/status_panel_transition_v2.rs:8:19
+  |
+8 | pub(super) struct Candidate {
+  |                   ^^^^^^^^^
+
+warning: method `is_valid` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:17:8
+   |
+16 | impl Candidate {
+   | -------------- method in this implementation
+17 |     fn is_valid(self) -> bool {
+   |        ^^^^^^^^
+
+warning: enum `ProtectionEvidence` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:32:17
+   |
+32 | pub(super) enum ProtectionEvidence {
+   |                 ^^^^^^^^^^^^^^^^^^
+
+warning: struct `BindGuard` is never constructed
+  --> src/services/discord/status_panel_transition_v2.rs:40:19
+   |
+40 | pub(super) struct BindGuard {
+   |                   ^^^^^^^^^
+
+warning: method `is_complete_for` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:50:8
+   |
+49 | impl BindGuard {
+   | -------------- method in this implementation
+50 |     fn is_complete_for(self, candidate: Candidate) -> bool {
+   |        ^^^^^^^^^^^^^^^
+
+warning: struct `BoundPanel` is never constructed
+  --> src/services/discord/status_panel_transition_v2.rs:62:19
+   |
+62 | pub(super) struct BoundPanel {
+   |                   ^^^^^^^^^^
+
+warning: enum `FailurePhase` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:67:17
+   |
+67 | pub(super) enum FailurePhase {
+   |                 ^^^^^^^^^^^^
+
+warning: enum `FailureReason` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:76:17
+   |
+76 | pub(super) enum FailureReason {
+   |                 ^^^^^^^^^^^^^
+
+warning: enum `QuarantineReason` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:83:17
+   |
+83 | pub(super) enum QuarantineReason {
+   |                 ^^^^^^^^^^^^^^^^
+
+warning: enum `JournalState` is never used
+  --> src/services/discord/status_panel_transition_v2.rs:94:17
+   |
+94 | pub(super) enum JournalState {
+   |                 ^^^^^^^^^^^^
+
+warning: associated items `prepared` and `is_terminal` are never used
+   --> src/services/discord/status_panel_transition_v2.rs:123:19
+    |
+122 | impl JournalState {
+    | ----------------- associated items in this implementation
+123 |     pub(super) fn prepared(candidate: Candidate) -> Self {
+    |                   ^^^^^^^^
+...
+127 |     fn is_terminal(self) -> bool {
+    |        ^^^^^^^^^^^
+
+warning: enum `TransitionEvent` is never used
+   --> src/services/discord/status_panel_transition_v2.rs:136:17
+    |
+136 | pub(super) enum TransitionEvent {
+    |                 ^^^^^^^^^^^^^^^
+
+warning: enum `TransitionError` is never used
+   --> src/services/discord/status_panel_transition_v2.rs:155:17
+    |
+155 | pub(super) enum TransitionError {
+    |                 ^^^^^^^^^^^^^^^
+
+warning: function `transition` is never used
+   --> src/services/discord/status_panel_transition_v2.rs:163:15
+    |
+163 | pub(super) fn transition(
+    |               ^^^^^^^^^^
+
+warning: function `recovery_bind_is_authorized` is never used
+   --> src/services/discord/status_panel_transition_v2.rs:215:15
+    |
+215 | pub(super) fn recovery_bind_is_authorized(state: JournalState) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `deletion_is_authorized` is never used
+   --> src/services/discord/status_panel_transition_v2.rs:226:15
+    |
+226 | pub(super) fn deletion_is_authorized(state: JournalState, message_id: u64) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `claim_task_response_delivery` is never used
+   --> src/services/discord/task_notification_delivery/mod.rs:392:43
+    |
+392 | pub(in crate::services::discord) async fn claim_task_response_delivery(
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `claim_task_response_delivery_with_recovery_key` is never used
+   --> src/services/discord/task_notification_delivery/mod.rs:421:43
+    |
+421 | pub(in crate::services::discord) async fn claim_task_response_delivery_with_recovery_key(
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `from_task_prompt` and `from_subagent_prompt` are never used
+  --> src/services/discord/task_notification_delivery/terminal_identity.rs:17:41
+   |
+16 | impl TaskCardEvent {
+   | ------------------ associated functions in this implementation
+17 |     pub(in crate::services::discord) fn from_task_prompt(
+   |                                         ^^^^^^^^^^^^^^^^
+...
+76 |     pub(in crate::services::discord) fn from_subagent_prompt(
+   |                                         ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `clear_provider_session_for_retry` is never used
+   --> src/services/discord/watchers/lifecycle/recovery_markers.rs:125:21
+    |
+125 | pub(crate) async fn clear_provider_session_for_retry(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_watcher_dispatch_id` is never used
+ --> src/services/discord/watchers/lifecycle/output_policy.rs:3:21
+  |
+3 | pub(crate) async fn resolve_watcher_dispatch_id(
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `try_claim_watcher` is never used
+   --> src/services/discord/watchers/lifecycle/claims.rs:177:37
+    |
+177 | pub(in crate::services::discord) fn try_claim_watcher(
+    |                                     ^^^^^^^^^^^^^^^^^
+
+warning: function `claim_or_reuse_watcher` is never used
+   --> src/services/discord/watchers/lifecycle/claims.rs:267:37
+    |
+267 | pub(in crate::services::discord) fn claim_or_reuse_watcher(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `claim_or_replace_watcher` is never used
+   --> src/services/discord/watchers/lifecycle/claims.rs:300:37
+    |
+300 | pub(in crate::services::discord) fn claim_or_replace_watcher(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `session_bound_ack_delivery_outcome` is never used
+  --> src/services/discord/tmux_watcher/session_bound_ack.rs:75:15
+   |
+75 | pub(super) fn session_bound_ack_delivery_outcome(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `new` and `for_turn` are never used
+  --> src/services/discord/turn_completion_events.rs:30:41
+   |
+29 | impl TurnCompletionEvent {
+   | ------------------------ associated functions in this implementation
+30 |     pub(in crate::services::discord) fn new(channel_id: ChannelId) -> Self {
+   |                                         ^^^
+...
+38 |     pub(in crate::services::discord) fn for_turn(channel_id: ChannelId, turn_id: u64) -> Self {
+   |                                         ^^^^^^^^
+
+warning: constant `PROVIDER_OVERLOAD_MAX_RETRIES` is never used
+  --> src/services/discord/tmux_overload_retry.rs:13:18
+   |
+13 | pub(super) const PROVIDER_OVERLOAD_MAX_RETRIES: u8 = 3;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ProviderOverloadDecision` is never used
+  --> src/services/discord/tmux_overload_retry.rs:28:17
+   |
+28 | pub(super) enum ProviderOverloadDecision {
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `normalized_retry_payload_text` is never used
+  --> src/services/discord/tmux_overload_retry.rs:37:15
+   |
+37 | pub(super) fn normalized_retry_payload_text(user_text: &str) -> &str {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_overload_fingerprint` is never used
+  --> src/services/discord/tmux_overload_retry.rs:47:15
+   |
+47 | pub(super) fn provider_overload_fingerprint(user_text: &str) -> String {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `provider_overload_retry_delay` is never used
+  --> src/services/discord/tmux_overload_retry.rs:56:15
+   |
+56 | pub(super) fn provider_overload_retry_delay(attempt: u8) -> std::time::Duration {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_provider_overload_retry` is never used
+   --> src/services/discord/tmux_overload_retry.rs:116:15
+    |
+116 | pub(super) fn record_provider_overload_retry(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `schedule_provider_overload_retry` is never used
+   --> src/services/discord/tmux_overload_retry.rs:152:15
+    |
+152 | pub(super) fn schedule_provider_overload_retry(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `terminal_commit_covers_marker` is never used
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:648:15
+    |
+648 | pub(super) fn terminal_commit_covers_marker(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `terminal_commit_covers_marker_with_offset` is never used
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:663:4
+    |
+663 | fn terminal_commit_covers_marker_with_offset(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_on_terminal_commit` is never used
+  --> src/services/discord/tui_direct_abort_marker/drain.rs:14:43
+   |
+14 | pub(in crate::services::discord) async fn drain_on_terminal_commit(
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_on_terminal_commit_with_offset` is never used
+  --> src/services/discord/tui_direct_abort_marker/drain.rs:34:43
+   |
+34 | pub(in crate::services::discord) async fn drain_on_terminal_commit_with_offset(
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_on_terminal_commit_with_applier` is never used
+  --> src/services/discord/tui_direct_abort_marker/drain.rs:83:43
+   |
+83 | pub(in crate::services::discord) async fn drain_on_terminal_commit_with_applier(
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `drain_on_terminal_commit_with_applier_and_offset` is never used
+   --> src/services/discord/tui_direct_abort_marker/drain.rs:106:43
+    |
+106 | pub(in crate::services::discord) async fn drain_on_terminal_commit_with_applier_and_offset(
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_commit_tombstone` is never used
+   --> src/services/discord/tui_direct_abort_marker/store.rs:193:37
+    |
+193 | pub(in crate::services::discord) fn record_commit_tombstone(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_commit_tombstone_at` is never used
+   --> src/services/discord/tui_direct_abort_marker/store.rs:253:37
+    |
+253 | pub(in crate::services::discord) fn record_commit_tombstone_at(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `record_commit_tombstone_at_with_offset` is never used
+   --> src/services/discord/tui_direct_abort_marker/store.rs:272:37
+    |
+272 | pub(in crate::services::discord) fn record_commit_tombstone_at_with_offset(
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `slash_command_control_prompt_is_local_command_stdout` is never used
+   --> src/services/discord/tui_prompt_relay/injected_prompt_policy.rs:132:15
+    |
+132 | pub(super) fn slash_command_control_prompt_is_local_command_stdout(prompt: &str) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `format_subagent_notification_card` is never used
+   --> src/services/discord/tui_prompt_relay/injected_prompt_policy.rs:265:15
+    |
+265 | pub(super) fn format_subagent_notification_card(tmux_session_name: &str, prompt: &str) -> String {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `slash_command_control_prompt_is_caveat_only` is never used
+   --> src/services/discord/tui_prompt_relay/injected_prompt_policy.rs:362:15
+    |
+362 | pub(super) fn slash_command_control_prompt_is_caveat_only(prompt: &str) -> bool {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `format_count_with_commas` is never used
+   --> src/services/discord/tui_prompt_relay/injected_prompt_policy.rs:417:15
+    |
+417 | pub(super) fn format_count_with_commas(count: usize) -> String {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_local_only_slash_command_prompt` is never used
+  --> src/services/discord/tui_prompt_relay/observed_prompt_decision.rs:59:15
+   |
+59 | pub(super) fn is_local_only_slash_command_prompt(prompt: &str) -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `fail_dispatch_auth_expired` is never used
+   --> src/services/discord/turn_bridge/completion_guard.rs:459:43
+    |
+459 | pub(in crate::services::discord) async fn fail_dispatch_auth_expired(
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `turn_key` is never read
+  --> src/services/discord/turn_finalizer/actor_state.rs:26:16
+   |
+25 | pub(super) struct PendingCompletionAdmission {
+   |                   -------------------------- field in this struct
+26 |     pub(super) turn_key: TurnKey,
+   |                ^^^^^^^^
+
+warning: struct `MementoToolFeedbackRequest` is never constructed
+  --> src/services/memory/memento.rs:91:19
+   |
+91 | pub(crate) struct MementoToolFeedbackRequest {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `tool_feedback` is never used
+   --> src/services/memory/memento.rs:678:25
+    |
+111 | impl MementoBackend {
+    | ------------------- method in this implementation
+...
+678 |     pub(crate) async fn tool_feedback(
+    |                         ^^^^^^^^^^^^^
+
+warning: function `normalize_tool_feedback_trigger_type` is never used
+   --> src/services/memory/memento.rs:741:4
+    |
+741 | fn normalize_tool_feedback_trigger_type(trigger_type: Option<String>) -> String {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SessionServer` is never constructed
+   --> src/services/platform/tmux.rs:648:12
+    |
+648 | pub struct SessionServer {
+    |            ^^^^^^^^^^^^^
+
+warning: function `list_sessions_with_server_pid` is never used
+   --> src/services/platform/tmux.rs:705:8
+    |
+705 | pub fn list_sessions_with_server_pid() -> Result<Vec<SessionServer>, String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_sessions_with_server_pid` is never used
+   --> src/services/platform/tmux.rs:720:4
+    |
+720 | fn parse_sessions_with_server_pid(text: &str) -> Vec<SessionServer> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src/services/routines/loader.rs:187:12
+    |
+186 | impl RoutineScriptLoader {
+    | ------------------------ associated function in this implementation
+187 |     pub fn new() -> Result<Self> {
+    |            ^^^
+
+warning: function `load_single_routine_script` is never used
+   --> src/services/routines/loader.rs:615:8
+    |
+615 | pub fn load_single_routine_script(root: &Path, path: &Path) -> Result<LoadedRoutineScript> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `source_channel_id` and `source_session_key` are never read
+  --> src/services/scheduled_messages/context_snapshot.rs:61:9
+   |
+59 | pub(crate) struct ContextSnapshotRow {
+   |                   ------------------ fields in this struct
+60 |     pub id: String,
+61 |     pub source_channel_id: String,
+   |         ^^^^^^^^^^^^^^^^^
+62 |     pub source_session_key: Option<String>,
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `ContextSnapshotRow` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `transcript_delivery_evidence` is never used
+  --> src/services/scheduled_messages/evidence.rs:14:15
+   |
+14 | pub(super) fn transcript_delivery_evidence(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `forward_resume_candidates` is never used
+   --> src/services/session_forwarding.rs:348:21
+    |
+348 | pub(crate) async fn forward_resume_candidates(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `tmux_line_is_claude_tui_spinner_progress` is never used
+   --> src/services/tmux_common.rs:408:4
+    |
+408 | fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `line_has_claude_tui_spinner_status_group` is never used
+   --> src/services/tmux_common.rs:630:4
+    |
+630 | fn line_has_claude_tui_spinner_status_group(line: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `as_str` is never used
+  --> src/services/tui_turn_state.rs:64:19
+   |
+51 | impl TuiReadyState {
+   | ------------------ method in this implementation
+...
+64 |     pub(crate) fn as_str(self) -> &'static str {
+   |                   ^^^^^^
+
+warning: methods `take_next_soft`, `cancel_queued_message`, and `hard_stop` are never used
+    --> src/services/turn_orchestrator.rs:1073:25
+     |
+ 689 | impl ChannelMailboxHandle {
+     | ------------------------- methods in this implementation
+...
+1073 |     pub(crate) async fn take_next_soft(
+     |                         ^^^^^^^^^^^^^^
+...
+1145 |     pub(crate) async fn cancel_queued_message(
+     |                         ^^^^^^^^^^^^^^^^^^^^^
+...
+1202 |     pub(crate) async fn hard_stop(&self) -> FinishTurnResult {
+     |                         ^^^^^^^^^
+
+warning: variants `CancelQueuedMessage` and `HardStop` are never constructed
+    --> src/services/turn_orchestrator.rs:1762:5
+     |
+1649 | enum ChannelMailboxMsg {
+     |      ----------------- variants in this enum
+...
+1762 |     CancelQueuedMessage {
+     |     ^^^^^^^^^^^^^^^^^^^
+...
+1790 |     HardStop {
+     |     ^^^^^^^^
+
+warning: field `queue_exit_events` is never read
+  --> src/services/turn_orchestrator/overflow.rs:34:16
+   |
+32 | pub(crate) struct SoftInterventionProbe {
+   |                   --------------------- field in this struct
+33 |     pub(crate) has_pending: bool,
+34 |     pub(crate) queue_exit_events: Vec<QueueExitEvent>,
+   |                ^^^^^^^^^^^^^^^^^
+
+warning: function `internal_error` is never used
+  --> src/utils/api.rs:26:15
+   |
+26 | pub(crate) fn internal_error(error: impl Display) -> ApiJsonResponse {
+   |               ^^^^^^^^^^^^^^
+
+warning: function `not_found` is never used
+  --> src/utils/api.rs:30:15
+   |
+30 | pub(crate) fn not_found(message: &'static str) -> ApiJsonResponse {
+   |               ^^^^^^^^^
+
+warning: function `tail_with_ellipsis_bytes` is never used
+  --> src/utils/format.rs:74:8
+   |
+74 | pub fn tail_with_ellipsis_bytes(text: &str, max_bytes: usize) -> String {
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^

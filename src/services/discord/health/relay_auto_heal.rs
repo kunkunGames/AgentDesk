@@ -1341,14 +1341,22 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
-        assert!(
-            std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", tmux_session])
-                .status()
-                .expect("start tmux fixture")
-                .success(),
-            "production snapshot must observe a live producer tmux session"
-        );
+        match std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", tmux_session])
+            .status()
+        {
+            Ok(status) => {
+                assert!(
+                    status.success(),
+                    "production snapshot must observe a live producer tmux session"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("tmux not found, skipping test");
+                return;
+            }
+            Err(e) => panic!("start tmux fixture: {}", e),
+        }
 
         let shared = crate::services::discord::make_shared_data_for_tests();
         let resume_offset = Arc::new(Mutex::new(None));
