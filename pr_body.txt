@@ -1,0 +1,31 @@
+What changed:
+Produced a no-change report due to overlap with existing open branches.
+
+Why:
+The task asked to improve intake routing, such as adding the missing duplicate log in the `IntakeRouter` for node override. However, after checking `git branch -r`, there are already multiple overlapping open branches in this category boundary (e.g., `jules/intake-router/fix-duplicate-message-log-2619711340301536431` and `jules/intake-router/node-override-duplicate-log-12849028873568096134`). As per the instructions, if the category already has an overlapping PR, I must stop and produce a no-change report instead of creating another PR.
+
+WorkFingerprint:
+- agent name: IntakeRouter
+- category boundary: src/cluster/intake_router_hook*, src/db/intake_outbox*
+- primary files: None (no-change report)
+- invariant protected: intake-time routing deduplication logs
+- public API impact: None
+- docs impact: None
+- verification plan: no-change
+- related PRs/issues: jules/intake-router/fix-duplicate-message-log-2619711340301536431, jules/intake-router/node-override-duplicate-log-12849028873568096134
+
+Duplicate/overlap check:
+Ran `git branch -r` and identified `jules/intake-router/fix-duplicate-message-log-2619711340301536431` and `jules/intake-router/node-override-duplicate-log-12849028873568096134`.
+
+Verification commands and results:
+- `git branch -r` confirmed overlap.
+- `cargo check --all-targets` (N/A for no-change, but run to verify baseline)
+
+Skipped checks with reasons:
+`services::discord::health::relay_auto_heal::tests::redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615` failed due to missing tmux fixture. This is a pre-existing test failure unrelated to this out-of-scope PR (which is a no-change report).
+
+Risk:
+None
+
+Rollback notes:
+None
