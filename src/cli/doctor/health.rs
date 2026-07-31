@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::contract::{FixSafety, SecurityExposure, Severity};
 use super::startup::LATEST_STARTUP_DOCTOR_ENDPOINT;
@@ -289,7 +289,7 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 #[cfg(test)]
 mod health_classification_tests {
     use super::super::contract::{FixSafety, Severity};
-    use super::{classify_degraded_reason, LATEST_STARTUP_DOCTOR_ENDPOINT};
+    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
 
     #[test]
     fn startup_doctor_reasons_point_to_latest_report_endpoint() {
