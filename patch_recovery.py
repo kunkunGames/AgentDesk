@@ -1,0 +1,8 @@
+with open('src/server/worker_recovery.rs', 'r') as f:
+    data = f.read()
+data = data.replace('worker = spec.name,\n                restart = spec.restart_policy.as_doc_str(),\n                reason = reason.as_doc_str(),', 'worker = spec.name,\n                target = spec.target,\n                restart = spec.restart_policy.as_doc_str(),\n                reason = reason.as_doc_str(),')
+data = data.replace('worker = spec.name,\n            restart = spec.restart_policy.as_doc_str(),\n            reason = reason.as_doc_str(),', 'worker = spec.name,\n            target = spec.target,\n            restart = spec.restart_policy.as_doc_str(),\n            reason = reason.as_doc_str(),')
+data = data.replace('worker = spec.name,\n                restart = spec.restart_policy.as_doc_str(),\n                "worker-local Tokio supervisor waiting for worker shutdown cleanup"', 'worker = spec.name,\n                target = spec.target,\n                restart = spec.restart_policy.as_doc_str(),\n                "worker-local Tokio supervisor waiting for worker shutdown cleanup"')
+data = data.replace('worker = spec.name,\n                        restart = spec.restart_policy.as_doc_str(),\n                        "worker-local Tokio worker exceeded graceful shutdown timeout; aborting"', 'worker = spec.name,\n                        target = spec.target,\n                        restart = spec.restart_policy.as_doc_str(),\n                        "worker-local Tokio worker exceeded graceful shutdown timeout; aborting"')
+with open('src/server/worker_recovery.rs', 'w') as f:
+    f.write(data)

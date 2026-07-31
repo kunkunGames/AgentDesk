@@ -235,6 +235,7 @@ async fn supervise_restartable<MakeFuture, Fut, RecordTerminal>(
             WORKER_RESTART_BUDGET_EXHAUSTED_COUNT.fetch_add(1, Ordering::AcqRel);
             tracing::error!(
                 worker = spec.name,
+                target = spec.target,
                 restart = spec.restart_policy.as_doc_str(),
                 reason = reason.as_doc_str(),
                 restart_count = restart_times.len(),
@@ -268,6 +269,7 @@ async fn supervise_restartable<MakeFuture, Fut, RecordTerminal>(
         consecutive_failures = consecutive_failures.saturating_add(1);
         tracing::warn!(
             worker = spec.name,
+            target = spec.target,
             restart = spec.restart_policy.as_doc_str(),
             reason = reason.as_doc_str(),
             restart_attempt,
@@ -313,6 +315,7 @@ where
         _ = wait_until_shutdown(shutdown) => {
             tracing::info!(
                 worker = spec.name,
+                target = spec.target,
                 restart = spec.restart_policy.as_doc_str(),
                 "worker-local Tokio supervisor waiting for worker shutdown cleanup"
             );
@@ -323,6 +326,7 @@ where
                 _ = &mut grace => {
                     tracing::warn!(
                         worker = spec.name,
+                        target = spec.target,
                         restart = spec.restart_policy.as_doc_str(),
                         "worker-local Tokio worker exceeded graceful shutdown timeout; aborting"
                     );
