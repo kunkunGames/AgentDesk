@@ -4,10 +4,10 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    e2e_control, health_api, idle_recap, maintenance, message_outbox, messages, monitoring,
-    pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
-    routines, scheduled_messages, skills_api, termination_events,
+    ApiRouter, AppState, auto_queue, claude_accounts_api, cluster, cron_api, dispatched_sessions,
+    dispatches, docs, e2e_control, health_api, idle_recap, maintenance, message_outbox, messages,
+    monitoring, pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api,
+    queue_api, routines, scheduled_messages, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -372,6 +372,14 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/provider-cli/{provider}",
                 patch(provider_cli_api::patch_provider_cli),
+            )
+            .route(
+                "/claude-accounts",
+                get(claude_accounts_api::get_claude_accounts),
+            )
+            .route(
+                "/claude-accounts/switch",
+                post(claude_accounts_api::switch_claude_account),
             ),
         state.clone(),
     );
