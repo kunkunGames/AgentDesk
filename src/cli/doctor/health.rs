@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::contract::{FixSafety, SecurityExposure, Severity};
 use super::startup::LATEST_STARTUP_DOCTOR_ENDPOINT;
@@ -289,7 +289,7 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 #[cfg(test)]
 mod health_classification_tests {
     use super::super::contract::{FixSafety, Severity};
-    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
+    use super::{classify_degraded_reason, LATEST_STARTUP_DOCTOR_ENDPOINT};
 
     #[test]
     fn startup_doctor_reasons_point_to_latest_report_endpoint() {
@@ -392,11 +392,17 @@ mod health_classification_tests {
         assert_eq!(tmux_reason.severity, Severity::Error);
         assert_eq!(tmux_reason.fix_safety, FixSafety::ExplicitRestartRequired);
         assert_eq!(tmux_reason.summary, "provider tmux is disconnected");
-        assert_eq!(tmux_reason.next_step, "check tmux credentials, connection status, and dcserver logs");
+        assert_eq!(
+            tmux_reason.next_step,
+            "check tmux credentials, connection status, and dcserver logs"
+        );
 
         let discord_reason = classify_degraded_reason("provider:discord:disconnected");
         assert_eq!(discord_reason.subsystem, "provider_runtime");
         assert_eq!(discord_reason.summary, "provider discord is disconnected");
-        assert_eq!(discord_reason.next_step, "check discord credentials, connection status, and dcserver logs");
+        assert_eq!(
+            discord_reason.next_step,
+            "check discord credentials, connection status, and dcserver logs"
+        );
     }
 }
