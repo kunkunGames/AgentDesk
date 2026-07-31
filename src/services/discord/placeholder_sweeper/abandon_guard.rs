@@ -856,6 +856,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires tmux which is missing on some CI runners"]
     async fn destructive_finalize_records_only_mailbox_edge_for_strict_plan_4888() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
