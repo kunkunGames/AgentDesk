@@ -181,6 +181,8 @@ def has_template_summary(body):
 def is_scratch_file_path(path):
     if not path or "/" in path:
         return False
+    if path.endswith(".diff") or path.endswith(".patch"):
+        return True
     root_scratch_files = {
         "pr-body.md",
         "plan.md",
