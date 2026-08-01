@@ -358,10 +358,10 @@ export default function DepartmentFormModal({
               </div>
 
               <div role="radiogroup" aria-labelledby="dept-theme-color-label">
-                <label id="dept-theme-color-label" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <div id="dept-theme-color-label" className="mb-1.5 block text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("테마 색상", "Theme Color")}
-                </label>
-                <div className="flex gap-2 flex-wrap">
+                </div>
+                <div className="flex flex-wrap gap-2">
                   {DEPT_COLORS.map((c, index) => (
                     <button
                       key={c}

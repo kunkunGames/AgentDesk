@@ -304,14 +304,15 @@ export default function OfficeManagerModal({
                 description={tr("아이콘과 대표 색상을 선택합니다.", "Choose the office icon and accent color.")}
               >
                 <div className="space-y-4">
-                  <div>
-                    <label
-                      className="block text-xs font-medium mb-1"
+                  <div role="radiogroup" aria-labelledby="office-manager-icon-label">
+                    <div
+                      id="office-manager-icon-label"
+                      className="mb-1 block text-xs font-medium"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("아이콘", "Icon")}
-                    </label>
-                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-label={tr("아이콘", "Icon")}>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       {OFFICE_ICONS.map((ic, idx) => (
                         <button
                           key={ic}
@@ -359,14 +360,15 @@ export default function OfficeManagerModal({
                       ))}
                     </div>
                   </div>
-                  <div>
-                    <label
-                      className="block text-xs font-medium mb-1"
+                  <div role="radiogroup" aria-labelledby="office-manager-color-label">
+                    <div
+                      id="office-manager-color-label"
+                      className="mb-1 block text-xs font-medium"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("색상", "Color")}
-                    </label>
-                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-label={tr("색상", "Color")}>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
                       {OFFICE_COLORS.map((c, idx) => (
                         <button
                           key={c}
