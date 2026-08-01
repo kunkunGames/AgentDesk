@@ -1340,15 +1340,23 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = if cfg!(unix) { std::process::Command::new("tmux") } else { std::process::Command::new("echo") }
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let _ = if cfg!(unix) {
+            std::process::Command::new("tmux")
+        } else {
+            std::process::Command::new("echo")
+        }
+        .args(["kill-session", "-t", tmux_session])
+        .status();
         assert!(
-            if cfg!(unix) { std::process::Command::new("tmux") } else { std::process::Command::new("echo") }
-                .args(["new-session", "-d", "-s", tmux_session])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(true),
+            if cfg!(unix) {
+                std::process::Command::new("tmux")
+            } else {
+                std::process::Command::new("echo")
+            }
+            .args(["new-session", "-d", "-s", tmux_session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true),
             "production snapshot must observe a live producer tmux session"
         );
 
@@ -1470,9 +1478,13 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        let _ = if cfg!(unix) { std::process::Command::new("tmux") } else { std::process::Command::new("echo") }
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let _ = if cfg!(unix) {
+            std::process::Command::new("tmux")
+        } else {
+            std::process::Command::new("echo")
+        }
+        .args(["kill-session", "-t", tmux_session])
+        .status();
     }
 
     #[test]
