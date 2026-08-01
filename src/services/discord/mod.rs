@@ -74,9 +74,11 @@ mod restart_mode;
 // #1074: session identity parsing SSoT (legacy + namespaced session_key forms).
 pub(crate) mod restart_report;
 mod role_map;
+mod role_map_enrichment;
 mod router;
 mod runtime_bootstrap;
 pub(in crate::services::discord) mod semantic_boundaries;
+mod skills_scan;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
 pub mod runtime_store;
@@ -86,6 +88,7 @@ pub mod runtime_store;
 mod relay_owner_observability;
 pub(crate) mod session_canonical_identity;
 pub(crate) mod session_identity;
+mod session_idle_cleanup;
 mod session_runtime;
 mod session_status_hook;
 mod session_transition;
@@ -215,10 +218,9 @@ use crate::services::gemini;
 use crate::services::opencode;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::qwen;
-use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
-
 use crate::services::turn_orchestrator::ChannelMailboxHandle;
 use crate::services::turn_orchestrator::HasPendingSoftQueueResult;
+use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
 use adk_session::{
     build_adk_session_key, build_session_key_candidates, derive_adk_session_info,
     lookup_pending_dispatch_for_thread, parse_dispatch_id,
@@ -226,10 +228,7 @@ use adk_session::{
 pub(in crate::services) use compact_turn_authority::{
     ManagedCompactTurnIdentity, compact_eligible_turn_source, live_managed_turn_matches,
 };
-use formatting::{
-    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_tool_input,
-    send_long_message_raw, truncate_str,
-};
+use formatting::{format_for_discord, format_tool_input, send_long_message_raw, truncate_str};
 #[cfg(test)]
 use inflight::save_inflight_state;
 use inflight::{InflightTurnState, load_inflight_states};
@@ -246,7 +245,11 @@ use queue_dispatch::{
 };
 use recovery_engine::restore_inflight_turns;
 use restart_report::flush_restart_reports;
+use role_map_enrichment::enrich_role_map_with_channel_ids;
 use router::handle_event;
+#[cfg(test)]
+use session_idle_cleanup::mark_session_disconnected_for_idle_cleanup;
+use session_idle_cleanup::maybe_cleanup_sessions;
 use session_status_hook::{
     post_canonical as post_adk_session_status_with_canonical_identity,
     post_channel_turn as post_adk_session_status_for_channel,
@@ -257,6 +260,8 @@ use settings::{
     load_last_session_path, resolve_role_binding, save_bot_settings,
     validate_bot_channel_routing_with_provider_channel,
 };
+pub(super) use skills_scan::scan_skills;
+use skills_scan::skill_dir_fingerprint_with_projects;
 #[cfg(unix)]
 use tmux::restore_tmux_watchers;
 #[cfg(unix)]
@@ -896,7 +901,7 @@ mod global_active_counter_tests {
 use session_runtime::{
     DiscordSession, RuntimeChannelBindingStatus, WorktreeInfo, auto_restore_session,
     auto_restore_session_force, auto_restore_session_with_dm_hint, bootstrap_thread_session,
-    cleanup_git_worktree, create_git_worktree, detect_worktree_conflict, provider_handles_channel,
+    create_git_worktree, detect_worktree_conflict, provider_handles_channel,
     rebind_channel_session, resolve_channel_category, resolve_is_dm_channel,
     resolve_reusable_worktree, resolve_runtime_channel_binding_status, resolve_thread_parent,
     select_restored_session_path, synthetic_thread_channel_name, validate_live_channel_routing,
@@ -4362,423 +4367,9 @@ pub(super) async fn kickoff_idle_queues(
     started_count
 }
 
-/// Scan for provider-specific skills available to this bot.
-pub(super) fn scan_skills(
-    provider: &ProviderKind,
-    project_path: Option<&str>,
-) -> Vec<(String, String)> {
-    if let Some(root) = crate::config::runtime_root() {
-        let _ = crate::runtime_layout::sync_managed_skills(&root);
-    }
-
-    let mut skills: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    match provider {
-        ProviderKind::Claude => {
-            for (name, desc) in BUILTIN_SKILLS {
-                seen.insert(name.to_string());
-                skills.push((name.to_string(), desc.to_string()));
-            }
-
-            let dirs_to_scan = collect_provider_skill_roots(provider, project_path);
-
-            for dir in dirs_to_scan {
-                if !dir.is_dir() {
-                    continue;
-                }
-                let Ok(entries) = fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "md").unwrap_or(false) {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            let name = stem.to_string();
-                            if seen.insert(name.clone()) {
-                                let desc = fs::read_to_string(&path)
-                                    .ok()
-                                    .map(|content| extract_skill_description(&content))
-                                    .unwrap_or_else(|| format!("Skill: {}", name));
-                                skills.push((name, desc));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ProviderKind::Codex
-        | ProviderKind::Gemini
-        | ProviderKind::OpenCode
-        | ProviderKind::Qwen => {
-            scan_directory_skills(
-                collect_provider_skill_roots(provider, project_path),
-                &mut seen,
-                &mut skills,
-            );
-        }
-        ProviderKind::Unsupported(_) => {}
-    }
-
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
-    skills
-}
-
-/// Compute a lightweight fingerprint of skill directories: (file_count, max_mtime_epoch).
-/// Used by the hot-reload poll to detect additions, modifications, and deletions.
-fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
-    let mut count = 0usize;
-    let mut max_mtime = 0u64;
-
-    let mut dirs = collect_provider_skill_roots(provider, None);
-    if provider_supports_directory_skills(provider) {
-        if let Some(root) = crate::config::runtime_root() {
-            dirs.push(crate::runtime_layout::managed_skills_root(&root));
-        }
-    }
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for dir in &dirs {
-        walk_mtime(dir, &mut count, &mut max_mtime);
-    }
-
-    (count, max_mtime)
-}
-
-/// Like `skill_dir_fingerprint` but also includes project-level skill directories.
-fn skill_dir_fingerprint_with_projects(
-    provider: &ProviderKind,
-    project_paths: &[String],
-) -> (usize, u64) {
-    let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for path in project_paths {
-        let Some(proj_dir) = provider_project_skill_dir(provider, path) else {
-            continue;
-        };
-        if proj_dir.is_dir() {
-            walk_mtime(&proj_dir, &mut count, &mut max_mtime);
-        }
-    }
-
-    (count, max_mtime)
-}
-
-fn provider_supports_directory_skills(provider: &ProviderKind) -> bool {
-    matches!(
-        provider,
-        ProviderKind::Claude
-            | ProviderKind::Codex
-            | ProviderKind::Gemini
-            | ProviderKind::OpenCode
-            | ProviderKind::Qwen
-    )
-}
-
-fn provider_home_skill_dir(provider: &ProviderKind, home: &Path) -> Option<std::path::PathBuf> {
-    match provider {
-        ProviderKind::Claude => Some(home.join(".claude").join("commands")),
-        ProviderKind::Codex => Some(home.join(".codex").join("skills")),
-        ProviderKind::Gemini => Some(home.join(".gemini").join("skills")),
-        ProviderKind::OpenCode => Some(home.join(".opencode").join("skills")),
-        ProviderKind::Qwen => Some(home.join(".qwen").join("skills")),
-        ProviderKind::Unsupported(_) => None,
-    }
-}
-
-fn provider_project_skill_dir(
-    provider: &ProviderKind,
-    project_path: &str,
-) -> Option<std::path::PathBuf> {
-    let project_root = Path::new(project_path);
-    match provider {
-        ProviderKind::Claude => Some(project_root.join(".claude").join("commands")),
-        ProviderKind::Codex => Some(project_root.join(".codex").join("skills")),
-        ProviderKind::Gemini => Some(project_root.join(".gemini").join("skills")),
-        ProviderKind::OpenCode => Some(project_root.join(".opencode").join("skills")),
-        ProviderKind::Qwen => Some(project_root.join(".qwen").join("skills")),
-        ProviderKind::Unsupported(_) => None,
-    }
-}
-
-fn collect_provider_skill_roots(
-    provider: &ProviderKind,
-    project_path: Option<&str>,
-) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        if let Some(path) = provider_home_skill_dir(provider, &home) {
-            roots.push(path);
-        }
-    }
-    if let Some(project_path) = project_path {
-        if let Some(path) = provider_project_skill_dir(provider, project_path) {
-            roots.push(path);
-        }
-    }
-    roots
-}
-
-fn scan_directory_skills(
-    roots: Vec<std::path::PathBuf>,
-    seen: &mut std::collections::HashSet<String>,
-    skills: &mut Vec<(String, String)>,
-) {
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            collect_directory_skill(&path, seen, skills);
-
-            if !path.is_dir() {
-                continue;
-            }
-            let Ok(nested) = fs::read_dir(&path) else {
-                continue;
-            };
-            for child in nested.filter_map(|e| e.ok()) {
-                collect_directory_skill(&child.path(), seen, skills);
-            }
-        }
-    }
-}
-
-fn collect_directory_skill(
-    path: &Path,
-    seen: &mut std::collections::HashSet<String>,
-    skills: &mut Vec<(String, String)>,
-) {
-    let Some(skill_path) = resolve_codex_skill_file(path) else {
-        return;
-    };
-    let Some(name) = skill_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-    else {
-        return;
-    };
-    let name = name.to_string();
-    if !seen.insert(name.clone()) {
-        return;
-    }
-    let desc = fs::read_to_string(&skill_path)
-        .ok()
-        .map(|content| extract_skill_description(&content))
-        .unwrap_or_else(|| format!("Skill: {}", name));
-    skills.push((name, desc));
-}
-
-fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
-    if path.is_dir() {
-        let skill_path = path.join("SKILL.md");
-        if skill_path.is_file() {
-            return Some(skill_path);
-        }
-    }
-    None
-}
-
 use discord_io::{check_auth, check_owner, rate_limit_wait, try_handle_pending_dm_reply};
 
 // ─── Event handler ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdleSessionWatcherCleanup {
-    ExpireSession,
-    DeferToTmuxLiveness,
-}
-
-fn idle_session_watcher_cleanup(has_watcher: bool) -> IdleSessionWatcherCleanup {
-    if has_watcher {
-        IdleSessionWatcherCleanup::DeferToTmuxLiveness
-    } else {
-        IdleSessionWatcherCleanup::ExpireSession
-    }
-}
-
-/// Periodically clean up idle sessions and their associated data.
-/// Called from handle_event; uses a static Mutex to track the last cleanup time.
-async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
-    use std::sync::OnceLock;
-    static LAST_CLEANUP: OnceLock<tokio::sync::Mutex<tokio::time::Instant>> = OnceLock::new();
-    let last = LAST_CLEANUP.get_or_init(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
-    let mut last_guard = last.lock().await;
-    if last_guard.elapsed() < SESSION_CLEANUP_INTERVAL {
-        return;
-    }
-    *last_guard = tokio::time::Instant::now();
-    drop(last_guard);
-
-    struct ExpiredSessionCleanup {
-        channel_id: ChannelId,
-        session_key: Option<String>,
-    }
-
-    let provider = shared.settings.read().await.provider.clone();
-    let expired: Vec<ExpiredSessionCleanup> = {
-        let data = shared.core.lock().await;
-        let now = tokio::time::Instant::now();
-        data.sessions
-            .iter()
-            .filter(|(channel_id, s)| {
-                now.duration_since(s.last_active) > SESSION_MAX_IDLE
-                    && matches!(
-                        idle_session_watcher_cleanup(shared.tmux_watchers.contains_key(channel_id)),
-                        IdleSessionWatcherCleanup::ExpireSession
-                    )
-            })
-            .map(|(ch, s)| ExpiredSessionCleanup {
-                channel_id: *ch,
-                session_key: s.channel_name.as_ref().map(|name| {
-                    let tmux_name = provider.build_tmux_session_name(name);
-                    adk_session::build_namespaced_session_key(
-                        &shared.token_hash,
-                        &provider,
-                        &tmux_name,
-                    )
-                }),
-            })
-            .collect()
-    };
-    if expired.is_empty() {
-        return;
-    }
-    {
-        let mut data = shared.core.lock().await;
-        for expired_session in &expired {
-            let ch = expired_session.channel_id;
-            // Clean up worktree if session had one
-            if let Some(session) = data.sessions.get(&ch) {
-                if let Some(ref wt) = session.worktree {
-                    cleanup_git_worktree(shared.pg_pool.as_ref(), wt);
-                }
-            }
-            data.sessions.remove(&ch);
-        }
-    }
-    // #3588: idle 정리는 in-memory/worktree 메모리 회수만 수행하고 provider
-    // session(claude resume id)은 DB에 보존한다. 다음 턴에서
-    // `fetch_provider_session_id`로 복원되어 `--resume`으로 transcript가 이어진다.
-    // retry_context(session_retry_context_key) kv는 의도적으로 저장하지 않는다 —
-    // 같은 키를 `take_session_retry_context`가 다음 턴에 무조건 take/주입하므로,
-    // resume이 성공하는 idle 경로에서 저장하면 transcript 중복 + "새 세션 시작"
-    // 레이블 오표시가 발생한다. (#3591에서 100턴 세션 리셋도 제거되어 reset 기반
-    // 저장 경로는 없다; resume 실패 복구만 auto_retry_with_history가 별도로 저장한다.)
-    // 명시적 세션 초기화는 idle recap의 `새 세션 시작` 버튼(idle_recap:clear)으로 한다.
-    for expired_session in &expired {
-        let cleared = mailbox_clear_channel(shared, &provider, expired_session.channel_id).await;
-        if cleared.removed_token.is_some() {
-            saturating_decrement_global_active(shared);
-        }
-        shared.api_timestamps.remove(&expired_session.channel_id);
-    }
-    // Record termination audit for cleaned-up sessions
-    for expired_session in &expired {
-        if let Some(session_key) = expired_session.session_key.as_deref() {
-            let should_record =
-                mark_session_disconnected_for_idle_cleanup(shared.pg_pool.as_ref(), session_key)
-                    .await;
-            if !should_record {
-                continue;
-            }
-
-            crate::services::termination_audit::record_termination_with_handles(
-                shared.pg_pool.as_ref(),
-                session_key,
-                None,
-                "cleanup",
-                "idle_session_expiry",
-                Some("in-memory session expired due to idle timeout"),
-                None,
-                None,
-                None,
-            );
-        }
-    }
-    tracing::info!("  [cleanup] Removed {} idle session(s)", expired.len());
-}
-
-async fn mark_session_disconnected_for_idle_cleanup(
-    pg_pool: Option<&sqlx::PgPool>,
-    session_key: &str,
-) -> bool {
-    let Some(pool) = pg_pool else {
-        return false;
-    };
-    let prior_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE session_key = $1")
-            .bind(session_key)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-    let _ = sqlx::query(
-        "UPDATE sessions
-         SET status = 'disconnected', active_dispatch_id = NULL
-         WHERE session_key = $1",
-    )
-    .bind(session_key)
-    .execute(pool)
-    .await;
-
-    prior_status.as_deref() != Some("disconnected")
-}
 
 #[cfg(test)]
 mod idle_cleanup_selector_tests {
@@ -4924,119 +4515,6 @@ mod idle_cleanup_selector_tests {
 // bootstrap_thread_session, resolve_channel_category, and other non-command functions.
 
 // ─── Text message → Claude AI ───────────────────────────────────────────────
-
-/// Enrich role_map.json's byChannelName entries with channelId from byChannelId.
-/// This enables reliable channel name → ID resolution without provider inference hacks.
-fn enrich_role_map_with_channel_ids() {
-    let Some(root) = crate::cli::agentdesk_runtime_root() else {
-        return;
-    };
-    let path = root.join("config/role_map.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-
-    let mut changed = false;
-
-    // Build maps from byChannelId: channelId → (roleId, provider) and name→id lookup
-    let by_id = json
-        .get("byChannelId")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    // Pass 1: collect mappings (name → channelId) without mutating
-    let mut mappings: Vec<(String, String)> = Vec::new();
-    if let Some(by_name) = json.get("byChannelName").and_then(|v| v.as_object()) {
-        // Collect already-assigned IDs to avoid duplicates
-        let already_assigned: std::collections::HashSet<String> = by_name
-            .iter()
-            .filter_map(|(_, e)| {
-                e.get("channelId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-
-        for (name, entry) in by_name {
-            if entry.get("channelId").is_some() {
-                continue;
-            }
-            let role_id = entry.get("roleId").and_then(|v| v.as_str()).unwrap_or("");
-            let entry_provider = entry.get("provider").and_then(|v| v.as_str());
-
-            let candidates: Vec<(&String, &serde_json::Value)> = by_id
-                .iter()
-                .filter(|(_, e)| e.get("roleId").and_then(|v| v.as_str()) == Some(role_id))
-                .collect();
-
-            let ch_id = if candidates.len() == 1 {
-                Some(candidates[0].0.clone())
-            } else if candidates.len() > 1 {
-                if let Some(p) = entry_provider {
-                    // Explicit provider — exact match
-                    candidates
-                        .iter()
-                        .find(|(_, e)| e.get("provider").and_then(|v| v.as_str()) == Some(p))
-                        .map(|(id, _)| id.to_string())
-                } else {
-                    // No provider in byChannelName — match by expected provider type:
-                    // Claude channels are the "primary" (cc suffix or no suffix)
-                    // Codex channels are the "alt" (cdx suffix)
-                    // This determines which byChannelId entry to pick.
-                    let expected_provider = if name.ends_with("-cdx") {
-                        "codex"
-                    } else {
-                        "claude"
-                    };
-                    candidates
-                        .iter()
-                        .find(|(_, e)| {
-                            e.get("provider").and_then(|v| v.as_str()) == Some(expected_provider)
-                        })
-                        .map(|(id, _)| id.to_string())
-                        .or_else(|| {
-                            // Fallback: pick one not already assigned
-                            candidates
-                                .iter()
-                                .find(|(id, _)| !already_assigned.contains(id.as_str()))
-                                .map(|(id, _)| id.to_string())
-                        })
-                }
-            } else {
-                None
-            };
-
-            if let Some(id) = ch_id {
-                mappings.push((name.clone(), id));
-            }
-        }
-    }
-
-    // Pass 2: apply mappings
-    if let Some(by_name) = json
-        .get_mut("byChannelName")
-        .and_then(|v| v.as_object_mut())
-    {
-        for (name, ch_id) in &mappings {
-            if let Some(entry) = by_name.get_mut(name) {
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("channelId".to_string(), serde_json::json!(ch_id));
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    if changed {
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            let _ = runtime_store::atomic_write(&path, &pretty);
-        }
-    }
-}
 
 // #3167 — a queued external USER intervention must be kickable while a
 // low-priority Background turn (monitor relay / self-paced TUI loop) holds the

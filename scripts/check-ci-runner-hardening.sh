@@ -100,11 +100,14 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.pg_db == 'true'",
     "runs_on" => "ubuntu-latest",
-    # #5025 re-pins after adding the production bridge-epilogue routing test to
-    # the existing toolchain-provisioned targeted lane whose mirror is required.
-    # #4985 keeps footer-marker regressions in that same branch-protected lane;
-    # both land in one job block, so the pin is recomputed for the merged content.
-    "job_sha256" => "6c60e700d0e2417135e76ae69e316fd79b94180fae74eebee672dc288e39fee5",
+    # #4979 S2 re-pins after adding the AGENTDESK_REQUIRE_PG=1 job env so a PG
+    # connection failure in this PG-backed lane hard-fails instead of
+    # soft-skipping green; the command inventory itself is unchanged.
+    # #5040 re-pins after adding the telemetry-only intake authority regressions
+    # to this existing toolchain-provisioned lane whose mirror is required.
+    # #5025 and #4985 retain their production bridge and footer-marker coverage
+    # in the same job block, so the pin covers the merged command inventory.
+    "job_sha256" => "45379287c8cd87d4dae3a9733b92cb65984dc042972e0e12046125f18664e3a9",
     "cargo_steps" => {
       "Footer-only marker regressions" => {
         "commands" => [
@@ -116,6 +119,11 @@ targets = {
       },
       "Trusted session forwarding tests" => {
         "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
+        "continue_on_error" => nil,
+        "timeout_minutes" => 10,
+      },
+      "Telemetry-only intake authority regressions" => {
+        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres"],
         "continue_on_error" => nil,
         "timeout_minutes" => 10,
       },
