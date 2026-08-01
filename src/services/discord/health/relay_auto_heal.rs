@@ -1320,6 +1320,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(
+        not(target_family = "unix"),
+        ignore = "tmux requires a unix host for fixture"
+    )]
     async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
