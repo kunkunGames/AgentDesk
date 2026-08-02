@@ -32,7 +32,7 @@ function defaultPipelineConfig() {
   };
 }
 
-function createPipeline(config) {
+function createPipeline(config, phaseGateDeclaration) {
   const resolved = clone(config || defaultPipelineConfig());
   const transitions = resolved.transitions || [];
   const states = resolved.states || [];
@@ -67,12 +67,18 @@ function createPipeline(config) {
     isTerminal(status) {
       return status === this.terminalState();
     },
-    resolvePhaseGateForCard() {
+    resolvePhaseGateDeclaration(kind) {
+      return typeof phaseGateDeclaration === "function"
+        ? clone(phaseGateDeclaration(kind))
+        : null;
+    },
+    resolvePhaseGateForCard(_cardId, kind) {
+      const declaration = this.resolvePhaseGateDeclaration(kind);
+      if (!declaration) return null;
       return {
         dispatch_to: "self",
         dispatch_type: "phase-gate",
-        pass_verdict: "phase_gate_passed",
-        checks: []
+        declaration
       };
     }
   };
@@ -113,7 +119,10 @@ function createExecRouter(routes) {
 
 function createAgentdeskMock(options) {
   const settings = options || {};
-  const pipeline = settings.pipeline || createPipeline(settings.pipelineConfig);
+  const pipeline = settings.pipeline || createPipeline(
+    settings.pipelineConfig,
+    settings.phaseGateDeclaration
+  );
   const state = {
     registeredPolicies: [],
     logs: { debug: [], info: [], warn: [], error: [] },
@@ -152,7 +161,8 @@ function createAgentdeskMock(options) {
     escalations: [],
     manualInterventions: [],
     flushedEscalations: 0,
-    kv: new Map()
+    kv: new Map(),
+    kvDeleteManyCalls: []
   };
 
   const dbQuery = settings.dbQuery || (() => []);
@@ -421,6 +431,14 @@ function createAgentdeskMock(options) {
       },
       delete(key) {
         state.kv.delete(key);
+      },
+      deleteMany(keys) {
+        const copiedKeys = clone(keys || []);
+        state.kvDeleteManyCalls.push(copiedKeys);
+        for (const key of copiedKeys) {
+          state.kv.delete(key);
+        }
+        return { ok: true, deleted: copiedKeys.length };
       }
     },
     autoQueue: {

@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-15 (against `main` @ `9594a4d94`).
+> Last refreshed: 2026-07-31 (PR #5048 stale-route recovery changes).
 >
 > Last refreshed: 2026-07-05 (#4089 — `worker_registry.rs` exposes the local RateLimitSync leader-worker active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: leader election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-leader switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the leader loop.)
 >
@@ -446,6 +446,58 @@
   before merging.
 
 ### Audited touches
+- 2026-07-30 — #5014 / PR #5020 destructive cancel commit: the inflight
+  sidecar flock, watcher cancel `AtomicBool`, and registry identity CAS remain
+  **worker-local** authority. The primitive adds no PostgreSQL lease, distributed
+  epoch, leader check, remote-owner RPC, durable cancel intent, worker placement,
+  or cross-node fencing; another node can independently verify the same channel
+  row. Gateway lease containment narrows that deployment condition but does not
+  turn the host-local commit into cluster authority.
+- 2026-07-26 — #4898 untrusted deploy-gate containment: PostgreSQL migration
+  0100 adds a validated cluster-wide `CHECK` constraint that rejects normalized
+  `deploy-gate` provenance. The `ALTER TABLE` lock serializes concurrent legacy
+  writers, so preflight row counts are diagnostic only and every old node is
+  fenced after commit. The release candidate applies migration 0100 after
+  staging, signing, and reversible tunnel readiness, but before requesting
+  `restart_pending` or any runtime self-exit trigger. Migration failure therefore
+  leaves the old process running; after commit, drain/persistence and bootout
+  proceed under a forward-only binary floor. Pre-0100 binaries must not restart
+  after commit. Existing
+  deploy-gate rows block rollout; no node converts or passes them. Enabling a
+  future trusted typed evidence capability requires a coordinated constraint
+  migration and capability rollout across the fleet.
+- 2026-07-25 — #4913 GO-A1 canonical Discord session identity: nullable
+  `(provider, discord_token_hash, channel_id, identity_kind)` metadata and
+  `session_key_aliases` are shared PostgreSQL authority. Canonical writes serialize
+  with tuple/locator-scoped PostgreSQL transaction advisory locks and row locks;
+  `session_locator_namespace` unique claims prevent concurrent primary/alias
+  ownership across tables even for old direct writers. Migration 0101 and runtime
+  share the scheduled-snapshot exclusion classifier; alias-aware provider-selector,
+  `/resume`, force-kill ownership, and idle-heartbeat reads converge on one durable
+  row. Ambiguous exact/alias/canonical or legacy evidence fails closed with
+  categorical diagnostics. Existing tmux names, processes, panes, FIFOs, gateway
+  leases, leader election, and worker placement remain unchanged; no cross-node
+  tmux adoption, rename, kill, or routing cutover is introduced.
+- 2026-07-25 — #4913 GO-C1 trusted session-forwarding prerequisite:
+  `session_forwarding` treats per-node `cluster.nodes.<instance>.trusted_forward_origin`
+  as operator-owned authority, requires exact agreement with fresh worker capability
+  advertisements, validates and pins every DNS answer, requires HTTPS by default,
+  disables proxies/redirects, and attaches forwarding credentials only after
+  validation. Cleartext HTTP requires separate private-address and insecure-
+  transport opt-ins and only private/Tailscale answers; public or mixed DNS stays
+  blocked. Deprecated IPv6 site-local `fec0::/10` is not an allowed private
+  topology and remains blocked with either opt-in. Receivers for tmux output,
+  force-kill, kill-tmux, cancel-turn, and
+  resume-previous fence the expected
+  owner header against the current PostgreSQL `sessions.instance_id` and local
+  instance before any node-local read/mutation; draft #4916 must apply the same
+  shared path to resume-candidates. Classification: leader/gateway-originated HTTP
+  routing to worker-local session state using existing PostgreSQL owner authority;
+  no new leader election, lease, schema, or durable outbox. Rolling order is (1)
+  configure trusted origins on every node, including explicit private/Tailscale
+  opt-in only where needed, (2) upgrade workers until matching origins and required
+  capabilities are advertised, then (3) upgrade the gateway/leader. Missing or
+  mismatched trust configuration is a typed 503 with no discovered-URL fallback.
 - 2026-07-24 — #4712 lifecycle de-giant rebase: `runtime_bootstrap.rs` changes only
   update the restart-marker characterization fixture to the current nonce/version
   encoding, while watcher lifecycle logic moves verbatim behind the existing facade.
@@ -835,11 +887,13 @@
 - #4611 owner-targeted cancel forwarding: REST cancel and Discord `/stop` resolve
   the canonical active `sessions.instance_id` owner and fail closed instead of
   mutating leader-local state when ownership is remote or changes during cancel.
-  Rolling upgrade order is workers first, then leaders: a routable owner must
-  advertise `capabilities.agentdesk_api.cancel_forwarding_v1=true`; leaders do
-  not forward cancel to older workers that lack the capability. Keep old and new
-  nodes registered during rollout only after every potential owner advertises
-  the fence. No durable cancel outbox or new lease is introduced.
+  The #4913 GO-C1 prerequisite supersedes the original workers-first shorthand:
+  first configure `cluster.nodes.<instance>.trusted_forward_origin` for every
+  potential owner, then upgrade workers until they advertise the exact configured
+  origin and `capabilities.agentdesk_api.cancel_forwarding_v1=true`, and upgrade
+  leaders last. Leaders do not forward cancel to older or mismatched workers.
+  Keep old and new nodes registered during rollout only after every potential
+  owner advertises the fence. No durable cancel outbox or new lease is introduced.
 
 - #4350 session-owner intake affinity: leader-only routing resolves the existing
   PG `sessions.instance_id` owner before `/node` or preferred labels, and every
@@ -848,6 +902,15 @@
   safe without local execution; queued items are front-requeued before marker
   teardown. Worker execution remains instance-local and is the one intentional
   admission bypass after an outbox claim. No new lease or migration.
+
+- #5040 owner-authority admission fence correction: `owner_authority_channel_ids`
+  now distinguishes `opted_in`, `not_opted_in`, and `unknown` at the admission
+  boundary. A `pending` predecessor is eligible for local recovery only when
+  its row age exceeds `forward_pre_claim_timeout_secs`, the owner is live-local,
+  and the channel is explicitly unlisted; the row is atomically retired under
+  the channel advisory lock before local execution. Unknown config and
+  `claimed`/`accepted`/`spawned` routes remain fenced. Foreign-owner routing,
+  worker claim, lease, migration, and gateway ownership remain unchanged.
 
 - #3630 frontier mirror for cancel/stop + prompt_too_long terminal arms:
   turn_bridge now mirrors only Delivered+committed terminal-replace lease ranges

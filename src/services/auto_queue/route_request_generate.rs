@@ -1,6 +1,8 @@
 use super::*;
 use serde::Deserialize;
 
+use crate::queue_contract::THREAD_GROUP_SERIAL_LANE_CONTRACT;
+
 /// POST /api/queue/request-generate (#2126)
 ///
 /// Dashboard-facing convenience endpoint. The dashboard asks the backend to
@@ -167,6 +169,9 @@ fn validate_allowed_gate_kinds(kinds: Option<&[String]>) -> Result<Option<Vec<St
                 "unknown phase_gate_kind '{trimmed}' (see GET /api/queue/phase-gates/catalog)"
             ));
         }
+        if let Some(reason) = crate::phase_gate::kind_unavailable_reason(trimmed) {
+            return Err(reason.to_string());
+        }
         if !normalized
             .iter()
             .any(|existing: &String| existing == trimmed)
@@ -234,7 +239,7 @@ pub(super) fn build_request_generate_instruction(input: &RequestGenerateInput<'_
          {allowed_kinds_line}\n\
          다음 절차로 처리:\n\
          1) 각 이슈를 gh로 직접 조회하여 본문/라벨/관련 의존성 파악\n\
-         2) 순서·thread_group(병렬 가능 단위)·batch_phase(직렬 페이즈)·phase_gate_kind 결정\n\
+         2) 순서·thread_group(serial lane)·batch_phase(실행 페이즈)·phase_gate_kind 결정\n\
          3) /api/queue/generate 호출 (스키마 아래)\n\n\
          호출 스키마:\n\
          POST /api/queue/generate\n\
@@ -250,7 +255,7 @@ pub(super) fn build_request_generate_instruction(input: &RequestGenerateInput<'_
          }}\n\n\
          가이드:\n\
          - entries는 실행 순서대로 정렬\n\
-         - thread_group: 동시 실행 가능한 카드는 같은 group, 직렬은 다른 group\n\
+         - {thread_group_contract}\n\
          - batch_phase: 페이즈 게이트 사이에 있는 카드는 같은 phase\n\
          {kind_guide_line}\n\
          - 자체 판단 후 즉시 호출, 완료 시 run_id를 본 채널에 보고",
@@ -261,6 +266,7 @@ pub(super) fn build_request_generate_instruction(input: &RequestGenerateInput<'_
         allowed_kinds_line = allowed_kinds_line,
         example_kind = example_kind,
         kind_guide_line = kind_guide_line,
+        thread_group_contract = THREAD_GROUP_SERIAL_LANE_CONTRACT,
     )
 }
 
@@ -314,14 +320,45 @@ mod tests {
         assert!(!text.contains("allowed_gate_kinds:"));
     }
 
-    /// Regression for codex review P1 on #2126: when allowed_gate_kinds
-    /// excludes the catalog default (`pr-confirm`), the synthesised call
-    /// example must not bleed the default back into the prompt and the
-    /// guide must explicitly forbid kinds outside the restriction.
+    #[test]
+    fn instruction_uses_exact_thread_group_serial_lane_contract() {
+        assert_eq!(
+            THREAD_GROUP_SERIAL_LANE_CONTRACT,
+            "Within one `batch_phase`, entries with the same `thread_group` share a serial lane with at most one active entry; entries with different `thread_group` values may run in parallel up to available capacity, and dependency-related entries must share a serial lane or use separate `batch_phase` values."
+        );
+        let issues = vec![1i64, 2];
+        let text = build_request_generate_instruction(&RequestGenerateInput {
+            repo: "r",
+            agent_id: "a",
+            issue_numbers: &issues,
+            allowed_gate_kinds: None,
+            request_id: "r1",
+        });
+
+        let expected_guide = format!("- {THREAD_GROUP_SERIAL_LANE_CONTRACT}");
+        assert!(
+            text.lines().any(|line| line.trim() == expected_guide),
+            "instruction must contain the canonical serial-lane contract exactly: {text}"
+        );
+        for reversed_wording in [
+            "thread_group(병렬 가능 단위)",
+            "동시 실행 가능한 카드는 같은 group",
+            "직렬은 다른 group",
+        ] {
+            assert!(
+                !text.contains(reversed_wording),
+                "instruction still contains reversed thread_group guidance `{reversed_wording}`: {text}"
+            );
+        }
+    }
+
+    /// Regression for codex review P1 on #2126: the synthesised call example
+    /// must use only an available kind from the restriction, and the guide must
+    /// explicitly forbid kinds outside it.
     #[test]
     fn instruction_example_kind_respects_allowed_restriction() {
         let issues = vec![42i64];
-        let allowed = vec!["deploy-gate".to_string()];
+        let allowed = vec!["pr-confirm".to_string()];
         let text = build_request_generate_instruction(&RequestGenerateInput {
             repo: "r",
             agent_id: "a",
@@ -330,12 +367,12 @@ mod tests {
             request_id: "r1",
         });
         assert!(
-            text.contains("\"phase_gate_kind\": \"deploy-gate\""),
+            text.contains("\"phase_gate_kind\": \"pr-confirm\""),
             "call example should use the first allowed kind: {text}"
         );
         assert!(
-            !text.contains("\"phase_gate_kind\": \"pr-confirm\""),
-            "pr-confirm must not appear when restricted to deploy-gate: {text}"
+            !text.contains("\"phase_gate_kind\": \"deploy-gate\""),
+            "unavailable deploy-gate must not appear outside the allowed restriction: {text}"
         );
         assert!(
             text.contains("반드시 allowed_gate_kinds"),
@@ -344,10 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_allowed_gate_kinds_accepts_catalog_values() {
-        let input = vec!["pr-confirm".to_string(), "deploy-gate".to_string()];
+    fn validate_allowed_gate_kinds_accepts_available_catalog_values() {
+        let input = vec!["pr-confirm".to_string()];
         let validated = validate_allowed_gate_kinds(Some(&input)).expect("valid");
-        assert_eq!(validated.as_deref().map(|v| v.len()), Some(2));
+        assert_eq!(validated.as_deref(), Some(&["pr-confirm".to_string()][..]));
+    }
+
+    #[test]
+    fn validate_allowed_gate_kinds_rejects_unavailable_deploy_gate() {
+        let input = vec!["deploy-gate".to_string()];
+        assert_eq!(
+            validate_allowed_gate_kinds(Some(&input)).unwrap_err(),
+            crate::phase_gate::DEPLOY_GATE_UNAVAILABLE_REASON
+        );
     }
 
     #[test]

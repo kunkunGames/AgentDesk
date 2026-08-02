@@ -1,7 +1,6 @@
 pub(crate) mod cancel_run;
 pub(crate) mod route;
 pub mod runtime;
-
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row as SqlxRow};
@@ -551,6 +550,22 @@ impl AutoQueueService {
                     .with_code(ErrorCode::Database)
                     .with_operation("count_cards_by_status_with_pg")
                     .with_context("status", status)
+            })
+    }
+
+    pub async fn count_cards_by_status_grouped_with_pg(
+        &self,
+        pool: &PgPool,
+        repo: Option<&str>,
+        agent_id: Option<&str>,
+        statuses: &[String],
+    ) -> ServiceResult<std::collections::HashMap<String, i64>> {
+        auto_queue::count_cards_by_status_grouped_pg(pool, repo, agent_id, statuses)
+            .await
+            .map_err(|error| {
+                ServiceError::internal(format!("count grouped cards: {error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("count_cards_by_status_grouped_with_pg")
             })
     }
 

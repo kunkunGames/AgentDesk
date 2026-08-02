@@ -834,6 +834,18 @@ pub(in crate::services::discord) async fn defer_promoted_dispatch_if_hosted_tui_
     if !hosted_tui_promote_readiness_blocked(shared, provider, channel_id).await {
         return false;
     }
+    // #4888: once the aggregate busy-retry budget is spent, stop arming the
+    // fail-open backstop that keeps re-driving the same busy pane. The entry is
+    // still restored at the queue front below — only the automatic re-drive
+    // stops, and the watcher-idle re-drain still delivers it on real TUI idle.
+    let retry_identity = super::super::super::busy_followup_retry_store::resolve_identity(
+        provider,
+        channel_id.get(),
+        intervention.message_id.get(),
+        &intervention.source_message_ids,
+    );
+    let busy_retry_capped =
+        super::super::super::busy_followup_retry_store::state_is_capped(retry_identity.state);
     let restored = super::super::super::mailbox_restore_dequeued_head(
         shared,
         provider,
@@ -855,13 +867,15 @@ pub(in crate::services::discord) async fn defer_promoted_dispatch_if_hosted_tui_
         );
         return false;
     }
-    super::super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
-        shared,
-        provider,
-        channel_id,
-        "hosted_tui_busy_pre_drain_defer",
-    )
-    .await;
+    if !busy_retry_capped {
+        super::super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
+            shared,
+            provider,
+            channel_id,
+            "hosted_tui_busy_pre_drain_defer",
+        )
+        .await;
+    }
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts}] 📬 #4270 promote gate: hosted TUI busy — queued turn re-preserved at queue front without teardown (channel {}, msg {})",
@@ -977,7 +991,7 @@ mod busy_retry_fifo_tests {
             .intervention
             .expect("A is dequeued first");
         assert_eq!(dequeued.message_id, first.message_id);
-        crate::services::discord::mailbox_clear_pending_dispatch_reservation(
+        let _ = crate::services::discord::mailbox_clear_pending_dispatch_reservation(
             &shared,
             &provider,
             channel_id,
@@ -1018,7 +1032,7 @@ mod busy_retry_fifo_tests {
             .await
             .intervention
             .expect("A retries before B");
-        crate::services::discord::mailbox_abandon_pending_dispatch(
+        let _ = crate::services::discord::mailbox_abandon_pending_dispatch(
             &shared,
             &provider,
             channel_id,
@@ -1033,7 +1047,7 @@ mod busy_retry_fifo_tests {
             .expect("B remains second");
         assert_eq!(retried_first.message_id, first.message_id);
         assert_eq!(later_second.message_id, second.message_id);
-        crate::services::discord::mailbox_abandon_pending_dispatch(
+        let _ = crate::services::discord::mailbox_abandon_pending_dispatch(
             &shared,
             &provider,
             channel_id,
@@ -1051,7 +1065,7 @@ mod busy_retry_fifo_tests {
             .await
             .intervention
             .expect("normal FIFO returns A");
-        crate::services::discord::mailbox_abandon_pending_dispatch(
+        let _ = crate::services::discord::mailbox_abandon_pending_dispatch(
             &shared,
             &provider,
             channel_id,

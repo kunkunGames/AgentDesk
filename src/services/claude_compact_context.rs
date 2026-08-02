@@ -27,6 +27,10 @@ const MAX_CATALOGS: usize = 32;
 const MAX_LAUNCH_PROVENANCE: usize = 512;
 const TMUX_LAUNCH_PROVENANCE_OPTION: &str = "@agentdesk_claude_compact_provenance";
 pub(crate) const CLAUDE_AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+/// OCX's own auto-context default (`AUTO_COMPACT_WINDOW_DEFAULT` in opencodex
+/// `context-windows.ts`). Mirrored so an ADK-hosted TUI receives the exact env
+/// an `ocx claude` launch would have injected for the same gateway policy.
+const OCX_AUTO_COMPACT_WINDOW_DEFAULT_TOKENS: u64 = 350_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClaudeLaunchProvenance {
@@ -61,7 +65,18 @@ struct PersistedLaunchProvenance {
 #[derive(Clone, Debug)]
 struct CatalogEntry {
     windows: HashMap<String, u64>,
+    /// The gateway's own effective `CLAUDE_CODE_AUTO_COMPACT_WINDOW` decision
+    /// (`None` when its auto-context policy is off or unreported).
+    auto_compact_window: Option<u64>,
     refreshed_at: Instant,
+}
+
+/// One fetched snapshot of the gateway's `/api/claude-code` surface: the
+/// model-window map plus the gateway's own auto-context decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GatewayCatalog {
+    pub(crate) windows: HashMap<String, u64>,
+    pub(crate) auto_compact_window: Option<u64>,
 }
 
 #[derive(Default)]
@@ -247,6 +262,87 @@ pub(crate) fn launch_auto_compact_window_for_session(
             gateway_proxy_env,
         )
     })
+}
+
+/// Absolute Claude Code launch knob for a mutable interactive TUI (#4591
+/// revision). Unlike the immutable headless knob above, this value is NOT
+/// derived from the launch model: it replicates the model-independent env the
+/// gateway itself injects into `ocx claude` launches, so mid-session model
+/// switches cannot make it stale. Without it, gateway-generated subagent
+/// definitions carrying a `[1m]` marker are accounted at 1M by Claude Code
+/// while the routed backend enforces a smaller real window — their internal
+/// loops overflow before compaction arms, and ADK's own compact steering can
+/// never reach a CLI-internal subagent loop. Scrubbed launches use only native
+/// selectors, whose `[1m]` windows are genuinely 1M, so they need no knob.
+pub(crate) fn tui_launch_auto_compact_window(
+    gateway_proxy_env: &ClaudeGatewayProxyEnv,
+) -> Option<u64> {
+    let ClaudeGatewayProxyEnv::Inject { base_url } = gateway_proxy_env else {
+        return None;
+    };
+    let proxy_url = normalize_proxy_url(base_url);
+    if proxy_url.is_empty() {
+        return None;
+    }
+    if let Some(decision) = cached_gateway_auto_compact_window(&proxy_url) {
+        return decision;
+    }
+    // Cold cache: a TUI pane launch is rare and not latency-critical, while a
+    // pane that misses this knob keeps the hazard for its whole lifetime. Run
+    // one bounded fetch on a dedicated thread (the HTTP client enforces its
+    // own 2s timeout) so this works from both async and blocking callers.
+    let fetch_url = proxy_url.clone();
+    let fetched = std::thread::Builder::new()
+        .name("claude-catalog-launch-fetch".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            Some(runtime.block_on(fetch_catalog(&fetch_url)))
+        })
+        .ok()?
+        .join()
+        .ok()??;
+    match fetched {
+        Ok(catalog) if !catalog.windows.is_empty() => {
+            let decision = catalog.auto_compact_window;
+            let mut state = CATALOG_STATE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            commit_catalog_entry(&mut state, &proxy_url, catalog);
+            decision
+        }
+        Ok(_) => {
+            tracing::warn!(
+                proxy_url,
+                "Claude launch catalog fetch returned an empty window map; TUI launches without an absolute compact window"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(
+                proxy_url,
+                %error,
+                "Claude launch catalog fetch failed; TUI launches without an absolute compact window"
+            );
+            None
+        }
+    }
+}
+
+/// Fresh-cache read of the gateway's auto-compact decision. Outer `None` means
+/// the cache is cold or stale; inner `None` means a fresh gateway reported its
+/// auto-context policy as off.
+fn cached_gateway_auto_compact_window(proxy_url: &str) -> Option<Option<u64>> {
+    let state = CATALOG_STATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state
+        .by_proxy_url
+        .get(proxy_url)
+        .filter(|entry| entry.refreshed_at.elapsed() < CATALOG_TTL)
+        .map(|entry| entry.auto_compact_window)
 }
 
 /// Render an isolation fence for shell-based launches. An inherited absolute
@@ -508,24 +604,31 @@ fn spawn_catalog_refresh(proxy_url: String) {
     });
 }
 
+/// Commit one fetched catalog snapshot without touching the in-flight refresh
+/// marker. Shared by the background refresh path and the bounded launch fetch.
+fn commit_catalog_entry(state: &mut CatalogState, proxy_url: &str, catalog: GatewayCatalog) {
+    state.by_proxy_url.insert(
+        proxy_url.to_string(),
+        CatalogEntry {
+            windows: catalog.windows,
+            auto_compact_window: catalog.auto_compact_window,
+            refreshed_at: Instant::now(),
+        },
+    );
+    trim_oldest_catalogs(state);
+}
+
 /// Commit a catalog refresh. Failed or empty refreshes deliberately retain a
 /// stale map for diagnostics/retry, but callers can never consume that map:
 /// [`cached_catalog_and_schedule_refresh`] returns only fresh entries.
-fn finish_catalog_refresh(proxy_url: &str, result: Result<HashMap<String, u64>, String>) {
+fn finish_catalog_refresh(proxy_url: &str, result: Result<GatewayCatalog, String>) {
     let mut state = CATALOG_STATE
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     state.refreshing.remove(proxy_url);
     match result {
-        Ok(windows) if !windows.is_empty() => {
-            state.by_proxy_url.insert(
-                proxy_url.to_string(),
-                CatalogEntry {
-                    windows,
-                    refreshed_at: Instant::now(),
-                },
-            );
-            trim_oldest_catalogs(&mut state);
+        Ok(catalog) if !catalog.windows.is_empty() => {
+            commit_catalog_entry(&mut state, proxy_url, catalog);
         }
         Ok(_) => tracing::warn!(proxy_url, "Claude context-window catalog was empty"),
         Err(error) => {
@@ -534,7 +637,7 @@ fn finish_catalog_refresh(proxy_url: &str, result: Result<HashMap<String, u64>, 
     }
 }
 
-async fn fetch_catalog(proxy_url: &str) -> Result<HashMap<String, u64>, String> {
+async fn fetch_catalog(proxy_url: &str) -> Result<GatewayCatalog, String> {
     let endpoint = catalog_endpoint(proxy_url)
         .ok_or_else(|| "Claude context-window proxy URL is empty".to_string())?;
     let client = CONTEXT_WINDOW_CLIENT.get_or_init(|| {
@@ -543,8 +646,11 @@ async fn fetch_catalog(proxy_url: &str) -> Result<HashMap<String, u64>, String> 
             .build()
             .expect("build Claude context-window HTTP client")
     });
-    let response = client
-        .get(&endpoint)
+    let mut request = client.get(&endpoint);
+    if let Some(token) = local_gateway_admin_token(&endpoint) {
+        request = request.header("x-opencodex-api-key", token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("GET {endpoint}: {error}"))?
@@ -554,7 +660,7 @@ async fn fetch_catalog(proxy_url: &str) -> Result<HashMap<String, u64>, String> 
         .text()
         .await
         .map_err(|error| format!("read {endpoint}: {error}"))?;
-    parse_context_window_catalog(&body).map_err(|error| format!("parse {endpoint}: {error}"))
+    parse_gateway_catalog(&body).map_err(|error| format!("parse {endpoint}: {error}"))
 }
 
 /// Parses both OCX's `contextWindows` map and array/object compatibility
@@ -562,10 +668,84 @@ async fn fetch_catalog(proxy_url: &str) -> Result<HashMap<String, u64>, String> 
 /// compatibility entries must name a model and its context-window field so
 /// root response metadata cannot poison the conservative unknown-model fallback.
 pub(crate) fn parse_context_window_catalog(body: &str) -> Result<HashMap<String, u64>, String> {
+    parse_gateway_catalog(body).map(|catalog| catalog.windows)
+}
+
+/// Full gateway snapshot: the window map plus the gateway's own auto-context
+/// decision derived from the same response body.
+pub(crate) fn parse_gateway_catalog(body: &str) -> Result<GatewayCatalog, String> {
     let value: Value = serde_json::from_str(body).map_err(|error| error.to_string())?;
     let mut windows = HashMap::new();
     collect_catalog_windows(&value, &mut windows);
-    Ok(windows)
+    Ok(GatewayCatalog {
+        windows,
+        auto_compact_window: ocx_auto_compact_window(&value),
+    })
+}
+
+/// Mirror OCX's `resolveAutoContext` (opencodex `context-windows.ts`): the
+/// gateway injects `CLAUDE_CODE_AUTO_COMPACT_WINDOW` into its own `ocx claude`
+/// launches exactly when its auto-context policy is on and the legacy
+/// `maxContextTokens` override is absent. An out-of-range or missing
+/// `autoCompactWindow` config value falls back to the 350k default, matching
+/// the gateway's own fallback. Absent policy fields fail closed.
+fn ocx_auto_compact_window(value: &Value) -> Option<u64> {
+    let object = value.as_object()?;
+    if object.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if object.get("autoContext").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if object
+        .get("maxContextTokens")
+        .and_then(Value::as_u64)
+        .is_some_and(|tokens| tokens > 0)
+    {
+        return None;
+    }
+    let window = object
+        .get("autoCompactWindow")
+        .and_then(Value::as_u64)
+        .filter(|window| {
+            (CLAUDE_AUTO_COMPACT_MIN_TOKENS..=CLAUDE_AUTO_COMPACT_MAX_TOKENS).contains(window)
+        })
+        .unwrap_or(OCX_AUTO_COMPACT_WINDOW_DEFAULT_TOKENS);
+    Some(window)
+}
+
+/// OCX gates its whole management API (`/api/*`, including the catalog
+/// endpoint) behind an admin token: `OPENCODEX_ADMIN_AUTH_TOKEN` env first,
+/// else the token file in its config dir (`$OPENCODEX_HOME`, default
+/// `~/.opencodex`). Mirror that resolution — but only for loopback endpoints:
+/// the file token is a host-local secret and must never be sent to a remote
+/// gateway. Absent token → no header (pre-auth gateways keep working).
+fn local_gateway_admin_token(endpoint: &str) -> Option<String> {
+    let host = reqwest::Url::parse(endpoint).ok()?.host_str()?.to_string();
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return None;
+    }
+    if let Ok(token) = std::env::var("OPENCODEX_ADMIN_AUTH_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    let config_dir = std::env::var("OPENCODEX_HOME")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".opencodex")))?;
+    let path = config_dir.join("admin-api-token");
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    // Mirror OCX's own read guard: regular file, bounded size.
+    if !metadata.is_file() || metadata.len() > 512 {
+        return None;
+    }
+    let token = std::fs::read_to_string(&path).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 fn collect_catalog_windows(value: &Value, windows: &mut HashMap<String, u64>) {
@@ -689,6 +869,15 @@ fn reset_for_test() {
 
 #[cfg(test)]
 pub(crate) fn put_catalog_for_test(proxy_url: &str, windows: HashMap<String, u64>) {
+    put_catalog_with_auto_compact_for_test(proxy_url, windows, None);
+}
+
+#[cfg(test)]
+pub(crate) fn put_catalog_with_auto_compact_for_test(
+    proxy_url: &str,
+    windows: HashMap<String, u64>,
+    auto_compact_window: Option<u64>,
+) {
     CATALOG_STATE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -697,6 +886,7 @@ pub(crate) fn put_catalog_for_test(proxy_url: &str, windows: HashMap<String, u64
             normalize_proxy_url(proxy_url),
             CatalogEntry {
                 windows,
+                auto_compact_window,
                 refreshed_at: Instant::now(),
             },
         );
@@ -786,6 +976,113 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed, HashMap::from([("gpt".to_string(), 372_000)]));
+    }
+
+    #[test]
+    fn gateway_auto_compact_mirrors_ocx_resolve_auto_context() {
+        let decide = |body: &str| parse_gateway_catalog(body).unwrap().auto_compact_window;
+        // Policy on, explicit in-range window.
+        assert_eq!(
+            decide(
+                r#"{"enabled":true,"autoContext":true,"autoCompactWindow":700000,"contextWindows":{}}"#
+            ),
+            Some(700_000)
+        );
+        // Policy on, null/missing window falls back to OCX's 350k default.
+        assert_eq!(
+            decide(
+                r#"{"enabled":true,"autoContext":true,"autoCompactWindow":null,"contextWindows":{}}"#
+            ),
+            Some(350_000)
+        );
+        // Out-of-range config values also fall back to the default, matching
+        // OCX's own hand-edit guard.
+        assert_eq!(
+            decide(
+                r#"{"enabled":true,"autoContext":true,"autoCompactWindow":5,"contextWindows":{}}"#
+            ),
+            Some(350_000)
+        );
+        // Auto-context off, gateway disabled, or the legacy maxContextTokens
+        // override all disable the knob; absent fields fail closed.
+        assert_eq!(
+            decide(r#"{"enabled":true,"autoContext":false,"contextWindows":{}}"#),
+            None
+        );
+        assert_eq!(
+            decide(r#"{"enabled":false,"autoContext":true,"contextWindows":{}}"#),
+            None
+        );
+        assert_eq!(
+            decide(
+                r#"{"enabled":true,"autoContext":true,"maxContextTokens":180000,"contextWindows":{}}"#
+            ),
+            None
+        );
+        assert_eq!(decide(r#"{"contextWindows":{"gpt":372000}}"#), None);
+        assert_eq!(decide(r#"[{"id":"gpt","context_window":372000}]"#), None);
+    }
+
+    #[test]
+    fn tui_launch_window_uses_fresh_gateway_policy_and_scrub_stays_disarmed() {
+        let _guard = state_test_guard();
+        let proxy = "http://tui-policy.test";
+        put_catalog_with_auto_compact_for_test(
+            proxy,
+            HashMap::from([("gpt".to_string(), 372_000)]),
+            Some(350_000),
+        );
+        assert_eq!(
+            tui_launch_auto_compact_window(&ClaudeGatewayProxyEnv::Inject {
+                base_url: proxy.to_string(),
+            }),
+            Some(350_000)
+        );
+
+        put_catalog_with_auto_compact_for_test(
+            proxy,
+            HashMap::from([("gpt".to_string(), 372_000)]),
+            None,
+        );
+        assert_eq!(
+            tui_launch_auto_compact_window(&ClaudeGatewayProxyEnv::Inject {
+                base_url: proxy.to_string(),
+            }),
+            None,
+            "a fresh gateway reporting auto-context off must not arm the knob"
+        );
+
+        assert_eq!(
+            tui_launch_auto_compact_window(&ClaudeGatewayProxyEnv::Scrub),
+            None,
+            "scrubbed launches use native selectors whose [1m] windows are genuinely 1M"
+        );
+    }
+
+    #[test]
+    fn gateway_admin_token_is_never_sent_to_non_loopback_hosts() {
+        assert_eq!(
+            local_gateway_admin_token("http://10.0.0.5:10100/api/claude-code"),
+            None
+        );
+        assert_eq!(
+            local_gateway_admin_token("http://gateway.example:10100/api/claude-code"),
+            None
+        );
+        assert_eq!(local_gateway_admin_token("not a url"), None);
+    }
+
+    #[test]
+    fn tui_launch_window_cold_cache_fetch_failure_fails_closed() {
+        let _guard = state_test_guard();
+        // 127.0.0.1:9 (discard) refuses immediately; the bounded launch fetch
+        // must fail closed without arming the knob.
+        assert_eq!(
+            tui_launch_auto_compact_window(&ClaudeGatewayProxyEnv::Inject {
+                base_url: "http://127.0.0.1:9".to_string(),
+            }),
+            None
+        );
     }
 
     #[test]
@@ -1112,5 +1409,31 @@ mod tests {
         assert!(enabled_command.get_envs().any(|(key, value)| {
             key == OsStr::new(CLAUDE_AUTO_COMPACT_WINDOW_ENV) && value == Some(OsStr::new("700000"))
         }));
+    }
+
+    /// Operator diagnostic against a live local gateway; never runs in CI.
+    /// `cargo test --lib live_probe_tui_launch_window -- --ignored --nocapture`
+    /// prints the launch decision, the raw fetch result (window count +
+    /// policy), and the committed cache entry for `http://127.0.0.1:10100`.
+    #[test]
+    #[ignore = "live gateway probe: requires an opencodex gateway on 127.0.0.1:10100"]
+    fn live_probe_tui_launch_window() {
+        let _guard = state_test_guard();
+        let decision = tui_launch_auto_compact_window(&ClaudeGatewayProxyEnv::Inject {
+            base_url: "http://127.0.0.1:10100".to_string(),
+        });
+        eprintln!("LIVE_PROBE decision={decision:?}");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let raw = runtime.block_on(fetch_catalog("http://127.0.0.1:10100"));
+        eprintln!(
+            "LIVE_PROBE raw_fetch={:?}",
+            raw.as_ref()
+                .map(|catalog| (catalog.windows.len(), catalog.auto_compact_window))
+        );
+        let cached = cached_gateway_auto_compact_window("http://127.0.0.1:10100");
+        eprintln!("LIVE_PROBE cached={cached:?}");
     }
 }

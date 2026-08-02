@@ -1110,14 +1110,17 @@ async fn backfill_missing_notify_outbox_pg(pool: &PgPool) -> Result<usize> {
 }
 
 async fn reset_broken_auto_queue_entries_pg(pool: &PgPool) -> Result<usize> {
-    sqlx::query(
+    let terminalized = sqlx::query(
         "UPDATE auto_queue_entries e
-         SET status = 'pending',
+         SET status = 'skipped',
              dispatch_id = NULL,
              slot_index = NULL,
              dispatched_at = NULL,
-             completed_at = NULL
-         WHERE e.status = 'dispatched'
+             completed_at = NOW()
+         FROM auto_queue_runs r
+         WHERE e.run_id = r.id
+           AND e.status = 'dispatched'
+           AND r.status = 'cancelled'
            AND (
              e.dispatch_id IS NULL
              OR TRIM(e.dispatch_id) = ''
@@ -1130,9 +1133,39 @@ async fn reset_broken_auto_queue_entries_pg(pool: &PgPool) -> Result<usize> {
            )",
     )
     .execute(pool)
-    .await
-    .map(|result| result.rows_affected() as usize)
-    .map_err(anyhow::Error::from)
+    .await?
+    .rows_affected() as usize;
+
+    let reset = sqlx::query(
+        "UPDATE auto_queue_entries e
+         SET status = 'pending',
+             dispatch_id = NULL,
+             slot_index = NULL,
+             dispatched_at = NULL,
+             completed_at = NULL
+         WHERE e.status = 'dispatched'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM auto_queue_runs r
+             WHERE r.id = e.run_id
+               AND r.status = 'cancelled'
+           )
+           AND (
+             e.dispatch_id IS NULL
+             OR TRIM(e.dispatch_id) = ''
+             OR NOT EXISTS (
+               SELECT 1
+               FROM task_dispatches td
+               WHERE td.id = e.dispatch_id
+                 AND td.status NOT IN ('cancelled', 'failed', 'completed')
+             )
+           )",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected() as usize;
+
+    Ok(terminalized + reset)
 }
 
 async fn auto_queue_pending_delivery_orphan_candidates_pg(
@@ -1796,6 +1829,19 @@ fn backfill_legacy_rebind_origin_turn_source(path: &std::path::Path) -> bool {
         "turn_source".to_string(),
         serde_json::Value::String("external_adopted".to_string()),
     );
+    let next_save_generation = object
+        .get("save_generation")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    object.insert(
+        "save_generation".to_string(),
+        serde_json::Value::from(next_save_generation),
+    );
+    object.insert(
+        "updated_at".to_string(),
+        serde_json::Value::String(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+    );
     let Ok(updated) = serde_json::to_string_pretty(&value) else {
         return false;
     };
@@ -1850,9 +1896,16 @@ mod stale_inflight_sweep_tests {
     }
 
     #[test]
-    fn stale_sweep_preserves_legacy_rebind_origin_without_turn_source() {
+    fn stale_sweep_legacy_backfill_invalidates_prior_destructive_cancel_pin() {
         let root = tempfile::tempdir().expect("temp root");
-        let legacy = write_stale_inflight(root.path(), "legacy", r#"{"rebind_origin":true}"#);
+        let original_updated_at = "2026-07-30 12:00:00";
+        let legacy = write_stale_inflight(
+            root.path(),
+            "legacy",
+            &format!(
+                r#"{{"rebind_origin":true,"save_generation":14,"updated_at":"{original_updated_at}"}}"#
+            ),
+        );
 
         let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
 
@@ -1865,6 +1918,8 @@ mod stale_inflight_sweep_tests {
             serde_json::from_str(&fs::read_to_string(&legacy).expect("legacy body"))
                 .expect("updated legacy json");
         assert_eq!(updated["turn_source"], "external_adopted");
+        assert_eq!(updated["save_generation"], 15);
+        assert_ne!(updated["updated_at"], original_updated_at);
     }
 
     #[test]

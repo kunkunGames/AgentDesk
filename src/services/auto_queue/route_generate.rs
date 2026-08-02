@@ -270,19 +270,28 @@ pub async fn generate(
     if cards.is_empty() {
         let mut counts_map = serde_json::Map::new();
         if let Some(pipeline) = crate::pipeline::try_get() {
-            for pipeline_state in &pipeline.states {
-                if !pipeline_state.terminal {
-                    let c = state
-                        .auto_queue_service()
-                        .count_cards_by_status_with_pg(
-                            pool,
-                            body.repo.as_deref(),
-                            body.agent_id.as_deref(),
-                            &pipeline_state.id,
-                        )
-                        .await
-                        .unwrap_or(0);
-                    counts_map.insert(pipeline_state.id.clone(), serde_json::json!(c));
+            let statuses: Vec<String> = pipeline
+                .states
+                .iter()
+                .filter(|s| !s.terminal)
+                .map(|s| s.id.clone())
+                .collect();
+
+            if !statuses.is_empty() {
+                let grouped = state
+                    .auto_queue_service()
+                    .count_cards_by_status_grouped_with_pg(
+                        pool,
+                        body.repo.as_deref(),
+                        body.agent_id.as_deref(),
+                        &statuses,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                for status in statuses {
+                    let count = grouped.get(&status).copied().unwrap_or(0);
+                    counts_map.insert(status, serde_json::json!(count));
                 }
             }
         }
@@ -715,4 +724,106 @@ pub(crate) async fn active_dispatch_id_for_card_pg(
     .bind(card_id)
     .fetch_optional(pool)
     .await
+}
+
+#[cfg(test)]
+mod deploy_gate_request_rejection_tests {
+    use super::*;
+
+    fn body(kind: &str) -> GenerateBody {
+        GenerateBody {
+            repo: Some("itismyfield/AgentDesk".to_string()),
+            agent_id: Some("project-agentdesk".to_string()),
+            auto_assign_agent: None,
+            issue_numbers: None,
+            entries: Some(vec![GenerateEntryBody {
+                issue_number: 4898,
+                batch_phase: Some(0),
+                thread_group: Some(1),
+                phase_gate_kind: Some(kind.to_string()),
+            }]),
+            review_mode: None,
+            mode: None,
+            unified_thread: None,
+            parallel: None,
+            max_concurrent_threads: None,
+            force: None,
+            max_concurrent_per_agent: None,
+        }
+    }
+
+    fn state_with_postgres(pg_pool: Option<sqlx::PgPool>) -> AppState {
+        let config = crate::config::Config::default();
+        let broadcast_tx = crate::eventbus::new_broadcast();
+        let batch_buffer = crate::eventbus::spawn_batch_flusher(broadcast_tx.clone());
+        AppState {
+            pg_pool,
+            engine: crate::engine::PolicyEngine::new(&config)
+                .expect("construct policy engine for validation test"), // agentdesk-audit: allow-unwrap — test fixture construction
+            config: Arc::new(config),
+            broadcast_tx,
+            batch_buffer,
+            health_registry: None,
+            cluster_instance_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_deploy_gate_is_a_typed_client_error_before_database_access() {
+        let error = generate(State(state_with_postgres(None)), Json(body("deploy-gate")))
+            .await
+            .expect_err("unavailable deploy-gate must be rejected");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), ErrorCode::AutoQueue);
+        assert_eq!(
+            error.message(),
+            crate::phase_gate::DEPLOY_GATE_UNAVAILABLE_REASON
+        );
+    }
+
+    #[cfg(test)]
+    mod postgres_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn unavailable_deploy_gate_creates_no_database_rows() {
+            let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let runs_before =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_runs")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue runs before request"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+            let entries_before =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_entries")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue entries before request"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+
+            let error = generate(
+                State(state_with_postgres(Some(pool.clone()))),
+                Json(body("deploy-gate")),
+            )
+            .await
+            .expect_err("unavailable deploy-gate must be rejected");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_runs")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue runs after request"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+                runs_before
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_entries")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue entries after request"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+                entries_before
+            );
+
+            pool.close().await;
+            pg_db.drop().await;
+        }
+    }
 }
