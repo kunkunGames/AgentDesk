@@ -598,6 +598,7 @@ src/
 │   │   │   ├── delivery.rs
 │   │   │   ├── delivery_frontier_probe.rs
 │   │   │   ├── delivery_record.rs
+│   │   │   ├── image_attachment.rs
 │   │   │   ├── manual_delivery.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs

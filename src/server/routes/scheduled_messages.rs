@@ -138,6 +138,19 @@ fn validate_image_attachment(
             "imageAttachment.contentType must be image/jpeg, image/png, image/webp, or image/gif",
         ));
     }
+    if let Err(error) =
+        crate::services::discord::outbound::image_attachment::validate_filename_content_type(
+            filename,
+            &content_type,
+        )
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "imageAttachment.filename is incompatible with imageAttachment.contentType: {error}"
+            ),
+        ));
+    }
     let data = BASE64_STANDARD
         .decode(body.data_base64.trim())
         .map_err(|_| {
@@ -181,13 +194,7 @@ pub async fn create_scheduled_message(
     Json(body): Json<CreateScheduledMessageBody>,
 ) -> ApiResponse {
     let pool = pool_or_unavailable(&state)?;
-    let new = validate_create(
-        pool,
-        &body,
-        state.config.cluster.enabled,
-        state.config.cluster.lease_ttl_secs,
-    )
-    .await?;
+    let new = validate_create(pool, &body, state.config.cluster.enabled).await?;
 
     // #4658: capture the immutable snapshot atomically with the definition
     // insert. Success guarantees the snapshot row exists (FK + CHECK); an empty
@@ -228,7 +235,6 @@ async fn validate_create(
     pool: &PgPool,
     body: &CreateScheduledMessageBody,
     cluster_enabled: bool,
-    cluster_lease_ttl_secs: u64,
 ) -> Result<NewScheduledMessage, AppError> {
     let content = body.content.trim();
     if content.is_empty() {
@@ -390,8 +396,7 @@ async fn validate_create(
     }
     validate_image_attachment_content_length(content, image_attachment.is_some())?;
     if image_attachment.is_some() {
-        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
-            .await?;
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled).await?;
     }
 
     Ok(NewScheduledMessage {
@@ -447,12 +452,11 @@ fn validate_image_attachment_content_length(
 async fn ensure_image_attachment_rollout_ready(
     pool: &PgPool,
     cluster_enabled: bool,
-    lease_ttl_secs: u64,
 ) -> Result<(), AppError> {
     if !cluster_enabled {
         return Ok(());
     }
-    let ready = db::image_attachment_rollout_ready_pg(pool, lease_ttl_secs)
+    let ready = db::image_attachment_rollout_ready_pg(pool)
         .await
         .map_err(|error| {
             app_error(
@@ -716,14 +720,7 @@ pub async fn patch_scheduled_message(
         ));
     }
 
-    let patch = build_patch(
-        pool,
-        body,
-        &existing,
-        state.config.cluster.enabled,
-        state.config.cluster.lease_ttl_secs,
-    )
-    .await?;
+    let patch = build_patch(pool, body, &existing, state.config.cluster.enabled).await?;
 
     match db::update_scheduled_message_pg(pool, &id, &patch).await {
         Ok(Some(row)) => Ok((
@@ -825,7 +822,6 @@ async fn build_patch(
     body: &serde_json::Map<String, JsonValue>,
     existing: &ScheduledMessageRow,
     cluster_enabled: bool,
-    cluster_lease_ttl_secs: u64,
 ) -> Result<ScheduledMessagePatch, AppError> {
     let bad_request = |message: String| app_error(StatusCode::BAD_REQUEST, message);
     let mut patch = ScheduledMessagePatch::default();
@@ -927,8 +923,7 @@ async fn build_patch(
     };
     validate_image_attachment_content_length(effective_content, effective_has_image_attachment)?;
     if patch.image_attachment.as_ref().is_some_and(Option::is_some) {
-        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
-            .await?;
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled).await?;
     }
 
     let mut effective_scheduled_at = patch.scheduled_at.unwrap_or(existing.scheduled_at);
@@ -1218,6 +1213,22 @@ mod tests {
             normalize_target_channel_id(Some("not-a-known-channel-alias".to_string())).is_err()
         );
         assert_eq!(normalize_target_channel_id(None).unwrap(), None);
+    }
+
+    #[test]
+    fn new_image_attachment_uploads_reject_mime_filename_mismatch() {
+        let body = ScheduledMessageImageAttachmentBody {
+            filename: "thumbnail.jpg".to_string(),
+            content_type: "image/png".to_string(),
+            data_base64: BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nthumbnail"),
+        };
+
+        let error = validate_image_attachment(&body)
+            .expect_err("new reservations must use a MIME-compatible filename");
+        assert!(
+            error.to_string().contains("filename extension"),
+            "unexpected validation error: {error}"
+        );
     }
 
     #[test]

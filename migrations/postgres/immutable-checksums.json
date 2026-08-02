@@ -530,6 +530,11 @@
       "path": "migrations/postgres/0103_scheduled_message_image_attachments.sql",
       "sha256": "444af31e3eef42dea9ff14815682a2f74028d7478525be9ff31f04ae43dd92ac",
       "version": 103
+    },
+    {
+      "path": "migrations/postgres/0104_scheduled_image_consumer_floor.sql",
+      "sha256": "61a283ccc3d6fbba9fbf04f1a4a195bfe2b16e34d26c38cd05101f44005a2f42",
+      "version": 104
     }
   ],
   "version": 1

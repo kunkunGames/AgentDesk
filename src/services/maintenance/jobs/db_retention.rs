@@ -6,13 +6,13 @@
 //! |-----------------------------------------|-----------|-----------------------------------|
 //! | `agent_quality_event`                   | 90 days   | Monthly aggregate, then DELETE    |
 //! | `session_transcripts`                   | 90 days   | Archive-table copy, then DELETE   |
-//! | `message_outbox` (sent)                 | 7 days    | DELETE (durable sentinels exempt) |
+//! | `message_outbox` (sent)                 | 7 days    | DELETE or clear sentinel payload  |
 //! | `auto_queue_entries`                    | 30 days   | DELETE (status='completed')       |
 //! | `task_dispatches`                       | 90 days   | Monthly aggregate, then DELETE    |
 //! | `turn_lifecycle_events`                 | 30 days   | DELETE (on `created_at`)          |
 //! | `skill_usage`                           | 90 days   | DELETE (on `used_at`)             |
 //! | `turns`                                 | 90 days   | Archive-table copy, then DELETE   |
-//! | `scheduled_messages` image bytes        | 7 days    | Clear terminal one-shot payloads  |
+//! | `scheduled_messages` image bytes        | 7 days    | Clear terminal payloads           |
 //! | `scheduled_message_context_snapshots`   | 30 days   | DELETE (all refs terminal + aged) |
 //!
 //! `kanban_cards` is explicitly **not** touched — done cards are permanent
@@ -81,10 +81,11 @@ impl RetentionReport {
 
 const TURN_RETENTION_DAYS: i32 = 90;
 const TRANSCRIPT_RETENTION_DAYS: i32 = 90;
-const OUTBOX_RETENTION_DAYS: i32 = 7;
+const OUTBOX_RETENTION_DAYS: i32 =
+    crate::services::message_outbox::PERSISTENT_ATTACHMENT_RETENTION_DAYS;
 // Keep durable image bytes no longer than their delivered outbox handoff. Only
-// terminal one-shot definitions are reclaimed; active recurring schedules keep
-// their image for the next fire.
+// terminal definitions are reclaimed; active recurring schedules keep their
+// image for the next fire.
 const SCHEDULED_MESSAGE_IMAGE_RETENTION_DAYS: i32 = OUTBOX_RETENTION_DAYS;
 const AUTO_QUEUE_RETENTION_DAYS: i32 = 30;
 const DISPATCH_RETENTION_DAYS: i32 = 90;
@@ -123,7 +124,7 @@ pub async fn db_retention_job(pool: &PgPool, dry_run: bool) -> Result<RetentionR
     retain_skill_usage(pool, dry_run, &mut report).await?;
     // 8. turns (archive-then-delete on finished_at). #3865
     retain_turns(pool, dry_run, &mut report).await?;
-    // 9. scheduled_messages image attachments (terminal one-shots only).
+    // 9. scheduled_messages image attachments (all terminal definitions).
     retain_scheduled_message_image_attachments(pool, dry_run, &mut report).await?;
     // 10. scheduled_message_context_snapshots (all refs terminal + aged). #4658/#4723
     retain_context_snapshots(pool, dry_run, &mut report).await?;
@@ -272,6 +273,8 @@ async fn retain_session_transcripts(
 // ─────────────────────────────────────────────────────────────────────────
 // 3. message_outbox: delete sent rows older than 7 days, except permanent
 // dedupe sentinels (`dedupe_key IS NOT NULL AND dedupe_expires_at IS NULL`).
+// Sentinels retain their exactly-once identity but shed binary payloads after
+// the same window.
 //
 // Schema uses `sent_at` (not `delivered_at`) — the DoD's "delivered" maps to
 // status='sent' + sent_at set. Treat both as interchangeable here.
@@ -282,6 +285,14 @@ async fn retain_message_outbox(
     report: &mut RetentionReport,
 ) -> Result<()> {
     if dry_run {
+        let payloads =
+            crate::services::message_outbox::count_expired_persistent_attachment_payloads_pg(pool)
+                .await?;
+        report.push(TableReport {
+            table_name: "message_outbox",
+            action: "clear_attachment_payload_would",
+            rows_affected: payloads,
+        });
         let would = sqlx::query(
             "SELECT COUNT(*)::BIGINT AS n FROM message_outbox \
              WHERE sent_at IS NOT NULL \
@@ -300,6 +311,14 @@ async fn retain_message_outbox(
         return Ok(());
     }
 
+    let payloads =
+        crate::services::message_outbox::clear_expired_persistent_attachment_payloads_pg(pool)
+            .await?;
+    report.push(TableReport {
+        table_name: "message_outbox",
+        action: "clear_attachment_payload",
+        rows_affected: payloads as i64,
+    });
     let del = sqlx::query(
         "DELETE FROM message_outbox \
          WHERE sent_at IS NOT NULL \
@@ -606,24 +625,24 @@ async fn retain_turns(pool: &PgPool, dry_run: bool, report: &mut RetentionReport
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 9. scheduled_messages: clear durable image bytes from aged terminal one-shot
-// definitions. Definitions are intentionally retained for audit, but their
-// 8 MiB upload payload must follow the outbox retention window.
+// 9. scheduled_messages: clear durable image bytes from aged terminal
+// definitions. Active recurring definitions remain `scheduled` and retain the
+// next fire's image. Definitions are intentionally retained for audit, but a
+// terminal definition's 8 MiB payload follows the outbox retention window.
 // ─────────────────────────────────────────────────────────────────────────
 async fn retain_scheduled_message_image_attachments(
     pool: &PgPool,
     dry_run: bool,
     report: &mut RetentionReport,
 ) -> Result<()> {
-    const TERMINAL_ONE_SHOT_IMAGE_PREDICATE: &str = "image_data IS NOT NULL \
-        AND schedule IS NULL \
+    const TERMINAL_IMAGE_PREDICATE: &str = "image_data IS NOT NULL \
         AND status IN ('sent', 'failed', 'canceled', 'expired') \
         AND updated_at < NOW() - ($1::INT || ' days')::INTERVAL";
 
     if dry_run {
         let would = sqlx::query(&format!(
             "SELECT COUNT(*)::BIGINT AS n FROM scheduled_messages \
-             WHERE {TERMINAL_ONE_SHOT_IMAGE_PREDICATE}"
+             WHERE {TERMINAL_IMAGE_PREDICATE}"
         ))
         .bind(SCHEDULED_MESSAGE_IMAGE_RETENTION_DAYS)
         .fetch_one(pool)
@@ -638,9 +657,8 @@ async fn retain_scheduled_message_image_attachments(
 
     let cleared = sqlx::query(&format!(
         "UPDATE scheduled_messages \
-         SET image_filename = NULL, image_content_type = NULL, image_data = NULL, \
-             updated_at = NOW() \
-         WHERE {TERMINAL_ONE_SHOT_IMAGE_PREDICATE}"
+         SET image_filename = NULL, image_content_type = NULL, image_data = NULL \
+         WHERE {TERMINAL_IMAGE_PREDICATE}"
     ))
     .bind(SCHEDULED_MESSAGE_IMAGE_RETENTION_DAYS)
     .execute(pool)
@@ -801,7 +819,7 @@ mod tests {
         let pool = db.connect_and_migrate().await;
 
         use crate::services::message_outbox::{
-            OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
+            OutboxAttachment, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe,
             enqueue_outbox_pg_returning_id_with_ttl,
         };
         let persistent_id = enqueue_outbox_pg_returning_id_with_persistent_dedupe(
@@ -813,7 +831,11 @@ mod tests {
                 source: "scheduled_message",
                 reason_code: Some("scheduled_message:v1:retention-test:slot"),
                 session_key: None,
-                attachment: None,
+                attachment: Some(OutboxAttachment {
+                    filename: "thumbnail.png",
+                    content_type: "image/png",
+                    data: b"\x89PNG\r\n\x1a\nthumbnail",
+                }),
             },
         )
         .await
@@ -868,6 +890,12 @@ mod tests {
             .await
             .expect("dry-run retention pass");
         assert_eq!(
+            dry.get("message_outbox", "clear_attachment_payload_would")
+                .map(|entry| entry.rows_affected),
+            Some(1),
+            "dry-run must report the permanent sentinel payload reclaim"
+        );
+        assert_eq!(
             dry.get("message_outbox", "delete_would")
                 .map(|entry| entry.rows_affected),
             Some(2),
@@ -877,6 +905,12 @@ mod tests {
         let report = db_retention_job(&pool, false)
             .await
             .expect("retention pass");
+        assert_eq!(
+            report
+                .get("message_outbox", "clear_attachment_payload")
+                .map(|entry| entry.rows_affected),
+            Some(1)
+        );
         assert_eq!(
             report
                 .get("message_outbox", "delete")
@@ -889,6 +923,20 @@ mod tests {
                 .await
                 .expect("read outbox survivors");
         assert_eq!(survivors, vec!["persistent"]);
+        let survivor: (Option<String>, Option<Vec<u8>>, Option<String>) = sqlx::query_as(
+            "SELECT attachment_filename, attachment_data, dedupe_key
+             FROM message_outbox WHERE id = $1",
+        )
+        .bind(persistent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read permanent sentinel after retention");
+        assert_eq!(survivor.0, None);
+        assert_eq!(survivor.1, None);
+        assert!(
+            survivor.2.is_some(),
+            "dedupe identity must survive payload reclaim"
+        );
 
         pool.close().await;
         db.drop().await;
@@ -1132,7 +1180,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn db_retention_clears_aged_terminal_one_shot_image_attachments_pg_test() {
+    async fn db_retention_clears_all_aged_terminal_image_attachments_without_reaging_pg_test() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
             "agentdesk_db_retention_scheduled_images",
             "db_retention scheduled image attachment reclaim",
@@ -1148,7 +1196,13 @@ mod tests {
                 "NOW() - INTERVAL '8 days'",
             ),
             (
-                "smsg_image_recurring",
+                "smsg_image_terminal_recurring",
+                "canceled",
+                Some("@every 1h"),
+                "NOW() - INTERVAL '8 days'",
+            ),
+            (
+                "smsg_image_active_recurring",
                 "scheduled",
                 Some("@every 1h"),
                 "NOW() - INTERVAL '8 days'",
@@ -1168,6 +1222,12 @@ mod tests {
             .await
             .expect("seed scheduled image definition");
         }
+        let terminal_updated_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM scheduled_messages WHERE id = 'smsg_image_terminal'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read terminal lifecycle timestamp before retention");
 
         let dry = db_retention_job(&pool, true)
             .await
@@ -1175,7 +1235,7 @@ mod tests {
         assert_eq!(
             dry.get("scheduled_messages", "clear_image_attachment_would")
                 .map(|entry| entry.rows_affected),
-            Some(1)
+            Some(2)
         );
 
         let report = db_retention_job(&pool, false)
@@ -1185,7 +1245,7 @@ mod tests {
             report
                 .get("scheduled_messages", "clear_image_attachment")
                 .map(|entry| entry.rows_affected),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             count(
@@ -1202,11 +1262,32 @@ mod tests {
             count(
                 &pool,
                 "SELECT COUNT(*)::BIGINT AS n FROM scheduled_messages \
-                 WHERE id = 'smsg_image_recurring' AND image_data IS NOT NULL"
+                 WHERE id = 'smsg_image_terminal_recurring' \
+                   AND image_filename IS NULL AND image_content_type IS NULL AND image_data IS NULL"
+            )
+            .await,
+            1,
+            "aged terminal recurring attachments must also be cleared"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*)::BIGINT AS n FROM scheduled_messages \
+                 WHERE id = 'smsg_image_active_recurring' AND image_data IS NOT NULL"
             )
             .await,
             1,
             "active recurring schedules must retain their image"
+        );
+        let retained_updated_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT updated_at FROM scheduled_messages WHERE id = 'smsg_image_terminal'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read terminal lifecycle timestamp after retention");
+        assert_eq!(
+            retained_updated_at, terminal_updated_at,
+            "payload reclamation must not postpone snapshot lifecycle retention"
         );
 
         pool.close().await;

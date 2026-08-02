@@ -337,26 +337,47 @@ pub async fn list_scheduled_messages_pg(
     builder.build_query_as().fetch_all(pool).await
 }
 
-/// True when every live cluster worker understands durable scheduled-image
-/// attachments. A missing advertisement is treated as an old binary.
-pub async fn image_attachment_rollout_ready_pg(
-    pool: &PgPool,
-    lease_ttl_secs: u64,
-) -> Result<bool, sqlx::Error> {
+/// True when every cluster worker still marked online advertises the post-0104
+/// image consumer floor. A node that advertises only the original 0103 image
+/// format cannot declare the transaction-local claim capability.
+///
+/// Deliberately do not infer liveness from heartbeat age here. The node
+/// registry owns the authoritative online -> offline transition; ignoring a
+/// stale-but-online row would open a creation-time rollout gap. Migration 0104
+/// independently fences consumers and refuses to install until the fleet is
+/// stopped, drained, and its online registry contains no legacy consumer.
+pub async fn image_attachment_rollout_ready_pg(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT NOT EXISTS (\
              SELECT 1 FROM worker_nodes \
              WHERE status = 'online' \
-               AND last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second') \
                AND COALESCE(\
-                   capabilities #>> '{scheduled_messages,image_attachments_v1}', \
+                   capabilities #>> '{scheduled_messages,consumer_floor_v1}', \
                    'false'\
                ) <> 'true'\
          )",
     )
-    .bind(lease_ttl_secs.max(1) as i64)
     .fetch_one(pool)
     .await
+}
+
+/// Declare, for the lifetime of one PostgreSQL transaction, that the caller
+/// implements the scheduled-image attachment delivery contract introduced by
+/// migration 0104. Database triggers reject image claims from older binaries
+/// that cannot make this declaration.
+pub(crate) async fn declare_image_attachment_consumer_v1_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT set_config(\
+            'agentdesk.scheduled_image_consumer_v1', \
+            'enabled', \
+            true\
+         )",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Apply a patch to a definition; only rows still in `scheduled` are editable.
@@ -610,6 +631,7 @@ async fn arm_delivery_slot_tx(
     lease_secs: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
+    declare_image_attachment_consumer_v1_tx(tx).await?;
     let delivery_id = format!("smdel_{}", Uuid::new_v4());
     let claim_token = format!("smclaim_{}", Uuid::new_v4());
     let armed = sqlx::query(
