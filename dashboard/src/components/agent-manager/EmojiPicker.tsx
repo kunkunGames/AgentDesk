@@ -108,7 +108,6 @@ export default function EmojiPicker({
       {open && (
         <div
           role="dialog"
-          aria-modal="true"
           aria-label={dialogLabel || tr({ ko: "이모지 선택", en: "Choose an emoji" })}
           className="absolute left-0 top-full z-[60] mt-1 overflow-hidden rounded-xl shadow-2xl"
           style={{
