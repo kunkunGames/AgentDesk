@@ -638,6 +638,7 @@ jobs:
         self.assertIn(
             '"$PYTHON" -m unittest tests.test_fast_check_ci_wiring', script
         )
+        self.assertIn('"$PYTHON" -m unittest tests.test_verify_dashboard', script)
         self.assertIn(
             'scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"',
             script,
