@@ -600,17 +600,38 @@
   the entire fleet together. The migration-specific CI gate is activated only
   when the migration 0093 SQL file is in the changed-file set, so unrelated PRs
   and the pre-0093 main branch are not gated by this boundary.
-- Migration 0104 scheduled-image delivery uses a database-enforced consumer
-  floor in addition to the worker heartbeat capability gate. Every node still
-  marked `online` must advertise `scheduled_messages.image_attachments_v1`
-  before the API accepts an image. More importantly, PostgreSQL triggers reject
-  image-bearing `scheduled_messages -> firing` and `message_outbox -> processing`
-  claims unless the transaction declares
-  `agentdesk.scheduled_image_consumer_v1=enabled`. Pre-0104 processes cannot
-  make that declaration, so a stale process resuming or registering after the
-  creation check remains fail-closed. Migration 0104 is forward-only after it
-  commits; rollback requires a forward fix or a pre-0104 database restore with
-  the entire fleet rolled back together.
+- Migration 0104 scheduled-image delivery is a **stop-and-drain binary-floor
+  boundary**, not a rolling migration. A legacy worker claims mixed text/image
+  batches in one transaction, so installing the row fence while that worker is
+  live would abort unrelated text claims. Before applying 0104, stop new
+  admission, let both queries below reach zero, stop every AgentDesk process,
+  verify the processes are gone, and only then mark their `worker_nodes` rows
+  `offline` (the registry has no graceful-shutdown transition):
+
+  ```sql
+  SELECT COUNT(*) FROM scheduled_messages
+   WHERE status = 'firing' AND image_data IS NOT NULL;
+  SELECT COUNT(*) FROM message_outbox
+   WHERE status = 'processing' AND attachment_data IS NOT NULL;
+
+  -- Run only after the service manager confirms every AgentDesk process stopped.
+  UPDATE worker_nodes
+     SET status = 'offline', updated_at = NOW()
+   WHERE status = 'online';
+  ```
+
+  Migration 0104 takes write-conflicting locks on `worker_nodes`,
+  `scheduled_messages`, and `message_outbox`, then fails with SQLSTATE `55000`
+  unless every still-online node advertises
+  `scheduled_messages.consumer_floor_v1` and both in-flight counts are zero.
+  After that atomic preflight, PostgreSQL triggers reject image-bearing
+  `scheduled_messages -> firing` and `message_outbox -> processing` claims
+  unless the transaction declares
+  `agentdesk.scheduled_image_consumer_v1=enabled`. Start only binaries that
+  advertise `consumer_floor_v1`; pre-0104 binaries must not restart because
+  their mixed batches intentionally fail closed at the database boundary.
+  Migration 0104 is forward-only after it commits; rollback requires a forward
+  fix or a pre-0104 database restore with the entire fleet rolled back together.
 - #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
   Discord gateway/runtime**. Queue acceptance and retry requeue states are
   rendered only by the existing persisted `turn_view_reconciler` identity;

@@ -151,8 +151,11 @@ push 예약은 선택적으로 대표 이미지 한 장을 함께 보낼 수 있
 
 - 허용 MIME: `image/jpeg`, `image/png`, `image/webp`, `image/gif`
 - 최대 크기: 8 MiB, MIME과 실제 파일 시그니처가 일치해야 함
-- Serenity가 multipart MIME을 파일명에서 정하므로 확장자도 MIME과 일치해야 한다.
-  JPEG는 `.jpg`/`.jpeg`, 나머지는 각각 `.png`/`.webp`/`.gif`를 허용한다.
+- Serenity가 multipart MIME을 파일명에서 정하므로 신규 CREATE/PATCH는 확장자도
+  MIME과 일치해야 한다. JPEG는 `.jpg`/`.jpeg`, 나머지는 각각
+  `.png`/`.webp`/`.gif`를 허용한다. 이 규칙 도입 전에 0103 API가 저장한 기존
+  예약은 delivery 경계에서 MIME의 canonical 확장자로 파일명만 정규화하여
+  전달하며, 이미 확보된 dedupe identity나 image bytes는 변경하지 않는다.
 - `imageAttachment`는 `deliveryKind: "push"`에서만 허용된다. agent 답변은
   agent가 생성하는 본문이므로 예약 파일을 별도로 끼워 넣지 않는다.
 - 활성 반복 예약(`status='scheduled'`)은 다음 발화를 위해 이미지를 유지한다.
@@ -161,11 +164,15 @@ push 예약은 선택적으로 대표 이미지 한 장을 함께 보낼 수 있
   dedupe sentinel도 7일 뒤 첨부 payload만 비우고 dedupe identity는 보존한다.
 
 클러스터 생성 gate는 heartbeat 시각으로 노드를 누락하지 않고 `online`으로 남은
-모든 worker capability를 확인한다. 별도로 0104의 PostgreSQL trigger는 이미지
-정의가 `firing`으로, 이미지 outbox row가 `processing`으로 바뀌기 전에 동일
-transaction의 `agentdesk.scheduled_image_consumer_v1=enabled` 선언을 요구한다.
-따라서 생성 gate 이후 구버전 process가 등록되거나 stale process가 재개되어도
-이미지 전달을 claim하지 못한다.
+모든 worker가 `scheduled_messages.consumer_floor_v1`을 광고하는지 확인한다.
+0104는 rolling migration이 아니라 stop-and-drain binary floor다. migration은
+`worker_nodes`, `scheduled_messages`, `message_outbox`의 claim 관련 write를 잠근 뒤
+구버전 online node와 이미 `firing`/`processing`인 image claim이 하나라도 있으면
+SQLSTATE `55000`으로 중단한다. preflight 통과 뒤 설치되는 PostgreSQL trigger는
+이미지 정의가 `firing`으로, 이미지 outbox row가 `processing`으로 바뀌기 전에
+동일 transaction의 `agentdesk.scheduled_image_consumer_v1=enabled` 선언을
+요구한다. 구버전 process는 migration 이후 재시작할 수 없으며, 전체 cutover 및
+rollback 절차는 `docs/agent-maintenance/multinode-transition.md`를 따른다.
 
 ### `scheduled_message_deliveries` — 발화 이력 (routine_runs 패턴)
 

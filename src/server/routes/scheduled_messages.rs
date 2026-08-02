@@ -1216,6 +1216,22 @@ mod tests {
     }
 
     #[test]
+    fn new_image_attachment_uploads_reject_mime_filename_mismatch() {
+        let body = ScheduledMessageImageAttachmentBody {
+            filename: "thumbnail.jpg".to_string(),
+            content_type: "image/png".to_string(),
+            data_base64: BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nthumbnail"),
+        };
+
+        let error = validate_image_attachment(&body)
+            .expect_err("new reservations must use a MIME-compatible filename");
+        assert!(
+            error.to_string().contains("filename extension"),
+            "unexpected validation error: {error}"
+        );
+    }
+
+    #[test]
     fn patch_rejects_stale_effective_one_shot_time() {
         let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap();
         let stale = now - Duration::minutes(2);

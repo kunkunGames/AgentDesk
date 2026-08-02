@@ -11,6 +11,7 @@ static ACTIVE_INTAKE_WORKER_PROVIDERS: LazyLock<RwLock<BTreeSet<String>>> =
 
 const PRESERVE_ON_CANCEL_V1: &str = "preserve_on_cancel_v1";
 pub(crate) const SCHEDULED_MESSAGE_IMAGE_ATTACHMENTS_V1: &str = "image_attachments_v1";
+pub(crate) const SCHEDULED_MESSAGE_IMAGE_CONSUMER_FLOOR_V1: &str = "consumer_floor_v1";
 
 /// Providers whose `run_bot` on this node is actively trying to take the Discord
 /// gateway lease (#4351). Advertised so a non-preferred holder can tell "the
@@ -111,7 +112,10 @@ pub(super) fn capabilities_with_runtime_state(base: &Value) -> Value {
     );
     capabilities.insert(
         "scheduled_messages".to_string(),
-        json!({ SCHEDULED_MESSAGE_IMAGE_ATTACHMENTS_V1: true }),
+        json!({
+            SCHEDULED_MESSAGE_IMAGE_ATTACHMENTS_V1: true,
+            SCHEDULED_MESSAGE_IMAGE_CONSUMER_FLOOR_V1: true,
+        }),
     );
     Value::Object(capabilities)
 }
@@ -224,6 +228,10 @@ mod tests {
         let capabilities = capabilities_with_runtime_state(&json!({}));
         assert_eq!(
             capabilities.pointer("/scheduled_messages/image_attachments_v1"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            capabilities.pointer("/scheduled_messages/consumer_floor_v1"),
             Some(&Value::Bool(true))
         );
     }

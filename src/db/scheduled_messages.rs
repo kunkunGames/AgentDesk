@@ -337,21 +337,22 @@ pub async fn list_scheduled_messages_pg(
     builder.build_query_as().fetch_all(pool).await
 }
 
-/// True when every cluster worker still marked online understands durable
-/// scheduled-image attachments. A missing advertisement is an old binary.
+/// True when every cluster worker still marked online advertises the post-0104
+/// image consumer floor. A node that advertises only the original 0103 image
+/// format cannot declare the transaction-local claim capability.
 ///
 /// Deliberately do not infer liveness from heartbeat age here. The node
 /// registry owns the authoritative online -> offline transition; ignoring a
 /// stale-but-online row would open a creation-time rollout gap. Migration 0104
-/// independently fences consumers, including processes that come online after
-/// this check.
+/// independently fences consumers and refuses to install until the fleet is
+/// stopped, drained, and its online registry contains no legacy consumer.
 pub async fn image_attachment_rollout_ready_pg(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT NOT EXISTS (\
              SELECT 1 FROM worker_nodes \
              WHERE status = 'online' \
                AND COALESCE(\
-                   capabilities #>> '{scheduled_messages,image_attachments_v1}', \
+                   capabilities #>> '{scheduled_messages,consumer_floor_v1}', \
                    'false'\
                ) <> 'true'\
          )",
