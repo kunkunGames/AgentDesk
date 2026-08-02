@@ -45,17 +45,16 @@ function activationWasDeferred(result) {
   return result && result.deferred === true;
 }
 
-function rotateActiveRunSweepCursor(runId) {
-  if (!runId) return;
+function rotateActiveRunSweepCursors(runIds) {
+  if (!runIds || runIds.length === 0) return;
   try {
+    var placeholders = runIds.map(function() { return "?"; }).join(",");
     agentdesk.db.execute(
-      "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE run_id = ? AND status = 'pending'",
-      [runId]
+      "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE run_id IN (" + placeholders + ") AND status = 'pending'",
+      runIds
     );
   } catch (e) {
-    autoQueueLog("warn", "failed to rotate active run sweep cursor for " + runId + ": " + e, {
-      run_id: runId
-    });
+    autoQueueLog("warn", "failed to rotate active run sweep cursors: " + e, {});
   }
 }
 
@@ -152,7 +151,7 @@ module.exports = {
   terminalStatesFromConfig: terminalStatesFromConfig,
   activationDispatchCount: activationDispatchCount,
   activationWasDeferred: activationWasDeferred,
-  rotateActiveRunSweepCursor: rotateActiveRunSweepCursor,
+  rotateActiveRunSweepCursors: rotateActiveRunSweepCursors,
   isDispatchableState: _isDispatchableState,
   dispatchableTargets: _dispatchableTargets,
   freePathToDispatchable: _freePathToDispatchable,

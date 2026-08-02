@@ -166,7 +166,11 @@ export default function AgentFormModal({
                 }
               }}
             >
-              <div className="flex flex-col items-center gap-1">
+              <div
+                className="flex flex-col items-center gap-1"
+                role="group"
+                aria-label={tr("스프라이트 선택", "Sprite selection")}
+              >
                 <button
                   type="button"
                   tabIndex={-1}
@@ -194,14 +198,16 @@ export default function AgentFormModal({
                       alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
+                      aria-current="true"
                     />
                   ) : (
                     <span
                       className="text-2xl"
                       role="img"
+                      aria-current="true"
                       aria-label={t({
-                        ko: `선택된 이모지 미리보기: ${formValues.avatar_emoji || "🤖"}`,
-                        en: `Selected emoji preview: ${formValues.avatar_emoji || "🤖"}`,
+                        ko: `선택된 아이콘 미리보기: ${formValues.avatar_emoji || "🤖"}`,
+                        en: `Selected icon preview: ${formValues.avatar_emoji || "🤖"}`,
                       })}
                     >
                       {formValues.avatar_emoji || "🤖"}
@@ -313,7 +319,7 @@ export default function AgentFormModal({
             <div className="grid grid-cols-[72px_1fr] gap-2">
               <div>
                 <label htmlFor={emojiBtnId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
-                  {tr("이모지", "Emoji")}
+                  {tr("아이콘", "Icon")}
                 </label>
                 <EmojiPicker
                   id={emojiBtnId}
@@ -321,10 +327,10 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected emoji: ${formValues.avatar_emoji}, change emoji` })
-                      : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
+                      ? t({ ko: `선택된 아이콘: ${formValues.avatar_emoji}, 아이콘 변경`, en: `Selected icon: ${formValues.avatar_emoji}, change icon` })
+                      : t({ ko: "아이콘 선택기 열기", en: "Open icon picker" })
                   }
-                  dialogLabel={t({ ko: "이모지 선택", en: "Choose an emoji" })}
+                  dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
                 />
               </div>
               <div>
@@ -373,9 +379,9 @@ export default function AgentFormModal({
             {isEdit && (
               <div>
                 <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
-                  <label className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <span className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     prompt.md
-                  </label>
+                  </span>
                   <label className="flex items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                     <input
                       type="checkbox"

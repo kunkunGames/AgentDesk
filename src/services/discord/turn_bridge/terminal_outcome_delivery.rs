@@ -40,6 +40,8 @@ mod busy_followup_retry;
 mod cancel_prompt_replace;
 mod contracts;
 mod delivery_epilogue;
+#[cfg(test)]
+mod delivery_epilogue_tests;
 mod empty_response_recovery;
 mod prompt_too_long_guidance;
 mod queue_retry_silence;
@@ -644,6 +646,7 @@ pub(super) async fn run_terminal_outcome_delivery(
                                             shared_owned.as_ref(),
                                             &provider,
                                             watcher_owner_channel_id,
+                                            inflight_state.tmux_session_name.as_deref(),
                                             lease_range,
                                             current_msg_id.get(),
                                             channel_id.get(),

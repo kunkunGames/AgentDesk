@@ -605,6 +605,234 @@ async fn dead_frontier_watcher_cancel_finalizes_owner_and_releases_inflight() {
 }
 
 #[tokio::test]
+async fn dead_frontier_gate_pass_then_generation_mismatch_preserves_turn() {
+    let _guard = auto_heal_test_lock().lock().await;
+    clear_auto_heal_attempts_for_tests();
+    let (_root_guard, root_dir) = isolated_agentdesk_root();
+    let provider = ProviderKind::Codex;
+    let (registry, shared) = registry_with_shared(provider.clone()).await;
+    let channel = ChannelId::new(4_030_004);
+    let user_msg = MessageId::new(4_030_104);
+    let tmux = "AgentDesk-codex-4030-generation-race";
+    let output_path = root_dir.path().join("generation-race.jsonl");
+    std::fs::write(
+        &output_path,
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    )
+    .expect("write terminal output fixture");
+    let token = start_test_turn(&shared, channel, user_msg).await;
+    shared.restart.global_active.store(1, Ordering::Relaxed);
+
+    let mut state = super::super::inflight::InflightTurnState::new(
+        provider.clone(),
+        channel.get(),
+        None,
+        1,
+        user_msg.get(),
+        4_030_204,
+        "watcher-owned generation race".to_string(),
+        None,
+        Some(tmux.to_string()),
+        Some(output_path.to_string_lossy().to_string()),
+        None,
+        0,
+    );
+    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui);
+    state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+    super::super::inflight::save_inflight_state(&state).expect("save watcher inflight");
+    let persisted = super::super::inflight::load_inflight_state(&provider, channel.get())
+        .expect("load watcher inflight");
+    shared.turn_finalizer.register_start(
+        super::super::turn_finalizer::TurnKey::new(
+            channel,
+            persisted.effective_finalizer_turn_id(),
+            shared.restart.current_generation,
+        ),
+        provider.clone(),
+        super::super::inflight::RelayOwnerKind::Watcher,
+        &shared,
+    );
+    let (watcher, watcher_cancel) = test_watcher_handle(tmux, &output_path);
+    watcher.last_heartbeat_ts_ms.store(1, Ordering::Release);
+    shared.tmux_watchers.insert(channel, watcher);
+
+    let hook_provider = provider.clone();
+    let _hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+        let root = super::super::inflight::inflight_runtime_root().expect("inflight root");
+        let path =
+            super::super::inflight::inflight_state_path(&root, &hook_provider, channel.get());
+        let _lock = super::super::lock_inflight_state_path(&path).expect("lock post-gate row");
+        let body = std::fs::read_to_string(&path).expect("read post-gate inflight");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&body).expect("parse post-gate inflight");
+        let next = value["save_generation"]
+            .as_u64()
+            .expect("save generation")
+            .saturating_add(1);
+        value["save_generation"] = serde_json::Value::from(next);
+        super::super::runtime_store::atomic_write(
+            &path,
+            &serde_json::to_string_pretty(&value).expect("serialize post-gate inflight"),
+        )
+        .expect("advance save generation after gate");
+    }));
+    let snapshot = RelayHealthSnapshot {
+        provider: provider.as_str().to_string(),
+        channel_id: channel.get(),
+        active_turn: RelayActiveTurn::Foreground,
+        tmux_session: Some(tmux.to_string()),
+        tmux_alive: Some(true),
+        watcher_attached: true,
+        watcher_attached_stale: true,
+        watcher_owner_channel_id: Some(channel.get()),
+        watcher_owns_live_relay: true,
+        bridge_inflight_present: true,
+        mailbox_has_cancel_token: true,
+        mailbox_active_user_msg_id: Some(user_msg.get()),
+        last_capture_offset: Some(1),
+        last_relay_offset: 0,
+        unread_bytes: Some(1),
+        desynced: true,
+        ..snapshot()
+    };
+    let mut decision = plan_relay_recovery(&snapshot, RelayStallState::TmuxAliveRelayDead, 1_000);
+    decision.affected.finalizer_turn_id = Some(persisted.effective_finalizer_turn_id());
+    assert_eq!(
+        relay_frontier_dead_reattach_owner(&decision),
+        Some(channel),
+        "fixture must reach the destructive dead-frontier branch"
+    );
+    assert!(decision.affected.finalizer_turn_id.is_some());
+
+    let _ = apply_relay_recovery_decision(
+        &registry,
+        &shared,
+        &provider,
+        &decision,
+        None,
+        RelayRecoveryApplySource::ProbeAutoHeal,
+    )
+    .await;
+
+    assert!(!watcher_cancel.load(Ordering::Acquire));
+    assert!(shared.tmux_watchers.contains_key(&channel));
+    assert!(!token.cancelled.load(Ordering::Relaxed));
+    assert!(super::super::inflight::load_inflight_state(&provider, channel.get()).is_some());
+}
+
+#[tokio::test]
+async fn destructive_cancel_stops_when_terminal_lease_starts_after_gate() {
+    let _guard = auto_heal_test_lock().lock().await;
+    clear_auto_heal_attempts_for_tests();
+    let (_root_guard, root_dir) = isolated_agentdesk_root();
+    let provider = ProviderKind::Codex;
+    let (registry, shared) = registry_with_shared(provider.clone()).await;
+    let channel = ChannelId::new(4_030_005);
+    let user_msg = MessageId::new(4_030_105);
+    let tmux = "AgentDesk-codex-4030-post-gate-lease";
+    let output_path = root_dir.path().join("post-gate-lease.jsonl");
+    std::fs::write(
+        &output_path,
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+    )
+    .expect("write terminal output fixture");
+    let token = start_test_turn(&shared, channel, user_msg).await;
+    shared.restart.global_active.store(1, Ordering::Relaxed);
+
+    let mut state = super::super::inflight::InflightTurnState::new(
+        provider.clone(),
+        channel.get(),
+        None,
+        1,
+        user_msg.get(),
+        4_030_205,
+        "watcher-owned post-gate lease".to_string(),
+        None,
+        Some(tmux.to_string()),
+        Some(output_path.to_string_lossy().to_string()),
+        None,
+        0,
+    );
+    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui);
+    state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+    super::super::inflight::save_inflight_state(&state).expect("save watcher inflight");
+    let persisted = super::super::inflight::load_inflight_state(&provider, channel.get())
+        .expect("load watcher inflight");
+    shared.turn_finalizer.register_start(
+        super::super::turn_finalizer::TurnKey::new(
+            channel,
+            persisted.effective_finalizer_turn_id(),
+            shared.restart.current_generation,
+        ),
+        provider.clone(),
+        super::super::inflight::RelayOwnerKind::Watcher,
+        &shared,
+    );
+    let (watcher, watcher_cancel) = test_watcher_handle(tmux, &output_path);
+    watcher.last_heartbeat_ts_ms.store(1, Ordering::Release);
+    shared.tmux_watchers.insert(channel, watcher);
+
+    let lease_key = super::super::DeliveryLeaseKey::from_inflight_state_for_site(
+        channel,
+        shared.restart.current_generation,
+        &persisted,
+        "relay_recovery_post_gate_test",
+    );
+    let hook_shared = Arc::clone(&shared);
+    let hook_key = lease_key.clone();
+    let _hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+        assert!(hook_shared.delivery_lease(channel).try_acquire(
+            hook_key.clone(),
+            super::super::LeaseHolder::Bridge,
+            0,
+            1,
+            u64::MAX,
+        ));
+        hook_shared
+            .tmux_relay_coord(channel)
+            .relay_slot
+            .store(1, Ordering::Release);
+    }));
+    let snapshot = RelayHealthSnapshot {
+        provider: provider.as_str().to_string(),
+        channel_id: channel.get(),
+        active_turn: RelayActiveTurn::Foreground,
+        tmux_session: Some(tmux.to_string()),
+        tmux_alive: Some(true),
+        watcher_attached: true,
+        watcher_attached_stale: true,
+        watcher_owner_channel_id: Some(channel.get()),
+        watcher_owns_live_relay: true,
+        bridge_inflight_present: true,
+        mailbox_has_cancel_token: true,
+        mailbox_active_user_msg_id: Some(user_msg.get()),
+        last_capture_offset: Some(1),
+        last_relay_offset: 0,
+        unread_bytes: Some(1),
+        desynced: true,
+        ..snapshot()
+    };
+    let mut decision = plan_relay_recovery(&snapshot, RelayStallState::TmuxAliveRelayDead, 1_000);
+    decision.affected.finalizer_turn_id = Some(persisted.effective_finalizer_turn_id());
+
+    let _ = apply_relay_recovery_decision(
+        &registry,
+        &shared,
+        &provider,
+        &decision,
+        None,
+        RelayRecoveryApplySource::ProbeAutoHeal,
+    )
+    .await;
+
+    assert!(!watcher_cancel.load(Ordering::Acquire));
+    assert!(shared.tmux_watchers.contains_key(&channel));
+    assert!(!token.cancelled.load(Ordering::Relaxed));
+    assert!(super::super::inflight::load_inflight_state(&provider, channel.get()).is_some());
+    assert!(shared.relay_emission_in_flight(channel));
+}
+
+#[tokio::test]
 async fn reattach_idle_tmux_clear_release_publishes_completion_event() {
     let _guard = auto_heal_test_lock().lock().await;
     clear_auto_heal_attempts_for_tests();
@@ -1847,6 +2075,69 @@ fn set_output_mtime_age(output_path: &std::path::Path, age: std::time::Duration)
         .expect("mtime before now");
     filetime::set_file_mtime(output_path, filetime::FileTime::from_system_time(modified))
         .expect("set output mtime");
+}
+
+#[test]
+fn idle_tmux_snapshot_missing_output_path_denies_claude_tui_but_keeps_legacy_pane_fallback() {
+    let provider = ProviderKind::Claude;
+    let channel_id = 4_997_004;
+    let mut state = super::super::inflight::InflightTurnState::new(
+        provider.clone(),
+        channel_id,
+        None,
+        1,
+        4_997_005,
+        4_997_006,
+        "freshly seeded ClaudeTui turn".to_string(),
+        None,
+        Some("AgentDesk-claude-4997-idle-tmux".to_string()),
+        None,
+        None,
+        0,
+    );
+    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
+    assert!(state.full_response.is_empty());
+    assert_eq!(state.last_offset, 0);
+    assert!(
+        !idle_tmux_repair_snapshot_ready_for_input(
+            &provider,
+            channel_id,
+            "AgentDesk-claude-4997-idle-tmux",
+            &state,
+            |_tmux, _provider| true,
+        ),
+        "missing ClaudeTui runtime output must override a ready pane fallback"
+    );
+
+    for blank_output_path in ["", "   "] {
+        state.output_path = Some(blank_output_path.to_string());
+        assert!(
+            !idle_tmux_repair_snapshot_ready_for_input(
+                &provider,
+                channel_id,
+                "AgentDesk-claude-4997-idle-tmux",
+                &state,
+                |_tmux, _provider| true,
+            ),
+            "blank ClaudeTui runtime output must override a ready pane fallback: {blank_output_path:?}"
+        );
+    }
+
+    state.runtime_kind =
+        Some(crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper);
+    for blank_output_path in [None, Some(""), Some("   ")] {
+        state.output_path = blank_output_path.map(str::to_string);
+        assert!(
+            idle_tmux_repair_snapshot_ready_for_input(
+                &provider,
+                channel_id,
+                "AgentDesk-claude-4997-idle-tmux",
+                &state,
+                |_tmux, _provider| true,
+            ),
+            "non-ClaudeTui blank output must retain the existing ready pane fallback: {blank_output_path:?}"
+        );
+    }
 }
 
 #[test]
