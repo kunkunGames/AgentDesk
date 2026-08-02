@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn db_retention_clears_aged_terminal_one_shot_image_attachments() {
+    async fn db_retention_clears_aged_terminal_one_shot_image_attachments_pg_test() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
             "agentdesk_db_retention_scheduled_images",
             "db_retention scheduled image attachment reclaim",
