@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 mod agent;
 mod outbox;
+mod writes;
 pub use agent::{
     RunningAgentDelivery, commit_delivery_agent_launch_pg, defer_delivery_without_retry_pg,
     list_running_agent_deliveries_pg, mark_delivery_agent_turn_started_pg,
@@ -22,6 +23,7 @@ pub use agent::{
     release_agent_delivery_to_poller_pg,
 };
 pub use outbox::outbox_statuses_for_deliveries_pg;
+pub use writes::{insert_scheduled_message_pg, insert_scheduled_message_tx};
 
 #[cfg(test)]
 mod postgres_tests;
@@ -42,7 +44,25 @@ pub const KIND_AGENT: &str = "agent";
 const DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, delivery_kind, \
      agent_id, agent_instruction, on_agent_failure, scheduled_at, schedule, timezone, \
      expires_at, status, in_flight_delivery_id, fire_count, last_fired_at, last_error, \
-     source, created_by, dedupe_key, created_at, updated_at";
+     source, created_by, dedupe_key, image_filename, image_content_type, image_data, \
+     octet_length(image_data) AS image_size_bytes, \
+     context_strategy, context_snapshot_id, \
+     on_context_failure, created_at, updated_at";
+
+// The list endpoint only exposes attachment metadata. Do not select image_data
+// there: a valid page can otherwise retain up to 1.6 GiB of decoded blobs.
+const LIST_DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, delivery_kind, \
+     agent_id, agent_instruction, on_agent_failure, scheduled_at, schedule, timezone, \
+     expires_at, status, in_flight_delivery_id, fire_count, last_fired_at, last_error, \
+     source, created_by, dedupe_key, image_filename, image_content_type, \
+     NULL::BYTEA AS image_data, octet_length(image_data) AS image_size_bytes, \
+     context_strategy, context_snapshot_id, \
+     on_context_failure, created_at, updated_at";
+
+pub const CONTEXT_STRATEGY_FRESH: &str = "fresh";
+pub const CONTEXT_STRATEGY_SNAPSHOT: &str = "snapshot";
+pub const ON_CONTEXT_FAILURE_FAIL: &str = "fail";
+pub const ON_CONTEXT_FAILURE_FRESH: &str = "fresh";
 
 // ── Row types ───────────────────────────────────────────────────────────────
 
@@ -69,6 +89,17 @@ pub struct ScheduledMessageRow {
     pub source: String,
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
+    pub image_filename: Option<String>,
+    pub image_content_type: Option<String>,
+    pub image_data: Option<Vec<u8>>,
+    pub image_size_bytes: Option<i32>,
+    /// #4658: 'fresh' (default) or 'snapshot'. Snapshot definitions reference an
+    /// immutable context row and run in an isolated fresh provider session.
+    pub context_strategy: String,
+    pub context_snapshot_id: Option<String>,
+    /// #4658: 'fail' (default, fail-closed) or 'fresh' (opt-in degrade) when the
+    /// snapshot cannot be validated at fire time.
+    pub on_context_failure: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -97,10 +128,41 @@ impl ScheduledMessageRow {
             "source": self.source,
             "createdBy": self.created_by,
             "dedupeKey": self.dedupe_key,
+            "imageAttachment": self.image_attachment_json(),
+            "contextStrategy": self.context_strategy,
+            "contextSnapshotId": self.context_snapshot_id,
+            "onContextFailure": self.on_context_failure,
             "createdAt": self.created_at.to_rfc3339(),
             "updatedAt": self.updated_at.to_rfc3339(),
         })
     }
+
+    fn image_attachment_json(&self) -> JsonValue {
+        let size_bytes = self
+            .image_size_bytes
+            .map(|size| size as usize)
+            .or_else(|| self.image_data.as_ref().map(Vec::len));
+        match (
+            self.image_filename.as_deref(),
+            self.image_content_type.as_deref(),
+            size_bytes,
+        ) {
+            (Some(filename), Some(content_type), Some(size_bytes)) => json!({
+                "filename": filename,
+                "contentType": content_type,
+                "sizeBytes": size_bytes,
+            }),
+            _ => JsonValue::Null,
+        }
+    }
+}
+
+/// Validated image payload stored with a scheduled push definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledMessageImageAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -169,6 +231,13 @@ pub struct NewScheduledMessage {
     pub source: String,
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
+    pub image_attachment: Option<ScheduledMessageImageAttachment>,
+    /// #4658: 'fresh' (default) or 'snapshot'. Defaulted by the route.
+    pub context_strategy: String,
+    /// Snapshot id captured before insert (snapshot strategy only). NULL for fresh.
+    pub context_snapshot_id: Option<String>,
+    /// #4658: 'fail' (default) or 'fresh'.
+    pub on_context_failure: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -184,6 +253,7 @@ pub struct ScheduledMessagePatch {
     pub schedule: Option<Option<String>>,
     pub timezone: Option<String>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub image_attachment: Option<Option<ScheduledMessageImageAttachment>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,39 +275,6 @@ pub fn is_unique_violation(error: &sqlx::Error) -> bool {
         error.as_database_error().and_then(|db| db.code()),
         Some(code) if code == "23505"
     )
-}
-
-pub async fn insert_scheduled_message_pg(
-    pool: &PgPool,
-    new: &NewScheduledMessage,
-) -> Result<ScheduledMessageRow, sqlx::Error> {
-    let id = format!("smsg_{}", Uuid::new_v4());
-    sqlx::query_as::<_, ScheduledMessageRow>(&format!(
-        "INSERT INTO scheduled_messages
-            (id, content, title, target_channel_id, bot, delivery_kind, agent_id,
-             agent_instruction, on_agent_failure, scheduled_at, schedule, timezone,
-             expires_at, source, created_by, dedupe_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-         RETURNING {DEFINITION_COLUMNS}"
-    ))
-    .bind(&id)
-    .bind(&new.content)
-    .bind(&new.title)
-    .bind(&new.target_channel_id)
-    .bind(&new.bot)
-    .bind(&new.delivery_kind)
-    .bind(&new.agent_id)
-    .bind(&new.agent_instruction)
-    .bind(&new.on_agent_failure)
-    .bind(new.scheduled_at)
-    .bind(&new.schedule)
-    .bind(&new.timezone)
-    .bind(new.expires_at)
-    .bind(&new.source)
-    .bind(&new.created_by)
-    .bind(&new.dedupe_key)
-    .fetch_one(pool)
-    .await
 }
 
 pub async fn get_scheduled_message_pg(
@@ -271,7 +308,7 @@ pub async fn list_scheduled_messages_pg(
     filters: &ListFilters,
 ) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages WHERE 1=1"
+        "SELECT {LIST_DEFINITION_COLUMNS} FROM scheduled_messages WHERE 1=1"
     ));
     if let Some(status) = &filters.status {
         builder.push(" AND status = ").push_bind(status);
@@ -298,6 +335,28 @@ pub async fn list_scheduled_messages_pg(
         .push(" ORDER BY created_at DESC LIMIT ")
         .push_bind(filters.limit.clamp(1, 200));
     builder.build_query_as().fetch_all(pool).await
+}
+
+/// True when every live cluster worker understands durable scheduled-image
+/// attachments. A missing advertisement is treated as an old binary.
+pub async fn image_attachment_rollout_ready_pg(
+    pool: &PgPool,
+    lease_ttl_secs: u64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS (\
+             SELECT 1 FROM worker_nodes \
+             WHERE status = 'online' \
+               AND last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second') \
+               AND COALESCE(\
+                   capabilities #>> '{scheduled_messages,image_attachments_v1}', \
+                   'false'\
+               ) <> 'true'\
+         )",
+    )
+    .bind(lease_ttl_secs.max(1) as i64)
+    .fetch_one(pool)
+    .await
 }
 
 /// Apply a patch to a definition; only rows still in `scheduled` are editable.
@@ -345,6 +404,20 @@ pub async fn update_scheduled_message_pg(
     }
     if let Some(expires_at) = &patch.expires_at {
         builder.push(", expires_at = ").push_bind(expires_at);
+    }
+    if let Some(image_attachment) = &patch.image_attachment {
+        let filename = image_attachment
+            .as_ref()
+            .map(|image| image.filename.as_str());
+        let content_type = image_attachment
+            .as_ref()
+            .map(|image| image.content_type.as_str());
+        let data = image_attachment.as_ref().map(|image| image.data.as_slice());
+        builder.push(", image_filename = ").push_bind(filename);
+        builder
+            .push(", image_content_type = ")
+            .push_bind(content_type);
+        builder.push(", image_data = ").push_bind(data);
     }
     builder
         .push(" WHERE id = ")

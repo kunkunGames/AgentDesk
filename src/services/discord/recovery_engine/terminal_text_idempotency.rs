@@ -6,7 +6,10 @@ use poise::serenity_prelude::{self as serenity, ChannelId, MessageId};
 
 use super::super::{formatting, recovery_paths};
 use super::RecoveryRelayOutcome;
-use crate::services::discord::outbound::{delivery_frontier_probe, delivery_record};
+use crate::services::discord::inflight::{opt_channel_id, opt_message_id};
+use crate::services::discord::outbound::{
+    completed_turn_ledger, delivery_frontier_probe, delivery_record,
+};
 use crate::services::discord::{
     DELIVERY_LEASE_DEADLINE_MS, DeliveryLeaseCell, DeliveryLeaseHeartbeat, DeliveryLeaseKey,
     LeaseHolder, LeaseOutcome, SharedData, inflight, lease_now_ms,
@@ -32,6 +35,13 @@ pub(in crate::services::discord) struct RecoveryDeliveryContext {
     current_output_eof: Option<u64>,
     attempts: u32,
     reuse_recorded_anchor: bool,
+    expected_gone_anchor: Option<(u64, u64)>,
+    /// #4564: the inbound `user_msg_id` this turn answers, copied from the
+    /// inflight state. Appended to the completed-turn ledger on a confirmed
+    /// durable-frontier write (`record_durable_frontier`) — this recovery path
+    /// bypasses the `shadow_mirror_delivered_frontier` funnel, so the append is
+    /// wired here too. `0` (synthetic/no-inbound turn) is a no-op sentinel.
+    user_msg_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,15 +56,17 @@ impl RecoveryDeliveryContext {
         state: &inflight::InflightTurnState,
         durable_range: Option<(u64, u64)>,
         delivery_generation: u64,
-    ) -> Self {
-        Self::from_state_for_channel(
+    ) -> Option<Self> {
+        let channel_id = opt_channel_id(state.channel_id)?;
+        Some(Self::from_state_for_channel(
             provider,
             state,
-            ChannelId::new(state.channel_id),
+            channel_id,
             durable_range,
             delivery_generation,
             true,
-        )
+            None,
+        ))
     }
 
     pub(in crate::services::discord) fn send_new_after_gone_anchor(
@@ -63,6 +75,7 @@ impl RecoveryDeliveryContext {
         channel_id: ChannelId,
         durable_range: Option<(u64, u64)>,
         delivery_generation: u64,
+        expected_gone_anchor: (u64, u64),
     ) -> Self {
         Self::from_state_for_channel(
             provider,
@@ -71,6 +84,7 @@ impl RecoveryDeliveryContext {
             durable_range,
             delivery_generation,
             false,
+            Some(expected_gone_anchor),
         )
     }
 
@@ -89,11 +103,14 @@ impl RecoveryDeliveryContext {
         durable_range: Option<(u64, u64)>,
         delivery_generation: u64,
         reuse_recorded_anchor: bool,
+        expected_gone_anchor: Option<(u64, u64)>,
     ) -> Self {
+        let record_channel_id =
+            opt_channel_id(state.delivery_record_owner_channel_id()).unwrap_or(channel_id);
         Self {
             provider: provider.clone(),
             channel_id,
-            record_channel_id: ChannelId::new(state.delivery_record_owner_channel_id()),
+            record_channel_id,
             tmux_session_name: state.tmux_session_name.clone(),
             lease_key: DeliveryLeaseKey::from_inflight_state_for_site(
                 channel_id,
@@ -111,6 +128,8 @@ impl RecoveryDeliveryContext {
                 .and_then(|path| std::fs::metadata(path).ok().map(|meta| meta.len())),
             attempts: state.recovery_relay_attempts,
             reuse_recorded_anchor,
+            expected_gone_anchor,
+            user_msg_id: state.user_msg_id,
         }
     }
 
@@ -120,13 +139,11 @@ impl RecoveryDeliveryContext {
         if !self.reuse_recorded_anchor {
             return None;
         }
-        if let Some(anchor) = self.durable_recorded_anchor() {
-            return Some(RecoveryAnchorReuse::DurableAlreadyDelivered(
-                MessageId::new(anchor),
-            ));
+        if let Some(anchor) = self.durable_recorded_anchor().and_then(opt_message_id) {
+            return Some(RecoveryAnchorReuse::DurableAlreadyDelivered(anchor));
         }
         self.inflight_recorded_anchor()
-            .map(MessageId::new)
+            .and_then(opt_message_id)
             .map(RecoveryAnchorReuse::InflightAnchor)
     }
 
@@ -211,8 +228,11 @@ impl RecoveryDeliveryContext {
             &self.identity,
             self.expected_turn_start_offset,
             self.expected_current_msg_id,
+            None,
             anchor.get(),
             text.len(),
+            None,
+            None,
         );
         if matches!(
             bind,
@@ -231,6 +251,19 @@ impl RecoveryDeliveryContext {
     }
 
     fn record_durable_frontier(&self, anchor: MessageId) {
+        // #4564: reaching here means a recovery terminal delivery was CONFIRMED
+        // (the caller bound the anchor after a successful send), so append the
+        // inbound turn to the completed-turn ledger. Keyed by the delivery
+        // channel the inbound `user_msg_id` lives in (`channel_id`, what catch-up
+        // scans) — NOT `record_channel_id` (the frontier's offset-authority
+        // channel). Independent of the durable-frontier write below so a delivery
+        // with no readable generation marker still suppresses the false TooOld
+        // notice. `0` is a no-op sentinel.
+        completed_turn_ledger::append_completed_turn(
+            &self.provider,
+            self.channel_id.get(),
+            self.user_msg_id,
+        );
         let Some(range) = self.durable_range else {
             return;
         };
@@ -268,11 +301,27 @@ impl RecoveryDeliveryContext {
             panel_msg_id: Some(anchor.get()),
             panel_channel_id: Some(self.channel_id.get()),
         };
-        if let Err(error) = delivery_record::write_delivered_frontier(
-            &self.provider,
-            self.record_channel_id.get(),
-            commit,
-        ) {
+        let write_result = if self.reuse_recorded_anchor {
+            delivery_record::write_delivered_frontier(
+                &self.provider,
+                self.record_channel_id.get(),
+                tmux_session_name,
+                commit,
+            )
+        } else if let Some(expected_gone_anchor) = self.expected_gone_anchor {
+            // This context is created only after Discord proved the exact durable
+            // anchor gone. It is the one permitted equal-range re-anchor path.
+            delivery_record::write_proven_gone_equal_range_frontier(
+                &self.provider,
+                self.record_channel_id.get(),
+                tmux_session_name,
+                expected_gone_anchor,
+                commit,
+            )
+        } else {
+            Err("recovery gone-anchor delivery lacks expected durable anchor identity".into())
+        };
+        if let Err(error) = write_result {
             tracing::warn!(
                 provider = %self.provider.as_str(),
                 channel_id = self.channel_id.get(),
@@ -504,6 +553,25 @@ mod tests {
             .join(format!("{channel_id}.json"))
     }
 
+    #[test]
+    fn zero_channel_or_anchor_ids_skip_recovery_context_without_panicking() {
+        let provider = ProviderKind::Codex;
+        let zero_channel_state = state(provider.clone(), 0);
+        assert!(
+            RecoveryDeliveryContext::from_state(&provider, &zero_channel_state, None, 42).is_none()
+        );
+
+        let context = RecoveryDeliveryContext::from_state(
+            &provider,
+            &state(provider.clone(), 44_099),
+            Some((128, 256)),
+            42,
+        )
+        .expect("non-zero test channel id");
+        assert_eq!(context.inflight_recorded_anchor(), None);
+        assert_eq!(context.anchor_reuse_decision(), None);
+    }
+
     #[tokio::test]
     async fn same_turn_retry_after_anchor_persist_keeps_same_lease_key() {
         let _lock = crate::config::shared_test_env_lock()
@@ -515,7 +583,8 @@ mod tests {
         inflight::save_inflight_state(&state).expect("save inflight");
 
         let delivery_generation = 42;
-        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, None, delivery_generation);
+        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, None, delivery_generation)
+            .expect("non-zero test channel id");
         ctx.record_successful_fresh_send(MessageId::new(77_000), "answer");
 
         let persisted =
@@ -525,7 +594,8 @@ mod tests {
             "anchor bind should bump the per-file save generation"
         );
         let retry_ctx =
-            RecoveryDeliveryContext::from_state(&provider, &persisted, None, delivery_generation);
+            RecoveryDeliveryContext::from_state(&provider, &persisted, None, delivery_generation)
+                .expect("non-zero test channel id");
 
         assert_eq!(
             ctx.lease_key, retry_ctx.lease_key,
@@ -549,7 +619,8 @@ mod tests {
             &state,
             None,
             shared.restart.current_generation,
-        );
+        )
+        .expect("non-zero test channel id");
 
         let mut fresh_posts = 0;
         assert!(ctx.recorded_anchor().is_none());
@@ -578,7 +649,8 @@ mod tests {
         let state = state(provider.clone(), 44_002);
         let tmux = state.tmux_session_name.as_deref().unwrap();
         write_generation_marker(tmux);
-        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42);
+        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42)
+            .expect("non-zero test channel id");
 
         let mut newer = state.clone();
         newer.user_msg_id = newer.user_msg_id.saturating_add(1);
@@ -612,7 +684,8 @@ mod tests {
         let path = inflight_state_path_for_test(temp.path(), &provider, state.channel_id);
         std::fs::create_dir_all(path.parent().expect("inflight parent")).expect("inflight parent");
         std::fs::create_dir(&path).expect("directory at inflight path forces read_to_string error");
-        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42);
+        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42)
+            .expect("non-zero test channel id");
 
         ctx.record_successful_fresh_send(MessageId::new(77_006), "answer");
 
@@ -638,7 +711,8 @@ mod tests {
         let state = state(provider.clone(), 44_007);
         let tmux = state.tmux_session_name.as_deref().unwrap();
         write_generation_marker(tmux);
-        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42);
+        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42)
+            .expect("non-zero test channel id");
 
         ctx.record_successful_fresh_send(MessageId::new(77_007), "answer");
 
@@ -681,7 +755,8 @@ mod tests {
             &state,
             Some((128, 256)),
             shared.restart.current_generation,
-        );
+        )
+        .expect("non-zero test channel id");
         let mut lease = ctx
             .try_acquire_fresh_send_lease(&shared, "answer")
             .expect("first attempt acquires");
@@ -695,7 +770,8 @@ mod tests {
             &state,
             Some((128, 256)),
             fresh_shared_after_restart.restart.current_generation,
-        );
+        )
+        .expect("non-zero test channel id");
         assert_eq!(
             retry_ctx.anchor_reuse_decision(),
             Some(RecoveryAnchorReuse::DurableAlreadyDelivered(
@@ -737,6 +813,7 @@ mod tests {
         delivery_record::write_delivered_frontier(
             &provider,
             matched_record_channel.get(),
+            tmux,
             delivery_record::DeliveredCommit {
                 range: (128, 256),
                 generation_mtime_ns,
@@ -754,6 +831,7 @@ mod tests {
             ChannelId::new(state.channel_id),
             Some((128, 256)),
             shared.restart.current_generation,
+            (state.channel_id, 77_008),
         )
         .with_record_channel_id(matched_record_channel);
         let mut lease = ctx
@@ -800,6 +878,7 @@ mod tests {
         delivery_record::write_delivered_frontier(
             &provider,
             state.delivery_record_owner_channel_id(),
+            tmux,
             delivery_record::DeliveredCommit {
                 range: (128, 256),
                 generation_mtime_ns,
@@ -817,6 +896,7 @@ mod tests {
             ChannelId::new(state.channel_id),
             Some((128, 256)),
             shared.restart.current_generation,
+            (state.channel_id, 77_004),
         );
         assert_eq!(
             ctx.recorded_anchor(),
@@ -835,7 +915,8 @@ mod tests {
             &state,
             Some((128, 256)),
             shared.restart.current_generation,
-        );
+        )
+        .expect("non-zero test channel id");
         assert_eq!(
             retry_ctx.recorded_anchor(),
             Some(MessageId::new(88_004)),
@@ -856,7 +937,8 @@ mod tests {
         write_generation_marker(tmux);
         inflight::save_inflight_state(&state).expect("save inflight");
 
-        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42);
+        let ctx = RecoveryDeliveryContext::from_state(&provider, &state, Some((128, 256)), 42)
+            .expect("non-zero test channel id");
         let outcome =
             crate::services::discord::formatting::ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "404 stale anchor".to_string(),

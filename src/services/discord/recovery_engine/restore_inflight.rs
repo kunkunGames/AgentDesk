@@ -10,51 +10,22 @@
 use super::terminal_watcher::restart_report_watcher_start;
 use super::*;
 
-/// Retry-aware tmux session check for recovery after dcserver restart.
-/// The first check can false-negative if tmux CLI hasn't fully initialized yet.
-pub(super) fn tmux_session_alive_with_retry(name: &str) -> bool {
-    if tmux_session_has_live_pane(name) {
-        return true;
-    }
-    // #2428 H5: retry up to 2 more times with exponential backoff + jitter
-    // (was a fixed 1s gap; see `recovery_retry_backoff`).
-    for attempt in 1..=2u32 {
-        std::thread::sleep(recovery_retry_backoff(attempt));
-        if tmux_session_has_live_pane(name) {
-            tracing::info!(
-                "  [recovery] tmux pane alive on retry {} for {}",
-                attempt,
-                name
-            );
-            return true;
-        }
-    }
-    false
-}
-
-/// Retry-aware tmux has_session check.
-fn tmux_has_session_with_retry(name: &str) -> bool {
-    if crate::services::platform::tmux::has_session(name) {
-        return true;
-    }
-    // #2428 H5: see `recovery_retry_backoff`.
-    for attempt in 1..=2u32 {
-        std::thread::sleep(recovery_retry_backoff(attempt));
-        if crate::services::platform::tmux::has_session(name) {
-            tracing::info!(
-                "  [recovery] tmux session found on retry {} for {}",
-                attempt,
-                name
-            );
-            return true;
-        }
-    }
-    false
-}
+use super::tmux_probe::{tmux_has_session_with_retry, tmux_session_alive_with_retry};
 
 #[cfg(not(unix))]
 fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Option<String> {
     None
+}
+
+fn recovery_output_path_with_tmux_fallback(
+    state: &inflight::InflightTurnState,
+    fallback_output: String,
+) -> Option<String> {
+    state
+        .output_path
+        .clone()
+        .filter(|path| !path.is_empty())
+        .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output))
 }
 
 pub(in crate::services::discord) async fn finish_recovered_turn_mailbox(
@@ -155,7 +126,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
 
     let settings_snapshot = shared.settings.read().await.clone();
 
-    for state in states {
+    for mut state in states {
         // #897 round-4 High: rebind_origin inflights are synthetic
         // placeholders owned by `/api/inflight/rebind` and do NOT carry
         // a real user message, dispatch context, or placeholder Discord
@@ -177,7 +148,13 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             continue;
         }
 
-        let channel_id = ChannelId::new(state.channel_id);
+        let Some(channel_id) = super::inflight::opt_channel_id(state.channel_id) else {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                "inflight recovery skipped because persisted channel id is zero"
+            );
+            continue;
+        };
 
         // #2235: silent-skip rows whose on-disk `runtime_kind` was a
         // present-but-unknown variant string. `load_inflight_states_from_root`
@@ -330,7 +307,6 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         provider,
                     )
                 };
-                let channel_id = ChannelId::new(state.channel_id);
                 // An un-anchored TUI-direct/recovery turn (current_msg_id == 0)
                 // delivers the recovered text as a NEW channel message, not an
                 // in-place edit (the helper handles both); `relay_ok` still
@@ -349,7 +325,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     channel_id,
                     optional_message_id(state.current_msg_id),
                     &final_text,
-                    Some(&recovery_context),
+                    recovery_context.as_ref(),
                 )
                 .await
                 .delivered();
@@ -719,7 +695,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                                 category_name: None,
                                 last_active: tokio::time::Instant::now(),
                                 worktree: None,
-                                born_generation: super::runtime_store::load_generation(),
+                                born_generation: super::runtime_store::process_generation(),
                             });
                     session.channel_id = Some(state.channel_id);
                     session.last_active = tokio::time::Instant::now();
@@ -729,6 +705,10 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     restore_recovered_session_worktree(session, &state);
                 }
 
+                super::recovery_two_message_panel::recover_two_message_panel(
+                    http, shared, provider, &mut state,
+                )
+                .await;
                 let finish_mailbox_on_completion =
                     reregister_active_turn_from_inflight(shared, &state).await;
 
@@ -761,12 +741,17 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         let watcher_claimed = {
                             #[cfg(unix)]
                             {
-                                let claim = super::tmux::claim_or_reuse_watcher(
+                                let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
                                     &shared.tmux_watchers,
                                     channel_id,
                                     handle,
                                     provider,
                                     "restart_report_recovery",
+                                    super::tmux::thread_follow_up_parent_channel_id(
+                                        channel_id,
+                                        state.logical_channel_id,
+                                        state.thread_id,
+                                    ),
                                 );
                                 claim.should_spawn()
                             }
@@ -902,17 +887,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             .map(tmux_runtime_paths)
             .unwrap_or_else(|| (String::new(), String::new()));
         let runtime_kind = state.runtime_kind_for_recovery();
-        let output_path = state
-            .output_path
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if !fallback_output.is_empty() {
-                    Some(fallback_output.clone())
-                } else {
-                    None
-                }
-            });
+        let output_path = recovery_output_path_with_tmux_fallback(&state, fallback_output);
         let input_fifo_path = if runtime_kind.requires_input_fifo() {
             state
                 .input_fifo_path
@@ -993,7 +968,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 channel_id,
                 current_msg_id,
                 &final_text,
-                Some(&recovery_context),
+                recovery_context.as_ref(),
             )
             .await
             .delivered();
@@ -1249,7 +1224,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 channel_id,
                 current_msg_id,
                 &final_text,
-                Some(&recovery_context),
+                recovery_context.as_ref(),
             )
             .await
             .delivered();
@@ -1741,7 +1716,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 continue;
             }
             let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
+            tracing::info!(
                 provider = %provider.as_str(),
                 channel_id = state.channel_id,
                 user_msg_id = state.user_msg_id,
@@ -1766,6 +1741,10 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             recovery_phase_after_tmux_probe(true, Some(pane_alive)),
             RecoveryPhase::WatcherReattach
         ) {
+            super::recovery_two_message_panel::recover_two_message_panel(
+                http, shared, provider, &mut state,
+            )
+            .await;
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] ↻ inflight recovery: pane alive for channel {}, spawning watcher immediately",
@@ -1836,7 +1815,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                             channel_id,
                             current_msg_id,
                             &format!("❌ {error}\nmain workspace fallback blocked."),
-                            Some(&recovery_context),
+                            recovery_context.as_ref(),
                         )
                         .await
                         .delivered();
@@ -1876,7 +1855,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         category_name: None,
                         last_active: tokio::time::Instant::now(),
                         worktree: None,
-                        born_generation: super::runtime_store::load_generation(),
+                        born_generation: super::runtime_store::process_generation(),
                     });
                 session.channel_id = Some(channel_id.get());
                 session.last_active = tokio::time::Instant::now();
@@ -1889,6 +1868,10 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 restore_recovered_session_worktree(session, &state);
             }
 
+            super::recovery_two_message_panel::recover_two_message_panel(
+                http, shared, provider, &mut state,
+            )
+            .await;
             let finish_mailbox_on_completion =
                 reregister_active_turn_from_inflight(shared, &state).await;
 
@@ -1933,12 +1916,17 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 let watcher_claimed = {
                     #[cfg(unix)]
                     {
-                        let claim = super::tmux::claim_or_reuse_watcher(
+                        let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
                             &shared.tmux_watchers,
                             channel_id,
                             handle,
                             provider,
                             "inflight_recovery",
+                            super::tmux::thread_follow_up_parent_channel_id(
+                                channel_id,
+                                state.logical_channel_id,
+                                state.thread_id,
+                            ),
                         );
                         claim.should_spawn()
                     }
@@ -2062,7 +2050,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     channel_id,
                     current_msg_id,
                     &format!("❌ {error}\nmain workspace fallback blocked."),
-                    Some(&recovery_context),
+                    recovery_context.as_ref(),
                 )
                 .await
                 .delivered();
@@ -2084,7 +2072,9 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 continue;
             }
         };
-        let cancel_token = Arc::new(CancelToken::new());
+        let cancel_token = Arc::new(CancelToken::from_persisted_turn_nonce(
+            state.turn_nonce.clone(),
+        ));
         super::turn_bridge::bind_cancel_token_tmux_runtime(
             provider,
             &cancel_token,
@@ -2112,7 +2102,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
 
-                    born_generation: super::runtime_store::load_generation(),
+                    born_generation: super::runtime_store::process_generation(),
                 });
             session.channel_id = Some(channel_id.get());
             session.last_active = tokio::time::Instant::now();
@@ -2137,7 +2127,14 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
         )
         .await;
 
-        let adk_session_key = build_adk_session_key(shared, channel_id, provider).await;
+        // Consume outgoing planned-restart authority (identity-guarded readoption)
+        // before the reader publishes RuntimeReady; failed adoption stays fail-closed.
+        if super::runtime::readopt_marker_eligible_real_user(&state) {
+            let _ = super::runtime::mark_readopted_from_inflight(
+                shared, provider, channel_id, &state, true,
+            );
+        }
+        let adk_session_key = build_adk_session_key(shared, channel_id, provider, None).await;
         let adk_session_name = channel_name.clone();
         let adk_session_info = derive_adk_session_info(
             Some(&state.user_text),
@@ -2213,7 +2210,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     if pane_alive {
                         // Session is alive but idle — hand off to watcher instead of retrying
-                        tracing::warn!(
+                        tracing::info!(
                             "  [{ts}] ↻ Recovery: session idle but pane alive — handing off to watcher (channel {})",
                             retry_channel_id
                         );
@@ -2264,12 +2261,20 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
         // `context_compact_percent_claude`) instead of `ContextThresholds::default()`
         // so the recovered turn's status panel reflects the user-set auto-compact
         // percent, matching the live launch paths (intake_turn/headless_turn).
-        // This is the display value; the spawn-side `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
-        // env is exported by the launch script (claude_tui/session.rs, #3166).
+        // This is the display ratio; Claude's launch script derives an absolute
+        // `CLAUDE_CODE_AUTO_COMPACT_WINDOW` when its launch model is known.
         let recovery_compact_percent =
             super::adk_session::fetch_context_thresholds(shared.api_port)
                 .await
                 .compact_pct_for(&provider);
+        if !state.silent_turn {
+            super::super::router::message_handler::typing_indicator::spawn_native_typing_indicator(
+                shared,
+                http.clone(),
+                channel_id,
+                state.effective_finalizer_turn_id(),
+            );
+        }
         spawn_turn_bridge(
             shared.clone(),
             cancel_token,
@@ -2313,10 +2318,154 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
 
 #[cfg(test)]
 mod tests {
+    use crate::services::agent_protocol::{RuntimeHandoffKind, StreamMessage};
+    use crate::services::discord::InflightRestartMode;
     use crate::services::discord::inflight::{
         self, GuardedSaveOutcome, InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
     };
     use crate::services::provider::ProviderKind;
+
+    fn generic_recovery_runtime_ready(
+        shared: &std::sync::Arc<super::SharedData>,
+        provider: &ProviderKind,
+        state: &InflightTurnState,
+        runtime_state: &InflightTurnState,
+        tx: &std::sync::mpsc::Sender<StreamMessage>,
+    ) -> GuardedSaveOutcome {
+        assert!(super::super::runtime::readopt_marker_eligible_real_user(
+            state
+        ));
+        let outcome = super::super::runtime::mark_readopted_from_inflight(
+            shared,
+            provider,
+            serenity::model::id::ChannelId::new(state.channel_id),
+            state,
+            true,
+        );
+        tx.send(StreamMessage::RuntimeReady {
+            handoff: super::super::runtime_handoff_for_recovery(
+                runtime_state.runtime_kind.expect("runtime kind"),
+                runtime_state.output_path.clone().expect("output path"),
+                runtime_state.input_fifo_path.clone(),
+                runtime_state
+                    .tmux_session_name
+                    .clone()
+                    .expect("tmux session"),
+                runtime_state.session_id.clone(),
+                runtime_state.last_offset,
+            ),
+        })
+        .expect("publish RuntimeReady after readoption");
+        assert!(
+            inflight::load_inflight_state(provider, state.channel_id)
+                .expect("readopted durable row")
+                .restart_mode
+                .is_none(),
+            "the generic recovery handoff must observe consumed restart authority"
+        );
+        outcome
+    }
+
+    #[test]
+    fn generic_recovery_consumes_restart_before_runtime_ready_and_persists_runtime_stamp() {
+        let _guard = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let root = tempfile::tempdir().expect("runtime root");
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            root.path(),
+        );
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let provider = ProviderKind::Claude;
+        let channel_id = 4_259_703;
+        let mut state = InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-4259-generic-recovery".to_string()),
+            343_742_347_365_974_026,
+            4_259_713,
+            4_259_714,
+            "generic recovery runtime handoff".to_string(),
+            Some("provider-session-before-recovery".to_string()),
+            Some("AgentDesk-claude-old-runtime".to_string()),
+            Some("/runtime/old-transcript.jsonl".to_string()),
+            None,
+            128,
+        );
+        state.set_restart_mode(InflightRestartMode::DrainRestart);
+        inflight::save_inflight_state(&state).expect("seed planned-restart row");
+        let expected = InflightTurnIdentity::from_state(&state);
+
+        let mut runtime_state = state.clone();
+        runtime_state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
+        runtime_state.output_path = Some("/runtime/recovered-transcript.jsonl".to_string());
+        runtime_state.last_offset = 4_096;
+        runtime_state.watcher_owner_channel_id = Some(channel_id);
+        runtime_state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        assert_eq!(
+            generic_recovery_runtime_ready(&shared, &provider, &state, &runtime_state, &tx,),
+            GuardedSaveOutcome::Saved,
+        );
+        assert!(matches!(
+            rx.recv().expect("RuntimeReady published"),
+            StreamMessage::RuntimeReady { .. }
+        ));
+        assert_eq!(
+            inflight::stamp_runtime_handoff_if_matches_identity(
+                &runtime_state,
+                &expected,
+                "test::generic_recovery_runtime_ready",
+            ),
+            GuardedSaveOutcome::Saved,
+            "runtime stamp must succeed only after generic recovery consumes restart authority"
+        );
+
+        let persisted = inflight::load_inflight_state(&provider, channel_id)
+            .expect("runtime-stamped recovery row");
+        assert!(persisted.readopted_from_inflight);
+        assert_eq!(persisted.restart_mode, None);
+        assert_eq!(persisted.restart_generation, None);
+        assert_eq!(persisted.runtime_kind, Some(RuntimeHandoffKind::ClaudeTui));
+        assert_eq!(
+            persisted.output_path.as_deref(),
+            Some("/runtime/recovered-transcript.jsonl")
+        );
+        assert_eq!(persisted.last_offset, 4_096);
+        assert_eq!(persisted.watcher_owner_channel_id, Some(channel_id));
+        assert_eq!(
+            persisted.effective_relay_owner_kind(),
+            RelayOwnerKind::Watcher
+        );
+    }
+
+    #[test]
+    fn restore_claude_tui_without_runtime_output_uses_tmux_fallback_path() {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            4_997_002,
+            None,
+            1,
+            2,
+            3,
+            "pending ClaudeTui recovery".to_string(),
+            None,
+            Some("AgentDesk-claude-4997".to_string()),
+            None,
+            Some("/runtime/input.fifo".to_string()),
+            0,
+        );
+        state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
+        let output_path = super::recovery_output_path_with_tmux_fallback(
+            &state,
+            "/runtime/AgentDesk-claude-4997.output".to_string(),
+        );
+        assert_eq!(
+            output_path.as_deref(),
+            Some("/runtime/AgentDesk-claude-4997.output"),
+            "ClaudeTui None must take the tmux fallback instead of recovery_missing_output_path"
+        );
+    }
 
     #[test]
     fn restore_rollout_output_path_patch_preserves_concurrent_relay_fields() {

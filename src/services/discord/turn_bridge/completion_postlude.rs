@@ -8,76 +8,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use super::guards::{CompletionGuard, InflightCleanupGuard};
 use super::*;
 
-pub(super) struct CompletionPostludeContext {
-    pub(super) shared_owned: Arc<SharedData>,
-    pub(super) gateway: Arc<dyn TurnGateway>,
-    pub(super) channel_id: ChannelId,
-    pub(super) provider: ProviderKind,
-    pub(super) cancel_token: Arc<crate::services::provider::CancelToken>,
-    pub(super) user_msg_id: Option<MessageId>,
-    pub(super) turn_id: String,
-    pub(super) request_owner_name: String,
-    pub(super) final_session_status: &'static str,
-    pub(super) status_panel_started_at: i64,
-    pub(super) has_queued_turns: bool,
-    pub(super) defer_watcher_resume: bool,
-    pub(super) can_chain_locally: bool,
-    pub(super) single_message_panel_footer_mode: bool,
-    pub(super) is_external_input_tui_direct: bool,
-    pub(super) context_window_tokens: u64,
-    pub(super) context_compact_percent: u64,
-    pub(super) turn_start: std::time::Instant,
-}
+mod channel_writeback;
+mod contracts;
 
-pub(super) struct CompletionPostludeState {
-    pub(super) full_response: String,
-    pub(super) user_text_owned: String,
-    pub(super) role_binding: Option<RoleBinding>,
-    pub(super) adk_session_key: Option<String>,
-    pub(super) adk_session_name: Option<String>,
-    pub(super) adk_session_info: Option<String>,
-    pub(super) adk_cwd: Option<String>,
-    pub(super) dispatch_id: Option<String>,
-    pub(super) dispatch_kind: Option<String>,
-    pub(super) new_session_id: Option<String>,
-    pub(super) new_raw_provider_session_id: Option<String>,
-    pub(super) status_panel_terminal_committed: bool,
-    pub(super) bridge_should_emit_completion: bool,
-    pub(super) current_msg_id: MessageId,
-    pub(super) status_panel_msg_id: Option<MessageId>,
-    pub(super) last_status_panel_text: String,
-    pub(super) completion_footer_terminal_text: Option<String>,
-    pub(super) spin_idx: usize,
-    pub(super) status_panel_generation: u64,
-    pub(super) preserve_inflight_for_cleanup_retry: bool,
-    pub(super) tmux_last_offset: Option<u64>,
-    pub(super) watcher_owner_channel_id: ChannelId,
-    pub(super) bridge_relay_delegated_to_watcher: bool,
-    pub(super) is_prompt_too_long: bool,
-    pub(super) resume_failure_detected: bool,
-    pub(super) recovery_retry: bool,
-    pub(super) rx_disconnected: bool,
-    pub(super) tmux_handed_off: bool,
-    pub(super) bridge_output_owner: Option<BridgeOutputOwner>,
-    pub(super) terminal_delivery_committed: bool,
-    pub(super) terminal_session_reset_required: bool,
-    pub(super) transcript_events: Vec<SessionTranscriptEvent>,
-    pub(super) accumulated_input_tokens: u64,
-    pub(super) accumulated_cache_create_tokens: u64,
-    pub(super) accumulated_cache_read_tokens: u64,
-    pub(super) accumulated_output_tokens: u64,
-    pub(super) accumulated_memory_input_tokens: u64,
-    pub(super) accumulated_memory_output_tokens: u64,
-    pub(super) transport_error: bool,
-    pub(super) api_friction_reports: Vec<crate::services::api_friction::ApiFrictionReport>,
-    pub(super) cancelled: bool,
-    pub(super) restart_followup_pending: bool,
-    pub(super) bridge_skip_holder_owns_inflight: bool,
-    pub(super) inflight_guard: InflightCleanupGuard,
-    pub(super) inflight_state: InflightTurnState,
-}
+pub(super) use contracts::{CompletionPostludeContext, CompletionPostludeState};
 
 pub(super) async fn run_completion_postlude(
     ctx: CompletionPostludeContext,
@@ -119,6 +56,7 @@ pub(super) async fn run_completion_postlude(
     let status_panel_msg_id = state.status_panel_msg_id;
     let mut last_status_panel_text = state.last_status_panel_text;
     let completion_footer_terminal_text = state.completion_footer_terminal_text;
+    let mut busy_requeue_outcome = state.busy_requeue_outcome;
     let spin_idx = state.spin_idx;
     let status_panel_generation = state.status_panel_generation;
     let preserve_inflight_for_cleanup_retry = state.preserve_inflight_for_cleanup_retry;
@@ -145,8 +83,9 @@ pub(super) async fn run_completion_postlude(
     let cancelled = state.cancelled;
     let restart_followup_pending = state.restart_followup_pending;
     let bridge_skip_holder_owns_inflight = state.bridge_skip_holder_owns_inflight;
+    let completion_guard = state.completion_guard;
     let mut inflight_guard = state.inflight_guard;
-    let inflight_state = state.inflight_state;
+    let mut inflight_state = state.inflight_state;
 
     let mut status_panel_completion_committed = true;
     if status_panel_terminal_committed
@@ -196,24 +135,49 @@ pub(super) async fn run_completion_postlude(
         }
         let indicator =
             super::super::single_message_panel::single_message_panel_spinner_frame(spin_idx);
-        status_panel_completion_committed = complete_bridge_terminal_footer_or_status_panel(
-            shared_owned.as_ref(),
-            gateway.as_ref(),
-            channel_id,
-            current_msg_id,
-            user_msg_id,
-            status_panel_msg_id,
+        let (terminal_projection_settled, committed) =
+            followup_requeue::TerminalProjectionSettled::after(
+                complete_bridge_terminal_footer_or_status_panel(
+                    shared_owned.as_ref(),
+                    gateway.as_ref(),
+                    channel_id,
+                    current_msg_id,
+                    user_msg_id,
+                    status_panel_msg_id,
+                    &provider,
+                    status_panel_started_at,
+                    &mut last_status_panel_text,
+                    single_message_panel_footer_mode,
+                    is_external_input_tui_direct, // #3959: suppress mirror chrome footer
+                    completion_footer_terminal_text.as_deref(),
+                    indicator,
+                    status_panel_generation, // #3805 P2: prove this turn's panel epoch
+                    inflight_state.tmux_session_name.as_deref(),
+                ),
+            )
+            .await;
+        status_panel_completion_committed = committed;
+        terminal_projection_settled.release_completion_admission(
+            &completion_guard,
+            busy_requeue_outcome.take(),
+            &shared_owned,
             &provider,
-            status_panel_started_at,
-            &mut last_status_panel_text,
-            single_message_panel_footer_mode,
-            is_external_input_tui_direct, // #3959: suppress mirror chrome footer
-            completion_footer_terminal_text.as_deref(),
-            indicator,
-            status_panel_generation, // #3805 P2: prove this turn's panel epoch
-            inflight_state.tmux_session_name.as_deref(),
-        )
-        .await;
+            channel_id,
+            "claude_tui_followup_requeue_after_completion_postlude_projection",
+        );
+    } else {
+        // No terminal projection is needed, so entry to this branch is itself
+        // the settled boundary consumed by both queue-admission paths.
+        let (terminal_projection_settled, ()) =
+            followup_requeue::TerminalProjectionSettled::after(async {}).await;
+        terminal_projection_settled.release_completion_admission(
+            &completion_guard,
+            busy_requeue_outcome.take(),
+            &shared_owned,
+            &provider,
+            channel_id,
+            "claude_tui_followup_requeue_after_completion_postlude_projection",
+        );
     }
 
     if status_panel_terminal_committed
@@ -290,6 +254,29 @@ pub(super) async fn run_completion_postlude(
     let mut reflect_request = None;
     let mut clear_provider_session = false;
     let capture_memory_settings = settings::memory_settings_for_binding(role_binding.as_ref());
+    // #4658 F1 completion-side isolation: detect a scheduled-snapshot turn by its
+    // ISOLATED session_key. A snapshot turn derives its `session_key` from the
+    // reservation label (AC-2), so it differs from the channel's canonical
+    // (channel-name-basis) key. Recompute the canonical key with the same
+    // production helper (`build_adk_session_key(.., None)`) — which normal intake
+    // and headless turns already use verbatim — and compare. When the turn's key
+    // is present and differs, the turn does NOT own the channel's live session and
+    // must produce ZERO channel-scoped side-effects a later LIVE turn can observe.
+    // The full isolation invariant (the enumerated gated effects #1..#5 and the
+    // F-2 mid-turn-rebind recompute limitation) lives in the `channel_writeback`
+    // module doc — the single source of truth for what `!isolated_from_channel`
+    // gates below. (#4634 bug class, completion side.)
+    let channel_canonical_session_key = super::super::adk_session::build_adk_session_key(
+        &shared_owned,
+        channel_id,
+        &provider,
+        None,
+    )
+    .await;
+    let isolated_from_channel = match adk_session_key.as_deref() {
+        Some(turn_key) => channel_canonical_session_key.as_deref() != Some(turn_key),
+        None => false,
+    };
     let session_id_to_persist = {
         let mut data = shared_owned.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id) {
@@ -302,35 +289,34 @@ pub(super) async fn run_completion_postlude(
                 should_record_final_turn,
             ) {
                 clear_provider_session = memory_plan.clear_provider_session;
-                if memory_plan.persist_transcript {
-                    session.history.push(HistoryItem {
-                        item_type: HistoryType::User,
-                        content: user_text_owned.clone(),
-                    });
-                    session.history.push(HistoryItem {
-                        item_type: HistoryType::Assistant,
-                        content: full_response.clone(),
-                    });
-                    should_persist_transcript = true;
+                // #4658 F1: the writeback helper leaves the channel session
+                // completely unchanged for a scheduled-snapshot turn.
+                let writeback = channel_writeback::apply_channel_turn_writeback(
+                    session,
+                    isolated_from_channel,
+                    &memory_plan,
+                    &user_text_owned,
+                    &full_response,
+                    new_session_id.as_deref(),
+                );
+                should_persist_transcript = writeback.persist_transcript;
+                // A snapshot turn must not reflect/capture the channel session
+                // either — both mutate or summarize `data.sessions[channel_id]`.
+                if !isolated_from_channel {
+                    if let Some(reason) = memory_plan.session_end_reason {
+                        reflect_request = take_memento_reflect_request(
+                            session,
+                            &capture_memory_settings,
+                            &provider,
+                            role_binding.as_ref(),
+                            channel_id.get(),
+                            reason,
+                        );
+                    }
+                    should_spawn_memory_capture = memory_plan.spawn_capture;
                 }
-                if let Some(reason) = memory_plan.session_end_reason {
-                    reflect_request = take_memento_reflect_request(
-                        session,
-                        &capture_memory_settings,
-                        &provider,
-                        role_binding.as_ref(),
-                        channel_id.get(),
-                        reason,
-                    );
-                }
-                if memory_plan.clear_provider_session {
-                    session.clear_provider_session();
-                } else if let Some(sid) = new_session_id.as_ref() {
-                    session.restore_provider_session(Some(sid.clone()));
-                }
-                should_spawn_memory_capture = memory_plan.spawn_capture;
                 should_analyze_recall_feedback = memory_plan.analyze_recall_feedback;
-                session.session_id.clone()
+                writeback.session_id_to_persist
             } else {
                 None
             }
@@ -372,8 +358,13 @@ pub(super) async fn run_completion_postlude(
         None
     };
     if let Some(analysis) = recall_feedback_analysis.as_ref()
-        && let Some(reminder) = build_voluntary_feedback_reminder(analysis)
+        && let Some(reminder) = channel_writeback::feedback_reminder_to_stash(
+            isolated_from_channel,
+            build_voluntary_feedback_reminder(analysis),
+        )
     {
+        // #4658 F1: gated on channel ownership above — a scheduled-snapshot turn
+        // never reaches this stash (see feedback_reminder_to_stash).
         // #4307 PR-B: stash the reminder (provider-scoped key) so the NEXT turn's
         // intake takes it and injects it into the model context (turn N+1). The
         // transcript event below only records it in the session_transcripts DB —
@@ -396,6 +387,33 @@ pub(super) async fn run_completion_postlude(
         }
         push_transcript_event(&mut transcript_events, reminder_transcript_event(reminder));
         recall_feedback_analysis = Some(analyze_recall_feedback_turn(&transcript_events));
+    }
+    // #4196: if this turn ends with uncommitted changes in its worktree, stash a
+    // WIP warning (provider-scoped key) so the NEXT turn's intake takes it and
+    // injects it into the model context (turn N+1). Reuses the #3792 detector via
+    // `turn_end_wip_warning_text` — no re-implementation of git status parsing.
+    // Gated on channel ownership (mirrors the feedback stash) so a scheduled or
+    // isolated snapshot turn never nudges the interactive session. A clean
+    // worktree yields `None` here, so nothing is stashed and turn N+1 is
+    // byte-for-byte unchanged. A stash failure only loses the next-turn nudge
+    // (the channel-post backstop still fires), so warn+skip.
+    if !isolated_from_channel
+        && let Some(wip_warning) =
+            super::super::turn_end_wip_warning::turn_end_wip_warning_text(Some(&inflight_state))
+        && let Err(error) = super::recovery_text::store_turn_end_wip_warning(
+            shared_owned.pg_pool.as_ref(),
+            &provider,
+            channel_id.get(),
+            &wip_warning,
+        )
+    {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            turn_id = turn_id.as_str(),
+            provider = provider.as_str(),
+            error = %error,
+            "failed to stash turn-end WIP warning for next-turn injection"
+        );
     }
     let model_token_usage = TurnTokenUsage {
         input_tokens: accumulated_input_tokens,
@@ -478,6 +496,8 @@ pub(super) async fn run_completion_postlude(
                 assistant_message: &full_response,
                 events: &transcript_events,
                 duration_ms: Some(turn_duration_ms(turn_start)),
+                turn_started_at_millis:
+                    crate::db::session_transcripts::discord_message_started_at_millis(user_msg_id),
             },
         )
         .await
@@ -521,7 +541,11 @@ pub(super) async fn run_completion_postlude(
         }
     }
 
-    if shared_owned.pg_pool.is_some() && !api_friction_reports.is_empty() {
+    // #4658 F1: `record_api_friction_reports` calls `backend.remember(..)`,
+    // landing in the agent's memento memory a live turn's recall can surface, so
+    // a scheduled-snapshot turn must skip it (isolation invariant, effect #5).
+    if !isolated_from_channel && shared_owned.pg_pool.is_some() && !api_friction_reports.is_empty()
+    {
         match crate::services::api_friction::record_api_friction_reports(
             shared_owned.pg_pool.as_ref(),
             &capture_memory_settings,
@@ -684,7 +708,7 @@ pub(super) async fn run_completion_postlude(
                 "turn_bridge::restart_full_response_patch@6330",
             );
         }
-        inflight_guard.provider.take();
+        inflight_guard.defuse();
     } else if preserve_inflight_for_cleanup_retry || bridge_output_owner.is_some() {
         // #3041 P1-2 (codex P1-2 R3): on a delivery-lease `Skip` the live
         // HOLDER (the watcher) owns this turn's inflight lifecycle and CLEARS
@@ -701,12 +725,16 @@ pub(super) async fn run_completion_postlude(
         // clear cannot race with a bridge re-save and resurrect a delivered row.
         let identity_guarded_skip_save =
             bridge_epilogue_skip_save_is_identity_guarded(bridge_skip_holder_owns_inflight);
+        let expected_identity =
+            crate::services::discord::inflight::InflightTurnIdentity::from_state(&inflight_state);
+        let expected_turn_start_offset = inflight_state.turn_start_offset;
+        let guarded_outcome =
+            crate::services::discord::inflight::save_inflight_state_if_matches_identity(
+                &mut inflight_state,
+                &expected_identity,
+                expected_turn_start_offset,
+            );
         if identity_guarded_skip_save {
-            let guarded_outcome =
-                crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                    &inflight_state,
-                    "turn_bridge::skip_holder_preserve@6355",
-                );
             crate::services::observability::emit_inflight_lifecycle_event(
                 provider.as_str(),
                 channel_id.get(),
@@ -720,13 +748,8 @@ pub(super) async fn run_completion_postlude(
                     "turn_start_offset": inflight_state.turn_start_offset,
                 }),
             );
-        } else {
-            let _ = crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                &inflight_state,
-                "turn_bridge::delegated_owner_preserve@6374",
-            );
         }
-        inflight_guard.provider.take();
+        inflight_guard.defuse();
         if let Some(owner) = bridge_output_owner {
             let lifecycle_event = match owner {
                 BridgeOutputOwner::WatcherRelay => "delegated_to_watcher",
@@ -795,7 +818,7 @@ pub(super) async fn run_completion_postlude(
                 dispatch_id.as_deref(),
                 adk_session_key.as_deref(),
                 Some(turn_id.as_str()),
-                Some(current_msg_id.get()),
+                optional_durable_current_msg_id_from_detached(current_msg_id),
                 "turn_bridge",
                 "skip",
                 None,
@@ -886,7 +909,7 @@ pub(super) async fn run_completion_postlude(
             }
         }
         // Defuse the guard — cleanup already done above.
-        inflight_guard.provider.take();
+        inflight_guard.defuse();
         crate::services::observability::emit_inflight_lifecycle_event(
             provider.as_str(),
             channel_id.get(),

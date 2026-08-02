@@ -129,7 +129,7 @@ impl ClaudeSlashPassthrough {
 /// `⏳`→`✅` lifecycle. The `local_only_whitelist_matches_passthrough_command_set`
 /// anti-drift test pins this against the [`ClaudeSlashPassthrough`] variant set.
 pub(in crate::services::discord) const LOCAL_ONLY_SLASH_COMMANDS: [&str; 4] =
-    ["/effort", "/compact", "/cost", "/context"];
+    crate::services::tui_prompt_control::LOCAL_ONLY_SLASH_COMMANDS;
 
 /// #3500: local-completing slash commands that are NOT AgentDesk pass-throughs.
 /// These are Claude-NATIVE commands (e.g. `/model`) the idle relay only OBSERVES
@@ -143,15 +143,15 @@ pub(in crate::services::discord) const LOCAL_ONLY_SLASH_COMMANDS: [&str; 4] =
 /// (which the `local_only_whitelist_matches_passthrough_command_set` anti-drift test
 /// pins to that variant set).
 pub(in crate::services::discord) const OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS: [&str; 1] =
-    ["/model"];
+    crate::services::tui_prompt_control::OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS;
 
 /// #3305/#3500: whether `kind` (a canonical `slash_command_control_kind`, e.g.
 /// `/compact`) is a local-completing command that SKIPS the turn lifecycle — either
 /// an AgentDesk pass-through ([`LOCAL_ONLY_SLASH_COMMANDS`]) or a Claude-native
 /// observation-only command ([`OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS`]).
+#[cfg(test)]
 pub(in crate::services::discord) fn is_local_only_slash_command_kind(kind: &str) -> bool {
-    LOCAL_ONLY_SLASH_COMMANDS.contains(&kind)
-        || OBSERVATION_ONLY_LOCAL_SLASH_COMMANDS.contains(&kind)
+    crate::services::tui_prompt_control::is_local_only_slash_command_kind(kind)
 }
 
 fn ultracode_notice() -> &'static str {
@@ -234,8 +234,7 @@ async fn run_claude_passthrough(
         return Ok(());
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!("  [{ts}] ◀ [{user_name}] {}", command.prompt());
+    log_command_received!(ctx.channel_id().get(), user_name, command.prompt());
 
     let (effective_provider, tmux_name) = resolve_effective_provider_and_tmux_name(ctx).await;
     if let Some(notice) = provider_preflight_notice(&effective_provider, command) {

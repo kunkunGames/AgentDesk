@@ -17,7 +17,6 @@ use super::{
     watcher_should_delete_suppressed_placeholder,
     watcher_should_direct_send_after_session_bound_ack,
     watcher_should_reclaim_orphan_turn_placeholder,
-    watcher_should_suppress_streaming_after_bridge_delivery,
     watcher_stream_seed_after_restored_seed_discard, watcher_terminal_commit_side_effects_for_test,
     watcher_terminal_edit_consumes_placeholder, watcher_terminal_response_for_direct_send,
     watcher_terminal_rewind_seed, watcher_wait_inflight_retry_plan,
@@ -515,7 +514,7 @@ async fn terminal_delivery_timeout_cleanup_releases_mailbox_and_preserves_follow
             author_id: UserId::new(99),
             author_is_bot: false,
             message_id: MessageId::new(2001),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(2001)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -655,7 +654,7 @@ fn watchdog_timeout_path_releases_mailbox_via_finalizer_and_does_not_double_fina
                 author_id: UserId::new(99),
                 author_is_bot: false,
                 message_id: MessageId::new(6001),
-                queued_generation: crate::services::discord::runtime_store::load_generation(),
+                queued_generation: crate::services::discord::runtime_store::process_generation(),
                 source_message_ids: vec![MessageId::new(6001)],
                 source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -943,7 +942,7 @@ fn timeout_finalize_drains_reacquired_id_zero_wedge_for_live_pinned_turn() {
                 author_id: UserId::new(99),
                 author_is_bot: false,
                 message_id: MessageId::new(3600),
-                queued_generation: crate::services::discord::runtime_store::load_generation(),
+                queued_generation: crate::services::discord::runtime_store::process_generation(),
                 source_message_ids: vec![MessageId::new(3600)],
                 source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -3374,6 +3373,7 @@ fn cross_turn_watcher_reuse_discards_restored_seed_through_watcher_wiring_4105()
         turn_identity: Some(seed_identity),
         streaming_rollover_frozen_msg_ids: Vec::new(),
         same_turn_rewind: false,
+        delivery_source: None,
     };
 
     let disposition = watcher_stream_seed_after_restored_seed_discard(
@@ -3821,16 +3821,57 @@ fn legacy_watcher_streaming_edit_keeps_processing_footer() {
 }
 
 #[test]
-fn watcher_streaming_suppresses_after_bridge_delivery_only_for_response() {
-    assert!(watcher_should_suppress_streaming_after_bridge_delivery(
-        true, true
-    ));
-    assert!(!watcher_should_suppress_streaming_after_bridge_delivery(
-        true, false
-    ));
-    assert!(!watcher_should_suppress_streaming_after_bridge_delivery(
-        false, true
-    ));
+fn watcher_streaming_suppression_stops_at_bridge_committed_frontier() {
+    let committed_terminal_range = Some((100, 200));
+
+    assert!(
+        super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            true,
+            true,
+            (100, 200),
+            committed_terminal_range,
+        )
+    );
+    assert!(
+        !super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            true,
+            true,
+            (200, 240),
+            committed_terminal_range,
+        )
+    );
+    assert!(
+        !super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            true,
+            true,
+            (180, 240),
+            committed_terminal_range,
+        )
+    );
+    assert!(
+        !super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            true,
+            false,
+            (100, 200),
+            committed_terminal_range,
+        )
+    );
+    assert!(
+        !super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            false,
+            true,
+            (100, 200),
+            committed_terminal_range,
+        )
+    );
+    assert!(
+        !super::streaming_status_tick::watcher_should_suppress_streaming_after_bridge_delivery(
+            true,
+            true,
+            (100, 200),
+            None,
+        )
+    );
 }
 
 #[test]
@@ -4056,9 +4097,10 @@ mod delivery_lease_heartbeat {
 // identity-gated advance, heartbeat) is exercised end-to-end. Pinned inline in
 // this `#[cfg(test)] mod tests` block of the FROZEN file => ZERO production LoC.
 mod watcher_short_replace_controller {
+    use super::super::loop_poll_prologue::WatcherSourceAuthority;
     use super::super::terminal_long_chunks::{
         WatcherLongChunksLocals, apply_watcher_long_chunks_result,
-        deliver_long_chunks_via_controller,
+        deliver_long_chunks_via_controller, remember_ordered_long_chunks_footer_target,
     };
     use super::super::terminal_send::{
         WatcherShortReplaceLocals, WatcherShortReplaceResult, apply_watcher_short_replace_result,
@@ -4092,6 +4134,7 @@ mod watcher_short_replace_controller {
         ok: bool,
         failure_class: WatcherSendFailureClass,
         replace_calls: AtomicUsize,
+        on_replace: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl TurnGateway for ShortReplaceFakeGateway {
@@ -4103,6 +4146,9 @@ mod watcher_short_replace_controller {
         ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
             Box::pin(async move {
                 self.replace_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(on_replace) = &self.on_replace {
+                    on_replace();
+                }
                 if self.ok {
                     Ok(self.outcome.clone())
                 } else {
@@ -4143,6 +4189,9 @@ mod watcher_short_replace_controller {
             _i: &'a crate::services::discord::Intervention,
             _o: &'a str,
             _h: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             panic!("unused on the short-replace path")
         }
@@ -4171,6 +4220,7 @@ mod watcher_short_replace_controller {
         clock: AtomicUsize,
         send_step: AtomicUsize,
         delete_step: AtomicUsize,
+        on_send: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl TurnGateway for LongChunksFakeGateway {
@@ -4182,6 +4232,9 @@ mod watcher_short_replace_controller {
         ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
             Box::pin(async move {
                 self.send_calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(on_send) = &self.on_send {
+                    on_send();
+                }
                 self.send_step
                     .store(self.clock.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
                 if self.send_ok {
@@ -4245,6 +4298,9 @@ mod watcher_short_replace_controller {
             _i: &'a crate::services::discord::Intervention,
             _o: &'a str,
             _h: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             panic!("unused on long chunks")
         }
@@ -4299,6 +4355,7 @@ mod watcher_short_replace_controller {
             ok,
             failure_class,
             replace_calls: AtomicUsize::new(0),
+            on_replace: None,
         }
     }
 
@@ -4311,6 +4368,7 @@ mod watcher_short_replace_controller {
             clock: AtomicUsize::new(1),
             send_step: AtomicUsize::new(0),
             delete_step: AtomicUsize::new(0),
+            on_send: None,
         }
     }
 
@@ -4336,6 +4394,10 @@ mod watcher_short_replace_controller {
             turn(),
             Some(lease_key()),
             INSTANCE,
+            WatcherSourceAuthority {
+                generation_mtime_ns: crate::services::discord::outbound::delivery_record::current_generation_mtime_ns("AgentDesk-claude-8141"),
+                reset_incarnation: shared.relay_frontier_token(ch()).reset_incarnation,
+            },
             START,
             END,
         )
@@ -4346,7 +4408,7 @@ mod watcher_short_replace_controller {
         gw: &LongChunksFakeGateway,
         shared: &Arc<crate::services::discord::SharedData>,
         cell: &Arc<DeliveryLeaseCell>,
-    ) -> toc::DeliveryOutcome {
+    ) -> super::super::terminal_long_chunks::WatcherLongChunksResult {
         deliver_long_chunks_via_controller(
             gw,
             shared,
@@ -4360,15 +4422,237 @@ mod watcher_short_replace_controller {
             turn(),
             Some(lease_key()),
             INSTANCE,
+            WatcherSourceAuthority {
+                generation_mtime_ns: crate::services::discord::outbound::delivery_record::current_generation_mtime_ns("AgentDesk-claude-8141"),
+                reset_incarnation: shared.relay_frontier_token(ch()).reset_incarnation,
+            },
             START,
             END,
         )
         .await
     }
 
+    fn set_generation(session: &str, unix_secs: i64, body: &str) -> i64 {
+        let path = crate::services::tmux_common::session_temp_path(session, "generation");
+        std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(unix_secs, 123))
+            .unwrap();
+        crate::services::discord::outbound::delivery_record::current_generation_mtime_ns(session)
+    }
+
+    #[test]
+    fn watcher_short_controller_current_authority_persists_pinned_ledger_4911() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().expect("runtime root");
+        let _root = super::AgentdeskRootGuard::set(temp.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let session = "AgentDesk-claude-8141";
+            let generation = set_generation(session, 1_700_491_810, "short-current");
+            shared
+                .tmux_relay_coord(ch())
+                .confirmed_end_generation_mtime_ns
+                .store(generation, Ordering::Release);
+            let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+            let gw = gateway(ReplaceLongMessageOutcome::EditedOriginal, true);
+            assert_eq!(
+                run(&gw, &shared, &cell).await,
+                WatcherShortReplaceResult::Delivered
+            );
+
+            let record =
+                crate::services::discord::outbound::delivery_record::read_record(&provider, CH)
+                    .expect("current short delivery record");
+            assert_eq!(record.delivered_frontier.unwrap().range, (START, END));
+            assert_eq!(record.recent_delivered_contents.len(), 1);
+            assert!(
+                crate::services::discord::outbound::completed_turn_ledger::settled_user_msg_ids(
+                    &provider, CH,
+                )
+                .contains(&turn().user_msg_id)
+            );
+        });
+    }
+
+    #[test]
+    fn watcher_short_controller_same_generation_reset_rejects_record_4911() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().expect("runtime root");
+        let _root = super::AgentdeskRootGuard::set(temp.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let session = "AgentDesk-claude-8141";
+            let generation = set_generation(session, 1_700_491_811, "same-generation");
+            let coord = shared.tmux_relay_coord(ch());
+            coord
+                .confirmed_end_generation_mtime_ns
+                .store(generation, Ordering::Release);
+            coord.confirmed_end_offset.store(START, Ordering::Release);
+
+            let reset_shared = Arc::clone(&shared);
+            let mut gw = gateway(ReplaceLongMessageOutcome::EditedOriginal, true);
+            gw.on_replace = Some(Arc::new(move || {
+                let coord = reset_shared.tmux_relay_coord(ch());
+                assert!(coord.reset_confirmed_frontier(START, 0));
+                crate::services::discord::outbound::delivery_record::record_delivered_content_fingerprint(
+                    &ProviderKind::Claude,
+                    ch(),
+                    session,
+                    "replacement short body",
+                );
+                crate::services::discord::outbound::delivery_record::write_delivered_frontier(
+                    &ProviderKind::Claude,
+                    CH,
+                    session,
+                    crate::services::discord::outbound::delivery_record::DeliveredCommit {
+                        range: (0, START),
+                        generation_mtime_ns: generation,
+                        attempts: 1,
+                        panel_msg_id: Some(8_141_900),
+                        panel_channel_id: Some(CH),
+                    },
+                )
+                .expect("seed same-generation replacement frontier");
+            }));
+            let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+            assert_eq!(
+                run(&gw, &shared, &cell).await,
+                WatcherShortReplaceResult::LandedStale
+            );
+            assert_eq!(
+                coord.confirmed_end_offset.load(Ordering::Acquire),
+                0,
+                "the stale POST must not advance the replacement incarnation"
+            );
+            let record =
+                crate::services::discord::outbound::delivery_record::read_record(&provider, CH)
+                    .expect("replacement record");
+            assert_eq!(record.delivered_frontier.unwrap().range, (0, START));
+            assert_eq!(record.recent_delivered_contents.len(), 1);
+            assert!(
+                crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
+                    &provider, ch(), session, "replacement short body",
+                )
+            );
+            assert!(
+                !crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
+                    &provider, ch(), session, "answer",
+                )
+            );
+            assert!(
+                !crate::services::discord::outbound::completed_turn_ledger::settled_user_msg_ids(
+                    &provider, CH,
+                )
+                .contains(&turn().user_msg_id)
+            );
+        });
+    }
+
+    #[test]
+    fn watcher_long_controller_same_name_generation_reset_rejects_record_4911() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().expect("runtime root");
+        let _root = super::AgentdeskRootGuard::set(temp.path());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let session = "AgentDesk-claude-8141";
+            let generation_a = set_generation(session, 1_700_491_812, "controller-a");
+            let coord = shared.tmux_relay_coord(ch());
+            coord
+                .confirmed_end_generation_mtime_ns
+                .store(generation_a, Ordering::Release);
+            coord.confirmed_end_offset.store(START, Ordering::Release);
+
+            let reset_shared = Arc::clone(&shared);
+            let mut gw = long_gateway(true, true);
+            gw.on_send = Some(Arc::new(move || {
+                let generation_b = set_generation(session, 1_700_491_813, "controller-b");
+                let coord = reset_shared.tmux_relay_coord(ch());
+                assert!(coord.reset_confirmed_frontier(START, 0));
+                crate::services::discord::outbound::delivery_record::record_delivered_content_fingerprint(
+                    &ProviderKind::Claude,
+                    ch(),
+                    session,
+                    "replacement long body",
+                );
+                crate::services::discord::outbound::delivery_record::write_delivered_frontier(
+                    &ProviderKind::Claude,
+                    CH,
+                    session,
+                    crate::services::discord::outbound::delivery_record::DeliveredCommit {
+                        range: (0, START),
+                        generation_mtime_ns: generation_b,
+                        attempts: 1,
+                        panel_msg_id: Some(8_141_901),
+                        panel_channel_id: Some(CH),
+                    },
+                )
+                .expect("seed same-name replacement frontier");
+            }));
+            let cell = Arc::new(DeliveryLeaseCell::new(ch()));
+            assert!(matches!(
+                run_long(&gw, &shared, &cell).await,
+                super::super::terminal_long_chunks::WatcherLongChunksResult::LandedStale
+            ));
+            assert_eq!(
+                coord.confirmed_end_offset.load(Ordering::Acquire),
+                0,
+                "the stale long POST must not advance the replacement incarnation"
+            );
+            let record =
+                crate::services::discord::outbound::delivery_record::read_record(&provider, CH)
+                    .expect("replacement record");
+            assert_eq!(record.delivered_frontier.unwrap().range, (0, START));
+            assert_eq!(record.recent_delivered_contents.len(), 1);
+            assert!(
+                crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
+                    &provider, ch(), session, "replacement long body",
+                )
+            );
+            let delayed_body = "x".repeat(crate::services::discord::DISCORD_MSG_LIMIT + 10);
+            assert!(
+                !crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
+                    &provider,
+                    ch(),
+                    session,
+                    &delayed_body,
+                )
+            );
+            assert!(
+                !crate::services::discord::outbound::completed_turn_ledger::settled_user_msg_ids(
+                    &provider, CH,
+                )
+                .contains(&turn().user_msg_id)
+            );
+        });
+    }
+
     fn toc_debug_outcome(outcome: &toc::DeliveryOutcome) -> &'static str {
         match outcome {
             toc::DeliveryOutcome::Delivered { .. } => "Delivered",
+            toc::DeliveryOutcome::FreshDelivered { .. } => "FreshDelivered",
             toc::DeliveryOutcome::NotDelivered { .. } => "NotDelivered",
             toc::DeliveryOutcome::Transient { .. } => "Transient",
             toc::DeliveryOutcome::Unknown { .. } => "Unknown",
@@ -4429,6 +4713,9 @@ mod watcher_short_replace_controller {
             .expect("current-thread runtime");
         runtime.block_on(async {
             let shared = crate::services::discord::make_shared_data_for_tests();
+            // #4911 R9: the guarded funnel advances only for a live immutable source
+            // generation, so the happy path needs a real generation marker.
+            set_generation("AgentDesk-claude-8141", 1_700_491_800, "live-generation");
             let cell = Arc::new(DeliveryLeaseCell::new(ch()));
             assert_eq!(shared.committed_relay_offset(ch()), 0);
             let gw = gateway(ReplaceLongMessageOutcome::EditedOriginal, true);
@@ -4525,6 +4812,9 @@ mod watcher_short_replace_controller {
                 _i: &'a crate::services::discord::Intervention,
                 _o: &'a str,
                 _h: bool,
+                _dispatch_lease: Option<
+                    std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+                >,
             ) -> GatewayFuture<'a, Result<(), String>> {
                 panic!("unused")
             }
@@ -4701,6 +4991,8 @@ mod watcher_short_replace_controller {
             .expect("current-thread runtime");
         runtime.block_on(async {
             let shared = crate::services::discord::make_shared_data_for_tests();
+            // #4911 R9: live immutable source generation for the guarded funnel.
+            set_generation("AgentDesk-claude-8141", 1_700_491_800, "live-generation");
             let cell = Arc::new(DeliveryLeaseCell::new(ch()));
             let gw = gateway(
                 ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
@@ -4713,6 +5005,7 @@ mod watcher_short_replace_controller {
                 run(&gw, &shared, &cell).await,
                 WatcherShortReplaceResult::DeliveredFallback {
                     edit_error: "edit failed".to_string(),
+                    replacement_anchor: None,
                 },
                 "CommitOnFallback maps SentFallbackAfterEditFailure → DeliveredFallback \
                      (advances, surfaces the replace identity + edit_error)"
@@ -4768,6 +5061,7 @@ mod watcher_short_replace_controller {
         let mut last_edit_text = "streamed body".to_string();
         let mut completion_footer_terminal_target = None;
         let mut retry_terminal_delivery_from_offset = false;
+        let mut terminal_delivery_landed_unproven = false;
         apply_watcher_short_replace_result(
             result,
             &shared,
@@ -4789,6 +5083,7 @@ mod watcher_short_replace_controller {
                 last_edit_text: &mut last_edit_text,
                 completion_footer_terminal_target: &mut completion_footer_terminal_target,
                 retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+                terminal_delivery_landed_unproven: &mut terminal_delivery_landed_unproven,
             },
         );
         assert!(!relay_ok);
@@ -4826,6 +5121,7 @@ mod watcher_short_replace_controller {
         let mut last_edit_text = "streamed body".to_string();
         let mut completion_footer_terminal_target = None;
         let mut retry_terminal_delivery_from_offset = false;
+        let mut terminal_delivery_landed_unproven = false;
         apply_watcher_short_replace_result(
             result,
             &shared,
@@ -4847,6 +5143,7 @@ mod watcher_short_replace_controller {
                 last_edit_text: &mut last_edit_text,
                 completion_footer_terminal_target: &mut completion_footer_terminal_target,
                 retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+                terminal_delivery_landed_unproven: &mut terminal_delivery_landed_unproven,
             },
         );
         assert!(!relay_ok);
@@ -4876,19 +5173,23 @@ mod watcher_short_replace_controller {
             .expect("current-thread runtime");
         runtime.block_on(async {
             let shared = crate::services::discord::make_shared_data_for_tests();
+            // #4911 R9: live immutable source generation for the guarded funnel.
+            set_generation("AgentDesk-claude-8141", 1_700_491_800, "live-generation");
             let cell = Arc::new(DeliveryLeaseCell::new(ch()));
             let gw = long_gateway(true, true);
             let outcome = run_long(&gw, &shared, &cell).await;
             match outcome {
-                toc::DeliveryOutcome::Delivered {
-                    new_chunks: Some(chunks),
-                    ..
-                } => {
+                super::super::terminal_long_chunks::WatcherLongChunksResult::Outcome(
+                    toc::DeliveryOutcome::Delivered {
+                        new_chunks: Some(chunks),
+                        ..
+                    },
+                ) => {
                     assert_eq!(chunks.first_message_id, Some(MessageId::new(9100)));
                     assert_eq!(chunks.tail_message_id, Some(MessageId::new(9101)));
                     assert_eq!(chunks.anchor_delete_error, None);
                 }
-                other => panic!("expected Delivered, got {}", toc_debug_outcome(&other)),
+                _ => panic!("expected persisted Delivered"),
             }
             assert_eq!(gw.send_calls.load(Ordering::SeqCst), 1);
             assert_eq!(gw.delete_calls.load(Ordering::SeqCst), 1);
@@ -4899,6 +5200,83 @@ mod watcher_short_replace_controller {
             assert_eq!(shared.committed_relay_offset(ch()), END);
             assert!(matches!(cell.read(), LeaseSnapshot::Unleased));
         });
+    }
+
+    #[test]
+    fn ordered_long_chunks_footer_target_uses_tail_message_and_text_4822() {
+        let mut footer_target = None;
+        let relay_text = format!("{}tail", "a".repeat(2_000));
+        let expected_tail = crate::services::discord::formatting::split_message(&relay_text)
+            .pop()
+            .expect("long response has a tail chunk");
+
+        remember_ordered_long_chunks_footer_target(
+            true,
+            &mut footer_target,
+            Some(MessageId::new(9101)),
+            &relay_text,
+        );
+
+        let target = footer_target.expect("ordered chunks must register footer tail");
+        assert_eq!(target.msg_id, MessageId::new(9101));
+        assert_eq!(target.text, expected_tail);
+        assert!(target.text.ends_with("tail"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_long_chunks_controller_registers_tail_footer_target_4822() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let http = Arc::new(Http::new("test-token"));
+        let mut relay_ok = true;
+        let mut direct = false;
+        let mut visible = false;
+        let mut external = false;
+        let mut placeholder = Some(MessageId::new(MSG));
+        let mut restored = true;
+        let mut last_edit = String::from("streamed");
+        let mut frozen = Vec::new();
+        let mut footer_target = None;
+        let relay_text = format!("{}tail", "a".repeat(2_000));
+        let outcome = toc::DeliveryOutcome::Delivered {
+            committed_to: END,
+            replace_kind: None,
+            new_chunks: Some(toc::NewChunksDelivery {
+                first_message_id: Some(MessageId::new(9100)),
+                tail_message_id: Some(MessageId::new(9101)),
+                anchor_delete_error: None,
+            }),
+        };
+
+        apply_watcher_long_chunks_result(
+            outcome,
+            &http,
+            &shared,
+            &ProviderKind::Claude,
+            ch(),
+            "AgentDesk-claude-8141",
+            MessageId::new(MSG),
+            &relay_text,
+            true,
+            &mut frozen,
+            None,
+            WatcherLongChunksLocals {
+                relay_ok: &mut relay_ok,
+                direct_send_delivered: &mut direct,
+                tui_direct_anchor_terminal_body_visible: &mut visible,
+                external_input_lease_consumed_by_relay: &mut external,
+                placeholder_msg_id: &mut placeholder,
+                placeholder_from_restored_inflight: &mut restored,
+                last_edit_text: &mut last_edit,
+                single_message_panel_footer_mode: true,
+                completion_footer_terminal_target: &mut footer_target,
+            },
+        )
+        .await;
+
+        assert!(
+            footer_target.is_some(),
+            "ordered chunks must register footer tail"
+        );
     }
 
     #[test]
@@ -4917,18 +5295,19 @@ mod watcher_short_replace_controller {
             .expect("current-thread runtime");
         runtime.block_on(async {
             let shared = crate::services::discord::make_shared_data_for_tests();
+            // #4911 R9: live immutable source generation for the guarded funnel.
+            set_generation("AgentDesk-claude-8141", 1_700_491_800, "live-generation");
             let cell = Arc::new(DeliveryLeaseCell::new(ch()));
             let gw = long_gateway(true, false);
             let outcome = run_long(&gw, &shared, &cell).await;
             match outcome {
-                toc::DeliveryOutcome::Delivered {
-                    new_chunks: Some(chunks),
-                    ..
-                } => assert_eq!(chunks.anchor_delete_error.as_deref(), Some("delete failed")),
-                other => panic!(
-                    "delete failure should still be Delivered, got {}",
-                    toc_debug_outcome(&other)
-                ),
+                super::super::terminal_long_chunks::WatcherLongChunksResult::Outcome(
+                    toc::DeliveryOutcome::Delivered {
+                        new_chunks: Some(chunks),
+                        ..
+                    },
+                ) => assert_eq!(chunks.anchor_delete_error.as_deref(), Some("delete failed")),
+                _ => panic!("delete failure should still be persisted Delivered"),
             }
             assert_eq!(shared.committed_relay_offset(ch()), END);
         });
@@ -4941,7 +5320,12 @@ mod watcher_short_replace_controller {
         let gw = long_gateway(false, true);
         let outcome = run_long(&gw, &shared, &cell).await;
         assert!(
-            matches!(outcome, toc::DeliveryOutcome::NotDelivered { .. }),
+            matches!(
+                outcome,
+                super::super::terminal_long_chunks::WatcherLongChunksResult::Outcome(
+                    toc::DeliveryOutcome::NotDelivered { .. }
+                )
+            ),
             "send failure maps to NotDelivered"
         );
         assert_eq!(gw.delete_calls.load(Ordering::SeqCst), 0);
@@ -4956,6 +5340,10 @@ mod watcher_short_replace_controller {
         let mut restored = true;
         let mut last_edit = String::from("streamed");
         let mut frozen = Vec::new();
+        let super::super::terminal_long_chunks::WatcherLongChunksResult::Outcome(outcome) = outcome
+        else {
+            panic!("send failure must remain an ordinary controller outcome");
+        };
         apply_watcher_long_chunks_result(
             outcome,
             &http,
@@ -4964,6 +5352,7 @@ mod watcher_short_replace_controller {
             ch(),
             "AgentDesk-claude-8141",
             MessageId::new(MSG),
+            "ordered response",
             true,
             &mut frozen,
             None,
@@ -4975,6 +5364,8 @@ mod watcher_short_replace_controller {
                 placeholder_msg_id: &mut placeholder,
                 placeholder_from_restored_inflight: &mut restored,
                 last_edit_text: &mut last_edit,
+                single_message_panel_footer_mode: false,
+                completion_footer_terminal_target: &mut None,
             },
         )
         .await;
@@ -5000,7 +5391,12 @@ mod watcher_short_replace_controller {
         ));
         let gw = long_gateway(true, true);
         let outcome = run_long(&gw, &shared, &cell).await;
-        assert!(matches!(outcome, toc::DeliveryOutcome::Transient { .. }));
+        assert!(matches!(
+            outcome,
+            super::super::terminal_long_chunks::WatcherLongChunksResult::Outcome(
+                toc::DeliveryOutcome::Transient { .. }
+            )
+        ));
         assert_eq!(gw.send_calls.load(Ordering::SeqCst), 0);
         assert_eq!(shared.committed_relay_offset(ch()), 0);
     }
@@ -5113,6 +5509,7 @@ mod watcher_short_replace_controller {
                 WatcherCompletionFooterTerminalTarget,
             > = None;
             let mut retry_terminal_delivery_from_offset = false;
+            let mut terminal_delivery_landed_unproven = false;
             apply_watcher_short_replace_result(
                 result,
                 &shared,
@@ -5135,6 +5532,7 @@ mod watcher_short_replace_controller {
                     last_edit_text: &mut last_edit_text,
                     completion_footer_terminal_target: &mut completion_footer_terminal_target,
                     retry_terminal_delivery_from_offset: &mut retry_terminal_delivery_from_offset,
+                    terminal_delivery_landed_unproven: &mut terminal_delivery_landed_unproven,
                 },
             );
             let footer_registered = completion_footer_terminal_target.is_some();
@@ -5171,10 +5569,20 @@ mod watcher_short_replace_controller {
         // committed — the legacy fallback arm (tmux_watcher.rs:6289-6372).
         let fb = run(WatcherShortReplaceResult::DeliveredFallback {
             edit_error: "edit failed".to_string(),
+            replacement_anchor: None,
         });
         assert!(
             !fb.footer_registered,
-            "fallback must NOT register the original as the completion-footer target (#2757)"
+            "fallback without a replacement anchor cannot register the original (#2757)"
+        );
+
+        let anchored = run(WatcherShortReplaceResult::DeliveredFallback {
+            edit_error: "edit failed".to_string(),
+            replacement_anchor: Some(MessageId::new(4_822_001)),
+        });
+        assert!(
+            anchored.footer_registered,
+            "fresh fallback must register its delivered replacement anchor"
         );
         assert!(
             !fb.committed,

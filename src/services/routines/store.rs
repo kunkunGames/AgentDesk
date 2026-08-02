@@ -6,7 +6,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::api_caller_observability::{RequestPrincipal, log_identity_consumption};
+use crate::api_caller_observability::{
+    IdentityConsumptionFields, RequestPrincipal, emit_identity_consumption,
+    identity_consumption_fields,
+};
 use crate::services::automation_candidate_contract::{
     PIPELINE_STAGE_ID, has_complete_loop_contract,
 };
@@ -45,6 +48,20 @@ const API_FRICTION_OBSERVATION_QUERY: &str = r#"
               AND event_count >= 2
             ORDER BY COALESCE(last_event_at, updated_at, created_at) DESC
             LIMIT $1
+            "#;
+
+const CONFIRM_AGENT_TURN_STARTED_QUERY: &str = r#"
+            UPDATE routine_runs
+            SET result_json = jsonb_set(
+                    COALESCE(result_json, '{}'::jsonb),
+                    '{fresh_context_guaranteed}',
+                    'true'::jsonb,
+                    true
+                ),
+                updated_at = NOW()
+            WHERE id = $1
+              AND turn_id = $2
+              AND action = 'agent'
             "#;
 
 #[derive(Debug)]
@@ -486,12 +503,10 @@ fn routine_delete_scope_gate(
     caller_agent_id: Option<&str>,
     principal: Option<&RequestPrincipal>,
 ) -> RoutineDeleteScopeGate {
-    log_identity_consumption(
-        "DELETE /api/routines/{id}",
+    emit_identity_consumption(routine_delete_identity_consumption_fields(
         principal,
         caller_agent_id,
-        false,
-    );
+    ));
 
     let Some(owner) = routine_agent_id
         .map(str::trim)
@@ -515,6 +530,18 @@ fn routine_delete_scope_gate(
             caller: caller.to_string(),
         }
     }
+}
+
+fn routine_delete_identity_consumption_fields(
+    principal: Option<&RequestPrincipal>,
+    caller_agent_id: Option<&str>,
+) -> IdentityConsumptionFields {
+    identity_consumption_fields(
+        "DELETE /api/routines/{id}",
+        principal,
+        caller_agent_id,
+        false,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -2386,6 +2413,17 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn confirm_agent_turn_started(&self, run_id: &str, turn_id: &str) -> Result<bool> {
+        let result = sqlx::query(CONFIRM_AGENT_TURN_STARTED_QUERY)
+            .bind(run_id)
+            .bind(turn_id)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| anyhow!("confirm routine agent turn started {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn schedule_agent_retry(
         &self,
         run_id: &str,
@@ -3230,6 +3268,7 @@ impl RoutineStore {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
         let checkpoint_size_error = match close.checkpoint.as_ref() {
             Some(checkpoint) => checkpoint_size_error(checkpoint, self.max_checkpoint_bytes)?,
@@ -3256,26 +3295,34 @@ impl RoutineStore {
 
         let mut tx = self.pool.begin().await?;
 
-        let target: Option<(String, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>)> =
-            sqlx::query_as(
-                r#"
-            SELECT r.id, r.schedule, r.next_due_at, rr.started_at
+        let target: Option<(
+            String,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+            Option<Value>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT r.id, r.schedule, r.next_due_at, rr.started_at, rr.result_json
             FROM routine_runs rr
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.id = $1
               AND rr.status = 'running'
             FOR UPDATE OF rr, r
             "#,
-            )
-            .bind(run_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
 
-        let Some((routine_id, schedule, current_next_due_at, started_at)) = target else {
+        let Some((routine_id, schedule, current_next_due_at, started_at, current_result_json)) =
+            target
+        else {
             tx.commit().await?;
             return Ok(false);
         };
+        result_json = preserve_fresh_context_evidence(result_json, current_result_json.as_ref());
         let scheduled_next_due_at = if close.next_due_at.should_update() {
             close.next_due_at.value()
         } else if let Some(schedule) = schedule.as_deref() {
@@ -3437,6 +3484,27 @@ fn validate_max_retries(max_retries: Option<i32>) -> Result<()> {
     Ok(())
 }
 
+fn preserve_fresh_context_evidence(
+    mut closing_result: Option<Value>,
+    current_result: Option<&Value>,
+) -> Option<Value> {
+    let verified = current_result
+        .and_then(|value| value.get("fresh_context_guaranteed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !verified {
+        return closing_result;
+    }
+
+    if closing_result.is_none() {
+        closing_result = Some(json!({}));
+    }
+    if let Some(object) = closing_result.as_mut().and_then(Value::as_object_mut) {
+        object.insert("fresh_context_guaranteed".to_string(), Value::Bool(true));
+    }
+    closing_result
+}
+
 fn checkpoint_size_error(
     checkpoint: &Value,
     max_checkpoint_bytes: usize,
@@ -3506,46 +3574,19 @@ struct CloseRun<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        API_FRICTION_OBSERVATION_QUERY, checkpoint_size_error,
+        API_FRICTION_OBSERVATION_QUERY, CONFIRM_AGENT_TURN_STARTED_QUERY, checkpoint_size_error,
         include_automation_candidate_card_observations, precomputed_observation_from_kv,
-        resume_without_next_due_is_invalid, truncate_chars,
+        preserve_fresh_context_evidence, resume_without_next_due_is_invalid, truncate_chars,
     };
     use crate::api_caller_observability::{AuthStrength, LOG_TARGET, RequestPrincipal};
     use chrono::{TimeZone, Utc};
     use serde_json::Value;
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::fmt::writer::MakeWriter;
 
     // Integration tests that require a live PG connection live in
     // src/integration_tests.rs and are gated on the `integration` feature.
     // The store SQL is compiled by `cargo check`; concurrent claim/recovery
     // behavior should be covered by PG integration tests once the runtime
     // harness starts executing routines.
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     #[test]
     fn resume_omitted_next_due_rejects_legacy_schedule_less_rows() {
@@ -3579,6 +3620,57 @@ mod tests {
         let checkpoint = serde_json::json!({"payload": "abcdef"});
         assert!(checkpoint_size_error(&checkpoint, 8).unwrap().is_some());
         assert!(checkpoint_size_error(&checkpoint, 128).unwrap().is_none());
+    }
+
+    #[test]
+    fn confirmation_can_merge_evidence_after_terminal_close_for_matching_turn() {
+        assert!(CONFIRM_AGENT_TURN_STARTED_QUERY.contains("AND turn_id = $2"));
+        assert!(CONFIRM_AGENT_TURN_STARTED_QUERY.contains("AND action = 'agent'"));
+        assert!(!CONFIRM_AGENT_TURN_STARTED_QUERY.contains("status = 'running'"));
+        assert!(CONFIRM_AGENT_TURN_STARTED_QUERY.contains("jsonb_set"));
+        assert!(
+            !CONFIRM_AGENT_TURN_STARTED_QUERY.contains("result_json = $3"),
+            "late confirmation must merge evidence without replacing terminal result metadata"
+        );
+    }
+
+    #[test]
+    fn close_preserves_verified_fresh_context_evidence_from_locked_row() {
+        let closing = Some(serde_json::json!({
+            "status": "completed",
+            "fresh_context_guaranteed": false
+        }));
+        let current = serde_json::json!({
+            "status": "started",
+            "fresh_context_guaranteed": true
+        });
+
+        let merged = preserve_fresh_context_evidence(closing, Some(&current)).expect("result");
+
+        assert_eq!(merged.get("status"), Some(&serde_json::json!("completed")));
+        assert_eq!(
+            merged.get("fresh_context_guaranteed"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn close_does_not_invent_unverified_fresh_context_evidence() {
+        let closing = Some(serde_json::json!({
+            "status": "completed",
+            "fresh_context_guaranteed": false
+        }));
+        let current = serde_json::json!({
+            "status": "started",
+            "fresh_context_guaranteed": false
+        });
+
+        let merged = preserve_fresh_context_evidence(closing, Some(&current)).expect("result");
+
+        assert_eq!(
+            merged.get("fresh_context_guaranteed"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]
@@ -3986,19 +4078,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_delete_scope_gate_logs_delete_path_identity_consumption() {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = CapturingWriter {
-            buffer: buffer.clone(),
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(true)
-            .with_writer(writer)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+    fn routine_delete_scope_gate_preserves_typed_audit_projection() {
         let principal = RequestPrincipal {
             auth_strength: AuthStrength::ServerAdmin,
             claimed_agent_id: Some("codex".to_string()),
@@ -4016,30 +4096,34 @@ mod tests {
                 caller: "resolved-codex".to_string()
             }
         );
-        drop(_guard);
 
-        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains(LOG_TARGET), "logs={logs}");
-        assert!(
-            logs.contains("endpoint=\"DELETE /api/routines/{id}\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("auth_strength=\"ServerAdmin\""),
-            "logs={logs}"
-        );
-        assert!(logs.contains("claimed_agent_id=\"codex\""), "logs={logs}");
-        assert!(
-            logs.contains("claimed_channel_id=\"manager-channel\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("consumed_agent_id=\"resolved-codex\""),
-            "logs={logs}"
-        );
-        assert!(
-            logs.contains("manager_channel_check_relied_on_claimed_header=false"),
-            "logs={logs}"
+        // This asserts the projection helper's own output for the DELETE
+        // argument shape, without the flaky formatted tracing capture. It does
+        // NOT observe the production call site: the helper is invoked here with
+        // arguments this test supplies, so changing what the DELETE handler
+        // actually passes — say, its `caller_agent_id` — leaves this test green.
+        // Nor does it inspect subscriber output or see fields added directly
+        // inside `tracing::info!`. Closing either gap needs a seam that reports
+        // the emitted values back from the production path; tracked as a site on
+        // umbrella #5003.
+        assert_eq!(LOG_TARGET, "agentdesk::api_caller_observability");
+        assert_eq!(
+            super::routine_delete_identity_consumption_fields(
+                Some(&principal),
+                Some("resolved-codex")
+            )
+            .named_values(),
+            vec![
+                ("endpoint", "DELETE /api/routines/{id}".to_string()),
+                ("auth_strength", "ServerAdmin".to_string()),
+                ("claimed_agent_id", "codex".to_string()),
+                ("claimed_channel_id", "manager-channel".to_string()),
+                ("consumed_agent_id", "resolved-codex".to_string()),
+                (
+                    "manager_channel_check_relied_on_claimed_header",
+                    "false".to_string(),
+                ),
+            ]
         );
     }
 

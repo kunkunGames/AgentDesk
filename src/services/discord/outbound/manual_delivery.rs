@@ -7,8 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateMessage};
+use serenity::{ChannelId, CreateAttachment, CreateMessage};
+use sqlx::PgPool;
 
+use crate::db::session_transcripts::{PersistSessionTranscript, persist_turn_db};
+use crate::services::discord::bot_role::UtilityBotRole;
 use crate::services::discord::formatting::{build_long_message_attachment, split_message};
 use crate::services::discord::outbound::delivery::{
     deliver_outbound as deliver_v3_outbound, first_raw_message_id,
@@ -24,6 +27,14 @@ use crate::services::dispatches::discord_delivery::{
     DispatchMessagePostError, DispatchMessagePostErrorKind,
 };
 
+fn manual_delivery_log_emoji(bot: &str) -> &'static str {
+    match UtilityBotRole::from_alias(bot) {
+        Some(UtilityBotRole::Notify) => "🔔",
+        Some(UtilityBotRole::Announce) | None => "📨",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundClient>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -34,9 +45,13 @@ pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundCl
     bot: &str,
     summary: Option<&str>,
     delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+    pg_pool: Option<&PgPool>,
+    record_transcript: bool,
+    transcript_source_label: Option<&str>,
+    attachment: Option<&ManualOutboundAttachment>,
 ) -> (&'static str, String) {
     let channel_id = ChannelId::new(channel_id_raw);
-    let send_result = deliver_manual_notification(
+    let send_result = deliver_manual_notification_with_attachment(
         client,
         dedup,
         &channel_id_raw.to_string(),
@@ -44,6 +59,7 @@ pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundCl
         bot,
         summary,
         delivery_id,
+        attachment,
     )
     .await;
     match send_result {
@@ -52,13 +68,23 @@ pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundCl
             delivery,
         } => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            let emoji = if bot == "notify" { "🔔" } else { "📨" };
+            let emoji = manual_delivery_log_emoji(bot);
             let delivery_tag = delivery
                 .map(|value| format!(" +{value}"))
                 .unwrap_or_default();
             tracing::info!(
                 "  [{ts}] {emoji} ROUTE: [{source}] → channel {channel_id} (bot={bot}{delivery_tag})"
             );
+            if record_transcript && !message_id.is_empty() && !content.trim().is_empty() {
+                record_manual_message_transcript(
+                    pg_pool,
+                    channel_id_raw,
+                    &message_id,
+                    content,
+                    transcript_source_label,
+                )
+                .await;
+            }
             let mut response = serde_json::json!({
                 "ok": true,
                 "target": format!("channel:{channel_id}"),
@@ -90,10 +116,74 @@ pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundCl
     }
 }
 
+fn synthetic_routine_pair<'a>(
+    channel_id_raw: u64,
+    message_id: &'a str,
+    content: &'a str,
+    source_label: Option<&str>,
+) -> (String, String, &'a str) {
+    let label = source_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("routine");
+    (
+        format!("manual-discord:{channel_id_raw}:{message_id}"),
+        format!("(routine {label} posted)"),
+        content,
+    )
+}
+
+async fn record_manual_message_transcript(
+    pg_pool: Option<&PgPool>,
+    channel_id_raw: u64,
+    message_id: &str,
+    content: &str,
+    source_label: Option<&str>,
+) {
+    let (turn_id, user_message, assistant_message) =
+        synthetic_routine_pair(channel_id_raw, message_id, content, source_label);
+    let channel_id = channel_id_raw.to_string();
+    let source_label = source_label
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let entry = PersistSessionTranscript {
+        turn_id: &turn_id,
+        session_key: None,
+        channel_id: Some(&channel_id),
+        agent_id: source_label,
+        provider: Some("routine"),
+        dispatch_id: None,
+        user_message: &user_message,
+        assistant_message,
+        events: &[],
+        duration_ms: None,
+        turn_started_at_millis: None,
+    };
+    if let Err(error) = persist_turn_db(pg_pool, entry).await {
+        tracing::warn!(
+            channel_id = channel_id_raw,
+            message_id,
+            error = %error,
+            "manual Discord message delivered but transcript persistence failed"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ManualOutboundDeliveryId<'a> {
     pub(crate) correlation_id: &'a str,
     pub(crate) semantic_event_id: &'a str,
+}
+
+/// Owned binary attachment passed from the durable outbox to Discord.
+///
+/// This deliberately owns its bytes because the send gate may perform async
+/// target authorization before the upload begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManualOutboundAttachment {
+    pub(crate) filename: String,
+    pub(crate) content_type: String,
+    pub(crate) data: Vec<u8>,
 }
 
 pub(super) fn is_reserved_voice_correlation_namespace(
@@ -185,6 +275,13 @@ pub(super) trait ManualOutboundClient: DiscordOutboundClient {
         content: &str,
         summary: Option<&str>,
     ) -> Result<String, DispatchMessagePostError>;
+
+    async fn post_binary_attachment(
+        &self,
+        target_channel: &str,
+        content: &str,
+        attachment: &ManualOutboundAttachment,
+    ) -> Result<String, DispatchMessagePostError>;
 }
 
 impl ManualOutboundClient for SerenityManualOutboundClient {
@@ -218,6 +315,40 @@ impl ManualOutboundClient for SerenityManualOutboundClient {
                 )
             })
     }
+
+    async fn post_binary_attachment(
+        &self,
+        target_channel: &str,
+        content: &str,
+        attachment: &ManualOutboundAttachment,
+    ) -> Result<String, DispatchMessagePostError> {
+        let channel_id = target_channel
+            .parse::<u64>()
+            .map(ChannelId::new)
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("invalid discord channel id {target_channel}: {error}"),
+                )
+            })?;
+        // Discord determines the preview from the file bytes/name. Keep the
+        // validated MIME for durable audit and future transports even though
+        // Serenity's CreateAttachment does not expose a MIME override.
+        let file = CreateAttachment::bytes(attachment.data.clone(), attachment.filename.clone());
+        channel_id
+            .send_message(
+                &*self.http,
+                CreateMessage::new().content(content).add_file(file),
+            )
+            .await
+            .map(|message| message.id.get().to_string())
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    error.to_string(),
+                )
+            })
+    }
 }
 
 async fn deliver_manual_notification<C: ManualOutboundClient>(
@@ -228,6 +359,29 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
     bot: &str,
     summary: Option<&str>,
     delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+) -> ManualDeliveryOutcome {
+    deliver_manual_notification_with_attachment(
+        client,
+        dedup,
+        channel_id,
+        content,
+        bot,
+        summary,
+        delivery_id,
+        None,
+    )
+    .await
+}
+
+async fn deliver_manual_notification_with_attachment<C: ManualOutboundClient>(
+    client: &C,
+    dedup: &OutboundDeduper,
+    channel_id: &str,
+    content: &str,
+    bot: &str,
+    summary: Option<&str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+    attachment: Option<&ManualOutboundAttachment>,
 ) -> ManualDeliveryOutcome {
     // Issue #2363: the manual dedupe key must include the resolved target
     // channel AND the sending `bot` identity. Voice announce delivery ids
@@ -260,10 +414,19 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
     };
 
     let content_len = content.chars().count();
+    if content_len > DISCORD_HARD_LIMIT_CHARS && attachment.is_some() {
+        return ManualDeliveryOutcome::Failed {
+            detail: format!(
+                "Discord messages with an image attachment must not exceed {DISCORD_HARD_LIMIT_CHARS} characters"
+            ),
+        };
+    }
     if content_len > DISCORD_HARD_LIMIT_CHARS {
         // Compatibility shim: v3 text delivery does not yet own attachment
         // upload or manual chunk-posting for over-2k `/api/discord/send` payloads.
-        let result = match if bot == "announce" {
+        let result = match if UtilityBotRole::from_alias(bot)
+            .is_some_and(UtilityBotRole::uses_attachment_for_oversize)
+        {
             client
                 .post_text_attachment(channel_id, content, summary)
                 .await
@@ -291,6 +454,20 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
         Ok(channel_id) => channel_id,
         Err(outcome) => return outcome,
     };
+    if let Some(attachment) = attachment {
+        let result = client
+            .post_binary_attachment(channel_id, content, attachment)
+            .await
+            .map(|message_id| ManualDeliveryOutcome::Sent {
+                message_id,
+                delivery: Some("binary_attachment"),
+            })
+            .unwrap_or_else(|error| ManualDeliveryOutcome::Failed {
+                detail: error.to_string(),
+            });
+        record_manual_delivery_success(dedup, reservation, dedup_key.as_deref(), &result);
+        return result;
+    }
     let result = deliver_manual_v3_text(
         client,
         dedup,
@@ -354,7 +531,9 @@ pub(super) async fn deliver_manual_dm_notification<C: ManualOutboundClient>(
                 };
             }
         };
-        let result = match if bot == "announce" {
+        let result = match if UtilityBotRole::from_alias(bot)
+            .is_some_and(UtilityBotRole::uses_attachment_for_oversize)
+        {
             client
                 .post_text_attachment(&dm_channel, content, summary)
                 .await
@@ -418,6 +597,7 @@ async fn reserve_manual_delivery(dedup: &OutboundDeduper, key: &str) -> ManualDe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_manual_v3_text<C: DiscordOutboundClient>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -587,11 +767,46 @@ mod manual_v3_delivery_tests {
 
     use crate::services::discord::health::{HealthRegistry, handle_send};
 
+    #[test]
+    fn synthetic_routine_pair_is_complete_and_message_id_deterministic() {
+        let first =
+            synthetic_routine_pair(42, "message-7", "posted briefing", Some("morning-briefing"));
+        let retry =
+            synthetic_routine_pair(42, "message-7", "posted briefing", Some("morning-briefing"));
+
+        assert_eq!(first.0, "manual-discord:42:message-7");
+        assert_eq!(first.0, retry.0);
+        assert_eq!(first.1, "(routine morning-briefing posted)");
+        assert!(!first.1.trim().is_empty());
+        assert_eq!(first.2, "posted briefing");
+        assert!(!first.2.trim().is_empty());
+    }
+
+    #[test]
+    fn synthetic_routine_pair_uses_non_empty_default_label() {
+        let pair = synthetic_routine_pair(42, "message-8", "body", Some("  "));
+        assert_eq!(pair.1, "(routine routine posted)");
+    }
+
+    #[test]
+    fn manual_delivery_log_emoji_preserves_legacy_mapping() {
+        assert_eq!(
+            manual_delivery_log_emoji(UtilityBotRole::Announce.alias()),
+            "📨"
+        );
+        assert_eq!(
+            manual_delivery_log_emoji(UtilityBotRole::Notify.alias()),
+            "🔔"
+        );
+        assert_eq!(manual_delivery_log_emoji("provider"), "📨");
+    }
+
     #[derive(Clone, Default)]
     struct MockManualOutboundClient {
         posts: Arc<Mutex<Vec<String>>>,
         post_targets: Arc<Mutex<Vec<String>>>,
         dm_resolutions: Arc<Mutex<Vec<String>>>,
+        binary_attachments: Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>,
     }
 
     impl DiscordOutboundClient for MockManualOutboundClient {
@@ -630,6 +845,100 @@ mod manual_v3_delivery_tests {
         ) -> Result<String, DispatchMessagePostError> {
             Ok("attachment-message-1".to_string())
         }
+
+        async fn post_binary_attachment(
+            &self,
+            target_channel: &str,
+            content: &str,
+            attachment: &ManualOutboundAttachment,
+        ) -> Result<String, DispatchMessagePostError> {
+            let mut binary_attachments = self.binary_attachments.lock().unwrap(); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+            binary_attachments.push((
+                target_channel.to_string(),
+                content.to_string(),
+                attachment.filename.clone(),
+                attachment.data.clone(),
+            ));
+            Ok("binary-attachment-message-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_notification_posts_a_binary_attachment_once_with_delivery_identity() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let attachment = ManualOutboundAttachment {
+            filename: "thumbnail.png".to_string(),
+            content_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nthumbnail".to_vec(),
+        };
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "scheduled:42",
+            semantic_event_id: "scheduled:42:slot",
+        };
+
+        let first = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            "scheduled update",
+            "notify",
+            None,
+            Some(delivery_id),
+            Some(&attachment),
+        )
+        .await;
+        let retry = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            "scheduled update",
+            "notify",
+            None,
+            Some(delivery_id),
+            Some(&attachment),
+        )
+        .await;
+
+        assert!(matches!(first, ManualDeliveryOutcome::Sent { .. }));
+        assert!(matches!(
+            retry,
+            ManualDeliveryOutcome::Sent {
+                delivery: Some("duplicate"),
+                ..
+            }
+        ));
+        assert_eq!(client.binary_attachments.lock().unwrap().len(), 1); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+    }
+
+    #[tokio::test]
+    async fn manual_notification_rejects_an_oversized_body_with_an_image_attachment() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let attachment = ManualOutboundAttachment {
+            filename: "thumbnail.png".to_string(),
+            content_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nthumbnail".to_vec(),
+        };
+        let outcome = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            &"x".repeat(DISCORD_HARD_LIMIT_CHARS + 1),
+            "notify",
+            None,
+            None,
+            Some(&attachment),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ManualDeliveryOutcome::Failed { ref detail }
+                if detail.contains("must not exceed")
+        ));
+        assert!(client.binary_attachments.lock().unwrap().is_empty()); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+        assert!(client.posts.lock().unwrap().is_empty()); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
     }
 
     #[tokio::test]

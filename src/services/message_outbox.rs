@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use sqlx::PgPool;
 
-use crate::services::provider::{CancelToken, cancel_requested};
+use crate::services::{
+    discord::bot_role::UtilityBotRole,
+    provider::{CancelToken, cancel_requested},
+};
 
 pub(crate) const LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS: i64 = 5 * 60;
 pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
@@ -11,7 +14,7 @@ pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
 /// outbox worker falls back to the notify bot only when that primary delivery
 /// fails, preserving human visibility without turning informational notices
 /// into agent work (#4449).
-pub(crate) const ACTIONABLE_OPS_ALERT_BOT: &str = "announce";
+pub(crate) const ACTIONABLE_OPS_ALERT_BOT: &str = UtilityBotRole::Announce.alias();
 
 pub(crate) fn is_actionable_ops_alert(source: &str, reason_code: Option<&str>) -> bool {
     matches!(
@@ -37,6 +40,16 @@ pub(crate) struct OutboxMessage<'a> {
     pub source: &'a str,
     pub reason_code: Option<&'a str>,
     pub session_key: Option<&'a str>,
+    /// Durable binary payload carried through the PostgreSQL outbox. The
+    /// worker owns the eventual Discord upload, so this must not be a path.
+    pub attachment: Option<OutboxAttachment<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutboxAttachment<'a> {
+    pub filename: &'a str,
+    pub content_type: &'a str,
+    pub data: &'a [u8],
 }
 
 #[derive(Debug)]
@@ -72,7 +85,7 @@ impl From<sqlx::Error> for OutboxEnqueueError {
     }
 }
 
-fn validate_outbox_source(source: &str) -> Result<(), OutboxEnqueueError> {
+pub(crate) fn validate_outbox_source(source: &str) -> Result<(), OutboxEnqueueError> {
     crate::services::discord::outbound::source_registry::validate_send_source_for(
         source,
         crate::services::discord::outbound::source_registry::SendCallerClass::LoopbackInternal,
@@ -82,7 +95,7 @@ fn validate_outbox_source(source: &str) -> Result<(), OutboxEnqueueError> {
     })
 }
 
-fn normalized_session_key(target: &str, session_key: Option<&str>) -> Option<String> {
+pub(crate) fn normalized_session_key(target: &str, session_key: Option<&str>) -> Option<String> {
     session_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -93,7 +106,7 @@ fn normalized_session_key(target: &str, session_key: Option<&str>) -> Option<Str
         })
 }
 
-fn normalized_reason_code(reason_code: Option<&str>) -> Option<&str> {
+pub(crate) fn normalized_reason_code(reason_code: Option<&str>) -> Option<&str> {
     reason_code.map(str::trim).filter(|value| !value.is_empty())
 }
 
@@ -140,7 +153,7 @@ pub(crate) fn delivery_bot_for_target_session<'a>(
     Cow::Borrowed(configured_bot)
 }
 
-fn dedupe_key_for_message(
+pub(crate) fn dedupe_key_for_message(
     target: &str,
     content: &str,
     reason_code: Option<&str>,
@@ -400,7 +413,7 @@ async fn find_duplicate_outbox_message_pg(
              WHERE target = $1
                AND reason_code = $2
                AND session_key = $3
-               AND status != 'failed'
+               AND status NOT IN ('failed', 'cancelled')
                AND created_at >= NOW() - ($4::BIGINT * INTERVAL '1 second')
              ORDER BY id DESC
              LIMIT 1",
@@ -420,7 +433,7 @@ async fn find_duplicate_outbox_message_pg(
            AND reason_code IS NULL
            AND content = $2
            AND session_key = $3
-           AND status != 'failed'
+           AND status NOT IN ('failed', 'cancelled')
            AND created_at >= NOW() - ($4::BIGINT * INTERVAL '1 second')
          ORDER BY id DESC
          LIMIT 1",
@@ -445,13 +458,24 @@ async fn release_expired_outbox_dedupe_key_pg(
             SET dedupe_key = NULL,
                 dedupe_expires_at = NULL
           WHERE dedupe_key = $1
-            AND status != 'failed'
+            AND status NOT IN ('failed', 'cancelled')
             AND dedupe_expires_at <= NOW()",
     )
     .bind(dedupe_key)
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+fn attachment_parts(message: OutboxMessage<'_>) -> (Option<&str>, Option<&str>, Option<&[u8]>) {
+    match message.attachment {
+        Some(attachment) => (
+            Some(attachment.filename),
+            Some(attachment.content_type),
+            Some(attachment.data),
+        ),
+        None => (None, None, None),
+    }
 }
 
 pub(crate) async fn enqueue_outbox_pg_returning_id(
@@ -508,13 +532,15 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
         reason_code,
         session_key.as_deref(),
     );
+    let (attachment_filename, attachment_content_type, attachment_data) = attachment_parts(message);
 
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO message_outbox
-         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at,
+          attachment_filename, attachment_content_type, attachment_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10)
          ON CONFLICT (dedupe_key)
-             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+             WHERE dedupe_key IS NOT NULL AND status NOT IN ('failed', 'cancelled')
          DO UPDATE SET dedupe_expires_at = NULL
          RETURNING id",
     )
@@ -525,6 +551,9 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
     .bind(reason_code)
     .bind(session_key.as_deref())
     .bind(dedupe_key.as_deref())
+    .bind(attachment_filename)
+    .bind(attachment_content_type)
+    .bind(attachment_data)
     .fetch_one(pool)
     .await
     .map_err(Into::into)
@@ -548,13 +577,15 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(
         reason_code,
         session_key.as_deref(),
     );
+    let (attachment_filename, attachment_content_type, attachment_data) = attachment_parts(message);
 
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO message_outbox
-         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
+         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at,
+          attachment_filename, attachment_content_type, attachment_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10)
          ON CONFLICT (dedupe_key)
-             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+             WHERE dedupe_key IS NOT NULL AND status NOT IN ('failed', 'cancelled')
          DO UPDATE SET dedupe_expires_at = NULL
          RETURNING id",
     )
@@ -565,6 +596,9 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(
     .bind(reason_code)
     .bind(session_key.as_deref())
     .bind(dedupe_key.as_deref())
+    .bind(attachment_filename)
+    .bind(attachment_content_type)
+    .bind(attachment_data)
     .fetch_one(&mut **tx)
     .await
     .map_err(Into::into)
@@ -656,16 +690,18 @@ pub(crate) async fn enqueue_outbox_pg_on_tx_with_ttl(
         })
         .flatten();
     release_expired_outbox_dedupe_key_pg(tx, dedupe_key.as_deref()).await?;
+    let (attachment_filename, attachment_content_type, attachment_data) = attachment_parts(message);
     Ok(sqlx::query_scalar::<_, i64>(
         "INSERT INTO message_outbox
-         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at)
+         (target, content, bot, source, reason_code, session_key, dedupe_key, dedupe_expires_at,
+          attachment_filename, attachment_content_type, attachment_data)
          VALUES ($1, $2, $3, $4, $5, $6, $7,
                  CASE WHEN $8::BIGINT > 0
                       THEN NOW() + ($8::BIGINT * INTERVAL '1 second')
-                      ELSE NULL
-                 END)
+                      ELSE NULL END,
+                 $9, $10, $11)
          ON CONFLICT (dedupe_key)
-             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+             WHERE dedupe_key IS NOT NULL AND status NOT IN ('failed', 'cancelled')
          DO NOTHING
          RETURNING id",
     )
@@ -677,6 +713,9 @@ pub(crate) async fn enqueue_outbox_pg_on_tx_with_ttl(
     .bind(session_key.as_deref())
     .bind(dedupe_key.as_deref())
     .bind(dedupe_ttl_secs)
+    .bind(attachment_filename)
+    .bind(attachment_content_type)
+    .bind(attachment_data)
     .fetch_optional(&mut **tx)
     .await?)
 }
@@ -730,14 +769,16 @@ pub(crate) async fn stage_outbox_pg_with_ttl(
     })?;
     let mut tx = pool.begin().await?;
     release_expired_outbox_dedupe_key_pg(&mut tx, Some(&dedupe_key)).await?;
+    let (attachment_filename, attachment_content_type, attachment_data) = attachment_parts(message);
     let inserted = sqlx::query_scalar::<_, i64>(
         "INSERT INTO message_outbox
          (target, content, bot, source, status, reason_code, session_key,
-          dedupe_key, dedupe_expires_at)
+          dedupe_key, dedupe_expires_at, attachment_filename, attachment_content_type,
+          attachment_data)
          VALUES ($1,$2,$3,$4,'held',$5,$6,$7,
-                 NOW() + ($8::BIGINT * INTERVAL '1 second'))
+                 NOW() + ($8::BIGINT * INTERVAL '1 second'), $9, $10, $11)
          ON CONFLICT (dedupe_key)
-             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+             WHERE dedupe_key IS NOT NULL AND status NOT IN ('failed', 'cancelled')
          DO NOTHING
          RETURNING id",
     )
@@ -749,6 +790,9 @@ pub(crate) async fn stage_outbox_pg_with_ttl(
     .bind(session_key.as_deref())
     .bind(&dedupe_key)
     .bind(dedupe_ttl_secs)
+    .bind(attachment_filename)
+    .bind(attachment_content_type)
+    .bind(attachment_data)
     .fetch_optional(&mut *tx)
     .await?;
     let id = match inserted {
@@ -756,7 +800,7 @@ pub(crate) async fn stage_outbox_pg_with_ttl(
         None => {
             sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM message_outbox
-              WHERE dedupe_key=$1 AND status!='failed'
+              WHERE dedupe_key=$1 AND status NOT IN ('failed', 'cancelled')
               ORDER BY id LIMIT 1",
             )
             .bind(&dedupe_key)
@@ -769,14 +813,15 @@ pub(crate) async fn stage_outbox_pg_with_ttl(
 }
 
 pub(crate) async fn activate_staged_outbox_pg(pool: &PgPool, id: i64) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query("UPDATE message_outbox SET status='pending' WHERE id=$1 AND status='held'")
-            .bind(id)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            == 1,
+    Ok(sqlx::query(
+        "UPDATE message_outbox SET status='pending'
+              WHERE id=$1 AND status='held' AND circuit_open_generation IS NULL",
     )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 /// Activate a held row, or confirm that a prior activation already made the
@@ -791,7 +836,9 @@ pub(crate) async fn activate_or_confirm_staged_outbox_pg(
         return Ok(true);
     }
     Ok(sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM message_outbox WHERE id=$1 AND status!='held')",
+        "SELECT EXISTS(
+             SELECT 1 FROM message_outbox
+              WHERE id=$1 AND status NOT IN ('held', 'cancelled'))",
     )
     .bind(id)
     .fetch_one(pool)
@@ -829,7 +876,7 @@ pub(crate) async fn gc_stale_outbox_rows(pool: &PgPool) -> Result<(u64, u64, u64
     .rows_affected();
     let failed = sqlx::query(
         "DELETE FROM message_outbox
-          WHERE status = 'failed'
+          WHERE status IN ('failed', 'cancelled')
             AND created_at < NOW() - INTERVAL '7 days'",
     )
     .execute(pool)
@@ -887,10 +934,12 @@ pub(crate) async fn enqueue_outbox_pg_on_tx(
     validate_outbox_source(message.source)?;
     let reason_code = normalized_reason_code(message.reason_code);
     let session_key = normalized_session_key(message.target, message.session_key);
+    let (attachment_filename, attachment_content_type, attachment_data) = attachment_parts(message);
     Ok(sqlx::query_scalar::<_, i64>(
         "INSERT INTO message_outbox
-         (target, content, bot, source, reason_code, session_key)
-         VALUES ($1, $2, $3, $4, $5, $6)
+         (target, content, bot, source, reason_code, session_key,
+          attachment_filename, attachment_content_type, attachment_data)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id",
     )
     .bind(message.target)
@@ -899,6 +948,9 @@ pub(crate) async fn enqueue_outbox_pg_on_tx(
     .bind(message.source)
     .bind(reason_code)
     .bind(session_key.as_deref())
+    .bind(attachment_filename)
+    .bind(attachment_content_type)
+    .bind(attachment_data)
     .fetch_one(&mut **tx)
     .await?)
 }
@@ -944,13 +996,13 @@ pub(crate) async fn enqueue_lifecycle_notification_pg(
          VALUES ($1, $2, $3, $4, $5, $6, $7,
                  NOW() + ($8::BIGINT * INTERVAL '1 second'))
          ON CONFLICT (dedupe_key)
-             WHERE dedupe_key IS NOT NULL AND status != 'failed'
+             WHERE dedupe_key IS NOT NULL AND status NOT IN ('failed', 'cancelled')
          DO NOTHING
          RETURNING id",
     )
     .bind(target)
     .bind(content)
-    .bind("notify")
+    .bind(UtilityBotRole::Notify.alias())
     .bind(LIFECYCLE_NOTIFIER_SOURCE)
     .bind(reason_code)
     .bind(session_key.as_deref())
@@ -992,6 +1044,7 @@ mod postgres_source_contract_tests {
             source: "unregistered_policy_source",
             reason_code: Some("issue_4424_test"),
             session_key: Some("issue-4424-forbidden"),
+            attachment: None,
         }
     }
 
@@ -1003,6 +1056,7 @@ mod postgres_source_contract_tests {
             source: "scheduled_message",
             reason_code: Some(reason_code),
             session_key: None,
+            attachment: None,
         }
     }
 
@@ -1097,6 +1151,7 @@ mod postgres_source_contract_tests {
                 source,
                 reason_code: None,
                 session_key: None,
+                attachment: None,
             };
             let worker_allows = crate::services::discord::outbound::send_gate::is_allowed_send_source_for(
                 source,
@@ -1203,6 +1258,7 @@ mod postgres_held_gc_tests {
             source: "long_turn_watchdog",
             reason_code: Some("relay_recovery.circuit_open"),
             session_key: Some(session_key),
+            attachment: None,
         }
     }
 
@@ -1275,6 +1331,7 @@ mod postgres_held_gc_tests {
                 source: "scheduled_message",
                 reason_code: Some("scheduled_message:v1:gc-test:slot"),
                 session_key: None,
+                attachment: None,
             },
         )
         .await
@@ -1288,6 +1345,7 @@ mod postgres_held_gc_tests {
                 source: "system",
                 reason_code: None,
                 session_key: None,
+                attachment: None,
             },
             0,
         )
@@ -1328,8 +1386,8 @@ mod stop_turn_notify_removal_tests {
     /// message is no longer enqueued by any stop entrypoint.
     const STOP_TURN_REASON_CODE: &str = "lifecycle.stop_turn";
 
-    /// Behavior model of the outbox under the four stop entrypoints
-    /// (reaction-remove ⏳, `/stop`, `!stop`, skill stop). Because
+    /// Behavior model of the outbox under the supported stop entrypoints
+    /// (`/stop`, `!stop`, and skill stop). Because
     /// `notify_turn_stop` was removed (compile-level guarantee — the function
     /// and its `commands` re-export no longer exist), simulating any stop path
     /// enqueues nothing. This in-test outbox records exactly what the stop
@@ -1407,7 +1465,7 @@ mod stop_turn_notify_removal_tests {
         );
         let key_b = dedupe_key_for_message(
             "channel:123",
-            "🛑 현재 턴 중단 (reaction remove ⏳) — tmux는 유지됩니다.",
+            "🛑 현재 턴 중단 (/stop) — tmux는 유지됩니다.",
             Some(STOP_TURN_REASON_CODE),
             Some("session-abc"),
         );

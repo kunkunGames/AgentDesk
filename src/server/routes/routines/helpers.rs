@@ -8,6 +8,7 @@ use crate::services::routines::{
     RoutineStore, is_migrated_launchd_script_ref, validate_routine_runtime_config,
     validate_routine_schedule,
 };
+use crate::utils::api::clamp_api_limit;
 
 use super::super::AppState;
 use super::PARALLEL_SAFE_MIGRATED_LAUNCHD_SCRIPT_REF;
@@ -32,29 +33,37 @@ pub(super) fn ensure_routine_runtime_runnable(
     Ok(())
 }
 
-pub(super) fn migrated_launchd_metadata_for_state(
+pub(super) async fn migrated_launchd_metadata_for_state(
     state: &AppState,
     script_ref: &str,
 ) -> AppResult<Option<Value>> {
     if !is_migrated_launchd_script_ref(script_ref) {
         return Ok(None);
     }
-    let loader = RoutineScriptLoader::new().map_err(|error| {
-        AppError::internal(format!("routine script loader init failed: {error}"))
-            .with_code(ErrorCode::Internal)
-    })?;
     let routine_script_dirs = state.config.routines.script_dirs();
-    loader.load_dirs(&routine_script_dirs).map_err(|error| {
-        AppError::internal(format!("routine script registry load failed: {error}"))
-            .with_code(ErrorCode::Config)
-    })?;
-    let Some(script) = loader.get_script(script_ref).map_err(|error| {
-        AppError::internal(format!("routine script lookup failed: {error}"))
-            .with_code(ErrorCode::Config)
+    let requested_script_ref = script_ref.to_string();
+    let script_ref_for_task = requested_script_ref.clone();
+    let script = tokio::task::spawn_blocking(move || {
+        let loader = RoutineScriptLoader::new_shared(&routine_script_dirs)
+            .map_err(|error| format!("routine script loader init failed: {error}"))?;
+        loader
+            .load_dirs(&routine_script_dirs)
+            .map_err(|error| format!("routine script registry load failed: {error}"))?;
+        loader
+            .get_script(&script_ref_for_task)
+            .map_err(|error| format!("routine script lookup failed: {error}"))
+    })
+    .await
+    .map_err(|error| {
+        AppError::internal(format!(
+            "routine script registry blocking task failed: {error}"
+        ))
+        .with_code(ErrorCode::Internal)
     })?
-    else {
+    .map_err(|error| AppError::internal(error).with_code(ErrorCode::Config))?;
+    let Some(script) = script else {
         return Err(AppError::conflict(format!(
-            "migrated routine {script_ref} is invalid: routine script not loaded"
+            "migrated routine {requested_script_ref} is invalid: routine script not loaded"
         )));
     };
     Ok(Some(script.metadata))
@@ -163,6 +172,14 @@ pub(super) fn validate_run_status_filter(status: &str) -> AppResult<()> {
     }
 }
 
+pub(super) fn normalize_routine_run_limit(limit: Option<i64>) -> i64 {
+    const DEFAULT_LIMIT: i64 = 20;
+
+    let requested = limit.unwrap_or(DEFAULT_LIMIT).max(0);
+    let requested = usize::try_from(requested).unwrap_or(usize::MAX);
+    clamp_api_limit(Some(requested)) as i64
+}
+
 pub(super) fn validate_schedule_request(schedule: Option<&str>) -> AppResult<()> {
     let Some(schedule) = schedule else {
         return Ok(());
@@ -248,8 +265,8 @@ mod tests {
 
     use super::super::PARALLEL_SAFE_MIGRATED_LAUNCHD_SCRIPT_REF;
     use super::{
-        ensure_routine_runtime_runnable, initial_attach_status, normalize_script_ref,
-        validate_distinct_fallback_agent,
+        ensure_routine_runtime_runnable, initial_attach_status, normalize_routine_run_limit,
+        normalize_script_ref, validate_distinct_fallback_agent,
     };
     use crate::config::RoutinesConfig;
     use crate::error::ErrorCode;
@@ -305,6 +322,18 @@ mod tests {
         let err = normalize_script_ref(" \t ").expect_err("empty refs must be rejected");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(err.message(), "script_ref is required");
+    }
+
+    #[test]
+    fn routine_run_limit_has_explicit_default_and_bounds() {
+        assert_eq!(normalize_routine_run_limit(None), 20);
+        assert_eq!(normalize_routine_run_limit(Some(-1)), 1);
+        assert_eq!(normalize_routine_run_limit(Some(0)), 1);
+        assert_eq!(normalize_routine_run_limit(Some(1)), 1);
+        assert_eq!(normalize_routine_run_limit(Some(250)), 250);
+        assert_eq!(normalize_routine_run_limit(Some(2_000)), 2_000);
+        assert_eq!(normalize_routine_run_limit(Some(2_001)), 2_000);
+        assert_eq!(normalize_routine_run_limit(Some(i64::MAX)), 2_000);
     }
 
     #[test]

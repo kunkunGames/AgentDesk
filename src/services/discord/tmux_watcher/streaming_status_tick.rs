@@ -131,6 +131,27 @@ pub(super) async fn update_streaming_status_tick(
             }
         }
 
+        // @persist-order-guard-start #4104
+        // Persist every throttled parsed snapshot, even without a Discord edit: a
+        // long tool hold must not leave the durable row at its initial empty state.
+        // Silent turns suppress rendering, not durable state; the helper validates
+        // complete turn identity under the sidecar lock to block stale overwrites.
+        persist_watcher_stream_progress(
+            &watcher_provider,
+            channel_id,
+            &tmux_session_name,
+            turn_identity_for_panel.as_ref(),
+            placeholder_msg_id,
+            &full_response,
+            response_sent_offset,
+            tool_state.current_tool_line.as_deref(),
+            tool_state.prev_tool_status.as_deref(),
+            task_notification_kind,
+            tool_state.any_tool_used,
+            tool_state.has_post_tool_text,
+            &watcher_streaming_rollover_frozen_msg_ids,
+        );
+
         // Headless silent trigger (metadata.silent=true): skip both
         // status-panel and streaming-chunk edits to keep the channel
         // at zero bytes for the assistant turn.
@@ -170,7 +191,11 @@ pub(super) async fn update_streaming_status_tick(
                 &watcher_provider,
                 status_panel_started_at,
             );
-            if panel_text != last_status_panel_text {
+            let panel_cache_invalidation_epoch = shared
+                .ui
+                .placeholder_live_events
+                .panel_cache_invalidation_epoch(channel_id, status_msg_id.get());
+            if panel_cache_invalidation_epoch.is_some() || panel_text != last_status_panel_text {
                 rate_limit_wait(&shared, channel_id).await;
                 match crate::services::discord::http::edit_channel_message(
                     &http,
@@ -182,6 +207,16 @@ pub(super) async fn update_streaming_status_tick(
                 {
                     Ok(_) => {
                         last_status_panel_text = panel_text;
+                        if let Some(epoch) = panel_cache_invalidation_epoch {
+                            shared
+                                .ui
+                                .placeholder_live_events
+                                .clear_panel_cache_invalidation_if_epoch(
+                                    channel_id,
+                                    status_msg_id.get(),
+                                    epoch,
+                                );
+                        }
                     }
                     Err(error) => {
                         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -197,9 +232,19 @@ pub(super) async fn update_streaming_status_tick(
         }
 
         let has_assistant_response_for_streaming = !full_response.trim().is_empty();
+        let bridge_committed_range =
+            crate::services::discord::outbound::delivery_frontier_probe::delivered_frontier_current_generation(
+                &watcher_provider,
+                channel_id,
+                &tmux_session_name,
+                Some(current_offset),
+            )
+            .map(|commit| commit.range);
         if watcher_should_suppress_streaming_after_bridge_delivery(
             turn_delivered.load(Ordering::Relaxed),
             has_assistant_response_for_streaming,
+            (data_start_offset, current_offset),
+            bridge_committed_range,
         ) {
             if let Some(msg_id) = placeholder_msg_id {
                 if watcher_should_delete_suppressed_placeholder(placeholder_from_restored_inflight)
@@ -430,14 +475,10 @@ pub(super) async fn update_streaming_status_tick(
                 data_start_offset,
                 turn_identity_for_panel.as_ref(),
             ) {
-                // #3003 (codex P2 r18): do NOT create a panel for an already
-                // stopped/abandoned turn. A stop tombstone can be recorded
-                // before the inflight row is removed; without this guard the
-                // interval-top reclaim would delete the panel and this branch
-                // would immediately recreate one for the same stopped turn.
-                // Snapshot the turn identity *before* the await so a
-                // stop/cancel/next-turn during send cannot persist stale
-                // state onto a different turn (codex P2 r4).
+                // #3003 (codex P2 r18): do not recreate an already stopped turn's
+                // panel after interval-top reclaim; a tombstone can precede row removal.
+                // Snapshot identity before await so stop/cancel/next-turn during send
+                // cannot persist stale state onto another turn (codex P2 r4).
                 let pre_send_identity = inflight_for_panel
                     .as_ref()
                     .map(crate::services::discord::inflight::InflightTurnIdentity::from_state);
@@ -508,12 +549,9 @@ pub(super) async fn update_streaming_status_tick(
                                         ..Default::default()
                                     },
                                 );
-                            // #3077 (codex P1): the pre-send snapshot narrows but does
-                            // NOT close the race (an overlapping watcher can rebind
-                            // between our load and this atomic bind). The bind is the
-                            // single source of truth for whether THIS panel is recorded,
-                            // so the adopted handle MUST come from its return — adopting
-                            // `panel_msg.id` unconditionally leaks a sent-but-unrecorded panel.
+                            // #3077 (codex P1): pre-send snapshot does not close a rebind
+                            // race; the atomic bind alone proves this panel was recorded.
+                            // Adopt its returned handle, never an unrecorded `panel_msg.id`.
                             let decision = resolve_tui_status_panel_bind_decision(bind_outcome);
                             if decision.delete_sent_panel {
                                 // The inflight row did NOT record our panel:
@@ -564,13 +602,9 @@ pub(super) async fn update_streaming_status_tick(
                                         panel_msg.id,
                                     );
                                 }
-                                // Resolve the handle from the row's CURRENT owned id as
-                                // observed by the bind (`decision.owned_panel_id`), never
-                                // the just-sent duplicate nor the (possibly stale) pre-bind
-                                // `fresh_inflight` snapshot (#3077 codex P2 #2). It is
-                                // `None` for GuardMismatch/Missing/IoError (no panel we may
-                                // claim → handle unset). Adopt only for the SAME turn we
-                                // sent for; a replacement turn's panel belongs to it.
+                                // Use the bind-observed CURRENT owned id, not the duplicate or
+                                // stale pre-bind snapshot (#3077 P2 #2). GuardMismatch/Missing/
+                                // IoError own none; adopt only for the same turn, never a replacement.
                                 let resolved_handle = if identity_matches {
                                     decision.owned_panel_id.map(serenity::MessageId::new)
                                 } else {
@@ -590,13 +624,6 @@ pub(super) async fn update_streaming_status_tick(
                             } else {
                                 // Bound / AlreadyBound: the row now owns this exact id.
                                 debug_assert!(decision.adopt_sent_panel);
-                                remove_watcher_two_message_panel_orphan_registration(
-                                    shared.ui.two_message_panel_enabled,
-                                    shared.as_ref(),
-                                    &watcher_provider,
-                                    channel_id,
-                                    panel_msg.id,
-                                );
                                 status_panel_msg_id = Some(panel_msg.id);
                                 // #3805 P2 (PR-C): a FRESH Bound opened this
                                 // turn's panel epoch (the generation the
@@ -606,10 +633,18 @@ pub(super) async fn update_streaming_status_tick(
                                 // re-open it (the local already carries the
                                 // on-disk seed). None/OFF → local untouched.
                                 if shared.ui.two_message_panel_enabled
-                                    && let Some(opened) =
-                                        bind_outcome.bound_status_panel_generation()
+                                    && let Some(adopted_generation) =
+                                        adopt_watcher_singleton_panel_after_fresh_bind(
+                                            &http,
+                                            &shared,
+                                            &watcher_provider,
+                                            channel_id,
+                                            &tmux_session_name,
+                                            panel_msg.id,
+                                        )
+                                        .await
                                 {
-                                    this_turn_status_panel_generation = opened;
+                                    this_turn_status_panel_generation = adopted_generation;
                                 }
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 tracing::info!(
@@ -876,6 +911,7 @@ pub(super) async fn update_streaming_status_tick(
             commit_streaming_status_tick_state!();
             return StreamingStatusTickOutcome::ContinueStreamingLoop;
         }
+        // @persist-order-guard-end #4104
         let mut display_text = build_watcher_streaming_edit_text_with_session_banner(
             &shared,
             channel_id,

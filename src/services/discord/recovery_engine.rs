@@ -29,6 +29,8 @@ use std::process::Command;
 
 #[path = "recovery_engine/status_panel.rs"]
 mod recovery_status_panel;
+#[path = "recovery_engine/two_message_panel.rs"]
+mod recovery_two_message_panel;
 #[path = "recovery_engine/status_panel_completion_producer.rs"]
 mod status_panel_completion_producer;
 use self::status_panel_completion_producer::*;
@@ -44,6 +46,8 @@ mod phase_policy;
 // recovery start-offset helper cluster into a leaf module.
 #[path = "recovery_engine/terminal_watcher.rs"]
 mod terminal_watcher;
+#[path = "recovery_engine/tmux_probe.rs"]
+mod tmux_probe;
 // #3479 item-2: behavior-preserving extraction of the inflight-state derivation
 // helper cluster (handoff message, ready-for-input probes, worktree info /
 // spawn-cwd derivation) into a leaf module.
@@ -179,13 +183,13 @@ use self::completion_delivery::{
 // a by-name import of a cfg'd-out item is a hard E0432 on non-unix targets.
 #[cfg(unix)]
 use self::restore_inflight::detect_live_tmux_output_path;
-use self::restore_inflight::tmux_session_alive_with_retry;
 pub(in crate::services::discord) use self::restore_inflight::{
     finish_recovered_turn_mailbox, restore_inflight_turns,
 };
 use self::restore_persist_outcome::{RestorePersistOutcome, restore_codex_rollout_output_path};
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
 pub(in crate::services::discord) use self::terminal_text_idempotency::RecoveryDeliveryContext;
+use self::tmux_probe::tmux_session_alive_with_retry;
 // #3479: re-import the analytics + transcript helpers so root call sites stay
 // byte-identical. `recovered_transcript_turn_id` is gated on cfg(test) — the root
 // reaches it only from its unit test (prod calls it inside analytics_transcript).
@@ -370,6 +374,7 @@ fn runtime_handoff_for_recovery(
             output_path,
             session_name: tmux_session_name,
             last_offset,
+            pid: 0,
         },
     }
 }
@@ -436,6 +441,8 @@ pub struct RebindOutcome {
 pub enum RebindError {
     /// Target tmux session is not alive — nothing to rebind to. 404.
     TmuxNotAlive { tmux_session: String },
+    /// A persisted or supplied Discord channel id was zero. 400.
+    ChannelIdZero,
     /// An inflight state already exists for this channel. Caller must clear
     /// it (force-kill or natural completion) before rebinding. 409.
     InflightAlreadyExists,
@@ -473,6 +480,7 @@ impl std::fmt::Display for RebindError {
             Self::TmuxNotAlive { tmux_session } => {
                 write!(f, "tmux session not alive: {tmux_session}")
             }
+            Self::ChannelIdZero => write!(f, "channel id must be non-zero"),
             Self::InflightAlreadyExists => {
                 write!(f, "inflight state already exists for this channel")
             }

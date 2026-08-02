@@ -166,6 +166,28 @@ pub(super) fn matching_watcher_turn_identity(
         .map(crate::services::discord::inflight::InflightTurnIdentity::from_state)
 }
 
+/// Authenticate a soft terminal against authority that existed before this
+/// frame was parsed. The owner, resume floor, and nonce must all name the same
+/// turn so historical transcript markers cannot borrow a newer turn's anchor or
+/// mint authority while the watcher is already consuming backlog.
+pub(super) fn watcher_soft_terminal_has_turn_authority(
+    state: Option<&crate::services::discord::inflight::InflightTurnState>,
+    tmux_session_name: &str,
+    data_start_offset: u64,
+    watcher_turn_nonce: Option<&str>,
+) -> bool {
+    state.is_some_and(|state| {
+        state.tmux_session_name.as_deref() == Some(tmux_session_name)
+            && state.last_offset.max(state.turn_start_offset.unwrap_or(0)) == data_start_offset
+            && !matches!(
+                state.effective_relay_owner_kind(),
+                crate::services::discord::inflight::RelayOwnerKind::None
+            )
+            && state.turn_nonce.as_deref().is_some()
+            && state.turn_nonce.as_deref() == watcher_turn_nonce
+    })
+}
+
 pub(super) fn matching_watcher_turn_nonce(
     state: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
@@ -234,12 +256,13 @@ pub(super) fn pinned_finalizer_turn_id(
         .unwrap_or(0)
 }
 
-pub(super) fn pinned_delivery_lease_key(
+pub(in crate::services::discord) fn pinned_delivery_lease_key(
     channel_id: poise::serenity_prelude::ChannelId,
     generation: u64,
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
     current_offset: u64,
+    relay_range_start: u64,
 ) -> crate::services::discord::DeliveryLeaseKey {
     if let Some(state) = inflight_before_relay.filter(|state| {
         state.tmux_session_name.as_deref().map(str::trim) == Some(tmux_session_name.trim())
@@ -249,8 +272,14 @@ pub(super) fn pinned_delivery_lease_key(
             channel_id, generation, state, "watcher",
         )
     } else {
-        crate::services::discord::DeliveryLeaseKey::new_for_site(
-            channel_id, generation, 0, None, None, "watcher",
+        crate::services::discord::DeliveryLeaseKey::new_for_site_with_fallback_offset(
+            channel_id,
+            generation,
+            0,
+            None,
+            None,
+            Some(relay_range_start),
+            "watcher",
         )
     }
 }
@@ -272,41 +301,106 @@ impl WatcherDirectTerminalResponseDecision {
     }
 }
 
+/// Pure core of the #4081/#4714 degenerate-key duplicate decision: the guard
+/// refuses ONLY a byte-identical content re-post (`duplicate`) that has no fresh
+/// in-range assistant text AND no pending user turn awaiting a response. Split
+/// out so the refusal logic is unit-tested directly without the global-state /
+/// delivery-record I/O the wrapper performs.
+pub(super) fn degenerate_duplicate_refuses_delivery(
+    duplicate: bool,
+    fresh_assistant_text_in_observed_range: bool,
+    pending_user_boundary: bool,
+) -> bool {
+    // #4714: a pending user boundary means a live follow-up turn is awaiting a
+    // response — never suppress it. Only a true re-post (no boundary, no fresh
+    // text) is a #4081 phantom duplicate.
+    duplicate && !fresh_assistant_text_in_observed_range && !pending_user_boundary
+}
+
+/// #4081 introduced this degenerate-key content-fingerprint guard to block the
+/// phantom RE-RELAY of the immediately-prior (already-delivered) response at a
+/// no-inflight soft boundary: with no inflight identity the lease key degenerates
+/// to `id-0`, and if the body byte-matches a recently-delivered fingerprint AND
+/// no fresh assistant text appears in the observed range, the watcher would
+/// re-post the same answer. That refusal is correct ONLY when no user turn is
+/// actually awaiting a response.
+///
+/// #4714 (the over-fire this guard now corrects): when the prior watcher-owned
+/// turn reaches terminal but its terminal submission / inflight / dispatch
+/// identity are lost (#3277 backstop path), a genuinely NEW follow-up user turn
+/// also runs under the degenerate `id-0` key. If that follow-up's body collides
+/// with the prior fingerprint and no fresh in-range assistant text is seen yet,
+/// the #4081 guard misjudged it as a duplicate and refused delivery — stranding
+/// the live channel with `route="duplicate_guard_refused"` and zero user-visible
+/// response (both placeholder and streaming suppressed).
+///
+/// The discriminator is a PENDING user boundary. A prompt anchor / external-input
+/// lease is recorded when a user turn arrives and CLEARED once that turn's
+/// response is delivered. Normally a #4081 phantom re-relay has no boundary,
+/// while a #4714 follow-up does, so the latter must not be refused.
+///
+/// Accepted cross-turn edge: the boundary is a single latest-turn slot, not an
+/// identity carried by this degenerate response. If turn A is delivered, turn B
+/// overwrites the slot, and A's phantom body is reconsidered while B is pending,
+/// A inherits B's boundary and can be sent once more. Neither the content
+/// fingerprint (which intentionally matches both a phantom and a legitimate
+/// byte-identical follow-up) nor the slot's message id / lease generation can
+/// identify the response after this path has lost its turn identity. Refusing
+/// that ambiguous overlap would recreate #4714 and strand B, so delivery wins.
+/// The exposure is bounded to a #4081 phantom overlapping a concurrently pending
+/// second message; ordinary re-posts with no pending boundary remain refused.
+///
+/// The boundary is read here (not threaded from the caller) to keep the hot
+/// `tmux_watcher.rs` relay-loop call site byte-identical (#3016 hot-file rule);
+/// this function already performs delivery-record I/O, so the extra
+/// `tui_prompt_dedupe` read is consistent with its impurity.
 pub(super) fn watcher_direct_terminal_response_decision(
     provider: &ProviderKind,
     channel_id: ChannelId,
-    generation: u64,
+    _generation: u64,
     tmux_session_name: &str,
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
-    current_offset: u64,
+    _current_offset: u64,
     fresh_assistant_text_in_observed_range: bool,
     response: &str,
 ) -> WatcherDirectTerminalResponseDecision {
     if response.trim().is_empty() {
         return WatcherDirectTerminalResponseDecision::Empty;
     }
-    let key = pinned_delivery_lease_key(
-        channel_id,
-        generation,
-        inflight_before_relay,
-        tmux_session_name,
-        current_offset,
-    );
-    let duplicate = key.is_degenerate_legacy()
+    let duplicate = inflight_before_relay.is_none()
         && crate::services::discord::outbound::delivery_record::recent_delivered_content_matches(
             provider,
             channel_id,
             tmux_session_name,
             response,
         );
-    if duplicate && !fresh_assistant_text_in_observed_range {
+    // #4714: a pending prompt anchor or external-input lease marks a live
+    // follow-up turn awaiting a response — mirrors the caller's
+    // `prompt_anchor_present_before_relay || external_input_lease_before_relay`.
+    let pending_user_boundary = crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
+        provider.as_str(),
+        tmux_session_name,
+        channel_id.get(),
+    )
+    .is_some()
+        || crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
+            provider.as_str(),
+            tmux_session_name,
+            channel_id.get(),
+        );
+    if degenerate_duplicate_refuses_delivery(
+        duplicate,
+        fresh_assistant_text_in_observed_range,
+        pending_user_boundary,
+    ) {
         tracing::warn!(
             provider = %provider.as_str(),
             channel_id = channel_id.get(),
             tmux_session = %tmux_session_name,
             response_len = response.len(),
             fresh_assistant_text_in_observed_range,
-            "watcher: suppressed degenerate-key duplicate terminal response by content fingerprint"
+            pending_user_boundary,
+            "watcher: suppressed inflight-less duplicate terminal response by content fingerprint"
         );
         return WatcherDirectTerminalResponseDecision::RefusedDegenerateDuplicate;
     }
@@ -320,6 +414,7 @@ pub(super) fn pinned_watcher_delivery_lease_identity(
     inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
     tmux_session_name: &str,
     current_offset: u64,
+    relay_range_start: u64,
 ) -> (
     crate::services::discord::turn_finalizer::TurnKey,
     crate::services::discord::DeliveryLeaseKey,
@@ -337,6 +432,7 @@ pub(super) fn pinned_watcher_delivery_lease_identity(
             inflight_before_relay,
             tmux_session_name,
             current_offset,
+            relay_range_start,
         ),
         crate::services::discord::LeaseHolder::Watcher {
             instance_id: watcher_instance_id,

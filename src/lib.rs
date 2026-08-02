@@ -3,8 +3,9 @@
 // style/complexity debt explicit here so this change can remove the crate-wide
 // dead_code blanket without rewriting unrelated modules.
 //
-// `too_many_arguments` is governed solely by this crate-wide allow; per-function
-// `#[allow(clippy::too_many_arguments)]` attributes are redundant and removed.
+// Structural complexity lints are denied crate-wide through Cargo.toml. Legacy
+// occurrences carry narrow item/module allows so newly introduced debt remains
+// visible to Clippy.
 //
 // `await_holding_lock` is intentionally NOT suppressed here (#3034): production
 // lock-across-await races must surface in clippy. The only legitimate holders
@@ -31,7 +32,6 @@
     clippy::if_same_then_else,
     clippy::items_after_test_module,
     clippy::iter_cloned_collect,
-    clippy::large_enum_variant,
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::let_underscore_future,
@@ -67,13 +67,10 @@
     clippy::redundant_guards,
     clippy::redundant_locals,
     clippy::redundant_pattern_matching,
-    clippy::result_large_err,
     clippy::single_char_add_str,
     clippy::single_match,
     clippy::suspicious_open_options,
-    clippy::too_many_arguments,
     clippy::trim_split_whitespace,
-    clippy::type_complexity,
     clippy::unnecessary_cast,
     clippy::unnecessary_filter_map,
     clippy::unnecessary_lazy_evaluations,
@@ -119,7 +116,9 @@ mod logging;
 pub(crate) mod manual_intervention;
 // Pipeline policy structs include retry/override fields retained for policy
 // compatibility across staged rollout paths.
+pub(crate) mod phase_gate;
 pub(crate) mod pipeline;
+pub(crate) mod queue_contract;
 pub(crate) mod receipt;
 // Reconciliation sweep jobs are invoked by maintenance scheduling, not by every
 // compile target.
@@ -134,6 +133,112 @@ mod server;
 // service submodules. The remaining dirty submodules each carry a scoped allow
 // (with a residual count) to be retired subtree-by-subtree.
 mod services;
+
+/// Opaque capability for a resolved Claude executable.
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command;
+///
+/// fn bypass_the_claude_builder(binary: ClaudeBinary) {
+///     let _raw_command = Command::new(binary);
+/// }
+/// ```
+///
+/// The capability remains sealed through aliases, references, helpers, closures,
+/// and renamed imports as well:
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// type BinaryAlias = ClaudeBinary;
+///
+/// fn bypass_alias(binary: ClaudeBinary) {
+///     let alias: BinaryAlias = binary;
+///     let _raw_command = ProcessCommand::new(alias);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// fn bypass_reference(binary: ClaudeBinary) {
+///     let reference = &binary;
+///     let _raw_command = ProcessCommand::new(reference);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// fn helper(binary: ClaudeBinary) {
+///     let _raw_command = ProcessCommand::new(binary);
+/// }
+///
+/// fn bypass_helper(binary: ClaudeBinary) {
+///     helper(binary);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// fn bypass_closure(binary: ClaudeBinary) {
+///     let spawn = |candidate: ClaudeBinary| ProcessCommand::new(candidate);
+///     let _raw_command = spawn(binary);
+/// }
+/// ```
+///
+/// A renamed `Command` import does not provide an escape hatch:
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// fn bypass_renamed_command(binary: ClaudeBinary) {
+///     let _raw_command = ProcessCommand::new(binary);
+/// }
+/// ```
+
+/// `ClaudeBinary` intentionally does not implement `AsRef<OsStr>`, `Deref`,
+/// `Display`, or a public path getter. It can therefore be consumed only through
+/// guarded Claude launch APIs rather than passed directly to `Command::new`.
+///
+/// This capability is created at trusted Claude launch boundaries and consumed
+/// by the guarded launch builder; raw process construction is intentionally not
+/// part of its public API.
+///
+/// ```compile_fail
+/// use agentdesk::ClaudeBinary;
+/// use std::process::Command as ProcessCommand;
+///
+/// fn bypass_public_capability(binary: ClaudeBinary) {
+///     let _raw_command = ProcessCommand::new(binary);
+/// }
+/// ```
+///
+/// Resolver-layer sealing (#4627) closes the last gap. `ClaudeBinary::resolve`
+/// obtains the raw executable path through a `pub(crate)` seam that lives behind
+/// the crate-private `services` module, so no external crate can reach it — the
+/// module path itself does not resolve from outside the crate. The public generic
+/// `resolve_provider_binary("claude")` scrubs the raw path to `None` and redacts
+/// the raw-path components in its `attempts` diagnostics, so there is no external
+/// route to a raw Claude executable path:
+///
+/// ```compile_fail
+/// // The sealed raw-path Claude resolver seam lives behind the crate-private
+/// // `services` module, so an external crate cannot even name the module that
+/// // contains it: this `use` fails to resolve, sealing the seam by construction.
+/// use agentdesk::services::platform::binary_resolver::BinaryResolution;
+///
+/// fn wants_raw_claude_path(_: BinaryResolution) {}
+/// ```
+pub use services::claude_command::ClaudeBinary;
+
 // Supervisor test hooks are intentionally retained for dispatch/runtime tests.
 pub(crate) mod supervisor;
 mod ui;

@@ -14,35 +14,45 @@
 //! `recovery_engine::reregister_active_turn_from_inflight` stays valid for its
 //! `watchers::lifecycle` / `manual_rebind` callers and for the
 //! `restore_inflight_turns` (restart-path) reattach calls; the reseed helper is
-//! private to this module. Moved verbatim — zero logic change.
+//! private to this module. Recovery preserves the persisted relay owner and maps
+//! only watcher-owned rows to the watcher projection admission barrier.
 
 use super::*;
 
-/// #3248/#3645: recovery must re-seed a Watcher-owned ledger entry after
-/// restart, keyed by the stable finalizer id, so busy GateTimeout defers and
-/// the far-backstop can reconcile. `register_start` is idempotent for the same
-/// `TurnKey`, so a later bridge handoff is a no-op refresh.
-fn reseed_watcher_owned_finalizer_ledger(
+/// Recovery re-seeds the persisted terminal owner instead of fabricating a
+/// watcher owner. Ownerless/non-watcher terminal paths do not emit a watcher
+/// projection edge, so they use immediate admission; watcher-owned rows retain
+/// the deferred projection barrier and far-backstop.
+fn reseed_recovered_finalizer_ledger(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     finalizer_turn_id: u64,
     provider: &ProviderKind,
+    relay_owner: super::inflight::RelayOwnerKind,
 ) {
     // id-0 would key the channel-only orphan slot. Only seed a full-identity
     // Watcher entry; synthetic live turns use their persisted finalizer_turn_id.
     if finalizer_turn_id == 0 {
         return;
     }
-    shared.turn_finalizer.register_start(
-        super::turn_finalizer::TurnKey::new(
-            channel_id,
-            finalizer_turn_id,
-            shared.restart.current_generation,
-        ),
-        provider.clone(),
-        super::inflight::RelayOwnerKind::Watcher,
-        shared, // #3016 phase-5a: prime the reconcile cache at register time.
-    );
+    let completion_admission_plan = if relay_owner == super::inflight::RelayOwnerKind::Watcher {
+        super::turn_finalizer::CompletionAdmissionPlan::AfterTerminalProjectionSettled
+    } else {
+        super::turn_finalizer::CompletionAdmissionPlan::Immediate
+    };
+    shared
+        .turn_finalizer
+        .register_start_with_completion_admission(
+            super::turn_finalizer::TurnKey::new(
+                channel_id,
+                finalizer_turn_id,
+                shared.restart.current_generation,
+            ),
+            provider.clone(),
+            relay_owner,
+            completion_admission_plan,
+            shared, // #3016 phase-5a: prime the reconcile cache at register time.
+        );
 }
 
 /// #4370 (review r3): may THIS re-adopted row own a ledger entry / on-disk marker?
@@ -99,24 +109,23 @@ pub(in crate::services::discord) fn readopt_marker_eligible_real_user(
 ///     live successor turn owns a DIFFERENT id and can never match, so the entry
 ///     is inert once its turn ends (see `ReadoptedMailboxOwner`).
 ///   * The on-disk `readopted_from_inflight` marker — the companion signal for a
-///     PRESENT row, written through the identity-guarded single-field patch
+///     PRESENT row, written through the identity-guarded narrow patch
 ///     `mark_readopted_from_inflight_if_identity_unchanged` (NOT a blind whole-row
 ///     save): a concurrently-cleared row is NOT resurrected (`Missing`), and a row
-///     a newer turn re-owns is NOT clobbered (`IdentityMismatch`). It preserves
-///     `restart_mode`, so it also lands on DrainRestart-preserved rows — where the
-///     broad identity-refresh save would refuse to write, which is why the ABSENT
-///     path relies on the ledger rather than this marker.
+///     a newer turn re-owns is NOT clobbered (`IdentityMismatch`). Under the same
+///     canonical lock it also consumes any planned-restart marker, transferring
+///     durable authority to the replacement process before runtime handoff.
 ///
 /// This does NOT touch the completion lifecycle: the re-adopted turn's own
 /// `✅`/footer + analytics still fire (see the `readopted_from_inflight` field doc
 /// for why it is DISTINCT from `relay_ownership_only`).
-fn mark_readopted_from_inflight(
+pub(super) fn mark_readopted_from_inflight(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
     state: &inflight::InflightTurnState,
     persist_durable_marker: bool,
-) {
+) -> inflight::GuardedSaveOutcome {
     // The re-adopted mailbox slot carries the turn's effective finalizer id as its
     // `active_user_message_id` (`mailbox_try_start_turn(..., finalizer_msg_id)` /
     // the existing-active-turn rebind below), so the ledger keys the row-ABSENT
@@ -137,17 +146,16 @@ fn mark_readopted_from_inflight(
             active_user_message_id,
             state,
         );
+        return inflight::GuardedSaveOutcome::Saved;
     }
 
-    if !persist_durable_marker {
-        return;
-    }
     let expected = inflight::InflightTurnIdentity::from_state(state);
-    match inflight::mark_readopted_from_inflight_if_identity_unchanged(
+    let outcome = inflight::mark_readopted_from_inflight_if_identity_unchanged(
         provider,
         channel_id.get(),
         &expected,
-    ) {
+    );
+    match outcome {
         inflight::GuardedSaveOutcome::Saved => {}
         inflight::GuardedSaveOutcome::Missing => {
             tracing::debug!(
@@ -171,6 +179,7 @@ fn mark_readopted_from_inflight(
             );
         }
     }
+    outcome
 }
 
 async fn reregister_active_turn_from_inflight_inner(
@@ -178,13 +187,20 @@ async fn reregister_active_turn_from_inflight_inner(
     state: &inflight::InflightTurnState,
     persist_durable_marker: bool,
 ) -> bool {
-    let finalizer_turn_id = state.effective_finalizer_turn_id();
-    if finalizer_turn_id == 0 {
+    let Some(finalizer_msg_id) =
+        super::inflight::opt_message_id(state.effective_finalizer_turn_id())
+    else {
+        tracing::warn!(
+            channel_id = state.channel_id,
+            "inflight reregister skipped because finalizer turn id is zero"
+        );
         return false;
-    }
-
-    let channel_id = ChannelId::new(state.channel_id);
-    let finalizer_msg_id = MessageId::new(finalizer_turn_id);
+    };
+    let Some(channel_id) = super::inflight::opt_channel_id(state.channel_id) else {
+        tracing::warn!("inflight reregister skipped because persisted channel id is zero");
+        return false;
+    };
+    let finalizer_turn_id = finalizer_msg_id.get();
     let snapshot = super::mailbox_snapshot(shared, channel_id).await;
     let Some(provider) = ProviderKind::from_str(&state.provider) else {
         tracing::error!(
@@ -195,7 +211,7 @@ async fn reregister_active_turn_from_inflight_inner(
         return false;
     };
     if recovery_terminal_delivery_already_committed(state) {
-        tracing::warn!(
+        tracing::info!(
             provider = %provider.as_str(),
             channel_id = state.channel_id,
             finalizer_turn_id,
@@ -232,10 +248,16 @@ async fn reregister_active_turn_from_inflight_inner(
         }
         let restored = snapshot.active_user_message_id == Some(finalizer_msg_id);
         if restored {
-            reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
+            reseed_recovered_finalizer_ledger(
+                shared,
+                channel_id,
+                finalizer_turn_id,
+                &provider,
+                state.effective_relay_owner_kind(),
+            );
             // #4370: a real-user turn re-bound to the mailbox across a restart.
             if readopted_ledger_record_allowed(state) {
-                mark_readopted_from_inflight(
+                let _ = mark_readopted_from_inflight(
                     shared,
                     &provider,
                     channel_id,
@@ -248,7 +270,13 @@ async fn reregister_active_turn_from_inflight_inner(
     }
 
     if state.request_owner_user_id == 0 {
-        reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
+        reseed_recovered_finalizer_ledger(
+            shared,
+            channel_id,
+            finalizer_turn_id,
+            &provider,
+            state.effective_relay_owner_kind(),
+        );
         return false;
     }
 
@@ -269,7 +297,13 @@ async fn reregister_active_turn_from_inflight_inner(
     )
     .await;
     if started {
-        reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
+        reseed_recovered_finalizer_ledger(
+            shared,
+            channel_id,
+            finalizer_turn_id,
+            &provider,
+            state.effective_relay_owner_kind(),
+        );
         // #4370: the mailbox now carries a re-adopted-from-inflight REAL user turn
         // (owner == request_owner_user_id). Record it in the ledger + on-disk
         // marker so a later starved injection / task-notification synthetic turn
@@ -404,7 +438,8 @@ mod reregister_ledger_reseed_tests {
     async fn reattach_reseeds_watcher_owned_ledger_entry() {
         let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_481);
-        let state = active_turn_state(ch.get(), 9001);
+        let mut state = active_turn_state(ch.get(), 9001);
+        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
 
         // Pre-condition: post-restart the in-memory ledger is empty — no
         // watcher-pending entry exists for this turn yet.
@@ -441,7 +476,8 @@ mod reregister_ledger_reseed_tests {
     async fn repeated_reattach_is_idempotent_single_watcher_entry() {
         let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_482);
-        let state = active_turn_state(ch.get(), 9101);
+        let mut state = active_turn_state(ch.get(), 9101);
+        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
 
         assert!(super::reregister_active_turn_from_inflight(&shared, &state).await);
         // Second call: the mailbox already holds the active turn, so this takes
@@ -463,6 +499,65 @@ mod reregister_ledger_reseed_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn non_watcher_recovery_does_not_fabricate_watcher_projection_barrier_4906() {
+        use serenity::model::id::{MessageId, UserId};
+        use std::sync::Arc;
+
+        let shared = super::super::make_shared_data_for_tests_with_storage(None);
+        let mut events =
+            crate::services::discord::turn_completion_events::subscribe_turn_completion_events(
+                &shared,
+            );
+        let ch = ChannelId::new(52_486);
+        let turn_id = 9_301;
+        let mut state = active_turn_state(ch.get(), turn_id);
+        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::StandbyRelay);
+        let token = Arc::new(crate::services::provider::CancelToken::new());
+        shared
+            .mailbox(ch)
+            .restore_active_turn(token, UserId::new(7), MessageId::new(turn_id))
+            .await;
+
+        assert!(super::reregister_active_turn_from_inflight(&shared, &state).await);
+        assert!(
+            !shared
+                .turn_finalizer
+                .has_live_watcher_pending(ch, shared.restart.current_generation)
+                .await,
+            "ownerless persisted recovery must not invent Watcher authority"
+        );
+
+        let outcome = shared
+            .turn_finalizer
+            .submit_terminal(
+                super::super::turn_finalizer::TurnKey::new(
+                    ch,
+                    turn_id,
+                    shared.restart.current_generation,
+                ),
+                ProviderKind::Claude,
+                super::super::turn_finalizer::TerminalEvent::Complete,
+                super::super::turn_finalizer::FinalizeContext::monitor(),
+                shared.clone(),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            super::super::turn_finalizer::FinalizeOutcome::Finalized {
+                removed_token: Some(_),
+                ..
+            }
+        ));
+        let released = events.try_recv().expect("mailbox release edge");
+        assert!(!released.queue_is_eligible());
+        let eligible = events
+            .try_recv()
+            .expect("immediate recovered owner admission");
+        assert!(eligible.queue_is_eligible());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn zero_user_msg_id_reseeds_with_finalizer_turn_id() {
         let shared = super::super::make_shared_data_for_tests_with_storage(None);
         let ch = ChannelId::new(52_483);
@@ -470,6 +565,7 @@ mod reregister_ledger_reseed_tests {
         state.user_msg_id = 0;
         state.current_msg_id = 0;
         state.finalizer_turn_id = 9_010_777;
+        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
 
         let restored = super::reregister_active_turn_from_inflight(&shared, &state).await;
         assert!(

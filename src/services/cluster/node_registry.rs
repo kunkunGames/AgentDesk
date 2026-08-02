@@ -21,8 +21,8 @@ pub(crate) use super::capability_routing::{
 use super::intake_worker_capabilities::capabilities_with_runtime_state;
 pub(crate) use super::intake_worker_capabilities::{
     deregister_gateway_waiter, node_awaits_gateway, node_supports_intake_provider,
-    refresh_worker_node_runtime_capabilities, register_gateway_waiter,
-    register_intake_worker_provider,
+    node_supports_intake_request, refresh_worker_node_runtime_capabilities,
+    register_gateway_waiter, register_intake_worker_provider,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -276,6 +276,7 @@ fn should_wake_wait_queue_after_node_join(leader_active: &AtomicBool) -> bool {
     leader_active.load(Ordering::Acquire)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_loop(
     pool: PgPool,
     instance_id: String,
@@ -466,6 +467,7 @@ async fn mark_stale_worker_nodes_offline(
     Ok(affected)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upsert_worker_node(
     pool: &PgPool,
     instance_id: &str,

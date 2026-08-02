@@ -4,13 +4,15 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-15 (against `main` @ `9594a4d94`).
+> Last refreshed: 2026-07-31 (PR #5048 stale-route recovery changes).
 >
 > Last refreshed: 2026-07-05 (#4089 — `worker_registry.rs` exposes the local RateLimitSync leader-worker active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: leader election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-leader switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the leader loop.)
 >
 > Last refreshed: 2026-07-11 (#4424 — message_outbox source authorization and leader-owned durable failed-row recovery).
 >
 > Last refreshed: 2026-07-11 (manual: scheduled-message leader worker ownership and touch gate).
+>
+> Last refreshed: 2026-07-21 (#4515 — worker-local restart budgets and the node-local fatal-exit ledger do not change worker ownership. The ledger serializes in-process read-modify-write operations and atomically replaces a node-local runtime-root file; it is deliberately not cluster-shared authority. Leader-only workers and PostgreSQL lease assumptions remain unchanged.)
 >
 > PR #3456 made the `src/server/worker_registry.rs` worker-lifecycle log fields
 > consistent: every started / stopped / future-exited / self-fenced /
@@ -373,6 +375,14 @@
   `src/services/discord/router/message_handler.rs:1420`; MCP capability checks
   are local in `src/services/mcp_config.rs:34`; tmux watcher state is in-process
   at `src/services/discord/mod.rs:538`.
+- `intake_worker.features` advertises versioned request protocols. A preserving
+  request (`preserve_on_cancel=true`) requires `preserve_on_cancel_v1`; a
+  non-preserving request may still use a legacy provider-capable worker. The same
+  request-aware eligibility check applies to preferred-label selection, explicit
+  `/node` routing, and durable foreign session owners. A live foreign owner that
+  lacks the request protocol remains live but is fenced as incompatible rather
+  than being reclassified as stale. New workers continue decoding a legacy
+  producer's nullable preservation field as false.
 - Enablement condition: #876/#879 add worker heartbeats, capability rows, and a
   dispatcher path that rejects stale workers.
 
@@ -436,7 +446,165 @@
   before merging.
 
 ### Audited touches
+- 2026-07-30 — #5014 / PR #5020 destructive cancel commit: the inflight
+  sidecar flock, watcher cancel `AtomicBool`, and registry identity CAS remain
+  **worker-local** authority. The primitive adds no PostgreSQL lease, distributed
+  epoch, leader check, remote-owner RPC, durable cancel intent, worker placement,
+  or cross-node fencing; another node can independently verify the same channel
+  row. Gateway lease containment narrows that deployment condition but does not
+  turn the host-local commit into cluster authority.
+- 2026-07-26 — #4898 untrusted deploy-gate containment: PostgreSQL migration
+  0100 adds a validated cluster-wide `CHECK` constraint that rejects normalized
+  `deploy-gate` provenance. The `ALTER TABLE` lock serializes concurrent legacy
+  writers, so preflight row counts are diagnostic only and every old node is
+  fenced after commit. The release candidate applies migration 0100 after
+  staging, signing, and reversible tunnel readiness, but before requesting
+  `restart_pending` or any runtime self-exit trigger. Migration failure therefore
+  leaves the old process running; after commit, drain/persistence and bootout
+  proceed under a forward-only binary floor. Pre-0100 binaries must not restart
+  after commit. Existing
+  deploy-gate rows block rollout; no node converts or passes them. Enabling a
+  future trusted typed evidence capability requires a coordinated constraint
+  migration and capability rollout across the fleet.
+- 2026-07-25 — #4913 GO-A1 canonical Discord session identity: nullable
+  `(provider, discord_token_hash, channel_id, identity_kind)` metadata and
+  `session_key_aliases` are shared PostgreSQL authority. Canonical writes serialize
+  with tuple/locator-scoped PostgreSQL transaction advisory locks and row locks;
+  `session_locator_namespace` unique claims prevent concurrent primary/alias
+  ownership across tables even for old direct writers. Migration 0101 and runtime
+  share the scheduled-snapshot exclusion classifier; alias-aware provider-selector,
+  `/resume`, force-kill ownership, and idle-heartbeat reads converge on one durable
+  row. Ambiguous exact/alias/canonical or legacy evidence fails closed with
+  categorical diagnostics. Existing tmux names, processes, panes, FIFOs, gateway
+  leases, leader election, and worker placement remain unchanged; no cross-node
+  tmux adoption, rename, kill, or routing cutover is introduced.
+- 2026-07-25 — #4913 GO-C1 trusted session-forwarding prerequisite:
+  `session_forwarding` treats per-node `cluster.nodes.<instance>.trusted_forward_origin`
+  as operator-owned authority, requires exact agreement with fresh worker capability
+  advertisements, validates and pins every DNS answer, requires HTTPS by default,
+  disables proxies/redirects, and attaches forwarding credentials only after
+  validation. Cleartext HTTP requires separate private-address and insecure-
+  transport opt-ins and only private/Tailscale answers; public or mixed DNS stays
+  blocked. Deprecated IPv6 site-local `fec0::/10` is not an allowed private
+  topology and remains blocked with either opt-in. Receivers for tmux output,
+  force-kill, kill-tmux, cancel-turn, and
+  resume-previous fence the expected
+  owner header against the current PostgreSQL `sessions.instance_id` and local
+  instance before any node-local read/mutation; draft #4916 must apply the same
+  shared path to resume-candidates. Classification: leader/gateway-originated HTTP
+  routing to worker-local session state using existing PostgreSQL owner authority;
+  no new leader election, lease, schema, or durable outbox. Rolling order is (1)
+  configure trusted origins on every node, including explicit private/Tailscale
+  opt-in only where needed, (2) upgrade workers until matching origins and required
+  capabilities are advertised, then (3) upgrade the gateway/leader. Missing or
+  mismatched trust configuration is a typed 503 with no discovered-URL fallback.
+- 2026-07-24 — #4712 lifecycle de-giant rebase: `runtime_bootstrap.rs` changes only
+  update the restart-marker characterization fixture to the current nonce/version
+  encoding, while watcher lifecycle logic moves verbatim behind the existing facade.
+  Gateway ownership, lease ordering, worker placement, and cross-node authority are
+  unchanged.
+- 2026-07-24 — #4533 transcript clear fence: `/clear` boundary writes and watcher
+  transcript persistence serialize through the same channel-scoped PostgreSQL
+  advisory transaction lock. The persisted boundary remains cluster-wide authority;
+  this adds no leader election, worker placement, lease, schema, or routing change.
+- 2026-07-24 — #4623 confirmed fresh-delivery cutover: the session sink preserves
+  transport-confirmed fresh outcomes through the process-local exact-sequence ring
+  and watcher ACK instead of folding them into sink errors. Existing shared delivery
+  leases and durable frontier authority remain unchanged; this adds no PostgreSQL
+  schema, leader election, worker placement, or cross-node adoption rule.
+- #4488 PR-F destructive E2E controls are worker-local and opt-in: exact-message deletion and one-shot send/delete failure injection resolve the provider runtime registered on the receiving dcserver; the route subtree remains unmounted unless `AGENTDESK_E2E_CONTROL=1`, and every target must be in the boot-bound `AGENTDESK_E2E_CHANNEL_IDS` allowlist. They add no PostgreSQL authority, leader election, lease, worker placement, or cross-node routing rule; the harness targets the node-local loopback control plane for the owning E2E cell.
+- 2026-07-24 — #4508 edit-failure fallback authority: controller and legacy
+  watcher owners capture the worker-local transcript path/generation before the
+  edit await, then re-read a locked, double-validated EOF/frontier snapshot while
+  retaining the same process-local delivery lease. Committed reconciliation uses
+  delivered-anchor-aware guarded placeholder cleanup. This adds no cross-node
+  adoption authority, leader election, PG lease, or routing change; rotated or
+  otherwise unverifiable worker-local sidecars remain fail-open for delivery.
+- 2026-07-24 — #4536 idle JSONL cursor/commit boundary: temporary active/grace
+  suppression now holds uncommitted ordered ranges, and only generation/EOF-checked
+  confirmed delivery advances the durable and in-memory frontiers. No inflight
+  blind save was added; #4843 reanchor and #4847 shared lease contracts remain intact.
+- #4756 blocking filesystem isolation: routine script reload scans remain inside the existing worker-local routine runtime and per-request validation paths, while startup dashboard provisioning and session-resume discovery retain their existing node-local paths. Moving those synchronous directory walks to Tokio's blocking pool changes no leader election, PG lease, worker placement, durable ownership, or cross-node routing authority.
+- #4340 r3 finalizer-panel ownership fencing remains worker-local: watchdog clear now returns the row removed under the existing per-channel inflight flock, and durable terminal-card records bind message IDs to turn episode plus panel/save revisions. No PostgreSQL schema, lease, leader election, cross-node routing, or owner placement authority changes.
+- #4521 live-state taxonomy audit: [`../relay-live-state-taxonomy.md`](../relay-live-state-taxonomy.md) classifies PostgreSQL authority, host-local durable sidecars, in-memory projections, and transient relay work. Cross-node `instance_id + epoch` stamping/reconciliation stays P3/deferred under #876–#884 until #4414 owner-approved design decides which durable state remains authoritative; current node-local files are never cross-node adoption authority. #4847's terminal delivery lease, #4843's durable-frontier reanchor CAS, #4830's panel invalidation epoch, and #4852's confirmed-commit-only idle cursor remain worker-local; I10 is now documented as landed.
+- #4777 PR-1 channel owner-authority rollout scope: `owner_authority_channel_ids`
+  is a live-read, raw top-level Discord channel allowlist used only to tag the
+  leader-owned intake planner's structured telemetry. It does not activate the
+  dormant owner-record authority, mutate PG ownership, alter worker placement,
+  or change Observe/Enforce admission behavior; later rollout PRs own those
+  authority changes. The environment mode override cannot populate or bypass
+  this YAML-only channel scope.
+- #4799 discrete machine-trigger markers: the watcher converts only footer-owned background terminal notifications into an idempotent lifecycle outbox marker keyed by channel plus semantic event identity; card-owned subagent notifications remain card-only, and monitor notices retain their existing offset-scoped aggregation. This adds no lease, owner, schema, or cross-node routing authority.
+- #4779 target preflight: added a pure fail-closed readiness report and transfer guard over worker-node capability evidence; owner mutation remains delegated to the generation-fenced handoff interface.
 
+- #4800 PostgreSQL pool-starvation fix: the existing `policy-tick` and
+  `github-sync` session advisory locks retain lock IDs 7,801,001 and 7,801,002
+  and the same singleton critical sections, but each lock now owns a dedicated
+  PostgreSQL connection instead of pinning a node-local runtime-pool slot across
+  nested database work or GitHub CLI network I/O. The runtime-pool acquire
+  deadline rises from 3s to 10s as burst margin. Classification:
+  **leader-only/singleton behavior unchanged, worker-local pool capacity freed**;
+  this changes no leader election, lock key, shared-row authority, routing rule,
+  or failover semantics.
+- #4781 text-only routed attachment contract: leader-side `intake_router_hook.rs` rejects gateway-local attachment paths before a foreign-owner, `/node`, or preferred-label outbox insert. Queued nonportable uploads are notice-and-drop rather than indefinitely requeued; this changes no leader election, worker lease, or durable owner authority.
+- #4785 Claude TUI readiness classification is worker-local to one session-bound
+  pane/transcript pair. Extracting foreground busy evidence and transcript-aware
+  timeout diagnostics changes no leader election, PG lease, cross-node routing,
+  durable ownership, or provider-session placement behavior.
+- #4706 structural lint debt backfill: item-level Clippy annotations and their checked-in occurrence ratchet change no runtime ownership, leader election, PG lease, or multinode routing behavior.
+- #4515 worker-local recovery supervision: `src/server/worker_recovery.rs` owns
+  bounded restart handling for the worker-local dispatch-outbox and session-discovery
+  tasks. Each node applies its own restart budget (at most 5 restarts within 10
+  minutes, with 1s-to-60s capped exponential backoff) and leaves an exhausted task
+  stopped on that node. `src/server/worker_registry.rs` retains both specs as
+  `WorkerExecutionScope::WorkerLocal`; this changes no leader election, leader-only
+  worker classification, lease acquisition, or cross-node ownership authority.
+- #4568 explicit queue cancellation: `/cancel-queued` removes only the selected
+  queued item's primary Discord message ID through the existing per-channel
+  mailbox actor; `/queue` exposes those primary IDs for the same channel. This
+  is **worker-local** queue control: it changes neither the durable intake
+  schema nor the migration 0093 preserve-on-cancel rollout boundary. The
+  existing migration 0093 binary-floor contract above remains authoritative.
+- #4548 lane-1 owner-aware Observe parity — **Leader-only routing decision,
+  worker-local execution, existing PG-backed visibility (not the dormant
+  generation-fenced PG-lease authority)**: the gateway leader's
+  `src/services/cluster/intake_router_hook.rs` now sends `Observe` through the
+  same live `sessions` owner classification, `worker_nodes` capability/liveness,
+  open `intake_outbox` route, attachment portability, `/node` override, and
+  preferred-label plan used by `Enforce`. Observe returns a structured shadow
+  outcome and `src/services/discord/router/intake_dispatch.rs` still admits the
+  turn locally, so provider/tmux execution remains worker-local and no outbox or
+  owner row is written. The reads use existing shared PostgreSQL state, but this
+  slice does not activate `owner_record.rs`, acquire a PG advisory lease, stamp
+  an owner generation, or add a leader side effect beyond the already
+  leader-owned gateway admission decision.
+- #4527 standby restart contract: both gateway and confirmed-standby providers
+  register the same restart marker poller before starting their intake worker.
+  The marker closes a provider-local atomic admission gate, returns an owned
+  pre-accept claim to `pending` without retry/error pollution, and waits for any
+  accepted tick to finish execution and its terminal outbox transition before
+  exposing `restart_pending` or consuming that provider's shutdown-barrier slot.
+  Indeterminate gateway-lease failures start neither worker nor poller.
+- #4550/#4604 intake preservation rolling-deploy contract: worker heartbeats
+  advertise `preserve_on_cancel_v1`, and all three routing authorities
+  (durable foreign session owner, explicit `/node`, and preferred labels) use the
+  same request-aware capability check. Human-authored terminal-shaped text is
+  preserved before stale-dispatch suppression; known automation and unavailable
+  utility-bot identity lookups retain the fail-safe stale drop.
+- Migration 0093 is an irreversible binary-floor boundary because binaries that
+  embed only migrations 0092 or earlier fail SQLx startup validation after 0093
+  exists in the database. Pre-stage and upgrade the entire fleet before applying
+  migration 0093. After migration 0093, binaries embedding only migrations 0092
+  or earlier must not restart or roll back. Rollback requires either a
+  forward-fix, or operators must Restore a pre-0093 database backup and roll back
+  the entire fleet together. The migration-specific CI gate is activated only
+  when the migration 0093 SQL file is in the changed-file set, so unrelated PRs
+  and the pre-0093 main branch are not gated by this boundary.
+- #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
+  Discord gateway/runtime**. Queue acceptance and retry requeue states are
+  rendered only by the existing persisted `turn_view_reconciler` identity;
+  removing queue-status cards introduces no worker, lease, durable queue, or
+  cross-node side effect.
 - #4263 (daily log-digest routine): adds a **LEADER-ONLY/SINGLETON** scheduled
   monitoring routine. `server::worker_registry` already runs
   `routine_runtime_loop` through `register_leader_tokio`, and the existing
@@ -486,8 +654,9 @@
   authority, PG lease, or leader-only side effect changes.
 - #4249 PostgreSQL bootstrap timeout hardening runs migration/reseed on an eager
   startup pool with a 10s acquire deadline, then eagerly activates the separate
-  runtime pool with the original 3s deadline before the shared six-attempt
-  retry/alert envelope can succeed. Typed `sqlx::Error::PoolTimedOut` failures
+  runtime pool before the shared six-attempt retry/alert envelope can succeed.
+  The runtime deadline was originally 3s and became 10s in #4800. Typed
+  `sqlx::Error::PoolTimedOut` failures
   get timestamped, source-attributed bootstrap diagnostics.
   Classification: **worker-local** — every node owns its own connection pool,
   wait budget, retry loop, and stderr; this changes no shared row, schema,
@@ -497,8 +666,8 @@
   gateway subscriptions plus the only destructive `ReactionRemove` intake
   route. This narrows connection-level event intake on every node; it does not
   change gateway lease acquisition, singleton ownership, worker routing, or
-  node-local/shared-Postgres authority. Explicit authenticated `/steer` and
-  `/stop` cancellation remain on their existing owners.
+  node-local/shared-Postgres authority. Explicit authenticated `/stop`
+  cancellation remains on its existing owner.
 
 - #4424 message_outbox source-contract recovery: the protected
   `GET /api/message-outbox/failed` inspection route is read-only on any control
@@ -565,6 +734,18 @@
   fire-and-forget session banner (`session_banner.rs`) is untouched. Delete
   failures fall back to the existing durable status-panel orphan store (also
   worker-local). OFF path is byte-identical.
+- #4488 two-message restart recovery + E2E: the restart inflight scan delegates
+  panel repair to `recovery_engine/two_message_panel.rs` before watcher/bridge
+  reattachment. The helper treats Discord message existence and snowflake order
+  only as repair evidence, then authorizes the replacement exclusively through
+  the existing full `InflightTurnIdentity` CAS and in-lock generation bump. A
+  just-sent panel is pre-registered in the worker-local orphan store, a bind loser
+  deletes or queues only its own duplicate, and an old live panel is retired only
+  after the same episode durably owns the replacement. The #4830 process-local
+  cache invalidation epoch is intentionally not copied across restart or panel
+  identities; the new panel starts uncached, while terminal reconcile remains
+  keyed to the rebound panel generation. No PG lease, leader gate, schema field,
+  or cross-node authority is added. The default-OFF flag remains unchanged.
 - #3038 (b) early TUI completion gate extraction: `turn_bridge/mod.rs` moved the
   #2293/#2780 early TUI quiescence gate (the eligibility filter + bounded
   `run_tui_completion_gate` probe + timed-out warning that compute
@@ -703,6 +884,17 @@
   effective authority. Classification: PG-lease-backed worker-local execution;
   no new gateway owner, no extra leader election surface.
 
+- #4611 owner-targeted cancel forwarding: REST cancel and Discord `/stop` resolve
+  the canonical active `sessions.instance_id` owner and fail closed instead of
+  mutating leader-local state when ownership is remote or changes during cancel.
+  The #4913 GO-C1 prerequisite supersedes the original workers-first shorthand:
+  first configure `cluster.nodes.<instance>.trusted_forward_origin` for every
+  potential owner, then upgrade workers until they advertise the exact configured
+  origin and `capabilities.agentdesk_api.cancel_forwarding_v1=true`, and upgrade
+  leaders last. Leaders do not forward cancel to older or mismatched workers.
+  Keep old and new nodes registered during rollout only after every potential
+  owner advertises the fence. No durable cancel outbox or new lease is introduced.
+
 - #4350 session-owner intake affinity: leader-only routing resolves the existing
   PG `sessions.instance_id` owner before `/node` or preferred labels, and every
   Discord/skill/queued producer shares one admission path. Stale or conflicting
@@ -710,6 +902,15 @@
   safe without local execution; queued items are front-requeued before marker
   teardown. Worker execution remains instance-local and is the one intentional
   admission bypass after an outbox claim. No new lease or migration.
+
+- #5040 owner-authority admission fence correction: `owner_authority_channel_ids`
+  now distinguishes `opted_in`, `not_opted_in`, and `unknown` at the admission
+  boundary. A `pending` predecessor is eligible for local recovery only when
+  its row age exceeds `forward_pre_claim_timeout_secs`, the owner is live-local,
+  and the channel is explicitly unlisted; the row is atomically retired under
+  the channel advisory lock before local execution. Unknown config and
+  `claimed`/`accepted`/`spawned` routes remain fenced. Foreign-owner routing,
+  worker claim, lease, migration, and gateway ownership remain unchanged.
 
 - #3630 frontier mirror for cancel/stop + prompt_too_long terminal arms:
   turn_bridge now mirrors only Delivered+committed terminal-replace lease ranges
@@ -1442,3 +1643,76 @@
   write. Per-turn prompt assembly joins the shared boundary while reading
   `session_transcripts`, so restart or worker reassignment cannot cross a clear.
   This adds no leader lease, singleton, or routing decision.
+- #4551 fresh routine context severance and verified start evidence — **Existing
+  leader-owned routine state, worker-local provider launch**: the routine
+  executor records turn-matched start evidence in the shared `routine_runs` row,
+  and terminal close serializes on that same row so neither interleaving loses
+  the verified flag. Fresh provider continuity is cleared only after the shared
+  transcript boundary succeeds. No new worker, queue, lease, singleton, routing
+  decision, or node-local authority is introduced.
+- #4538 PR-A durable intake placement-owner (dormant schema + owner-CAS
+  primitives) — **PG-lease-backed shared authority, dormant**: migration 0094
+  adds `intake_session_owners` (history-row registry keyed on
+  `(provider, raw_channel_id)` with a monotonic generation, one `active` row per
+  identity via `iso_unique_active`) plus `intake_outbox` owner-stamp columns
+  (`owner_generation`, `owner_instance_id`, `admission_kind`, `idempotency_key`
+  with its sparse unique index). The
+  `src/services/cluster/intake_router_hook/owner_record.rs` acquire / transfer
+  (3-way CAS) / adopt / fenced claim / stale-sweep / SAVEPOINT-admission helpers
+  serialize per channel on a deterministic `pg_advisory_xact_lock` key and fence
+  every authoritative write on `(owner_instance_id, generation)`. This is a
+  **generation-fenced PG-lease** authority in the taxonomy above
+  (`pg_lease_backed_claim`), not leader-only or worker-local. PR-A ships it
+  DORMANT: no production caller resolves ownership or routes intake through it
+  (reader flip + admission wiring are PR-C / #4548), and the schema-activation
+  CHECK (`intake_outbox_open_requires_owner`) and open-route unique re-alignment
+  are deferred to PR-C. Migration 0094 is an irreversible binary-floor boundary:
+  binaries embedding only migrations 0093 or earlier fail SQLx startup
+  validation once 0094 exists, so pre-stage and upgrade the whole fleet before
+  applying it, and do not restart/roll back a pre-0094 binary afterward. Its
+  migration-specific CI gate activates only when the 0094 SQL file is in the
+  changed-file set.
+
+- #4615 S3a dormant circuit-alert authority — **PG-lease-backed shared authority,
+  dormant**: migration 0096 adds a channel-scoped
+  `message_outbox_circuit_authority` watermark and complete circuit coordinate
+  stamps on `message_outbox`. Reservation, held staging, activation, and fresh-vouch
+  revocation reuse the existing `intake_session_owners` active
+  `(owner_instance_id, generation)` check and its deterministic
+  `OwnerIdentity::advisory_key()` transaction lock. A channel-global
+  `authority_epoch` orders episode resets while same-episode frontier transitions
+  must follow the coupled baseline/open-generation rule. Non-owner and stale
+  writers fail closed. S3a ships dormant: no relay producer or outbox worker uses
+  these APIs until S3b adds the final worker delivery fence, so no circuit alert
+  is exposed to an unfenced external send. Classification:
+  **generation-fenced PG-lease authority**; no leader-only singleton is added.
+
+- #4527 (safe-restart standby drain + standby health visibility): `runtime_bootstrap.rs`
+  now registers a **confirmed-standby** node's provider `SharedData` into the
+  `HealthRegistry` even when the gateway runtime never starts (lease held
+  elsewhere), and `runtime_bootstrap/gateway_lease.rs` splits the lease outcome
+  into `Proceed` / `Standby` (confirmed `Ok(None)`) / `Failed`. This is
+  **worker-local** health visibility (not leader-only or PG-lease): it exposes
+  the standby intake worker's own `global_active` / provider `active_turns` /
+  mailbox / relay state — previously only populated inside the gateway runtime —
+  so the safe-restart wrapper cannot mistake a live standby turn for an idle
+  node. A new provider-health `runtime_state_complete=true` flag lets the wrapper
+  reject legacy/partial health as idle evidence. Lease-acquire *errors* are
+  classified `Failed` (never `Standby`), so a restart never skips leader
+  drain-ack on an ambiguous lease result: every incomplete/failed/missing signal
+  falls back to the existing drain path (fail-closed).
+- #4658 scheduled-message immutable context snapshots: **PG-lease-safe /
+  worker-local execution, no new leader or lease authority**. Snapshot capture
+  (`services::scheduled_messages::context_snapshot::capture_snapshot_tx`) and
+  validation (`validate_snapshot_pg`) store and read the fully-rendered context
+  inline in `scheduled_message_context_snapshots` (PostgreSQL), never provider
+  session files, so a snapshot captured on one node validates and fires on any
+  other node — the capture node and the fire node need not be the same. The fire
+  path reuses the existing `scheduled_message_deliveries` claim
+  (`FOR UPDATE SKIP LOCKED` + launch-commit barrier); snapshot validation runs
+  **before** that barrier, so recovery/adopt semantics and the at-most-once
+  launch contract are unchanged. The isolated session key
+  (`scheduled:{definition_id}`) is derived deterministically from PG-persisted
+  definition state, so any node computes the identical, channel-independent key
+  — the reserved turn never mutates the channel's live `sessions.session_key`
+  row. No node-local timer, leader singleton, or advisory lease is introduced.

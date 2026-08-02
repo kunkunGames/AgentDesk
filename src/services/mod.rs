@@ -7,6 +7,8 @@ pub mod auto_queue;
 pub mod automation_candidate_contract;
 pub mod automation_candidate_materializer;
 pub mod claude;
+pub(crate) mod claude_command;
+pub mod claude_compact_context;
 pub mod claude_compact_trigger;
 pub mod claude_e;
 pub(crate) mod claude_gateway_proxy;
@@ -55,6 +57,9 @@ pub mod memory;
 // live on clean sibling modules. Remove during message_outbox dead-code cleanup.
 #[allow(dead_code)]
 pub mod message_outbox;
+pub(crate) mod message_outbox_circuit_authority;
+#[cfg(test)]
+mod message_outbox_circuit_authority_tests;
 pub mod message_outbox_recovery;
 pub(crate) mod message_outbox_recovery_support;
 #[cfg(test)]
@@ -112,22 +117,32 @@ pub(crate) mod session_selector_validity;
 #[allow(dead_code)]
 pub mod session_backend;
 pub mod session_forwarding;
+pub mod session_resume;
 pub mod settings;
 pub mod shell_guard;
 pub mod slo;
+pub(crate) mod stale_turn_reconciler;
+pub(crate) mod task_completion_v1;
 // #3034: 1 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during termination_audit dead-code cleanup.
+pub(crate) mod terminal_status_formatting;
 #[allow(dead_code)]
 pub mod termination_audit;
 pub mod tmux_common;
 pub mod tmux_diagnostics;
+pub(crate) mod tmux_turn_liveness;
 #[cfg(unix)]
 pub mod tmux_wrapper;
 pub mod tool_output_guard;
 // #3034: 4 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during tui_prompt_dedupe dead-code cleanup.
+pub(crate) mod tui_prompt_control;
 #[allow(dead_code)]
 pub(crate) mod tui_prompt_dedupe;
+// #4754 Slice 1 removes the automatic intake call site; retain this helper
+// module for the subsequent manual-steering slice without dead-code noise.
+#[allow(dead_code)]
+pub(crate) mod tui_steering;
 pub(crate) mod tui_turn_state;
 pub mod turn_cancel_finalizer;
 pub mod turn_lifecycle;

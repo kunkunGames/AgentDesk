@@ -10,6 +10,7 @@ pub(super) fn status_panel_completion_ready_after_terminal_body(
     terminal_delivery_committed && terminal_body_visible && !preserve_inflight_for_cleanup_retry
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     shared: &SharedData,
     gateway: &G,
@@ -51,7 +52,21 @@ pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
             if let Some(warning) = wip_warning {
                 warning.commit();
             }
+            if !singleton::commit_completed_binding(
+                shared,
+                provider,
+                channel_id,
+                status_panel_msg_id,
+            ) {
+                return false;
+            }
             purge_pending_bind_for_completed_status_panel(
+                shared,
+                provider,
+                channel_id,
+                status_panel_msg_id,
+            );
+            purge_terminal_reconcile_for_completed_status_panel(
                 shared,
                 provider,
                 channel_id,
@@ -89,8 +104,22 @@ pub(super) async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
                     if let Some(warning) = wip_warning {
                         warning.commit();
                     }
+                    if !singleton::commit_completed_binding(
+                        shared,
+                        provider,
+                        channel_id,
+                        status_panel_msg_id,
+                    ) {
+                        return false;
+                    }
                     *last_status_panel_text = panel_text;
                     purge_pending_bind_for_completed_status_panel(
+                        shared,
+                        provider,
+                        channel_id,
+                        status_panel_msg_id,
+                    );
+                    purge_terminal_reconcile_for_completed_status_panel(
                         shared,
                         provider,
                         channel_id,
@@ -148,6 +177,7 @@ fn completion_panel_with_wip_warning(
     (panel_text, reservation)
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StatusPanelWipInflight<'a> {
     Preloaded(&'a super::super::InflightTurnState),
     Loaded(super::super::InflightTurnState),
@@ -204,6 +234,7 @@ fn status_panel_wip_inflight_for_completion<'a>(
     .map(StatusPanelWipInflight::Loaded)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_status_panel_v2_fallback_with_gateway<G: TurnGateway + ?Sized>(
     shared: &SharedData,
     gateway: &G,
@@ -229,6 +260,10 @@ async fn complete_status_panel_v2_fallback_with_gateway<G: TurnGateway + ?Sized>
                 message_id,
                 source,
             );
+            if !singleton::commit_completed_binding(shared, provider, channel_id, Some(message_id))
+            {
+                return false;
+            }
             *last_status_panel_text = panel_text;
             true
         }
@@ -244,6 +279,7 @@ async fn complete_status_panel_v2_fallback_with_gateway<G: TurnGateway + ?Sized>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
     shared: &std::sync::Arc<SharedData>,
     http: &serenity::Http,
@@ -290,7 +326,21 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
             if let Some(warning) = wip_warning {
                 warning.commit();
             }
+            if !singleton::commit_completed_binding(
+                shared,
+                provider,
+                channel_id,
+                status_panel_msg_id,
+            ) {
+                return false;
+            }
             purge_pending_bind_for_completed_status_panel(
+                shared.as_ref(),
+                provider,
+                channel_id,
+                status_panel_msg_id,
+            );
+            purge_terminal_reconcile_for_completed_status_panel(
                 shared.as_ref(),
                 provider,
                 channel_id,
@@ -301,6 +351,7 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
         StatusPanelCompletionAction::SendFallback => {
             rate_limit_wait(shared, channel_id).await;
             complete_status_panel_v2_fallback_with_http(
+                shared.as_ref(),
                 http,
                 channel_id,
                 provider,
@@ -321,8 +372,22 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
                     if let Some(warning) = wip_warning {
                         warning.commit();
                     }
+                    if !singleton::commit_completed_binding(
+                        shared.as_ref(),
+                        provider,
+                        channel_id,
+                        status_panel_msg_id,
+                    ) {
+                        return false;
+                    }
                     *last_status_panel_text = panel_text;
                     purge_pending_bind_for_completed_status_panel(
+                        shared.as_ref(),
+                        provider,
+                        channel_id,
+                        status_panel_msg_id,
+                    );
+                    purge_terminal_reconcile_for_completed_status_panel(
                         shared.as_ref(),
                         provider,
                         channel_id,
@@ -334,6 +399,7 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
                     let error = error.to_string();
                     if status_panel_message_missing_error(&error) {
                         return complete_status_panel_v2_fallback_with_http(
+                            shared.as_ref(),
                             http,
                             channel_id,
                             provider,
@@ -359,7 +425,9 @@ pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_status_panel_v2_fallback_with_http(
+    shared: &SharedData,
     http: &serenity::Http,
     channel_id: ChannelId,
     provider: &ProviderKind,
@@ -383,6 +451,10 @@ async fn complete_status_panel_v2_fallback_with_http(
                 message_id,
                 source,
             );
+            if !singleton::commit_completed_binding(shared, provider, channel_id, Some(message_id))
+            {
+                return false;
+            }
             *last_status_panel_text = panel_text;
             true
         }
@@ -398,22 +470,17 @@ async fn complete_status_panel_v2_fallback_with_http(
     }
 }
 
-fn purge_pending_bind_for_completed_status_panel(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    status_panel_msg_id: Option<MessageId>,
-) {
-    let Some(message_id) = normalize_status_panel_message_id(status_panel_msg_id) else {
-        return;
-    };
-    crate::services::discord::status_panel_orphan_store::remove_pending_bind(
-        provider,
-        &shared.token_hash,
-        channel_id.get(),
-        message_id.get(),
-    );
-}
+mod fallback;
+mod purge;
+mod singleton;
+use fallback::{
+    persist_status_panel_completion_fallback_message_id, send_status_panel_v2_completion_fallback,
+    send_status_panel_v2_completion_fallback_http,
+};
+use purge::{
+    purge_pending_bind_for_completed_status_panel,
+    purge_terminal_reconcile_for_completed_status_panel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusPanelCompletionAction {
@@ -506,83 +573,6 @@ pub(super) fn status_panel_completion_edit_aliases_newer_turn(
 /// the same over-suppression carve-out the alias predicate uses for the EDIT.
 pub(super) fn bridge_epilogue_identity_guards_inflight_clear(this_turn_user_msg_id: u64) -> bool {
     this_turn_user_msg_id != 0
-}
-
-fn persist_status_panel_completion_fallback_message_id(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    expected_user_msg_id: Option<u64>,
-    message_id: MessageId,
-    source: &'static str,
-) {
-    if is_synthetic_headless_message_id(message_id) {
-        return;
-    }
-    let Some(expected_user_msg_id) = expected_user_msg_id else {
-        return;
-    };
-    // #3077: route the load-modify-save through the typed bind op so the
-    // user_msg_id guard and the field set are serialized under the inflight
-    // flock (no TOCTOU with a concurrent turn rebinding the row). Behavior is
-    // preserved: bind only when the on-disk row still belongs to this turn.
-    let guard = super::inflight::StatusPanelBindGuard {
-        require_user_msg_id: Some(expected_user_msg_id),
-        ..Default::default()
-    };
-    match super::inflight::bind_status_panel(provider, channel_id.get(), message_id.get(), &guard) {
-        super::inflight::StatusPanelBindOutcome::Bound { .. }
-        | super::inflight::StatusPanelBindOutcome::AlreadyBound
-        | super::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet(_) => {}
-        super::inflight::StatusPanelBindOutcome::Missing => {}
-        super::inflight::StatusPanelBindOutcome::GuardMismatch => {
-            tracing::debug!(
-                "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id != expected {}",
-                message_id,
-                channel_id,
-                source,
-                expected_user_msg_id
-            );
-        }
-        super::inflight::StatusPanelBindOutcome::IoError => {
-            tracing::warn!(
-                "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}",
-                message_id,
-                channel_id,
-                source
-            );
-        }
-    }
-}
-
-async fn send_status_panel_v2_completion_fallback_http(
-    http: &serenity::Http,
-    channel_id: ChannelId,
-    panel_text: &str,
-) -> Result<MessageId, String> {
-    super::http::send_channel_message(http, channel_id, panel_text)
-        .await
-        .map(|message| message.id)
-        .map_err(|error| error.to_string())
-}
-
-async fn send_status_panel_v2_completion_fallback<G: TurnGateway + ?Sized>(
-    shared: &SharedData,
-    gateway: &G,
-    channel_id: ChannelId,
-    panel_text: &str,
-) -> Result<MessageId, String> {
-    if gateway.can_chain_locally() {
-        return gateway.send_message(channel_id, panel_text).await;
-    }
-    let Some(http) = shared.serenity_http_or_token_fallback() else {
-        return Err(
-            "no Discord HTTP available for status-panel-v2 completion fallback".to_string(),
-        );
-    };
-    super::http::send_channel_message(&http, channel_id, panel_text)
-        .await
-        .map(|message| message.id)
-        .map_err(|error| error.to_string())
 }
 
 fn status_panel_message_missing_error(error: &str) -> bool {

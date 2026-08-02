@@ -11,31 +11,16 @@ use std::sync::Arc;
 use super::*;
 
 use crate::services::agent_protocol::TaskNotificationKind;
+use crate::services::discord::formatting::{
+    DeferredReplaceLongMessageOutcome, replace_long_message_raw_deferred,
+};
 use crate::services::discord::inflight::{InflightTurnIdentity, InflightTurnState};
 use crate::services::discord::task_notification_delivery as task_delivery;
 use crate::services::discord::turn_finalizer::TurnKey;
 use crate::services::discord::{DeliveryLeaseCell, SharedData};
 use crate::services::provider::ProviderKind;
 
-pub(in crate::services::discord) struct WatcherDirectFallbackLocals<'a> {
-    pub(in crate::services::discord) tui_direct_anchor_terminal_body_visible: &'a mut bool,
-    pub(in crate::services::discord) placeholder_msg_id: &'a mut Option<MessageId>,
-    pub(in crate::services::discord) placeholder_from_restored_inflight: &'a mut bool,
-    pub(in crate::services::discord) last_edit_text: &'a mut String,
-    pub(in crate::services::discord) watcher_streaming_rollover_frozen_msg_ids:
-        &'a mut Vec<MessageId>,
-    pub(in crate::services::discord) watcher_long_chunk_anchor_msg_id: &'a mut Option<MessageId>,
-    pub(in crate::services::discord) watcher_long_chunk_delivered_body: &'a mut Option<String>,
-    pub(in crate::services::discord) completion_footer_terminal_target:
-        &'a mut Option<WatcherCompletionFooterTerminalTarget>,
-    pub(in crate::services::discord) retry_terminal_delivery_from_offset: &'a mut bool,
-    pub(in crate::services::discord) tui_direct_anchor_or_lease_present_for_lifecycle: &'a mut bool,
-    pub(in crate::services::discord) watcher_direct_terminal_idle_committed: &'a mut bool,
-    pub(in crate::services::discord) last_relayed_offset: &'a mut Option<u64>,
-    pub(in crate::services::discord) last_observed_generation_mtime_ns: &'a mut Option<i64>,
-    pub(in crate::services::discord) task_response_claim:
-        &'a mut Option<task_delivery::ResponseDeliveryClaim>,
-}
+pub(in crate::services::discord) use super::terminal_delivery_types::WatcherDirectFallbackLocals;
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
@@ -61,6 +46,7 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
     watcher_lease_turn: TurnKey,
     watcher_lease_key: &crate::services::discord::DeliveryLeaseKey,
     watcher_instance_id: u64,
+    source_authority: WatcherSourceAuthority,
     watcher_lease_start: u64,
     watcher_lease_end: u64,
     inflight_before_relay: &Option<InflightTurnState>,
@@ -78,10 +64,10 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
         placeholder_from_restored_inflight,
         last_edit_text,
         watcher_streaming_rollover_frozen_msg_ids,
-        watcher_long_chunk_anchor_msg_id,
-        watcher_long_chunk_delivered_body,
+        watcher_terminal_delivery_proof,
         completion_footer_terminal_target,
         retry_terminal_delivery_from_offset,
+        terminal_delivery_landed_unproven,
         tui_direct_anchor_or_lease_present_for_lifecycle,
         watcher_direct_terminal_idle_committed,
         last_relayed_offset,
@@ -210,6 +196,7 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                             watcher_lease_turn,
                             Some(watcher_lease_key.clone()),
                             watcher_instance_id,
+                            source_authority,
                             (watcher_lease_start, watcher_lease_end),
                             session_bound_fallback_uses_full_body,
                             &mut *watcher_streaming_rollover_frozen_msg_ids,
@@ -225,11 +212,15 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                 placeholder_from_restored_inflight:
                                     &mut *placeholder_from_restored_inflight,
                                 last_edit_text: &mut *last_edit_text,
+                                single_message_panel_footer_mode,
+                                completion_footer_terminal_target:
+                                    &mut *completion_footer_terminal_target,
                             },
                         )
                         .await;
                     } else {
                         let delivered_long_chunk_body = direct_terminal_response.to_string();
+                        let mut long_chunk_anchor_msg_id = None;
                         terminal_long_chunks::apply_watcher_long_chunks_legacy(
                             &http,
                             &shared,
@@ -241,7 +232,7 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                             session_bound_fallback_uses_full_body,
                             &mut *watcher_streaming_rollover_frozen_msg_ids,
                             inflight_before_relay.as_ref(),
-                            &mut *watcher_long_chunk_anchor_msg_id,
+                            &mut long_chunk_anchor_msg_id,
                             terminal_long_chunks::WatcherLongChunksLocals {
                                 relay_ok: &mut relay_ok,
                                 direct_send_delivered: &mut direct_send_delivered,
@@ -253,11 +244,18 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                 placeholder_from_restored_inflight:
                                     &mut *placeholder_from_restored_inflight,
                                 last_edit_text: &mut *last_edit_text,
+                                single_message_panel_footer_mode,
+                                completion_footer_terminal_target:
+                                    &mut *completion_footer_terminal_target,
                             },
                         )
                         .await;
-                        if watcher_long_chunk_anchor_msg_id.is_some() {
-                            *watcher_long_chunk_delivered_body = Some(delivered_long_chunk_body);
+                        if long_chunk_anchor_msg_id.is_some() {
+                            *watcher_terminal_delivery_proof =
+                                Some(terminal_long_chunks::WatcherTerminalDeliveryProof {
+                                    anchor_msg_id: long_chunk_anchor_msg_id,
+                                    raw_body: delivered_long_chunk_body,
+                                });
                         }
                     }
                 } else if cutover_short_replace {
@@ -283,7 +281,9 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                         watcher_lease_turn,
                         Some(watcher_lease_key.clone()),
                         watcher_instance_id,
+                        source_authority,
                         (watcher_lease_start, watcher_lease_end),
+                        response_sent_offset,
                         single_message_panel_footer_mode,
                         inflight_before_relay.as_ref(),
                         terminal_send::WatcherShortReplaceLocals {
@@ -301,6 +301,8 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                 &mut *completion_footer_terminal_target,
                             retry_terminal_delivery_from_offset:
                                 &mut *retry_terminal_delivery_from_offset,
+                            terminal_delivery_landed_unproven:
+                                &mut *terminal_delivery_landed_unproven,
                         },
                     )
                     .await;
@@ -308,8 +310,12 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                     // #3805 P1: capture the tail continuation chunk (id +
                     // its own text) so the completion footer re-anchors onto
                     // it instead of stranding on the edited chunk 0.
+                    let expected_transcript = crate::services::discord::outbound::delivery_record::capture_edit_failure_transcript_identity(
+                        shared,
+                        tmux_session_name,
+                    );
                     let mut last_chunk_anchor = None;
-                    match replace_long_message_raw_with_outcome(
+                    let replace_outcome = replace_long_message_raw_deferred(
                         &http,
                         channel_id,
                         msg_id,
@@ -317,9 +323,52 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                         &shared,
                         &mut last_chunk_anchor,
                     )
-                    .await
-                    {
-                        Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
+                    .await;
+                    enum WatcherDeferredReplaceOutcome {
+                        Replace(ReplaceLongMessageOutcome),
+                        AlreadyCommittedAfterEditFailure { edit_error: String },
+                    }
+                    let replace_outcome = match replace_outcome {
+                        Ok(DeferredReplaceLongMessageOutcome::Edited(outcome)) => {
+                            Ok(WatcherDeferredReplaceOutcome::Replace(outcome))
+                        }
+                        Ok(DeferredReplaceLongMessageOutcome::EditFailed { edit_error }) => {
+                            if crate::services::discord::outbound::delivery_record::range_committed_after_edit_failure(
+                                shared,
+                                watcher_provider,
+                                channel_id,
+                                tmux_session_name,
+                                expected_transcript.as_ref(),
+                                watcher_lease_end,
+                            ) {
+                                Ok(WatcherDeferredReplaceOutcome::AlreadyCommittedAfterEditFailure {
+                                    edit_error,
+                                })
+                            } else {
+                                crate::services::discord::formatting::send_long_message_raw_with_rollback(
+                                    http,
+                                    channel_id,
+                                    msg_id,
+                                    &relay_text,
+                                    shared,
+                                )
+                                .await
+                                .map(|message_ids| {
+                                    WatcherDeferredReplaceOutcome::Replace(
+                                        ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+                                            edit_error,
+                                            replacement_anchor: message_ids.first().copied(),
+                                        },
+                                    )
+                                })
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match replace_outcome {
+                        Ok(WatcherDeferredReplaceOutcome::Replace(
+                            ReplaceLongMessageOutcome::EditedOriginal,
+                        )) => {
                             direct_send_delivered = true;
                             *tui_direct_anchor_terminal_body_visible = true;
                             external_input_lease_consumed_by_relay =
@@ -335,6 +384,11 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                             msg_id,
                                             &relay_text,
                                         );
+                            *watcher_terminal_delivery_proof =
+                                Some(terminal_long_chunks::WatcherTerminalDeliveryProof {
+                                    anchor_msg_id: Some(footer_target_msg_id),
+                                    raw_body: direct_terminal_response.to_string(),
+                                });
                             remember_watcher_completion_footer_terminal_target(
                                 single_message_panel_footer_mode,
                                 &mut *completion_footer_terminal_target,
@@ -370,16 +424,36 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                 "watcher_terminal_relay",
                             );
                         }
-                        Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
-                            edit_error,
-                            ..
-                        }) => {
+                        Ok(WatcherDeferredReplaceOutcome::Replace(
+                            ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+                                edit_error,
+                                replacement_anchor,
+                            },
+                        )) => {
                             direct_send_delivered = true;
                             *tui_direct_anchor_terminal_body_visible = true;
                             external_input_lease_consumed_by_relay =
                                 watcher_inflight_represents_external_input(
                                     inflight_before_relay.as_ref(),
                                 );
+                            *watcher_terminal_delivery_proof =
+                                Some(terminal_long_chunks::WatcherTerminalDeliveryProof {
+                                    anchor_msg_id: replacement_anchor,
+                                    raw_body: direct_terminal_response.to_string(),
+                                });
+                            if let Some(replacement_anchor) = replacement_anchor {
+                                let tail = crate::services::discord::formatting::split_message(
+                                    &relay_text,
+                                )
+                                .pop()
+                                .unwrap_or_else(|| relay_text.clone());
+                                remember_watcher_completion_footer_terminal_target(
+                                    single_message_panel_footer_mode,
+                                    &mut *completion_footer_terminal_target,
+                                    replacement_anchor,
+                                    &tail,
+                                );
+                            }
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::info!(
                                 "  [{ts}] 👁 ✓ relayed terminal response (fallback send after edit failure) channel {} msg {} ({} chars, edit_error={edit_error})",
@@ -455,14 +529,42 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                                 );
                             }
                         }
-                        Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
-                            sent_chunks,
-                            total_chunks,
-                            failed_chunk_index,
-                            sent_continuation_message_ids,
-                            cleanup_errors,
-                            error,
+                        Ok(WatcherDeferredReplaceOutcome::AlreadyCommittedAfterEditFailure {
+                            edit_error,
                         }) => {
+                            terminal_send::committed_placeholder_cleanup::reconcile_already_committed_after_edit_failure(
+                                terminal_send::committed_placeholder_cleanup::CommittedEditFailureReconcileCtx {
+                                    http,
+                                    shared,
+                                    provider: watcher_provider,
+                                    channel_id,
+                                    tmux_session_name,
+                                    msg_id,
+                                    inflight_before_relay: inflight_before_relay.as_ref(),
+                                    range: (watcher_lease_start, watcher_lease_end),
+                                    response_sent_offset,
+                                    edit_error,
+                                    direct_send_delivered: &mut direct_send_delivered,
+                                    tui_direct_anchor_terminal_body_visible,
+                                    placeholder_msg_id,
+                                    placeholder_from_restored_inflight,
+                                    last_edit_text,
+                                    cleanup_source: "watcher_terminal_relay_already_committed_cleanup",
+                                    record_source: "watcher_terminal_relay_already_committed_after_edit_failure",
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(WatcherDeferredReplaceOutcome::Replace(
+                            ReplaceLongMessageOutcome::PartialContinuationFailure {
+                                sent_chunks,
+                                total_chunks,
+                                failed_chunk_index,
+                                sent_continuation_message_ids,
+                                cleanup_errors,
+                                error,
+                            },
+                        )) => {
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             let display_error = stripped_send_error(&error);
                             tracing::warn!(
@@ -572,12 +674,38 @@ pub(in crate::services::discord) async fn apply_watcher_direct_fallback_send(
                         )
                         .await
                         {
-                            Ok(_) => {
+                            Ok(message_ids) => {
                                 *tui_direct_anchor_or_lease_present_for_lifecycle |=
                                     prompt_anchor.is_some();
                                 external_input_lease_consumed_by_relay =
                                     external_input_lease_before_relay || prompt_anchor.is_some();
                                 direct_send_delivered = true;
+                                // #4911 R10: the placeholderless fresh send is a
+                                // confirmed terminal delivery like the edit arms, so
+                                // it must carry a delivery proof. Without it the
+                                // outer commit takes the proof-less
+                                // `AdvancedWithoutProof` branch: the frontier moves
+                                // but no DeliveredCommit / receipt / ledger entry /
+                                // #4081 fingerprint is written, which is exactly the
+                                // missing-fingerprint precondition #4911 replays on.
+                                *watcher_terminal_delivery_proof =
+                                    Some(terminal_long_chunks::WatcherTerminalDeliveryProof {
+                                        anchor_msg_id: message_ids.last().copied(),
+                                        raw_body: direct_terminal_response.to_string(),
+                                    });
+                                if let Some(msg_id) = message_ids.last().copied() {
+                                    let tail = crate::services::discord::formatting::split_message(
+                                        &relay_text,
+                                    )
+                                    .pop()
+                                    .unwrap_or_else(|| relay_text.clone());
+                                    remember_watcher_completion_footer_terminal_target(
+                                        single_message_panel_footer_mode,
+                                        &mut *completion_footer_terminal_target,
+                                        msg_id,
+                                        &tail,
+                                    );
+                                }
                                 *tui_direct_anchor_terminal_body_visible = true;
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 tracing::info!(

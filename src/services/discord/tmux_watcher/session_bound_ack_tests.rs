@@ -128,6 +128,69 @@ fn resolve_time_drop_span_ignores_prior_turn_drops() {
     );
 }
 
+#[tokio::test]
+async fn fenced_zero_delivery_resolves_exact_not_delivered_without_timeout_4909() {
+    use crate::services::cluster::session_matcher::{MatchedChannel, expected_rollout_path_for};
+    use crate::services::cluster::stream_relay::{
+        RelaySink, TerminalCommitFence, spawn_stream_relay,
+    };
+    use crate::services::discord::health::HealthRegistry;
+    use crate::services::discord::session_relay_sink::{
+        PURE_SUBAGENT_ZERO_DELIVERY_PAYLOAD, SessionBoundDiscordRelaySink,
+    };
+    use crate::services::provider::ProviderKind;
+    use std::sync::Arc;
+
+    let channel_id = "4909";
+    let session = ProviderKind::Claude.build_tmux_session_name(channel_id);
+    let binding = MatchedChannel {
+        channel_id: channel_id.to_string(),
+        agent_id: format!("agent-{channel_id}"),
+        provider: ProviderKind::Claude,
+        expected_session_name: session.clone(),
+        expected_rollout_path: expected_rollout_path_for(&session),
+    };
+    let sink: Arc<dyn RelaySink> = Arc::new(SessionBoundDiscordRelaySink::new(Arc::new(
+        HealthRegistry::new(),
+    )));
+    let handle = spawn_stream_relay(binding, sink);
+    let producer = handle.producer();
+    let sent = producer.try_send_terminal_frame_with_sequence(
+        PURE_SUBAGENT_ZERO_DELIVERY_PAYLOAD.to_string(),
+        TerminalCommitFence {
+            consumed_end: 256,
+            turn_user_msg_id: 49_090,
+            turn_started_at: "2026-07-27T00:00:00Z".to_string(),
+            turn_start_offset: Some(64),
+        },
+    );
+    let sequence = sent.sequence.expect("terminal frame enqueued");
+    let metrics = producer.metrics().clone();
+    let target = SessionBoundRelayAckTarget {
+        metrics: metrics.clone(),
+        sequence,
+        turn_start_offset: Some(64),
+    };
+
+    let ack = wait_for_session_bound_relay_delivery_ack(
+        Some(&target),
+        std::time::Duration::from_millis(250),
+    )
+    .await;
+
+    assert_eq!(
+        ack,
+        SessionBoundRelayAckOutcome::NotDelivered,
+        "the real parser and sink must resolve the exact ACK instead of timing out"
+    );
+    assert_ne!(ack, SessionBoundRelayAckOutcome::TimedOut);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.last_terminal_skipped_sequence, Some(sequence));
+    assert_eq!(snapshot.last_terminal_committed_sequence, None);
+    assert_eq!(snapshot.last_sink_error_sequence, None);
+    handle.shutdown().await;
+}
+
 /// #3579: the `NotAttempted` vs `MissingTarget` sentinel split. `NotAttempted`
 /// is the watcher-owned NON-attempt (the ack-wait block was skipped); it must
 /// stay DISTINCT from the genuine `MissingTarget` failure (the ack-wait ran but
@@ -193,6 +256,199 @@ mod not_attempted_sentinel {
             SessionBoundRelayAckOutcome::MissingTarget,
             "a ran-but-no-target ack-wait is a real failure, not the benign non-attempt"
         );
+    }
+}
+
+mod confirmed_fresh_delivery {
+    use super::super::{
+        SessionBoundRelayAckOutcome, SessionBoundRelayAckTarget,
+        session_bound_ack_confirms_transport, session_bound_ack_delivery_outcome,
+        session_bound_ack_outcome_after_resolve_time_mirror_check,
+        session_bound_relay_ack_snapshot_outcome,
+        watcher_should_direct_send_after_session_bound_ack,
+    };
+    use crate::services::cluster::stream_relay::{DeliveryOutcome, RelayMetrics};
+    use std::sync::Arc;
+
+    fn target(metrics: Arc<RelayMetrics>, sequence: u64) -> SessionBoundRelayAckTarget {
+        SessionBoundRelayAckTarget {
+            metrics,
+            sequence,
+            turn_start_offset: Some(100),
+        }
+    }
+
+    #[test]
+    fn delivered_and_fresh_delivered_both_own_terminal_delivery() {
+        assert!(session_bound_ack_confirms_transport(
+            SessionBoundRelayAckOutcome::Delivered
+        ));
+        assert!(session_bound_ack_confirms_transport(
+            SessionBoundRelayAckOutcome::FreshDelivered {
+                committed_to: None,
+                persistence_recorded: false,
+            }
+        ));
+        assert!(!session_bound_ack_confirms_transport(
+            SessionBoundRelayAckOutcome::NotDelivered
+        ));
+    }
+
+    #[test]
+    fn resolve_time_span_drop_preserves_confirmed_fresh_transport() {
+        let metrics = Arc::new(RelayMetrics::default());
+        metrics.record_dropped_sequence_for_test(10);
+        let target = target(metrics, 12);
+        let mut turn_fully_mirrored = true;
+        let ack = SessionBoundRelayAckOutcome::FreshDelivered {
+            committed_to: None,
+            persistence_recorded: false,
+        };
+
+        let resolved = session_bound_ack_outcome_after_resolve_time_mirror_check(
+            ack,
+            &mut turn_fully_mirrored,
+            Some(&target),
+            Some(9),
+        );
+
+        assert_eq!(resolved, ack);
+        assert!(
+            !turn_fully_mirrored,
+            "the span drop still degrades mirror completeness"
+        );
+        assert!(session_bound_ack_confirms_transport(resolved));
+        assert!(
+            !watcher_should_direct_send_after_session_bound_ack(true, resolved, true),
+            "a span drop cannot revoke confirmed fresh transport and authorize a duplicate POST"
+        );
+    }
+
+    #[test]
+    fn exact_fresh_resolution_suppresses_same_process_fallback_for_all_metadata_shapes() {
+        for (sequence, committed_to, persistence_recorded) in [
+            (41, Some(200), true),
+            (42, Some(200), false),
+            (43, None, true),
+            (44, None, false),
+        ] {
+            let metrics = Arc::new(RelayMetrics::default());
+            metrics.record_terminal_outcome(
+                sequence,
+                DeliveryOutcome::FreshDelivered {
+                    committed_to,
+                    persistence_recorded,
+                },
+            );
+            let ack = session_bound_relay_ack_snapshot_outcome(Some(&target(metrics, sequence)))
+                .expect("fresh resolution must resolve its exact ACK");
+            assert_eq!(
+                ack,
+                SessionBoundRelayAckOutcome::FreshDelivered {
+                    committed_to,
+                    persistence_recorded,
+                }
+            );
+            assert!(
+                !watcher_should_direct_send_after_session_bound_ack(true, ack, true),
+                "confirmed fresh transport must suppress SendFull even without a frontier or persistence record"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_resolution_is_exact_sequence_and_does_not_suppress_neighbors() {
+        let metrics = Arc::new(RelayMetrics::default());
+        metrics.record_terminal_outcome(
+            50,
+            DeliveryOutcome::FreshDelivered {
+                committed_to: None,
+                persistence_recorded: false,
+            },
+        );
+        metrics.record_terminal_outcome(51, DeliveryOutcome::NotDelivered);
+
+        assert!(matches!(
+            session_bound_relay_ack_snapshot_outcome(Some(&target(metrics.clone(), 50))),
+            Some(SessionBoundRelayAckOutcome::FreshDelivered { .. })
+        ));
+        let neighbor = session_bound_relay_ack_snapshot_outcome(Some(&target(metrics, 51)))
+            .expect("neighbor resolution");
+        assert_eq!(neighbor, SessionBoundRelayAckOutcome::NotDelivered);
+        assert!(watcher_should_direct_send_after_session_bound_ack(
+            true, neighbor, true
+        ));
+    }
+
+    #[test]
+    fn actual_failures_keep_existing_reconciliation_intent() {
+        for ack in [
+            SessionBoundRelayAckOutcome::NotDelivered,
+            SessionBoundRelayAckOutcome::RingUnknown,
+            SessionBoundRelayAckOutcome::Dropped,
+            SessionBoundRelayAckOutcome::SinkError,
+            SessionBoundRelayAckOutcome::TimedOut,
+            SessionBoundRelayAckOutcome::MissingTarget,
+        ] {
+            assert!(
+                watcher_should_direct_send_after_session_bound_ack(true, ack, true),
+                "{ack:?} must retain the existing SendFull-or-Skip reconciliation path"
+            );
+        }
+        assert_eq!(
+            session_bound_ack_delivery_outcome(SessionBoundRelayAckOutcome::SinkError),
+            DeliveryOutcome::Unknown,
+            "a Permanent sink error remains an unconfirmed sink error, never fresh confirmation"
+        );
+    }
+}
+
+mod soft_terminal_authority {
+    use super::super::watcher_direct_fallback_has_turn_authority;
+    use crate::services::discord::tmux::WatcherTerminalKind;
+
+    #[test]
+    fn ownerless_soft_stop_without_external_boundary_cannot_post() {
+        assert!(!watcher_direct_fallback_has_turn_authority(
+            Some(WatcherTerminalKind::SoftStopHookSummary),
+            false,
+        ));
+        assert!(!watcher_direct_fallback_has_turn_authority(
+            Some(WatcherTerminalKind::SoftUserBoundary),
+            false,
+        ));
+    }
+
+    #[test]
+    fn soft_stop_requires_pre_frame_turn_authority() {
+        assert!(watcher_direct_fallback_has_turn_authority(
+            Some(WatcherTerminalKind::SoftStopHookSummary),
+            true,
+        ));
+    }
+
+    #[test]
+    fn ownerless_hard_result_keeps_recovery_fallback() {
+        assert!(watcher_direct_fallback_has_turn_authority(
+            Some(WatcherTerminalKind::HardResult),
+            false,
+        ));
+        assert!(watcher_direct_fallback_has_turn_authority(None, false));
+    }
+
+    #[test]
+    fn unauthorized_soft_terminal_drains_before_terminal_tail() {
+        let source = include_str!("../tmux_watcher.rs");
+        let branch_start = source
+            .rfind("if watcher_direct_fallback_requested && !watcher_direct_fallback_authorized")
+            .expect("unauthorized soft-terminal drain branch");
+        let tail_start = source[branch_start..]
+            .find("let relay_suppressed")
+            .map(|offset| branch_start + offset)
+            .expect("terminal finalization tail");
+        let branch = &source[branch_start..tail_start];
+        assert!(branch.contains("slot_guard.release()"));
+        assert!(branch.contains("continue 'watcher_loop"));
     }
 }
 

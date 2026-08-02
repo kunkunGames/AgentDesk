@@ -57,15 +57,25 @@ fn intake_dispatch_invariant_direct_execution_body_has_no_external_producer_call
 
 #[test]
 fn intake_dispatch_invariant_worker_post_claim_is_the_only_router_bypass() {
-    let worker_boundary = include_str!("../message_handler/intake_turn.rs");
-    assert!(!worker_boundary.contains("dispatch_text_intake("));
-    assert!(!worker_boundary.contains("admit_text_intake("));
-    assert!(!worker_boundary.contains("try_route_intake("));
-    assert!(!worker_boundary.contains("IntakeSubmission {"));
+    // The worker boundary spans the intake body module plus its extracted
+    // worker entry seam (intake_turn/worker_entry.rs, split out in #4743).
+    let worker_body = include_str!("../message_handler/intake_turn.rs");
+    let worker_entry = include_str!("../message_handler/intake_turn/worker_entry.rs");
+    for source in [worker_body, worker_entry] {
+        assert!(!source.contains("dispatch_text_intake("));
+        assert!(!source.contains("admit_text_intake("));
+        assert!(!source.contains("try_route_intake("));
+        assert!(!source.contains("IntakeSubmission {"));
+    }
     assert_eq!(
-        worker_boundary.matches("handle_text_message(").count(),
-        2,
-        "the worker boundary must contain only its direct call plus the body definition"
+        worker_body.matches("handle_text_message(").count(),
+        1,
+        "the worker body module must contain only the body definition"
+    );
+    assert_eq!(
+        worker_entry.matches("handle_text_message(").count(),
+        1,
+        "the extracted worker entry must contain only its direct post-claim call"
     );
     assert_eq!(
         include_str!("../message_handler.rs")
@@ -77,18 +87,33 @@ fn intake_dispatch_invariant_worker_post_claim_is_the_only_router_bypass() {
 }
 
 #[test]
-fn intake_dispatch_invariant_queued_entrypoints_admit_before_teardown() {
-    for (name, source) in [
-        ("gateway", include_str!("../../gateway.rs")),
-        ("discord_mod", include_str!("../../mod.rs")),
+fn intake_dispatch_invariant_queued_entrypoints_promote_markers_after_admission_before_finish() {
+    for (name, source, promotion) in [
+        (
+            "gateway",
+            include_str!("../../gateway.rs"),
+            "drain_dispatched_queue_markers(",
+        ),
+        (
+            "discord_mod",
+            include_str!("../../mod.rs"),
+            "start_and_drain_kickoff_markers(",
+        ),
     ] {
         let admit = source
             .find("admit_queued_intake(")
             .unwrap_or_else(|| panic!("{name} queue path lost central admission"));
+        let promote = source
+            .find(promotion)
+            .unwrap_or_else(|| panic!("{name} queue path lost marker promotion"));
         let finish = source
             .find("finish_admitted_queued_intake(")
             .unwrap_or_else(|| panic!("{name} queue path lost admitted local finish"));
-        assert!(admit < finish, "{name} executes before admission");
+        assert!(
+            admit < promote && promote < finish,
+            "{name} must promote persisted queue markers only after admission and before finish"
+        );
+        assert_eq!(source.matches(promotion).count(), 1);
         assert_eq!(source.matches("finish_admitted_queued_intake(").count(), 1);
     }
 }
@@ -100,10 +125,12 @@ use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
 
 use super::{
-    IntakeOrigin, IntakeSubmission, QueuedAdmissionDisposition, dispatch_skill_intake,
-    dispatch_text_intake,
+    IntakeAdmission, IntakeOrigin, IntakeSubmission, QueuedAdmissionDisposition,
+    admission_for_decision, dispatch_skill_intake, dispatch_text_intake,
 };
 use crate::db::auto_queue::test_support::TestPostgresDb;
+use crate::services::cluster::intake_router_hook::{IntakeRouterDecision, ResolvedSessionOwner};
+use crate::services::cluster::intake_routing_config::OwnerAuthorityChannelOptIn;
 use crate::services::discord::router::message_handler::{IntakeDeps, IntakeRequest};
 use crate::services::discord::router::{TurnKind, admit_queued_intake};
 use crate::services::provider::ProviderKind;
@@ -172,7 +199,13 @@ async fn seed_foreign_owner(pool: &sqlx::PgPool, channel_id: ChannelId, owner_in
         "INSERT INTO worker_nodes (instance_id, status, role, effective_role,
          labels, capabilities, last_heartbeat_at, started_at, updated_at)
          VALUES ($1, 'online', 'worker', 'worker', '[]'::jsonb,
-         '{\"intake_worker\":{\"enabled\":true,\"providers\":[\"claude\"]}}'::jsonb,
+         -- A real foreign worker always advertises \"preserve_on_cancel_v1\" via
+         -- capabilities_with_runtime_state() (intake_worker_capabilities.rs). Without
+         -- it, node_supports_intake_request() treats the node as protocol-incompatible
+         -- for preserve_on_cancel=true requests, and resolve_session_owner() classifies
+         -- it as LiveForeignIncompatible instead of LiveForeign, blocking the forward
+         -- entirely (#4550 multinode preserve tri-state).
+         '{\"intake_worker\":{\"enabled\":true,\"providers\":[\"claude\"],\"features\":[\"preserve_on_cancel_v1\"]}}'::jsonb,
          NOW(), NOW(), NOW())",
     )
     .bind(owner_instance_id)
@@ -197,6 +230,7 @@ fn request(channel_id: ChannelId, message_id: u64, text: &str) -> IntakeRequest 
     IntakeRequest {
         channel_id,
         user_msg_id: MessageId::new(message_id),
+        busy_followup_retry_user_msg_id: MessageId::new(message_id),
         request_owner: UserId::new(4350),
         request_owner_name: "owner-affinity-test".to_string(),
         user_text: text.to_string(),
@@ -208,17 +242,29 @@ fn request(channel_id: ChannelId, message_id: u64, text: &str) -> IntakeRequest 
         has_reply_boundary: false,
         dm_hint: Some(false),
         turn_kind: TurnKind::Foreground,
+        preserve_on_cancel: false,
     }
 }
 
 fn queued_intervention(message_id: u64, pending_uploads: Vec<String>) -> Intervention {
+    let queued_generation = crate::services::discord::runtime_store::process_generation();
     Intervention {
         author_id: UserId::new(4350),
         author_is_bot: false,
         message_id: MessageId::new(message_id),
-        queued_generation: crate::services::discord::runtime_store::load_generation(),
+        queued_generation,
         source_message_ids: vec![MessageId::new(message_id)],
-        source_message_queued_generations: Vec::new(),
+        // A genuine human-authored queued message always carries a
+        // `user_instruction` source marker from the enqueue path (see
+        // intake_gate/queue_effects.rs), so `preserve_on_cancel()` is true.
+        // Mirror that here instead of an empty vec so the forwarded outbox
+        // row records `Some(true)` for the multinode preserve tri-state (#4550).
+        source_message_queued_generations: vec![
+            crate::services::turn_orchestrator::SourceMessageQueuedGeneration::user_instruction(
+                MessageId::new(message_id),
+                queued_generation,
+            ),
+        ],
         source_text_segments: Vec::new(),
         text: format!("queued-{message_id}"),
         mode: InterventionMode::Soft,
@@ -229,6 +275,138 @@ fn queued_intervention(message_id: u64, pending_uploads: Vec<String>) -> Interve
         pending_uploads,
         voice_announcement: None,
     }
+}
+
+fn submission_for_admission(channel_id: ChannelId, message_id: u64) -> IntakeSubmission {
+    IntakeSubmission {
+        provider: ProviderKind::Claude,
+        request: request(channel_id, message_id, "admission policy"),
+        origin: IntakeOrigin::LiveMessage,
+        preserve_on_cancel: false,
+        has_nonportable_uploads: false,
+        attachments: Vec::new(),
+        preloaded_uploads: Vec::new(),
+        voice_announcement: None,
+    }
+}
+
+#[test]
+fn telemetry_only_unopted_live_local_pending_open_route_runs_locally_5040() {
+    let submission = submission_for_admission(ChannelId::new(4_350_351), 4_350_361);
+    let admission = admission_for_decision(
+        OwnerAuthorityChannelOptIn::NotOptedIn,
+        12,
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id: "mac-mini-release".to_string(),
+            open_route_id: None,
+            open_route_status: "pending".to_string(),
+            open_route_age_secs: Some(60),
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+        },
+        &submission,
+    );
+
+    assert!(
+        matches!(admission, IntakeAdmission::Local(_)),
+        "an explicitly unlisted local pending route may use the stale-route recovery exception"
+    );
+}
+
+#[test]
+fn telemetry_only_unopted_live_local_fresh_pending_route_stays_fenced_5040() {
+    let submission = submission_for_admission(ChannelId::new(4_350_365), 4_350_375);
+    let admission = admission_for_decision(
+        OwnerAuthorityChannelOptIn::NotOptedIn,
+        12,
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id: "mac-mini-release".to_string(),
+            open_route_id: None,
+            open_route_status: "pending".to_string(),
+            open_route_age_secs: Some(1),
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+        },
+        &submission,
+    );
+
+    assert!(matches!(
+        admission,
+        IntakeAdmission::DeferredOpenRoute { .. }
+    ));
+}
+
+#[test]
+fn telemetry_only_unopted_live_foreign_owner_stays_fenced_5040() {
+    let submission = submission_for_admission(ChannelId::new(4_350_371), 4_350_381);
+    let admission = admission_for_decision(
+        OwnerAuthorityChannelOptIn::NotOptedIn,
+        12,
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id: "foreign-instance".to_string(),
+            open_route_id: None,
+            open_route_status: "pending".to_string(),
+            open_route_age_secs: Some(60),
+            resolved_owner: ResolvedSessionOwner::LiveForeign,
+        },
+        &submission,
+    );
+
+    assert!(
+        matches!(
+            admission,
+            IntakeAdmission::DeferredOpenRoute {
+                ref target_instance_id,
+            } if target_instance_id == "foreign-instance"
+        ),
+        "a live foreign owner must retain the open-route fence"
+    );
+}
+
+#[test]
+fn telemetry_only_unopted_unknown_owner_authority_keeps_local_fence_5040() {
+    let submission = submission_for_admission(ChannelId::new(4_350_391), 4_350_401);
+    let admission = admission_for_decision(
+        OwnerAuthorityChannelOptIn::Unknown,
+        12,
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id: "local-instance".to_string(),
+            open_route_id: None,
+            open_route_status: "pending".to_string(),
+            open_route_age_secs: Some(60),
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+        },
+        &submission,
+    );
+
+    assert!(matches!(
+        admission,
+        IntakeAdmission::DeferredOpenRoute {
+            ref target_instance_id,
+        } if target_instance_id == "local-instance"
+    ));
+}
+
+#[test]
+fn telemetry_only_unopted_local_accepted_route_stays_fenced_5040() {
+    let submission = submission_for_admission(ChannelId::new(4_350_411), 4_350_421);
+    let admission = admission_for_decision(
+        OwnerAuthorityChannelOptIn::NotOptedIn,
+        12,
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id: "local-instance".to_string(),
+            open_route_id: None,
+            open_route_status: "accepted".to_string(),
+            open_route_age_secs: Some(60),
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+        },
+        &submission,
+    );
+
+    assert!(matches!(
+        admission,
+        IntakeAdmission::DeferredOpenRoute {
+            ref target_instance_id,
+        } if target_instance_id == "local-instance"
+    ));
 }
 
 fn deps<'a>(
@@ -267,6 +445,7 @@ async fn intake_dispatch_invariant_enforce_without_postgres_blocks_owner_unknown
         origin: IntakeOrigin::LiveMessage,
         preserve_on_cancel: false,
         has_nonportable_uploads: false,
+        attachments: Vec::new(),
         preloaded_uploads: Vec::new(),
         voice_announcement: None,
     };
@@ -299,8 +478,9 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
             provider: ProviderKind::Claude,
             request: request(channel_id, 4_350_111, "plain live intake"),
             origin: IntakeOrigin::LiveMessage,
-            preserve_on_cancel: false,
+            preserve_on_cancel: true,
             has_nonportable_uploads: false,
+            attachments: Vec::new(),
             preloaded_uploads: Vec::new(),
             voice_announcement: None,
         },
@@ -319,6 +499,7 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
         "/unknown-skill".to_string(),
         IntakeOrigin::SlashSkill,
         Vec::new(),
+        None,
     )
     .await
     .expect("slash skill forwards");
@@ -334,12 +515,13 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
         "Execute /registered-skill".to_string(),
         IntakeOrigin::TextSkill,
         Vec::new(),
+        None,
     )
     .await
     .expect("text skill forwards");
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT target_instance_id, provider FROM intake_outbox
+    let rows: Vec<(String, String, Option<bool>)> = sqlx::query_as(
+        "SELECT target_instance_id, provider, preserve_on_cancel FROM intake_outbox
          WHERE channel_id = $1 ORDER BY id",
     )
     .bind(channel_id.get().to_string())
@@ -349,14 +531,65 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
     assert_eq!(
         rows,
         vec![
-            (owner.to_string(), "claude".to_string()),
-            (owner.to_string(), "claude".to_string()),
-            (owner.to_string(), "claude".to_string()),
+            (owner.to_string(), "claude".to_string(), Some(true)),
+            (owner.to_string(), "claude".to_string(), Some(false)),
+            (owner.to_string(), "claude".to_string(), Some(false)),
         ]
     );
     assert!(
         shared.core.lock().await.sessions.is_empty(),
         "foreign admission must not create a local session"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn raw_attachment_foreign_owner_blocks_before_outbox_or_local_state_pg() {
+    let _env = ScopedIntakeTestEnv::enforce();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let channel_id = ChannelId::new(4_350_151);
+    seed_foreign_owner(&pool, channel_id, "worker-owner-4350-raw-attachment").await;
+
+    let shared =
+        crate::services::discord::make_shared_data_for_tests_with_storage(Some(pool.clone()));
+    let http = Arc::new(serenity::Http::new("Bot intake-dispatch-test"));
+    let deps = deps(&http, &shared);
+    let submission = IntakeSubmission {
+        provider: ProviderKind::Claude,
+        request: request(channel_id, 4_350_161, "inspect the attachment"),
+        origin: IntakeOrigin::LiveMessage,
+        preserve_on_cancel: false,
+        has_nonportable_uploads: false,
+        attachments: vec![super::super::message_handler::AttachmentDescriptor {
+            filename: "report.txt".to_string(),
+            url: "https://cdn.discordapp.com/attachments/1/2/report.txt".to_string(),
+        }],
+        preloaded_uploads: Vec::new(),
+        voice_announcement: None,
+    };
+
+    assert!(matches!(
+        super::admit_text_intake(&deps, &submission).await,
+        super::IntakeAdmission::Blocked {
+            reason: crate::services::cluster::intake_router_hook::IntakeBlockedReason::NonPortableAttachmentForeignOwner { .. }
+        }
+    ));
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
+            .bind(channel_id.get().to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("count raw attachment routes");
+    assert_eq!(
+        outbox_count, 0,
+        "raw attachments never enter a foreign outbox"
+    );
+    assert!(
+        shared.core.lock().await.sessions.is_empty(),
+        "blocked raw attachment admission must not create local session state"
     );
 
     pool.close().await;
@@ -387,24 +620,30 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
         false,
         false,
         "owner_affinity_queue_test",
+        None,
     )
     .await
     {
         QueuedAdmissionDisposition::Admitted(admitted) => admitted,
-        QueuedAdmissionDisposition::Deferred => panic!("live foreign owner should forward"),
+        QueuedAdmissionDisposition::Deferred
+        | QueuedAdmissionDisposition::RejectedNonPortableAttachment
+        | QueuedAdmissionDisposition::RejectedRestore => {
+            panic!("live foreign owner should forward")
+        }
     };
     super::finish_admitted_queued_intake(&deps, admitted, &intervention)
         .await
         .expect("forwarded queued finish is a no-op");
 
-    let row: (String, String) = sqlx::query_as(
-        "SELECT target_instance_id, provider FROM intake_outbox WHERE channel_id = $1",
+    let row: (String, String, Option<bool>) = sqlx::query_as(
+        "SELECT target_instance_id, provider, preserve_on_cancel
+         FROM intake_outbox WHERE channel_id = $1",
     )
     .bind(channel_id.get().to_string())
     .fetch_one(&pool)
     .await
     .expect("forwarded queue row");
-    assert_eq!(row, (owner.to_string(), "claude".to_string()));
+    assert_eq!(row, (owner.to_string(), "claude".to_string(), Some(true)));
     assert!(shared.core.lock().await.sessions.is_empty());
     assert!(
         shared
@@ -421,7 +660,7 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
+async fn queued_foreign_attachment_is_rejected_without_requeue_pg() {
     let _env = ScopedIntakeTestEnv::enforce();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -446,20 +685,16 @@ async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
             false,
             false,
             "owner_affinity_attachment_test",
+            None,
         )
         .await,
-        QueuedAdmissionDisposition::Deferred
+        QueuedAdmissionDisposition::RejectedNonPortableAttachment
     ));
 
     let snapshot = shared.mailbox(channel_id).snapshot().await;
-    assert_eq!(snapshot.intervention_queue.len(), 1);
-    assert_eq!(
-        snapshot.intervention_queue[0].message_id,
-        intervention.message_id
-    );
-    assert_eq!(
-        snapshot.intervention_queue[0].pending_uploads,
-        vec![local_path]
+    assert!(
+        snapshot.intervention_queue.is_empty(),
+        "a nonportable queued attachment must be consumed, not requeued forever"
     );
     assert!(
         shared.core.lock().await.sessions.is_empty(),
@@ -477,8 +712,8 @@ async fn queued_foreign_attachment_requeues_and_arms_slow_backstop_pg() {
             .restart
             .deferred_hook_backlog
             .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "blocked queued intake arms exactly one slow lost-wakeup backstop"
+        0,
+        "a rejected attachment must not arm a retry backstop"
     );
 
     pool.close().await;
@@ -506,6 +741,7 @@ async fn distinct_open_route_requeues_queued_successor_pg() {
             origin: IntakeOrigin::LiveMessage,
             preserve_on_cancel: false,
             has_nonportable_uploads: false,
+            attachments: Vec::new(),
             preloaded_uploads: Vec::new(),
             voice_announcement: None,
         },
@@ -514,17 +750,31 @@ async fn distinct_open_route_requeues_queued_successor_pg() {
     .expect("predecessor forwards");
 
     let successor = queued_intervention(4_350_412, Vec::new());
+    let persistence = crate::services::discord::queue_persistence_context(
+        &shared,
+        &ProviderKind::Claude,
+        channel_id,
+    );
+    shared
+        .mailbox(channel_id)
+        .replace_queue(vec![successor.clone()], persistence.clone())
+        .await;
+    let dequeued = shared.mailbox(channel_id).take_next_soft(persistence).await;
+    let intervention = dequeued
+        .intervention
+        .expect("queued successor must be dequeued before admission");
     assert!(matches!(
         admit_queued_intake(
             &deps,
             ProviderKind::Claude,
             channel_id,
-            &successor,
-            successor.author_id,
+            &intervention,
+            intervention.author_id,
             "successor-owner".to_string(),
             false,
             false,
             "owner_affinity_open_route_test",
+            dequeued.dispatch_lease,
         )
         .await,
         QueuedAdmissionDisposition::Deferred

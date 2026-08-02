@@ -148,6 +148,7 @@ pub(super) fn record_provider_overload_retry(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn schedule_provider_overload_retry(
     shared: Arc<SharedData>,
     http: Arc<serenity::Http>,
@@ -293,6 +294,9 @@ mod completion_release_tests {
             _intervention: &'a Intervention,
             _request_owner_name: &'a str,
             _has_more_queued_turns: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async { Ok(()) })
         }

@@ -1,6 +1,7 @@
 use poise::serenity_prelude::ChannelId;
 use serde::Serialize;
 
+use super::liveness_authority::CaptureCoordinateObservation;
 use super::mailbox::MailboxHealthSnapshot;
 use super::provider_probe::{self, ProviderHealthSnapshot};
 use super::redaction;
@@ -46,6 +47,8 @@ pub struct WatcherStateSnapshot {
     /// Current tmux output JSONL length when an inflight `output_path` is known.
     /// `null` means the endpoint could not identify a capture file.
     pub last_capture_offset: Option<u64>,
+    #[serde(skip)]
+    pub(in crate::services::discord) capture_coordinate: CaptureCoordinateObservation,
     /// Bytes present in the capture file but not yet confirmed as relayed.
     /// `null` when `last_capture_offset` is unknown.
     pub unread_bytes: Option<u64>,
@@ -88,6 +91,10 @@ pub struct WatcherStateSnapshot {
     /// mailbox is idle (no active turn).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mailbox_active_user_msg_id: Option<u64>,
+    /// Internal episode identity captured with the active message ID. It is
+    /// intentionally excluded from operator JSON and only authorizes repair.
+    #[serde(skip)]
+    pub(in crate::services::discord) mailbox_active_turn_nonce: Option<String>,
     /// #4408 phase-2 (I1): the transcript path the dcserver actually binds its
     /// relay tail to. Resolved with per-field precedence — a live inflight row's
     /// persisted `output_path` wins; otherwise the in-memory tmux runtime
@@ -361,6 +368,7 @@ struct RelayHealthBuildInput {
     channel_id: u64,
     mailbox_has_cancel_token: bool,
     mailbox_active_user_msg_id: Option<u64>,
+    mailbox_turn_started_at_ms: Option<i64>,
     queue_depth: usize,
     watcher_attached: bool,
     watcher_attached_stale: bool,
@@ -380,6 +388,15 @@ struct RelayHealthBuildInput {
     last_outbound_activity_ms: Option<i64>,
 }
 
+fn authoritative_tmux_session(
+    enriched_session: Option<&str>,
+    mailbox_cancel_session: Option<&str>,
+) -> Option<String> {
+    enriched_session
+        .or(mailbox_cancel_session)
+        .map(str::to_string)
+}
+
 fn build_relay_health_snapshot(input: RelayHealthBuildInput) -> RelayHealthSnapshot {
     RelayHealthSnapshot {
         provider: input.provider,
@@ -395,6 +412,7 @@ fn build_relay_health_snapshot(input: RelayHealthBuildInput) -> RelayHealthSnaps
         bridge_current_msg_id: input.bridge_current_msg_id,
         mailbox_has_cancel_token: input.mailbox_has_cancel_token,
         mailbox_active_user_msg_id: input.mailbox_active_user_msg_id,
+        mailbox_turn_started_at_ms: input.mailbox_turn_started_at_ms,
         queue_depth: input.queue_depth,
         pending_discord_callback_msg_id: input
             .bridge_current_msg_id
@@ -533,17 +551,19 @@ async fn watcher_state_snapshot_for_shared(
     let has_pending_queue = !mailbox_snapshot.intervention_queue.is_empty();
     let mailbox_engaged =
         mailbox_has_cancel_token || mailbox_active_user_msg_id.is_some() || has_pending_queue;
-    let mailbox_cancel_tmux_session = mailbox_snapshot.cancel_token.as_ref().and_then(|token| {
-        token
-            .tmux_session
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-    });
-    let tmux_session_for_liveness_probe = session
-        .tmux_session
-        .as_deref()
-        .or(mailbox_cancel_tmux_session.as_deref());
+    let mailbox_cancel_tmux_session = mailbox_snapshot
+        .cancel_token
+        .as_ref()
+        .and_then(|token| token.tmux_session_name());
+    // Use one authority for both the probe target and the published identity.
+    // The cancel token is the earliest turn-owned tmux proof and can exist
+    // before inflight/watcher enrichment. Keeping only the probe fallback would
+    // publish `tmux_alive=None` with `tmux_session=None` on a transient probe
+    // error, allowing aged orphan cleanup to bypass AgentDesk-name protection.
+    let authoritative_tmux_session = authoritative_tmux_session(
+        session.tmux_session.as_deref(),
+        mailbox_cancel_tmux_session.as_deref(),
+    );
     let has_thread_proof = shared.dispatch.thread_parents.contains_key(&channel)
         || shared
             .dispatch
@@ -560,7 +580,7 @@ async fn watcher_state_snapshot_for_shared(
     }
 
     let tmux_session_alive =
-        SessionEnrichment::probe_tmux_session_alive(tmux_session_for_liveness_probe).await;
+        SessionEnrichment::probe_tmux_session_alive(authoritative_tmux_session.as_deref()).await;
     let desynced = session.desynced(tmux_session_alive == Some(true), session.attached);
     let active_turn =
         relay_active_turn_from_inflight(mailbox_has_cancel_token, session.inflight.as_ref());
@@ -576,11 +596,14 @@ async fn watcher_state_snapshot_for_shared(
         channel_id: channel.get(),
         mailbox_has_cancel_token,
         mailbox_active_user_msg_id,
+        mailbox_turn_started_at_ms: mailbox_snapshot
+            .turn_started_at
+            .map(|started_at| started_at.timestamp_millis()),
         queue_depth: mailbox_snapshot.intervention_queue.len(),
         watcher_attached: session.attached,
         watcher_attached_stale: session.watcher_attached_stale,
         watcher_owner_channel_id: session.watcher_owner_channel_id,
-        tmux_session: session.tmux_session.clone(),
+        tmux_session: authoritative_tmux_session.clone(),
         tmux_alive: tmux_session_alive,
         bridge_inflight_present: session.inflight_state_present,
         bridge_current_msg_id: session.inflight_current_msg_id(),
@@ -603,8 +626,7 @@ async fn watcher_state_snapshot_for_shared(
     // runtime binding is a sync single-shot lookup (its Mutex guard is released
     // inside the call and never held across the awaits above/below), so this adds
     // no `await_holding_lock` allow.
-    let tmux_runtime_binding = session
-        .tmux_session
+    let tmux_runtime_binding = authoritative_tmux_session
         .as_deref()
         .and_then(crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session);
     let (bound_output_path, bound_session_id) = resolve_bound_selector(
@@ -621,12 +643,13 @@ async fn watcher_state_snapshot_for_shared(
     Some(WatcherStateSnapshot {
         provider: provider_name.to_string(),
         attached: session.attached,
-        tmux_session: session.tmux_session.clone(),
+        tmux_session: authoritative_tmux_session,
         watcher_owner_channel_id: session.watcher_owner_channel_id,
         last_relay_offset: session.last_relay_offset,
         inflight_state_present: session.inflight_state_present,
         last_relay_ts_ms: session.last_relay_ts_ms,
         last_capture_offset: session.last_capture_offset,
+        capture_coordinate: session.capture_coordinate.clone(),
         unread_bytes: session.unread_bytes,
         desynced,
         reconnect_count: session.reconnect_count,
@@ -637,6 +660,7 @@ async fn watcher_state_snapshot_for_shared(
         tmux_session_alive,
         has_pending_queue,
         mailbox_active_user_msg_id,
+        mailbox_active_turn_nonce: mailbox_snapshot.active_turn_nonce.clone(),
         bound_output_path,
         bound_session_id,
         inflight_terminal_delivery_committed: session.inflight_terminal_delivery_committed(),
@@ -754,6 +778,9 @@ async fn build_health_snapshot_with_options(
                     channel_id: channel.get(),
                     mailbox_has_cancel_token,
                     mailbox_active_user_msg_id,
+                    mailbox_turn_started_at_ms: snapshot
+                        .turn_started_at
+                        .map(|started_at| started_at.timestamp_millis()),
                     queue_depth,
                     watcher_attached: session.watcher_attached,
                     watcher_attached_stale: session.watcher_attached_stale,
@@ -978,8 +1005,8 @@ mod tests {
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
     use super::{
-        HealthRegistry, build_health_snapshot, rebind_origin_inflight_is_idle,
-        relay_active_turn_from_inflight, resolve_bound_selector,
+        HealthRegistry, authoritative_tmux_session, build_health_snapshot,
+        rebind_origin_inflight_is_idle, relay_active_turn_from_inflight, resolve_bound_selector,
     };
     use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::discord::inflight::InflightTurnState;
@@ -1151,6 +1178,18 @@ mod tests {
         );
         // A whitespace-only session id is treated as absent, not an empty bind.
         assert!(emitted.get("bound_session_id").is_none());
+    }
+
+    #[test]
+    fn enriched_tmux_identity_precedes_mailbox_fallback() {
+        assert_eq!(
+            authoritative_tmux_session(Some("inflight-owner"), Some("token-fallback")),
+            Some("inflight-owner".to_string())
+        );
+        assert_eq!(
+            authoritative_tmux_session(None, Some("token-fallback")),
+            Some("token-fallback".to_string())
+        );
     }
 
     #[tokio::test]

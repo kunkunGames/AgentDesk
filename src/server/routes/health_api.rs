@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 
 use crate::db::session_status::is_active_status;
+use crate::error::{AppError, ErrorCode};
 use crate::services::discord::{health, outbound};
 use crate::services::provider::ProviderKind;
 use crate::services::{disk_monitor, health_diagnostics};
@@ -17,6 +18,17 @@ use crate::services::{disk_monitor, health_diagnostics};
 use super::AppState;
 
 const X_AGENTDESK_SOURCE: &str = "x-agentdesk-source";
+
+/// Preserve the long-standing health-control API envelope while centralizing
+/// status, category, and message construction in `AppError`.
+fn legacy_health_error(error: AppError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = error.status();
+    let mut body = serde_json::json!({"ok": false, "error": error.message()});
+    body.as_object_mut()
+        .expect("health error envelope is an object")
+        .extend(error.context().clone());
+    (status, Json(body))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AckDispatchOutboxFailuresRequest {
@@ -216,7 +228,9 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         // — otherwise standby would mask the worsen signal it just unmasked.
         let cluster_standby_without_gateway =
             cluster_standby_without_gateway(state, server_up, &degraded_reasons).await;
-        if cluster_standby_without_gateway {
+        let all_registered_providers_standby = registry.all_providers_are_standby().await;
+        let cluster_standby = cluster_standby_without_gateway || all_registered_providers_standby;
+        if cluster_standby {
             degraded_reasons.retain(|reason| reason.as_str() != Some("no_providers_registered"));
             json["cluster_standby"] = serde_json::json!(true);
         }
@@ -261,6 +275,18 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             degraded_reasons.push(reason);
         }
 
+        // #4515 PR2: worker-local recovery circuit. Budget exhaustion of a
+        // necessary worker (dispatch_outbox / session_discovery) worsens to
+        // Unhealthy → readiness 503; an un-migrated LoopOwned worker's
+        // unexpected death worsens to Degraded. Flapping is intentionally kept
+        // OUT of degraded_reasons (§9.3 deploy-gate safety) and exposed as a
+        // separate informational field below.
+        apply_worker_recovery_reasons(&mut status, &mut degraded_reasons);
+        let worker_restart_flapping = crate::server::worker_recovery::recovery_flapping_info();
+        if !worker_restart_flapping.is_empty() {
+            json["worker_restart_flapping"] = serde_json::Value::Array(worker_restart_flapping);
+        }
+
         // Startup doctor warnings are boot/recovery diagnostics, not proof
         // that the current runtime is unhealthy. Keep them on a separate
         // startup axis so deploy/restart gates that read runtime health do
@@ -275,10 +301,12 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         json["startup_degraded_reasons"] =
             startup_doctor_count_reasons(doctor_failed, doctor_warned);
 
-        // #2049 Finding 3: now that every worsen check has run, lift status
-        // to Healthy only when standby has *no other* degraded reasons.
-        if cluster_standby_without_gateway && degraded_reasons.is_empty() {
-            status = health::HealthStatus::Healthy;
+        // A standby without a gateway is operationally degraded even when its
+        // HTTP server and worker heartbeat remain live. Keep this explicit so
+        // health checks cannot report a relay-dead node as healthy.
+        if cluster_standby_without_gateway {
+            status = status.worsen(health::HealthStatus::Degraded);
+            degraded_reasons.push(serde_json::json!("gateway_standby"));
         }
 
         let snapshot_fully_recovered = json["fully_recovered"].as_bool().unwrap_or(false);
@@ -366,6 +394,13 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             degraded_reasons.push(reason);
         }
 
+        // #4515 PR2: mirror the registry branch so a fatal worker recovery
+        // circuit also drives standalone `/api/health` readiness — otherwise a
+        // HealthRegistry-less node would report ready while a necessary worker
+        // is permanently dead.
+        apply_worker_recovery_reasons(&mut health_state, &mut degraded_reasons);
+        let worker_restart_flapping = crate::server::worker_recovery::recovery_flapping_info();
+
         let status = if health_state.is_http_ready() {
             StatusCode::OK
         } else {
@@ -400,6 +435,9 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             "recovery_duration": 0.0,
             "degraded_reasons": serde_json::Value::Array(degraded_reasons),
         });
+        if !worker_restart_flapping.is_empty() {
+            json["worker_restart_flapping"] = serde_json::Value::Array(worker_restart_flapping);
+        }
         if let Some(snapshot) = disk_snapshot {
             json["disk_free_bytes"] = serde_json::json!(snapshot.free_bytes);
             json["disk_total_bytes"] = serde_json::json!(snapshot.total_bytes);
@@ -834,6 +872,25 @@ fn opencode_warm_pool_degraded_reasons() -> Vec<serde_json::Value> {
     reasons
 }
 
+/// #4515 PR2: fold worker-local recovery reasons into a health snapshot. Shared
+/// by the registry and standalone `/api/health` branches so a fatal worker
+/// recovery circuit drives readiness identically in both. Flapping is handled
+/// separately (informational field) and never appears here.
+fn apply_worker_recovery_reasons(
+    status: &mut health::HealthStatus,
+    degraded_reasons: &mut Vec<serde_json::Value>,
+) {
+    use crate::server::worker_recovery::RecoveryReasonSeverity;
+    for reason in crate::server::worker_recovery::recovery_health_reasons() {
+        let worsened = match reason.severity {
+            RecoveryReasonSeverity::Unhealthy => health::HealthStatus::Unhealthy,
+            RecoveryReasonSeverity::Degraded => health::HealthStatus::Degraded,
+        };
+        *status = status.worsen(worsened);
+        degraded_reasons.push(serde_json::json!(reason.reason));
+    }
+}
+
 /// GET /api/health — public safe health summary.
 pub async fn health_handler(State(state): State<AppState>) -> Response {
     health_response(&state, false).await
@@ -845,11 +902,12 @@ pub async fn health_detail_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if !local_or_configured_control_endpoint_allowed(&state.config, Some(peer_addr)) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
     health_response(&state, true).await
 }
@@ -858,10 +916,11 @@ pub async fn list_dispatch_outbox_failures_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let Some(pool) = state.pg_pool_ref() else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "pg pool unavailable"})),
-        );
+            ErrorCode::Config,
+            "pg pool unavailable",
+        ));
     };
     match health_diagnostics::load_failed_dispatch_outbox_rows(pool, None).await {
         Ok(rows) => (
@@ -872,10 +931,7 @@ pub async fn list_dispatch_outbox_failures_handler(
                 "rows": rows,
             })),
         ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-        ),
+        Err(error) => legacy_health_error(AppError::internal(error.to_string())),
     }
 }
 
@@ -884,28 +940,20 @@ pub async fn ack_dispatch_outbox_failures_handler(
     Json(request): Json<AckDispatchOutboxFailuresRequest>,
 ) -> impl IntoResponse {
     let Some(pool) = state.pg_pool_ref() else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "pg pool unavailable"})),
-        );
+            ErrorCode::Config,
+            "pg pool unavailable",
+        ));
     };
     let ids = request.ids.as_deref();
     if ids.is_none() && !request.dry_run.unwrap_or(false) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "ids required unless dry_run is true",
-            })),
-        );
+        return legacy_health_error(AppError::bad_request("ids required unless dry_run is true"));
     }
     let rows = match health_diagnostics::load_failed_dispatch_outbox_rows(pool, ids).await {
         Ok(rows) => rows,
         Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            );
+            return legacy_health_error(AppError::internal(error.to_string()));
         }
     };
     if rows.is_empty() {
@@ -953,10 +1001,7 @@ pub async fn ack_dispatch_outbox_failures_handler(
                 "acknowledged_ids": acknowledged_ids,
             })),
         ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-        ),
+        Err(error) => legacy_health_error(AppError::internal(error.to_string())),
     }
 }
 
@@ -966,11 +1011,12 @@ pub async fn startup_doctor_latest_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if !local_or_configured_control_endpoint_allowed(&state.config, Some(peer_addr)) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     Json(crate::cli::doctor::startup::latest_startup_doctor_response_json()).into_response()
@@ -983,23 +1029,19 @@ pub async fn stale_mailbox_repair_handler(
     body: Bytes,
 ) -> Response {
     if !local_or_configured_control_endpoint_allowed(&state.config, Some(peer_addr)) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let body_str = String::from_utf8_lossy(&body);
     let request = match serde_json::from_str::<StaleMailboxRepairRequest>(&body_str) {
         Ok(request) => request,
         Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({"ok": false, "error": format!("invalid request: {error}")}),
-                ),
-            )
+            return legacy_health_error(AppError::bad_request(format!("invalid request: {error}")))
                 .into_response();
         }
     };
@@ -1013,15 +1055,10 @@ pub async fn stale_mailbox_repair_handler(
         Some(provider) => match ProviderKind::from_str(provider) {
             Some(provider) => Some(provider),
             None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "invalid provider",
-                        "provider": provider
-                    })),
+                return legacy_health_error(
+                    AppError::bad_request("invalid provider").with_context("provider", provider),
                 )
-                    .into_response();
+                .into_response();
             }
         },
         None => None,
@@ -1473,33 +1510,31 @@ pub async fn relay_recovery_handler(
     body: Bytes,
 ) -> Response {
     if !local_or_configured_control_endpoint_allowed(&state.config, Some(peer_addr)) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let channel_id = match channel_id.parse::<u64>() {
         Ok(channel_id) if channel_id > 0 => channel_id,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "channel_id must be a numeric Discord channel ID"
-                })),
-            )
-                .into_response();
+            return legacy_health_error(AppError::bad_request(
+                "channel_id must be a numeric Discord channel ID",
+            ))
+            .into_response();
         }
     };
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let request = if body.is_empty() {
@@ -1509,14 +1544,10 @@ pub async fn relay_recovery_handler(
         match serde_json::from_str::<RelayRecoveryRequest>(&body_str) {
             Ok(request) => request,
             Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("invalid request: {error}")
-                    })),
-                )
-                    .into_response();
+                return legacy_health_error(AppError::bad_request(format!(
+                    "invalid request: {error}"
+                )))
+                .into_response();
             }
         }
     };
@@ -1545,19 +1576,21 @@ pub async fn send_handler(
     body: Bytes,
 ) -> Response {
     if !discord_control_endpoints_allowed(&state.config, Some(peer_addr), &headers) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let body_str = String::from_utf8_lossy(&body);
@@ -1594,19 +1627,21 @@ pub async fn reload_discord_bot_tokens_handler(
     headers: HeaderMap,
 ) -> Response {
     if !discord_control_endpoints_allowed(&state.config, Some(peer_addr), &headers) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let report = registry.reload_bot_tokens().await;
@@ -1660,19 +1695,21 @@ pub async fn rebind_inflight_handler(
     body: Bytes,
 ) -> Response {
     if !discord_control_endpoints_allowed(&state.config, Some(peer_addr), &headers) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let body_str = String::from_utf8_lossy(&body);
@@ -1694,19 +1731,21 @@ pub async fn send_to_agent_handler(
     body: Bytes,
 ) -> Response {
     if !discord_control_endpoints_allowed(&state.config, Some(peer_addr), &headers) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let body_str = String::from_utf8_lossy(&body);
@@ -1734,19 +1773,21 @@ pub async fn senddm_handler(
     body: Bytes,
 ) -> Response {
     if !discord_control_endpoints_allowed(&state.config, Some(peer_addr), &headers) {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
-        )
-            .into_response();
+            ErrorCode::Policy,
+            "auth_token required for non-loopback host",
+        ))
+        .into_response();
     }
 
     let Some(ref registry) = state.health_registry else {
-        return (
+        return legacy_health_error(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
-        )
-            .into_response();
+            ErrorCode::Config,
+            "Discord not available (standalone mode)",
+        ))
+        .into_response();
     };
 
     let body_str = String::from_utf8_lossy(&body);
@@ -2584,11 +2625,15 @@ mod tests {
             "dashboard": true,
             "server_up": true,
             "intake_routing": {
+                "enabled": true,
                 "mode": "observe",
                 "source": "yaml",
+                "owner_authority_allowlist_size": 2,
+                "recent_decision_count": 17,
                 "yaml": {
                     "enabled": true,
                     "mode": "observe",
+                    "owner_authority_allowlist_size": 2,
                     "forward_pre_claim_timeout_secs": 12,
                     "stale_claim_recovery_secs": 60
                 },
@@ -2597,8 +2642,14 @@ mod tests {
                 "configuration_warnings": []
             }
         }));
+        assert_eq!(public["intake_routing"]["enabled"], json!(true));
         assert_eq!(public["intake_routing"]["mode"], json!("observe"));
         assert_eq!(public["intake_routing"]["source"], json!("yaml"));
+        assert_eq!(
+            public["intake_routing"]["owner_authority_allowlist_size"],
+            json!(2)
+        );
+        assert_eq!(public["intake_routing"]["recent_decision_count"], json!(17));
         assert_eq!(public["intake_routing"]["warning_count"], json!(0));
         assert_eq!(public["ok"], json!(true));
     }

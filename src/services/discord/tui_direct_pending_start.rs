@@ -40,6 +40,48 @@ use serde::{Deserialize, Serialize};
 
 use super::SharedData;
 
+#[path = "tui_direct_pending_start/watcher_cancel.rs"]
+mod watcher_cancel;
+
+#[cfg(test)]
+type DestructiveCancelPostGateHook = Arc<dyn Fn() + Send + Sync + 'static>;
+#[cfg(test)]
+static DESTRUCTIVE_CANCEL_POST_GATE_HOOK: LazyLock<Mutex<Option<DestructiveCancelPostGateHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn run_destructive_cancel_post_gate_hook_for_tests() {
+    let hook = DESTRUCTIVE_CANCEL_POST_GATE_HOOK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+struct DestructiveCancelPostGateHookGuard;
+
+#[cfg(test)]
+impl Drop for DestructiveCancelPostGateHookGuard {
+    fn drop(&mut self) {
+        *DESTRUCTIVE_CANCEL_POST_GATE_HOOK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn set_destructive_cancel_post_gate_hook_for_tests(
+    hook: DestructiveCancelPostGateHook,
+) -> DestructiveCancelPostGateHookGuard {
+    *DESTRUCTIVE_CANCEL_POST_GATE_HOOK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(hook);
+    DestructiveCancelPostGateHookGuard
+}
+
 /// Conservative poll interval for the wait predicate.
 pub(super) const PENDING_START_POLL: Duration = Duration::from_millis(100);
 
@@ -75,6 +117,10 @@ pub(super) const PENDING_START_CLAIM_RETRY_BACKOFF: Duration = Duration::from_mi
 /// #4030 mirrors the #4020 positive stale-owner age gate for reclaiming a row
 /// that still looks FOREIGN-live but has stopped advancing.
 pub(super) const STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS: i64 = 120;
+
+/// A committed row must remain byte-for-byte frozen for this long after crossing
+/// a process generation before pane readiness can replace missing terminal JSONL.
+pub(super) const RESTART_ORPHAN_COMMITTED_GRACE_SECS: i64 = 10 * 60;
 
 /// Lifecycle state of a durable pending-start record. Kept tiny and
 /// string-serialized so a forward/backward dcserver swap reads it tolerantly.
@@ -134,6 +180,7 @@ impl TuiDirectPendingStart {
 /// `SharedData`). One `tokio::Mutex` per `(provider, channel_id)`; the worker
 /// holds it for the whole wait+claim so same-channel pending prompts serialize
 /// FIFO while different channels run fully in parallel.
+#[allow(clippy::type_complexity)]
 static CHANNEL_LOCKS: LazyLock<Mutex<HashMap<(String, u64), Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -714,6 +761,85 @@ fn committed_foreign_inflight_is_finalize_clearable(
         && state.terminal_delivery_committed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestartOrphanEvidence {
+    generation_crossed: bool,
+    committed_frozen_past_grace: bool,
+    pane_ready_for_input: bool,
+}
+
+impl RestartOrphanEvidence {
+    fn permits_finalize_clear(self) -> bool {
+        self.generation_crossed && self.committed_frozen_past_grace && self.pane_ready_for_input
+    }
+}
+
+fn inflight_generation_precedes_current(
+    state: &super::inflight::InflightTurnState,
+    current_generation: u64,
+) -> bool {
+    state.born_generation != 0 && state.born_generation != current_generation
+        || state
+            .restart_generation
+            .is_some_and(|generation| generation != current_generation)
+}
+
+fn restart_orphan_evidence_at(
+    state: &super::inflight::InflightTurnState,
+    current_generation: u64,
+    now_unix_secs: i64,
+    pane_ready_for_input: bool,
+) -> RestartOrphanEvidence {
+    let committed_frozen_past_grace = super::inflight::parse_updated_at_unix(&state.updated_at)
+        .is_some_and(|updated_at| {
+            now_unix_secs.saturating_sub(updated_at) >= RESTART_ORPHAN_COMMITTED_GRACE_SECS
+        });
+    RestartOrphanEvidence {
+        generation_crossed: inflight_generation_precedes_current(state, current_generation),
+        committed_frozen_past_grace,
+        pane_ready_for_input,
+    }
+}
+
+fn claude_tui_output_path_missing(state: &super::inflight::InflightTurnState) -> bool {
+    crate::services::tui_turn_state::claude_tui_output_path_missing(
+        state.runtime_kind,
+        state.output_path.as_deref(),
+    )
+}
+
+fn restart_orphan_independent_pane_ready(
+    state: &super::inflight::InflightTurnState,
+    readiness: crate::services::tmux_turn_liveness::IndependentTmuxReadiness,
+) -> bool {
+    !claude_tui_output_path_missing(state)
+        && matches!(
+            readiness,
+            crate::services::tmux_turn_liveness::IndependentTmuxReadiness::ReadyForInput
+        )
+}
+
+fn restart_orphan_pane_ready_for_input(
+    provider: &crate::services::provider::ProviderKind,
+    state: &super::inflight::InflightTurnState,
+    tmux_session_name: &str,
+) -> bool {
+    let output_path = state
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(std::path::Path::new);
+    let readiness = crate::services::tmux_turn_liveness::independent_tmux_readiness(
+        tmux_session_name,
+        provider,
+        state.runtime_kind,
+        output_path,
+        Some(state.last_offset),
+    );
+    restart_orphan_independent_pane_ready(state, readiness)
+}
+
 async fn submit_stale_foreign_inflight_cancel(
     shared: &Arc<SharedData>,
     provider: &crate::services::provider::ProviderKind,
@@ -724,42 +850,76 @@ async fn submit_stale_foreign_inflight_cancel(
     if finalizer_turn_id == 0 {
         return false;
     }
-    let Some(current) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
-        tracing::warn!(
-            provider = %provider.as_str(),
-            channel_id = channel_id.get(),
-            finalizer_turn_id,
-            "tui_direct_pending_start: stale FOREIGN cancel no-op; inflight disappeared before finalizer submit"
-        );
-        return false;
-    };
     let mailbox_active_user_msg_id = super::mailbox_snapshot(shared, channel_id)
         .await
         .active_user_message_id
         .map(|id| id.get());
-    if !probe.pin.matches_state(&current)
-        || mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id
-        || current.updated_at != probe.updated_at
-        || current.save_generation != probe.save_generation
-    {
-        tracing::warn!(
+    if mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id {
+        tracing::info!(
             provider = %provider.as_str(),
             channel_id = channel_id.get(),
-            expected_finalizer_turn_id = finalizer_turn_id,
-            current_finalizer_turn_id = current.effective_finalizer_turn_id(),
             expected_mailbox_active_user_msg_id = probe.pin.mailbox_active_user_msg_id.unwrap_or(0),
             mailbox_active_user_msg_id = mailbox_active_user_msg_id.unwrap_or(0),
-            expected_tmux_session = ?probe.pin.tmux_session_name,
-            current_tmux_session = ?current.tmux_session_name,
-            expected_updated_at = %probe.updated_at,
-            current_updated_at = %current.updated_at,
-            expected_save_generation = probe.save_generation,
-            current_save_generation = current.save_generation,
-            "tui_direct_pending_start: stale FOREIGN cancel no-op; identity/death-evidence pin no longer matches"
+            "tui_direct_pending_start: stale FOREIGN cancel no-op; mailbox episode changed"
         );
         return false;
     }
-    let stale_identity = super::inflight::InflightTurnIdentity::from_state(&current);
+    let expected_cancel = probe
+        .pin
+        .tmux_session_name
+        .as_deref()
+        .and_then(|tmux_session| {
+            watcher_cancel::cancel_for_tmux_session(&shared.tmux_watchers, tmux_session)
+        });
+    let cancel_for_commit = expected_cancel.clone();
+    let commit_outcome = super::inflight::commit_destructive_cancel_locked(
+        provider,
+        channel_id.get(),
+        &probe.inflight_identity,
+        &probe.updated_at,
+        probe.save_generation,
+        move |_| match cancel_for_commit {
+            Some(cancel) => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                Ok(super::inflight::CommitEvidence::CancelledWatcher)
+            }
+            None => Ok(super::inflight::CommitEvidence::NoWatcher),
+        },
+    );
+    if !matches!(
+        commit_outcome,
+        super::inflight::DestructiveCancelCommitOutcome::CommittedCancelled
+            | super::inflight::DestructiveCancelCommitOutcome::CommittedNoWatcher
+    ) {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            ?commit_outcome,
+            "tui_direct_pending_start: stale FOREIGN cancel no-op; flock-held pin commit failed"
+        );
+        return false;
+    }
+    // The flock is released before registry CAS; the two lock domains never overlap.
+    if let (Some(tmux_session), Some(cancel)) = (
+        probe.pin.tmux_session_name.as_deref(),
+        expected_cancel.as_ref(),
+    ) && shared
+        .tmux_watchers
+        .remove_tmux_session_if_current(tmux_session, cancel)
+        .is_none()
+    {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            tmux_session,
+            "tui_direct_pending_start: stale FOREIGN cancel committed but watcher incarnation changed; finalizer skipped"
+        );
+        return false;
+    }
+    // E1 closes the watcher left behind at destruction time. It does not close a
+    // last pre-cancel self-heal iteration or later restoration/reclaim recreation
+    // (#5012/E3), nor durable observation of finalizer degradation (E2/E6).
+    let stale_identity = probe.inflight_identity.clone();
     let _ = shared
         .turn_finalizer
         .submit_terminal(
@@ -805,13 +965,14 @@ async fn submit_committed_foreign_inflight_complete(
     provider: &crate::services::provider::ProviderKind,
     channel_id: poise::serenity_prelude::ChannelId,
     probe: &super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
+    restart_orphan_evidence: bool,
 ) -> bool {
     let finalizer_turn_id = probe.pin.finalizer_turn_id;
     if finalizer_turn_id == 0 {
         return false;
     }
     let Some(current) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
-        tracing::warn!(
+        tracing::info!(
             provider = %provider.as_str(),
             channel_id = channel_id.get(),
             finalizer_turn_id,
@@ -823,14 +984,16 @@ async fn submit_committed_foreign_inflight_complete(
         .await
         .active_user_message_id
         .map(|id| id.get());
+    let terminal_envelope_present =
+        super::destructive_cancel_gate::terminal_envelope_present(provider, probe);
     if !current.terminal_delivery_committed
-        || !super::destructive_cancel_gate::terminal_envelope_present(provider, probe)
+        || (!terminal_envelope_present && !restart_orphan_evidence)
         || !probe.pin.matches_state(&current)
         || mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id
         || current.updated_at != probe.updated_at
         || current.save_generation != probe.save_generation
     {
-        tracing::warn!(
+        tracing::info!(
             provider = %provider.as_str(),
             channel_id = channel_id.get(),
             expected_finalizer_turn_id = finalizer_turn_id,
@@ -850,6 +1013,26 @@ async fn submit_committed_foreign_inflight_complete(
     }
 
     let committed_identity = super::inflight::InflightTurnIdentity::from_state(&current);
+    if restart_orphan_evidence {
+        let archive_outcome =
+            super::inflight::archive_inflight_state_if_matches_identity_generation(
+                provider,
+                channel_id.get(),
+                &committed_identity,
+                &probe.updated_at,
+                probe.save_generation,
+                "stuck-restart-orphan",
+            );
+        if archive_outcome != super::inflight::GuardedClearOutcome::Cleared {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id = channel_id.get(),
+                ?archive_outcome,
+                "tui_direct_pending_start: restart-orphan archive failed; preserving committed FOREIGN inflight"
+            );
+            return false;
+        }
+    }
     let outcome = shared
         .turn_finalizer
         .submit_terminal(
@@ -877,7 +1060,8 @@ async fn submit_committed_foreign_inflight_complete(
         finalizer_turn_id,
         finalize_outcome = ?std::mem::discriminant(&outcome),
         gone_or_changed,
-        "tui_direct_pending_start: committed FOREIGN inflight cleared via finalizer Complete under terminal-envelope gate"
+        restart_orphan_evidence,
+        "tui_direct_pending_start: committed FOREIGN inflight cleared via finalizer Complete under terminal or restart-orphan evidence"
     );
     gone_or_changed
 }
@@ -906,7 +1090,17 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
             channel,
         );
         let relay_frontier = probe.relay_frontier;
-        if !super::destructive_cancel_gate::terminal_envelope_present(&provider, &probe) {
+        let terminal_envelope_present =
+            super::destructive_cancel_gate::terminal_envelope_present(&provider, &probe);
+        let pane_ready_for_input = !terminal_envelope_present
+            && restart_orphan_pane_ready_for_input(&provider, &state, &record.tmux_session_name);
+        let restart_evidence = restart_orphan_evidence_at(
+            &state,
+            shared.restart.current_generation,
+            chrono::Utc::now().timestamp(),
+            pane_ready_for_input,
+        );
+        if !terminal_envelope_present && !restart_evidence.permits_finalize_clear() {
             tracing::warn!(
                 provider = %record.provider,
                 channel_id = record.channel_id,
@@ -917,12 +1111,21 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
                 committed_updated_at = %state.updated_at,
                 relay_frontier = ?relay_frontier,
                 capture_offset = ?capture_offset,
-                "tui_direct_pending_start: skipped committed FOREIGN finalize-clear; terminal envelope evidence missing"
+                generation_crossed = restart_evidence.generation_crossed,
+                committed_frozen_past_grace = restart_evidence.committed_frozen_past_grace,
+                pane_ready_for_input = restart_evidence.pane_ready_for_input,
+                "tui_direct_pending_start: skipped committed FOREIGN finalize-clear; terminal envelope and restart-orphan evidence missing"
             );
             return false;
         }
-        let cleared =
-            submit_committed_foreign_inflight_complete(shared, &provider, channel, &probe).await;
+        let cleared = submit_committed_foreign_inflight_complete(
+            shared,
+            &provider,
+            channel,
+            &probe,
+            !terminal_envelope_present,
+        )
+        .await;
         if cleared {
             tracing::warn!(
                 provider = %record.provider,
@@ -934,7 +1137,8 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
                 committed_updated_at = %state.updated_at,
                 relay_frontier = ?relay_frontier,
                 capture_offset = ?capture_offset,
-                "tui_direct_pending_start: cleared committed FOREIGN inflight with terminal envelope via finalizer Complete; re-evaluating before claiming (#4035)"
+                restart_orphan_evidence = !terminal_envelope_present,
+                "tui_direct_pending_start: cleared committed FOREIGN inflight via finalizer Complete; re-evaluating before claiming (#4805)"
             );
         }
         return cleared;
@@ -972,6 +1176,8 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
         return false;
     }
 
+    #[cfg(test)]
+    run_destructive_cancel_post_gate_hook_for_tests();
     let demoted = submit_stale_foreign_inflight_cancel(shared, &provider, channel, &probe).await;
     if demoted {
         tracing::warn!(
@@ -1507,6 +1713,31 @@ mod tests {
         LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
+    fn test_watcher_handle(
+        tmux_session_name: &str,
+        output_path: &std::path::Path,
+    ) -> (
+        super::super::TmuxWatcherHandle,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            super::super::TmuxWatcherHandle {
+                tmux_session_name: tmux_session_name.to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                cancel: cancel.clone(),
+                pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                    super::super::tmux_watcher_now_ms(),
+                )),
+            },
+            cancel,
+        )
+    }
+
     struct EnvReset(Option<std::ffi::OsString>);
 
     impl Drop for EnvReset {
@@ -1853,6 +2084,192 @@ mod tests {
         state.last_offset = std::fs::metadata(output_path)
             .expect("ready output metadata")
             .len();
+    }
+
+    fn restart_orphan_state(
+        current_generation: u64,
+        committed_age_secs: i64,
+    ) -> super::super::inflight::InflightTurnState {
+        let mut state = super::super::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            4_805_001,
+            None,
+            1,
+            4_805_101,
+            4_805_102,
+            "committed restart orphan".to_string(),
+            None,
+            Some("tmux-4805".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.terminal_delivery_committed = true;
+        state.born_generation = current_generation.saturating_sub(1);
+        state.updated_at = local_timestamp_age_secs(committed_age_secs);
+        state
+    }
+
+    #[test]
+    fn restart_orphan_claude_tui_without_runtime_output_path_stays_not_ready() {
+        let mut state = restart_orphan_state(17, RESTART_ORPHAN_COMMITTED_GRACE_SECS + 1);
+        state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
+        assert!(claude_tui_output_path_missing(&state));
+        assert!(
+            !restart_orphan_independent_pane_ready(
+                &state,
+                crate::services::tmux_turn_liveness::IndependentTmuxReadiness::ReadyForInput,
+            ),
+            "missing ClaudeTui runtime output must override independent pane readiness"
+        );
+    }
+
+    #[test]
+    fn restart_orphan_requires_generation_boundary() {
+        let current_generation = 17;
+        let mut state =
+            restart_orphan_state(current_generation, RESTART_ORPHAN_COMMITTED_GRACE_SECS + 1);
+        state.born_generation = current_generation;
+        let evidence = restart_orphan_evidence_at(
+            &state,
+            current_generation,
+            chrono::Utc::now().timestamp(),
+            true,
+        );
+        assert!(!evidence.permits_finalize_clear());
+        assert!(!evidence.generation_crossed);
+    }
+
+    #[test]
+    fn restart_orphan_requires_frozen_committed_grace() {
+        let current_generation = 17;
+        let state =
+            restart_orphan_state(current_generation, RESTART_ORPHAN_COMMITTED_GRACE_SECS - 1);
+        let evidence = restart_orphan_evidence_at(
+            &state,
+            current_generation,
+            chrono::Utc::now().timestamp(),
+            true,
+        );
+        assert!(!evidence.permits_finalize_clear());
+        assert!(!evidence.committed_frozen_past_grace);
+    }
+
+    #[test]
+    fn restart_orphan_requires_ready_for_input() {
+        let current_generation = 17;
+        let state =
+            restart_orphan_state(current_generation, RESTART_ORPHAN_COMMITTED_GRACE_SECS + 1);
+        let evidence = restart_orphan_evidence_at(
+            &state,
+            current_generation,
+            chrono::Utc::now().timestamp(),
+            false,
+        );
+        assert!(!evidence.permits_finalize_clear());
+        assert!(!evidence.pane_ready_for_input);
+    }
+
+    #[test]
+    fn restart_orphan_all_evidence_permits_finalize_clear() {
+        let current_generation = 17;
+        let state =
+            restart_orphan_state(current_generation, RESTART_ORPHAN_COMMITTED_GRACE_SECS + 1);
+        let evidence = restart_orphan_evidence_at(
+            &state,
+            current_generation,
+            chrono::Utc::now().timestamp(),
+            true,
+        );
+        assert!(evidence.permits_finalize_clear());
+    }
+
+    #[test]
+    fn restart_request_window_sidecar_keeps_old_process_epoch() {
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+
+        let old_process_generation = super::super::runtime_store::allocate_process_generation();
+        assert_eq!(old_process_generation, 1);
+        super::super::runtime_store::set_process_generation_for_tests(Some(old_process_generation));
+        let previewed_replacement_generation =
+            super::super::runtime_store::next_process_generation();
+        assert_eq!(previewed_replacement_generation, 2);
+        assert_eq!(
+            super::super::runtime_store::process_generation(),
+            old_process_generation,
+            "restart request preview must not advance the durable counter during quiesce"
+        );
+
+        let state = super::super::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            4_805_003,
+            None,
+            1,
+            4_805_103,
+            4_805_104,
+            "born while restart request is quiescing".to_string(),
+            None,
+            Some("tmux-4805-request-window".to_string()),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(state.born_generation, old_process_generation);
+        assert!(inflight_generation_precedes_current(
+            &state,
+            previewed_replacement_generation
+        ));
+        super::super::runtime_store::set_process_generation_for_tests(None);
+    }
+
+    #[test]
+    fn restart_orphan_archive_moves_sidecar_under_archive_root() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        let provider = crate::services::provider::ProviderKind::Claude;
+        let mut state = restart_orphan_state(17, RESTART_ORPHAN_COMMITTED_GRACE_SECS + 1);
+        state.channel_id = 4_805_002;
+        state.save_generation = 41;
+        write_inflight_fixture(root.path(), &provider, &state);
+        let current = super::super::inflight::load_inflight_state(&provider, state.channel_id)
+            .expect("fixture inflight");
+        let identity = super::super::inflight::InflightTurnIdentity::from_state(&current);
+
+        assert_eq!(
+            super::super::inflight::archive_inflight_state_if_matches_identity_generation(
+                &provider,
+                current.channel_id,
+                &identity,
+                &current.updated_at,
+                current.save_generation,
+                "stuck-restart-orphan",
+            ),
+            super::super::inflight::GuardedClearOutcome::Cleared
+        );
+        assert!(
+            super::super::inflight::load_inflight_state(&provider, current.channel_id).is_none()
+        );
+        let archive = root.path().join("runtime/discord_inflight/archive");
+        let archived_names: Vec<_> = std::fs::read_dir(archive)
+            .expect("archive dir")
+            .map(|entry| entry.expect("archive entry").file_name())
+            .collect();
+        assert_eq!(archived_names.len(), 1);
+        assert!(
+            archived_names[0]
+                .to_string_lossy()
+                .starts_with("4805002.json.stuck-restart-orphan-")
+        );
     }
 
     #[test]
@@ -2402,6 +2819,178 @@ mod tests {
                 "frozen nonzero relay frontier with unchanged ready capture is death evidence"
             );
             assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        });
+    }
+
+    #[test]
+    fn stale_foreign_gate_pass_then_generation_mismatch_preserves_turn() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_118;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_218;
+            let tmux = "tmux-4030-generation-race";
+            let output_path = root.path().join("ready-generation-race.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"result","result":"done","session_id":"s"}"#,
+            )
+            .expect("write terminal output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let (watcher, watcher_cancel) = test_watcher_handle(tmux, &output_path);
+            watcher
+                .last_heartbeat_ts_ms
+                .store(1, std::sync::atomic::Ordering::Release);
+            shared.tmux_watchers.insert(channel, watcher);
+            let mut rec = record("claude", channel_id, 4_030_318);
+            rec.tmux_session_name = tmux.to_string();
+
+            let hook_root = root.path().to_path_buf();
+            let hook_provider = provider.clone();
+            let _hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+                let current =
+                    super::super::inflight::load_inflight_state(&hook_provider, channel_id)
+                        .expect("load post-gate inflight");
+                write_inflight_fixture(&hook_root, &hook_provider, &current);
+            }));
+
+            assert!(!demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+            assert!(!watcher_cancel.load(std::sync::atomic::Ordering::Acquire));
+            assert!(shared.tmux_watchers.has_live_watcher_handle(tmux));
+            assert!(!token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(super::super::inflight::load_inflight_state(&provider, channel_id).is_some());
+        });
+    }
+
+    #[test]
+    fn stale_foreign_demote_cancels_and_removes_current_watcher() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_116;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_216;
+            let tmux = "tmux-4030-e1-watcher";
+            let output_path = root.path().join("ready-e1-watcher.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            )
+            .expect("write ready output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let mut state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            stamp_claude_ready_for_input_evidence(&mut state, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let (watcher, watcher_cancel) = test_watcher_handle(tmux, &output_path);
+            watcher
+                .last_heartbeat_ts_ms
+                .store(1, std::sync::atomic::Ordering::Release);
+            shared.tmux_watchers.insert(channel, watcher);
+            let mut rec = record("claude", channel_id, 4_030_316);
+            rec.tmux_session_name = tmux.to_string();
+
+            assert!(demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+            assert!(watcher_cancel.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!shared.tmux_watchers.has_live_watcher_handle(tmux));
+            assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        });
+    }
+
+    #[test]
+    fn stale_foreign_demote_without_watcher_still_commits_cancel() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::TempDir::new().expect("runtime root");
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+        current_thread_rt().block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let channel_id = 4_030_117;
+            let channel = poise::serenity_prelude::ChannelId::new(channel_id);
+            let stale_msg = 4_030_217;
+            let tmux = "tmux-4030-e1-no-watcher";
+            let output_path = root.path().join("ready-e1-no-watcher.jsonl");
+            std::fs::write(
+                &output_path,
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            )
+            .expect("write ready output");
+            let token = Arc::new(crate::services::provider::CancelToken::new());
+            assert!(
+                super::super::mailbox_try_start_turn(
+                    &shared,
+                    channel,
+                    token.clone(),
+                    poise::serenity_prelude::UserId::new(1),
+                    poise::serenity_prelude::MessageId::new(stale_msg),
+                )
+                .await
+            );
+            shared
+                .restart
+                .global_active
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+            let mut state =
+                stale_foreign_state(provider.clone(), channel_id, stale_msg, tmux, &output_path);
+            stamp_claude_ready_for_input_evidence(&mut state, &output_path);
+            write_inflight_fixture(root.path(), &provider, &state);
+            let mut rec = record("claude", channel_id, 4_030_317);
+            rec.tmux_session_name = tmux.to_string();
+
+            assert!(!shared.tmux_watchers.has_live_watcher_handle(tmux));
+            assert!(demote_stale_foreign_inflight_if_current(&shared, &rec).await);
+            assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(super::super::inflight::load_inflight_state(&provider, channel_id).is_none());
         });
     }
 

@@ -3,9 +3,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use serenity::model::id::{ChannelId, MessageId};
-use sqlx::PgPool;
-
 use super::super::SharedData;
 use super::super::health::HealthRegistry;
 use super::super::placeholder_live_events::PlaceholderLiveEvents;
@@ -17,13 +14,14 @@ use super::super::task_notification_delivery::{
     TaskCardTransport, TaskNotificationContext, TaskResponseCommitOutcome,
     claim_existing_task_response_delivery,
     claim_task_response_delivery_with_recovery_key_and_started_at,
-    commit_task_response_delivered_bounded, durable_response_turn_key, ensure_card,
+    commit_task_response_delivered_bounded, durable_response_turn_key, ensure_card_with_shared,
     fallback_response_turn_key, provider_bot_key, rebind_task_response_card,
     record_task_response_sent_bounded,
 };
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::cluster::stream_relay::RelaySinkError;
 use crate::services::provider::ProviderKind;
+use serenity::model::id::{ChannelId, MessageId};
 
 fn defer_task_response_to_watcher(
     turn_start_offset: Option<u64>,
@@ -75,12 +73,14 @@ pub(super) async fn ensure_task_context_card(
         return Ok(None);
     };
     let provider_http = shared.serenity_http_or_token_fallback();
-    let notify_http = super::super::health::resolve_bot_http(health_registry.as_ref(), "notify")
-        .await
-        .ok();
+    let notify_role = super::super::bot_role::UtilityBotRole::Notify;
+    let notify_http =
+        super::super::health::resolve_utility_bot_http(health_registry.as_ref(), notify_role)
+            .await
+            .ok();
     let clients = CardDeliveryClients::new(
         notify_http
-            .map(|http| CardBot::new("notify", http))
+            .map(|http| CardBot::new(notify_role.alias(), http))
             .into_iter()
             .chain(
                 provider_http.map(|http| CardBot::new(provider_bot_key(provider.as_str()), http)),
@@ -88,7 +88,7 @@ pub(super) async fn ensure_task_context_card(
     );
     let transport = DiscordTaskCardTransport::new(shared.clone());
     let outcome = confirm_task_context_card(
-        shared.pg_pool.as_ref(),
+        Some(shared),
         &clients,
         &transport,
         &shared.ui.placeholder_live_events,
@@ -314,8 +314,17 @@ impl super::SessionBoundDiscordRelaySink {
         task_response_claim: Option<ResponseDeliveryClaim>,
         trace: &super::SessionRelayTraceContext,
         sink_lease_guard: Option<&super::SinkDeliveryLeaseGuard>,
+        sink_delivery_ctx: super::delivery_frontier::SinkDeliveryCtx<'_>,
     ) -> Result<super::SessionRelayDeliveryOutcome, RelaySinkError> {
         let channel = ChannelId::new(channel_id);
+        // #4911 R10 (P1-5): a NewMessage route reached WITHOUT a task card is a
+        // plain terminal body POST. It used to advance through the generic
+        // `advance_after_confirmed_post` path — no lease-time source generation,
+        // no durable frontier/receipt/ledger — so it stayed the last terminal
+        // delivery outside the guarded funnel. Track which arm ran so only that
+        // arm switches to the funnel; the task-card arm keeps its own fence.
+        let mut plain_body_anchor_msg_id = None;
+        let mut plain_body_posted = false;
         let prompt_anchor = super::relay_format::ssh_direct_prompt_anchor_for_response(
             provider,
             &delivery.session_name,
@@ -365,13 +374,16 @@ impl super::SessionBoundDiscordRelaySink {
                 &delivery.session_name,
             );
             let provider_http = shared.serenity_http_or_token_fallback();
-            let notify_http =
-                super::super::health::resolve_bot_http(self.health_registry.as_ref(), "notify")
-                    .await
-                    .ok();
+            let notify_role = super::super::bot_role::UtilityBotRole::Notify;
+            let notify_http = super::super::health::resolve_utility_bot_http(
+                self.health_registry.as_ref(),
+                notify_role,
+            )
+            .await
+            .ok();
             let clients = CardDeliveryClients::new(
                 notify_http
-                    .map(|http| CardBot::new("notify", http))
+                    .map(|http| CardBot::new(notify_role.alias(), http))
                     .into_iter()
                     .chain(
                         provider_http
@@ -405,15 +417,18 @@ impl super::SessionBoundDiscordRelaySink {
             .map_err(RelaySinkError::Transient)?;
             response_heartbeat = Some(heartbeat);
         } else {
-            super::super::formatting::send_long_message_raw_with_reference(
-                http,
-                channel,
-                relay_text,
-                shared,
-                prompt_anchor_reference,
-            )
-            .await
-            .map_err(|error| RelaySinkError::Transient(error.to_string()))?;
+            let message_ids =
+                super::super::formatting::send_long_message_raw_with_reference_returning_message_ids(
+                    http,
+                    channel,
+                    relay_text,
+                    shared,
+                    prompt_anchor_reference,
+                )
+                .await
+                .map_err(|error| RelaySinkError::Transient(error.to_string()))?;
+            plain_body_anchor_msg_id = message_ids.last().map(|message_id| message_id.get());
+            plain_body_posted = true;
         }
         prompt_anchor_reference = answer_reference(channel, task_card_message_id, prompt_anchor);
         if let Some(prompt_anchor) = prompt_anchor {
@@ -454,14 +469,41 @@ impl super::SessionBoundDiscordRelaySink {
             Some("new message"),
         );
         // #3041 P1-3: post-POST fresh identity re-check before frontier advance.
-        self.advance_after_confirmed_post(
-            shared,
-            provider,
-            channel_id,
-            &delivery.session_name,
-            delivery,
-            sink_lease_guard,
-        );
+        // #4911 R10: the plain terminal body takes the guarded funnel so its
+        // advance is bound to the lease-time source generation and leaves the
+        // Phase-A durable proof; a stale/unrecorded landing is surfaced instead of
+        // being reported as an ordinary delivery.
+        let plain_body_proof = if plain_body_posted {
+            Some(super::delivery_frontier::finish_sink_delivery(
+                sink_delivery_ctx,
+                plain_body_anchor_msg_id,
+                &delivery.response_text,
+                sink_lease_guard,
+                "src/services/discord/session_relay_sink/task_notification_context.rs:sink_new_message_terminal_advance",
+            ))
+        } else {
+            self.advance_after_confirmed_post(
+                shared,
+                provider,
+                channel_id,
+                &delivery.session_name,
+                delivery,
+                sink_lease_guard,
+            );
+            None
+        };
+        if let Some(proof) = plain_body_proof
+            && proof != super::delivery_frontier::SinkDeliveryProofResult::Persisted
+        {
+            // The plain-body arm and the task-card arm are mutually exclusive, so
+            // no task-response heartbeat can be running here; the bounded final
+            // delivery CAS below belongs to the card path only.
+            debug_assert!(
+                response_heartbeat.is_none(),
+                "plain terminal body never runs under a task response heartbeat"
+            );
+            return Ok(super::SessionRelayDeliveryOutcome::from_proof(proof));
+        }
         let commit_outcome =
             commit_response_fence(shared, delivery, task_response_claim.as_ref()).await;
         if let Some(heartbeat) = response_heartbeat {
@@ -478,8 +520,9 @@ impl super::SessionBoundDiscordRelaySink {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn confirm_task_context_card<T: TaskCardTransport>(
-    pool: Option<&PgPool>,
+    shared: Option<&Arc<SharedData>>,
     clients: &CardDeliveryClients,
     transport: &T,
     live_events: &PlaceholderLiveEvents,
@@ -492,7 +535,25 @@ async fn confirm_task_context_card<T: TaskCardTransport>(
         return Ok(None);
     };
     let event = context.to_event(channel_id, provider, session_name);
-    let outcome = ensure_card(pool, clients, transport, &event, EnsureIntent::Promotion).await?;
+    let outcome = if let Some(shared) = shared {
+        ensure_card_with_shared(
+            shared.as_ref(),
+            clients,
+            transport,
+            &event,
+            EnsureIntent::Promotion,
+        )
+        .await?
+    } else {
+        super::super::task_notification_delivery::ensure_card(
+            None,
+            clients,
+            transport,
+            &event,
+            EnsureIntent::Promotion,
+        )
+        .await?
+    };
     live_events.claim_terminal_slot_for_card(
         ChannelId::new(channel_id),
         event.kind(),
@@ -665,6 +726,8 @@ mod tests {
             frame_turn_user_msg_id: 0,
             frame_turn_started_at: "2026-07-11T01:37:00Z".to_string(),
             frame_turn_start_offset: Some(4055),
+            relay_range: None,
+            relay_generation_mtime_ns: None,
         };
         let transport = OrderedTransport {
             fail: AtomicBool::new(false),

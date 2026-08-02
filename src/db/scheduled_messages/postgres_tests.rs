@@ -46,6 +46,10 @@ async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMess
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -58,6 +62,163 @@ async fn claim_one(pool: &PgPool, owner: &str, lease_secs: i64) -> ClaimedFire {
         .expect("claim due scheduled message");
     assert_eq!(claims.len(), 1, "exactly one definition should be due");
     claims.pop().expect("claimed fire")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_list_scheduled_messages_keeps_image_blobs_out_of_memory() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_image_list_metadata",
+        "scheduled image list metadata projection",
+    )
+    .await;
+    let image_data = b"\x89PNG\r\n\x1a\nrepresentative-image".to_vec();
+    let message = insert_scheduled_message_pg(
+        &pool,
+        &NewScheduledMessage {
+            content: "image list projection".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() + Duration::minutes(5),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+            image_attachment: Some(ScheduledMessageImageAttachment {
+                filename: "thumbnail.png".to_string(),
+                content_type: "image/png".to_string(),
+                data: image_data.clone(),
+            }),
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
+        },
+    )
+    .await
+    .expect("insert image-bearing scheduled definition");
+
+    let listed = list_scheduled_messages_pg(&pool, &ListFilters::default())
+        .await
+        .expect("list scheduled definitions");
+    let listed = listed
+        .iter()
+        .find(|row| row.id == message.id)
+        .expect("image-bearing definition is listed");
+    assert_eq!(listed.image_data, None, "list must not load image bytes");
+    assert_eq!(listed.image_size_bytes, Some(image_data.len() as i32));
+    assert_eq!(
+        listed.to_api_json()["imageAttachment"]["sizeBytes"],
+        serde_json::json!(image_data.len())
+    );
+
+    let loaded = get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("load scheduled definition")
+        .expect("definition exists");
+    assert_eq!(loaded.image_data, Some(image_data));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_image_rollout_rejects_legacy_online_workers() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_image_rollout_gate",
+        "scheduled image rollout capability gate",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO worker_nodes (instance_id, status, capabilities, last_heartbeat_at) \
+         VALUES ('legacy-worker', 'online', $1, NOW())",
+    )
+    .bind(serde_json::json!({}))
+    .execute(&pool)
+    .await
+    .expect("seed legacy online worker");
+    assert!(
+        !image_attachment_rollout_ready_pg(&pool, 60)
+            .await
+            .expect("query rollout gate"),
+        "a live worker without the feature advertisement blocks new image reservations"
+    );
+
+    sqlx::query("UPDATE worker_nodes SET capabilities = $1 WHERE instance_id = 'legacy-worker'")
+        .bind(serde_json::json!({
+            "scheduled_messages": {"image_attachments_v1": true}
+        }))
+        .execute(&pool)
+        .await
+        .expect("mark worker image-capable");
+    assert!(
+        image_attachment_rollout_ready_pg(&pool, 60)
+            .await
+            .expect("query rollout gate after upgrade")
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_reclaimed_snapshot_rejects_nonterminal_status() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_reclaimed_nonterminal",
+        "reclaimed snapshot nonterminal status constraint",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_PUSH).await;
+
+    let error = sqlx::query(
+        "UPDATE scheduled_messages
+         SET context_strategy = 'snapshot', context_snapshot_id = NULL,
+             context_snapshot_reclaimed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(&message.id)
+    .execute(&pool)
+    .await
+    .expect_err("scheduled definitions must not enter the reclaimed snapshot state");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.constraint()),
+        Some("chk_smsg_snapshot_required")
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_reclaimed_snapshot_accepts_terminal_status() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_reclaimed_terminal",
+        "reclaimed snapshot terminal status constraint",
+    )
+    .await;
+    let message = insert_due_message(&pool, KIND_PUSH).await;
+
+    let result = sqlx::query(
+        "UPDATE scheduled_messages
+         SET status = 'sent', context_strategy = 'snapshot', context_snapshot_id = NULL,
+             context_snapshot_reclaimed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(&message.id)
+    .execute(&pool)
+    .await
+    .expect("terminal definitions may enter the reclaimed snapshot state");
+    assert_eq!(result.rows_affected(), 1);
+
+    pool.close().await;
+    pg_db.drop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -544,6 +705,10 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
                 source: "postgres_test".to_string(),
                 created_by: Some("postgres_test".to_string()),
                 dedupe_key: None,
+                image_attachment: None,
+                context_strategy: "fresh".to_string(),
+                context_snapshot_id: None,
+                on_context_failure: "fail".to_string(),
             },
         )
         .await
@@ -1233,6 +1398,10 @@ async fn postgres_cancel_reports_committed_agent_handoff_not_intent() {
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await

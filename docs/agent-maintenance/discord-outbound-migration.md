@@ -1,5 +1,13 @@
 # Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436 / #1457)
 
+> Last refreshed: 2026-07-24 (#4508 review follow-up — watcher anchored short-replace now uses an edit-only deferred transport boundary in both controller and retained legacy paths. On edit failure, the range owner keeps the same delivery lease and suppresses fallback POST only after a locked, stable pre-edit-path/generation + EOF-bounded durable-frontier recheck; any rotate, marker, metadata, or frontier uncertainty remains fail-open. Already-committed reconciliation reuses delivered-anchor-aware guarded placeholder cleanup and drops local/orphan tracking only after cleanup commits. This changes A4 replacement authority and lifecycle parity, but adds no v3 producer or direct-send callsite; the coverage rows below are unchanged).
+>
+> Last refreshed: 2026-07-24 (#4536 — confirmed idle/catch-up ranged POSTs now persist a generation-scoped ordered JSONL frontier before advancing the in-memory watermark. This adds an internal delivery-record commit writer but no Discord transport verb or v3 producer callsite; the coverage map below is unchanged).
+>
+> Last refreshed: 2026-07-23 (#4797 round 4 — test gateway implementations thread the queued-dispatch capability required by the `TurnGateway` trait; outbound controller delivery verbs, production callsite coverage, and delivery semantics are unchanged).
+>
+> Last refreshed: 2026-07-21 (against #4706 lint-debt annotations only; outbound callsite coverage and delivery semantics are unchanged).
+
 > Last refreshed: 2026-07-03 (against #3874 dead-code removal — manual outbound callsite coverage map refreshed after removing permanently-None `Option<&Db>` threading; no delivery semantics change).
 
 > Last refreshed: 2026-07-11 (#4424 — `outbound/source_registry.rs` is now the single typed, caller-class-scoped authorization table for send and message_outbox enqueue; eight verified producers are added for LoopbackInternal only. Delivery verbs and v3 callsite migration status are unchanged.)
@@ -26,6 +34,12 @@
 > `AlreadyStopping` reaction-control reply reason. The live
 > `QueuedCardPostFailed` referenced lifecycle notice, its outbound-v3 delivery
 > path, dedup identity, and every remaining callsite are unchanged.)
+>
+> Last refreshed: 2026-07-16 (#4248/#4329 review follow-up —
+> `router/intake_gate/queue_effects.rs` adds `QueueReactionFailed` as a second
+> `send_reaction_control_reply` reason when the reaction-only queue marker cannot
+> be delivered. It reuses the existing referenced outbound-v3 lifecycle notice
+> path and stable per-message correlation id; no new direct Serenity send exists.)
 
 > Last refreshed: 2026-07-11 (#4438 — the test-only default-OFF long-chunk
 > delivery-record check now holds the shared test-environment lock and resolves
@@ -129,6 +143,8 @@ and caller-class tests, and this coverage page in the same change.
 
 `DeliveryOutcome::Delivered` replace metadata is additive: `FreshFallbackAfterEditFailure` carries the fallback replacement anchor when Discord returns one, so A6a recovery can re-record D1 idempotency while non-recovery owners continue to ignore the extra field.
 
+For A4 watcher anchored short-replace, #4508 splits edit from fallback-send authority. Both the controller adapter and retained legacy branch capture the watcher transcript path/generation before the edit await, keep the same `DeliveryLease` across edit, durable recheck, and possible fallback, and issue a fresh POST only when the locked path/generation/EOF/frontier snapshot does not prove the range committed. A proven concurrent commit returns `AlreadyCommittedAfterEditFailure`; its stale-placeholder cleanup uses the shared delivered-anchor-aware guard and clears placeholder/orphan tracking only after deletion commits. Thus controller and legacy paths have the same fail-open transport and lifecycle boundary without introducing a new callsite category.
+
 `outbound/mod.rs` re-exports the v3 message/policy/result and shared
 transport primitives. New production callsites should import
 `outbound::delivery::deliver_outbound` explicitly.
@@ -202,7 +218,7 @@ These callsites already use the unified delivery engine. Rows marked
 | `src/services/discord/task_notification_delivery/gateway.rs` via `gateway/outbound_messages.rs` | durable task-notification cards | **migrated_v3**. Create uses the row's stable nonce with enforcement; edit returns a classified confirmed-missing result only for structured Discord `404/10008`. The PG card authority, not the process deduper, decides create/edit/replacement ownership. |
 | `src/services/discord/formatting/long_send_rollback.rs` via `http.rs` | durable task-response replies | **nonce-hardened required-reference compatibility path**. Sink and watcher share the exact `response_turn_key`; each physical reply chunk derives a distinct stable nonce and sets `enforce_nonce=true`. A retry after Discord POST success but response `sent`-CAS failure reconciles the returned message id instead of duplicating the reply. |
 | `src/services/discord/gateway.rs:400` (`TurnGateway::{send_message, edit_message}`) | turn-bridge messages/edits | **migrated_v3 transitively via gateway**. Used for handoff, rollover freeze, snapshot, stable update, and terminal edit. |
-| `src/services/discord/router/intake_gate.rs` (`send_reaction_control_reply`) | reaction-control lifecycle replies | **migrated_v3**. Short fixed replies for queued-card POST fallback and duplicate stop now use referenced v3 lifecycle notices. Correlation = `intake-reaction-control:<channel_id>:<message_id>`, semantic = `intake-reaction-control:<channel_id>:<message_id>:<reason_key>`. |
+| `src/services/discord/outbound/reaction_control.rs` (`send_reaction_control_reply_http`) | reaction-control lifecycle replies | **migrated_v3 and nonce-hardened**. Queued-card POST and queue-reaction failure fallbacks use referenced v3 lifecycle notices. Correlation = `intake-reaction-control:<channel_id>:<message_id>`, semantic = `intake-reaction-control:<channel_id>:<message_id>:<reason_key>`; the same identity derives an enforced stable Discord create nonce for bounded replay suppression across process-local deduper restarts. |
 | `src/services/discord/monitoring_status.rs:115` (`deliver_monitoring_status`) | monitoring status | **migrated_v3**. Status banner send + edit with `preserve_inline_content`; edits use `without_idempotency()`. |
 | `src/services/discord/meeting_orchestrator.rs:754, 796` (`meeting_outbound_message` / edit path) | meeting status / cancel / parse-error | **migrated_v3**. Stable meeting dedup metadata plus `OutboundOperation::Edit`. |
 | `src/services/routines/discord_log.rs:486, 531` (`deliver_or_update_discord_summary`) | routine Discord summary | **migrated_v3**. Uses direct v3 send/edit and disables semantic dedupe for repeated summary writes. |
@@ -397,9 +413,14 @@ button hits the manual outbound API, which is covered under §3.A
   `response_reply_nonce_reconciles_after_sent_cas_failure_and_lease_takeover_pg`
   pin per-chunk reply nonces, required references, and the POST-success / failed
   `sent`-CAS / expired-lease takeover boundary without a second physical reply.
-- `src/services/discord/outbound/reaction_control.rs`:
-  `reaction_control_reply_ids_are_stable_per_message_and_reason` verifies the
-  reaction-control lifecycle replies keep stable correlation and semantic ids.
+- `src/services/discord/outbound/reaction_control.rs`,
+  `src/services/discord/outbound/serenity_reference.rs`, and
+  `src/services/discord/outbound/delivery.rs`:
+  `reaction_control_reply_ids_are_stable_for_queued_card_failure`,
+  `lifecycle_notice_nonce_is_stable_and_semantic_event_scoped`, and
+  `v3_referenced_send_preserves_reference_and_dedupes` verify stable lifecycle
+  identity, reason-scoped enforced nonce reuse, and reference preservation across
+  a fresh process-local deduper retry.
 - `src/services/discord/turn_bridge/mod.rs`:
   `final_completion_delivery_stays_blocked_until_terminal_message_commits`
   verifies final completion delivery remains blocked until the terminal Discord
@@ -415,6 +436,19 @@ button hits the manual outbound API, which is covered under §3.A
 - `src/services/discord/outbound/manual_delivery.rs`:
   #3807 keeps the manual over-limit notification path on the compatibility
   chunk shim while adding compact continuation context to each split message.
+- `src/services/discord/outbound/completed_turn_ledger.rs` and
+  `src/services/discord/outbound/delivery_record.rs` (#4564): the durable
+  completed-turn ledger is appended ONLY from the `shadow_mirror_delivered_frontier`
+  terminal-delivery funnel (and the recovery `record_durable_frontier` bypass), gated
+  on `is_delivered`, so the catch-up TooOld gate can suppress a false restart-gap
+  notice for an already-answered inbound message.
+  `ledger_append_keys_by_delivery_channel_not_watcher_owner_4564` pins the
+  channel-split invariant: the ledger keys by the DELIVERY channel and records the
+  delivered turn's EXPLICIT inbound `user_msg_id` (passed by the bridge/commit call
+  site from the turn snapshot), never a commit-time reload of the offset-authority
+  `watcher_owner_channel_id` — whose preserved inflight row is an unanswered turn
+  that a reload would false-Settle (silent-loss vector). The same-channel
+  sink/watcher callers pass `None`, keeping `session_relay_sink.rs` untouched.
 
 ## 6. Guardrail proposal (DoD #4)
 
@@ -590,3 +624,16 @@ changing runtime behavior.
 > Last refreshed: 2026-07-08 (#4218 — tracing log field key rename only across outbound (`channel =` -> `channel_id =` / shorthand); no delivery verb / API / callsite coverage change.)
 
 > Last refreshed: 2026-07-13 (#4225 S2 — routed `send` target grammar is shared by CLI help, resolver failures, and API errors; unsupported colon-prefixed targets are rejected before alias lookup. No outbound delivery verb, transport, or callsite coverage change.)
+
+> Last refreshed: 2026-07-18 (#4486 — outbound send-bot identity is now typed via the extracted `discord::bot_role::UtilityBotRole` enum ({Announce, Notify} with `alias()`/`from_alias()`); `outbound/manual_delivery.rs`, `send_api.rs`, `send_gate.rs`, and `send_to_agent.rs` swap raw announce/notify bot alias strings for `UtilityBotRole::_.alias()`. This is a pure identifier-typing refactor — no delivery verb, transport, dedup identity, target grammar, or callsite coverage change; the production callsite coverage map is unchanged.)
+> Last refreshed: 2026-07-18 (#4046 S1r-1 — `outbound/turn_output_controller.rs` gains a pure-add anchor-less `OutputPlan::SendFresh { range, reference, record }` verb (body threaded via `TurnOutputCtx::body`), housed in the new child module `turn_output_controller/fresh_send.rs`. It is NOT wired to any live owner path yet (dormant; zero production caller), so the production callsite coverage map is unchanged. NoRange is deliver-without-advance: it never invokes the owner `advance` callback, and its body-byte-length pseudo-range is process-local lease serialization only, not offset authority. NoRange records neither durable frontier nor terminal anchor; its current-generation retry fingerprint lives under the dedicated `runtime/discord_fresh_send_records` namespace, physically separate from the watcher-shared `discord_delivery_records` suppression authority. Both range and NoRange refuse a mismatch between the actual POST channel and the record channel before fingerprint lookup, lease acquire, or transport. A confirmed fresh POST returns the explicit `FreshDelivered { committed_to, persistence_recorded }` outcome, so a missing generation marker or frontier/fingerprint write failure is never hidden as ordinary `Delivered`; `committed_to: None` identifies NoRange while `Some(end)` identifies a successfully advanced real range.)
+
+> Last refreshed: 2026-07-18 (#4046 S1r-1 P2 — the sink-side classifier for the (dormant) fresh-send outcome now lives in `session_relay_sink/delivery_outcome_classify.rs`: a `FreshDelivered` short-replace controller outcome (unreachable this stage) maps to `RelaySinkError::Permanent`, mirroring `tmux_watcher/terminal_send.rs`'s conservative non-retry `Skipped`; every other non-delivery stays retriable `Transient`. **This `Permanent` mapping is INTENT-ONLY and does NOT by itself prevent a duplicate POST.** The current sink consumer is error-variant-blind: `stream_relay.rs::deliver_frame` folds `Transient` and `Permanent` into one sink-error marker, and §3.2 reconciliation (`session_bound_ack.rs`) re-POSTs via SendFull whenever `committed < end` regardless of the error variant. The real duplicate vector is that §3.2 `committed < end` SendFull, not a blind sink retry (the original P2 "Transient triggers a blind retry" framing was inaccurate). Actual duplicate-POST prevention is deferred to the S1r-2~5 cutover, which must guarantee `committed == end` or make the consumer honor the error variant — tracked in issue #4623. No delivery verb / API / callsite coverage change; the arm is dormant with zero production caller.)
+
+> Last refreshed: 2026-07-20 (#4657 — outbound send path gains an opt-in `record_transcript` param (snake/camel accepted) threaded HTTP JSON → `handle_send_with_caller` → `ManualOutboundOptions` → `send_gate.rs::send_resolved_manual_message_with_client` → `manual_delivery.rs`. When set (routine channel posts only; default off), after a confirmed `ManualDeliveryOutcome::Sent` the target-channel post is recorded to `session_transcripts` via `persist_turn_db` as a synthetic non-empty turn pair (user=`(routine <label> posted)`, assistant=post body, provider=`routine`, deterministic turn_id `manual-discord:<channel_id>:<message_id>` → ON CONFLICT upsert dedup) so standing-session `channel_recent_context` inherits it. Transcript-record failure only warns and never reverts delivery success. This is an additive opt-in side-effect after delivery: no delivery verb, transport, dedup identity, or target grammar change; utility/status-panel sends stay default-off and unrecorded, so the production callsite coverage map is unchanged.)
+
+> Last refreshed: 2026-07-24 (#4841 — same-path Claude `/compact` recovery adds a conditional durable-frontier reanchor in `outbound/delivery_record.rs`. The idle relay snapshots the exact current-generation frontier END that proved `END > EOF`; under the existing record flock, the reanchor lowers the END only when generation and END still match that snapshot. A concurrent confirmed delivery that replaces/advances the frontier therefore wins and makes the stale reanchor a no-op. This is coordinate-space repair only: it adds no delivery verb, transport, retry, or direct-send callsite, and preserves the frontier's attempt and terminal-anchor metadata.)
+
+> Last refreshed: 2026-07-24 (#4533 — the optional manual-delivery transcript record explicitly opts out of the interactive `/clear` turn-start fence because it is a synthetic post-delivery pair, not an in-flight user turn. No delivery verb, transport, dedup identity, target grammar, or callsite coverage changed.)
+
+> Last refreshed: 2026-07-29 (#4911/#4961 Phase A R9 — `outbound/delivery_record.rs` gains `WatcherDeliveryRecordAuthority` (frontier token + lease-time reset incarnation + source generation + pinned nonzero ledger user_msg_id) threaded into `record_watcher_terminal_delivery` → `shadow_mirror_delivered_frontier_inner`. Watcher and session-sink terminal deliveries now capture that immutable source identity BEFORE transport and re-verify it inside the frontier mutation guard, so a POST that landed after its source generation/incarnation was replaced advances nothing and records no fingerprint/ledger side effect (reported as `LandedStale`); a landed POST whose durable record write fails is reported as `LandedUnrecorded` instead of a silent `Delivered`. No new delivery verb, transport, target grammar, or dedup identity: the production callsite coverage map is unchanged — the same callsites now route their advance/record/fingerprint epilogue through the single guarded funnel instead of independent ambient writes.)

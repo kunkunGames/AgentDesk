@@ -115,6 +115,7 @@ pub(in crate::services::discord) fn recovery_short_replace_should_cutover(
 /// inject a fake driving the REAL controller. `Replace { Active }` keeps
 /// `post_send_finalize` a no-op (the replace IS the edit); `NoLease` means no
 /// lease/heartbeat/double-acquire (transport-only).
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn deliver_recovery_replace_via_controller<G>(
     gateway: &G,
     shared: &Arc<SharedData>,
@@ -165,6 +166,7 @@ where
 /// closure yielding a fixed [`super::shared::ChannelProbeVerdict`] so the
 /// `DeliveryOutcome → RecoveryRelayOutcome` map (incl. the probe escalation) is
 /// exercised through the REAL controller without a live Discord client.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_recovery_replace_via_controller_with_probe<G, F, Fut>(
     gateway: &G,
     shared: &Arc<SharedData>,
@@ -281,7 +283,7 @@ mod tests {
     use super::*;
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::gateway::{GatewayFuture, TurnGateway};
-    use crate::services::discord::inflight;
+    use crate::services::discord::inflight::{self, opt_channel_id, opt_message_id};
     use crate::services::discord::make_shared_data_for_tests;
     use crate::services::discord::outbound::delivery_frontier_probe;
     use crate::services::discord::recovery_paths::shared::ChannelProbeVerdict;
@@ -400,6 +402,9 @@ mod tests {
             _i: &'a crate::services::discord::Intervention,
             _o: &'a str,
             _h: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             panic!("unused TurnGateway method on the recovery short-replace path")
         }
@@ -604,7 +609,8 @@ mod tests {
             &state,
             Some((128, 256)),
             shared.restart.current_generation,
-        );
+        )
+        .expect("non-zero test channel id");
         let gateway = RecoveryFakeGateway::new(
             ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "404 stale anchor".to_string(),
@@ -618,8 +624,8 @@ mod tests {
                 &gateway,
                 &shared,
                 &provider,
-                ChannelId::new(state.channel_id),
-                MessageId::new(state.current_msg_id),
+                opt_channel_id(state.channel_id).expect("non-zero test channel id"),
+                opt_message_id(state.current_msg_id).expect("non-zero test message id"),
                 "answer",
                 Some(&context),
                 || async move { ChannelProbeVerdict::Gone },
@@ -637,7 +643,8 @@ mod tests {
         );
         let anchor = delivery_frontier_probe::current_generation_delivered_anchor(
             &provider,
-            ChannelId::new(state.delivery_record_owner_channel_id()),
+            opt_channel_id(state.delivery_record_owner_channel_id())
+                .expect("non-zero test record channel id"),
             tmux,
             Some(u64::MAX),
         )

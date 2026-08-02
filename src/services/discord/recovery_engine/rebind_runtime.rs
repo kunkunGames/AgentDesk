@@ -397,6 +397,7 @@ fn persist_codex_tui_rebind_rollout_cursor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_codex_tui_rebind_relay_output(
     tmux_session_name: &str,
     rollout_path: &str,
@@ -474,7 +475,7 @@ pub(super) fn spawn_codex_tui_rebind_relay_output(
             let tail_handle = std::thread::Builder::new()
                 .name("codex_tui_rebind_rollout_tail".to_string())
                 .spawn(move || {
-                    crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset(
+                    crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset_for_tmux(
                         &tail_rollout_path,
                         raw_start_offset,
                         tail_session_id.as_deref(),
@@ -487,6 +488,7 @@ pub(super) fn spawn_codex_tui_rebind_relay_output(
                                     &tail_tmux_session_name,
                                 )
                         },
+                        &tail_tmux_session_name,
                     )
                 });
 
@@ -919,7 +921,8 @@ fn codex_rebind_stream_message_json(
             "cache_read_input_tokens": cache_read_tokens,
             "output_tokens": output_tokens,
         })),
-        crate::services::agent_protocol::StreamMessage::StatusEvents { .. }
+        crate::services::agent_protocol::StreamMessage::ActiveUsageSnapshot { .. }
+        | crate::services::agent_protocol::StreamMessage::StatusEvents { .. }
         | crate::services::agent_protocol::StreamMessage::RetryBoundary
         | crate::services::agent_protocol::StreamMessage::TmuxReady { .. }
         | crate::services::agent_protocol::StreamMessage::RuntimeReady { .. }
@@ -1017,6 +1020,17 @@ mod tests {
         crate::services::tui_prompt_dedupe::TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[test]
+    fn active_usage_snapshot_is_non_renderable_in_rebind_output() {
+        let message = crate::services::agent_protocol::StreamMessage::ActiveUsageSnapshot {
+            model: Some("routed-sonnet[1m]".to_string()),
+            input_tokens: 560_000,
+            cache_create_tokens: 0,
+            cache_read_tokens: 0,
+        };
+        assert_eq!(codex_rebind_stream_message_json(message), None);
     }
 
     fn write_codex_tui_runtime_marker(tmux_session_name: &str) {

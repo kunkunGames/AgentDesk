@@ -63,6 +63,11 @@ const DEFAULT_ASSISTANT_RESPONSE_DEADLINE_SECS: u64 = 30 * 60;
 /// lifecycle event is well past any realistic tool runtime — at that point
 /// we surface a terminal Done so the bridge can advance.
 const DEFAULT_PENDING_TOOL_CALL_DEADLINE_SECS: u64 = 5 * 60;
+/// A fresh pane marker may extend pending-tool recovery, but never indefinitely.
+/// Two additional minutes start only after the five-minute inactivity deadline,
+/// covering normal foreground commands that typically finish within seconds or
+/// tens of seconds while still forcing a wedged TUI turn to fail open.
+const DEFAULT_PANE_BUSY_VETO_CAP_SECS: u64 = 2 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutTailOutcome {
@@ -80,7 +85,6 @@ pub struct CodexTuiTailResult {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
 pub struct RolloutTailOptions {
     pub wait_for_rollout: Duration,
     pub terminal_drain: Duration,
@@ -122,6 +126,13 @@ pub struct RolloutTailOptions {
     /// the tail keeps a turn-local copy until the matching rollout user
     /// message is observed.
     pub discord_origin_prompt: Option<String>,
+    /// Optional pane-busy probe. Only `Fresh` vetoes the pending-tool recovery
+    /// Done; idle, expired, and unavailable evidence preserve the legacy
+    /// fail-open completion behavior.
+    pub pane_busy_probe: Option<Box<dyn FnMut() -> super::input::CodexPaneBusySignal + Send>>,
+    /// Hard wall-clock cap for the continuous `Fresh` veto interval after the
+    /// pending-tool deadline. Once reached, recovery fails open to `Done`.
+    pub pane_busy_veto_cap: Duration,
 }
 
 impl Default for RolloutTailOptions {
@@ -140,6 +151,8 @@ impl Default for RolloutTailOptions {
             apply_pending_tool_deadline_without_assistant_text: true,
             tmux_session_name: None,
             discord_origin_prompt: None,
+            pane_busy_probe: None,
+            pane_busy_veto_cap: Duration::from_secs(DEFAULT_PANE_BUSY_VETO_CAP_SECS),
         }
     }
 }
@@ -163,6 +176,14 @@ pub(crate) fn rollout_file_matches_cwd(rollout_path: &Path, cwd: &Path) -> bool 
     rollout_session_cwd_matches(rollout_path, &canonical_cwd)
 }
 
+fn pane_busy_probe_for_tmux(
+    tmux_session_name: &str,
+) -> Box<dyn FnMut() -> super::input::CodexPaneBusySignal + Send> {
+    let tmux_session_name = tmux_session_name.to_string();
+    let mut tracker = super::input::CodexPaneBusySignalTracker::default();
+    Box::new(move || tracker.probe_tmux(&tmux_session_name))
+}
+
 pub fn tail_latest_rollout_for_cwd_with_handoff_for_tmux(
     cwd: &Path,
     modified_since: SystemTime,
@@ -175,6 +196,7 @@ pub fn tail_latest_rollout_for_cwd_with_handoff_for_tmux(
     let mut options = RolloutTailOptions::default();
     options.tmux_session_name = Some(tmux_session_name.to_string());
     options.discord_origin_prompt = discord_origin_prompt.map(ToString::to_string);
+    options.pane_busy_probe = Some(pane_busy_probe_for_tmux(tmux_session_name));
     tail_latest_rollout_for_cwd_with_handoff_options(
         cwd,
         modified_since,
@@ -211,21 +233,14 @@ fn tail_latest_rollout_for_cwd_with_handoff_options(
         rollout_session_id.as_deref(),
         Some(0),
     );
-    tail_rollout_file_until_assistant_response(
+    tail_rollout_file_until_assistant_response_with_pane_busy_probe(
         &rollout_path,
         0,
         None,
         &sender,
         cancel_token,
         is_alive,
-        options.terminal_drain,
-        options.assistant_response_deadline,
-        options.pending_tool_call_deadline,
-        options.enable_task_complete_fast_path,
-        options.legacy_terminal_drain,
-        options.apply_pending_tool_deadline_without_assistant_text,
-        options.tmux_session_name,
-        options.discord_origin_prompt,
+        options,
     )
     .map(|(read_result, outcome)| CodexTuiTailResult {
         read_result,
@@ -273,22 +288,56 @@ pub fn tail_rollout_file_from_offset(
     cancel_token: Option<Arc<CancelToken>>,
     is_alive: impl FnMut() -> bool,
 ) -> Result<ReadOutputResult, String> {
-    let defaults = RolloutTailOptions::default();
-    tail_rollout_file_until_assistant_response(
+    tail_rollout_file_from_offset_with_pane_busy_probe(
+        rollout_path,
+        start_offset,
+        session_id,
+        sender,
+        cancel_token,
+        is_alive,
+        None,
+    )
+}
+
+pub fn tail_rollout_file_from_offset_for_tmux(
+    rollout_path: &Path,
+    start_offset: u64,
+    session_id: Option<&str>,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<Arc<CancelToken>>,
+    is_alive: impl FnMut() -> bool,
+    tmux_session_name: &str,
+) -> Result<ReadOutputResult, String> {
+    tail_rollout_file_from_offset_with_pane_busy_probe(
+        rollout_path,
+        start_offset,
+        session_id,
+        sender,
+        cancel_token,
+        is_alive,
+        Some(pane_busy_probe_for_tmux(tmux_session_name)),
+    )
+}
+
+fn tail_rollout_file_from_offset_with_pane_busy_probe(
+    rollout_path: &Path,
+    start_offset: u64,
+    session_id: Option<&str>,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<Arc<CancelToken>>,
+    is_alive: impl FnMut() -> bool,
+    pane_busy_probe: Option<Box<dyn FnMut() -> super::input::CodexPaneBusySignal + Send>>,
+) -> Result<ReadOutputResult, String> {
+    let mut defaults = RolloutTailOptions::default();
+    defaults.pane_busy_probe = pane_busy_probe;
+    tail_rollout_file_until_assistant_response_with_pane_busy_probe(
         rollout_path,
         start_offset,
         session_id.map(ToString::to_string),
         &sender,
         cancel_token,
         is_alive,
-        defaults.terminal_drain,
-        defaults.assistant_response_deadline,
-        defaults.pending_tool_call_deadline,
-        defaults.enable_task_complete_fast_path,
-        defaults.legacy_terminal_drain,
-        defaults.apply_pending_tool_deadline_without_assistant_text,
-        defaults.tmux_session_name,
-        defaults.discord_origin_prompt,
+        defaults,
     )
     .map(|result| result.0)
 }
@@ -320,23 +369,17 @@ pub fn tail_warm_followup_rollout_for_tmux(
     let options = RolloutTailOptions {
         tmux_session_name: Some(tmux_session_name.to_string()),
         discord_origin_prompt: Some(discord_origin_prompt.to_string()),
+        pane_busy_probe: Some(pane_busy_probe_for_tmux(tmux_session_name)),
         ..RolloutTailOptions::default()
     };
-    tail_rollout_file_until_assistant_response(
+    tail_rollout_file_until_assistant_response_with_pane_busy_probe(
         rollout_path,
         start_offset,
         Some(session_id.to_string()),
         &sender,
         cancel_token,
         is_alive,
-        options.terminal_drain,
-        options.assistant_response_deadline,
-        options.pending_tool_call_deadline,
-        options.enable_task_complete_fast_path,
-        options.legacy_terminal_drain,
-        options.apply_pending_tool_deadline_without_assistant_text,
-        options.tmux_session_name,
-        options.discord_origin_prompt,
+        options,
     )
     .map(|(read_result, outcome)| CodexTuiTailResult {
         read_result,
@@ -346,6 +389,7 @@ pub fn tail_warm_followup_rollout_for_tmux(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn tail_resumed_rollout_for_session_with_handoff_for_tmux(
     cwd: &Path,
     session_id: &str,
@@ -363,6 +407,7 @@ pub fn tail_resumed_rollout_for_session_with_handoff_for_tmux(
     let mut options = RolloutTailOptions::default();
     options.tmux_session_name = Some(tmux_session_name.to_string());
     options.discord_origin_prompt = discord_origin_prompt.map(ToString::to_string);
+    options.pane_busy_probe = Some(pane_busy_probe_for_tmux(tmux_session_name));
     tail_resumed_rollout_for_session_with_handoff_options(
         cwd,
         session_id,
@@ -380,6 +425,7 @@ pub fn tail_resumed_rollout_for_session_with_handoff_for_tmux(
 // #3034: test-only — the non-handoff resumed-tail variant is exercised by the
 // resume regression tests; production uses the `_with_handoff_for_tmux` form.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn tail_resumed_rollout_for_session_with_options(
     cwd: &Path,
     session_id: &str,
@@ -407,6 +453,7 @@ fn tail_resumed_rollout_for_session_with_options(
     .map(|result| result.read_result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tail_resumed_rollout_for_session_with_handoff_options(
     cwd: &Path,
     session_id: &str,
@@ -442,21 +489,14 @@ fn tail_resumed_rollout_for_session_with_handoff_options(
         Some(start_offset),
     );
     let known_session_id = (start_offset > 0).then(|| session_id.to_string());
-    tail_rollout_file_until_assistant_response(
+    tail_rollout_file_until_assistant_response_with_pane_busy_probe(
         &rollout_path,
         start_offset,
         known_session_id,
         &sender,
         cancel_token,
         is_alive,
-        options.terminal_drain,
-        options.assistant_response_deadline,
-        options.pending_tool_call_deadline,
-        options.enable_task_complete_fast_path,
-        options.legacy_terminal_drain,
-        options.apply_pending_tool_deadline_without_assistant_text,
-        options.tmux_session_name,
-        options.discord_origin_prompt,
+        options,
     )
     .map(|(read_result, outcome)| CodexTuiTailResult {
         read_result,
@@ -521,6 +561,7 @@ fn wait_for_latest_rollout_for_cwd(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_resumed_rollout_for_session(
     cwd: &Path,
     session_id: &str,
@@ -750,13 +791,14 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tail_rollout_file_until_assistant_response(
     rollout_path: &Path,
     start_offset: u64,
     initial_session_id: Option<String>,
     sender: &Sender<StreamMessage>,
     cancel_token: Option<Arc<CancelToken>>,
-    mut is_alive: impl FnMut() -> bool,
+    is_alive: impl FnMut() -> bool,
     terminal_drain: Duration,
     assistant_response_deadline: Option<Duration>,
     pending_tool_call_deadline: Option<Duration>,
@@ -766,6 +808,49 @@ fn tail_rollout_file_until_assistant_response(
     tmux_session_name: Option<String>,
     discord_origin_prompt: Option<String>,
 ) -> Result<(ReadOutputResult, RolloutTailOutcome), String> {
+    tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+        rollout_path,
+        start_offset,
+        initial_session_id,
+        sender,
+        cancel_token,
+        is_alive,
+        RolloutTailOptions {
+            terminal_drain,
+            assistant_response_deadline,
+            pending_tool_call_deadline,
+            enable_task_complete_fast_path,
+            legacy_terminal_drain,
+            apply_pending_tool_deadline_without_assistant_text,
+            tmux_session_name,
+            discord_origin_prompt,
+            ..RolloutTailOptions::default()
+        },
+    )
+}
+
+fn tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+    rollout_path: &Path,
+    start_offset: u64,
+    initial_session_id: Option<String>,
+    sender: &Sender<StreamMessage>,
+    cancel_token: Option<Arc<CancelToken>>,
+    mut is_alive: impl FnMut() -> bool,
+    options: RolloutTailOptions,
+) -> Result<(ReadOutputResult, RolloutTailOutcome), String> {
+    let RolloutTailOptions {
+        terminal_drain,
+        assistant_response_deadline,
+        pending_tool_call_deadline,
+        enable_task_complete_fast_path,
+        legacy_terminal_drain,
+        apply_pending_tool_deadline_without_assistant_text,
+        tmux_session_name,
+        discord_origin_prompt,
+        mut pane_busy_probe,
+        pane_busy_veto_cap,
+        ..
+    } = options;
     let mut file = std::fs::File::open(rollout_path)
         .map_err(|error| format!("open Codex rollout {}: {error}", rollout_path.display()))?;
     let file_len = file
@@ -786,6 +871,7 @@ fn tail_rollout_file_until_assistant_response(
     let mut partial_line = Vec::new();
     let mut buf = [0u8; 8192];
     let mut last_output_at: Option<Instant> = None;
+    let mut pane_busy_veto_started_at: Option<Instant> = None;
     let started_at = Instant::now();
     let mut hook_events = crate::services::claude_tui::hook_server::subscribe_hook_events();
     // #2172 cancel boundary: wrap the raw sender so any send after the
@@ -883,6 +969,34 @@ fn tail_rollout_file_until_assistant_response(
                     && let Some(deadline) = pending_tool_call_deadline
                     && last_output_at.is_some_and(|at| at.elapsed() >= deadline)
                 {
+                    let busy_signal = pane_busy_probe
+                        .as_mut()
+                        .map_or(super::input::CodexPaneBusySignal::Unavailable, |probe| {
+                            probe()
+                        });
+                    if busy_signal == super::input::CodexPaneBusySignal::Fresh {
+                        let veto_started_at =
+                            *pane_busy_veto_started_at.get_or_insert_with(Instant::now);
+                        if veto_started_at.elapsed() < pane_busy_veto_cap {
+                            tracing::debug!(
+                                rollout_path = %rollout_path.display(),
+                                pending_keyed = state.pending_tool_calls.len(),
+                                pending_unkeyed = state.pending_tool_calls_unkeyed,
+                                veto_elapsed_ms = veto_started_at.elapsed().as_millis(),
+                                veto_cap_ms = pane_busy_veto_cap.as_millis(),
+                                "Codex rollout tail kept pending tool call open because the pane busy signal is fresh"
+                            );
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                        tracing::warn!(
+                            rollout_path = %rollout_path.display(),
+                            veto_elapsed_ms = veto_started_at.elapsed().as_millis(),
+                            veto_cap_ms = pane_busy_veto_cap.as_millis(),
+                            "Codex pane-busy veto reached its hard cap; failing open to pending-tool recovery"
+                        );
+                    }
+
                     let elapsed_secs = last_output_at
                         .map(|at| at.elapsed().as_secs())
                         .unwrap_or_default();
@@ -1806,6 +1920,8 @@ mod tests {
                 apply_pending_tool_deadline_without_assistant_text: true,
                 tmux_session_name: None,
                 discord_origin_prompt: None,
+                pane_busy_probe: None,
+                pane_busy_veto_cap: Duration::from_secs(DEFAULT_PANE_BUSY_VETO_CAP_SECS),
             },
         )
         .unwrap();
@@ -1867,6 +1983,8 @@ mod tests {
                 apply_pending_tool_deadline_without_assistant_text: true,
                 tmux_session_name: None,
                 discord_origin_prompt: None,
+                pane_busy_probe: None,
+                pane_busy_veto_cap: Duration::from_secs(DEFAULT_PANE_BUSY_VETO_CAP_SECS),
             },
         )
         .unwrap();
@@ -2767,6 +2885,279 @@ mod tests {
                 "slow launch prompt",
             ),
             crate::services::tui_prompt_dedupe::PromptObservation::SuppressedRecentDuplicate
+        );
+    }
+
+    fn pending_tool_rollout() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-stuck.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"stuck-tool","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"never_returns","arguments":"{}","call_id":"c-stuck"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        (dir, rollout)
+    }
+
+    #[test]
+    fn fresh_pane_busy_signal_vetoes_pending_tool_deadline_done() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let path = rollout.clone();
+        let handle = std::thread::spawn(move || {
+            tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+                &path,
+                0,
+                None,
+                &tx,
+                None,
+                || true,
+                RolloutTailOptions {
+                    terminal_drain: Duration::from_secs(60),
+                    assistant_response_deadline: Some(Duration::from_secs(60)),
+                    pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                    legacy_terminal_drain: None,
+                    pane_busy_probe: Some(Box::new(move || {
+                        if cancel_rx.try_recv().is_ok() {
+                            super::super::input::CodexPaneBusySignal::Idle
+                        } else {
+                            super::super::input::CodexPaneBusySignal::Fresh
+                        }
+                    })),
+                    ..RolloutTailOptions::default()
+                },
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(250));
+        let early = rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            early
+                .iter()
+                .all(|message| !matches!(message, StreamMessage::Done { .. })),
+            "fresh pane-busy evidence must veto deadline Done: {early:?}"
+        );
+
+        cancel_tx.send(()).unwrap();
+        let (result, _outcome) = handle.join().unwrap().unwrap();
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn elapsed_only_busy_marker_changes_expire_and_emit_done() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let mut tracker = super::super::input::CodexPaneBusySignalTracker::with_freshness(
+            Duration::from_millis(150),
+        );
+        let elapsed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let elapsed_probe = elapsed.clone();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            || true,
+            RolloutTailOptions {
+                terminal_drain: Duration::from_secs(60),
+                assistant_response_deadline: Some(Duration::from_secs(60)),
+                pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                legacy_terminal_drain: None,
+                pane_busy_probe: Some(Box::new(move || {
+                    let seconds = elapsed_probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tracker.observe_capture_at(
+                        &format!("• Working ({seconds}s • esc to interrupt)"),
+                        Instant::now(),
+                    )
+                })),
+                pane_busy_veto_cap: Duration::from_secs(1),
+                ..RolloutTailOptions::default()
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(elapsed.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let started_at = Instant::now();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            || true,
+            RolloutTailOptions {
+                terminal_drain: Duration::from_secs(60),
+                assistant_response_deadline: Some(Duration::from_secs(60)),
+                pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                legacy_terminal_drain: None,
+                pane_busy_probe: Some(Box::new(move || {
+                    probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    super::super::input::CodexPaneBusySignal::Fresh
+                })),
+                pane_busy_veto_cap: Duration::from_millis(250),
+                ..RolloutTailOptions::default()
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(
+            probes.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the hard cap must allow multiple fresh veto probes"
+        );
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(250),
+            "the hard cap must retain the short normal-busy grace window"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "an always-fresh probe must not hang the tailer"
+        );
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn short_foreground_busy_veto_survives_until_completion() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let path = rollout.clone();
+        let handle = std::thread::spawn(move || {
+            tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+                &path,
+                0,
+                None,
+                &tx,
+                None,
+                || true,
+                RolloutTailOptions {
+                    terminal_drain: Duration::from_secs(60),
+                    assistant_response_deadline: Some(Duration::from_secs(60)),
+                    pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                    legacy_terminal_drain: None,
+                    pane_busy_probe: Some(Box::new(|| {
+                        super::super::input::CodexPaneBusySignal::Fresh
+                    })),
+                    pane_busy_veto_cap: Duration::from_secs(2),
+                    ..RolloutTailOptions::default()
+                },
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            rx.try_iter()
+                .all(|message| !matches!(message, StreamMessage::Done { .. })),
+            "normal foreground work must remain vetoed before completion"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap()
+            .write_all(
+                br#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c-stuck","output":"ok"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+"#,
+            )
+            .unwrap();
+
+        let (result, _outcome) = handle.join().unwrap().unwrap();
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn idle_pane_signal_allows_pending_tool_deadline_done() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            || true,
+            RolloutTailOptions {
+                terminal_drain: Duration::from_secs(60),
+                assistant_response_deadline: Some(Duration::from_secs(60)),
+                pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                legacy_terminal_drain: None,
+                pane_busy_probe: Some(Box::new(|| super::super::input::CodexPaneBusySignal::Idle)),
+                ..RolloutTailOptions::default()
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn expired_pane_busy_signal_allows_pending_tool_deadline_done() {
+        let (_dir, rollout) = pending_tool_rollout();
+        let (tx, rx) = mpsc::channel();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response_with_pane_busy_probe(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            || true,
+            RolloutTailOptions {
+                terminal_drain: Duration::from_secs(60),
+                assistant_response_deadline: Some(Duration::from_secs(60)),
+                pending_tool_call_deadline: Some(Duration::from_millis(100)),
+                legacy_terminal_drain: None,
+                pane_busy_probe: Some(Box::new(|| {
+                    super::super::input::CodexPaneBusySignal::Expired
+                })),
+                ..RolloutTailOptions::default()
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        assert!(
+            rx.iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
         );
     }
 

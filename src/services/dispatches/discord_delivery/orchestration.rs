@@ -300,7 +300,9 @@ pub(crate) struct HttpDispatchTransport {
 impl HttpDispatchTransport {
     pub(crate) fn from_runtime_with_pg(pg_pool: Option<PgPool>) -> Self {
         Self {
-            announce_bot_token: crate::credential::read_bot_token("announce"),
+            announce_bot_token: crate::credential::read_bot_token(
+                crate::services::discord::bot_role::UtilityBotRole::Announce.alias(),
+            ),
             discord_api_base: discord_api_base_url(),
             thread_owner_user_id: resolve_dispatch_thread_owner_user_id(pg_pool.as_ref()),
             pg_pool,
@@ -456,7 +458,9 @@ pub(crate) async fn sync_dispatch_status_reaction_with_pg(
         return Ok(());
     };
 
-    let Some(token) = crate::credential::read_bot_token("announce") else {
+    let Some(token) = crate::credential::read_bot_token(
+        crate::services::discord::bot_role::UtilityBotRole::Announce.alias(),
+    ) else {
         return Err("no announce bot token".to_string());
     };
     let base_url = discord_api_base_url();
@@ -601,6 +605,7 @@ pub(crate) async fn send_dispatch_to_discord_with_pg_result(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_dispatch_to_discord_inner_with_context_pg(
     agent_id: &str,
     title: &str,
@@ -1439,6 +1444,7 @@ fn create_review_decision_followup_dispatch(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_review_result_message_via_http(
     pg_pool: Option<&PgPool>,
     review_dispatch_id: &str,

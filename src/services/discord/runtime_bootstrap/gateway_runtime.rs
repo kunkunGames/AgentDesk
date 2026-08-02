@@ -1,9 +1,9 @@
 use super::*;
 
-/// Start the leader gateway runtime after the singleton lease succeeds.
-/// This is the final `run_bot` tail: restored-state logging, health
-/// registration, poise framework/client construction, gateway-lease keepalive,
-/// SIGTERM handler spawn, and the gateway backend event loop, in that order.
+/// Start the leader gateway runtime after health registration, restart-marker
+/// fencing, and optional intake-worker startup. This final `run_bot` tail owns
+/// framework/client construction, gateway-lease keepalive, the SIGTERM handler,
+/// and the gateway backend event loop, in that order.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bot_start_gateway_runtime(
     token: &str,
@@ -44,11 +44,6 @@ pub(super) async fn run_bot_start_gateway_runtime(
             );
         }
     }
-
-    // Register this provider with the health check registry
-    health_registry
-        .register(provider.as_str().to_string(), shared.clone())
-        .await;
 
     let token_owned = token.to_string();
     let shared_clone = shared.clone();
@@ -118,6 +113,10 @@ pub(super) async fn run_bot_start_gateway_runtime(
         .await
         .expect("Failed to create Discord client");
 
+    // This path is reached only after gateway-role resolution. Standby and
+    // indeterminate runtimes return before framework construction, so the
+    // refresh task remains owned by the active gateway lifecycle.
+    let model_catalog_refresh_task = model_catalog::spawn_claude_model_catalog_refresh(&provider);
     let gateway_lease_task = gateway_lease.map(|lease| {
         run_bot_spawn_gateway_lease_keepalive(
             lease,
@@ -139,6 +138,7 @@ pub(super) async fn run_bot_start_gateway_runtime(
         client,
         &provider_for_error,
         gateway_lease_task,
+        model_catalog_refresh_task,
         startup_reconcile_remaining_for_client_start,
         startup_doctor_started_for_client_start,
         health_registry_for_client_start,

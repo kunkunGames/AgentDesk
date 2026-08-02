@@ -38,7 +38,10 @@ def _strip_html_comments(value):
 
 def _meaningful_field_value(value, *, allow_none=False):
     normalized = _strip_html_comments(value).strip().strip("-–—").strip()
-    if re.match(r"(?i)^[a-z0-9 /_-]+\s*:\s*$", normalized):
+    if re.match(
+        r"(?i)^(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\*\*)?\s*$",
+        normalized,
+    ):
         return False
     placeholders = {"n/a", "todo", "tbd", "na"}
     if not allow_none:
@@ -51,7 +54,11 @@ def _is_markdown_heading(line):
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
         return False
-    return re.match(r"^(?:[-*]\s*)?(?:\*\*)?[a-z0-9 /_-]+\s*:(?:\*\*)?(?:\s.*)?$", line.strip(), re.I)
+    return re.match(
+        r"^(?:[-*]\s*)?(?:\[[ xX]\]\s*)?(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\*\*)?(?:\s.*)?$",
+        line.strip(),
+        re.I,
+    )
 
 def _meaningful_branch_ref(value):
     normalized = value.strip().strip("`").strip(".,;:)]}")
@@ -60,7 +67,7 @@ def _meaningful_branch_ref(value):
 def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_labels=True):
     for label in labels:
         pattern = re.compile(
-            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|(?:\*\*)?[ \t]*)$"
+            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:\[[xX]\][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|[ \t]*)$"
         )
         for match in pattern.finditer(body):
             if _meaningful_field_value(match.group(1) or "", allow_none=allow_none):
@@ -88,49 +95,61 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
                 break
     return False
 
-def has_duplicate_guard_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*duplicate pr guard:\*\*", body):
-        return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "duplicate pr guard",
-            "duplicate-pr guard",
-            "duplicate/overlap check",
-            "overlap check",
-        ],
+def _has_checked_template_ack(body, labels):
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    return bool(
+        re.search(
+            rf"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:{label_pattern})(?::\*\*|\*\*[ \t]*:)",
+            body,
+        )
     )
+
+def has_duplicate_guard_ack(body):
+    labels = [
+        "duplicate pr guard",
+        "duplicate-pr guard",
+        "duplicate/overlap check",
+        "overlap check",
+    ]
+    if _has_checked_template_ack(body, labels):
+        return True
+    return has_non_empty_body_field(body, labels)
 
 def has_no_change_verification_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*no-change verification:\*\*", body):
+    labels = [
+        "no-change verification",
+        "no change verification",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "no-change verification",
-            "no change verification",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_stale_branch_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*stale branch cleanup:\*\*", body):
+    labels = [
+        "stale branch cleanup",
+        "stale-branch cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "stale branch cleanup",
-            "stale-branch cleanup",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_scratch_file_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*scratch file cleanup:\*\*", body):
+    labels = [
+        "scratch file cleanup",
+        "scratch-file cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
+        return True
+    return has_non_empty_body_field(body, labels)
+
+def has_mergeability_status_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*mergeability status:\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
         [
-            "scratch file cleanup",
-            "scratch-file cleanup",
+            "mergeability status",
+            "mergeability-status",
         ],
     )
 
@@ -139,7 +158,9 @@ def has_overlap_reference(body):
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicates?|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
     negated_overlap_context = re.compile(r"(?i)\b(?:non[- ]?overlapp?ing|non[- ]?overlap|not overlapping|not overlap|does not overlap|no overlapping|no overlap)\b")
     branch_ref = re.compile(r"(?i)\b(?:branch(?:es)?|head(?:\s+ref)?|ref)\b\s*[:=-]?\s*`?([A-Za-z0-9][A-Za-z0-9._/-]*)`?")
-    overlap_detail_field = re.compile(r"(?i)^(?:[-*]\s*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)\s*:")
+    overlap_detail_field = re.compile(
+        r"(?i)^(?:[-*]\s*)?(?:\*\*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)(?:\*\*)?\s*:(?:\*\*)?"
+    )
     in_overlap_block = False
     block_has_pr = False
     block_has_branch = False
@@ -168,7 +189,7 @@ def has_overlap_reference(body):
         block_has_pr = block_has_pr or bool(pr_ref.search(stripped))
         block_has_branch = block_has_branch or any(
             _meaningful_branch_ref(match.group(1))
-            for match in branch_ref.finditer(stripped)
+            for match in branch_ref.finditer(stripped.replace("**", ""))
         )
         if block_has_pr and block_has_branch:
             return True
@@ -181,6 +202,8 @@ def has_template_summary(body):
 def is_scratch_file_path(path):
     if not path or "/" in path:
         return False
+    if path.endswith(".diff") or path.endswith(".patch"):
+        return True
     root_scratch_files = {
         "pr-body.md",
         "plan.md",
@@ -191,12 +214,15 @@ def is_scratch_file_path(path):
         "test.js",
         "verify.sh",
         "sql_test.rs",
+        "prs.json",
+        "scratch.json",
+        "scratchpad.json",
     }
     if path in root_scratch_files:
         return True
     return bool(
-        re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js)$", path)
-        or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js)$", path)
+        re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", path)
+        or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", path)
     )
 
 def main():
@@ -240,6 +266,10 @@ def main():
             print("  [!] MISSING BOUNDARY: PR body lacks the required 'Boundary' field.")
         if not has_non_empty_body_field(body, ["primary files"]):
             print("  [!] MISSING PRIMARY FILES: PR body lacks the required 'Primary files' field.")
+        if not has_non_empty_body_field(body, ["public api impact"]):
+            print("  [!] MISSING PUBLIC API IMPACT: PR body lacks the required 'Public API impact' field.")
+        if not has_non_empty_body_field(body, ["docs impact"]):
+            print("  [!] MISSING DOCS IMPACT: PR body lacks the required 'Docs impact' field.")
         if not has_non_empty_body_field(body, ["queue hygiene invariant"]):
             print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
         if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"]):
@@ -250,6 +280,8 @@ def main():
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
+        if not has_mergeability_status_ack(body):
+            print("  [!] MISSING MERGEABILITY STATUS CHECK: PR body lacks a completed mergeability status acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
         if not has_non_empty_body_field(
@@ -262,6 +294,28 @@ def main():
             print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
         if not has_non_empty_body_field(body, ["risk and rollback notes", "rollback notes", "rollback"]):
             print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
+
+        # In AgentDesk, PR hygiene and merge-readiness are strictly validated by scripts/analyze_prs.py.
+        # It enforces that PR titles matching jules/<agent_name>/* branches explicitly start with
+        # the corresponding AgentName: prefix.
+        head_ref_name = pr.get('headRefName', '')
+        if head_ref_name.startswith('jules/'):
+            parts = head_ref_name.split('/')
+            if len(parts) >= 3:
+                agent_slug = parts[1].lower()
+                overrides = {
+                    "cartographer-lite": "Cartographer-Lite:",
+                    "onboardingsmith": "OnboardingSmith:",
+                    "domainkeeper": "DomainKeeper:",
+                    "api-routemaster": "ApiRoutemaster:",
+                }
+                if agent_slug in overrides:
+                    expected_prefix = overrides[agent_slug]
+                else:
+                    expected_prefix = "".join(p.capitalize() for p in agent_slug.split("-")) + ":"
+
+                if not title.startswith(expected_prefix):
+                    print(f"  [!] INVALID TITLE PREFIX: Branch '{head_ref_name}' requires PR title to start with '{expected_prefix}'. Found: '{title}'.")
 
         # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
         is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
@@ -295,14 +349,14 @@ def main():
                 print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
-        if "no-change" in title.lower():
+        if "no-change" in title.lower() or "no change" in title.lower():
             if not has_no_change_verification_ack(body):
                 print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
             if files_data.get("files") is not None:
                 if len(files_data["files"]) > 0:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
                 else:
-                    print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
+                    print(f"  [!] EMPTY NO-CHANGE PR: No changed files. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
                     if not has_overlap_reference(body):
                         print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
 

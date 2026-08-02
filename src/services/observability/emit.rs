@@ -41,6 +41,7 @@ pub fn emit_turn_started(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_turn_finished_with_dispatch_kind(
     provider: &str,
     channel_id: u64,
@@ -569,6 +570,7 @@ pub fn emit_bridge_latency_spans(
 /// The bridge-side delivery decision is NOT covered by the watcher-side
 /// `relay_flight_recorder` tracing, so this closes that observability gap
 /// before the delivery-lease consolidation touches the hot path.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_relay_delivery(
     provider: &str,
     channel_id: u64,
@@ -617,7 +619,8 @@ pub fn emit_relay_delivery(
 /// reuses the `PlaceholderCleanupOperation` vocab (`delete_terminal` /
 /// `delete_nonterminal` / `edit_terminal` / `edit_preserve`) or a site-specific
 /// descriptive verb, and `outcome` is one of `committed` | `already_gone` |
-/// `failed` | `skipped_committed_terminal`. The outcome doubles as the event
+/// `failed` | `skipped_committed_terminal` | `skipped_terminal_retry_pending`.
+/// The outcome doubles as the event
 /// `status` (correlation column) so a query can split committed deletes from
 /// guard-skips without parsing the payload.
 #[allow(clippy::too_many_arguments)]
@@ -736,6 +739,7 @@ pub fn emit_agent_quality_event(event: AgentQualityEvent) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_event(
     event_type: &str,
     provider: Option<&str>,

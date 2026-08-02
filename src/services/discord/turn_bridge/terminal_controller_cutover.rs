@@ -318,11 +318,15 @@ pub(super) async fn deliver_short_replace_via_controller(
         shared,
         provider,
         watcher_owner_channel_id,
+        tmux_session_name,
         (start, end),
         dr::outcome_is_shadow_delivered(&outcome),
         Some(msg_id.get()),
         Some(channel_id.get()),
         Some(delivered_body),
+        // #4564: explicit inbound turn id from the turn snapshot — the ledger is
+        // keyed by the delivery channel (`channel_id`), NOT `watcher_owner_channel_id`.
+        Some(turn.user_msg_id),
     );
     outcome
 }
@@ -406,9 +410,12 @@ pub(super) async fn deliver_long_chunks_via_controller(
             provider,
             watcher_owner_channel_id,
             channel_id,
+            tmux_session_name,
             (start, end),
             chunks.tail_message_id.map(|m| m.get()),
             delivered_body,
+            // #4564: explicit inbound turn id; ledger keyed by delivery `channel_id`.
+            Some(turn.user_msg_id),
         );
     }
     outcome
@@ -501,11 +508,15 @@ pub(super) async fn apply_bridge_long_chunks_legacy(
     dispatch_id: Option<&str>,
     session_key: Option<&str>,
     turn_id: Option<&str>,
+    // #4564: inbound turn id of the delivered turn (delivery channel = `channel_id`),
+    // threaded from the caller's inflight snapshot so the completed-turn ledger is
+    // keyed by the inbound channel, not `watcher_owner_channel_id`.
+    ledger_user_msg_id: u64,
     locals: BridgeLongChunksLocals<'_>,
 ) {
     if matches!(lease_acquire, BridgeLeaseAcquire::Skip) {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
+        tracing::info!(
             channel_id = channel_id.get(),
             "  [{ts}] 🌉 #3041 B2: delivery lease held by another holder — bridge skipped duplicate long terminal send (channel {})",
             channel_id
@@ -554,9 +565,11 @@ pub(super) async fn apply_bridge_long_chunks_legacy(
                         provider,
                         watcher_owner_channel_id,
                         channel_id,
+                        tmux_session_name,
                         lease_range,
                         last_chunk_msg_id.map(|m| m.get()),
                         delivered_body,
+                        Some(ledger_user_msg_id),
                     );
                 }
             }
@@ -636,7 +649,8 @@ pub(super) fn apply_bridge_long_chunks_outcome(
             *locals.preserve_inflight_for_cleanup_retry = true;
             *locals.bridge_skip_holder_owns_inflight = true;
         }
-        toc::DeliveryOutcome::NotDelivered { .. }
+        toc::DeliveryOutcome::FreshDelivered { .. }
+        | toc::DeliveryOutcome::NotDelivered { .. }
         | toc::DeliveryOutcome::Unknown { .. }
         | toc::DeliveryOutcome::Skipped
         | toc::DeliveryOutcome::Delivered { .. } => {
@@ -909,8 +923,8 @@ pub(super) fn apply_bridge_short_replace_outcome(
                 turn_id,
             );
         }
-        // Empty body — excluded by the cutover gate, so unreachable in prod.
-        toc::DeliveryOutcome::Skipped => {
+        // SendFresh and empty body are excluded by this replace cutover gate.
+        toc::DeliveryOutcome::FreshDelivered { .. } | toc::DeliveryOutcome::Skipped => {
             *locals.preserve_inflight_for_cleanup_retry = true;
         }
     }
@@ -1086,6 +1100,9 @@ mod tests {
                 _i: &'a crate::services::discord::Intervention,
                 _o: &'a str,
                 _h: bool,
+                _dispatch_lease: Option<
+                    std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+                >,
             ) -> GatewayFuture<'a, Result<(), String>> {
                 panic!("unused on the short-replace path")
             }
@@ -1311,6 +1328,9 @@ mod tests {
                 _i: &'a crate::services::discord::Intervention,
                 _o: &'a str,
                 _h: bool,
+                _dispatch_lease: Option<
+                    std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+                >,
             ) -> GatewayFuture<'a, Result<(), String>> {
                 panic!("unused on the long-chunk path")
             }

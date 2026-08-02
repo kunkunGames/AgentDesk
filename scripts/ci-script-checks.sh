@@ -68,6 +68,9 @@ echo "=== Policy DB capability manifest guard (#3734) ==="
 echo "=== Merge automation policy tests (#4250) ==="
 node --test policies/__tests__/merge-automation.test.js
 
+echo "=== Timeout shadow aggregation gate tests (#3950) ==="
+node --test scripts/__tests__/timeout-shadow-gate.test.mjs
+
 echo "=== Daily log-digest routine tests (#4263) ==="
 node --test policies/__tests__/daily-log-digest.test.js
 "$PYTHON" -m unittest tests.test_daily_log_digest
@@ -111,12 +114,39 @@ echo "=== CI timeout wrapper tests (#4413) ==="
 echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
+echo "=== TUI relay assertion unit tests (#5065) ==="
+"$PYTHON" -m unittest scripts.e2e.tui_relay.test_assertions
+
+echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
+"$PYTHON" -m unittest tests.test_fast_check_ci_wiring
+
+echo "=== Rust test-lane coverage ratchet (#4846/#4910) ==="
+if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
+  echo "ERROR: TEST_LANE_BASELINE_REF must name an immutable comparison snapshot" >&2
+  exit 1
+fi
+"$PYTHON" scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"
+"$PYTHON" -m unittest tests.test_test_lane_coverage
+
+echo "=== Test-target integrity gate (#5003, warn-only rollout) ==="
+# cargo exits 0 on zero filter matches, so a curated lane with the wrong
+# --lib/--bin/--test flag can run 0 tests while its required check stays
+# green. Warn-only until the known offenders are repaired (separate slice);
+# flip to --enforce afterwards. The unittest run below is the gate's own
+# mutation proof (bad fixture must fail, fixed fixture must pass).
+"$PYTHON" scripts/check_test_target_integrity.py
+"$PYTHON" -m unittest tests.test_check_test_target_integrity
+
+echo "=== PostgreSQL test-lane membership gate (#4979, enforced) ==="
+"$PYTHON" scripts/check_pg_test_lane_membership.py --baseline-ref "$TEST_LANE_BASELINE_REF"
+"$PYTHON" -m unittest tests.test_check_pg_test_lane_membership
+
 echo "=== Scheduled-message PG path-filter wiring contract ==="
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js verify.sh; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js verify.sh prs.json scratch.json scratchpad.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -146,7 +176,7 @@ for scratch_file in scratch.py scratchpad.py scratch.js scratchpad.js; do
     FAIL=1
   fi
 done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js; do
+for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js scratch[._-]*.json scratchpad[._-]*.json test_scratch[._-]*.json test_*.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -164,13 +194,8 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
-if grep -rn 'env!("HOME")' --include='*.rs' \
-  --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
-else
-  echo "OK: No env!(\"HOME\") found"
-fi
+echo "=== Checking hardcoded home paths (hard gate; see #100) ==="
+"$PYTHON" scripts/check-portable-paths.py --rust-env-home-only
 
 echo "=== Path integrity check ==="
 FAIL=0
@@ -205,19 +230,22 @@ echo "=== Relay watchdog + PG tunnel supervisor tests (#4381/#4378) ==="
 "$PYTHON" -m unittest tests.test_relay_watchdog tests.test_pg_tunnel
 
 echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036) ==="
-# Generic committed markdown freshness drift is warning-only for ordinary PRs
-# and is refreshed by the weekly regen-docs workflow. This CI invocation writes
-# the current generated view into the workspace so the checks below compare
-# against current source facts.
-# The generator hard-fails (exit 2) on giant-file registry drift: unregistered
-# new giants, ghost registrations left after decomposition, or deadline-less
-# [[entry]] tables in scripts/giant_file_registry.toml. Generated-docs drift
-# (exit 1) is a hard fail in PRs to prevent drift merging and spawning
-# duplicate downstream inventory refresh PRs.
-"$PYTHON" scripts/generate_inventory_docs.py --check
+# Inventory snapshots are untracked, so generate them in the CI workspace
+# before checks consume their source-of-truth data. The generator hard-fails
+# (exit 2) on giant-file registry drift: unregistered new giants, ghost
+# registrations left after decomposition, or deadline-less [[entry]] tables in
+# scripts/giant_file_registry.toml. The following git diff is the PR-time
+# drift gate: generation updates snapshots, then CI rejects changes to tracked
+# source-of-truth docs instead of comparing the generated workspace to itself.
+"$PYTHON" scripts/generate_inventory_docs.py
+git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
 
 echo "=== Inventory prod/test split regression tests (#4394) ==="
 "$PYTHON" -m unittest tests.test_inventory_giant_split
+
+echo "=== Structural Clippy allow occurrence ratchet (#4519) ==="
+"$PYTHON" scripts/check_clippy_allow_ratchet.py
+"$PYTHON" -m unittest tests.test_clippy_allow_ratchet
 
 echo "=== API docs coverage gate (#3719) ==="
 "$PYTHON" scripts/check_api_docs_coverage.py
@@ -237,11 +265,12 @@ echo "=== Contract symbol-ref doc<->code sync gate (#4268) ==="
 "$PYTHON" scripts/check_contract_symbol_refs.py
 "$PYTHON" -m unittest tests.test_contract_symbol_refs
 
-echo "=== Agent maintenance freshness gate (warn, #1432; LoC hard-gate, #3036) ==="
-# --warning-only keeps the #1432 freshness/touch rollout non-fatal, while
-# --line-count-gate hard-fails on change-surfaces.md production-LoC drift, ghost
-# freeze entries, and decomposition regressions.
-"$PYTHON" scripts/check_agent_maintenance_docs.py --warning-only --line-count-gate
+echo "=== Agent maintenance freshness gate (warn, #1432; targeted hard gates) ==="
+# --warning-only keeps the #1432 freshness/touch rollout non-fatal. The LoC gate
+# remains unconditional; the migration 0093 rollout gate activates only when the
+# migration itself is in the changed-file set.
+"$PYTHON" scripts/check_agent_maintenance_docs.py --warning-only --line-count-gate \
+  --migration-0093-rollout-gate
 
 echo "=== Shell test suites (tests/*.sh) ==="
 # #4255: these suites existed but NOTHING executed them — `tests/**` appears in

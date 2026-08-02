@@ -91,18 +91,51 @@ pub fn version() -> Result<String, String> {
     }
 }
 
-/// Check if a named tmux session exists.
-pub fn has_session(session_name: &str) -> bool {
-    if is_blank_session_name(session_name) {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionPresence {
+    Present,
+    Missing,
+    ProbeFailed,
+}
+
+/// Check whether a named tmux session definitely exists or definitely does not.
+/// Transport, socket, permission, timeout, and unexpected tmux errors remain
+/// distinguishable from a confirmed missing session so destructive callers can
+/// fail closed.
+fn classify_has_session_output(output: &Output) -> SessionPresence {
+    if output.status.success() {
+        return SessionPresence::Present;
     }
-    tmux_command()
-        .args(["has-session", "-t", &exact_target(session_name)])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("can't find session")
+        || stderr.contains("no such session")
+        || stderr.contains("no server running")
+    {
+        SessionPresence::Missing
+    } else {
+        SessionPresence::ProbeFailed
+    }
+}
+
+pub(crate) fn session_presence(session_name: &str) -> SessionPresence {
+    if is_blank_session_name(session_name) {
+        return SessionPresence::ProbeFailed;
+    }
+
+    let mut command = tmux_command();
+    command.args(["has-session", "-t", &exact_target(session_name)]);
+    let Ok(output) = wait_for_tmux_output(command, Duration::from_secs(3), "tmux has-session")
+    else {
+        return SessionPresence::ProbeFailed;
+    };
+    classify_has_session_output(&output)
+}
+
+/// Compatibility boolean for non-destructive callers. Probe failures continue
+/// to read as unavailable; destructive recovery must use [`session_presence`].
+pub fn has_session(session_name: &str) -> bool {
+    session_presence(session_name) == SessionPresence::Present
 }
 
 /// Create a new detached tmux session.
@@ -525,41 +558,53 @@ pub fn pane_current_path(session_name: &str) -> Option<String> {
 ///
 /// `scroll_back` is the number of lines to capture (negative = from bottom).
 pub fn capture_pane(session_name: &str, scroll_back: i32) -> Option<String> {
-    let scroll = scroll_back.to_string();
-    tmux_command()
-        .args([
-            "capture-pane",
-            "-p",
-            "-t",
-            // `capture-pane` expects a session target here, not an exact-match
-            // pane target, so pass the plain session name.
-            session_name,
-            "-S",
-            &scroll,
-        ])
+    capture_pane_command(session_name, scroll_back, false)
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
+/// Capture pane content while bounding the tmux subprocess wait.
+pub fn capture_pane_timeout(
+    session_name: &str,
+    scroll_back: i32,
+    timeout: Duration,
+) -> Option<String> {
+    wait_for_tmux_output(
+        capture_pane_command(session_name, scroll_back, false),
+        timeout,
+        "tmux capture-pane",
+    )
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
+fn capture_pane_command(session_name: &str, scroll_back: i32, preserve_escapes: bool) -> Command {
+    let scroll = scroll_back.to_string();
+    let mut command = tmux_command();
+    command.arg("capture-pane");
+    if preserve_escapes {
+        command.arg("-e");
+    }
+    command.args([
+        "-p",
+        "-t",
+        // `capture-pane` expects a session target here, not an exact-match
+        // pane target, so pass the plain session name.
+        session_name,
+        "-S",
+        &scroll,
+    ]);
+    command
+}
+
 /// Capture pane content from a tmux session while preserving ANSI attributes.
 ///
 /// `scroll_back` is the number of lines to capture (negative = from bottom).
 pub fn capture_pane_with_escapes(session_name: &str, scroll_back: i32) -> Option<String> {
-    let scroll = scroll_back.to_string();
-    tmux_command()
-        .args([
-            "capture-pane",
-            "-e",
-            "-p",
-            "-t",
-            // `capture-pane` expects a session target here, not an exact-match
-            // pane target, so pass the plain session name.
-            session_name,
-            "-S",
-            &scroll,
-        ])
+    capture_pane_command(session_name, scroll_back, true)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -850,12 +895,12 @@ pub fn has_live_pane(session_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// #3635: three-state liveness of a tmux session's panes. Unlike [`has_live_pane`]
-/// (which collapses both "session absent" and "probe failed" to `false`), this
-/// distinguishes a *definitive* negative (`DeadOrAbsent`) from a *probe failure*
-/// (`ProbeError`). Callers deciding to destroy state on death MUST treat
-/// `ProbeError` as "unknown ⇒ preserve" — a transient tmux hiccup is not proof
-/// the owner died.
+/// #4489 introduced three-state liveness of a tmux session's panes and the
+/// per-command two-second probe bound. Unlike [`has_live_pane`] (which collapses
+/// both "session absent" and "probe failed" to `false`), this distinguishes a
+/// *definitive* negative (`DeadOrAbsent`) from a *probe failure* (`ProbeError`).
+/// Callers deciding to destroy state on death MUST treat `ProbeError` as
+/// "unknown ⇒ preserve" — a transient tmux hiccup is not proof the owner died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLiveness {
     /// Session exists and has at least one non-dead pane.
@@ -881,10 +926,11 @@ pub fn pane_liveness(session_name: &str) -> PaneLiveness {
     match wait_for_tmux_output(has_session, PANE_LIVENESS_PROBE_TIMEOUT, "tmux has-session") {
         // Spawn/exec failure ⇒ we never reached tmux: unknown, not dead.
         Err(_) => return PaneLiveness::ProbeError,
-        // Clean non-zero exit ⇒ no such session (or no server running): the
-        // session — and the process that lived in it — is gone.
-        Ok(output) if !output.status.success() => return PaneLiveness::DeadOrAbsent,
-        Ok(_) => {}
+        Ok(output) => match classify_has_session_output(&output) {
+            SessionPresence::Present => {}
+            SessionPresence::Missing => return PaneLiveness::DeadOrAbsent,
+            SessionPresence::ProbeFailed => return PaneLiveness::ProbeError,
+        },
     }
     let mut list_panes = tmux_command();
     list_panes.args([
@@ -919,6 +965,31 @@ pub fn set_option(session_name: &str, key: &str, value: &str) {
         .output();
 }
 
+/// Read one tmux session option without treating a missing session/option as a
+/// fatal condition. Callers that rehydrate best-effort runtime metadata should
+/// use this instead of shelling out themselves: malformed targets, absent tmux,
+/// and non-success responses all resolve to `None`.
+pub fn get_option(session_name: &str, key: &str) -> Option<String> {
+    if is_blank_session_name(session_name) || key.trim().is_empty() {
+        return None;
+    }
+    let output = tmux_command()
+        .args([
+            "show-options",
+            "-qv",
+            "-t",
+            &exact_target(session_name),
+            key,
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod target_safety_tests {
     use super::*;
@@ -926,6 +997,7 @@ mod target_safety_tests {
     #[test]
     fn blank_session_name_is_not_a_valid_target() {
         assert!(!has_session(""));
+        assert_eq!(get_option("", "@agentdesk_claude_compact_provenance"), None);
         assert!(
             kill_session_output_internal_with_timeout(
                 "",
@@ -1180,6 +1252,49 @@ mod timeout_tests {
         let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[test]
+    fn session_presence_distinguishes_missing_from_probe_failure() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        write_fake_tmux(
+            temp.path(),
+            "case \"$FAKE_TMUX_MODE\" in missing) echo \"can't find session: test\" >&2; exit 1;; failed) echo 'permission denied' >&2; exit 1;; *) exit 0;; esac",
+        );
+        let _path = PathOverride::prepend(temp.path());
+
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "missing") };
+        assert_eq!(session_presence("agentdesk-test"), SessionPresence::Missing);
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "failed") };
+        assert_eq!(
+            session_presence("agentdesk-test"),
+            SessionPresence::ProbeFailed
+        );
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "present") };
+        assert_eq!(session_presence("agentdesk-test"), SessionPresence::Present);
+        unsafe { std::env::remove_var("FAKE_TMUX_MODE") };
+    }
+
+    #[test]
+    fn pane_liveness_does_not_classify_probe_failure_as_dead() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        write_fake_tmux(
+            temp.path(),
+            "case \"$FAKE_TMUX_MODE\" in missing) echo \"can't find session: test\" >&2; exit 1;; failed) echo 'permission denied' >&2; exit 1;; *) if [ \"$1\" = \"list-panes\" ]; then echo 0; fi; exit 0;; esac",
+        );
+        let _path = PathOverride::prepend(temp.path());
+
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "failed") };
+        assert_eq!(
+            pane_liveness("agentdesk-test"),
+            PaneLiveness::ProbeError,
+            "an unexpected has-session failure is unknown, not confirmed death"
+        );
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "missing") };
+        assert_eq!(pane_liveness("agentdesk-test"), PaneLiveness::DeadOrAbsent);
+        unsafe { std::env::set_var("FAKE_TMUX_MODE", "present") };
+        assert_eq!(pane_liveness("agentdesk-test"), PaneLiveness::Live);
+        unsafe { std::env::remove_var("FAKE_TMUX_MODE") };
     }
 
     #[test]

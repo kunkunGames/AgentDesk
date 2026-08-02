@@ -1,19 +1,20 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
 };
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    health_api, idle_recap, maintenance, message_outbox, messages, monitoring, pipeline,
-    prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api, routines,
+    e2e_control, health_api, idle_recap, maintenance, message_outbox, messages, monitoring,
+    pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
     scheduled_messages, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
 
 pub(crate) fn router(state: AppState) -> ApiRouter {
-    protected_api_domain(
+    let router = protected_api_domain(
         Router::new()
             .route(
                 "/dispatches",
@@ -43,6 +44,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/discord/bot-tokens/reload",
                 post(health_api::reload_discord_bot_tokens_handler),
             )
+            // Destructive E2E routes are conditionally mounted in the enabled branch below.
             .route(
                 "/discord/send-to-agent",
                 post(health_api::send_to_agent_handler),
@@ -205,6 +207,14 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 post(dispatched_sessions::kill_tmux_session),
             )
             .route(
+                "/sessions/{session_key}/reconcile-stale-turn",
+                post(dispatched_sessions::reconcile_stale_turn),
+            )
+            .route(
+                "/sessions/{session_key}/resume-previous",
+                post(dispatched_sessions::resume_previous_session),
+            )
+            .route(
                 "/sessions/{session_key}/idle-recap",
                 post(idle_recap::post_idle_recap),
             )
@@ -232,43 +242,19 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 get(prompt_manifest_retention::get_retention_status),
             )
             .route(
-                "/routines",
-                get(routines::list_routines).post(routines::attach_routine),
-            )
-            .route("/routines/metrics", get(routines::routine_metrics))
-            .route(
-                "/routines/runs/search",
-                get(routines::search_routine_run_results),
-            )
-            .route(
-                "/routines/{id}",
-                get(routines::get_routine)
-                    .patch(routines::patch_routine)
-                    .delete(routines::delete_routine),
-            )
-            .route("/routines/{id}/runs", get(routines::list_routine_runs))
-            .route("/routines/{id}/pause", post(routines::pause_routine))
-            .route("/routines/{id}/resume", post(routines::resume_routine))
-            .route("/routines/{id}/detach", post(routines::detach_routine))
-            .route("/routines/{id}/run-now", post(routines::run_routine_now))
-            .route(
-                "/routines/{id}/session/reset",
-                post(routines::reset_routine_session),
-            )
-            .route(
-                "/routines/{id}/session/kill",
-                post(routines::kill_routine_session),
-            )
-            .route(
                 "/scheduled-messages",
                 get(scheduled_messages::list_scheduled_messages)
-                    .post(scheduled_messages::create_scheduled_message),
+                    .post(scheduled_messages::create_scheduled_message)
+                    // The optional 8 MiB image is base64-encoded in JSON.
+                    // Keep this limit local to the upload-capable endpoint.
+                    .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
             )
             .route(
                 "/scheduled-messages/{id}",
                 get(scheduled_messages::get_scheduled_message)
                     .patch(scheduled_messages::patch_scheduled_message)
-                    .delete(scheduled_messages::cancel_scheduled_message),
+                    .delete(scheduled_messages::cancel_scheduled_message)
+                    .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
             )
             .route(
                 "/scheduled-messages/{id}/trigger-now",
@@ -364,6 +350,26 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/provider-cli/{provider}",
                 patch(provider_cli_api::patch_provider_cli),
             ),
-        state,
-    )
+        state.clone(),
+    );
+    // Keep this branch below the ordinary route chain so disabled boots expose no
+    // method router or body extractor for any /e2e/discord path.
+    if crate::services::discord::e2e_control::enabled() {
+        crate::services::discord::e2e_control::sweep_expired();
+        router.merge(protected_api_domain(
+            Router::new()
+                .route(
+                    "/e2e/discord/channels/{channel_id}/messages/{message_id}",
+                    delete(e2e_control::delete_discord_message),
+                )
+                .route(
+                    "/e2e/discord/failures",
+                    post(e2e_control::inject_discord_failure)
+                        .delete(e2e_control::clear_discord_failure),
+                ),
+            state,
+        ))
+    } else {
+        router
+    }
 }

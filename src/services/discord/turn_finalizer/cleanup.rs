@@ -191,6 +191,10 @@ pub(in crate::services::discord) struct SyntheticClaimSnapshot {
     pub(in crate::services::discord) injected_prompt_message_id: Option<u64>,
     pub(in crate::services::discord) tmux_session_name: Option<String>,
     pub(in crate::services::discord) started_at: String,
+    pub(in crate::services::discord) status_message_id: Option<u64>,
+    pub(in crate::services::discord) status_panel_generation: u64,
+    pub(in crate::services::discord) save_generation: u64,
+    pub(in crate::services::discord) current_tool_line: Option<String>,
     pub(in crate::services::discord) turn_start_offset: Option<u64>,
     pub(in crate::services::discord) relay_ownership_only: bool,
     pub(in crate::services::discord) relay_owner_kind: RelayOwnerKind,
@@ -208,10 +212,81 @@ impl SyntheticClaimSnapshot {
             injected_prompt_message_id: row.injected_prompt_message_id,
             tmux_session_name: row.tmux_session_name.clone(),
             started_at: row.started_at.clone(),
+            status_message_id: row.status_message_id,
+            status_panel_generation: row.status_panel_generation,
+            save_generation: row.save_generation,
+            current_tool_line: row.current_tool_line.clone(),
             turn_start_offset: row.turn_start_offset,
             relay_ownership_only: row.relay_ownership_only,
             relay_owner_kind: row.effective_relay_owner_kind(),
         }
+    }
+}
+
+pub(super) fn enqueue_terminal_status_panel_reconcile(
+    key: TurnKey,
+    provider: &ProviderKind,
+    event: &TerminalEvent,
+    submit_snapshot: Option<&SyntheticClaimSnapshot>,
+    shared: &SharedData,
+) {
+    let snapshot = match submit_snapshot {
+        Some(snapshot) if snapshot.user_msg_id == key.user_msg_id => snapshot.clone(),
+        _ => {
+            let Some(row) = crate::services::discord::inflight::load_inflight_state(
+                provider,
+                key.channel_id.get(),
+            ) else {
+                return;
+            };
+            if key.user_msg_id != 0 && !row.matches_finalizer_turn_id(key.user_msg_id) {
+                return;
+            }
+            SyntheticClaimSnapshot::from_row(&row)
+        }
+    };
+    let Some(panel_message_id) = snapshot.status_message_id else {
+        return;
+    };
+    if crate::services::discord::turn_bridge::normalize_status_panel_message_id(Some(
+        serenity::model::id::MessageId::new(panel_message_id),
+    ))
+    .is_none()
+    {
+        return;
+    }
+    let terminal_status = match event {
+        TerminalEvent::Complete => {
+            crate::services::discord::abandon_request_store::TerminalCardStatus::Completed
+        }
+        TerminalEvent::Cancel | TerminalEvent::GateTimeout { .. } | TerminalEvent::RelayMiss => {
+            crate::services::discord::abandon_request_store::TerminalCardStatus::Aborted
+        }
+    };
+    if let Err(error) = crate::services::discord::abandon_request_store::enqueue(
+        provider,
+        &shared.token_hash,
+        key.channel_id.get(),
+        crate::services::discord::abandon_request_store::AbandonRecord {
+            msg_id: panel_message_id,
+            started_at: snapshot.started_at.clone(),
+            current_tool_line: snapshot.current_tool_line,
+            terminal_status,
+            episode: crate::services::discord::abandon_request_store::AbandonEpisodeIdentity {
+                user_msg_id: snapshot.user_msg_id,
+                started_at: snapshot.started_at,
+                status_panel_generation: snapshot.status_panel_generation,
+                save_generation: snapshot.save_generation,
+            },
+        },
+    ) {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = key.channel_id.get(),
+            panel_message_id,
+            error = %error,
+            "failed to persist terminal status-panel reconcile request"
+        );
     }
 }
 
@@ -323,6 +398,24 @@ pub(super) fn ensure_synthetic_claim_marker_before_clear(
 /// Late `AlreadyFinalized` losers still perform guarded active-state cleanup.
 /// This is intentionally narrower than `do_finalize`: only the same real turn id
 /// can lose mailbox/inflight state, so a newer active turn is preserved.
+pub(in crate::services::discord) async fn rearm_queue_backstop_after_mailbox_release(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::model::id::ChannelId,
+    has_pending: bool,
+    reason: &'static str,
+) -> bool {
+    if !has_pending {
+        return false;
+    }
+    // The channel-scoped scheduler coalesces duplicate release/late-cleanup arms,
+    // and its worker rechecks the mailbox before every dispatch attempt.
+    crate::services::discord::arm_slow_idle_queue_backstop_if_queue_nonempty(
+        shared, provider, channel_id, reason,
+    )
+    .await
+}
+
 pub(super) async fn already_finalized_active_state(
     key: TurnKey,
     provider: &ProviderKind,
@@ -351,6 +444,17 @@ pub(super) async fn already_finalized_active_state(
     let Some(token) = finish.removed_token.as_ref() else {
         return;
     };
+    shared
+        .turn_finalizer
+        .note_mailbox_released(key, shared.clone());
+    rearm_queue_backstop_after_mailbox_release(
+        shared,
+        provider,
+        key.channel_id,
+        finish.has_pending,
+        "already_finalized_mailbox_release",
+    )
+    .await;
 
     if ctx.allow_completion_cleanup && !matches!(event, TerminalEvent::Cancel) {
         token.mark_completion_cleanup();
@@ -666,6 +770,187 @@ mod tests {
             .restore_active_turn(token.clone(), UserId::new(7), MessageId::new(user_msg_id))
             .await;
         token
+    }
+
+    #[test]
+    fn complete_finalize_snapshot_queues_status_panel_reconcile() {
+        with_isolated_runtime_root(|| {
+            let shared = super::super::super::make_shared_data_for_tests();
+            let provider = ProviderKind::Claude;
+            let channel_id = ChannelId::new(4_340_001);
+            let user_msg_id = 4_340_002;
+            let mut row = InflightTurnState::new(
+                provider.clone(),
+                channel_id.get(),
+                None,
+                7,
+                user_msg_id,
+                4_340_003,
+                "prompt".to_string(),
+                Some("session".to_string()),
+                Some("AgentDesk-claude-4340".to_string()),
+                Some("/tmp/issue-4340.jsonl".to_string()),
+                None,
+                0,
+            );
+            row.status_message_id = Some(4_340_004);
+            let snapshot = SyntheticClaimSnapshot::from_row(&row);
+
+            enqueue_terminal_status_panel_reconcile(
+                TurnKey::new(channel_id, user_msg_id, 0),
+                &provider,
+                &TerminalEvent::Complete,
+                Some(&snapshot),
+                shared.as_ref(),
+            );
+
+            let pending = crate::services::discord::abandon_request_store::load_pending(
+                &provider,
+                &shared.token_hash,
+            );
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].0, channel_id.get());
+            assert_eq!(pending[0].1.msg_id, 4_340_004);
+            assert_eq!(
+                pending[0].1.terminal_status,
+                crate::services::discord::abandon_request_store::TerminalCardStatus::Completed
+            );
+        });
+    }
+
+    #[test]
+    fn cancel_finalize_snapshot_queues_aborted_status_panel_reconcile() {
+        with_isolated_runtime_root(|| {
+            let shared = super::super::super::make_shared_data_for_tests();
+            let provider = ProviderKind::Codex;
+            let channel_id = ChannelId::new(4_340_011);
+            let user_msg_id = 4_340_012;
+            let mut row = InflightTurnState::new(
+                provider.clone(),
+                channel_id.get(),
+                None,
+                7,
+                user_msg_id,
+                4_340_013,
+                "prompt".to_string(),
+                Some("session".to_string()),
+                Some("AgentDesk-codex-4340".to_string()),
+                Some("/tmp/issue-4340-cancel.jsonl".to_string()),
+                None,
+                0,
+            );
+            row.status_message_id = Some(4_340_014);
+            let snapshot = SyntheticClaimSnapshot::from_row(&row);
+
+            enqueue_terminal_status_panel_reconcile(
+                TurnKey::new(channel_id, user_msg_id, 0),
+                &provider,
+                &TerminalEvent::Cancel,
+                Some(&snapshot),
+                shared.as_ref(),
+            );
+
+            let pending = crate::services::discord::abandon_request_store::load_pending(
+                &provider,
+                &shared.token_hash,
+            );
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].1.terminal_status,
+                crate::services::discord::abandon_request_store::TerminalCardStatus::Aborted
+            );
+        });
+    }
+
+    #[test]
+    fn mailbox_release_backstop_coalesces_duplicate_arms_and_eventually_fires_4906() {
+        with_isolated_runtime_root(|| {
+            test_rt().block_on(async {
+                use crate::services::turn_orchestrator::{
+                    Intervention, InterventionMode, SourceMessageTextSegment,
+                };
+                use std::sync::atomic::Ordering;
+
+                let shared = super::super::super::make_shared_data_for_tests();
+                let provider = ProviderKind::Claude;
+                let channel_id = ChannelId::new(4_906_201);
+                let queued_id = MessageId::new(4_906_202);
+                let intervention = Intervention {
+                    author_id: UserId::new(7),
+                    author_is_bot: false,
+                    message_id: queued_id,
+                    queued_generation: crate::services::discord::runtime_store::process_generation(),
+                    source_message_ids: vec![queued_id],
+                    source_message_queued_generations: Vec::new(),
+                    source_text_segments: vec![SourceMessageTextSegment::new(
+                        queued_id,
+                        "queued after mailbox release",
+                    )],
+                    text: "queued after mailbox release".to_string(),
+                    mode: InterventionMode::Soft,
+                    created_at: std::time::Instant::now(),
+                    reply_context: None,
+                    has_reply_boundary: false,
+                    merge_consecutive: false,
+                    pending_uploads: Vec::new(),
+                    voice_announcement: None,
+                };
+                let enqueued = shared
+                    .mailbox(channel_id)
+                    .enqueue(
+                        intervention,
+                        crate::services::discord::queue_persistence_context(
+                            &shared,
+                            &provider,
+                            channel_id,
+                        ),
+                    )
+                    .await;
+                assert!(enqueued.enqueued);
+                let fires_before =
+                    crate::services::discord::queue_io::idle_queue_backstop_fires_for_tests();
+
+                assert!(
+                    rearm_queue_backstop_after_mailbox_release(
+                        &shared,
+                        &provider,
+                        channel_id,
+                        true,
+                        "test_mailbox_release",
+                    )
+                    .await
+                );
+                assert!(
+                    !rearm_queue_backstop_after_mailbox_release(
+                        &shared,
+                        &provider,
+                        channel_id,
+                        true,
+                        "test_mailbox_release_duplicate",
+                    )
+                    .await,
+                    "duplicate release/late-cleanup arms must coalesce"
+                );
+                assert_eq!(
+                    shared.restart.deferred_hook_backlog.load(Ordering::Relaxed),
+                    1,
+                    "exactly one channel backstop is armed"
+                );
+
+                tokio::time::advance(
+                    crate::services::discord::queue_io::idle_queue_backstop_delay_for_tests(),
+                )
+                .await;
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    crate::services::discord::queue_io::idle_queue_backstop_fires_for_tests()
+                        > fires_before,
+                    "the coalesced release backstop must eventually execute its snapshot reconciliation"
+                );
+            });
+        });
     }
 
     #[test]
@@ -1512,6 +1797,143 @@ mod tests {
                     take_reaction_cleanup_records().is_empty(),
                     "reachable AlreadyFinalized losers inherit watcher/bridge/monitor context and must not masquerade as the backstop reaction owner"
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn late_already_finalized_cleanup_releases_mailbox_and_rearms_once_4906() {
+        with_isolated_runtime_root(|| {
+            test_rt().block_on(async {
+                use crate::services::turn_orchestrator::{
+                    Intervention, InterventionMode, SourceMessageTextSegment,
+                };
+                use std::sync::atomic::Ordering;
+
+                let shared =
+                    super::super::super::make_shared_data_for_tests_with_storage(None);
+                let provider = ProviderKind::Claude;
+                let channel_id = ChannelId::new(4_906_301);
+                let turn_id = real_message_id(302);
+                let queued_id = MessageId::new(real_message_id(303));
+                let finalizer = shared.turn_finalizer.clone();
+                let key = TurnKey::new(channel_id, turn_id, 0);
+                let mut completion_events =
+                    crate::services::discord::turn_completion_events::subscribe_turn_completion_events(
+                        &shared,
+                    );
+                finalizer.register_start_with_completion_admission(
+                    key,
+                    provider.clone(),
+                    RelayOwnerKind::Watcher,
+                    super::super::CompletionAdmissionPlan::AfterTerminalProjectionSettled,
+                    &shared,
+                );
+
+                let winner = finalizer
+                    .submit_terminal(
+                        key,
+                        provider.clone(),
+                        TerminalEvent::Complete,
+                        FinalizeContext::watcher(),
+                        shared.clone(),
+                    )
+                    .await;
+                assert!(matches!(
+                    winner,
+                    FinalizeOutcome::Finalized {
+                        removed_token: None,
+                        ..
+                    }
+                ));
+                assert!(completion_events.try_recv().is_err());
+
+                let token = seed_active_turn(&shared, channel_id, turn_id).await;
+                shared.restart.global_active.store(1, Ordering::Relaxed);
+                let queued = Intervention {
+                    author_id: UserId::new(7),
+                    author_is_bot: false,
+                    message_id: queued_id,
+                    queued_generation: crate::services::discord::runtime_store::process_generation(),
+                    source_message_ids: vec![queued_id],
+                    source_message_queued_generations: Vec::new(),
+                    source_text_segments: vec![SourceMessageTextSegment::new(
+                        queued_id,
+                        "queued behind late finalized cleanup",
+                    )],
+                    text: "queued behind late finalized cleanup".to_string(),
+                    mode: InterventionMode::Soft,
+                    created_at: std::time::Instant::now(),
+                    reply_context: None,
+                    has_reply_boundary: false,
+                    merge_consecutive: false,
+                    pending_uploads: Vec::new(),
+                    voice_announcement: None,
+                };
+                assert!(
+                    shared
+                        .mailbox(channel_id)
+                        .enqueue(
+                            queued,
+                            crate::services::discord::queue_persistence_context(
+                                &shared,
+                                &provider,
+                                channel_id,
+                            ),
+                        )
+                        .await
+                        .enqueued
+                );
+
+                let late = finalizer
+                    .submit_terminal(
+                        key,
+                        provider.clone(),
+                        TerminalEvent::Complete,
+                        FinalizeContext::bridge(),
+                        shared.clone(),
+                    )
+                    .await;
+                assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
+                assert!(token.cancelled.load(Ordering::Relaxed));
+                assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+                assert!(
+                    crate::services::discord::mailbox_snapshot(&shared, channel_id)
+                        .await
+                        .cancel_token
+                        .is_none(),
+                    "the late loser must release the matching mailbox token"
+                );
+                assert_eq!(
+                    shared.restart.deferred_hook_backlog.load(Ordering::Relaxed),
+                    1,
+                    "mailbox release with backlog must arm one coalesced slow backstop"
+                );
+                assert!(
+                    !rearm_queue_backstop_after_mailbox_release(
+                        &shared,
+                        &provider,
+                        channel_id,
+                        true,
+                        "test_late_already_finalized_duplicate",
+                    )
+                    .await,
+                    "the admission edge and explicit duplicate backstop must not arm twice"
+                );
+
+                let released = completion_events
+                    .try_recv()
+                    .expect("late cleanup must publish mailbox release");
+                assert!(!released.queue_is_eligible());
+                assert!(completion_events.try_recv().is_err());
+                finalizer.note_terminal_projection_settled(key, true, shared.clone());
+                finalizer.note_terminal_projection_settled(key, true, shared.clone());
+                assert!(!finalizer.has_live_watcher_pending(channel_id, 0).await);
+                let eligible = completion_events
+                    .try_recv()
+                    .expect("late projection edge must release retained admission authority");
+                assert!(eligible.queue_is_eligible());
+                assert!(completion_events.try_recv().is_err());
             });
         });
     }

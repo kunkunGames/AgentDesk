@@ -7,6 +7,7 @@ pub(super) async fn commit_episode_side_effects(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: u64,
+    discord_channel_id: ChannelId,
     recovered_state: &super::inflight::InflightTurnState,
     mut locked_episode: Option<super::inflight::LockedInflightEpisode>,
     existing_inflight_present: bool,
@@ -18,8 +19,6 @@ pub(super) async fn commit_episode_side_effects(
     tmux_session_name: &str,
     initial_offset: u64,
 ) -> Result<(Option<super::inflight::LockedInflightEpisode>, bool), RebindError> {
-    let discord_channel_id = ChannelId::new(channel_id);
-
     // A terminal commit is a lifecycle-authority transition, not a reattachable
     // episode. The reservation pin normally rejects a commit that wins before
     // adoption; keep this lock-held check as defense in depth so the guarded
@@ -69,7 +68,7 @@ pub(super) async fn commit_episode_side_effects(
             category_name: None,
             last_active: tokio::time::Instant::now(),
             worktree: None,
-            born_generation: super::runtime_store::load_generation(),
+            born_generation: super::runtime_store::process_generation(),
         });
     session.channel_id = Some(channel_id);
     session.last_active = tokio::time::Instant::now();
@@ -91,7 +90,7 @@ pub(super) async fn commit_episode_side_effects(
 
     #[cfg(test)]
     if locked_episode.is_some() {
-        super::await_episode_authority_held_barrier().await;
+        super::test_barriers::await_episode_authority_held_barrier().await;
     }
 
     let finish_mailbox_on_completion = if existing_inflight_present {

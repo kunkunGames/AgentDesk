@@ -455,6 +455,36 @@ _health_json_reasons() {
   _health_json_get_string_array_csv "$health_json" "degraded_reasons"
 }
 
+_health_json_gateway_standby_only() {
+  local health_json="$1"
+  local reasons_csv reason
+  [ -n "$health_json" ] || return 1
+
+  if _health_json_has_jq; then
+    printf '%s' "$health_json" | jq -e '
+      .status == "degraded"
+      and (.db == true)
+      and (.server_up == true)
+      and (.cluster_standby == true)
+      and ((.degraded_reasons // []) | length > 0)
+      and all((.degraded_reasons // [])[]; test("^(gateway_standby|provider:[^:]+:gateway_standby)$"))
+    ' >/dev/null 2>&1
+    return
+  fi
+
+  [ "$(_health_json_status "$health_json")" = "degraded" ] || return 1
+  _health_json_field_is_true "$health_json" "db" || return 1
+  _health_json_field_is_true "$health_json" "server_up" || return 1
+  _health_json_field_is_true "$health_json" "cluster_standby" || return 1
+  reasons_csv=$(_health_json_reasons "$health_json" || true)
+  [ -n "$reasons_csv" ] || return 1
+  while IFS=, read -r reason; do
+    [ -n "$reason" ] || return 1
+    [[ "$reason" =~ ^gateway_standby$|^provider:[^:]+:gateway_standby$ ]] || return 1
+  done <<< "$reasons_csv"
+  return 0
+}
+
 _health_json_reconcile_only() {
   local health_json="$1"
   local reasons_csv reason
@@ -611,6 +641,10 @@ health_json_is_ready() {
       fi
       return 1
     fi
+    if _health_json_field_is_true "$health_json" "cluster_standby"; then
+      _health_json_gateway_standby_only "$health_json"
+      return $?
+    fi
     [ "$status" = "healthy" ] && return 0
     if [ "$allow_reconcile_degraded" = "1" ] \
       && _health_json_field_exists "$health_json" "fully_recovered" \
@@ -621,6 +655,11 @@ health_json_is_ready() {
       return 0
     fi
     return 1
+  fi
+
+  if _health_json_field_is_true "$health_json" "cluster_standby"; then
+    _health_json_gateway_standby_only "$health_json"
+    return $?
   fi
 
   if [ "$status" = "healthy" ]; then
@@ -752,6 +791,7 @@ assert_restart_helpers_loaded() {
   local fn
   for fn in \
     request_restart_drain_mode_or_fail \
+    wait_for_restart_persistence_or_fail \
     wait_for_live_turns_to_drain_or_fail \
     clear_restart_drain_mode; do
     if ! declare -F "$fn" >/dev/null 2>&1; then
@@ -768,11 +808,24 @@ assert_restart_helpers_loaded() {
 
 clear_restart_drain_mode() {
   local runtime_root="$1"
+  local marker="$runtime_root/restart_pending"
+  local cancel="$runtime_root/restart_cancelled"
+  local cancel_tmp="${cancel}.$$"
+  local nonce=""
   if [ -z "$runtime_root" ]; then
     echo "✗ [gate] runtime root is required to clear restart drain mode" >&2
     return 1
   fi
-  rm -f "$runtime_root/restart_pending"
+  if [ -f "$marker" ]; then
+    nonce=$(grep '^nonce=' "$marker" 2>/dev/null | cut -d= -f2- | tr -d '\n')
+  fi
+  # Publish cancellation before removing the request. A poller dropped in
+  # this handoff then still finds its nonce-bound cancellation marker and
+  # rolls its admission fence back instead of leaving restart state stranded.
+  {
+    [ -n "$nonce" ] && printf 'nonce=%s\n' "$nonce"
+    printf 'cancelled_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >"$cancel_tmp" && mv "$cancel_tmp" "$cancel" && rm -f "$marker"
 }
 
 _health_origin_header() {
@@ -784,6 +837,12 @@ _health_origin_header() {
   printf 'Origin: http://%s' "${ADK_DEFAULT_LOOPBACK}"
 }
 
+_restart_pending_snapshot() {
+  local port="$1"
+  curl -s --max-time 3 -H "$(_health_origin_header)" \
+    "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null
+}
+
 _restart_pending_acknowledged() {
   local port="$1"
   local detail_json
@@ -792,8 +851,7 @@ _restart_pending_acknowledged() {
   # `unhealthy` for restart-pending — see src/services/discord/health.rs), and
   # `-f` would drop the body and report failure exactly when we need to read
   # the body to confirm the gate is armed (#1447 review P1, iteration 2).
-  detail_json=$(curl -s --max-time 3 -H "$(_health_origin_header)" \
-    "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null) || return 1
+  detail_json=$(_restart_pending_snapshot "$port") || return 1
   [ -n "$detail_json" ] || return 1
 
   # restart_pending is per-provider. Require EVERY provider that exposes
@@ -815,6 +873,37 @@ _restart_pending_acknowledged() {
     return 1
   fi
   printf '%s' "$detail_json" | grep -q '"restart_pending":true'
+}
+
+wait_for_restart_persistence_or_fail() {
+  local scope="$1"
+  local runtime_root="$2"
+  local expected_nonce="$3"
+  local max_wait="${4:-30}"
+  local waited=0
+  local marker="$runtime_root/restart_pending"
+  local ack="$runtime_root/restart_persisted"
+
+  if [ -z "$runtime_root" ]; then
+    echo "✗ [gate] ${scope} runtime root is required for restart persistence" >&2
+    return 1
+  fi
+
+  while [ "$waited" -lt "$max_wait" ]; do
+    if [ -f "$ack" ] \
+      && grep -Fqx "nonce=${expected_nonce}" "$ack" 2>/dev/null; then
+      echo "✓ [gate] ${scope} restart persistence acknowledged by runtime"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  clear_restart_drain_mode "$runtime_root" || true
+  rm -f "$ack" 2>/dev/null || true
+  echo "✗ [gate] ${scope} restart persistence was not acknowledged within ${max_wait}s" >&2
+  echo "  Cleared restart_pending and refused bootout: the in-flight delivery frontier is not durable." >&2
+  return 1
 }
 
 _foreign_active_turns_or_empty() {
@@ -876,6 +965,12 @@ guard_no_foreign_active_turns_or_warn() {
   return 1
 }
 
+# AGENTDESK_RESTART_REQUEST_NONCE and AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED
+# are intentional out-parameters: the sourcing deploy script (deploy-release.sh
+# lines ~2069-2070) reads them after this function returns. shellcheck analyses
+# this library in isolation and cannot see that cross-file consumption, so it
+# reports SC2034 (appears unused). Silence it for this function.
+# shellcheck disable=SC2034
 request_restart_drain_mode_or_fail() {
   local scope="$1"
   local label="$2"
@@ -888,6 +983,10 @@ request_restart_drain_mode_or_fail() {
   local marker
   local tmp_marker
   local job_state
+  local nonce
+
+  AGENTDESK_RESTART_REQUEST_NONCE=""
+  AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=0
 
   if [ -z "$runtime_root" ]; then
     echo "✗ [gate] ${scope} runtime root is required for restart drain mode" >&2
@@ -904,31 +1003,32 @@ request_restart_drain_mode_or_fail() {
     return 1
   fi
 
+  rm -f "$runtime_root/restart_persisted" "$runtime_root/restart_cancelled" 2>/dev/null || true
+
   mkdir -p "$runtime_root" || {
     echo "✗ [gate] failed to create ${scope} runtime root: $runtime_root" >&2
     return 1
   }
 
   marker="$runtime_root/restart_pending"
-  tmp_marker="${marker}.$$"
-  {
+  nonce="$(date -u '+%Y%m%dT%H%M%S')-$$-${RANDOM:-0}"
+  # O_EXCL ownership: never overwrite another restart nonce. The marker is the
+  # process-wide restart lease, shared with standby promotion.
+  if ! ( set -o noclobber; {
+    printf 'nonce=%s\n' "$nonce"
     printf 'source=%s\n' "$source"
     printf 'scope=%s\n' "$scope"
     printf 'label=%s\n' "$label"
     date -u '+requested_at=%Y-%m-%dT%H:%M:%SZ'
-  } >"$tmp_marker" || {
-    echo "✗ [gate] failed to write restart drain marker: $tmp_marker" >&2
+  } >"$marker" ) 2>/dev/null; then
+    echo "✗ [gate] restart drain marker already owned: $marker" >&2
     return 1
-  }
-  mv "$tmp_marker" "$marker" || {
-    rm -f "$tmp_marker"
-    echo "✗ [gate] failed to publish restart drain marker: $marker" >&2
-    return 1
-  }
+  fi
 
   while [ "$waited" -lt "$ack_wait" ]; do
     if _restart_pending_acknowledged "$port"; then
       echo "✓ [gate] ${scope} restart drain mode acknowledged by runtime"
+      AGENTDESK_RESTART_REQUEST_NONCE="$nonce"
       return 0
     fi
     # #1447 review P2: idle runtime may consume the marker (restart_ctrl
@@ -937,6 +1037,7 @@ request_restart_drain_mode_or_fail() {
     # has disappeared, the runtime acknowledged it the only way it can.
     if [ ! -e "$marker" ]; then
       echo "▸ [gate] ${scope} restart drain marker consumed by runtime — treating as acknowledged"
+      AGENTDESK_RESTART_REQUEST_NONCE="$nonce"
       return 0
     fi
     sleep 1
@@ -950,7 +1051,9 @@ request_restart_drain_mode_or_fail() {
     # and call exit(0) — flapping under KeepAlive. The service is not
     # running, so there is nothing to drain; clear the marker and report
     # success.
-    rm -f "$marker" 2>/dev/null || true
+    rm -f "$marker" "$runtime_root/restart_persisted" \
+      "$runtime_root/restart_cancelled" 2>/dev/null || true
+    AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1
     echo "▸ [gate] ${scope} launchd job is not running; cleared restart drain marker (no in-flight turns to drain)"
     return 0
   fi
@@ -958,13 +1061,28 @@ request_restart_drain_mode_or_fail() {
   # last poll and the post-loop launchd check. Same ack semantics as above.
   if [ ! -e "$marker" ]; then
     echo "▸ [gate] ${scope} restart drain marker consumed by runtime during timeout window — treating as acknowledged"
+    AGENTDESK_RESTART_REQUEST_NONCE="$nonce"
     return 0
   fi
 
-  echo "✗ [gate] ${scope} restart drain mode was not acknowledged within ${ack_wait}s" >&2
-  echo "  Refusing restart to avoid bypassing live-turn drain protection." >&2
+  # Drain condition removed: a stuck/hung turn that never drains must not
+  # permanently block a deploy. #4735 durable restart relay reattaches turns
+  # after restart (silent reattach + inflight rebind), so an unacknowledged
+  # drain is no longer fatal — clear the marker and proceed. The only cost is a
+  # possible mid-stream truncation in the SIGTERM window. Set
+  # AGENTDESK_RESTART_STRICT_DRAIN=1 to restore the classic refuse-on-timeout
+  # behaviour when chunk-level stream integrity is required.
+  if [ "${AGENTDESK_RESTART_STRICT_DRAIN:-0}" = "1" ]; then
+    echo "✗ [gate] ${scope} restart drain mode was not acknowledged within ${ack_wait}s" >&2
+    echo "  Refusing restart (AGENTDESK_RESTART_STRICT_DRAIN=1)." >&2
+    clear_restart_drain_mode "$runtime_root" || true
+    return 1
+  fi
+  echo "⚠ [gate] ${scope} restart drain mode not acknowledged within ${ack_wait}s — proceeding anyway (drain condition removed; durable relay reattaches turns)" >&2
   clear_restart_drain_mode "$runtime_root" || true
-  return 1
+  AGENTDESK_RESTART_REQUEST_NONCE="$nonce"
+  AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1
+  return 0
 }
 
 wait_for_live_turns_to_drain_or_fail() {

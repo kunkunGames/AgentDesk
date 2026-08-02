@@ -9,8 +9,8 @@ surfaces. This script keeps that authority explicit:
 * referenced commits are ancestors of the current checkout when the header is
   commit-anchored;
 * PRs that touch guarded code paths also touch the matching maintenance page;
-* line counts copied into ``change-surfaces.md`` are compared with the
-  generated module inventory.
+* frozen ``change-surfaces.md`` paths are checked against the generated module
+  inventory for current giant-surface integrity.
 
 Warnings do not fail the script. Errors fail unless ``--warning-only`` is
 passed, which is the initial CI rollout mode for #1432.
@@ -50,17 +50,25 @@ MODULE_INVENTORY_ROW_RE = re.compile(
     r"^\|\s*`[^`]+`\s*\|\s*`(?P<path>[^`]+\.rs)`\s*\|"
     r"\s*(?P<lines>\d+)\s*\|\s*(?P<prod>\d+)\s*\|\s*(?P<test>\d+)\s*\|"
 )
-# `` `path` (1234 lines …) `` or `` `path` (~1234 lines …) `` — explicit form.
-CHANGE_SURFACE_LINE_RE = re.compile(
-    r"`(?P<path>src/[^`]+\.rs)`\s*\(~?(?P<lines>\d+)\s+lines\b"
-)
-# `` `path` (1234) `` or `` `path` (~1234) `` — bare line-count shorthand used in
-# the services_misc_giants list. The parenthetical must be a number only (no
-# trailing prose), so `(line 1971, …)` or `(directory, refactored)` are ignored.
+# `` `path` (frozen giant surface …) `` — count-free frozen-entry shorthand.
+# The explicit marker keeps these entries distinct from ordinary path references.
 CHANGE_SURFACE_SHORTHAND_RE = re.compile(
-    r"`(?P<path>src/[^`]+\.rs)`\s*\(~?(?P<lines>\d+)\)"
+    r"`(?P<path>src/[^`]+\.rs)`\s*\(frozen giant surface\b"
 )
 GIANT_FILE_THRESHOLD = 1000
+MIGRATION_0093_PATH = (
+    "migrations/postgres/0093_intake_outbox_preserve_on_cancel.sql"
+)
+MIGRATION_0093_ROLLOUT_MARKERS: tuple[str, ...] = (
+    "migration 0093 is an irreversible binary-floor boundary",
+    "pre-stage and upgrade the entire fleet before applying migration 0093",
+    (
+        "after migration 0093, binaries embedding only migrations 0092 or earlier "
+        "must not restart or roll back"
+    ),
+    "forward-fix",
+    "restore a pre-0093 database backup and roll back the entire fleet together",
+)
 
 
 @dataclass(frozen=True)
@@ -118,7 +126,11 @@ DOC_TOUCH_RULES: tuple[TouchRule, ...] = (
     TouchRule(
         patterns=(
             "src/server/worker_registry.rs",
+            "src/services/cluster/intake_router_hook.rs",
+            "src/services/cluster/intake_router_hook/**",
+            "src/services/cluster/intake_worker_capabilities.rs",
             "src/services/discord/runtime_bootstrap.rs",
+            "migrations/postgres/0093_intake_outbox_preserve_on_cancel.sql",
             "policies/merge-automation.js",
             "src/server/routes/dispatches/outbox.rs",
         ),
@@ -322,8 +334,7 @@ def parse_module_inventory(path: Path) -> dict[str, int]:
 
     change-surfaces.md freezes modules by their review surface, which is the
     production line count (excluding `#[cfg(test)] mod` blocks). The inventory's
-    ``Prod`` column is the authority, so the freshness gate compares against it
-    rather than the raw total (#3036).
+    ``Prod`` column is the authority for frozen giant-surface integrity (#3036).
     """
 
     inventory: dict[str, int] = {}
@@ -345,7 +356,7 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
             Finding(
                 "warning",
                 "docs/generated/module-inventory.md",
-                "module inventory is missing or empty; cannot verify copied line counts.",
+                "module inventory is missing or empty; cannot verify frozen giant surfaces.",
             )
         ]
     if not change_surfaces.is_file():
@@ -359,22 +370,11 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
 
     findings: list[Finding] = []
     rel_doc = rel_posix(change_surfaces, repo_root)
-    for line_no, line in enumerate(change_surfaces.read_text(encoding="utf-8").splitlines(), start=1):
-        # Collect (path, documented_lines) pairs from both the explicit
-        # "(N lines)" form and the bare "(N)"/"(~N)" shorthand, de-duplicating
-        # overlaps where the shorthand regex also matches inside a longer span.
-        matched: dict[tuple[int, str], int] = {}
-        for match in CHANGE_SURFACE_LINE_RE.finditer(line):
-            matched[(match.start(), match.group("path"))] = int(match.group("lines"))
-        explicit_spans = [
-            match.span() for match in CHANGE_SURFACE_LINE_RE.finditer(line)
-        ]
+    for line_no, line in enumerate(
+        change_surfaces.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         for match in CHANGE_SURFACE_SHORTHAND_RE.finditer(line):
-            if any(start <= match.start() < end for start, end in explicit_spans):
-                continue
-            matched[(match.start(), match.group("path"))] = int(match.group("lines"))
-
-        for (_pos, path), documented in sorted(matched.items()):
+            path = match.group("path")
             actual = inventory.get(path)
             if actual is None:
                 # The module-inventory only lists *production* modules, so a
@@ -395,7 +395,7 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
                             (
                                 f"{path} is a test file (excluded from the "
                                 "production module inventory); reword the freeze "
-                                "entry to drop its line count."
+                                "entry to remove the test-file path."
                             ),
                             line_no,
                         )
@@ -406,7 +406,7 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
                             "error",
                             rel_doc,
                             (
-                                f"{path} is frozen with a line count but is "
+                                f"{path} is frozen but is "
                                 + (
                                     "not a production module in "
                                     "docs/generated/module-inventory.md"
@@ -438,27 +438,37 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
                     )
                 )
                 continue
-            if documented != actual:
-                # Stale numbers are an error so the page cannot silently rot, and
-                # an increase specifically signals a decomposition regression
-                # (the frozen surface grew instead of shrinking).
-                regression = " (production surface grew — decomposition regression)" \
-                    if actual > documented else ""
-                findings.append(
-                    Finding(
-                        "error",
-                        rel_doc,
-                        (
-                            f"{path} production line count is {documented} in "
-                            f"change-surfaces.md but {actual} in "
-                            f"module-inventory.md{regression}. Re-run "
-                            "`python3 scripts/generate_inventory_docs.py` and sync "
-                            "the freeze entry."
-                        ),
-                        line_no,
-                    )
-                )
     return findings
+
+
+def check_migration_0093_rollout_contract(
+    repo_root: Path, changed_files: set[str]
+) -> list[Finding]:
+    if MIGRATION_0093_PATH not in changed_files:
+        return []
+
+    rel_path = "docs/agent-maintenance/multinode-transition.md"
+    path = repo_root / rel_path
+    if not path.is_file():
+        return [
+            Finding("error", rel_path, "migration 0093 rollout contract is missing")
+        ]
+    normalized = " ".join(path.read_text(encoding="utf-8").lower().split())
+    missing = [
+        marker
+        for marker in MIGRATION_0093_ROLLOUT_MARKERS
+        if marker not in normalized
+    ]
+    if not missing:
+        return []
+    return [
+        Finding(
+            "error",
+            rel_path,
+            "migration 0093 rollout contract is missing required marker(s): "
+            + "; ".join(missing),
+        )
+    ]
 
 
 def github_escape(value: str) -> str:
@@ -536,9 +546,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--line-count-gate",
         action="store_true",
         help=(
-            "hard-fail on change-surfaces.md production-LoC drift, ghost freeze "
-            "entries, and decomposition regressions even under --warning-only "
-            "(#3036 measurement integrity gate)"
+            "hard-fail on frozen giant-surface integrity errors, including "
+            "missing, non-production, and below-threshold ghost entries even "
+            "under --warning-only (#3036)"
+        ),
+    )
+    parser.add_argument(
+        "--migration-0093-rollout-gate",
+        action="store_true",
+        help=(
+            "hard-fail when the migration 0093 binary-floor rollout contract is "
+            "missing, even under --warning-only"
         ),
     )
     return parser.parse_args(argv)
@@ -546,6 +564,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # Path/severity of findings produced by check_change_surface_line_counts.
 CHANGE_SURFACE_DOC = "docs/agent-maintenance/change-surfaces.md"
+MODULE_INVENTORY_DOC = "docs/generated/module-inventory.md"
+
+
+def ensure_module_inventory(repo_root: Path) -> Finding | None:
+    """Regenerate the inventory before parsing its line counts."""
+
+    # The generator currently writes all inventory docs, including tracked
+    # snapshots. This standalone gate favors fresh line-count data over a clean
+    # worktree; CI separately rejects any resulting tracked-doc drift.
+    generator = repo_root / "scripts/generate_inventory_docs.py"
+    if not generator.is_file():
+        return None
+    result = subprocess.run(
+        [sys.executable, str(generator)],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode == 0 and (repo_root / MODULE_INVENTORY_DOC).is_file():
+        return None
+    detail = (result.stderr or result.stdout).strip()
+    return Finding(
+        "error",
+        MODULE_INVENTORY_DOC,
+        f"failed to generate untracked module inventory: {detail or 'unknown error'}",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -553,6 +599,9 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = args.repo_root.resolve()
 
     findings: list[Finding] = []
+    inventory_finding = ensure_module_inventory(repo_root)
+    if inventory_finding is not None:
+        findings.append(inventory_finding)
     findings.extend(check_doc_headers(repo_root, args.today, args.freshness_days))
     line_count_findings = check_change_surface_line_counts(repo_root)
     findings.extend(line_count_findings)
@@ -564,17 +613,23 @@ def main(argv: list[str] | None = None) -> int:
         changed_files, warning = changed_files_from_git(repo_root, base_ref)
         if warning is not None:
             findings.append(warning)
+    rollout_findings = check_migration_0093_rollout_contract(repo_root, changed_files)
+    findings.extend(rollout_findings)
     findings.extend(check_doc_touch_rules(changed_files))
 
     emit_findings(findings, args.warning_only)
     has_errors = any(finding.severity == "error" for finding in findings)
     if has_errors and not args.warning_only:
         return 1
-    # Even in the #1432 warning-only rollout, production-LoC integrity is a hard
-    # gate when requested: stale numbers, ghost entries, and decomposition
-    # regressions must not slip through (#3036).
+    # Even in the #1432 warning-only rollout, frozen giant-surface integrity is
+    # a hard gate when requested: missing, non-production, and ghost entries
+    # must not slip through (#3036).
     if args.line_count_gate and any(
         finding.severity == "error" for finding in line_count_findings
+    ):
+        return 1
+    if args.migration_0093_rollout_gate and any(
+        finding.severity == "error" for finding in rollout_findings
     ):
         return 1
     return 0

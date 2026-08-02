@@ -3,13 +3,19 @@ mod adk_session;
 pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
 mod answer_flush_barrier;
+pub(crate) mod bot_role;
+mod busy_followup_retry_store;
 // #3479 item-2: restart-gap message recovery extracted to its catch-up sibling.
 mod catch_up;
 mod commands;
+mod compact_turn_authority;
+mod completion_footer_metadata;
+mod delivery_lease_cell;
 mod delivery_lease_key;
 mod destructive_cancel_gate;
 mod discord_io;
 mod dispatch_policy;
+pub(crate) mod e2e_control;
 mod footer_view_reconciler;
 pub(crate) mod formatting;
 mod gateway;
@@ -50,6 +56,7 @@ mod queued_placeholders_store;
 mod reaction_cleanup;
 mod reaction_lifecycle;
 mod readopted_mailbox_ledger;
+mod relay_coord;
 mod relay_health;
 pub(crate) mod relay_recovery;
 mod replace_outcome_policy;
@@ -69,9 +76,11 @@ mod restart_mode;
 // #1074: session identity parsing SSoT (legacy + namespaced session_key forms).
 pub(crate) mod restart_report;
 mod role_map;
+mod role_map_enrichment;
 mod router;
 mod runtime_bootstrap;
 pub(in crate::services::discord) mod semantic_boundaries;
+mod skills_scan;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
 pub mod runtime_store;
@@ -79,8 +88,12 @@ pub mod runtime_store;
 // relay flight recorder's two-signal owner separation and the three terminal
 // lifecycle events. No relay/cleanup behaviour lives here.
 mod relay_owner_observability;
+pub(crate) mod session_canonical_identity;
 pub(crate) mod session_identity;
+mod session_idle_cleanup;
 mod session_runtime;
+mod session_status_hook;
+mod session_transition;
 pub(crate) mod settings;
 pub(crate) mod shared_memory;
 // #3038 S1/S2: extracted SharedData field clusters (named sub-structs + their
@@ -91,19 +104,35 @@ mod single_message_panel;
 mod stall_recovery;
 mod startup_reclaim;
 mod status_panel_orphan_store;
-mod steering;
+mod status_panel_singleton_store;
+// #4891 Task #26 Slice 1: dormant pure proofs; no production caller or authority.
+mod status_panel_transition_v2;
 pub(in crate::services::discord) mod streaming_finalizer;
 mod task_notification_delivery;
 pub(in crate::services::discord) mod task_supervisor;
 mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
+#[cfg(all(test, unix))]
+pub(crate) fn claim_cross_channel_tmux_watcher_for_high_risk_test(
+    requested_channel_id: ChannelId,
+    existing_channel_id: ChannelId,
+    thread_parent_channel_id: Option<ChannelId>,
+) {
+    tmux::claim_cross_channel_tmux_watcher_for_test(
+        requested_channel_id,
+        existing_channel_id,
+        thread_parent_channel_id,
+    );
+}
 mod turn_completion_events;
 pub(in crate::services::discord) mod turn_end_wip_warning;
 #[cfg(unix)]
 pub(crate) use tmux::write_spawn_nonce;
 #[cfg(unix)]
 mod tmux_error_detect;
+#[cfg(unix)]
+pub(crate) use tmux_error_detect::{ProviderProseDiagnostic, classify_provider_prose_diagnostic};
 #[cfg(unix)]
 mod tmux_lifecycle;
 #[cfg(unix)]
@@ -112,11 +141,18 @@ mod tmux_overload_retry;
 mod tmux_reaper;
 #[cfg(unix)]
 mod tmux_restart_handoff;
+mod tmux_watcher_registry;
+#[rustfmt::skip]
+#[cfg(test)]
+mod tmux_watcher_registry_restore_tests;
+#[cfg(test)]
+mod relay_coord_tests;
 mod tui_direct_abort_marker;
 mod tui_direct_pending_start;
 mod tui_prompt_relay;
 mod tui_task_card;
 mod turn_bridge;
+#[allow(clippy::too_many_arguments)]
 mod turn_finalizer;
 mod turn_view_reconciler;
 mod voice_acknowledgement;
@@ -130,8 +166,23 @@ mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
 
-pub(in crate::services::discord) use delivery_lease_key::DeliveryLeaseKey;
+#[allow(unused_imports)]
+pub(in crate::services::discord) use tmux_watcher_registry::{
+    TMUX_WATCHER_STALE_HEARTBEAT_MS, TmuxWatcherBinding, TmuxWatcherHandle, TmuxWatcherRegistry,
+    TmuxWatcherRegistryGuard, lock_tmux_watcher_registry, tmux_watcher_now_ms,
+};
+
+pub(in crate::services::discord) use delivery_lease_cell::{
+    DELIVERY_LEASE_DEADLINE_MS, DELIVERY_LEASE_HEARTBEAT_MS, DeliveryLeaseCell,
+    DeliveryLeaseHeartbeat, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
+};
 pub(crate) use meeting_orchestrator as meeting;
+#[allow(unused_imports)]
+pub(in crate::services) use relay_coord::TmuxRelayCoord;
+pub(in crate::services::discord) use {
+    delivery_lease_key::DeliveryLeaseKey,
+    relay_health::{RelayFrontierMutationGuard, RelayFrontierToken},
+};
 // #3479 item-2: re-export the catch-up subsystem entry points referenced
 // outside the extracted cluster (`maybe_schedule_catch_up_retry_after_queue_drain`
 // here in mod.rs and `catch_up_missed_messages` in runtime_bootstrap recovery).
@@ -141,20 +192,21 @@ pub(in crate::services::discord) use catch_up::{
 };
 pub(in crate::services::discord) use mailbox_finish::{
     mailbox_finish_cancelled_turn, mailbox_finish_owned_turn, mailbox_finish_turn,
-    mailbox_finish_turn_if_matches, mailbox_finish_turn_if_matches_started_before,
+    mailbox_finish_turn_if_matches, mailbox_finish_turn_if_matches_episode_started_before,
 };
 pub(in crate::services::discord) use recovery_engine as recovery;
 // #3038 S1: re-export the extracted cluster type so the `SharedData` field
 // declaration and constructor literals reference it without a module-qualified
 // path (surface freeze, #3294/#3295 pattern).
 pub(crate) use restart_mode::InflightRestartMode;
-pub(crate) use router::HeadlessTurnStartError;
+pub(crate) use router::{
+    HeadlessTurnStartError, IntakeRequest, TurnKind, execute_intake_turn_core,
+};
 #[cfg(unix)]
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
-// #3038 S4: re-export the live-placeholder cluster type so `SharedData`
-// declarations/constructors keep the S1/S2/S3 unqualified surface.
-pub(in crate::services::discord) use shared_state::{PlaceholderState, PolicyRuntime};
-pub(in crate::services::discord) use shared_state::{QueuedPlaceholderState, RuntimeHttpCache};
+pub(in crate::services::discord) use shared_state::{
+    PlaceholderState, PolicyRuntime, QueuedPlaceholderState, RuntimeHttpCache,
+};
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
@@ -164,11 +216,6 @@ pub(in crate::services) use shared_state::DispatchRoutingState;
 // #3038 S3: same scope rationale as S2 — the cluster-E members were
 // `pub(super)` on `SharedData` (visible up to `crate::services`).
 pub(in crate::services) use shared_state::RestartLifecycle;
-// Phase 2-pre.3 of intake-node-routing: worker entry point. Phase 3 will
-// add the worker polling loop that imports these names; until then they
-// are intentionally exposed but unused at the crate boundary.
-#[allow(unused_imports)]
-pub(crate) use router::{IntakeRequest, TurnKind, execute_intake_turn_core};
 pub(crate) use turn_bridge::TmuxCleanupPolicy;
 
 use std::collections::HashMap;
@@ -191,35 +238,50 @@ use crate::services::gemini;
 use crate::services::opencode;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::qwen;
-use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
-
 use crate::services::turn_orchestrator::ChannelMailboxHandle;
 use crate::services::turn_orchestrator::HasPendingSoftQueueResult;
+use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
 use adk_session::{
     build_adk_session_key, build_session_key_candidates, derive_adk_session_info,
-    lookup_pending_dispatch_for_thread, parse_dispatch_id, post_adk_session_status,
+    lookup_pending_dispatch_for_thread, parse_dispatch_id,
 };
-use formatting::{
-    BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_tool_input,
-    send_long_message_raw, truncate_str,
+pub(in crate::services) use compact_turn_authority::{
+    ManagedCompactTurnIdentity, compact_eligible_turn_source, live_managed_turn_matches,
 };
-pub(crate) use inflight::clear_inflight_state;
-pub(crate) use inflight::lock_inflight_state_path;
-use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
+use formatting::{format_for_discord, format_tool_input, send_long_message_raw, truncate_str};
+#[cfg(test)]
+use inflight::save_inflight_state;
+use inflight::{InflightTurnState, load_inflight_states};
+pub(crate) use inflight::{clear_inflight_state, lock_inflight_state_path};
 pub(in crate::services::discord) use prompt_builder::load_channel_recent_context;
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 pub(in crate::services::discord) use queue_dispatch::MailboxEnqueueOutcome;
 use queue_dispatch::{
-    MailboxTakeNextSoftOutcome, mailbox_abandon_unclaimed_dispatch_after_success,
+    AutomaticQueueProgression, MailboxTakeNextSoftOutcome,
+    automatic_progression as automatic_queue_progression,
+    mailbox_abandon_unclaimed_dispatch_after_success, mailbox_requeue_intervention_front,
+    mailbox_restore_dequeued_head, mailbox_take_next_automatic_intervention,
+    mailbox_take_next_soft_intervention,
 };
 use recovery_engine::restore_inflight_turns;
 use restart_report::flush_restart_reports;
+use role_map_enrichment::enrich_role_map_with_channel_ids;
 use router::handle_event;
+#[cfg(test)]
+use session_idle_cleanup::mark_session_disconnected_for_idle_cleanup;
+use session_idle_cleanup::maybe_cleanup_sessions;
+use session_status_hook::{
+    post_canonical as post_adk_session_status_with_canonical_identity,
+    post_channel_turn as post_adk_session_status_for_channel,
+    post_legacy as post_adk_session_status,
+};
 use settings::{
     RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings,
     load_last_session_path, resolve_role_binding, save_bot_settings,
     validate_bot_channel_routing_with_provider_channel,
 };
+pub(super) use skills_scan::scan_skills;
+use skills_scan::skill_dir_fingerprint_with_projects;
 #[cfg(unix)]
 use tmux::restore_tmux_watchers;
 #[cfg(unix)]
@@ -227,7 +289,7 @@ use tmux_reaper::{cleanup_orphan_tmux_sessions, reap_dead_tmux_sessions};
 use turn_bridge::{TurnBridgeContext, spawn_turn_bridge, tmux_runtime_paths};
 
 pub(crate) use crate::services::turn_orchestrator::has_soft_intervention_at;
-pub(crate) use prompt_builder::DispatchProfile;
+pub(crate) use prompt_builder::{DispatchProfile, PromptProfiles};
 pub(crate) use runtime_bootstrap::RunBotContext;
 pub(crate) use runtime_bootstrap::run_bot;
 
@@ -257,8 +319,7 @@ pub(crate) use inflight::latest_request_owner_user_id_for_channel;
 pub use settings::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
 };
-// #2047 Finding 5 — expose role-map resolver to the HTTP routes layer so the
-// `/api/discord/channels/{id}` proxy can deny lookups for channels that are
+// #2047 Finding 5 — expose the role-map resolver so HTTP channel lookups can deny channels that are
 // not registered with this AgentDesk instance.
 pub(crate) use settings::resolve_role_binding as resolve_channel_role_binding;
 
@@ -769,6 +830,44 @@ fn increment_counter(counter: &AtomicUsize, reason: &str) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) use router::try_intake_runtime_transition_after_redirect;
+#[cfg(test)]
+pub(crate) use session_runtime::resume_launch_state_for_tests;
+
+#[cfg(test)]
+pub(crate) fn register_resume_watcher_for_tests(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+) {
+    shared.tmux_watchers.insert(
+        channel_id,
+        TmuxWatcherHandle {
+            tmux_session_name: tmux_session_name.to_string(),
+            output_path: format!("/runtime/{tmux_session_name}.jsonl"),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_offset: Arc::new(std::sync::Mutex::new(None)),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_heartbeat_ts_ms: Arc::new(
+                std::sync::atomic::AtomicI64::new(tmux_watcher_now_ms()),
+            ),
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn resume_owner_channel_for_tests(
+    shared: &SharedData,
+    tmux_session_name: &str,
+) -> Option<ChannelId> {
+    shared
+        .tmux_watchers
+        .owner_channel_for_tmux_session(tmux_session_name)
+}
+
+#[cfg(test)]
 mod global_active_counter_tests {
     use super::{increment_counter, saturating_decrement_counter};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -822,10 +921,10 @@ mod global_active_counter_tests {
 use session_runtime::{
     DiscordSession, RuntimeChannelBindingStatus, WorktreeInfo, auto_restore_session,
     auto_restore_session_force, auto_restore_session_with_dm_hint, bootstrap_thread_session,
-    cleanup_git_worktree, create_git_worktree, detect_worktree_conflict, provider_handles_channel,
-    resolve_channel_category, resolve_is_dm_channel, resolve_reusable_worktree,
-    resolve_runtime_channel_binding_status, resolve_thread_parent, select_restored_session_path,
-    synthetic_thread_channel_name, validate_live_channel_routing,
+    create_git_worktree, detect_worktree_conflict, provider_handles_channel,
+    rebind_channel_session, resolve_channel_category, resolve_is_dm_channel,
+    resolve_reusable_worktree, resolve_runtime_channel_binding_status, resolve_thread_parent,
+    select_restored_session_path, synthetic_thread_channel_name, validate_live_channel_routing,
     validate_live_channel_routing_with_dm_hint,
 };
 
@@ -885,1207 +984,6 @@ impl Default for DiscordBotSettings {
             allow_all_users: false,
             allowed_bot_ids: Vec::new(),
         }
-    }
-}
-
-/// Shared state for the Discord bot (multi-channel: each channel has its own session)
-/// Handle for a background tmux output watcher
-pub(super) struct TmuxWatcherHandle {
-    /// Tmux session this watcher owns. Used to enforce the single-watcher
-    /// policy when the same session is reattached through another path.
-    pub(super) tmux_session_name: String,
-    /// JSONL/transcript path this watcher tails for the session. A single tmux
-    /// session can change relay files when it graduates from the prelaunch
-    /// wrapper to a provider-native TUI handoff.
-    pub(super) output_path: String,
-    /// Signal to pause monitoring (while Discord handler reads its own turn)
-    pub(super) paused: Arc<std::sync::atomic::AtomicBool>,
-    /// After Discord handler finishes its turn, set this offset so watcher resumes from here
-    pub(super) resume_offset: Arc<std::sync::Mutex<Option<u64>>>,
-    /// Signal to cancel the watcher (quiet exit, no "session ended" message)
-    pub(super) cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Epoch counter: incremented each time paused is set to true.
-    /// Watcher snapshots this before reading; if it changed, the read is stale.
-    pub(super) pause_epoch: Arc<std::sync::atomic::AtomicU64>,
-    /// Set by turn_bridge when it delivers the response directly (non-handoff path).
-    /// Watcher checks this before relay to avoid duplicate messages.
-    pub(super) turn_delivered: Arc<std::sync::atomic::AtomicBool>,
-    /// Updated by the watcher task loop. If this stops moving while the registry
-    /// still has a slot, the slot is stale and must not suppress a new watcher.
-    pub(super) last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
-}
-
-// #3016 phase-5b2: the per-handle `mailbox_finalize_owed: Arc<AtomicBool>` field
-// (#1452 turn-scoped bridge→watcher finalization debt) has been removed. Phase-5b1
-// replaced every finalize-decision consumer of the flag — the watcher's
-// normal-completion finalize now fires on the confirmed-completion / structural
-// signal (`normal_completion = true`), and the bridge-handoff invariant uses the
-// ledger's `register_start(RelayOwnerKind::Watcher)` authority — so the flag was
-// write-only and is now deleted entirely with identical behaviour.
-
-pub(super) const TMUX_WATCHER_STALE_HEARTBEAT_MS: i64 = 60_000;
-
-pub(super) fn tmux_watcher_now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
-
-impl TmuxWatcherHandle {
-    pub(super) fn heartbeat_stale(&self) -> bool {
-        let last = self
-            .last_heartbeat_ts_ms
-            .load(std::sync::atomic::Ordering::Acquire);
-        last <= 0 || tmux_watcher_now_ms().saturating_sub(last) > TMUX_WATCHER_STALE_HEARTBEAT_MS
-    }
-}
-
-pub(super) type TmuxWatcherRegistryGuard = std::sync::MutexGuard<'static, ()>;
-
-static TMUX_WATCHER_REGISTRY_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-pub(super) fn lock_tmux_watcher_registry() -> TmuxWatcherRegistryGuard {
-    TMUX_WATCHER_REGISTRY_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-/// Registry for active tmux output watchers.
-///
-/// Ownership is keyed by tmux session name so duplicate attaches for the same
-/// live session converge before a second relay can spawn. A channel index is
-/// retained for existing routing and diagnostics callers that ask "does this
-/// Discord channel currently have watcher coverage?".
-pub(super) struct TmuxWatcherRegistry {
-    by_tmux_session: dashmap::DashMap<String, TmuxWatcherHandle>,
-    tmux_session_by_channel: dashmap::DashMap<ChannelId, String>,
-    owner_channel_by_tmux_session: dashmap::DashMap<String, ChannelId>,
-    /// #3105: authoritative owner-channel bindings re-registered for LIVE tmux
-    /// sessions that currently have no live watcher handle — e.g. a Claude TUI
-    /// session the user is typing into directly whose watcher slot was evicted
-    /// by a compact/restart/rebind and never re-claimed (no foreground turn).
-    ///
-    /// This is part of the authoritative registry, NOT the `tui_prompt_dedupe`
-    /// mirror: it is sourced only from the configured channel→provider bindings
-    /// (`settings::list_registered_channel_bindings`), which deterministically
-    /// resolve a session's owner channel from its (base or thread-suffixed)
-    /// tmux name. Kept in a separate map so the strict 1:1 watcher-handle
-    /// invariant across the three maps above is untouched; the live watcher map
-    /// always wins on lookup, and a real watcher claim for the session clears
-    /// the restored entry so it can never shadow live truth.
-    restored_owner_by_tmux_session: dashmap::DashMap<String, ChannelId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TmuxWatcherBinding {
-    pub(super) owner_channel_id: ChannelId,
-    pub(super) tmux_session_name: String,
-}
-
-impl TmuxWatcherRegistry {
-    pub(super) fn new() -> Self {
-        Self {
-            by_tmux_session: dashmap::DashMap::new(),
-            tmux_session_by_channel: dashmap::DashMap::new(),
-            owner_channel_by_tmux_session: dashmap::DashMap::new(),
-            restored_owner_by_tmux_session: dashmap::DashMap::new(),
-        }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.by_tmux_session.len()
-    }
-
-    pub(super) fn contains_key(&self, channel_id: &ChannelId) -> bool {
-        self.channel_binding(channel_id)
-            .and_then(|binding| self.by_tmux_session.get(&binding.tmux_session_name))
-            .is_some()
-    }
-
-    pub(super) fn get(
-        &self,
-        channel_id: &ChannelId,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, TmuxWatcherHandle>> {
-        let tmux_session_name = self.tmux_session_by_channel.get(channel_id)?.clone();
-        self.by_tmux_session.get(&tmux_session_name)
-    }
-
-    // #3034: test-only convenience wrapper (prod code calls `insert_locked`
-    // with an explicit registry guard). Used only by `#[cfg(test)]` setup.
-    #[allow(dead_code)]
-    pub(super) fn insert(
-        &self,
-        channel_id: ChannelId,
-        handle: TmuxWatcherHandle,
-    ) -> Option<TmuxWatcherHandle> {
-        let guard = lock_tmux_watcher_registry();
-        self.insert_locked(&guard, channel_id, handle)
-    }
-
-    pub(super) fn insert_locked(
-        &self,
-        _guard: &TmuxWatcherRegistryGuard,
-        channel_id: ChannelId,
-        handle: TmuxWatcherHandle,
-    ) -> Option<TmuxWatcherHandle> {
-        if let Some((_, old_tmux_session_name)) = self.tmux_session_by_channel.remove(&channel_id) {
-            self.owner_channel_by_tmux_session
-                .remove(&old_tmux_session_name);
-            self.by_tmux_session.remove(&old_tmux_session_name);
-        }
-
-        let tmux_session_name = handle.tmux_session_name.clone();
-        if let Some((_, old_owner_channel_id)) = self
-            .owner_channel_by_tmux_session
-            .remove(&tmux_session_name)
-        {
-            self.tmux_session_by_channel.remove(&old_owner_channel_id);
-        }
-
-        // #3105: a live watcher handle is now the authoritative owner for this
-        // session — drop any restored owner-only binding so it can never shadow
-        // or contradict live truth.
-        self.restored_owner_by_tmux_session
-            .remove(&tmux_session_name);
-
-        self.tmux_session_by_channel
-            .insert(channel_id, tmux_session_name.clone());
-        self.owner_channel_by_tmux_session
-            .insert(tmux_session_name.clone(), channel_id);
-        self.by_tmux_session.insert(tmux_session_name, handle)
-    }
-
-    pub(super) fn remove(&self, channel_id: &ChannelId) -> Option<(ChannelId, TmuxWatcherHandle)> {
-        let guard = lock_tmux_watcher_registry();
-        self.remove_locked(&guard, channel_id)
-    }
-
-    pub(super) fn remove_locked(
-        &self,
-        _guard: &TmuxWatcherRegistryGuard,
-        channel_id: &ChannelId,
-    ) -> Option<(ChannelId, TmuxWatcherHandle)> {
-        let (_, tmux_session_name) = self.tmux_session_by_channel.remove(channel_id)?;
-        self.owner_channel_by_tmux_session
-            .remove(&tmux_session_name);
-        self.by_tmux_session
-            .remove(&tmux_session_name)
-            .map(|(_, handle)| (*channel_id, handle))
-    }
-
-    pub(super) fn remove_tmux_session_locked(
-        &self,
-        _guard: &TmuxWatcherRegistryGuard,
-        tmux_session_name: &str,
-    ) -> Option<(ChannelId, TmuxWatcherHandle)> {
-        let (_, owner_channel_id) = self
-            .owner_channel_by_tmux_session
-            .remove(tmux_session_name)?;
-        self.tmux_session_by_channel.remove(&owner_channel_id);
-        self.by_tmux_session
-            .remove(tmux_session_name)
-            .map(|(_, handle)| (owner_channel_id, handle))
-    }
-
-    pub(super) fn remove_tmux_session_if_current(
-        &self,
-        tmux_session_name: &str,
-        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> Option<(ChannelId, TmuxWatcherHandle)> {
-        let guard = lock_tmux_watcher_registry();
-        let is_current = self
-            .by_tmux_session
-            .get(tmux_session_name)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.cancel, expected_cancel));
-        if !is_current {
-            return None;
-        }
-        self.remove_tmux_session_locked(&guard, tmux_session_name)
-    }
-
-    pub(super) fn cancel_and_remove_channel_if_current(
-        &self,
-        channel_id: &ChannelId,
-        expected_tmux_session_name: &str,
-        expected_output_path: &str,
-        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> bool {
-        let guard = lock_tmux_watcher_registry();
-        let Some(tmux_session_name) = self
-            .tmux_session_by_channel
-            .get(channel_id)
-            .map(|entry| entry.clone())
-        else {
-            return false;
-        };
-        if tmux_session_name != expected_tmux_session_name {
-            return false;
-        }
-        let matches_current = self
-            .by_tmux_session
-            .get(&tmux_session_name)
-            .is_some_and(|entry| {
-                entry.output_path == expected_output_path
-                    && Arc::ptr_eq(&entry.cancel, expected_cancel)
-            });
-        if !matches_current {
-            return false;
-        }
-        let Some((_, handle)) = self.remove_locked(&guard, channel_id) else {
-            return false;
-        };
-        handle
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        true
-    }
-
-    pub(super) fn iter(&self) -> dashmap::iter::Iter<'_, String, TmuxWatcherHandle> {
-        self.by_tmux_session.iter()
-    }
-
-    pub(super) fn channel_binding(&self, channel_id: &ChannelId) -> Option<TmuxWatcherBinding> {
-        let tmux_session_name = self.tmux_session_by_channel.get(channel_id)?.clone();
-        let owner_channel_id = self
-            .owner_channel_by_tmux_session
-            .get(&tmux_session_name)
-            .map(|entry| *entry.value())
-            .unwrap_or(*channel_id);
-        Some(TmuxWatcherBinding {
-            owner_channel_id,
-            tmux_session_name,
-        })
-    }
-
-    pub(super) fn owner_channel_for_tmux_session(
-        &self,
-        tmux_session_name: &str,
-    ) -> Option<ChannelId> {
-        // The live watcher-handle binding is the primary authority. When no live
-        // watcher owns the session (e.g. a TUI-direct session whose slot was
-        // evicted by compact/restart/rebind), fall back to the #3105 restored
-        // owner map — still authoritative (settings-derived), unlike the dedupe
-        // mirror, which is never consulted here.
-        self.owner_channel_by_tmux_session
-            .get(tmux_session_name)
-            .map(|entry| *entry.value())
-            .or_else(|| {
-                self.restored_owner_by_tmux_session
-                    .get(tmux_session_name)
-                    .map(|entry| *entry.value())
-            })
-    }
-
-    /// #3105: re-register the authoritative owner channel for a LIVE tmux
-    /// session that currently has no live watcher handle.
-    ///
-    /// This is the self-heal path for the permanent relay drop described in
-    /// #3105: the idle transcript relay resolves a session's owner channel
-    /// deterministically from the configured channel→provider bindings (which
-    /// handle both base and thread-suffixed tmux names) and promotes that
-    /// evidence into the authoritative registry here, instead of routing from
-    /// the `tui_prompt_dedupe` mirror (which #3018 forbids as a reverse
-    /// authority).
-    ///
-    /// No-ops when a live watcher already owns the session (live truth wins) or
-    /// when the binding is unchanged. Returns `true` only on the first/changed
-    /// registration so callers can emit a single bounded incident instead of a
-    /// per-poll log.
-    pub(super) fn restore_owner_channel_for_tmux_session(
-        &self,
-        tmux_session_name: &str,
-        channel_id: ChannelId,
-    ) -> bool {
-        let _guard = lock_tmux_watcher_registry();
-        if self
-            .owner_channel_by_tmux_session
-            .contains_key(tmux_session_name)
-        {
-            // A live watcher handle already owns this session authoritatively.
-            self.restored_owner_by_tmux_session
-                .remove(tmux_session_name);
-            return false;
-        }
-        let changed = self
-            .restored_owner_by_tmux_session
-            .get(tmux_session_name)
-            .map(|entry| *entry.value())
-            != Some(channel_id);
-        self.restored_owner_by_tmux_session
-            .insert(tmux_session_name.to_string(), channel_id);
-        changed
-    }
-
-    /// #3105: drop a restored owner-only binding (e.g. once the session is no
-    /// longer live). Idempotent.
-    pub(super) fn clear_restored_owner_for_tmux_session(&self, tmux_session_name: &str) {
-        self.restored_owner_by_tmux_session
-            .remove(tmux_session_name);
-    }
-
-    /// #3105 (codex P1 sub-case B): true when a LIVE watcher handle currently
-    /// owns this tmux session. Used to distinguish a genuinely dead/orphaned
-    /// session (no live watcher) from a live session whose authoritative owner
-    /// map entry was transiently evicted (which must self-heal, not be tombstoned).
-    pub(super) fn has_live_watcher_handle(&self, tmux_session_name: &str) -> bool {
-        self.by_tmux_session.contains_key(tmux_session_name)
-    }
-
-    pub(super) fn tmux_session_is_stale(&self, tmux_session_name: &str) -> Option<bool> {
-        self.by_tmux_session
-            .get(tmux_session_name)
-            .map(|entry| entry.heartbeat_stale())
-    }
-
-    pub(super) fn tmux_session_live_for_relay(&self, tmux_session_name: &str) -> Option<bool> {
-        self.by_tmux_session.get(tmux_session_name).map(|entry| {
-            !entry.cancel.load(std::sync::atomic::Ordering::Relaxed) && !entry.heartbeat_stale()
-        })
-    }
-
-    /// #2843: the output path the live watcher (if any) is tailing for this tmux
-    /// session. The Claude idle relay uses this to decide whether a non-stale
-    /// watcher genuinely covers the freshest transcript (and thus already relays
-    /// it). Comparing against the runtime *binding* is wrong: re-registering the
-    /// binding does not retarget the already-running watcher, so the binding and
-    /// the watcher can point at different files.
-    pub(super) fn watcher_output_path(&self, tmux_session_name: &str) -> Option<String> {
-        self.by_tmux_session
-            .get(tmux_session_name)
-            .map(|entry| entry.output_path.clone())
-    }
-}
-
-#[cfg(test)]
-mod tmux_watcher_registry_restore_tests {
-    use super::*;
-
-    fn live_watcher_handle(tmux_session_name: &str) -> TmuxWatcherHandle {
-        TmuxWatcherHandle {
-            tmux_session_name: tmux_session_name.to_string(),
-            output_path: format!("/tmp/{tmux_session_name}.jsonl"),
-            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            resume_offset: Arc::new(std::sync::Mutex::new(None)),
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_heartbeat_ts_ms: Arc::new(
-                std::sync::atomic::AtomicI64::new(tmux_watcher_now_ms()),
-            ),
-        }
-    }
-
-    // #3105: a LIVE TUI session whose authoritative watcher-handle binding is
-    // missing (slot evicted by compact/restart/rebind, never re-claimed) must be
-    // self-healable via an authoritative re-registration so the idle relay can
-    // route again — instead of dropping every poll forever. This is the
-    // registry-side half of the fix; it asserts the restore is treated as
-    // authoritative on lookup and does NOT depend on the dedupe mirror.
-    #[test]
-    fn restored_owner_makes_missing_registry_resolve_for_live_session() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471";
-        let channel = ChannelId::new(1_504_468_805_772_902_471);
-
-        // No live watcher handle yet → registry misses (the #3018 drop trigger).
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
-
-        // Authoritative (settings-derived) re-registration repairs the miss.
-        assert!(
-            registry.restore_owner_channel_for_tmux_session(tmux, channel),
-            "first restore must report a change so a single bounded incident is emitted"
-        );
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(tmux),
-            Some(channel),
-            "restored owner must resolve authoritatively from the registry"
-        );
-
-        // Re-applying the same binding is a no-op (no repeated per-poll incident).
-        assert!(
-            !registry.restore_owner_channel_for_tmux_session(tmux, channel),
-            "unchanged restore must not re-report a change"
-        );
-    }
-
-    // A real live watcher handle is the primary authority and must win over (and
-    // evict) any restored owner-only binding — restored entries can never shadow
-    // or contradict live truth.
-    #[test]
-    fn live_watcher_handle_overrides_and_evicts_restored_owner() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471";
-        let restored_channel = ChannelId::new(111_000_000_000_000);
-        let live_channel = ChannelId::new(222_000_000_000_000);
-
-        registry.restore_owner_channel_for_tmux_session(tmux, restored_channel);
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(tmux),
-            Some(restored_channel)
-        );
-
-        // Claiming a live watcher handle takes over and drops the restored entry.
-        registry.insert(live_channel, live_watcher_handle(tmux));
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(tmux),
-            Some(live_channel),
-            "live watcher handle must win over a restored owner-only binding"
-        );
-
-        // Removing the live watcher must NOT resurrect the evicted restored entry.
-        registry.remove(&live_channel);
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(tmux),
-            None,
-            "evicted restored entry must not resurrect after the live watcher is removed"
-        );
-    }
-
-    // Restoring an owner while a live watcher already owns the session must be a
-    // no-op (and clear any leftover restored entry) — never override live truth.
-    #[test]
-    fn restore_is_noop_when_live_watcher_owns_session() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-claude-adk-cc";
-        let live_channel = ChannelId::new(333_000_000_000_000);
-
-        registry.insert(live_channel, live_watcher_handle(tmux));
-        assert!(
-            !registry
-                .restore_owner_channel_for_tmux_session(tmux, ChannelId::new(444_000_000_000_000)),
-            "restore must not report a change when a live watcher owns the session"
-        );
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(tmux),
-            Some(live_channel),
-            "live watcher owner must be unchanged by a restore attempt"
-        );
-    }
-
-    // The base and thread-suffixed tmux names are distinct registry keys; a
-    // restored owner for the thread-suffixed live session resolves on its own
-    // exact key (the relay resolves the channel from the suffixed name).
-    #[test]
-    fn base_and_thread_suffixed_names_resolve_independently() {
-        let registry = TmuxWatcherRegistry::new();
-        let base = "AgentDesk-claude-adk-cc";
-        let suffixed = "AgentDesk-claude-adk-cc-t1504468805772902471";
-        let channel = ChannelId::new(1_504_468_805_772_902_471);
-
-        registry.restore_owner_channel_for_tmux_session(suffixed, channel);
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(suffixed),
-            Some(channel)
-        );
-        assert_eq!(
-            registry.owner_channel_for_tmux_session(base),
-            None,
-            "the base name must not borrow the thread-suffixed session's owner"
-        );
-    }
-
-    // Clearing a restored owner (e.g. when the pane is no longer live) must drop
-    // the binding so a dead session can never resolve.
-    #[test]
-    fn clear_restored_owner_drops_binding() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471";
-        let channel = ChannelId::new(1_504_468_805_772_902_471);
-
-        registry.restore_owner_channel_for_tmux_session(tmux, channel);
-        registry.clear_restored_owner_for_tmux_session(tmux);
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
-    }
-
-    #[test]
-    fn cancel_and_remove_channel_if_current_only_rolls_back_matching_claim() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-codex-adk-cdx";
-        let channel = ChannelId::new(1_504_468_805_772_902_471);
-        let handle = live_watcher_handle(tmux);
-        let expected_output_path = handle.output_path.clone();
-        let expected_cancel = handle.cancel.clone();
-        registry.insert(channel, handle);
-
-        assert!(
-            !registry.cancel_and_remove_channel_if_current(
-                &channel,
-                tmux,
-                "/tmp/different.jsonl",
-                &expected_cancel
-            ),
-            "output-path mismatch must not remove a possibly newer watcher"
-        );
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), Some(channel));
-        assert!(!expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
-
-        assert!(registry.cancel_and_remove_channel_if_current(
-            &channel,
-            tmux,
-            &expected_output_path,
-            &expected_cancel
-        ));
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
-        assert!(expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[test]
-    fn tmux_session_is_stale_does_not_fold_cancel_flag_into_heartbeat() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-codex-adk-cdx-fresh-cancel";
-        let channel = ChannelId::new(1_504_468_805_772_902_472);
-        let handle = live_watcher_handle(tmux);
-        let cancel = handle.cancel.clone();
-        registry.insert(channel, handle);
-
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        assert_eq!(
-            registry.tmux_session_is_stale(tmux),
-            Some(false),
-            "a fresh heartbeat watcher with an early cancel flag is cancelled, not heartbeat-stale"
-        );
-        assert_eq!(
-            registry.tmux_session_live_for_relay(tmux),
-            Some(false),
-            "the same cancelled handle is still not relay-live; cancel is evaluated separately"
-        );
-    }
-}
-
-/// Per-channel coordination for watcher-to-Discord relay emission.
-///
-/// This state is **shared across watcher-handle replacements** (unlike
-/// `TmuxWatcherHandle`, which is recreated on watcher reattach). It keeps
-/// relay emission serialized if a stale outgoing watcher overlaps with its
-/// successor, and it exposes the confirmed-output watermark used by watcher
-/// stop checks.
-///
-/// Scope: intra-process only. Persisted dedupe across dcserver restarts is
-/// still handled by `InflightTurnState::last_watcher_relayed_offset` in the
-/// inflight JSON.
-pub(super) struct TmuxRelayCoord {
-    /// Non-zero while some watcher instance is actively emitting a relay for
-    /// this channel. Holds the `data_start_offset` of the in-progress emission.
-    /// Acquired via `compare_exchange(0, offset)` — only one watcher can
-    /// hold the slot, so concurrent attempts from outgoing+incoming watchers
-    /// serialize rather than double-fire.
-    pub(super) relay_slot: Arc<std::sync::atomic::AtomicU64>,
-    /// End offset (exclusive) of the last relay this process has confirmed
-    /// delivery for. 0 = no confirmed delivery yet this process lifetime.
-    ///
-    /// #3017: this is the single output-offset authority for the relay-dedup
-    /// paths (read via `SharedData::committed_relay_offset`, advanced by the
-    /// watcher's `advance_watcher_confirmed_end`). For an inflight-less wake /
-    /// idle-background / monitor-auto-turn turn, the secondary relay actors
-    /// (idle-JSONL relay, session-bound sink) CONSULT this watermark so a
-    /// byte-range the watcher already committed is relayed exactly once
-    /// regardless of which actor observes it first (the E-13 dedup invariant).
-    /// For a normal
-    /// Discord-origin turn (inflight present) the watcher remains the sole
-    /// relay owner and relay dedupe is still scoped to the watcher instance via
-    /// its local `last_relayed_offset` — a valid owner is never suppressed
-    /// solely because another watcher advanced this watermark; only the
-    /// no-inflight wake/idle paths gate on it.
-    pub(super) confirmed_end_offset: Arc<std::sync::atomic::AtomicU64>,
-    /// Wall-clock timestamp (ms since epoch) of the most recent confirmed
-    /// relay. 0 = no confirmed relay observed yet. Read by the
-    /// `watcher-state` observability endpoint (#964). Monotonic is NOT
-    /// required — this is a telemetry field only.
-    pub(super) last_relay_ts_ms: Arc<std::sync::atomic::AtomicI64>,
-    /// Number of watcher reattach/reconnect spawns observed for this channel
-    /// in the current dcserver process. Exposed through watcher-state (#964).
-    pub(super) reconnect_count: Arc<std::sync::atomic::AtomicU64>,
-    /// `.generation` marker file mtime (nanos since epoch) snapshotted the
-    /// last time `confirmed_end_offset` was advanced. 0 = never observed.
-    ///
-    /// `reset_stale_relay_watermark_if_output_regressed` (#1270) uses this
-    /// to distinguish two output-regression scenarios that look identical
-    /// at the byte level:
-    ///   - Mid-flight rotation (`truncate_jsonl_head_safe` rename — same
-    ///     wrapper, same `.generation` mtime): pin watermark to current
-    ///     EOF so we don't re-relay surviving content (PR #1256 intent).
-    ///   - Cancel→respawn (`cleanup_session_temp_files` deletes
-    ///     `.generation`, claude.rs writes a fresh one — new wrapper, new
-    ///     mtime): reset watermark to 0 so the genuinely-new response is
-    ///     relayed.
-    ///
-    /// `.generation` is the stable wrapper-identity signal because it's
-    /// written once per spawn and never touched by the live wrapper, so its
-    /// mtime survives jsonl rotation but flips on a fresh spawn.
-    pub(super) confirmed_end_generation_mtime_ns: Arc<std::sync::atomic::AtomicI64>,
-    /// #3041 P1-1: the LIVE per-channel delivery lease. Added ALONGSIDE
-    /// `relay_slot` (which is NOT removed yet — its guard migration is a later
-    /// step). The watcher acquires this before delivering the terminal response
-    /// and commits it after; the commit is what advances `confirmed_end_offset`
-    /// (replacing the watcher's inline advance). Shared via `Arc` across all
-    /// watcher instances for the channel so a replacement watcher observes a
-    /// live holder's lease and skips the duplicate send (the §5.2 B2 invariant).
-    pub(in crate::services::discord) delivery_lease: Arc<DeliveryLeaseCell>,
-}
-
-impl TmuxRelayCoord {
-    pub(super) fn new(channel_id: ChannelId) -> Self {
-        Self {
-            relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            confirmed_end_generation_mtime_ns: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            delivery_lease: Arc::new(DeliveryLeaseCell::new(channel_id)),
-        }
-    }
-
-    pub(super) fn note_relay_progress_heartbeat(&self, now_ms: i64) {
-        self.last_relay_ts_ms.store(now_ms, Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-mod relay_coord_tests {
-    use super::*;
-
-    #[test]
-    fn relay_progress_heartbeat_stamps_each_confirmed_chunk() {
-        let coord = TmuxRelayCoord::new(ChannelId::new(4_178));
-
-        coord.note_relay_progress_heartbeat(1_000);
-        assert_eq!(coord.last_relay_ts_ms.load(Ordering::Acquire), 1_000);
-
-        coord.note_relay_progress_heartbeat(1_500);
-        assert_eq!(coord.last_relay_ts_ms.load(Ordering::Acquire), 1_500);
-        assert_eq!(coord.confirmed_end_offset.load(Ordering::Acquire), 0);
-    }
-}
-
-// ===========================================================================
-// #3041 §2-§3 — Delivery-lease `DeliveryLeaseCell` state machine.
-//
-// As of P1-1 the WATCHER terminal-delivery path wires this LIVE: the watcher
-// acquires the cell before sending, heartbeat-renews it during the send, and
-// commits+advances+releases INLINE. The `relay_slot` field above is LEFT
-// UNTOUCHED for now (its guard migration is a later step). The SINK/BRIDGE
-// committers (P1-2) and the 3-way ACK reconciliation (P1-3) are not wired yet,
-// so the actor `CommitDelivery`/`ReleaseDelivery` messages and some helpers
-// remain dormant — those still carry targeted `#[allow(dead_code)]` attributes
-// tagged with this issue/phase, to be wired/removed by the follow-up phases.
-//
-// Design (faithful to #3041 §2-§3):
-//   lease = (delivery_lease_key, byte_range [start,end))
-//           → a "one-time terminal-delivery right".
-//   The lease key is deliberately separate from the finalizer's `TurnKey`: the
-//   finalizer keeps its id-0 channel-collapse semantics, while delivery leasing
-//   needs id-0 turns disambiguated by their inflight start identity.
-//   State machine:
-//     Unleased --(CAS acquire)--> Leased{holder, deadline, range}
-//               --(commit)-------> Committed{Delivered|NotDelivered|Unknown}
-//               --(release)------> Unleased
-//     deadline reclaim: Leased --(deadline elapsed)--> Unleased
-// ===========================================================================
-
-/// Who currently holds (or is attempting to hold) the delivery lease.
-///
-/// #3041 P1-0: dormant, wired in P1-1.. — the holder is matched on
-/// compare-and-release so an actor can only release a lease it actually owns.
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::services::discord) enum LeaseHolder {
-    /// A tmux watcher instance. `instance_id` distinguishes an outgoing
-    /// watcher from its successor across a reattach so a stale watcher cannot
-    /// release the live watcher's lease.
-    Watcher { instance_id: u64 },
-    /// The standby / output sink relay.
-    Sink,
-    /// The bridge (turn-bridge handoff path).
-    Bridge,
-}
-
-/// The three-way commit outcome (#3041 §3). `Unknown` is the safety value for
-/// any ambiguous terminal (drop / panic / partial write) and MUST NOT advance
-/// the confirmed-delivery offset — only `Delivered` does.
-///
-/// #3041 P1-0: dormant, wired in P1-1...
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::services::discord) enum LeaseOutcome {
-    /// Terminal output was confirmed delivered to Discord; the offset may
-    /// advance to `end`.
-    Delivered,
-    /// Delivery was intentionally suppressed / not performed; offset unchanged.
-    NotDelivered,
-    /// Ambiguous (drop / panic / partial). Offset MUST NOT advance.
-    Unknown,
-}
-
-/// The lease state machine value, owned behind the cell's mutex. The `AtomicU8`
-/// tag below is the single-winner CAS gate for acquire; this payload is only
-/// ever mutated by that winner (or by a deadline reclaim), and every mutation
-/// flips the tag AND writes the payload under the SAME mutex, so the tag and
-/// payload are always observed coherently (#3041 codex). `read()` also takes
-/// the mutex — there is no lock-free read fast path.
-///
-/// #3041 P1-0: dormant, wired in P1-1...
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-#[derive(Clone, Debug)]
-enum LeaseState {
-    /// No holder; the lease is available to acquire.
-    Unleased,
-    /// Held by `holder` for delivery identity `key` until `deadline` (monotonic ms
-    /// since process start); covers the half-open byte range `[start, end)`.
-    /// The lease key is the FULL `(DeliveryLeaseKey, [start,end))` identity
-    /// (#3041 §2): `commit`/`release` verify it so a stale commit or release
-    /// from an OLDER turn (or the same turn with a different range) cannot act
-    /// on a reacquired NEWER lease. `reclaim_if_expired` is intentionally
-    /// deadline-only (identity-agnostic) — it force-returns an expired lease
-    /// regardless of holder/key so a dead holder cannot strand the cell.
-    Leased {
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        deadline_ms: u64,
-        start: u64,
-        end: u64,
-    },
-    /// Committed with a three-way outcome; carries the same `(holder, key,
-    /// range)` identity forward so a stale release is rejected. Awaits a
-    /// `release` to return to `Unleased`.
-    Committed {
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        start: u64,
-        end: u64,
-        outcome: LeaseOutcome,
-    },
-}
-
-/// #3041 P1-1: process-monotonic millisecond clock for delivery-lease
-/// deadlines. The acquire deadline and the reconciler's `reclaim_if_expired`
-/// MUST read the SAME clock; a wall clock would jump on NTP steps and could
-/// reclaim a live holder or strand a dead one. Anchored to a process-start
-/// `Instant` so it is purely monotonic (never goes backwards). NOTE: this is a
-/// real wall-monotonic clock, not the Tokio test clock; gated-clock tests drive
-/// `reclaim_if_expired` with explicit `now_ms` arguments rather than this fn.
-pub(in crate::services::discord) fn lease_now_ms() -> u64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-}
-
-/// Internal CAS gate tag for the [`DeliveryLeaseCell`]. The CAS that flips
-/// `UNLEASED → LEASED` is the single-winner acquire primitive — exactly one
-/// acquirer wins; concurrent losers serialize on the payload mutex and observe
-/// a non-`UNLEASED` tag under the lock. The tag is taken/flipped under the
-/// payload mutex (never on its own); it is NOT a lock-free read fast path —
-/// `read()` always takes the mutex (#3041 R1 coherence fix).
-const TAG_UNLEASED: u8 = 0;
-const TAG_LEASED: u8 = 1;
-const TAG_COMMITTED: u8 = 2;
-
-/// One-time terminal-delivery right for a single `(channel, turn, byte_range)`
-/// (#3041 §2-§3). DORMANT in P1-0 — added alongside, NOT replacing,
-/// `TmuxRelayCoord::relay_slot`. The `state_tag` is the single-winner CAS
-/// acquire primitive; the `payload` mutex carries the rich lease state (holder
-/// / deadline / range / outcome). The tag flip, payload write, and `read()` all
-/// happen under the one mutex, so they are always mutually coherent.
-///
-/// #3041 P1-0: dormant, wired in P1-1...
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-pub(in crate::services::discord) struct DeliveryLeaseCell {
-    /// The channel this lease coordinates. Part of the lease identity.
-    channel_id: ChannelId,
-    /// Internal CAS gate tag (`TAG_*`). The acquire CAS on this word is the
-    /// single-winner gate; it is flipped under the payload mutex, NOT lock-free
-    /// for readers — `read()` takes the mutex.
-    state_tag: std::sync::atomic::AtomicU8,
-    /// Rich lease payload. Mutated by the CAS winner or a deadline reclaim, and
-    /// read by `read()` — all under this one mutex (the coherence invariant).
-    payload: std::sync::Mutex<LeaseState>,
-}
-
-/// A point-in-time snapshot of a [`DeliveryLeaseCell`], returned by `read()`
-/// (which materializes it under the payload mutex).
-///
-/// #3041 P1-0: dormant, wired in P1-1...
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-#[derive(Clone, Debug)]
-pub(in crate::services::discord) enum LeaseSnapshot {
-    Unleased,
-    Leased {
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        deadline_ms: u64,
-        start: u64,
-        end: u64,
-    },
-    Committed {
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        start: u64,
-        end: u64,
-        outcome: LeaseOutcome,
-    },
-}
-
-#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
-impl DeliveryLeaseCell {
-    /// Construct a fresh `Unleased` cell for `channel_id`. The lease key and
-    /// byte range are supplied per-acquire, not at
-    /// construction, so one cell serves the channel across sequential turns.
-    pub(in crate::services::discord) fn new(channel_id: ChannelId) -> Self {
-        Self {
-            channel_id,
-            state_tag: std::sync::atomic::AtomicU8::new(TAG_UNLEASED),
-            payload: std::sync::Mutex::new(LeaseState::Unleased),
-        }
-    }
-
-    /// The channel this lease coordinates.
-    pub(in crate::services::discord) fn channel_id(&self) -> ChannelId {
-        self.channel_id
-    }
-
-    /// Read the current lease state. Always materialized UNDER the payload
-    /// mutex so the snapshot can never disagree with a concurrently-acquiring
-    /// writer (#3041 codex): because `try_acquire`/`commit`/`release`/`reclaim`
-    /// flip `state_tag` AND write `payload` while holding the SAME mutex, any
-    /// observer that takes the lock sees a tag/payload pair that are mutually
-    /// coherent. `state_tag` remains the single-winner CAS gate for acquire; it
-    /// is NOT used as a lock-free read fast-path here because that reintroduced
-    /// the publish/observe window the codex review flagged.
-    pub(in crate::services::discord) fn read(&self) -> LeaseSnapshot {
-        let guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &*guard {
-            LeaseState::Unleased => LeaseSnapshot::Unleased,
-            LeaseState::Leased {
-                holder,
-                key,
-                deadline_ms,
-                start,
-                end,
-            } => LeaseSnapshot::Leased {
-                holder: *holder,
-                key: key.clone(),
-                deadline_ms: *deadline_ms,
-                start: *start,
-                end: *end,
-            },
-            LeaseState::Committed {
-                holder,
-                key,
-                start,
-                end,
-                outcome,
-            } => LeaseSnapshot::Committed {
-                holder: *holder,
-                key: key.clone(),
-                start: *start,
-                end: *end,
-                outcome: *outcome,
-            },
-        }
-    }
-
-    /// CAS-acquire the lease for the full `(delivery_lease_key, [start,end))`
-    /// identity (#3041 §2) on behalf of `holder` until `deadline_ms`. Records
-    /// `key` so a later `commit`/`release` carrying a STALE older lease key is
-    /// rejected (the §2 hazard: a reclaim+reacquire reuses the same holder kind,
-    /// so holder alone is insufficient).
-    ///
-    /// Ordering invariant (codex coherence fix): the tag CAS and the payload
-    /// write happen UNDER the SAME mutex, and `read()` also locks, so a tag and
-    /// its payload are never observed out of step. The CAS keeps single-winner
-    /// semantics — exactly one acquirer flips `UNLEASED → LEASED`; every
-    /// concurrent loser (already holding the lock by then) sees a non-`UNLEASED`
-    /// tag under the lock and returns `false` without mutating the payload.
-    pub(in crate::services::discord) fn try_acquire(
-        &self,
-        key: DeliveryLeaseKey,
-        holder: LeaseHolder,
-        start: u64,
-        end: u64,
-        deadline_ms: u64,
-    ) -> bool {
-        use std::sync::atomic::Ordering;
-        let mut guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Single-winner gate, taken while holding the payload lock so the tag
-        // flip and the payload write publish together. Concurrent acquirers
-        // serialize on the mutex; whoever runs second sees a non-`UNLEASED` tag.
-        if self
-            .state_tag
-            .compare_exchange(
-                TAG_UNLEASED,
-                TAG_LEASED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        *guard = LeaseState::Leased {
-            holder,
-            key,
-            deadline_ms,
-            start,
-            end,
-        };
-        true
-    }
-
-    /// Commit the lease three-way (#3041 §3). Verifies the FULL `(holder, key,
-    /// [start,end))` identity against the currently-`Leased` lease (#3041 §2):
-    /// any mismatch — wrong holder, a STALE older lease key, or a different range
-    /// — or a non-`Leased` state is a no-op that returns `false`. This closes
-    /// the §2 hazard where a stale commit from an older turn could act on a
-    /// reacquired same-channel/same-holder-kind lease. On success the tag
-    /// advances `LEASED → COMMITTED` (under the lock) and the outcome is
-    /// recorded. `Unknown` records but the caller MUST NOT advance the offset.
-    pub(in crate::services::discord) fn commit(
-        &self,
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        start: u64,
-        end: u64,
-        outcome: LeaseOutcome,
-    ) -> bool {
-        use std::sync::atomic::Ordering;
-        let mut guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &*guard {
-            LeaseState::Leased {
-                holder: cur_holder,
-                key: cur_key,
-                start: cur_start,
-                end: cur_end,
-                ..
-            } if *cur_holder == holder
-                && cur_key == &key
-                && *cur_start == start
-                && *cur_end == end =>
-            {
-                *guard = LeaseState::Committed {
-                    holder,
-                    key,
-                    start,
-                    end,
-                    outcome,
-                };
-                self.state_tag.store(TAG_COMMITTED, Ordering::Release);
-                true
-            }
-            // Identity mismatch (holder / stale turn / range) or not Leased.
-            _ => false,
-        }
-    }
-
-    /// Compare-and-release: return the cell to `Unleased` ONLY if the FULL
-    /// `(holder, key, [start,end))` identity matches the recorded lease (#3041
-    /// §2-§3) — symmetric with `commit`. Verifying the key AND the byte range
-    /// (not just the holder) is what closes the §2 hazard: a stale release from
-    /// an OLDER turn — or from the SAME turn but an OLDER byte range after a
-    /// reclaim+reacquire re-leased a different range (e.g. a continuation chunk)
-    /// — is a no-op returning `false`, so it can never release the live newer
-    /// lease. A release is valid from either `Leased` (abandoned without commit)
-    /// or `Committed` (the normal post-commit release).
-    pub(in crate::services::discord) fn release(
-        &self,
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        start: u64,
-        end: u64,
-    ) -> bool {
-        use std::sync::atomic::Ordering;
-        let mut guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let matches = match &*guard {
-            LeaseState::Leased {
-                holder: cur,
-                key: cur_key,
-                start: cur_start,
-                end: cur_end,
-                ..
-            }
-            | LeaseState::Committed {
-                holder: cur,
-                key: cur_key,
-                start: cur_start,
-                end: cur_end,
-                ..
-            } => *cur == holder && cur_key == &key && *cur_start == start && *cur_end == end,
-            LeaseState::Unleased => false,
-        };
-        if !matches {
-            return false;
-        }
-        *guard = LeaseState::Unleased;
-        self.state_tag.store(TAG_UNLEASED, Ordering::Release);
-        true
-    }
-
-    /// #3041 P1-1 (§3, codex R2 Issue-1): HEARTBEAT renew. While the holder's
-    /// terminal send future is in flight, the holder periodically calls this to
-    /// extend the lease deadline so the (deliberately SHORT) deadline is a
-    /// HOLDER-LIVENESS signal, not a hard cap on delivery duration. If the cell
-    /// is `Leased` by EXACTLY `(holder, key)` (matched on holder + delivery lease
-    /// key), its `deadline_ms` is overwritten with `new_deadline_ms`
-    /// and `true` is returned. ANY other state — a different holder, a stale
-    /// older key, a `Committed`/`Unleased` cell, or a cell already reclaimed and
-    /// reacquired by someone else — is a no-op returning `false`. The range is
-    /// intentionally NOT matched: a renew only ever needs to prove "this exact
-    /// holder for this exact lease key is still alive", and the live holder's range is
-    /// fixed for the lifetime of the lease anyway.
-    ///
-    /// Race-safety (why renew can never extend SOMEONE ELSE's lease): the match
-    /// requires the recorded `holder` AND `key` to equal the caller's, both
-    /// taken UNDER the same payload mutex as every other mutation. If the cell
-    /// was reclaimed (→ `Unleased`) and reacquired by a replacement, the holder
-    /// or key will differ and the renew no-ops. A late heartbeat tick that
-    /// fires after the holder already committed sees `Committed` (not `Leased`)
-    /// and no-ops. The ONLY successful renew extends the caller's OWN live lease.
-    pub(in crate::services::discord) fn renew(
-        &self,
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-        new_deadline_ms: u64,
-    ) -> bool {
-        let mut guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let LeaseState::Leased {
-            holder: cur_holder,
-            key: cur_key,
-            deadline_ms,
-            ..
-        } = &mut *guard
-        {
-            if *cur_holder == holder && cur_key == &key {
-                *deadline_ms = new_deadline_ms;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Deadline reclaim: if the lease is `Leased` and `now_ms >= deadline_ms`,
-    /// force it back to `Unleased` regardless of holder (the holder is presumed
-    /// dead/stuck). Returns `true` if a reclaim occurred. A `Committed` lease is
-    /// never reclaimed by deadline — it awaits an explicit holder `release`.
-    pub(in crate::services::discord) fn reclaim_if_expired(&self, now_ms: u64) -> bool {
-        use std::sync::atomic::Ordering;
-        let mut guard = self
-            .payload
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let LeaseState::Leased { deadline_ms, .. } = &*guard {
-            if now_ms >= *deadline_ms {
-                *guard = LeaseState::Unleased;
-                self.state_tag.store(TAG_UNLEASED, Ordering::Release);
-                return true;
-            }
-        }
-        false
-    }
-}
-
-/// #3041 P1-1/P1-2: delivery-lease acquire deadline shared by BOTH the watcher
-/// and the bridge terminal-delivery paths. The deadline is a HOLDER-LIVENESS
-/// signal, NOT a hard cap on delivery duration — while a send future is in
-/// flight the holder keeps the lease alive with a background HEARTBEAT that
-/// `renew()`s the deadline every [`DELIVERY_LEASE_HEARTBEAT_MS`]. Because a LIVE
-/// holder always re-extends within one interval, a long multi-chunk send (which
-/// can exceed any FIXED deadline) is NEVER reclaimed mid-flight; a genuinely
-/// DEAD holder stops renewing, so the lease expires and a replacement reclaims
-/// it within ~one deadline. Picked as 3× the heartbeat (15s = 3 × 5s): one tick
-/// can be skipped entirely and the lease still survives to the next, while
-/// dead-holder recovery is ~15s. P1-2 reuses this so the WATCHER and the BRIDGE
-/// share one deadline against the one per-channel cell — whoever holds it blocks
-/// the other's acquire (cross-actor duplicate prevention).
-pub(in crate::services::discord) const DELIVERY_LEASE_DEADLINE_MS: u64 = 15_000;
-
-/// #3041 P1-1/P1-2: how often an in-flight holder renews its delivery lease.
-/// Must be strictly less than (and a small fraction of)
-/// [`DELIVERY_LEASE_DEADLINE_MS`] so a live holder always re-extends before
-/// expiry even if one tick is delayed (the deadline is 3× this).
-pub(in crate::services::discord) const DELIVERY_LEASE_HEARTBEAT_MS: u64 = 5_000;
-
-/// #3041 P1-1 (§3, codex R2 Issue-1) / P1-2: RAII handle for the in-flight
-/// delivery-lease heartbeat task, shared by the watcher and the bridge. The
-/// holder spawns the heartbeat right after a successful `try_acquire` and
-/// `stop()`s it BEFORE the inline commit (and the `Drop` impl aborts it on any
-/// early return / panic), so the renew loop can NEVER outlive the send and race
-/// the commit. While the holder task lives the heartbeat keeps the lease alive
-/// (`renew`); if the holder TASK dies the spawned heartbeat is dropped/aborted
-/// with it → the lease stops being renewed → it expires → a replacement reclaims
-/// it. A heartbeat tick can only ever `renew` THIS holder's OWN still-`Leased`
-/// lease (matched on holder+key), so a last tick that races `stop()`+commit
-/// merely extends our own deadline, which the immediately-following commit then
-/// flips to `Committed` — harmless.
-pub(in crate::services::discord) struct DeliveryLeaseHeartbeat {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl DeliveryLeaseHeartbeat {
-    /// Spawn a background task that renews `(holder, key)`'s lease on `cell`
-    /// every [`DELIVERY_LEASE_HEARTBEAT_MS`], each time pushing the deadline to
-    /// `lease_now_ms() + DELIVERY_LEASE_DEADLINE_MS`. The first tick fires AFTER
-    /// one interval (the acquire already set a fresh deadline). The loop exits on
-    /// its own as soon as a `renew` returns false (the lease is no longer ours —
-    /// committed, released, or reclaimed), so it self-terminates even before an
-    /// explicit `stop()`.
-    pub(in crate::services::discord) fn spawn(
-        cell: std::sync::Arc<DeliveryLeaseCell>,
-        holder: LeaseHolder,
-        key: DeliveryLeaseKey,
-    ) -> Self {
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-                DELIVERY_LEASE_HEARTBEAT_MS,
-            ));
-            // Skip the immediate tick `interval` emits at t=0; the acquire just
-            // set a fresh deadline, so the first renew is one interval later.
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let renewed = cell.renew(
-                    holder,
-                    key.clone(),
-                    lease_now_ms().saturating_add(DELIVERY_LEASE_DEADLINE_MS),
-                );
-                if !renewed {
-                    // Lease is no longer ours (committed/released/reclaimed):
-                    // nothing left to keep alive.
-                    break;
-                }
-            }
-        });
-        Self { handle }
-    }
-
-    /// Stop the heartbeat. Idempotent. Called BEFORE the inline commit so the
-    /// renew loop is guaranteed not to race the commit.
-    pub(in crate::services::discord) fn stop(self) {
-        self.handle.abort();
-    }
-}
-
-impl Drop for DeliveryLeaseHeartbeat {
-    fn drop(&mut self) {
-        // Safety net: if the send path returns early / panics before an explicit
-        // `stop()`, aborting on drop guarantees the heartbeat cannot outlive the
-        // owning holder frame.
-        self.handle.abort();
     }
 }
 
@@ -2150,6 +1048,11 @@ pub(crate) struct SharedData {
     pub(super) core: Mutex<CoreState>,
     /// Per-channel request lifecycle actor registry.
     mailboxes: ChannelMailboxRegistry,
+    /// Serializes `/resume` rebinds with intake session selection for each channel.
+    /// Weak entries let inactive channels disappear once the final intake/resume
+    /// guard drops; the map is opportunistically pruned on each lookup, so channel
+    /// churn cannot retain one mutex per historical channel for process lifetime.
+    session_transition_locks: dashmap::DashMap<ChannelId, std::sync::Weak<tokio::sync::Mutex<()>>>,
     /// Bot settings — mostly reads, rare writes
     pub(super) settings: tokio::sync::RwLock<DiscordBotSettings>,
     /// Per-channel timestamps of the last Discord API call (for rate limiting)
@@ -2277,6 +1180,8 @@ pub(crate) struct SharedData {
     pub(in crate::services::discord) turn_view_reconciler: turn_view_reconciler::TurnViewReconciler,
     readopted_mailbox_ledger: readopted_mailbox_ledger::ReadoptedMailboxLedger, // #4370
 }
+
+pub(crate) use session_transition::{SESSION_TRANSITION_LOCK_WAIT_TIMEOUT, SessionTransitionBusy};
 
 impl SharedData {
     pub(super) fn has_runtime_storage(&self) -> bool {
@@ -2477,6 +1382,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
             active_meetings: std::collections::HashMap::new(),
         }),
         mailboxes: ChannelMailboxRegistry::default(),
+        session_transition_locks: dashmap::DashMap::new(),
         settings: tokio::sync::RwLock::new(DiscordBotSettings::default()),
         api_timestamps: dashmap::DashMap::new(),
         skills_cache: tokio::sync::RwLock::new(Vec::new()),
@@ -2508,6 +1414,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         restart: RestartLifecycle {
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            intake_worker_lifecycle: Default::default(),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_generation: 0,
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2520,6 +1427,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
             global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+            shutdown_slot_consumed: std::sync::atomic::AtomicBool::new(false),
         },
         turn_finalizer: turn_finalizer::TurnFinalizer::spawn(),
         dispatch: DispatchRoutingState {
@@ -2564,21 +1472,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
     })
 }
 
-fn queue_persistence_context(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-) -> QueuePersistenceContext {
-    QueuePersistenceContext::new(
-        provider,
-        &shared.token_hash,
-        shared
-            .dispatch
-            .role_overrides
-            .get(&channel_id)
-            .map(|override_id| override_id.value().get()),
-    )
-}
+use queue_dispatch::persistence_context as queue_persistence_context;
 
 async fn mailbox_snapshot(shared: &SharedData, channel_id: ChannelId) -> ChannelMailboxSnapshot {
     match shared.mailbox_peek(channel_id) {
@@ -2761,14 +1655,14 @@ fn cleanup_retry_inflight_blocks_idle_kickoff(
     let Some(state) = inflight::load_inflight_state(provider, channel_id.get()) else {
         return false;
     };
-    if state.current_msg_id == 0 {
+    let Some(current_msg_id) = inflight::opt_message_id(state.current_msg_id) else {
         return false;
-    }
+    };
 
     shared
         .ui
         .placeholder_cleanup
-        .terminal_cleanup_retry_pending(provider, channel_id, MessageId::new(state.current_msg_id))
+        .terminal_cleanup_retry_pending(provider, channel_id, current_msg_id)
 }
 
 fn idle_queue_snapshot_has_pending_or_marker_backlog(
@@ -2845,6 +1739,10 @@ async fn idle_queue_channel_has_kickable_backlog(
     snapshot: &ChannelMailboxSnapshot,
 ) -> bool {
     idle_queue_snapshot_has_kickable_backlog(shared, provider, channel_id, snapshot)
+        && !matches!(
+            automatic_queue_progression(shared, provider, channel_id, snapshot),
+            AutomaticQueueProgression::BlockedByCappedRetries
+        )
 }
 
 async fn mailbox_try_start_turn(
@@ -3492,117 +2390,23 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
     true
 }
 
-async fn mailbox_take_next_soft_intervention(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-) -> MailboxTakeNextSoftOutcome {
-    loop {
-        let result: TakeNextSoftResult = shared
-            .mailbox(channel_id)
-            .take_next_soft(queue_persistence_context(shared, provider, channel_id))
-            .await;
-        let queue_len_after = result.queue_len_after;
-        apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-        if let Some(error) = result.persistence_error {
-            tracing::error!(
-                provider = provider.as_str(),
-                channel_id = channel_id.get(),
-                error = %error,
-                "mailbox dequeue failed durable pending-queue persistence"
-            );
-            return MailboxTakeNextSoftOutcome {
-                intervention: None,
-                dispatch_lease: None,
-                has_more: result.has_more,
-                persistence_error: Some(error),
-            };
-        }
-        maybe_schedule_catch_up_retry_after_queue_drain(
-            shared,
-            provider,
-            channel_id,
-            queue_len_after,
-        );
-        let Some(intervention) = result.intervention else {
-            return MailboxTakeNextSoftOutcome {
-                intervention: None,
-                dispatch_lease: None,
-                has_more: result.has_more,
-                persistence_error: None,
-            };
-        };
-
-        if let Some(stale) =
-            stale_dispatch_turn_for_queued_intervention(shared.pg_pool.as_ref(), &intervention)
-                .await
-        {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ⏭ DISPATCH-GUARD: dropped queued terminal dispatch {} in channel {} (status={})",
-                stale.dispatch_id,
-                channel_id,
-                stale.status
-            );
-            let queue_exit_events = [QueueExitEvent {
-                intervention: intervention.clone(),
-                kind: stale.queue_exit_kind,
-            }];
-            apply_queue_exit_feedback(shared, channel_id, &queue_exit_events).await;
-            mailbox_abandon_pending_dispatch(shared, provider, channel_id, intervention.message_id)
-                .await;
-            drop(result.dispatch_lease);
-            continue;
-        }
-
-        return MailboxTakeNextSoftOutcome {
-            intervention: Some(intervention),
-            dispatch_lease: result.dispatch_lease,
-            has_more: result.has_more,
-            persistence_error: None,
-        };
-    }
-}
-
-#[cfg(test)]
-mod queued_dequeue_dispatch_guard_wiring_tests {
-    #[test]
-    fn dequeue_uses_preservation_aware_stale_dispatch_guard() {
-        let source = include_str!("mod.rs");
-        let function_start = source
-            .find("async fn mailbox_take_next_soft_intervention(")
-            .expect("mailbox dequeue helper exists");
-        let function_end = source[function_start..]
-            .find("\nasync fn idle_queue_take_next_soft_if_ready(")
-            .map(|offset| function_start + offset)
-            .expect("mailbox dequeue helper has a stable following function");
-        let function_body = &source[function_start..function_end];
-        let queued_guard = format!(
-            "{}{}",
-            "stale_dispatch_turn_for_queued_",
-            "intervention(shared.pg_pool.as_ref(), &intervention)"
-        );
-        let text_guard = format!(
-            "{}{}",
-            "stale_dispatch_turn_for_", "text(shared.pg_pool.as_ref(), &intervention.text)"
-        );
-
-        assert!(
-            function_body.contains(&queued_guard),
-            "dequeue must retain the preservation-aware queued dispatch guard"
-        );
-        assert!(
-            !function_body.contains(&text_guard),
-            "dequeue must not bypass queued preservation with the raw text guard"
-        );
-    }
-}
-
 async fn idle_queue_take_next_soft_if_ready(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> MailboxTakeNextSoftOutcome {
+    let _transition_guard = match shared.session_transition_lock(channel_id).try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::debug!(
+                provider = provider.as_str(),
+                channel_id = channel_id.get(),
+                "KICKOFF: session transition owns channel; preserving queued head"
+            );
+            return MailboxTakeNextSoftOutcome::default();
+        }
+    };
+
     // #3167 — only a real (non-background) active turn blocks the dequeue. The
     // cleanup-retry guard remains a correctness guard; the hosted-TUI busy-pane
     // re-scrape gate was removed in #4048 S3 because finalize completion is now
@@ -3659,46 +2463,48 @@ async fn idle_queue_take_next_soft_if_ready(
         return MailboxTakeNextSoftOutcome::default();
     }
 
-    mailbox_take_next_soft_intervention(shared, provider, channel_id).await
+    mailbox_take_next_automatic_intervention(shared, provider, channel_id).await
 }
 
-async fn mailbox_requeue_intervention_front(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    intervention: Intervention,
-) {
-    let result: RequeueInterventionResult = shared
-        .mailbox(channel_id)
-        .requeue_front(
-            intervention,
-            queue_persistence_context(shared, provider, channel_id),
-        )
-        .await;
-    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-    if let Some(error) = result.persistence_error.as_ref() {
-        tracing::warn!(
-            provider = provider.as_str(),
-            channel_id = channel_id.get(),
-            error = %error,
-            "mailbox requeue-front failed durable pending-queue persistence; pending dispatch marker remains the durable backstop"
+#[cfg(test)]
+mod queued_dequeue_dispatch_guard_wiring_tests {
+    #[test]
+    fn dequeue_uses_preservation_aware_stale_dispatch_guard() {
+        let source = include_str!("queue_dispatch.rs");
+        let function_start = source
+            .find("async fn mailbox_take_soft_intervention(")
+            .expect("mailbox dequeue helper exists");
+        let function_body = &source[function_start..];
+        let queued_guard = format!("{}{}", "stale_dispatch_turn_for_queued_", "intervention(");
+        let text_guard = format!(
+            "{}{}",
+            "stale_dispatch_turn_for_", "text(shared.pg_pool.as_ref(), &intervention.text)"
+        );
+
+        assert!(
+            function_body.contains(&queued_guard),
+            "dequeue must retain the preservation-aware queued dispatch guard"
+        );
+        assert!(
+            !function_body.contains(&text_guard),
+            "dequeue must not bypass queued preservation with the raw text guard"
         );
     }
 }
 
-async fn mailbox_abandon_pending_dispatch(
+pub(in crate::services::discord) async fn mailbox_abandon_pending_dispatch(
     shared: &SharedData,
     provider: &ProviderKind,
     channel_id: ChannelId,
     user_message_id: MessageId,
-) {
+) -> bool {
     shared
         .mailbox(channel_id)
         .abandon_pending_dispatch(
             user_message_id,
             queue_persistence_context(shared, provider, channel_id),
         )
-        .await;
+        .await
 }
 
 async fn mailbox_clear_pending_dispatch_reservation(
@@ -3706,72 +2512,17 @@ async fn mailbox_clear_pending_dispatch_reservation(
     provider: &ProviderKind,
     channel_id: ChannelId,
     user_message_id: MessageId,
-) {
+) -> bool {
     shared
         .mailbox(channel_id)
         .clear_pending_dispatch_reservation(
             user_message_id,
             queue_persistence_context(shared, provider, channel_id),
         )
-        .await;
+        .await
 }
 
-/// Re-queue the inflight message that a claude TUI follow-up could not submit
-/// because the pane was busy at submit time. The follow-up busy-timeout is
-/// PRE-submit (the prompt was never delivered), so retrying cannot double-send.
-/// Enqueues to the BACK of the channel mailbox — matching
-/// `enqueue_busy_tui_followup_for_retry` — so the message is retried after the
-/// in-flight turn frees the pane rather than hot-looping. No-op for anchorless
-/// (recovery) turns or empty text.
-pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_retry(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    inflight_state: &InflightTurnState,
-) -> MailboxEnqueueOutcome {
-    let user_msg_id = inflight_state.user_msg_id;
-    if user_msg_id == 0 || inflight_state.user_text.trim().is_empty() {
-        return MailboxEnqueueOutcome::default();
-    }
-    let message_id = MessageId::new(user_msg_id);
-    // FIX #6 (Codex P2): rebuild the retry Intervention from the persisted
-    // follow-up requeue context instead of hardcoding empty values, so a
-    // PRE-submit busy-timeout requeue preserves the originating turn's reply
-    // context, attachments, and voice metadata. Legacy rows (pre-v9) default
-    // these to None/empty/false, matching the previous behavior exactly.
-    // #4247 FIX 2: rebuild the mark from the persisted `followup_preserve_on_cancel`
-    // decision; leaving it unmarked would regress a genuine-human-marked instruction
-    // to origin/main's drop-on-cancel behavior at the downstream preservation guards.
-    let queued_generation = shared.restart.current_generation;
-    let source_message_queued_generations = if inflight_state.followup_preserve_on_cancel {
-        vec![
-            crate::services::turn_orchestrator::SourceMessageQueuedGeneration::user_instruction(
-                message_id,
-                queued_generation,
-            ),
-        ]
-    } else {
-        Vec::new()
-    };
-    let intervention = Intervention {
-        author_id: UserId::new(inflight_state.request_owner_user_id),
-        author_is_bot: false,
-        message_id,
-        queued_generation,
-        source_message_ids: vec![message_id],
-        source_message_queued_generations,
-        source_text_segments: Vec::new(),
-        text: inflight_state.user_text.clone(),
-        mode: crate::services::turn_orchestrator::InterventionMode::Soft,
-        created_at: std::time::Instant::now(),
-        reply_context: inflight_state.followup_reply_context.clone(),
-        has_reply_boundary: inflight_state.followup_has_reply_boundary,
-        merge_consecutive: inflight_state.followup_merge_consecutive,
-        pending_uploads: inflight_state.followup_pending_uploads.clone(),
-        voice_announcement: inflight_state.followup_voice_announcement.clone(),
-    };
-    mailbox_enqueue_intervention(shared, provider, channel_id, intervention).await
-}
+pub(in crate::services::discord) use busy_followup_retry_store::requeue_inflight_for_followup_retry as mailbox_requeue_inflight_for_followup_retry;
 
 #[cfg(test)]
 mod followup_retry_requeue_tests {
@@ -3842,7 +2593,9 @@ mod followup_retry_requeue_tests {
             let provider = ProviderKind::Claude;
             let channel_id = ChannelId::new(3_752_001);
             let user_msg_id = MessageId::new(3_752_101);
-            let state = followup_inflight(channel_id, user_msg_id, false);
+            let retry_user_msg_id = MessageId::new(3_752_100);
+            let mut state = followup_inflight(channel_id, user_msg_id, false);
+            state.busy_followup_retry_user_msg_id = retry_user_msg_id.get();
 
             let outcome =
                 mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
@@ -3858,7 +2611,11 @@ mod followup_retry_requeue_tests {
             let intervention = &snapshot.intervention_queue[0];
             assert_eq!(intervention.author_id, UserId::new(42));
             assert_eq!(intervention.message_id, user_msg_id);
-            assert_eq!(intervention.source_message_ids, vec![user_msg_id]);
+            assert_eq!(
+                intervention.source_message_ids,
+                vec![user_msg_id, retry_user_msg_id],
+                "retry requeue must preserve the canonical source identity across another drain"
+            );
             assert_eq!(intervention.text, "please continue");
             assert_eq!(intervention.reply_context.as_deref(), Some("reply context"));
             assert!(intervention.has_reply_boundary);
@@ -3920,7 +2677,7 @@ mod followup_retry_requeue_tests {
     }
 
     #[test]
-    fn pre_submit_requeue_reports_duplicate_refusal_outcome() {
+    fn inflight_retry_restores_earlier_message_without_reversing_fifo_4797() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .expect("shared env lock poisoned");
@@ -3937,21 +2694,50 @@ mod followup_retry_requeue_tests {
         rt.block_on(async {
             let shared = make_shared_data_for_tests();
             let provider = ProviderKind::Claude;
-            let channel_id = ChannelId::new(3_752_002);
-            let user_msg_id = MessageId::new(3_752_102);
-            let state = followup_inflight(channel_id, user_msg_id, false);
+            let channel_id = ChannelId::new(4_797_001);
+            let first_id = MessageId::new(4_797_101);
+            let later_id = MessageId::new(4_797_102);
+            let state = followup_inflight(channel_id, first_id, false);
+            let later = Intervention {
+                author_id: UserId::new(43),
+                author_is_bot: true,
+                message_id: later_id,
+                queued_generation: shared.restart.current_generation,
+                source_message_ids: vec![later_id],
+                source_message_queued_generations: Vec::new(),
+                source_text_segments: Vec::new(),
+                text: "later bot B".to_string(),
+                mode: crate::services::turn_orchestrator::InterventionMode::Soft,
+                created_at: std::time::Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
+                pending_uploads: Vec::new(),
+                voice_announcement: None,
+            };
+            mailbox_enqueue_intervention(&shared, &provider, channel_id, later.clone()).await;
 
-            let first =
+            let retry =
                 mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
                     .await;
-            let second =
+            assert!(retry.enqueued);
+
+            let snapshot = mailbox_snapshot(&shared, channel_id).await;
+            let order: Vec<_> = snapshot
+                .intervention_queue
+                .iter()
+                .map(|item| item.message_id)
+                .collect();
+            assert_eq!(order, vec![first_id, later_id]);
+            assert!(!snapshot.intervention_queue[0].author_is_bot);
+            assert!(snapshot.intervention_queue[1].author_is_bot);
+
+            let duplicate =
                 mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
                     .await;
-
-            assert!(first.enqueued);
-            assert!(!second.enqueued);
+            assert!(!duplicate.enqueued);
             assert_eq!(
-                second.refusal_reason,
+                duplicate.refusal_reason,
                 Some(
                     crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued
                 )
@@ -3959,8 +2745,8 @@ mod followup_retry_requeue_tests {
             let snapshot = mailbox_snapshot(&shared, channel_id).await;
             assert_eq!(
                 snapshot.intervention_queue.len(),
-                1,
-                "duplicate pre-submit requeue must not create a second queued prompt"
+                2,
+                "duplicate inflight retry must not create a second queued prompt"
             );
         });
     }
@@ -3980,6 +2766,22 @@ async fn mailbox_cancel_soft_intervention(
         )
         .await;
     apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    if let Some(removed) = result.removed.as_ref() {
+        let retry_identity = busy_followup_retry_store::resolve_identity(
+            provider,
+            channel_id.get(),
+            removed.message_id.get(),
+            &removed.source_message_ids,
+        );
+        if let Some(state) = retry_identity.state {
+            let _ = busy_followup_retry_store::clear_if_current(
+                provider,
+                channel_id.get(),
+                retry_identity.user_msg_id,
+                state.notice_message_id,
+            );
+        }
+    }
     result.removed
 }
 
@@ -4214,11 +3016,18 @@ async fn kickoff_idle_queue_channel(
         has_more,
         false,
         "intake_admission_pre_kickoff_defer",
+        dispatch_lease.clone(),
     )
     .await
     {
         router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
-        router::QueuedAdmissionDisposition::Deferred => {
+        router::QueuedAdmissionDisposition::Deferred
+        | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment => {
+            drop(dispatch_lease);
+            return IdleQueueKickoffChannelOutcome::default();
+        }
+        router::QueuedAdmissionDisposition::RejectedRestore => {
+            queue_dispatch::log_kickoff_rejected_restore(provider, channel_id);
             drop(dispatch_lease);
             return IdleQueueKickoffChannelOutcome::default();
         }
@@ -4256,7 +3065,29 @@ async fn kickoff_idle_queue_channel(
                 "  [{ts}]   ⚠ KICKOFF: failed to start turn for channel {}: {e}",
                 channel_id
             );
-            mailbox_requeue_intervention_front(shared, provider, channel_id, intervention).await;
+            let restored = mailbox_restore_dequeued_head(
+                shared,
+                provider,
+                channel_id,
+                intervention,
+                dispatch_lease
+                    .as_ref()
+                    .expect("dequeued kickoff intervention must carry its lease")
+                    .clone(),
+            )
+            .await;
+            if !restored.enqueued {
+                tracing::error!(
+                    provider = provider.as_str(),
+                    channel_id = channel_id.get(),
+                    refusal_reason = restored
+                        .refusal_reason
+                        .map(|reason| reason.as_str())
+                        .unwrap_or("none"),
+                    persistence_error = restored.persistence_error.as_deref().unwrap_or("none"),
+                    "KICKOFF: dequeued-head restore rejected after dispatch failure"
+                );
+            }
             drop(dispatch_lease);
             IdleQueueKickoffChannelOutcome { started: false }
         }
@@ -4266,6 +3097,10 @@ async fn kickoff_idle_queue_channel(
                 provider,
                 channel_id,
                 intervention.message_id,
+                dispatch_lease
+                    .as_ref()
+                    .expect("dequeued kickoff intervention must carry its lease")
+                    .clone(),
             )
             .await;
             drop(dispatch_lease);
@@ -4314,423 +3149,9 @@ pub(super) async fn kickoff_idle_queues(
     started_count
 }
 
-/// Scan for provider-specific skills available to this bot.
-pub(super) fn scan_skills(
-    provider: &ProviderKind,
-    project_path: Option<&str>,
-) -> Vec<(String, String)> {
-    if let Some(root) = crate::config::runtime_root() {
-        let _ = crate::runtime_layout::sync_managed_skills(&root);
-    }
-
-    let mut skills: Vec<(String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    match provider {
-        ProviderKind::Claude => {
-            for (name, desc) in BUILTIN_SKILLS {
-                seen.insert(name.to_string());
-                skills.push((name.to_string(), desc.to_string()));
-            }
-
-            let dirs_to_scan = collect_provider_skill_roots(provider, project_path);
-
-            for dir in dirs_to_scan {
-                if !dir.is_dir() {
-                    continue;
-                }
-                let Ok(entries) = fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "md").unwrap_or(false) {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            let name = stem.to_string();
-                            if seen.insert(name.clone()) {
-                                let desc = fs::read_to_string(&path)
-                                    .ok()
-                                    .map(|content| extract_skill_description(&content))
-                                    .unwrap_or_else(|| format!("Skill: {}", name));
-                                skills.push((name, desc));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ProviderKind::Codex
-        | ProviderKind::Gemini
-        | ProviderKind::OpenCode
-        | ProviderKind::Qwen => {
-            scan_directory_skills(
-                collect_provider_skill_roots(provider, project_path),
-                &mut seen,
-                &mut skills,
-            );
-        }
-        ProviderKind::Unsupported(_) => {}
-    }
-
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
-    skills
-}
-
-/// Compute a lightweight fingerprint of skill directories: (file_count, max_mtime_epoch).
-/// Used by the hot-reload poll to detect additions, modifications, and deletions.
-fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
-    let mut count = 0usize;
-    let mut max_mtime = 0u64;
-
-    let mut dirs = collect_provider_skill_roots(provider, None);
-    if provider_supports_directory_skills(provider) {
-        if let Some(root) = crate::config::runtime_root() {
-            dirs.push(crate::runtime_layout::managed_skills_root(&root));
-        }
-    }
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for dir in &dirs {
-        walk_mtime(dir, &mut count, &mut max_mtime);
-    }
-
-    (count, max_mtime)
-}
-
-/// Like `skill_dir_fingerprint` but also includes project-level skill directories.
-fn skill_dir_fingerprint_with_projects(
-    provider: &ProviderKind,
-    project_paths: &[String],
-) -> (usize, u64) {
-    let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for path in project_paths {
-        let Some(proj_dir) = provider_project_skill_dir(provider, path) else {
-            continue;
-        };
-        if proj_dir.is_dir() {
-            walk_mtime(&proj_dir, &mut count, &mut max_mtime);
-        }
-    }
-
-    (count, max_mtime)
-}
-
-fn provider_supports_directory_skills(provider: &ProviderKind) -> bool {
-    matches!(
-        provider,
-        ProviderKind::Claude
-            | ProviderKind::Codex
-            | ProviderKind::Gemini
-            | ProviderKind::OpenCode
-            | ProviderKind::Qwen
-    )
-}
-
-fn provider_home_skill_dir(provider: &ProviderKind, home: &Path) -> Option<std::path::PathBuf> {
-    match provider {
-        ProviderKind::Claude => Some(home.join(".claude").join("commands")),
-        ProviderKind::Codex => Some(home.join(".codex").join("skills")),
-        ProviderKind::Gemini => Some(home.join(".gemini").join("skills")),
-        ProviderKind::OpenCode => Some(home.join(".opencode").join("skills")),
-        ProviderKind::Qwen => Some(home.join(".qwen").join("skills")),
-        ProviderKind::Unsupported(_) => None,
-    }
-}
-
-fn provider_project_skill_dir(
-    provider: &ProviderKind,
-    project_path: &str,
-) -> Option<std::path::PathBuf> {
-    let project_root = Path::new(project_path);
-    match provider {
-        ProviderKind::Claude => Some(project_root.join(".claude").join("commands")),
-        ProviderKind::Codex => Some(project_root.join(".codex").join("skills")),
-        ProviderKind::Gemini => Some(project_root.join(".gemini").join("skills")),
-        ProviderKind::OpenCode => Some(project_root.join(".opencode").join("skills")),
-        ProviderKind::Qwen => Some(project_root.join(".qwen").join("skills")),
-        ProviderKind::Unsupported(_) => None,
-    }
-}
-
-fn collect_provider_skill_roots(
-    provider: &ProviderKind,
-    project_path: Option<&str>,
-) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        if let Some(path) = provider_home_skill_dir(provider, &home) {
-            roots.push(path);
-        }
-    }
-    if let Some(project_path) = project_path {
-        if let Some(path) = provider_project_skill_dir(provider, project_path) {
-            roots.push(path);
-        }
-    }
-    roots
-}
-
-fn scan_directory_skills(
-    roots: Vec<std::path::PathBuf>,
-    seen: &mut std::collections::HashSet<String>,
-    skills: &mut Vec<(String, String)>,
-) {
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            collect_directory_skill(&path, seen, skills);
-
-            if !path.is_dir() {
-                continue;
-            }
-            let Ok(nested) = fs::read_dir(&path) else {
-                continue;
-            };
-            for child in nested.filter_map(|e| e.ok()) {
-                collect_directory_skill(&child.path(), seen, skills);
-            }
-        }
-    }
-}
-
-fn collect_directory_skill(
-    path: &Path,
-    seen: &mut std::collections::HashSet<String>,
-    skills: &mut Vec<(String, String)>,
-) {
-    let Some(skill_path) = resolve_codex_skill_file(path) else {
-        return;
-    };
-    let Some(name) = skill_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-    else {
-        return;
-    };
-    let name = name.to_string();
-    if !seen.insert(name.clone()) {
-        return;
-    }
-    let desc = fs::read_to_string(&skill_path)
-        .ok()
-        .map(|content| extract_skill_description(&content))
-        .unwrap_or_else(|| format!("Skill: {}", name));
-    skills.push((name, desc));
-}
-
-fn resolve_codex_skill_file(path: &Path) -> Option<std::path::PathBuf> {
-    if path.is_dir() {
-        let skill_path = path.join("SKILL.md");
-        if skill_path.is_file() {
-            return Some(skill_path);
-        }
-    }
-    None
-}
-
 use discord_io::{check_auth, check_owner, rate_limit_wait, try_handle_pending_dm_reply};
 
 // ─── Event handler ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdleSessionWatcherCleanup {
-    ExpireSession,
-    DeferToTmuxLiveness,
-}
-
-fn idle_session_watcher_cleanup(has_watcher: bool) -> IdleSessionWatcherCleanup {
-    if has_watcher {
-        IdleSessionWatcherCleanup::DeferToTmuxLiveness
-    } else {
-        IdleSessionWatcherCleanup::ExpireSession
-    }
-}
-
-/// Periodically clean up idle sessions and their associated data.
-/// Called from handle_event; uses a static Mutex to track the last cleanup time.
-async fn maybe_cleanup_sessions(shared: &Arc<SharedData>) {
-    use std::sync::OnceLock;
-    static LAST_CLEANUP: OnceLock<tokio::sync::Mutex<tokio::time::Instant>> = OnceLock::new();
-    let last = LAST_CLEANUP.get_or_init(|| tokio::sync::Mutex::new(tokio::time::Instant::now()));
-    let mut last_guard = last.lock().await;
-    if last_guard.elapsed() < SESSION_CLEANUP_INTERVAL {
-        return;
-    }
-    *last_guard = tokio::time::Instant::now();
-    drop(last_guard);
-
-    struct ExpiredSessionCleanup {
-        channel_id: ChannelId,
-        session_key: Option<String>,
-    }
-
-    let provider = shared.settings.read().await.provider.clone();
-    let expired: Vec<ExpiredSessionCleanup> = {
-        let data = shared.core.lock().await;
-        let now = tokio::time::Instant::now();
-        data.sessions
-            .iter()
-            .filter(|(channel_id, s)| {
-                now.duration_since(s.last_active) > SESSION_MAX_IDLE
-                    && matches!(
-                        idle_session_watcher_cleanup(shared.tmux_watchers.contains_key(channel_id)),
-                        IdleSessionWatcherCleanup::ExpireSession
-                    )
-            })
-            .map(|(ch, s)| ExpiredSessionCleanup {
-                channel_id: *ch,
-                session_key: s.channel_name.as_ref().map(|name| {
-                    let tmux_name = provider.build_tmux_session_name(name);
-                    adk_session::build_namespaced_session_key(
-                        &shared.token_hash,
-                        &provider,
-                        &tmux_name,
-                    )
-                }),
-            })
-            .collect()
-    };
-    if expired.is_empty() {
-        return;
-    }
-    {
-        let mut data = shared.core.lock().await;
-        for expired_session in &expired {
-            let ch = expired_session.channel_id;
-            // Clean up worktree if session had one
-            if let Some(session) = data.sessions.get(&ch) {
-                if let Some(ref wt) = session.worktree {
-                    cleanup_git_worktree(shared.pg_pool.as_ref(), wt);
-                }
-            }
-            data.sessions.remove(&ch);
-        }
-    }
-    // #3588: idle 정리는 in-memory/worktree 메모리 회수만 수행하고 provider
-    // session(claude resume id)은 DB에 보존한다. 다음 턴에서
-    // `fetch_provider_session_id`로 복원되어 `--resume`으로 transcript가 이어진다.
-    // retry_context(session_retry_context_key) kv는 의도적으로 저장하지 않는다 —
-    // 같은 키를 `take_session_retry_context`가 다음 턴에 무조건 take/주입하므로,
-    // resume이 성공하는 idle 경로에서 저장하면 transcript 중복 + "새 세션 시작"
-    // 레이블 오표시가 발생한다. (#3591에서 100턴 세션 리셋도 제거되어 reset 기반
-    // 저장 경로는 없다; resume 실패 복구만 auto_retry_with_history가 별도로 저장한다.)
-    // 명시적 세션 초기화는 idle recap의 `새 세션 시작` 버튼(idle_recap:clear)으로 한다.
-    for expired_session in &expired {
-        let cleared = mailbox_clear_channel(shared, &provider, expired_session.channel_id).await;
-        if cleared.removed_token.is_some() {
-            saturating_decrement_global_active(shared);
-        }
-        shared.api_timestamps.remove(&expired_session.channel_id);
-    }
-    // Record termination audit for cleaned-up sessions
-    for expired_session in &expired {
-        if let Some(session_key) = expired_session.session_key.as_deref() {
-            let should_record =
-                mark_session_disconnected_for_idle_cleanup(shared.pg_pool.as_ref(), session_key)
-                    .await;
-            if !should_record {
-                continue;
-            }
-
-            crate::services::termination_audit::record_termination_with_handles(
-                shared.pg_pool.as_ref(),
-                session_key,
-                None,
-                "cleanup",
-                "idle_session_expiry",
-                Some("in-memory session expired due to idle timeout"),
-                None,
-                None,
-                None,
-            );
-        }
-    }
-    tracing::info!("  [cleanup] Removed {} idle session(s)", expired.len());
-}
-
-async fn mark_session_disconnected_for_idle_cleanup(
-    pg_pool: Option<&sqlx::PgPool>,
-    session_key: &str,
-) -> bool {
-    let Some(pool) = pg_pool else {
-        return false;
-    };
-    let prior_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE session_key = $1")
-            .bind(session_key)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-    let _ = sqlx::query(
-        "UPDATE sessions
-         SET status = 'disconnected', active_dispatch_id = NULL
-         WHERE session_key = $1",
-    )
-    .bind(session_key)
-    .execute(pool)
-    .await;
-
-    prior_status.as_deref() != Some("disconnected")
-}
 
 #[cfg(test)]
 mod idle_cleanup_selector_tests {
@@ -4877,119 +3298,6 @@ mod idle_cleanup_selector_tests {
 
 // ─── Text message → Claude AI ───────────────────────────────────────────────
 
-/// Enrich role_map.json's byChannelName entries with channelId from byChannelId.
-/// This enables reliable channel name → ID resolution without provider inference hacks.
-fn enrich_role_map_with_channel_ids() {
-    let Some(root) = crate::cli::agentdesk_runtime_root() else {
-        return;
-    };
-    let path = root.join("config/role_map.json");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-
-    let mut changed = false;
-
-    // Build maps from byChannelId: channelId → (roleId, provider) and name→id lookup
-    let by_id = json
-        .get("byChannelId")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-
-    // Pass 1: collect mappings (name → channelId) without mutating
-    let mut mappings: Vec<(String, String)> = Vec::new();
-    if let Some(by_name) = json.get("byChannelName").and_then(|v| v.as_object()) {
-        // Collect already-assigned IDs to avoid duplicates
-        let already_assigned: std::collections::HashSet<String> = by_name
-            .iter()
-            .filter_map(|(_, e)| {
-                e.get("channelId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-
-        for (name, entry) in by_name {
-            if entry.get("channelId").is_some() {
-                continue;
-            }
-            let role_id = entry.get("roleId").and_then(|v| v.as_str()).unwrap_or("");
-            let entry_provider = entry.get("provider").and_then(|v| v.as_str());
-
-            let candidates: Vec<(&String, &serde_json::Value)> = by_id
-                .iter()
-                .filter(|(_, e)| e.get("roleId").and_then(|v| v.as_str()) == Some(role_id))
-                .collect();
-
-            let ch_id = if candidates.len() == 1 {
-                Some(candidates[0].0.clone())
-            } else if candidates.len() > 1 {
-                if let Some(p) = entry_provider {
-                    // Explicit provider — exact match
-                    candidates
-                        .iter()
-                        .find(|(_, e)| e.get("provider").and_then(|v| v.as_str()) == Some(p))
-                        .map(|(id, _)| id.to_string())
-                } else {
-                    // No provider in byChannelName — match by expected provider type:
-                    // Claude channels are the "primary" (cc suffix or no suffix)
-                    // Codex channels are the "alt" (cdx suffix)
-                    // This determines which byChannelId entry to pick.
-                    let expected_provider = if name.ends_with("-cdx") {
-                        "codex"
-                    } else {
-                        "claude"
-                    };
-                    candidates
-                        .iter()
-                        .find(|(_, e)| {
-                            e.get("provider").and_then(|v| v.as_str()) == Some(expected_provider)
-                        })
-                        .map(|(id, _)| id.to_string())
-                        .or_else(|| {
-                            // Fallback: pick one not already assigned
-                            candidates
-                                .iter()
-                                .find(|(id, _)| !already_assigned.contains(id.as_str()))
-                                .map(|(id, _)| id.to_string())
-                        })
-                }
-            } else {
-                None
-            };
-
-            if let Some(id) = ch_id {
-                mappings.push((name.clone(), id));
-            }
-        }
-    }
-
-    // Pass 2: apply mappings
-    if let Some(by_name) = json
-        .get_mut("byChannelName")
-        .and_then(|v| v.as_object_mut())
-    {
-        for (name, ch_id) in &mappings {
-            if let Some(entry) = by_name.get_mut(name) {
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("channelId".to_string(), serde_json::json!(ch_id));
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    if changed {
-        if let Ok(pretty) = serde_json::to_string_pretty(&json) {
-            let _ = runtime_store::atomic_write(&path, &pretty);
-        }
-    }
-}
-
 // #3167 — a queued external USER intervention must be kickable while a
 // low-priority Background turn (monitor relay / self-paced TUI loop) holds the
 // active-turn slot, and the dequeue gate must cancel the background token so
@@ -5015,7 +3323,7 @@ mod idle_queue_background_supersede_tests {
             author_id: UserId::new(7),
             author_is_bot: false,
             message_id: MessageId::new(message_id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -5028,6 +3336,63 @@ mod idle_queue_background_supersede_tests {
             pending_uploads: Vec::new(),
             voice_announcement: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_transition_preserves_queued_head_order_until_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = crate::config::set_agentdesk_root_for_test(tmp.path());
+
+        let shared = make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_794_200);
+        let first = user_intervention(4_794_201, "first");
+        let second = user_intervention(4_794_202, "second");
+        shared
+            .mailbox(channel_id)
+            .replace_queue(
+                vec![first.clone(), second.clone()],
+                queue_persistence_context(&shared, &provider, channel_id),
+            )
+            .await;
+
+        let transition_guard = shared
+            .session_transition_lock(channel_id)
+            .lock_owned()
+            .await;
+        let blocked = idle_queue_take_next_soft_if_ready(&shared, &provider, channel_id).await;
+        assert!(
+            blocked.intervention.is_none(),
+            "transition ownership must defer kickoff before dequeue"
+        );
+        let blocked_snapshot = mailbox_snapshot(&shared, channel_id).await;
+        assert_eq!(
+            blocked_snapshot
+                .intervention_queue
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>(),
+            vec![first.message_id, second.message_id],
+            "deferred kickoff must preserve FIFO without tail requeue"
+        );
+        assert_eq!(blocked_snapshot.pending_user_dispatch, None);
+
+        drop(transition_guard);
+        let released = idle_queue_take_next_soft_if_ready(&shared, &provider, channel_id).await;
+        assert_eq!(
+            released.intervention.as_ref().map(|item| item.message_id),
+            Some(first.message_id),
+            "the original head must dequeue first after transition release"
+        );
+        assert_eq!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .intervention_queue
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>(),
+            vec![second.message_id]
+        );
     }
 
     // SAFETY (await_holding_lock): the test-env Mutex is held across awaits to
@@ -5190,6 +3555,7 @@ mod idle_queue_background_supersede_tests {
                     &provider,
                     channel_id,
                     consumed.message_id,
+                    dispatch_lease.clone(),
                 )
                 .await;
 
@@ -5226,6 +3592,82 @@ mod idle_queue_background_supersede_tests {
                         .map(|(marker, _)| marker.message_id),
                     Some(next.message_id),
                     "next head receives the only remaining marker"
+                );
+            });
+    }
+
+    #[test]
+    fn stale_success_cleanup_cannot_abandon_same_identity_successor_lease() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let shared = make_shared_data_for_tests();
+                let provider = ProviderKind::Claude;
+                let channel_id = ChannelId::new(4_797_904);
+                let intervention = user_intervention(4_797_905, "same identity successor");
+                let persistence = queue_persistence_context(&shared, &provider, channel_id);
+                shared
+                    .mailbox(channel_id)
+                    .replace_queue(vec![intervention.clone()], persistence.clone())
+                    .await;
+
+                let first = shared
+                    .mailbox(channel_id)
+                    .take_next_soft(persistence.clone())
+                    .await;
+                let stale_lease = first
+                    .dispatch_lease
+                    .expect("first dequeue must carry lease L1");
+                let restored = shared
+                    .mailbox(channel_id)
+                    .restore_dequeued_head(
+                        first.intervention.expect("first dequeue must return head"),
+                        persistence.clone(),
+                        stale_lease.clone(),
+                    )
+                    .await;
+                assert!(restored.enqueued);
+
+                let second = shared.mailbox(channel_id).take_next_soft(persistence).await;
+                let successor_lease = second
+                    .dispatch_lease
+                    .expect("successor dequeue must carry lease L2");
+                assert_eq!(
+                    second.intervention.as_ref().map(|item| item.message_id),
+                    Some(intervention.message_id)
+                );
+
+                mailbox_abandon_unclaimed_dispatch_after_success(
+                    &shared,
+                    &provider,
+                    channel_id,
+                    intervention.message_id,
+                    stale_lease,
+                )
+                .await;
+
+                let snapshot = mailbox_snapshot(&shared, channel_id).await;
+                assert_eq!(
+                    snapshot.pending_user_dispatch,
+                    Some(intervention.message_id)
+                );
+                assert_eq!(
+                    load_channel_pending_dispatch_marker(&provider, &shared.token_hash, channel_id)
+                        .map(|(marker, _)| marker.message_id),
+                    Some(intervention.message_id),
+                    "stale L1 cleanup must preserve L2's durable marker"
+                );
+                assert_eq!(
+                    Arc::strong_count(&successor_lease),
+                    2,
+                    "stale L1 cleanup must preserve the actor-held L2 reservation"
                 );
             });
     }

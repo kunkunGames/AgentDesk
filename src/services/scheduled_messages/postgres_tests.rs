@@ -65,6 +65,10 @@ async fn insert_agent_message(
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -106,6 +110,10 @@ async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -240,6 +248,68 @@ async fn postgres_scheduled_message_default_notify_reaches_push_outbox() {
         .await
         .expect("load default-notify outbox row");
     assert_eq!(outbox_bot, "notify");
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_push_handoff_copies_image_attachment_to_outbox() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_image_handoff",
+        "scheduled message image attachment handoff",
+    )
+    .await;
+    let image_data = b"\x89PNG\r\n\x1a\nrepresentative-image".to_vec();
+    let message = db::insert_scheduled_message_pg(
+        &pool,
+        &db::NewScheduledMessage {
+            content: "image-bearing scheduled push".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::minutes(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+            image_attachment: Some(db::ScheduledMessageImageAttachment {
+                filename: "thumbnail.png".to_string(),
+                content_type: "image/png".to_string(),
+                data: image_data.clone(),
+            }),
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
+        },
+    )
+    .await
+    .expect("insert image-bearing scheduled push");
+
+    let fire = claim_one(&pool, "image-handoff-worker").await;
+    fire_claimed(&pool, None, fire, Utc::now()).await;
+    let delivery = db::list_deliveries_pg(&pool, &message.id, 1, None)
+        .await
+        .expect("load scheduled delivery")
+        .pop()
+        .expect("one delivery");
+    let attachment: (Option<String>, Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT attachment_filename, attachment_content_type, attachment_data
+           FROM message_outbox WHERE id = $1",
+    )
+    .bind(delivery.outbox_id.expect("outbox handoff"))
+    .fetch_one(&pool)
+    .await
+    .expect("load outbox image attachment");
+    assert_eq!(attachment.0.as_deref(), Some("thumbnail.png"));
+    assert_eq!(attachment.1.as_deref(), Some("image/png"));
+    assert_eq!(attachment.2, Some(image_data));
 
     pool.close().await;
     pg_db.drop().await;
@@ -434,6 +504,10 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -516,6 +590,10 @@ async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_an
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -679,6 +757,10 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await

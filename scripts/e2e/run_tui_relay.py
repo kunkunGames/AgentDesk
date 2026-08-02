@@ -64,6 +64,7 @@ COVERAGE_CLASS_RANK = {
 REAL_PROVIDER_STEP_KEYS: tuple[str, ...] = (
     "send_prompt",
     "send_provider_hold_prompt",
+    "send_timed_response_prompt",
     "send_prompts_concurrent",
     "send_keys",
 )
@@ -73,6 +74,9 @@ CONTROLLED_HARNESS_STEP_KEYS: tuple[str, ...] = (
     "capture_session_identity",
     "assert_session_preserved",
     "cancel_turn",
+    "delete_status_panel",
+    "inject_discord_failure",
+    "clear_discord_failure",
     "assert_health",
     "kill_pane",
     "send_keys_no_enter",
@@ -117,6 +121,9 @@ REPORT_RECORD_KEYS: tuple[str, ...] = (
     "provider_hold_states",
     "cancel_turns",
     "health_assertions",
+    "deleted_status_panels",
+    "discord_failure_injections",
+    "discord_failure_clears",
     "post_scenario_idle",
     "fixture_steps",
     "fixture_replays",
@@ -804,6 +811,8 @@ def load_scenarios(scenarios_dir: Path, *, cell: str) -> list[dict[str, Any]]:
 
 
 def is_destructive(scenario: dict[str, Any]) -> bool:
+    if scenario.get("destructive") is True:
+        return True
     for step in scenario.get("steps") or []:
         if not isinstance(step, dict):
             continue
@@ -814,6 +823,8 @@ def is_destructive(scenario: dict[str, Any]) -> bool:
             "send_keys_no_enter",
             "poison_claude_tui_relay_offset",
             "cancel_turn",
+            "delete_status_panel",
+            "inject_discord_failure",
         ):
             if key in step:
                 return True
@@ -1236,6 +1247,35 @@ def _infer_direct_input_prompt_from_keys(keys: list[str]) -> str | None:
         if not _looks_like_tmux_control_key(key):
             return key
     return None
+
+
+def build_timed_response_prompt(params: Any, *, scenario_id: str) -> str:
+    """Build a live prompt that exposes a deterministic mid-turn control window."""
+
+    if not isinstance(params, dict):
+        raise assertions.AssertionError(
+            f"send_timed_response_prompt requires a mapping: {params!r}"
+        )
+    before_marker = str(params.get("before_marker") or "").strip()
+    after_marker = str(params.get("after_marker") or "").strip()
+    if not before_marker or not after_marker:
+        raise assertions.AssertionError(
+            "send_timed_response_prompt requires before_marker and after_marker"
+        )
+    hold_seconds = int(params.get("hold_seconds") or DEFAULT_PROVIDER_HOLD_SECONDS)
+    if hold_seconds <= 0:
+        raise assertions.AssertionError(
+            f"send_timed_response_prompt hold_seconds must be positive: {hold_seconds}"
+        )
+    return (
+        f"E2E {scenario_id} timed response fixture.\n\n"
+        "Follow these steps exactly:\n"
+        f"1. First, emit assistant text containing exactly one line: {before_marker}\n"
+        "2. Immediately use your normal shell/terminal command tool to run:\n"
+        f"   python3 -c \"import time; time.sleep({hold_seconds})\"\n"
+        f"3. Do not write, echo, quote, or mention {after_marker} before the command returns.\n"
+        f"4. After the command returns, send exactly one line: {after_marker}\n"
+    )
 
 
 def build_provider_hold_prompt(params: Any, *, scenario_id: str) -> str:
@@ -2199,7 +2239,7 @@ def _marker_presence(
         relay_hits = [
             str(message.get("id") or "")
             for message in window.messages
-            if marker in (message.get("content") or "")
+            if (body := assertions.relay_body(message)) is not None and marker in body
         ]
         raw_hits = [
             str(message.get("id") or "")
@@ -2288,13 +2328,16 @@ def _classify_wait_timeout(
         return "prompt_not_submitted_input_buffer_still_contains_prompt"
 
     raw_has_needle = any(needle in (m.get("content") or "") for m in window.raw_messages)
-    relay_has_needle = any(needle in (m.get("content") or "") for m in window.messages)
+    relay_has_needle = any(
+        (body := assertions.relay_body(message)) is not None and needle in body
+        for message in window.messages
+    )
     if raw_has_needle and not relay_has_needle:
         return "relay_surface_filter_miss_raw_contains_needle"
 
     if head:
         for message in window.messages:
-            body = message.get("content") or ""
+            body = assertions.relay_body(message) or ""
             head_at = body.find(head)
             if head_at != -1 and body.find(needle, head_at + len(head)) == -1:
                 return "body_truncated_or_tail_missing_after_head"
@@ -2427,8 +2470,7 @@ def wait_for_discord_text_with_tui_idle_draft_guard(
     observed: list[dict[str, Any]] = []
     observed_by_id: dict[str, dict[str, Any]] = {}
     predicate = lambda message: (  # noqa: E731
-        assertions.is_relay_response(message)
-        and needle in (message.get("content") or "")
+        (body := assertions.relay_body(message)) is not None and needle in body
     )
     while time.monotonic() < deadline:
         messages = client.fetch_messages(channel_id, after_id=after_id, limit=100)
@@ -2592,6 +2634,26 @@ def run_scenario(
                 declared=declared_coverage_class,
                 scenario_id=scenario_id,
             )
+        return result
+
+    enabled_features = {
+        feature.strip()
+        for feature in os.environ.get("AGENTDESK_E2E_FEATURES", "").split(",")
+        if feature.strip()
+    }
+    required_features = {
+        str(feature).strip()
+        for feature in scenario.get("requires_features") or []
+        if str(feature).strip()
+    }
+    missing_features = sorted(required_features - enabled_features)
+    if missing_features:
+        result["status"] = "skipped"
+        result["reason"] = "missing E2E features: " + ", ".join(missing_features)
+        result["failure_attribution"] = _failure_attribution(
+            "feature_gate",
+            str(result["reason"]),
+        )
         return result
 
     destructive = is_destructive(scenario)
@@ -2921,11 +2983,16 @@ def run_one_cell(
                 channel_id=channel_id,
             )
             time.sleep(3)
-        elif "send_provider_hold_prompt" in step:
+        elif "send_provider_hold_prompt" in step or "send_timed_response_prompt" in step:
             _prepare_first_prompt_window()
-            prompt = build_provider_hold_prompt(
-                step["send_provider_hold_prompt"],
-                scenario_id=str(scenario_id),
+            timed_response = "send_timed_response_prompt" in step
+            params = step[
+                "send_timed_response_prompt" if timed_response else "send_provider_hold_prompt"
+            ]
+            prompt = (
+                build_timed_response_prompt(params, scenario_id=str(scenario_id))
+                if timed_response
+                else build_provider_hold_prompt(params, scenario_id=str(scenario_id))
             )
             window.mark_prompt_sent()
             last_sent_prompt = prompt
@@ -2945,8 +3012,9 @@ def run_one_cell(
             )
             record.setdefault("provider_hold_prompts", []).append(
                 {
+                    "kind": "timed_response" if timed_response else "cancel_hold",
                     "hold_seconds": int(
-                        (step["send_provider_hold_prompt"] or {}).get(
+                        (params or {}).get(
                             "hold_seconds",
                             DEFAULT_PROVIDER_HOLD_SECONDS,
                         )
@@ -3160,6 +3228,66 @@ def run_one_cell(
                     timeout_s=float(params.get("timeout_s", 15)),
                 )
             )
+        elif "delete_status_panel" in step:
+            params = step["delete_status_panel"] or {}
+            panel_regex = str(
+                params.get(
+                    "panel_regex",
+                    r"Processing\.\.\.|진행 중|응답 완료|^🟢|^✅|^🔴|^📦",
+                )
+            )
+            _ingest_observed(client.fetch_messages(channel_id, after_id=after_id, limit=100))
+            panel = assertions.latest_status_panel(window, panel_regex=panel_regex)
+            message_id = str(panel.get("id") or "")
+            if not message_id.isdigit():
+                raise assertions.AssertionError(
+                    f"delete_status_panel resolved invalid message id: {message_id!r}"
+                )
+            response = client.delete_message(
+                channel_id,
+                message_id,
+                provider=cell_provider(cell),
+            )
+            window.raw_messages = [
+                message
+                for message in window.raw_messages
+                if str(message.get("id") or "") != message_id
+            ]
+            window.messages = [
+                message
+                for message in window.messages
+                if str(message.get("id") or "") != message_id
+            ]
+            record.setdefault("deleted_status_panels", []).append(
+                {"message_id": message_id, "response": response}
+            )
+        elif "inject_discord_failure" in step:
+            params = step["inject_discord_failure"] or {}
+            operation = str(params.get("operation") or "").strip().lower()
+            if operation not in {"send", "delete"}:
+                raise assertions.AssertionError(
+                    "inject_discord_failure operation must be send or delete"
+                )
+            response = client.inject_failure(
+                channel_id,
+                provider=cell_provider(cell),
+                operation=operation,
+                count=int(params.get("count", 1)),
+            )
+            record.setdefault("discord_failure_injections", []).append(response)
+        elif "clear_discord_failure" in step:
+            params = step["clear_discord_failure"] or {}
+            operation = str(params.get("operation") or "").strip().lower()
+            if operation not in {"send", "delete"}:
+                raise assertions.AssertionError(
+                    "clear_discord_failure operation must be send or delete"
+                )
+            response = client.clear_failure(
+                channel_id,
+                provider=cell_provider(cell),
+                operation=operation,
+            )
+            record.setdefault("discord_failure_clears", []).append(response)
         elif "assert_health" in step:
             params = step["assert_health"] or {}
             record.setdefault("health_assertions", []).append(
@@ -3279,8 +3407,18 @@ def run_one_cell(
     _update_record_window_snapshot(record, window)
 
     try:
+        enabled_features = frozenset(
+            feature.strip()
+            for feature in os.environ.get("AGENTDESK_E2E_FEATURES", "").split(",")
+            if feature.strip()
+        )
         for assertion_spec in scenario.get("assertions") or []:
-            run_assertion(assertion_spec, window=window, record=record)
+            run_assertion(
+                assertion_spec,
+                window=window,
+                record=record,
+                enabled_features=enabled_features,
+            )
             record["assertions"].append({"spec": assertion_spec, "passed": True})
 
         idle_check = assert_cell_idle(
@@ -3638,9 +3776,16 @@ def run_assertion(
     *,
     window: assertions.Window,
     record: dict[str, Any] | None = None,
+    enabled_features: frozenset[str] = frozenset(),
 ) -> None:
     if not isinstance(spec, dict):
         raise assertions.AssertionError(f"bad assertion spec: {spec!r}")
+    required_feature = spec.get("requires_feature")
+    if required_feature is not None:
+        required_feature = str(required_feature)
+        if required_feature not in enabled_features:
+            return
+        spec = {key: value for key, value in spec.items() if key != "requires_feature"}
     if "message_count_between_markers" in spec:
         params = spec["message_count_between_markers"]
         assertions.message_count_between_markers(
@@ -3744,6 +3889,27 @@ def run_assertion(
             ),
             include_our_send=bool(params.get("include_our_send", False)),
         )
+    elif "status_panel_after_body" in spec:
+        params = spec["status_panel_after_body"]
+        if not isinstance(params, dict) or "body_marker" not in params:
+            raise assertions.AssertionError(
+                f"status_panel_after_body requires body_marker: {spec!r}"
+            )
+        assertions.status_panel_after_body(
+            window,
+            body_marker=str(params["body_marker"]),
+            panel_regex=str(
+                params.get("panel_regex", r"Processing\.\.\.|진행 중|응답 완료|^🟢|^✅|^🔴|^📦")
+            ),
+        )
+    elif "single_status_panel" in spec:
+        params = spec["single_status_panel"]
+        panel_regex = (
+            params.get("panel_regex", r"Processing\.\.\.|진행 중|응답 완료|^🟢|^✅|^🔴|^📦")
+            if isinstance(params, dict)
+            else r"Processing\.\.\.|진행 중|응답 완료|^🟢|^✅|^🔴|^📦"
+        )
+        assertions.single_status_panel(window, panel_regex=str(panel_regex))
     elif "completion_chrome_after_body" in spec:
         params = spec["completion_chrome_after_body"]
         body_marker = params.get("body_marker") if isinstance(params, dict) else params

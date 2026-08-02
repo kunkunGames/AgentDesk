@@ -114,12 +114,9 @@ pub(super) struct SummaryRuleDef {
 // ─── Tilde expansion ────────────────────────────────────────────────────────
 
 fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ─── Loading ────────────────────────────────────────────────────────────────
@@ -240,10 +237,6 @@ pub(super) fn resolve_workspace(
     Some(expand_tilde(ws))
 }
 
-// #3034: consumed by `settings::content::load_shared_prompt_for_profile`,
-// the profile-aware shared-prompt loader (currently unwired in prod but a
-// real feature surface). Keep the org-schema resolver live.
-#[allow(dead_code)]
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     let schema = load_org_schema()?;
     // Explicit shared_prompt > auto-derived from prompts_root/agents/_shared.prompt.md

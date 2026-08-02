@@ -6,6 +6,7 @@ use poise::serenity_prelude as serenity;
 use serde::Serialize;
 use serenity::{ChannelId, MessageId};
 
+use crate::services::discord::inflight::opt_message_id;
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::discord::turn_view_reconciler::note_intake_turn_cleared_via_shared as tv_clear;
 use crate::services::discord::{self as discord, SharedData};
@@ -55,6 +56,7 @@ pub struct IdleTmuxStaleTurnRepairResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IdleTmuxStaleTurnInflightPin {
     identity: discord::inflight::InflightTurnIdentity,
+    turn_nonce: Option<String>,
     finalizer_turn_id: u64,
     updated_at: String,
     save_generation: u64,
@@ -80,6 +82,84 @@ async fn shared_for_provider(
     registry
         .shared_for_provider_on_channel(provider, channel_id)
         .await
+}
+
+pub(crate) async fn resume_runtime_for_channel(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> Option<Arc<SharedData>> {
+    shared_for_provider(registry, provider, channel_id).await
+}
+
+pub(crate) fn retain_resume_runtime_owner_before_teardown(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+) -> bool {
+    shared
+        .tmux_watchers
+        .retain_owner_during_session_rebind(tmux_session_name, channel_id)
+}
+
+pub(crate) fn clear_resume_runtime_owner_after_death(shared: &SharedData, tmux_session_name: &str) {
+    shared
+        .tmux_watchers
+        .clear_restored_owner_for_tmux_session(tmux_session_name);
+}
+
+/// Mirror a successful durable `/resume` target into the owning Discord runtime.
+///
+/// `retain_runtime_owner` means teardown left the tmux pane alive. In that case
+/// the authoritative owner-only registry entry is re-established before the
+/// channel session is changed, so direct-pane output remains delayed/routable
+/// without promoting the diagnostic dedupe mirror to routing authority.
+pub(crate) async fn rebind_channel_provider_session(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    cwd: &str,
+    session_id: &str,
+    tmux_session_name: &str,
+    retain_runtime_owner: bool,
+) {
+    let retained_runtime_owner = retain_runtime_owner
+        && shared
+            .tmux_watchers
+            .retain_owner_during_session_rebind(tmux_session_name, channel_id);
+    let (previous_path, previous_session_id) =
+        discord::rebind_channel_session(shared, provider, channel_id, cwd, session_id).await;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        provider = provider.as_str(),
+        channel_id = channel_id.get(),
+        tmux_session_name,
+        retained_runtime_owner,
+        previous_path = previous_path.as_deref().unwrap_or("<none>"),
+        previous_session_id = previous_session_id.as_deref().unwrap_or("<none>"),
+        target_cwd = cwd,
+        target_session_id = session_id,
+        "  [{ts}] ↻ /resume: rebound in-memory session to previous provider session",
+    );
+}
+
+/// #4790 `/resume` guard: report whether `channel_id` has an active or
+/// recovery-blocking turn for `provider_name`. The rebind path refuses to
+/// repoint a channel that is mid-turn (its running tmux/provider process would
+/// keep writing to the OLD transcript). Returns `false` when no runtime owns the
+/// channel (nothing in flight here).
+pub(crate) async fn channel_has_active_turn(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+) -> bool {
+    let Some(provider) = ProviderKind::from_str(provider_name) else {
+        return false;
+    };
+    let Some(shared) = shared_for_provider(registry, &provider, channel_id).await else {
+        return false;
+    };
+    discord::mailbox_has_blocking_active_turn(&shared, channel_id).await
 }
 
 async fn owning_runtime_http_for_channel(
@@ -154,6 +234,7 @@ fn capture_idle_tmux_stale_turn_inflight_pin(
     let finalizer_turn_id = state.effective_finalizer_turn_id();
     (finalizer_turn_id != 0).then(|| IdleTmuxStaleTurnInflightPin {
         identity: discord::inflight::InflightTurnIdentity::from_state(state),
+        turn_nonce: state.turn_nonce.clone(),
         finalizer_turn_id,
         updated_at: state.updated_at.clone(),
         save_generation: state.save_generation,
@@ -219,10 +300,7 @@ fn preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
 
 fn cancel_token_tmux_session(token: &Arc<CancelToken>) -> Option<String> {
     token
-        .tmux_session
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+        .tmux_session_name()
         .filter(|session| !session.trim().is_empty())
 }
 
@@ -942,11 +1020,12 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct ExplicitBackgroundWatchdogClear {
     clear_outcome: discord::inflight::GuardedClearOutcome,
     pending_hourglass_user_msg_id: Option<u64>,
     finalizer_turn_id: u64,
+    claim_snapshot: Option<discord::turn_finalizer::SyntheticClaimSnapshot>,
 }
 
 fn revalidate_and_clear_explicit_background_inflight(
@@ -960,6 +1039,7 @@ fn revalidate_and_clear_explicit_background_inflight(
             clear_outcome: discord::inflight::GuardedClearOutcome::Missing,
             pending_hourglass_user_msg_id: None,
             finalizer_turn_id: 0,
+            claim_snapshot: None,
         };
     };
     let finalizer_turn_id = snapshot_finalizer_turn_id.unwrap_or(snapshot_identity.user_msg_id);
@@ -968,18 +1048,24 @@ fn revalidate_and_clear_explicit_background_inflight(
             clear_outcome: discord::inflight::GuardedClearOutcome::UserMsgMismatch,
             pending_hourglass_user_msg_id: None,
             finalizer_turn_id,
+            claim_snapshot: None,
         };
     }
-    let clear_outcome = discord::inflight::clear_inflight_state_if_matches_identity(
-        provider,
-        channel_id.get(),
-        snapshot_identity,
-    );
+    let (clear_outcome, removed_row) =
+        discord::inflight::clear_inflight_state_if_matches_identity_returning_row(
+            provider,
+            channel_id.get(),
+            snapshot_identity,
+        );
+    let claim_snapshot = removed_row
+        .as_ref()
+        .map(discord::turn_finalizer::SyntheticClaimSnapshot::from_row);
     ExplicitBackgroundWatchdogClear {
         clear_outcome,
         pending_hourglass_user_msg_id: (snapshot_identity.user_msg_id != 0)
             .then_some(snapshot_identity.user_msg_id),
         finalizer_turn_id,
+        claim_snapshot,
     }
 }
 
@@ -1068,11 +1154,12 @@ pub async fn clear_idle_tmux_stale_turn(
         .map(|pin| pin.identity.user_msg_id)
         .unwrap_or(0);
     let finish = if expected_user_msg_id != 0 {
-        discord::mailbox_finish_turn_if_matches_started_before(
+        discord::mailbox_finish_turn_if_matches_episode_started_before(
             &shared,
             &provider,
             channel_id,
             MessageId::new(expected_user_msg_id),
+            inflight_pin.as_ref().and_then(|pin| pin.turn_nonce.clone()),
             repair_started_at,
         )
         .await
@@ -1456,7 +1543,8 @@ pub(super) fn rebind_error_status_and_message(
         | discord::recovery_engine::RebindError::InflightEpisodeChanged
         | discord::recovery_engine::RebindError::StaleOutputPath { .. }
         | discord::recovery_engine::RebindError::RuntimeBindingUnavailable { .. } => "409 Conflict",
-        discord::recovery_engine::RebindError::ChannelNotBound
+        discord::recovery_engine::RebindError::ChannelIdZero
+        | discord::recovery_engine::RebindError::ChannelNotBound
         | discord::recovery_engine::RebindError::ChannelNameMissing => "400 Bad Request",
         discord::recovery_engine::RebindError::Internal(_) => "500 Internal Server Error",
     };
@@ -1481,6 +1569,14 @@ mod rebind_error_status_tests {
         assert_eq!(status, "409 Conflict");
         assert!(message.contains("codex_tui"));
         assert!(message.contains("AgentDesk-codex-adk-cdx"));
+    }
+
+    #[test]
+    fn zero_channel_id_maps_to_bad_request() {
+        let (status, message) = rebind_error_status_and_message(&RebindError::ChannelIdZero);
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(message.contains("non-zero"));
     }
 }
 
@@ -1542,7 +1638,7 @@ pub fn spawn_watchdog(port: u16) {
                 if ok {
                     if consecutive_failures > 0 {
                         let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
+                        tracing::info!(
                             "  [{ts}] 🩺 watchdog: health recovered after {consecutive_failures} failure(s)"
                         );
                     }
@@ -1635,6 +1731,16 @@ pub(crate) async fn run_stall_watchdog_pass(
             Some(snapshot) => snapshot,
             None => continue,
         };
+        let now_mono_secs = super::liveness_authority::monotonic_now_secs();
+        let tick_inflight = discord::inflight::load_inflight_state(provider, channel_id.get());
+        let capture_assessment = super::liveness_authority::observe_and_publish_from_tick(
+            provider,
+            channel_id,
+            &snapshot,
+            tick_inflight.as_ref(),
+            now_unix_secs,
+            now_mono_secs,
+        );
         if relay_dead_reattach::try_apply(
             registry,
             shared.clone(),
@@ -1749,6 +1855,7 @@ pub(crate) async fn run_stall_watchdog_pass(
             let generation = shared.restart.current_generation;
             let shared_for_submit = shared.clone();
             let provider_for_submit = provider.clone();
+            let claim_snapshot = revalidated.claim_snapshot.clone();
             let has_pending = cleanup_then_submit_explicit_background_watchdog_cancel(
                 &shared,
                 provider,
@@ -1758,7 +1865,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                 move || async move {
                     shared_for_submit
                         .turn_finalizer
-                        .submit_terminal(
+                        .submit_terminal_with_claim_snapshot(
                             discord::turn_finalizer::TurnKey::new(
                                 channel_id,
                                 finalizer_turn_id,
@@ -1767,6 +1874,7 @@ pub(crate) async fn run_stall_watchdog_pass(
                             provider_for_submit,
                             discord::turn_finalizer::TerminalEvent::Cancel,
                             discord::turn_finalizer::FinalizeContext::monitor(),
+                            claim_snapshot,
                             shared_for_submit.clone(),
                         )
                         .await
@@ -1814,16 +1922,10 @@ pub(crate) async fn run_stall_watchdog_pass(
             continue;
         }
 
-        let capture_advancing = stall_liveness::stall_watchdog_capture_offset_advancing(
-            provider,
-            channel_id,
-            &snapshot,
-            now_unix_secs,
-        );
         let should_clean = stall_watchdog_should_force_clean(
             snapshot.attached,
             snapshot.desynced,
-            capture_advancing,
+            capture_assessment.advancing,
             snapshot.inflight_terminal_delivery_committed,
             snapshot.inflight_started_at.as_deref(),
             now_unix_secs,
@@ -2171,7 +2273,14 @@ async fn maybe_recover_completed_stale_leak(
         return false;
     };
 
-    let current_msg_id = MessageId::new(state.current_msg_id);
+    let Some(current_msg_id) = opt_message_id(state.current_msg_id) else {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            "leak recovery skipped because persisted current message id is zero"
+        );
+        return false;
+    };
     let current_message = if confirmed_chunks == 0 {
         let current_bot_user_id = match http.get_current_user().await {
             Ok(user) => user.id.get(),
@@ -3172,6 +3281,63 @@ mod stall_watchdog_pure_tests {
             .expect("newer row must survive mismatch");
         assert_eq!(persisted.started_at, "2099-01-01 00:00:00");
         assert_eq!(persisted.turn_start_offset, Some(99));
+    }
+
+    #[test]
+    fn explicit_background_watchdog_clear_returns_reanchored_removed_row_snapshot() {
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let _env = TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tempdir.path(),
+        );
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_340_101);
+        let mut state = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            None,
+            1,
+            4_340_102,
+            4_340_103,
+            "explicit background".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-4340-watchdog".to_string()),
+            Some("/tmp/issue-4340-watchdog.jsonl".to_string()),
+            None,
+            10,
+        );
+        state.status_message_id = Some(4_340_104);
+        inflight::save_inflight_state(&state).expect("save watchdog row");
+        let identity = InflightTurnIdentity::from_state(&state);
+        let stale_snapshot = inflight::load_inflight_state(&provider, channel_id.get())
+            .map(|row| {
+                crate::services::discord::turn_finalizer::SyntheticClaimSnapshot::from_row(&row)
+            })
+            .expect("load pre-reanchor snapshot");
+        assert_eq!(stale_snapshot.status_message_id, Some(4_340_104));
+
+        state.status_message_id = Some(4_340_105);
+        state.status_panel_generation = 2;
+        inflight::save_inflight_state(&state).expect("re-anchor same identity before clear");
+
+        let outcome = revalidate_and_clear_explicit_background_inflight(
+            &provider,
+            channel_id,
+            Some(&identity),
+            Some(state.effective_finalizer_turn_id()),
+        );
+
+        assert_eq!(outcome.clear_outcome, GuardedClearOutcome::Cleared);
+        assert_eq!(
+            outcome
+                .claim_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.status_message_id),
+            Some(4_340_105)
+        );
+        assert!(inflight::load_inflight_state(&provider, channel_id.get()).is_none());
     }
 
     #[test]
@@ -4243,7 +4409,7 @@ mod stall_watchdog_auto_heal_tests {
                 category_name: None,
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
-                born_generation: crate::services::discord::runtime_store::load_generation(),
+                born_generation: crate::services::discord::runtime_store::process_generation(),
             },
         );
     }
@@ -4582,13 +4748,17 @@ mod stall_watchdog_auto_heal_tests {
         );
     }
 
-    /// #4460: fresh producer activity must be authoritative even while the
-    /// control plane is desynced. This is the production shape that the W0
-    /// shadow verdict mislabeled `control_plane_desync`: the transcript is
-    /// fresh, but the turn itself is old enough to enter branch 4. It must not
-    /// page and must never clean the turn.
+    /// #4615: in the pre-backstop window, capture advancement is intentionally
+    /// defense-in-depth: it closes the early `should_clean` gate, while the
+    /// secondary liveness evaluation can independently defer from the recorded
+    /// advance history. This integration test proves the combined suppression,
+    /// not isolation of the early wire. The opposite stuck-true mutation is
+    /// guarded by `pre_backstop_flat_capture_pages_genuine_stall_pg`; direct
+    /// early-gate semantics remain covered by
+    /// `stall_watchdog_capture_advancing_blocks_force_clean`, and secondary
+    /// history by the stall-liveness first-threshold regression.
     #[tokio::test(flavor = "current_thread")]
-    async fn branch4_producer_liveness_suppresses_page_and_preserves_turn_pg() {
+    async fn pre_backstop_capture_advance_has_defense_in_depth_suppression_pg() {
         let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
             "agentdesk_stall_watchdog_producer_live",
             "stall watchdog producer-live suppression tests",
@@ -4619,6 +4789,12 @@ mod stall_watchdog_auto_heal_tests {
         let stale_output = tempdir.path().join("force-clean-stale.jsonl");
         std::fs::write(&stale_output, "partial stale output\n")
             .expect("write stale output fixture");
+        let stale_mtime = chrono::Utc::now().timestamp() - 5 * 60 * 60;
+        filetime::set_file_mtime(
+            &stale_output,
+            filetime::FileTime::from_unix_time(stale_mtime, 0),
+        )
+        .expect("age transcript beyond stateless liveness windows");
         let stale_token = seed_active_mailbox_and_session(&shared, channel, user_msg).await;
         let mut stale_state = seed_idle_inflight(
             &provider,
@@ -4644,6 +4820,28 @@ mod stall_watchdog_auto_heal_tests {
             watcher_handle(stale_tmux, &stale_output, watcher_cancel.clone()),
         );
         let turn_view_ops_before = shared.turn_view_reconciler.ops().len();
+        let baseline = registry
+            .snapshot_watcher_state_for_shared(&provider, shared.clone(), channel.get())
+            .await
+            .expect("capture baseline snapshot");
+        let observed_at = chrono::Utc::now().timestamp();
+        assert!(
+            !super::super::liveness_authority::observe_capture_coordinate(
+                &provider,
+                channel,
+                &baseline,
+                observed_at,
+                1,
+            )
+            .advancing
+        );
+        std::fs::write(&stale_output, "partial stale output\nproducer advanced\n")
+            .expect("advance capture without refreshing transcript evidence");
+        filetime::set_file_mtime(
+            &stale_output,
+            filetime::FileTime::from_unix_time(stale_mtime, 0),
+        )
+        .expect("keep transcript mtime stale after capture growth");
 
         let cleaned = super::run_stall_watchdog_pass(&registry, &provider).await;
 
@@ -4760,12 +4958,14 @@ mod stall_watchdog_auto_heal_tests {
             .expect("initial absolute-backstop watcher snapshot");
         let observation_time = chrono::Utc::now().timestamp();
         assert!(
-            !super::stall_liveness::stall_watchdog_capture_offset_advancing(
+            !super::super::liveness_authority::observe_capture_coordinate(
                 &provider,
                 channel,
                 &initial_snapshot,
                 observation_time,
-            ),
+                1,
+            )
+            .advancing,
             "first capture observation only establishes the baseline"
         );
         std::fs::write(&output, "fresh producer output\nstill advancing\n")
@@ -4775,12 +4975,14 @@ mod stall_watchdog_auto_heal_tests {
             .await
             .expect("advanced absolute-backstop watcher snapshot");
         assert!(
-            super::stall_liveness::stall_watchdog_capture_offset_advancing(
+            super::super::liveness_authority::observe_capture_coordinate(
                 &provider,
                 channel,
                 &advanced_snapshot,
                 observation_time + 1,
-            ),
+                2,
+            )
+            .advancing,
             "fixture must prove cross-tick capture advancement"
         );
 
@@ -4820,11 +5022,12 @@ mod stall_watchdog_auto_heal_tests {
         );
     }
 
-    /// A genuinely stalled/desynced turn has no fresh producer evidence. It
-    /// must page once through the provider-owned DM bot, while the branch-4
-    /// no-cleanup invariant preserves every turn authority on repeated passes.
+    /// #4615: a pre-backstop genuine stall with flat, never-advanced capture
+    /// and no stateless evidence must page once. Replacing
+    /// `capture_assessment.advancing` with `true` makes the row-count assertion
+    /// fail because the page is incorrectly suppressed.
     #[tokio::test(flavor = "current_thread")]
-    async fn branch4_genuine_stall_pages_once_and_preserves_turn_pg() {
+    async fn pre_backstop_flat_capture_pages_genuine_stall_pg() {
         let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
             "agentdesk_stall_watchdog_genuine_stall",
             "stall watchdog genuine-stall paging tests",
@@ -4867,7 +5070,7 @@ mod stall_watchdog_auto_heal_tests {
             0,
             "genuinely-stalled-session",
         );
-        let stale_at = (chrono::Local::now() - chrono::Duration::hours(5))
+        let stale_at = (chrono::Local::now() - chrono::Duration::minutes(30))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
         state.started_at = stale_at.clone();
@@ -4995,6 +5198,53 @@ mod stall_watchdog_auto_heal_tests {
         );
         assert!(token.cancelled.load(Ordering::Relaxed));
         assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+
+        let next_token = Arc::new(CancelToken::new());
+        assert!(
+            super::super::super::mailbox_try_start_turn(
+                &shared,
+                channel,
+                next_token.clone(),
+                UserId::new(7),
+                MessageId::new(71),
+            )
+            .await
+        );
+        let next_watcher_cancel = Arc::new(AtomicBool::new(false));
+        shared.tmux_watchers.insert(
+            channel,
+            super::super::super::TmuxWatcherHandle {
+                tmux_session_name: "AgentDesk-codex-next-watchdog".to_string(),
+                output_path: "/tmp/agentdesk-test-next-watchdog.jsonl".to_string(),
+                paused: Arc::new(AtomicBool::new(false)),
+                resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                cancel: next_watcher_cancel.clone(),
+                pause_epoch: Arc::new(AtomicU64::new(0)),
+                turn_delivered: Arc::new(AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(AtomicI64::new(0)),
+            },
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+
+        let released = super::super::relay_auto_heal::apply_watchdog_orphan_token_cleanup(
+            &registry,
+            &provider,
+            shared.clone(),
+            channel,
+        )
+        .await;
+
+        assert!(!released, "watchdog rate limit must block a second reclaim");
+        assert!(shared.tmux_watchers.contains_key(&channel));
+        assert!(!next_watcher_cancel.load(Ordering::Relaxed));
+        assert!(
+            super::super::super::mailbox_snapshot(&shared, channel)
+                .await
+                .cancel_token
+                .is_some()
+        );
+        assert!(!next_token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -5071,7 +5321,7 @@ mod hard_stop_completion_event_tests {
             author_id: UserId::new(id),
             author_is_bot: false,
             message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -5640,6 +5890,7 @@ mod explicit_background_watchdog_cleanup_tests {
             clear_outcome: GuardedClearOutcome::Cleared,
             pending_hourglass_user_msg_id: Some(4_019_402_901),
             finalizer_turn_id: 4_019_402_901,
+            claim_snapshot: None,
         };
         let order = Arc::new(Mutex::new(Vec::new()));
 

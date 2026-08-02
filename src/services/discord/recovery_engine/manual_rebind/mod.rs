@@ -18,14 +18,15 @@
 use super::manual_rebind_output_path::saved_output_path_for_rebind_resolution;
 use super::manual_rebind_override::upsert_rebind_session_id_override;
 use super::*;
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
 
 mod adoption;
 mod codex_tui_replay;
 mod episode_handoff;
+mod test_barriers;
 #[cfg(unix)]
 mod watcher_claim;
+#[cfg(test)]
+use test_barriers::await_post_adoption_claim_barrier;
 #[cfg(unix)]
 use watcher_claim::claim_rebind_watcher;
 
@@ -45,7 +46,13 @@ pub(crate) use self::codex_tui_replay::{
     codex_tui_rebind_should_load_existing_normalized_replay_events,
     codex_tui_rebind_start_after_crossed_provider_turn,
 };
+#[cfg(test)]
+pub(crate) use self::test_barriers::{
+    EpisodeAuthorityHeldBarrier, PostAdoptionClaimBarrier, install_episode_authority_held_barrier,
+    install_post_adoption_claim_barrier,
+};
 
+#[allow(clippy::large_enum_variant)]
 enum PendingRebindInflightRollback {
     RestoreExistingAdoption {
         state: super::inflight::InflightTurnState,
@@ -124,102 +131,6 @@ impl PendingRebindInflightRollback {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct PostAdoptionClaimBarrier {
-    pub(crate) reached: std::sync::Arc<tokio::sync::Barrier>,
-    pub(crate) resume: std::sync::Arc<tokio::sync::Barrier>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct EpisodeAuthorityHeldBarrier {
-    pub(crate) reached: std::sync::Arc<tokio::sync::Barrier>,
-    pub(crate) resume: std::sync::Arc<tokio::sync::Barrier>,
-}
-
-#[cfg(test)]
-fn post_adoption_claim_barrier_slot() -> &'static Mutex<Option<PostAdoptionClaimBarrier>> {
-    static SLOT: OnceLock<Mutex<Option<PostAdoptionClaimBarrier>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn episode_authority_held_barrier_slot() -> &'static Mutex<Option<EpisodeAuthorityHeldBarrier>> {
-    static SLOT: OnceLock<Mutex<Option<EpisodeAuthorityHeldBarrier>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-pub(crate) struct PostAdoptionClaimBarrierGuard(Option<PostAdoptionClaimBarrier>);
-
-#[cfg(test)]
-pub(crate) struct EpisodeAuthorityHeldBarrierGuard(Option<EpisodeAuthorityHeldBarrier>);
-
-#[cfg(test)]
-impl Drop for PostAdoptionClaimBarrierGuard {
-    fn drop(&mut self) {
-        *post_adoption_claim_barrier_slot()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = self.0.take();
-    }
-}
-
-#[cfg(test)]
-impl Drop for EpisodeAuthorityHeldBarrierGuard {
-    fn drop(&mut self) {
-        *episode_authority_held_barrier_slot()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = self.0.take();
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn install_post_adoption_claim_barrier(
-    barrier: PostAdoptionClaimBarrier,
-) -> PostAdoptionClaimBarrierGuard {
-    let previous = post_adoption_claim_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .replace(barrier);
-    PostAdoptionClaimBarrierGuard(previous)
-}
-
-#[cfg(test)]
-pub(crate) fn install_episode_authority_held_barrier(
-    barrier: EpisodeAuthorityHeldBarrier,
-) -> EpisodeAuthorityHeldBarrierGuard {
-    let previous = episode_authority_held_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .replace(barrier);
-    EpisodeAuthorityHeldBarrierGuard(previous)
-}
-
-#[cfg(test)]
-async fn await_post_adoption_claim_barrier() {
-    let barrier = post_adoption_claim_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone();
-    if let Some(barrier) = barrier {
-        barrier.reached.wait().await;
-        barrier.resume.wait().await;
-    }
-}
-
-#[cfg(test)]
-async fn await_episode_authority_held_barrier() {
-    let barrier = episode_authority_held_barrier_slot()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .clone();
-    if let Some(barrier) = barrier {
-        barrier.reached.wait().await;
-        barrier.resume.wait().await;
-    }
-}
-
 /// #896: Rebind a live tmux session to a freshly-created inflight state and
 /// (re)spawn the output watcher — recovers orphan states whose tmux is alive
 /// but whose inflight JSON was cleared, leaving output with no relay path.
@@ -277,6 +188,7 @@ pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rebind_inflight_for_channel_inner(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -287,7 +199,8 @@ async fn rebind_inflight_for_channel_inner(
     minimum_initial_offset: Option<u64>,
     expected_episode: Option<&super::inflight::InflightEpisodePin>,
 ) -> Result<RebindOutcome, RebindError> {
-    let discord_channel_id = ChannelId::new(channel_id);
+    let discord_channel_id =
+        super::inflight::opt_channel_id(channel_id).ok_or(RebindError::ChannelIdZero)?;
 
     // Preflight existence check — fast 409 before walking the validation /
     // tmux-liveness path. Advisory only; the AUTHORITATIVE guard is the atomic
@@ -807,7 +720,7 @@ async fn rebind_inflight_for_channel_inner(
         state.rebind_origin_created_at_unix = Some(super::inflight::now_unix());
         state.rebind_origin_deadline_secs =
             Some(super::inflight::rebind_origin_deadline_secs_env());
-        state.rebind_origin_birth_generation = Some(super::runtime_store::load_generation());
+        state.rebind_origin_birth_generation = Some(super::runtime_store::process_generation());
 
         // Atomic create-or-fail: if a legitimate turn created its inflight file
         // between the preflight check above and this point, the write fails
@@ -839,6 +752,7 @@ async fn rebind_inflight_for_channel_inner(
             shared,
             provider,
             channel_id,
+            discord_channel_id,
             &recovered_state_for_session,
             locked_episode_from_adoption.take(),
             existing_inflight.is_some(),
@@ -879,6 +793,11 @@ async fn rebind_inflight_for_channel_inner(
                 handle,
                 provider,
                 discard_restored_render_seed,
+                super::tmux::thread_follow_up_parent_channel_id(
+                    discord_channel_id,
+                    recovered_state_for_session.logical_channel_id,
+                    recovered_state_for_session.thread_id,
+                ),
             );
             if watcher_should_spawn {
                 if let Some(PendingCodexTuiRebindRelay {

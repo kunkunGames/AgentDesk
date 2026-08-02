@@ -59,22 +59,48 @@ pub(super) async fn build_adk_session_key(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
     provider: &ProviderKind,
+    // #4658: when set (scheduled-snapshot turns), the key is derived from this
+    // label instead of the channel name, so the reserved turn gets a distinct
+    // `sessions.session_key` and never overwrites the channel's live session row
+    // (AC-2; independent of the #4634 session_key collision class).
+    session_basis_override: Option<&str>,
 ) -> Option<String> {
-    let channel_name = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|s| s.channel_name.as_ref())
-            .cloned()
-    }
-    .or_else(|| registered_channel_fallback_name(channel_id, provider))?;
-    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    let channel_name = if session_basis_override.is_some() {
+        // Override short-circuits the channel-name lookup entirely, so a
+        // snapshot turn never needs (and never touches) the channel's session.
+        None
+    } else {
+        let from_memory = {
+            let data = shared.core.lock().await;
+            data.sessions
+                .get(&channel_id)
+                .and_then(|s| s.channel_name.as_ref())
+                .cloned()
+        };
+        from_memory.or_else(|| registered_channel_fallback_name(channel_id, provider))
+    };
+    let basis = resolve_session_key_basis(session_basis_override, channel_name.as_deref())?;
+    let tmux_name = provider.build_tmux_session_name(&basis);
 
     Some(build_namespaced_session_key(
         &shared.token_hash,
         provider,
         &tmux_name,
     ))
+}
+
+/// #4658 session-isolation guard: choose the session-key basis. When a
+/// scheduled-snapshot override is present it always wins over the channel name,
+/// so the derived `sessions.session_key` can never collide with the channel's
+/// live session (AC-2). Returns `None` only when neither source is available.
+pub(in crate::services::discord) fn resolve_session_key_basis(
+    session_basis_override: Option<&str>,
+    channel_name: Option<&str>,
+) -> Option<String> {
+    match session_basis_override {
+        Some(override_basis) => Some(override_basis.to_string()),
+        None => channel_name.map(str::to_string),
+    }
 }
 
 pub(super) fn registered_channel_fallback_name(
@@ -167,52 +193,48 @@ pub(super) fn derive_adk_session_info(
     "AgentDesk 작업 진행 중".to_string()
 }
 
-pub(super) async fn post_adk_session_status(
+/// Persist the origin classification at turn start. Every started turn overwrites
+/// the previous marker, so an ordinary interactive turn can never inherit a
+/// dispatched-origin marker from an older turn.
+pub(super) async fn record_turn_start_origin(
     session_key: Option<&str>,
-    name: Option<&str>,
-    model: Option<&str>,
-    status: &str,
     provider: &ProviderKind,
-    session_info: Option<&str>,
-    tokens: Option<u64>,
-    cwd: Option<&str>,
-    dispatch_id: Option<&str>,
-    thread_channel_id: Option<u64>,
-    channel_id: Option<serenity::ChannelId>,
-    agent_id: Option<&str>,
-    _api_port: u16,
+    channel_id: serenity::ChannelId,
+    turn_nonce: Option<&str>,
+    dispatched_origin: bool,
 ) {
-    let Some(session_key) = session_key else {
+    let (Some(session_key), Some(turn_nonce)) =
+        (session_key, turn_nonce.filter(|value| !value.is_empty()))
+    else {
         return;
     };
-    let status = crate::db::session_status::normalize_incoming_session_status(Some(status));
-
     let body = crate::services::dispatched_sessions::HookSessionBody {
         session_key: session_key.to_string(),
         instance_id: None,
-        agent_id: agent_id.map(str::to_string),
-        status: Some(status.to_string()),
+        agent_id: None,
+        status: Some(crate::db::session_status::TURN_ACTIVE.to_string()),
         provider: Some(provider.as_str().to_string()),
-        session_info: session_info.map(str::to_string),
-        name: name.and_then(clean_nonempty).map(str::to_string),
-        model: model
-            .and_then(clean_nonempty)
-            .filter(|value| !value.eq_ignore_ascii_case(provider.as_str()))
-            .map(str::to_string),
-        tokens,
-        cwd: cwd.and_then(clean_nonempty).map(str::to_string),
-        dispatch_id: dispatch_id.and_then(clean_nonempty).map(str::to_string),
-        thread_channel_id: thread_channel_id.map(|id| id.to_string()),
+        session_info: None,
+        name: None,
+        model: None,
+        tokens: None,
+        cwd: None,
+        dispatch_id: None,
+        thread_channel_id: None,
         claude_session_id: None,
         session_id: None,
-        channel_id: channel_id.map(|id| id.get().to_string()),
+        channel_id: Some(channel_id.get().to_string()),
+        identity_kind: None,
+        discord_token_hash: None,
+        turn_start_nonce: Some(turn_nonce.to_string()),
+        dispatched_origin: Some(dispatched_origin),
     };
-
     if let Err(err) = super::internal_api::hook_session(body).await {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!("  [{ts}] ⚠ ADK session POST failed: {err}");
+        tracing::warn!(channel_id = channel_id.get(), error = %err, "failed to persist turn-start origin marker");
     }
 }
+
+pub(super) use super::session_status_hook::post_legacy as post_adk_session_status;
 
 /// Delete a session row from the DB by session_key.
 /// Used to clean up thread sessions after dispatch completion.
@@ -268,6 +290,10 @@ pub(super) async fn save_provider_session_id(
         claude_session_id: Some(session_id.to_string()),
         session_id: raw_provider_session_id.map(str::to_string),
         channel_id: Some(channel_id.get().to_string()),
+        identity_kind: None,
+        discord_token_hash: None,
+        turn_start_nonce: None,
+        dispatched_origin: None,
     };
     if let Err(err) = super::internal_api::hook_session(body).await {
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -672,6 +698,55 @@ fn clean_nonempty(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
+mod session_key_basis_tests {
+    use super::{build_namespaced_session_key, resolve_session_key_basis};
+    use crate::services::provider::ProviderKind;
+
+    // #4658 session-isolation guard. Mutation proof: make
+    // `resolve_session_key_basis` ignore the override (always return the channel
+    // name) and both the override-wins and non-collision assertions below fail.
+    #[test]
+    fn snapshot_override_wins_over_channel_name() {
+        let basis = resolve_session_key_basis(Some("scheduled:smsg_abc"), Some("general"));
+        assert_eq!(basis.as_deref(), Some("scheduled:smsg_abc"));
+        // Falls back to the channel name only when no override is present.
+        assert_eq!(
+            resolve_session_key_basis(None, Some("general")).as_deref(),
+            Some("general")
+        );
+        assert_eq!(resolve_session_key_basis(None, None), None);
+    }
+
+    #[test]
+    fn snapshot_session_key_never_collides_with_channel_session_key() {
+        let provider = ProviderKind::Claude;
+        let token_hash = "tok";
+        let channel_name = "team-backend";
+
+        let channel_basis =
+            resolve_session_key_basis(None, Some(channel_name)).expect("channel basis");
+        let snapshot_basis =
+            resolve_session_key_basis(Some("scheduled:smsg_abc"), Some(channel_name))
+                .expect("snapshot basis");
+
+        let channel_key = build_namespaced_session_key(
+            token_hash,
+            &provider,
+            &provider.build_tmux_session_name(&channel_basis),
+        );
+        let snapshot_key = build_namespaced_session_key(
+            token_hash,
+            &provider,
+            &provider.build_tmux_session_name(&snapshot_basis),
+        );
+        assert_ne!(
+            channel_key, snapshot_key,
+            "a snapshot turn must derive a session_key distinct from the channel's live session"
+        );
+    }
+}
+
+#[cfg(test)]
 mod parse_dispatch_id_tests {
     use super::parse_dispatch_id;
 
@@ -704,17 +779,15 @@ mod compact_threshold_tests {
     use super::ContextThresholds;
     use crate::services::provider::ProviderKind;
 
-    /// #3097: a configured `context_compact_percent_claude` value must be the
-    /// value `compact_pct_for(Claude)` returns — this is exactly the number that
-    /// flows into the claude spawn's `compact_percent` and thus sets
-    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (the spawn only sets the env var when
-    /// the value is `> 0`).
+    /// A configured `context_compact_percent_claude` value must remain distinct
+    /// from the generic and Codex percentages.
     #[test]
     fn compact_pct_for_claude_uses_claude_specific_override() {
         let thresholds = ContextThresholds {
             compact_pct: 80,
             compact_pct_codex: 100,
             compact_pct_claude: 60,
+            compact_lower_bound_tokens: 300_000,
             context_window: 1_000_000,
         };
         // Claude takes its own override, distinct from the generic value.
@@ -723,7 +796,7 @@ mod compact_threshold_tests {
         assert_eq!(thresholds.compact_pct_for(&ProviderKind::Codex), 100);
         // Other providers fall back to the generic value.
         assert_eq!(thresholds.compact_pct_for(&ProviderKind::Gemini), 80);
-        // A configured Claude value is > 0, so the override env var would be set.
+        // The launch path turns this percentage into an absolute safe window.
         assert!(thresholds.compact_pct_for(&ProviderKind::Claude) > 0);
     }
 
@@ -736,68 +809,10 @@ mod compact_threshold_tests {
             compact_pct: 55,
             compact_pct_codex: 100,
             compact_pct_claude: 55,
+            compact_lower_bound_tokens: 300_000,
             context_window: 1_000_000,
         };
         assert_eq!(thresholds.compact_pct_for(&ProviderKind::Claude), 55);
-    }
-}
-
-#[cfg(test)]
-mod compact_call_site_tests {
-    use super::claude_compact_trigger_evaluates_at_completion;
-    use crate::services::claude_compact_trigger::{observe_and_decide_for_test, state_test_guard};
-
-    // #3262 issue #4 (pure call-site gate): a zero-usage observation
-    // (`occupied == 0`) must NOT short-circuit the trigger evaluation — it is the
-    // canonical post-compact re-arm signal. Only a disabled feature (threshold 0)
-    // skips. This is the decision the call site lost in the early-`return`.
-    #[test]
-    fn zero_usage_does_not_short_circuit_trigger_evaluation() {
-        // usage 0 with a live threshold STILL evaluates (re-arm must be reached).
-        assert!(claude_compact_trigger_evaluates_at_completion(0, 60));
-        // A small threshold whose re-arm floor requires usage ≈ 0 still evaluates.
-        assert!(claude_compact_trigger_evaluates_at_completion(0, 1));
-        // Non-zero usage of course evaluates too.
-        assert!(claude_compact_trigger_evaluates_at_completion(123_456, 60));
-        // Only a disabled feature (unset/zero threshold) skips — degrade-safe.
-        assert!(!claude_compact_trigger_evaluates_at_completion(0, 0));
-        assert!(!claude_compact_trigger_evaluates_at_completion(999, 0));
-    }
-
-    // #3262 issue #4 (closes the integration gap the unit tests missed): drive the
-    // CALL-SITE path — gate → `observe_and_decide` — and prove that a
-    // turn-completion observation with usage == 0 RE-ARMS a previously-fired latch
-    // so the next threshold crossing fires again. The prior early-return
-    // (`if occupied == 0 { return; }`) starved this re-arm: a low-threshold channel
-    // fired once and stayed permanently disarmed.
-    #[test]
-    fn zero_usage_turn_completion_rearms_via_call_site_path() {
-        let _g = state_test_guard();
-        // Low threshold whose re-arm floor (threshold - 5, saturating) lands at 0,
-        // so ONLY a usage==0 observation can re-arm — exactly the case the
-        // early-return used to starve.
-        let ch = 770_001_u64;
-        let threshold = 3_u64;
-
-        // Helper mirroring the call site: gate first (usage==0 must NOT skip),
-        // then run the latch transition with the real usage percent.
-        let evaluate = |occupied: u64, usage_pct: u64| -> bool {
-            if !claude_compact_trigger_evaluates_at_completion(occupied, threshold) {
-                return false;
-            }
-            observe_and_decide_for_test(ch, usage_pct, threshold)
-        };
-
-        // First crossing fires (injects) and disarms.
-        assert!(evaluate(50_000, 5));
-        // Still parked above on a later completion: no re-fire (once-per-cycle).
-        assert!(!evaluate(90_000, 9));
-        // Post-compact turn-completion drops to ZERO usage. With the prior
-        // early-return this observation never reached the latch and the channel
-        // stayed disarmed forever. It must now re-arm (and not inject).
-        assert!(!evaluate(0, 0));
-        // Proof of re-arm: the next genuine crossing fires again.
-        assert!(evaluate(40_000, 4));
     }
 }
 
@@ -809,8 +824,10 @@ pub(super) struct ContextThresholds {
     /// Provider-specific override (if set). Falls back to compact_pct.
     pub compact_pct_codex: u64,
     /// Claude-specific override (if set). Falls back to compact_pct.
-    /// Flows to `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` on the claude spawn (#3097).
     pub compact_pct_claude: u64,
+    /// Provider-neutral minimum occupancy before compacting. Claude applies it
+    /// to its model-aware context window; unset settings default to 300k.
+    pub compact_lower_bound_tokens: u64,
     pub context_window: u64,
 }
 
@@ -822,6 +839,8 @@ impl Default for ContextThresholds {
             // Default to the generic compact_pct default so Claude inherits the
             // shared threshold unless `context_compact_percent_claude` is set.
             compact_pct_claude: 60,
+            compact_lower_bound_tokens:
+                crate::services::claude_compact_context::DEFAULT_CONTEXT_COMPACT_LOWER_BOUND_TOKENS,
             context_window: 1_000_000,
         }
     }
@@ -868,11 +887,14 @@ pub(super) async fn fetch_context_thresholds(_api_port: u16) -> ContextThreshold
     // value still applies it to Claude, while `context_compact_percent_claude`
     // takes precedence when present.
     let compact_pct_claude = find_u64("context_compact_percent_claude").unwrap_or(compact_pct);
+    let compact_lower_bound_tokens = find_u64("context_compact_lower_bound_tokens")
+        .unwrap_or(defaults.compact_lower_bound_tokens);
 
     ContextThresholds {
         compact_pct,
         compact_pct_codex,
         compact_pct_claude,
+        compact_lower_bound_tokens,
         context_window: defaults.context_window,
     }
 }
@@ -907,7 +929,40 @@ pub(super) async fn backfill_completed_panel_usage_and_maybe_inject_compact(
         output_tokens: state.accum_output_tokens,
     };
     let occupied = usage.context_occupancy_input_tokens();
-    let context_window = provider.resolve_context_window(state.last_model.as_deref());
+    // Claude's real window belongs to the launch-time gateway provenance, not
+    // today's live config. Keep the provider fallback for panel display when a
+    // legacy/unregistered pane cannot prove launch provenance, but never use it
+    // to drive the authoritative compact trigger.
+    let claude_window_resolution = matches!(provider, ProviderKind::Claude)
+        .then(|| {
+            crate::services::claude_compact_context::context_window_for_turn(
+                tmux_session_name,
+                state.last_model.as_deref(),
+            )
+        })
+        .flatten();
+    let claude_launch_window = match claude_window_resolution {
+        Some(crate::services::claude_compact_context::TurnWindowResolution::Proven(window)) => {
+            Some(window)
+        }
+        _ => None,
+    };
+    let claude_trigger_window = claude_window_resolution.map(|resolution| match resolution {
+        crate::services::claude_compact_context::TurnWindowResolution::Proven(window) => window,
+        crate::services::claude_compact_context::TurnWindowResolution::UnprovenLaunchBound => {
+            crate::services::claude_compact_context::CLAUDE_AUTO_COMPACT_MAX_TOKENS
+        }
+    });
+    let compact_window_source = claude_window_resolution.map(|resolution| match resolution {
+        crate::services::claude_compact_context::TurnWindowResolution::Proven(_) => {
+            crate::services::claude_compact_trigger::CompactWindowSource::Proven
+        }
+        crate::services::claude_compact_context::TurnWindowResolution::UnprovenLaunchBound => {
+            crate::services::claude_compact_trigger::CompactWindowSource::FallbackMax
+        }
+    });
+    let context_window = claude_launch_window
+        .unwrap_or_else(|| provider.resolve_context_window(state.last_model.as_deref()));
     let ctx_cfg = fetch_context_thresholds(shared.api_port).await;
     let compact_pct = ctx_cfg.compact_pct_for(provider);
 
@@ -929,53 +984,36 @@ pub(super) async fn backfill_completed_panel_usage_and_maybe_inject_compact(
         );
     }
 
-    // #3262: Claude ignores CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, so enforce the
-    // configured threshold ourselves by injecting `/compact` into the live TUI
-    // (claude-only, once-per-fill-cycle, idle-gated — see claude_compact_trigger).
-    // Runs regardless of status_panel_v2_enabled so disabling the v2 panel never
-    // silently disables auto-compact.
-    //
-    // #3262 issue #4 (call-site integration gap): the trigger evaluation runs
-    // UNCONDITIONALLY at this turn-completion boundary, including when
-    // `occupied == 0` (usage 0). A zero-usage observation cannot inject
-    // (`should_inject_compact` still requires `usage_pct >= threshold`) but it is
-    // the canonical post-compact signal that RE-ARMS the latch via
-    // `observe_and_decide`. Short-circuiting on zero usage (the prior early-return)
-    // starved the live re-arm path, leaving a low-threshold channel permanently
-    // disarmed after the first fire. `context_usage_percent` returns 0 safely when
-    // `context_window == 0`, so an unresolved window degrades to a re-arm-only 0.
-    if claude_compact_trigger_evaluates_at_completion(occupied, compact_pct) {
-        let usage_pct = context_usage_percent(occupied, context_window);
-        crate::services::claude_compact_trigger::maybe_inject_compact(
-            channel_id.get(),
-            tmux_session_name,
-            provider,
-            usage_pct,
-            compact_pct,
-        );
+    // The token trigger runs even when `occupied == 0`: a post-compact usage
+    // reset is the observable re-arm signal handled inside the trigger. Exact
+    // catalog evidence uses the proven window; launch-bound but unproven panes use
+    // the conservative maximum-window threshold. Missing provenance/model remains
+    // a no-op. Idempotency is keyed on observable USAGE occupancy (`occupied`),
+    // never on a cosmetic `auto_compacted` string heuristic.
+    if matches!(provider, ProviderKind::Claude)
+        && let Some(turn_identity) =
+            super::ManagedCompactTurnIdentity::capture_live(channel_id.get(), tmux_session_name)
+    {
+        match compact_window_source {
+            Some(window_source) => {
+                crate::services::claude_compact_trigger::maybe_inject_compact_with_source(
+                    turn_identity,
+                    provider,
+                    occupied,
+                    claude_trigger_window,
+                    compact_pct,
+                    ctx_cfg.compact_lower_bound_tokens,
+                    window_source,
+                );
+            }
+            None => crate::services::claude_compact_trigger::maybe_inject_compact(
+                turn_identity,
+                provider,
+                occupied,
+                None,
+                compact_pct,
+                ctx_cfg.compact_lower_bound_tokens,
+            ),
+        }
     }
-}
-
-/// Pure call-site gate for the #3262 Claude `/compact` trigger evaluation at a
-/// turn-completion boundary. Returns whether
-/// [`backfill_completed_panel_usage_and_maybe_inject_compact`] should evaluate the
-/// compact trigger for this completion.
-///
-/// The load-bearing property (issue #4): a zero-usage observation
-/// (`occupied == 0`) must NOT short-circuit — it is the canonical post-compact
-/// re-arm signal that has to reach `observe_and_decide`. The only thing that lets
-/// us skip the trigger entirely is a degrade-safe `0`/unset threshold (the feature
-/// is off), which `maybe_inject_compact` would itself no-op on anyway; gating here
-/// just avoids the redundant call. Provider gating (claude-only) and the actual
-/// re-arm/inject decision stay inside `maybe_inject_compact` /
-/// `observe_and_decide`.
-pub(crate) fn claude_compact_trigger_evaluates_at_completion(
-    occupied: u64,
-    threshold_pct: u64,
-) -> bool {
-    // usage==0 (occupied==0) MUST still evaluate (re-arm). Only a disabled feature
-    // (threshold 0) skips. `occupied` is referenced to make the zero-usage
-    // non-short-circuit explicit and testable.
-    let _ = occupied;
-    threshold_pct > 0
 }

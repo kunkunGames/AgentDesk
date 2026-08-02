@@ -5,13 +5,14 @@ use std::sync::OnceLock;
 /// larger `SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES` below.
 pub(in crate::services::discord) const SINGLE_MESSAGE_PANEL_FOOTER_BUDGET_BYTES: usize = 600;
 /// #3497: byte budget for the LIVE single-message footer panel BODY (Recent +
-/// Tasks/Subagents/Context; excludes the spinner/status header). Normal Recent
-/// output is compact after #3806, but the footer clamp still handles legacy or
+/// Tasks/Subagents/context usage; excludes the spinner/status header). The 1400-byte
+/// cap includes Discord's per-line subtext prefixes. Normal Recent output is compact
+/// after #3806, but the footer clamp still handles legacy or
 /// debug-shaped fenced Recent sections as whole blocks. The relay body auto-uses
 /// the remaining message space (`DISCORD_MSG_LIMIT − footer_len − margin`) and
 /// rolls over when longer, so commentary is preserved across messages rather
 /// than starving the terminal panel.
-pub(in crate::services::discord) const SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES: usize = 1200;
+pub(in crate::services::discord) const SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES: usize = 1400;
 pub(in crate::services::discord) const SINGLE_MESSAGE_PANEL_SPINNER_FRAMES: &[&str] =
     &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // Residual background agents can legitimately run for about an hour, but a
@@ -95,6 +96,12 @@ pub(in crate::services::discord) fn compose_footer_status_block(
     clamp_footer_status_block(status_block)
 }
 
+/// Render terminal relay context as Discord subtext. Every non-empty line is
+/// explicitly prefixed because Discord does not carry a multiline subtext span.
+pub(in crate::services::discord) fn completion_footer_subtext(block: &str) -> String {
+    crate::services::terminal_status_formatting::format_subtext_block(block)
+}
+
 pub(in crate::services::discord) fn compose_completion_footer_text(
     body: &str,
     completion_block: Option<&str>,
@@ -106,8 +113,9 @@ pub(in crate::services::discord) fn compose_completion_footer_text(
     else {
         return body.to_string();
     };
+    let block = completion_footer_subtext(block);
     if body.is_empty() {
-        return clamp_footer_status_block(block.to_string());
+        return clamp_footer_status_block(block);
     }
 
     let suffix = format!("\n\n{block}");
@@ -134,7 +142,7 @@ pub(in crate::services::discord) fn compose_completion_footer_text(
     // succeeds every reported terminal slot's mark was actually present.
     //
     // The footer block is fence-balanced by construction: `render_completion_footer`
-    // emits only the Context line plus Tasks/Subagents slot lines (no fenced Recent
+    // emits only the context-usage line plus Tasks/Subagents slot lines (no fenced Recent
     // block lives here), so it carries zero ``` runs (an even count). balanced base
     // + balanced footer = balanced combined.
     let base = repair_fence_parity(base);
@@ -184,7 +192,8 @@ pub(in crate::services::discord) fn completion_footer_base_body(
 fn compose_merged_footer_status_block(indicator: &str, panel_text: &str) -> Option<String> {
     let (header_line, panel_body) = panel_text.split_once('\n').unwrap_or((panel_text, ""));
     let header = merged_footer_header_line(indicator, header_line)?;
-    let panel_body = clamp_footer_panel_text(panel_body);
+    let panel_body = completion_footer_subtext(panel_body);
+    let panel_body = clamp_footer_panel_text(&panel_body);
     if panel_body.trim().is_empty() {
         Some(header)
     } else {
@@ -197,12 +206,15 @@ fn merged_footer_header_line(indicator: &str, header_line: &str) -> Option<Strin
     if header.is_empty() {
         None
     } else {
-        Some(format!("{indicator} {header}"))
+        Some(format!("-# {indicator} {header}"))
     }
 }
 
 fn strip_panel_header_status_marker(header_line: &str) -> Option<&str> {
-    let header_line = header_line.trim();
+    let header_line = header_line
+        .trim()
+        .strip_prefix("-# ")
+        .unwrap_or_else(|| header_line.trim());
     if header_line.is_empty() {
         return None;
     }
@@ -234,7 +246,7 @@ fn clamp_footer_panel_text(panel_text: &str) -> String {
         return panel_text.to_string();
     }
 
-    const TRUNCATION_MARKER: &str = "…";
+    const TRUNCATION_MARKER: &str = "-# …";
     if SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES <= TRUNCATION_MARKER.len() {
         let safe_end = super::formatting::floor_char_boundary(
             TRUNCATION_MARKER,
@@ -263,7 +275,7 @@ fn clamp_footer_panel_text(panel_text: &str) -> String {
         while kept > 0
             && lines
                 .get(kept)
-                .is_some_and(|line| line.trim_start().starts_with("```"))
+                .is_some_and(|line| strip_subtext_prefix(line.trim_start()).starts_with("```"))
         {
             kept -= 1;
         }
@@ -386,7 +398,7 @@ pub(in crate::services::discord) fn text_has_frozen_spinner_footer(text: &str) -
 /// codex round-1 High-b core: split `text` into `(body, footer)` only when the
 /// message ends with a frozen-spinner footer. The footer is the maximal trailing
 /// run of footer-shaped lines (streaming status line, `Tasks`/`Subagents` header,
-/// `└ ` slot line, or `Context   ` summary), the run must contain a braille
+/// `└ ` slot line, or icon-led context summary), the run must contain a braille
 /// spinner glyph, and its first line must open a footer (a status line or section
 /// header) so an unrelated `└ ` quote alone cannot trigger it. `body` is every
 /// line before the run, joined verbatim. Returns `None` when the tail is ordinary
@@ -445,7 +457,7 @@ fn tail_frozen_footer_split(text: &str) -> Option<(String, String)> {
     }
     let footer_lines = &lines[start..];
     // First footer line must open a footer (status line or section header); a
-    // bare `└ ` / `Context   ` tail without a header is not a panel footer, and a
+    // bare `└ ` / context-summary tail without a header is not a panel footer, and a
     // bare truncation marker without a footer above it is not one either. The
     // first non-blank line is therefore required to be a real footer opener, NOT a
     // marker — so a lone `…` tail can never anchor a (nonexistent) footer.
@@ -488,13 +500,17 @@ fn line_is_truncation_marker(line: &str) -> bool {
 
 /// True when `line` is one of the footer-section shapes the panel renders: a
 /// streaming/merged status line, a `Tasks`/`Subagents` header, a `└ ` slot line,
-/// or a `Context   ` summary. Used only by the tail-anchored reclaim split.
+/// or an icon-led context summary. Used only by the tail-anchored reclaim split.
 fn line_is_footer_shaped(line: &str) -> bool {
-    let trimmed = line.trim();
+    let trimmed = strip_subtext_prefix(line.trim());
     is_single_message_footer_status_line(trimmed)
         || completion_footer_section_header(trimmed)
         || completion_footer_context_line(trimmed)
         || trimmed.starts_with("└ ")
+}
+
+fn strip_subtext_prefix(line: &str) -> &str {
+    line.strip_prefix("-# ").unwrap_or(line)
 }
 
 fn line_ends_with_spinner_glyph(line: &str) -> bool {
@@ -652,15 +668,15 @@ fn is_spinner_prefix_char(ch: char) -> bool {
 fn text_has_single_message_footer_surface(text: &str) -> bool {
     text.lines()
         .filter_map(|line| {
-            let line = line.trim();
+            let line = strip_subtext_prefix(line.trim());
             (!line.is_empty()).then_some(line)
         })
         .any(|line| {
-            line.starts_with("Context   ")
+            completion_footer_context_line(line)
                 || line == "Tasks"
                 || line == "Subagents"
                 || line.starts_with("└ ")
-                // #3983: the footer's line-2 time line identifies the new panel surface.
+                // #4601: the footer's split last-update line identifies the panel surface.
                 || line.starts_with("마지막 업데이트 ")
                 // Legacy pre-#3983 merged header shape.
                 || (line.contains(" — ") && line.contains("(<t:"))
@@ -749,15 +765,20 @@ fn completion_footer_starts_after_body(footer: &str, body: &str) -> bool {
 }
 
 fn completion_footer_context_line(line: &str) -> bool {
+    let line = strip_subtext_prefix(line).trim_start();
     line.starts_with("Context   ")
+        || ((line.starts_with("📦 ") || line.starts_with("⚠️ ") || line.starts_with("⚠ "))
+            && line.contains("auto-compact"))
 }
 
 fn completion_footer_section_header(line: &str) -> bool {
-    line == "Tasks" || line == "Subagents"
+    matches!(strip_subtext_prefix(line), "Tasks" | "Subagents")
 }
 
 fn completion_footer_has_slot_shape(footer: &str) -> bool {
-    footer.lines().any(|line| line.starts_with("└ "))
+    footer
+        .lines()
+        .any(|line| strip_subtext_prefix(line).starts_with("└ "))
 }
 
 fn completion_footer_first_line_is_section_header(footer: &str) -> bool {
@@ -824,6 +845,7 @@ fn is_panel_activity_status_label(status: &str) -> bool {
         "진행 중" | "monitor 대기" | "완료" | "백그라운드 완료" | "scheduled wakeup"
     ) || status.starts_with("응답 지연")
         || parenthesized_status_label(status, "scheduled wakeup")
+        || parenthesized_status_label(status, "마지막 도구")
         || parenthesized_status_label(status, "도구 실행 중")
         || parenthesized_status_label(status, "subagent 실행 중")
         || parenthesized_status_label(status, "workflow 실행 중")
@@ -851,6 +873,7 @@ fn legacy_merged_status_prefix(status: &str) -> bool {
 fn strip_footer_braille_spinner_prefix(line: &str) -> Option<&str> {
     const BRAILLE_SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+    let line = strip_subtext_prefix(line.trim());
     let mut chars = line.chars();
     let first = chars.next()?;
     if !BRAILLE_SPINNER_FRAMES.contains(&first) || !chars.next().is_some_and(char::is_whitespace) {
@@ -983,10 +1006,22 @@ mod tests {
         let panel = "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nSubagents\n└ review inspect";
         let block = super::compose_footer_status_block("⠸", panel);
 
-        assert!(block.starts_with("⠸ 진행 중 — Claude (<t:1700000000:R>)"));
+        assert!(block.starts_with("-# ⠸ 진행 중 — Claude (<t:1700000000:R>)"));
         assert!(!footer_header(&block).contains('🟢'));
         assert!(!block.contains("계속 처리 중"));
-        assert!(block.contains("\n\nSubagents\n└ review inspect"));
+        assert!(block.contains("\n\n-# Subagents\n-# └ review inspect"));
+    }
+
+    #[test]
+    fn latest_tool_footer_header_is_recognized_after_spinner_merge() {
+        let panel = "🔧 마지막 도구 ([Read] · src/lib.rs)\n턴 시작 : 07-25 09:00:00";
+        let block = super::compose_footer_status_block("⠸", panel);
+
+        assert_eq!(
+            footer_header(&block),
+            "-# ⠸ 마지막 도구 ([Read] · src/lib.rs)"
+        );
+        assert!(super::is_merged_footer_status_line(footer_header(&block)));
     }
 
     #[test]
@@ -1006,7 +1041,7 @@ mod tests {
         let panel = "Header\n\nTools\n└ cargo test";
         let block = super::compose_footer_status_block("⠸", panel);
 
-        assert_eq!(block, "⠸ Header\n\nTools\n└ cargo test");
+        assert_eq!(block, "-# ⠸ Header\n\n-# Tools\n-# └ cargo test");
         assert!(!panel_portion(&block).ends_with("\n…"));
     }
 
@@ -1023,10 +1058,10 @@ mod tests {
             .split_once('\n')
             .expect("over-budget panel should keep merged header and panel body");
 
-        assert_eq!(header, "⠸ 진행 중 — Claude (<t:1700000000:R>)");
+        assert_eq!(header, "-# ⠸ 진행 중 — Claude (<t:1700000000:R>)");
         assert!(panel.len() <= super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES);
-        assert!(panel.ends_with("\n…") || panel == "…");
-        assert!(block.len() > super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES);
+        assert!(panel.ends_with("\n-# …") || panel == "-# …");
+        assert!(block.len() > panel.len());
     }
 
     #[test]
@@ -1128,7 +1163,7 @@ mod tests {
         );
     }
 
-    /// #3497: the raised 1200B panel budget renders a full ~1000B 🖥️ Recent
+    /// #3497: the raised live-panel budget renders a full ~1000B 🖥️ Recent
     /// terminal block that the prior 600B budget would have truncated/dropped.
     #[test]
     fn footer_panel_budget_shows_recent_block_over_legacy_600_3497() {
@@ -1138,15 +1173,15 @@ mod tests {
             "🟢 진행 중 — Claude (<t:1700000000:R>)\n🖥️ Recent (host)\n```text\n{recent_body}```"
         );
         let block = super::compose_footer_status_block("⠸", &panel);
-        // The full fenced block survives (not severed by the clamp) under 1200B,
+        // The full fenced block survives (not severed by the clamp) under the live-panel budget,
         // whereas a 600B budget would have dropped the whole Recent section (#3495).
         assert!(
             block.contains("🖥️ Recent"),
-            "Recent header dropped under 1200B budget: {block}"
+            "Recent header dropped under live-panel budget: {block}"
         );
         assert!(
             block.contains("L cargo build output line"),
-            "Recent terminal body truncated under 1200B budget: {block}"
+            "Recent terminal body truncated under live-panel budget: {block}"
         );
         assert_eq!(
             block.matches("```").count() % 2,
@@ -1165,7 +1200,7 @@ mod tests {
     #[test]
     fn compose_completion_footer_repair_scoped_to_body_keeps_footer_marks_3394() {
         let body = "Here is some output:\n\n```text\nchopped streamed body";
-        let footer = "Context   📦 154.6k / 1.0M tokens (15%)\n\nTasks\n└ Bash Finished job ✓";
+        let footer = "📦 154.6k / 1.0M (15%)\n\nTasks\n└ Bash Finished job ✓";
         let composed = super::compose_completion_footer_text(body, Some(footer));
 
         // The footer block (and its terminal ✓) survives composition.
@@ -1173,7 +1208,7 @@ mod tests {
             composed.contains("Bash Finished job ✓"),
             "footer ✓ was deleted by combined fence repair: {composed}"
         );
-        assert!(composed.contains("Context   📦"));
+        assert!(composed.contains("📦"));
         assert!(composed.contains("Tasks"));
         // The body's dangling opener is dropped (boundary-scoped repair).
         assert!(
@@ -1246,14 +1281,62 @@ mod tests {
     /// any repair touching the body's closed fence — parity stays even and both
     /// the fenced body and the footer survive intact.
     #[test]
+    fn completion_footer_subtext_prefixes_each_nonempty_line_4080() {
+        assert_eq!(
+            super::completion_footer_subtext(
+                "📦 10 / 100 (10%) · auto-compact 50%\n\nTasks\n└ Bash Done ✓\n⏱ 2m 34s"
+            ),
+            "-# 📦 10 / 100 (10%) · auto-compact 50%\n\n-# Tasks\n-# └ Bash Done ✓\n-# ⏱ 2m 34s"
+        );
+    }
+
+    #[test]
+    fn subtext_completion_footer_is_stripped_at_terminal_reconciliation_4080() {
+        let text = "Final answer\n\n-# 📦 10 / 100 (10%) · auto-compact 50%\n\n-# Tasks\n-# └ Bash Done ✓\n-# ⏱ 2m 34s";
+        assert_eq!(
+            super::strip_streaming_footer(text, &ProviderKind::Claude),
+            Some("Final answer".to_string())
+        );
+    }
+
+    #[test]
     fn compose_completion_footer_keeps_balanced_body_fence_intact_3394() {
         let body = "intro\n\n```text\nclosed body\n```\noutro";
-        let footer = "Context   📦 1.0k / 1.0M tokens (1%)\n\nTasks\n└ Bash Done ✓";
+        let footer = "📦 1.0k / 1.0M (1%)\n\nTasks\n└ Bash Done ✓";
         let composed = super::compose_completion_footer_text(body, Some(footer));
 
         assert!(composed.contains("```text\nclosed body\n```"));
         assert!(composed.contains("Bash Done ✓"));
         assert_eq!(composed.matches("```").count() % 2, 0);
+    }
+
+    #[test]
+    fn footer_panel_clamp_keeps_marker_inside_subtext_at_exact_boundary_4848() {
+        let first_line = format!(
+            "-# {}",
+            "x".repeat(
+                super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES - "-# ".len() - 1 - "-# …".len()
+            )
+        );
+        let panel = format!("🟢 진행 중 — Claude (<t:1700000000:R>)\n{first_line}\n-# overflow");
+        let block = super::compose_footer_status_block("⠸", &panel);
+        let panel = panel_portion(&block);
+
+        assert_eq!(
+            panel.len(),
+            super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES
+        );
+        assert!(
+            panel.ends_with("\n-# …"),
+            "marker escaped subtext: {panel:?}"
+        );
+        assert!(
+            panel
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| line.starts_with("-# ")),
+            "every non-empty clamped line must remain subtext: {panel:?}"
+        );
     }
 
     #[test]
@@ -1266,9 +1349,16 @@ mod tests {
         let block = super::compose_footer_status_block("⠸", &panel);
         let truncated_lines: Vec<&str> = panel_portion(&block).lines().collect();
 
+        let expected_second = format!("-# {second}");
+        let expected_third = format!("-# {third}");
         assert_eq!(
             truncated_lines,
-            vec!["", second.as_str(), third.as_str(), "…"]
+            vec![
+                "",
+                expected_second.as_str(),
+                expected_third.as_str(),
+                "-# …"
+            ]
         );
         assert!(!panel_portion(&block).contains(fourth.as_str()));
         assert!(panel_portion(&block).len() <= super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES);
@@ -1286,14 +1376,14 @@ mod tests {
 
         assert!(std::str::from_utf8(panel.as_bytes()).is_ok());
         assert!(panel.len() <= super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES);
-        assert_eq!(panel_lines.last().copied(), Some("…"));
+        assert_eq!(panel_lines.last().copied(), Some("-# …"));
         assert_eq!(panel_lines.len(), 2);
         assert!(!panel.contains("Subagents"));
     }
 
     #[test]
     fn footer_rollover_reservation_is_bound_by_panel_budget_s3() {
-        const STREAMING_PLACEHOLDER_MARGIN_BYTES: usize = 10;
+        const STREAMING_PLACEHOLDER_MARGIN_CHARS: usize = 10;
 
         let huge_panel = format!(
             "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nTools\n{}",
@@ -1301,21 +1391,24 @@ mod tests {
         );
         let status_block = super::compose_footer_status_block("⠸", &huge_panel);
         let merged_header = footer_header(&status_block);
-        let max_footer_len =
-            2 + merged_header.len() + 1 + super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES;
+        let max_footer_chars = 2
+            + merged_header.chars().count()
+            + 1
+            + super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES;
         let footer = format!("\n\n{status_block}");
+        let footer_chars = footer.chars().count();
         let expected_body_budget = DISCORD_MSG_LIMIT
-            .saturating_sub(footer.len() + STREAMING_PLACEHOLDER_MARGIN_BYTES)
+            .saturating_sub(footer_chars + STREAMING_PLACEHOLDER_MARGIN_CHARS)
             .max(1);
         let minimum_body_budget = DISCORD_MSG_LIMIT
-            .saturating_sub(max_footer_len + STREAMING_PLACEHOLDER_MARGIN_BYTES)
+            .saturating_sub(max_footer_chars + STREAMING_PLACEHOLDER_MARGIN_CHARS)
             .max(1);
         let current_portion = "x".repeat(expected_body_budget + 1);
         let plan =
             super::super::formatting::plan_streaming_rollover(&current_portion, &status_block)
                 .expect("body should roll over after reserving the bounded footer");
 
-        assert!(footer.len() <= max_footer_len);
+        assert!(footer_chars <= max_footer_chars);
         assert_eq!(plan.split_at, expected_body_budget);
         assert!(plan.split_at >= minimum_body_budget);
         assert!(plan.display_snapshot.ends_with(&footer));
@@ -1331,10 +1424,10 @@ mod tests {
                 .expect("body should roll over after reserving the footer");
         let seed = super::super::formatting::build_streaming_placeholder_text("", &status_block);
 
-        assert!(seed.starts_with("⠸ 진행 중 — Claude (<t:1700000000:R>)"));
-        assert!(seed.contains("Tools\n└ cargo test --lib single_message_panel"));
+        assert!(seed.starts_with("-# ⠸ 진행 중 — Claude (<t:1700000000:R>)"));
+        assert!(seed.contains("-# Tools\n-# └ cargo test --lib single_message_panel"));
         assert!(!plan.frozen_chunk.contains("진행 중 — Claude"));
-        assert!(!plan.frozen_chunk.contains("Tools\n└ cargo test"));
+        assert!(!plan.frozen_chunk.contains("-# Tools\n-# └ cargo test"));
         assert!(
             plan.display_snapshot
                 .ends_with(&format!("\n\n{status_block}"))
@@ -1401,13 +1494,51 @@ mod tests {
     }
 
     #[test]
+    fn subtext_footer_only_completion_surface_is_exposed_4080() {
+        let footer = super::completion_footer_subtext(
+            "📦 10 / 100 (10%) · auto-compact 50%\n\nTasks\n└ Bash Done ✓\n⏱ 2m 34s",
+        );
+
+        assert!(super::streaming_footer_only_surface_was_exposed(
+            &footer,
+            &ProviderKind::Claude
+        ));
+        assert_eq!(
+            super::strip_streaming_footer(&footer, &ProviderKind::Claude),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn footer_only_surface_recognizes_split_fixed_kst_time_lines() {
+        let panel = "🟢 진행 중\n턴 트리거: https://discord.com/channels/1/2/3\n턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)";
+        let rendered = super::compose_footer_status_block("⠸", panel);
+
+        assert!(super::streaming_footer_only_surface_was_exposed(
+            &rendered,
+            &ProviderKind::Claude
+        ));
+    }
+
+    #[test]
+    fn footer_only_surface_recognizes_legacy_combined_time_line() {
+        let panel = "🟢 진행 중\n\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>) / 턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)";
+        let rendered = super::compose_footer_status_block("⠸", panel);
+
+        assert!(super::streaming_footer_only_surface_was_exposed(
+            &rendered,
+            &ProviderKind::Claude
+        ));
+    }
+
+    #[test]
     fn terminal_footer_replacement_keeps_completion_context_block() {
         let panel = "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nSubagents\n└ review inspect";
         let rendered = format!(
             "Final answer\n\n{}",
             super::compose_footer_status_block("⠸", panel)
         );
-        let completion = "Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%";
+        let completion = "📦 154.6k / 1.0M (15%) · auto-compact 60%";
 
         let finalized = super::finalize_streaming_footer_with_completion(
             &rendered,
@@ -1416,14 +1547,25 @@ mod tests {
         )
         .expect("streaming footer should be replaced by completion block");
 
-        assert_eq!(finalized, format!("Final answer\n\n{completion}"));
+        assert_eq!(finalized, format!("Final answer\n\n-# {completion}"));
         assert!(!finalized.contains("진행 중 — Claude"));
         assert!(!finalized.contains("Subagents"));
     }
 
     #[test]
+    fn legacy_context_footer_is_stripped_during_format_transition_4846() {
+        let legacy = "Final answer\n\n-# Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%\n\n-# Tasks\n-# └ Bash Done ✓";
+
+        assert_eq!(
+            super::strip_streaming_footer(legacy, &ProviderKind::Claude),
+            Some("Final answer".to_string())
+        );
+    }
+
+    #[test]
     fn completion_footer_strip_supports_suppression_exposure_test() {
-        let completion = "Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job ✓";
+        let completion =
+            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job ✓";
 
         assert_eq!(
             super::strip_streaming_footer(completion, &ProviderKind::Claude),
@@ -1464,7 +1606,8 @@ mod tests {
 
     #[test]
     fn completion_footer_strip_removes_frozen_supersede_shape() {
-        let completion = "Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job …";
+        let completion =
+            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job …";
 
         assert_eq!(
             super::strip_streaming_footer(
@@ -1493,7 +1636,7 @@ mod tests {
             .block
             .expect("old footer block");
         assert!(old_block.contains('⠸'));
-        assert!(old_block.contains("Context   "));
+        assert!(old_block.contains("📦 "));
         assert!(old_block.contains("Subagents\n└ "));
 
         assert_eq!(
@@ -1522,8 +1665,8 @@ mod tests {
 
         assert_eq!(supersede.message_id, MessageId::new(3_089_121));
         assert!(supersede.remove_after_edit);
-        assert!(supersede.text.starts_with("Old answer\n\nContext   "));
-        assert!(supersede.text.contains("Subagents\n└ "));
+        assert!(supersede.text.starts_with("Old answer\n\n-# 📦 "));
+        assert!(supersede.text.contains("-# Subagents\n-# └ "));
         assert!(supersede.text.contains('…'));
         assert!(!supersede.text.contains('⠸'));
         assert!(!supersede.text.contains('⠼'));
@@ -1996,7 +2139,10 @@ mod tests {
 
         assert_eq!(edit.message_id, MessageId::new(3_089_123));
         assert!(edit.remove_after_edit);
-        assert!(edit.text.contains("Tasks\n└ Bash Run background codex …"));
+        assert!(
+            edit.text
+                .contains("-# Tasks\n-# └ Bash Run background codex …")
+        );
         assert!(!edit.text.contains('⠼'));
         assert!(!edit.text.contains('✓'));
         footer_registry::completion_footer_record_edit_result_for_edit(
@@ -2035,7 +2181,7 @@ mod tests {
         .expect("expired unfinished footer should render one freeze edit");
 
         assert!(edit.remove_after_edit);
-        assert!(edit.text.contains("Subagents\n└ "));
+        assert!(edit.text.contains("-# Subagents\n-# └"));
         assert!(edit.text.contains('…'));
         assert!(!edit.text.contains('⠸'));
         assert!(!edit.text.contains('✓'));
@@ -2075,7 +2221,10 @@ mod tests {
         .expect("expired unfinished background Bash footer should render one freeze edit");
 
         assert!(edit.remove_after_edit);
-        assert!(edit.text.contains("Tasks\n└ Bash Run background codex"));
+        assert!(
+            edit.text
+                .contains("-# Tasks\n-# └ Bash Run background codex")
+        );
         assert!(edit.text.contains('…'));
         assert!(!edit.text.contains('⠸'));
         assert!(!edit.text.contains('✓'));
@@ -2115,7 +2264,7 @@ mod tests {
         .expect("non-expired unfinished footer should render an animated edit");
 
         assert!(!edit.remove_after_edit);
-        assert!(edit.text.contains("Subagents\n└ "));
+        assert!(edit.text.contains("-# Subagents\n-# └"));
         assert!(edit.text.contains('⠸'));
 
         footer_registry::completion_footer_record_edit_result(
