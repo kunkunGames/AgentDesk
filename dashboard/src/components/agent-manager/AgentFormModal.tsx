@@ -379,9 +379,9 @@ export default function AgentFormModal({
             {isEdit && (
               <div>
                 <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
-                  <label className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  <span className="text-xs font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     prompt.md
-                  </label>
+                  </span>
                   <label className="flex items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                     <input
                       type="checkbox"
