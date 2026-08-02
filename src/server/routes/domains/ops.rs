@@ -8,7 +8,7 @@ use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
     e2e_control, health_api, idle_recap, maintenance, message_outbox, messages, monitoring,
     pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
-    routines, scheduled_messages, skills_api, termination_events,
+    scheduled_messages, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -240,34 +240,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/prompt-manifest/retention",
                 get(prompt_manifest_retention::get_retention_status),
-            )
-            .route(
-                "/routines",
-                get(routines::list_routines).post(routines::attach_routine),
-            )
-            .route("/routines/metrics", get(routines::routine_metrics))
-            .route(
-                "/routines/runs/search",
-                get(routines::search_routine_run_results),
-            )
-            .route(
-                "/routines/{id}",
-                get(routines::get_routine)
-                    .patch(routines::patch_routine)
-                    .delete(routines::delete_routine),
-            )
-            .route("/routines/{id}/runs", get(routines::list_routine_runs))
-            .route("/routines/{id}/pause", post(routines::pause_routine))
-            .route("/routines/{id}/resume", post(routines::resume_routine))
-            .route("/routines/{id}/detach", post(routines::detach_routine))
-            .route("/routines/{id}/run-now", post(routines::run_routine_now))
-            .route(
-                "/routines/{id}/session/reset",
-                post(routines::reset_routine_session),
-            )
-            .route(
-                "/routines/{id}/session/kill",
-                post(routines::kill_routine_session),
             )
             .route(
                 "/scheduled-messages",
