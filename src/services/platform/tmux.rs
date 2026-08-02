@@ -30,7 +30,7 @@ fn is_blank_session_name(session_name: &str) -> bool {
     session_name.trim().is_empty()
 }
 
-pub(crate) fn tmux_command() -> Command {
+fn tmux_command() -> Command {
     let mut cmd = Command::new("tmux");
     binary_resolver::apply_runtime_path(&mut cmd);
     cmd
