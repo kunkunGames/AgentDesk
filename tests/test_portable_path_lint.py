@@ -142,6 +142,85 @@ class PortablePathLintTests(unittest.TestCase):
         self.assertIn("/Users/me.dev", result.stderr)
         self.assertIn("/Users/example-prod", result.stderr)
 
+    def test_rust_env_home_gate_detects_macro_whitespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.rs"
+            path.write_text(
+                'const A: &str = env!( "HOME" );\nconst B: &str = env! /* gap */ ("HOME");\n',
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    tmp,
+                    "--rust-env-home-only",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bad.rs:1", result.stderr)
+        self.assertIn("bad.rs:2", result.stderr)
+
+    def test_rust_env_home_gate_ignores_comments_and_string_fixtures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "safe.rs"
+            path.write_text(
+                "\n".join(
+                    [
+                        '// env!("HOME")',
+                        '/* env!( "HOME" ) */',
+                        'const EXAMPLE: &str = r#"env!("HOME")"#;',
+                        'const OTHER: &str = env!("CARGO_PKG_VERSION");',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    tmp,
+                    "--rust-env-home-only",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_rust_env_home_gate_rejects_raw_home_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad_raw.rs"
+            path.write_text('const HOME: &str = env!(r#"HOME"#);\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    tmp,
+                    "--rust-env-home-only",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bad_raw.rs:1", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
