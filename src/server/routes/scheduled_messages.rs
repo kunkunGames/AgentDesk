@@ -181,7 +181,13 @@ pub async fn create_scheduled_message(
     Json(body): Json<CreateScheduledMessageBody>,
 ) -> ApiResponse {
     let pool = pool_or_unavailable(&state)?;
-    let new = validate_create(pool, &body).await?;
+    let new = validate_create(
+        pool,
+        &body,
+        state.config.cluster.enabled,
+        state.config.cluster.lease_ttl_secs,
+    )
+    .await?;
 
     // #4658: capture the immutable snapshot atomically with the definition
     // insert. Success guarantees the snapshot row exists (FK + CHECK); an empty
@@ -221,6 +227,8 @@ pub async fn create_scheduled_message(
 async fn validate_create(
     pool: &PgPool,
     body: &CreateScheduledMessageBody,
+    cluster_enabled: bool,
+    cluster_lease_ttl_secs: u64,
 ) -> Result<NewScheduledMessage, AppError> {
     let content = body.content.trim();
     if content.is_empty() {
@@ -380,6 +388,11 @@ async fn validate_create(
             "imageAttachment is only valid for push delivery",
         ));
     }
+    validate_image_attachment_content_length(content, image_attachment.is_some())?;
+    if image_attachment.is_some() {
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
+            .await?;
+    }
 
     Ok(NewScheduledMessage {
         content: content.to_string(),
@@ -413,6 +426,47 @@ async fn validate_create(
         context_snapshot_id: None,
         on_context_failure,
     })
+}
+
+fn validate_image_attachment_content_length(
+    content: &str,
+    has_image_attachment: bool,
+) -> Result<(), AppError> {
+    let hard_limit = crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS;
+    if has_image_attachment && content.chars().count() > hard_limit {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "content must not exceed {hard_limit} characters when imageAttachment is provided"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_image_attachment_rollout_ready(
+    pool: &PgPool,
+    cluster_enabled: bool,
+    lease_ttl_secs: u64,
+) -> Result<(), AppError> {
+    if !cluster_enabled {
+        return Ok(());
+    }
+    let ready = db::image_attachment_rollout_ready_pg(pool, lease_ttl_secs)
+        .await
+        .map_err(|error| {
+            app_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("verify scheduled image rollout readiness: {error}"),
+            )
+        })?;
+    if ready {
+        return Ok(());
+    }
+    Err(app_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "imageAttachment is temporarily unavailable while cluster workers upgrade",
+    ))
 }
 
 fn validate_agent_only_fields(
@@ -662,7 +716,14 @@ pub async fn patch_scheduled_message(
         ));
     }
 
-    let patch = build_patch(pool, body, &existing).await?;
+    let patch = build_patch(
+        pool,
+        body,
+        &existing,
+        state.config.cluster.enabled,
+        state.config.cluster.lease_ttl_secs,
+    )
+    .await?;
 
     match db::update_scheduled_message_pg(pool, &id, &patch).await {
         Ok(Some(row)) => Ok((
@@ -763,6 +824,8 @@ async fn build_patch(
     pool: &PgPool,
     body: &serde_json::Map<String, JsonValue>,
     existing: &ScheduledMessageRow,
+    cluster_enabled: bool,
+    cluster_lease_ttl_secs: u64,
 ) -> Result<ScheduledMessagePatch, AppError> {
     let bad_request = |message: String| app_error(StatusCode::BAD_REQUEST, message);
     let mut patch = ScheduledMessagePatch::default();
@@ -856,6 +919,16 @@ async fn build_patch(
         return Err(bad_request(
             "imageAttachment is only valid for push delivery".to_string(),
         ));
+    }
+    let effective_content = patch.content.as_deref().unwrap_or(&existing.content);
+    let effective_has_image_attachment = match &patch.image_attachment {
+        Some(image_attachment) => image_attachment.is_some(),
+        None => existing.image_data.is_some(),
+    };
+    validate_image_attachment_content_length(effective_content, effective_has_image_attachment)?;
+    if patch.image_attachment.as_ref().is_some_and(Option::is_some) {
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
+            .await?;
     }
 
     let mut effective_scheduled_at = patch.scheduled_at.unwrap_or(existing.scheduled_at);

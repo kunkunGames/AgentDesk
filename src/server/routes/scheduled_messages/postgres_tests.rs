@@ -38,6 +38,23 @@ fn scheduled_image_attachment_rejects_paths_and_non_image_mime_types() {
 }
 
 #[test]
+fn scheduled_image_attachment_rejects_oversized_discord_content() {
+    let content = "x".repeat(crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS + 1);
+    let error = validate_image_attachment_content_length(&content, true)
+        .expect_err("an image-bearing Discord message must fit one message");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error
+            .to_json_value()
+            .get("error")
+            .and_then(JsonValue::as_str),
+        Some("content must not exceed 2000 characters when imageAttachment is provided")
+    );
+    validate_image_attachment_content_length(&content, false)
+        .expect("text-only delivery retains existing long-content handling");
+}
+
+#[test]
 fn scheduled_message_bot_defaults_to_non_triggering_notify() {
     assert_eq!(scheduled_message_bot_or_default(None), "notify");
     assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
@@ -120,7 +137,7 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
         on_context_failure: None,
     };
 
-    let new = validate_create(&pool, &body)
+    let new = validate_create(&pool, &body, false, 1)
         .await
         .expect("validate explicit bot create");
     assert_eq!(new.bot, "notify");
@@ -162,7 +179,7 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
         on_context_failure: None,
     };
 
-    let err = validate_create(&pool, &body)
+    let err = validate_create(&pool, &body, false, 1)
         .await
         .expect_err("push agentId must fail as a request error before INSERT");
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -220,6 +237,8 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         &pool,
         metadata_body.as_object().expect("metadata patch object"),
         &existing,
+        false,
+        1,
     )
     .await
     .expect("metadata-only PATCH must not treat stored default fail as explicit input");
@@ -233,6 +252,8 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         &pool,
         clear_body.as_object().expect("agent clear patch object"),
         &existing,
+        false,
+        1,
     )
     .await
     .expect("explicit null clears leave no effective agent-only value");
@@ -257,6 +278,8 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             &pool,
             body.as_object().expect("invalid push patch object"),
             &existing,
+            false,
+            1,
         )
         .await
         .expect_err("push PATCH must reject effective agent-only values");

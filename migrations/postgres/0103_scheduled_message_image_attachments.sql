@@ -25,7 +25,7 @@ BEGIN
                 (image_filename IS NULL AND image_content_type IS NULL AND image_data IS NULL)
                 OR
                 (image_filename IS NOT NULL AND image_content_type IS NOT NULL AND image_data IS NOT NULL)
-            );
+            ) NOT VALID;
     END IF;
 
     IF NOT EXISTS (
@@ -33,7 +33,7 @@ BEGIN
     ) THEN
         ALTER TABLE scheduled_messages
             ADD CONSTRAINT chk_smsg_image_attachment_push_only
-            CHECK (image_data IS NULL OR delivery_kind = 'push');
+            CHECK (image_data IS NULL OR delivery_kind = 'push') NOT VALID;
     END IF;
 
     IF NOT EXISTS (
@@ -41,7 +41,7 @@ BEGIN
     ) THEN
         ALTER TABLE scheduled_messages
             ADD CONSTRAINT chk_smsg_image_attachment_size
-            CHECK (image_data IS NULL OR octet_length(image_data) <= 8388608);
+            CHECK (image_data IS NULL OR octet_length(image_data) <= 8388608) NOT VALID;
     END IF;
 
     IF NOT EXISTS (
@@ -57,7 +57,7 @@ BEGIN
                 (attachment_filename IS NOT NULL
                     AND attachment_content_type IS NOT NULL
                     AND attachment_data IS NOT NULL)
-            );
+            ) NOT VALID;
     END IF;
 
     IF NOT EXISTS (
@@ -65,6 +65,6 @@ BEGIN
     ) THEN
         ALTER TABLE message_outbox
             ADD CONSTRAINT chk_message_outbox_attachment_size
-            CHECK (attachment_data IS NULL OR octet_length(attachment_data) <= 8388608);
+            CHECK (attachment_data IS NULL OR octet_length(attachment_data) <= 8388608) NOT VALID;
     END IF;
 END $$;

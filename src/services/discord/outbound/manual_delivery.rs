@@ -414,6 +414,13 @@ async fn deliver_manual_notification_with_attachment<C: ManualOutboundClient>(
     };
 
     let content_len = content.chars().count();
+    if content_len > DISCORD_HARD_LIMIT_CHARS && attachment.is_some() {
+        return ManualDeliveryOutcome::Failed {
+            detail: format!(
+                "Discord messages with an image attachment must not exceed {DISCORD_HARD_LIMIT_CHARS} characters"
+            ),
+        };
+    }
     if content_len > DISCORD_HARD_LIMIT_CHARS {
         // Compatibility shim: v3 text delivery does not yet own attachment
         // upload or manual chunk-posting for over-2k `/api/discord/send` payloads.
@@ -845,7 +852,8 @@ mod manual_v3_delivery_tests {
             content: &str,
             attachment: &ManualOutboundAttachment,
         ) -> Result<String, DispatchMessagePostError> {
-            self.binary_attachments.lock().unwrap().push((
+            let mut binary_attachments = self.binary_attachments.lock().unwrap(); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+            binary_attachments.push((
                 target_channel.to_string(),
                 content.to_string(),
                 attachment.filename.clone(),
@@ -900,7 +908,37 @@ mod manual_v3_delivery_tests {
                 ..
             }
         ));
-        assert_eq!(client.binary_attachments.lock().unwrap().len(), 1);
+        assert_eq!(client.binary_attachments.lock().unwrap().len(), 1); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+    }
+
+    #[tokio::test]
+    async fn manual_notification_rejects_an_oversized_body_with_an_image_attachment() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let attachment = ManualOutboundAttachment {
+            filename: "thumbnail.png".to_string(),
+            content_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nthumbnail".to_vec(),
+        };
+        let outcome = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            &"x".repeat(DISCORD_HARD_LIMIT_CHARS + 1),
+            "notify",
+            None,
+            None,
+            Some(&attachment),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ManualDeliveryOutcome::Failed { ref detail }
+                if detail.contains("must not exceed")
+        ));
+        assert!(client.binary_attachments.lock().unwrap().is_empty()); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+        assert!(client.posts.lock().unwrap().is_empty()); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
     }
 
     #[tokio::test]

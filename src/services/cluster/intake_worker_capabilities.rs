@@ -10,6 +10,7 @@ static ACTIVE_INTAKE_WORKER_PROVIDERS: LazyLock<RwLock<BTreeSet<String>>> =
     LazyLock::new(|| RwLock::new(BTreeSet::new()));
 
 const PRESERVE_ON_CANCEL_V1: &str = "preserve_on_cancel_v1";
+pub(crate) const SCHEDULED_MESSAGE_IMAGE_ATTACHMENTS_V1: &str = "image_attachments_v1";
 
 /// Providers whose `run_bot` on this node is actively trying to take the Discord
 /// gateway lease (#4351). Advertised so a non-preferred holder can tell "the
@@ -107,6 +108,10 @@ pub(super) fn capabilities_with_runtime_state(base: &Value) -> Value {
     capabilities.insert(
         "discord_gateway".to_string(),
         json!({ "waiting_providers": gateway_waiters }),
+    );
+    capabilities.insert(
+        "scheduled_messages".to_string(),
+        json!({ SCHEDULED_MESSAGE_IMAGE_ATTACHMENTS_V1: true }),
     );
     Value::Object(capabilities)
 }
@@ -211,6 +216,15 @@ mod tests {
                 .pointer("/intake_worker/features/0")
                 .and_then(Value::as_str),
             Some(PRESERVE_ON_CANCEL_V1)
+        );
+    }
+
+    #[test]
+    fn runtime_capability_advertises_scheduled_image_attachment_protocol() {
+        let capabilities = capabilities_with_runtime_state(&json!({}));
+        assert_eq!(
+            capabilities.pointer("/scheduled_messages/image_attachments_v1"),
+            Some(&Value::Bool(true))
         );
     }
 }
