@@ -102,6 +102,7 @@ export default function DepartmentFormModal({
   useReturnFocus(true);
   const colorButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const iconBtnId = useId();
+  const themeColorLabelId = useId();
 
   // sort_order 기반 다음 순번 계산
   const nextSortOrder = (() => {
@@ -325,8 +326,8 @@ export default function DepartmentFormModal({
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
                     aria-label={
                       form.icon
-                        ? t({ ko: `선택된 아이콘: ${form.icon}, 아이콘 변경`, en: `Selected Icon: ${form.icon}, change Icon` })
-                        : t({ ko: "아이콘 선택기 열기", en: "Open Icon picker" })
+                        ? t({ ko: `선택된 아이콘: ${form.icon}, 아이콘 변경`, en: `Selected icon: ${form.icon}, change icon` })
+                        : t({ ko: "아이콘 선택기 열기", en: "Open icon picker" })
                     }
                     dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
                   />
@@ -357,10 +358,10 @@ export default function DepartmentFormModal({
                 </div>
               </div>
 
-              <div role="radiogroup" aria-labelledby="dept-theme-color-label">
-                <label id="dept-theme-color-label" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+              <div role="radiogroup" aria-labelledby={themeColorLabelId}>
+                <div id={themeColorLabelId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("테마 색상", "Theme Color")}
-                </label>
+                </div>
                 <div className="flex gap-2 flex-wrap">
                   {DEPT_COLORS.map((c, index) => (
                     <button

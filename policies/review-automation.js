@@ -1432,14 +1432,11 @@ function processVerdict(cardId, verdict, result, options) {
     // Review passed — check for next pipeline stage, otherwise terminal (#110)
     // Look for the next stage AFTER current pipeline_stage_id (stage_order based),
     // OR the first review_pass stage if card has no current pipeline stage.
-    var cardInfo = agentdesk.db.query(
-      "SELECT pipeline_stage_id, repo_id FROM kanban_cards WHERE id = ?",
-      [cardId]
-    );
+    var cardInfo = agentdesk.cards.get(cardId);
     var nextStage = null;
-    if (cardInfo.length > 0 && cardInfo[0].repo_id) {
-      var repoId = cardInfo[0].repo_id;
-      var currentStageId = cardInfo[0].pipeline_stage_id;
+    if (cardInfo && cardInfo.repo_id) {
+      var repoId = cardInfo.repo_id;
+      var currentStageId = cardInfo.pipeline_stage_id;
 
       if (currentStageId) {
         // Has current stage — find next stage by stage_order
@@ -1583,7 +1580,7 @@ function processVerdict(cardId, verdict, result, options) {
       }
     } else {
       // No more stages — clear pipeline_stage_id and mark terminal.
-      if (cardInfo.length > 0 && cardInfo[0].pipeline_stage_id) {
+      if (cardInfo && cardInfo.pipeline_stage_id) {
         agentdesk.db.execute(
           "UPDATE kanban_cards SET pipeline_stage_id = NULL, updated_at = datetime('now') WHERE id = ?",
           [cardId]

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 DASHBOARD_DIR="$REPO/dashboard"
-REQUIRED_NODE_VERSION=22.15.0
+REQUIRED_NODE_VERSION=22.22.0
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: node is required to verify the dashboard" >&2
@@ -59,6 +59,10 @@ if [ "$audit_status" -ne 0 ]; then
     echo "       DASHBOARD_AUDIT_WAIVER='<reason>' ./scripts/verify-dashboard.sh" >&2
     exit "$audit_status"
   fi
+elif [ -n "${DASHBOARD_AUDIT_WAIVER:-}" ]; then
+  echo "Error: DASHBOARD_AUDIT_WAIVER is set but npm audit found no high/critical advisories." >&2
+  echo "       The waiver is stale and must be removed to restore the strict security gate." >&2
+  exit 1
 fi
 
 echo "==> Dashboard build"

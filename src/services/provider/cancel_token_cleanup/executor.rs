@@ -340,7 +340,10 @@ pub(crate) fn with_executor_dispatch_seam(test: impl FnOnce()) {
     use std::sync::{Mutex, OnceLock};
 
     static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _lock = TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _lock = TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     PID_KILL_DISPATCHES.store(0, Ordering::Relaxed);
     TMUX_KILL_DISPATCHES.store(0, Ordering::Relaxed);
     PID_KILL_SUCCEEDS.store(true, Ordering::Relaxed);
@@ -368,7 +371,10 @@ mod tests {
     }
 
     fn bind(token: &CancelToken, name: &str) {
-        *token.tmux_binding.lock().unwrap() = authority::publish(
+        *token
+            .tmux_binding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = authority::publish(
             ProviderKind::Claude,
             name,
             token.claude_interrupt_generation,
@@ -486,7 +492,10 @@ mod tests {
     fn unregistered_binding_dispatches_pid_and_tmux_cleanup() {
         with_seam(|| {
             let token = CancelToken::new();
-            *token.tmux_binding.lock().unwrap() = Some(TmuxBinding::NameOnly {
+            *token
+                .tmux_binding
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(TmuxBinding::NameOnly {
                 name: "AgentDesk-codex-executor-unregistered".to_string(),
             });
             token.store_child_pid(std::process::id());
@@ -517,8 +526,20 @@ mod tests {
             assert_eq!(outcome.authorization, KillAuthorizationState::Stale);
             assert_eq!(PID_KILL_DISPATCHES.load(Ordering::Relaxed), 0);
             assert_eq!(TMUX_KILL_DISPATCHES.load(Ordering::Relaxed), 0);
-            assert!(token.tmux_binding.lock().unwrap().is_some());
-            assert!(token.child_pid.lock().unwrap().is_some());
+            assert!(
+                token
+                    .tmux_binding
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_some()
+            );
+            assert!(
+                token
+                    .child_pid
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_some()
+            );
         });
     }
 }

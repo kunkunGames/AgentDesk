@@ -28,6 +28,10 @@ test-active-usage-4631:
 # Stage 1 keeps the existing CI-safe subset. The broad non-PG sweep currently
 # fails legacy/full integration route tests; see docs/ci/rust-quality-gates.md.
 test-non-pg:
+    # cards_ops JSON decoding must remain fail-soft for persisted malformed payloads.
+    cargo test --lib engine::ops::cards_ops::parse_json_value_tests -- --skip _pg --skip pg_ --skip postgres
+    # Typed KV bulk deletion must keep its array-bound payload contract covered.
+    cargo test --lib engine::ops::kv_ops::tests -- --skip _pg --skip pg_ --skip postgres
     # #4878: keep the generated queue docs on the canonical thread-group contract.
     cargo test --lib server::routes::docs::inventory::endpoints::part_0 -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::task_completion_v1::tests -- --skip _pg --skip pg_ --skip postgres
@@ -44,12 +48,18 @@ test-non-pg:
     cargo test --lib server::claude_oauth_usage_tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib tui_task_card::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib server::routes::message_outbox::tests -- --skip _pg --skip pg_ --skip postgres
+    # Keep the non-PostgreSQL unit tests covered after outbox_claiming's PG split.
+    cargo test --lib services::dispatches::outbox_claiming::tests -- --skip _pg --skip pg_ --skip postgres
+    # Keep the non-PostgreSQL unit tests covered after delivery guard's PG split.
+    cargo test --lib services::dispatches::discord_delivery::guard::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib discord_thread_create -- --test-threads=1
     # #4599: queue reaction fallback and persisted-v1 promotion contracts.
     cargo test --lib reaction_control::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib intake_queue_transaction::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib pending_reaction_failure_adapter_tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib intake_dispatch_invariant_queued_entrypoints_promote_markers -- --skip _pg --skip pg_ --skip postgres
+    # #5040: telemetry-only owner planning cannot fence an unopted live-local channel.
+    cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres
     # #4788: raw attachment preparation must remain behind local admission.
     cargo test --lib attachment -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib mailbox_reaction_tests -- --skip _pg --skip pg_ --skip postgres
@@ -90,6 +100,8 @@ test-non-pg:
     cargo test --lib canonical_identity::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib session_canonical_identity::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::observability::metrics::tests -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib services::observability::turn_lifecycle::tests -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib services::observability::recovery_audit::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib cli::args::tests::legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract
     cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
@@ -111,7 +123,9 @@ test-non-pg:
     # Filter the real rustdoc harness to this public capability contract.
     cargo test --doc ClaudeBinary
 
+# PostgreSQL tests belong in the library harness. Integration and doctest targets
+# are intentionally excluded; add a separate PG lane command if either gains PG coverage.
 test-postgres:
-    cargo test -- _pg pg_ postgres --nocapture --test-threads=1
+    cargo test --lib -- _pg pg_ postgres --nocapture --test-threads=1
 
 check: fmt-check lint cargo-check test

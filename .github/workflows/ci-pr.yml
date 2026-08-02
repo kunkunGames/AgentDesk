@@ -131,10 +131,14 @@ jobs:
               - 'src/services/session_forwarding.rs'
               - 'src/services/session_forwarding/**'
               - 'src/server/routes/queue_api.rs'
+              - 'src/server/resource_locks.rs'
               # #4460: recovery owns production-shaped PostgreSQL/outbox
               # tests; changes to the owner or its sidecars must run them.
               - 'src/services/discord/health/recovery.rs'
               - 'src/services/discord/health/recovery/**'
+              - 'src/services/discord/watchers/lifecycle/restore_tests.rs'
+              - 'src/services/maintenance/jobs/worktree_orphan_sweep.rs'
+              - 'src/services/pipeline_override.rs'
               # #5025: terminal-delivery evidence routing and every local
               # producer/epilogue sibling run in `test_fast`, whose registered
               # required mirror is `Fast targeted tests (ubuntu-latest)`.
@@ -564,6 +568,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
       # Preserve the full serial PostgreSQL suite while reducing cold-link
       # time and memory exposure on hosted runners. Assertions and panic text
       # remain available; only native debug symbols are omitted.
@@ -598,6 +603,29 @@ jobs:
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Observe curated lane selections
+        timeout-minutes: 20
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -o pipefail
+          python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee "$RUNNER_TEMP/selection-evidence-test-fast.log"
+
+      - name: Require observer summary
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          python3 scripts/check_test_target_integrity.py --verify-selection-evidence "$RUNNER_TEMP/selection-evidence-test-fast.log"
+
       - name: Footer-only marker regressions
         timeout-minutes: 10
         shell: bash
@@ -617,6 +645,18 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres
+
+      # #5040: `intake_dispatch::tests` predates the lane-coverage ratchet and is
+      # baselined debt. Select the telemetry-only admission regressions explicitly
+      # in this branch-protected lane so a zero-test filter cannot pass unnoticed.
+      - name: Telemetry-only intake authority regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres
 
       # #5025: this job is mirrored by the branch-protected
       # `Fast targeted tests (ubuntu-latest)` context above. Keep the router test
@@ -666,6 +706,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -689,10 +730,36 @@ jobs:
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Observe curated lane selections
+        timeout-minutes: 20
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -o pipefail
+          python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee "$RUNNER_TEMP/selection-evidence-high-risk.log"
+
+      - name: Require observer summary
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          python3 scripts/check_test_target_integrity.py --verify-selection-evidence "$RUNNER_TEMP/selection-evidence-high-risk.log"
+
       - name: High-risk recovery lane
         run: |
           cargo test --lib high_risk_recovery:: -- --test-threads=1
           cargo test --lib services::discord::recovery_engine::state_extractors::tests -- --test-threads=1
+          cargo test --lib services::discord::relay_health::tests -- --test-threads=1
+          cargo test --lib services::discord::health::session_enrichment::tests -- --test-threads=1
+          cargo test --lib services::discord::health::relay_dead_reattach::tests -- --test-threads=1
           cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
           cargo test --lib services::discord::terminal_ui_obligation::tests -- --test-threads=1
 
@@ -710,7 +777,7 @@ jobs:
         run: sccache --show-stats || true
 
   high_risk_recovery_required_context:
-    name: High-risk recovery required context (ubuntu-latest)
+    name: High-risk recovery path-filter mirror (ubuntu-latest)
     needs:
       - changes
       - high-risk-recovery
@@ -719,7 +786,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Mirror high-risk recovery result for branch protection
+      - name: Mirror high-risk recovery result across path-filter skips
         env:
           CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
           FILTER_NAME: high_risk_recovery
@@ -829,20 +896,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `scripts/check_pg_test_lane_membership.py` stays dependency-free on
+      # purpose, but `tests/test_check_pg_test_lane_membership.py` uses PyYAML
+      # as an independent oracle to prove the hand-written `tests/fixtures/
+      # pg_lane/jobs_*.yml` inputs really are the YAML shapes the dependency-free
+      # parser claims to handle. setup-python gives a clean interpreter, so the
+      # oracle must be installed explicitly or the suite errors on import.
+      - name: Install script-test Python deps
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
       - name: Large file guard
         shell: bash
         run: |
           set -euo pipefail
           limit=$((10 * 1024 * 1024))
           failed=0
-          while IFS= read -r path; do
+          while IFS= read -r -d '' path; do
             [ -f "$path" ] || continue
             size=$(git cat-file -s "HEAD:$path")
             if [ "$size" -gt "$limit" ]; then
               printf 'ERROR: tracked file exceeds 10 MiB: %s (%s bytes)\n' "$path" "$size"
               failed=1
             fi
-          done < <(git ls-files)
+          done < <(git ls-files -z)
           exit "$failed"
 
       - name: Install shellcheck

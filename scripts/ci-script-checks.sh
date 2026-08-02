@@ -114,8 +114,14 @@ echo "=== CI timeout wrapper tests (#4413) ==="
 echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
+echo "=== TUI relay assertion unit tests (#5065) ==="
+"$PYTHON" -m unittest scripts.e2e.tui_relay.test_assertions
+
 echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
 "$PYTHON" -m unittest tests.test_fast_check_ci_wiring
+
+echo "=== Dashboard verification security-gate contracts ==="
+"$PYTHON" -m unittest tests.test_verify_dashboard
 
 echo "=== Rust test-lane coverage ratchet (#4846/#4910) ==="
 if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
@@ -191,13 +197,8 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
-if grep -rn 'env!("HOME")' --include='*.rs' \
-  --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
-else
-  echo "OK: No env!(\"HOME\") found"
-fi
+echo "=== Checking hardcoded home paths (hard gate; see #100) ==="
+"$PYTHON" scripts/check-portable-paths.py --rust-env-home-only
 
 echo "=== Path integrity check ==="
 FAIL=0

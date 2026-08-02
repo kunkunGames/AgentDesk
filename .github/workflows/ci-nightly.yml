@@ -181,6 +181,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -232,6 +233,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -262,7 +264,7 @@ jobs:
 
       - name: Rust multinode invariants
         timeout-minutes: 15
-        run: "cargo test --bin agentdesk multinode_regression:: -- --nocapture --test-threads=1"
+        run: "cargo test --lib multinode_regression:: -- --nocapture --test-threads=1"
 
       - name: Merge gate policy invariants
         run: node --test policies/__tests__/merge-automation.test.js
@@ -287,6 +289,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
