@@ -1321,6 +1321,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
