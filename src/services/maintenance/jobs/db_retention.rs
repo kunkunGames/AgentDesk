@@ -124,7 +124,7 @@ pub async fn db_retention_job(pool: &PgPool, dry_run: bool) -> Result<RetentionR
     retain_skill_usage(pool, dry_run, &mut report).await?;
     // 8. turns (archive-then-delete on finished_at). #3865
     retain_turns(pool, dry_run, &mut report).await?;
-    // 9. scheduled_messages image attachments (terminal one-shots only).
+    // 9. scheduled_messages image attachments (all terminal definitions).
     retain_scheduled_message_image_attachments(pool, dry_run, &mut report).await?;
     // 10. scheduled_message_context_snapshots (all refs terminal + aged). #4658/#4723
     retain_context_snapshots(pool, dry_run, &mut report).await?;
