@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use crate::queue_contract::THREAD_GROUP_SERIAL_LANE_CONTRACT;
+
 #[allow(unused_imports)]
 use super::super::{EndpointDoc, ParamDoc, body_param, ep, header_param, path_param, query_param};
 
@@ -672,7 +674,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         .with_params([
             ("id", path_param("Auto-queue run id")),
             ("issue_number", body_param("integer", true, "GitHub issue number")),
-            ("thread_group", body_param("integer", false, "Optional thread-group override")),
+            (
+                "thread_group",
+                body_param("integer", false, THREAD_GROUP_SERIAL_LANE_CONTRACT),
+            ),
             ("batch_phase", body_param("integer", false, "Optional batch phase override")),
         ]),
         ep(
@@ -696,6 +701,16 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         .with_params([(
             "session_key",
             path_param("Dispatched session key to recap"),
+        )]),
+        ep(
+            "POST",
+            "/api/sessions/{session_key}/reconcile-stale-turn",
+            "sessions",
+            "Reset a stale busy session to idle only when it has no active dispatch and an expired heartbeat.",
+        )
+        .with_params([(
+            "session_key",
+            path_param("Dispatched session key to reconcile"),
         )]),
         ep(
             "GET",
@@ -736,4 +751,23 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "Versioned operational health payload with bottleneck annotations.",
         )
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_run_entry_docs_use_canonical_thread_group_contract() {
+        let endpoint = endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.path == "/api/queue/runs/{id}/entries")
+            .expect("add run entry endpoint");
+        let param = endpoint
+            .params
+            .get("thread_group")
+            .expect("thread_group parameter");
+
+        assert_eq!(param.description, THREAD_GROUP_SERIAL_LANE_CONTRACT);
+    }
 }

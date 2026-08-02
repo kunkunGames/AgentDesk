@@ -74,6 +74,7 @@ fn query_ids(value: &str) -> Result<Vec<i64>, &'static str> {
     exact_ids(parsed)
 }
 
+#[allow(clippy::result_large_err)]
 fn control_allowed(state: &AppState, peer: SocketAddr) -> Result<(), Response> {
     if local_or_configured_control_endpoint_allowed(&state.config, Some(peer)) {
         Ok(())
@@ -122,8 +123,14 @@ fn normalized_monitor_alert(
             "auto_queue.monitor_anomaly",
             crate::services::message_outbox::ACTIONABLE_OPS_ALERT_BOT,
         ),
-        ("alert", "REVIEW_LONG") => ("auto_queue.monitor_review_long", "notify"),
-        ("recovery", _) => ("auto_queue.monitor_recovery", "notify"),
+        ("alert", "REVIEW_LONG") => (
+            "auto_queue.monitor_review_long",
+            crate::services::discord::bot_role::UtilityBotRole::Notify.alias(),
+        ),
+        ("recovery", _) => (
+            "auto_queue.monitor_recovery",
+            crate::services::discord::bot_role::UtilityBotRole::Notify.alias(),
+        ),
         _ => return Err("action must be alert or recovery"),
     };
     Ok((
@@ -170,6 +177,7 @@ pub async fn enqueue_monitor_alert(
             source: "auto-queue-monitor",
             reason_code: Some(reason_code),
             session_key: Some(&session_key),
+            attachment: None,
         },
         MONITOR_ALERT_DEDUPE_TTL_SECS,
     )

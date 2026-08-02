@@ -12,12 +12,9 @@ use crate::services::provider::ProviderKind;
 
 /// Expand `~` or `~/` prefix to the user's home directory.
 fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn load_role_map_json() -> Option<serde_json::Value> {
@@ -481,10 +478,6 @@ pub(super) fn resolve_workspace(
         .map(|s| expand_tilde(s))
 }
 
-// #3034: consumed by `settings::content::load_shared_prompt_for_profile`, the
-// profile-aware shared-prompt loader (unwired in prod but a real feature
-// surface). Keep the role_map resolver live.
-#[allow(dead_code)]
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     let json = load_role_map_json()?;
     json.get("sharedPromptFile")

@@ -75,7 +75,7 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                     continue;
                 }
                 let Some(channel_id) =
-                    owner_channel_for_tmux_session(&shared, &ProviderKind::Codex, &tmux_session_name)
+                    owner_channel_for_tmux_session(&shared, &ProviderKind::Codex, &tmux_session_name, RelayEmissionKind::Poll)
                 else {
                     // #3018/#3306/#3656: registry miss ⇒ drop; Codex repair-ineligible.
                     continue;
@@ -129,6 +129,7 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                     &rollout_path,
                                     observed_at,
                                 );
+                                let expected = inflight::InflightTurnIdentity::from_state(&inflight);
                                 let mut repaired = inflight;
                                 repaired.output_path =
                                     rollout_path.to_str().map(ToString::to_string);
@@ -137,13 +138,18 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                 repaired.session_key = lease.session_key.clone();
                                 repaired.runtime_kind = lease.runtime_kind;
                                 repaired.set_relay_owner_kind(RelayOwnerKind::None);
-                                if let Err(error) = inflight::save_inflight_state(&repaired) {
+                                let outcome = inflight::save_inflight_state_if_identity_matches_allow_output_restamp(
+                                    &repaired,
+                                    &expected,
+                                    "codex_idle_rollout_repair",
+                                );
+                                if !matches!(outcome, inflight::GuardedSaveOutcome::Saved) {
                                     tracing::warn!(
                                         tmux_session_name = %tmux_session_name,
                                         channel_id = channel_id.get(),
                                         rollout_path = %rollout_path.display(),
-                                        error = %error,
-                                        "failed to repair Codex ownerless external-input inflight with live rollout path"
+                                        ?outcome,
+                                        "skipped Codex ownerless external-input inflight repair"
                                     );
                                     continue;
                                 }
@@ -418,7 +424,7 @@ async fn run_codex_idle_response_tail(
         .name("codex_idle_response_tail_reader".to_string())
         .spawn(move || {
             let read_result =
-                crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset(
+                crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset_for_tmux(
                     &rollout_for_reader,
                     start_offset,
                     None,
@@ -429,6 +435,7 @@ async fn run_codex_idle_response_tail(
                             &tmux_for_reader,
                         )
                     },
+                    &tmux_for_reader,
                 )
                 .map(|result| match result {
                     ReadOutputResult::Completed { offset }
@@ -565,14 +572,16 @@ fn collect_codex_idle_response(
     tmux_session_name: String,
 ) -> Result<(String, u64), String> {
     let (tx, rx) = mpsc::channel();
-    let read_result = crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset(
-        &rollout_path,
-        start_offset,
-        None,
-        tx,
-        None,
-        || crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name),
-    )?;
+    let read_result =
+        crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset_for_tmux(
+            &rollout_path,
+            start_offset,
+            None,
+            tx,
+            None,
+            || crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name),
+            &tmux_session_name,
+        )?;
 
     let mut streamed = String::new();
     let mut done_result: Option<String> = None;

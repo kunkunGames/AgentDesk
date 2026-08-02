@@ -639,10 +639,15 @@ pub(in crate::services) struct RestartLifecycle {
     pub(in crate::services) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Global shutdown flag — when set, watchers exit quietly via cancel path
     pub(in crate::services) shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Provider-local intake tick activity. The deferred-restart poller fences
+    /// admissions, waits for this handle to drain, then acknowledges its marker
+    /// and consumes this provider's process-global shutdown-barrier slot.
+    pub(in crate::services) intake_worker_lifecycle:
+        crate::services::cluster::intake_worker::IntakeWorkerLifecycle,
     /// Number of turns currently in finalization phase (response sending + cleanup).
     /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
     pub(in crate::services) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
-    /// Current restart generation — incremented on each --restart-dcserver.
+    /// Immutable process epoch allocated once when this dcserver boots.
     /// Used to distinguish old (pre-restart) sessions from fresh ones.
     pub(in crate::services) current_generation: u64,
     /// Set when a `restart_pending` marker is detected. While true, the router
@@ -674,6 +679,9 @@ pub(in crate::services) struct RestartLifecycle {
     /// Per-provider flag: ensures this provider decrements `shutdown_remaining` at most once,
     /// even if both the deferred restart poll loop and SIGTERM handler run.
     pub(in crate::services) shutdown_counted: std::sync::atomic::AtomicBool,
+    /// Whether this provider already consumed its process-wide barrier slot.
+    /// Cancellation restores only consumed slots, not merely acquired permits.
+    pub(in crate::services) shutdown_slot_consumed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]

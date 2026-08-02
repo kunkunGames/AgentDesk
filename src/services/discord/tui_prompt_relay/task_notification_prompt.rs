@@ -105,13 +105,15 @@ pub(super) async fn resolve_gate(
             );
             return None;
         }
+        enqueue_footer_only_background_marker(shared, channel_id, event);
         clear_observed_external_turn_lease_if_current(prompt, channel_id, lease);
         return None;
     }
 
     let registry = shared.health_registry();
+    let notify_role = super::super::bot_role::UtilityBotRole::Notify;
     let notify_http = if let Some(registry) = registry.as_ref() {
-        match super::super::health::resolve_bot_http(registry.as_ref(), "notify").await {
+        match super::super::health::resolve_utility_bot_http(registry.as_ref(), notify_role).await {
             Ok(http) => Some(http),
             Err((status, body)) => {
                 tracing::warn!(
@@ -130,7 +132,9 @@ pub(super) async fn resolve_gate(
     let provider_http = shared.serenity_http_or_token_fallback();
     let clients = super::super::task_notification_delivery::CardDeliveryClients::new(
         notify_http
-            .map(|http| super::super::task_notification_delivery::CardBot::new("notify", http))
+            .map(|http| {
+                super::super::task_notification_delivery::CardBot::new(notify_role.alias(), http)
+            })
             .into_iter()
             .chain(provider_http.map(|http| {
                 super::super::task_notification_delivery::CardBot::new(
@@ -141,8 +145,8 @@ pub(super) async fn resolve_gate(
     );
     let transport =
         super::super::task_notification_delivery::DiscordTaskCardTransport::new(shared.clone());
-    let outcome = match super::super::task_notification_delivery::ensure_card(
-        shared.pg_pool.as_ref(),
+    let outcome = match super::super::task_notification_delivery::ensure_card_with_shared(
+        shared.as_ref(),
         &clients,
         &transport,
         event,
@@ -186,6 +190,30 @@ pub(super) async fn resolve_gate(
     })
 }
 
+/// Prompt observation remains a producer when the watcher cannot reach the
+/// terminal frame. It shares the watcher key, so observing the same semantic
+/// event through both paths still produces one outbox lifecycle notice.
+fn enqueue_footer_only_background_marker(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    event: &super::super::task_notification_delivery::TaskCardEvent,
+) {
+    let target = format!("channel:{}", channel_id.get());
+    let session_key =
+        super::super::task_notification_delivery::footer_background_marker_session_key(
+            channel_id,
+            event.event_key(),
+        );
+    let content = event.footer_only_marker_content();
+    let _ = crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
+        shared.pg_pool.as_ref(),
+        target.as_str(),
+        Some(session_key.as_str()),
+        "lifecycle.background_task_complete",
+        content.as_str(),
+    );
+}
+
 async fn legacy_notify_gate(
     shared: &Arc<SharedData>,
     prompt: &ObservedTuiPrompt,
@@ -204,8 +232,11 @@ async fn legacy_notify_gate(
         );
         return None;
     };
-    let notify_http = match super::super::health::resolve_bot_http(registry.as_ref(), "notify")
-        .await
+    let notify_http = match super::super::health::resolve_utility_bot_http(
+        registry.as_ref(),
+        super::super::bot_role::UtilityBotRole::Notify,
+    )
+    .await
     {
         Ok(http) => http,
         Err((status, body)) => {

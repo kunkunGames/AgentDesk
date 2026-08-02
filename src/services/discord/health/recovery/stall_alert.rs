@@ -62,7 +62,7 @@ async fn canonical_alert_session_key(
                 .map(|key| (tmux_name.to_string(), key))
         });
     let channel_fallback =
-        discord::adk_session::build_adk_session_key(shared, channel_id, provider)
+        discord::adk_session::build_adk_session_key(shared, channel_id, provider, None)
             .await
             .filter(|key| session_key_tmux_for_provider(key, provider).is_some());
     let expected_tmux = tmux_fallback
@@ -146,10 +146,11 @@ pub(super) async fn notify_suspected_stall_without_cleanup(
         crate::services::message_outbox::OutboxMessage {
             target: &target,
             content: &content,
-            bot: "notify",
+            bot: crate::services::discord::bot_role::UtilityBotRole::Notify.alias(),
             source: "stall_watchdog",
             reason_code: Some(STALL_WATCHDOG_MENTION_REASON_CODE),
             session_key: session_key.as_deref(),
+            attachment: None,
         },
         STALL_WATCHDOG_MENTION_COOLDOWN_SECS,
     )
@@ -449,7 +450,7 @@ mod tests {
                             category_name: None,
                             last_active: tokio::time::Instant::now(),
                             worktree: None,
-                            born_generation: discord::runtime_store::load_generation(),
+                            born_generation: discord::runtime_store::process_generation(),
                         },
                     );
                 }

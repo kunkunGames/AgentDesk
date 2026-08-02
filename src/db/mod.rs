@@ -1,8 +1,11 @@
 pub mod agents;
 pub mod auto_queue;
+pub(crate) mod automation_candidate_card_program;
 pub mod automation_candidates;
 pub mod cancel_tombstones;
 pub mod dispatch_semaphores;
+#[path = "dispatched_sessions/canonical_identity.rs"]
+pub(crate) mod dispatched_session_canonical_identity;
 #[path = "dispatched_sessions/rebind_override.rs"]
 pub(crate) mod dispatched_session_rebind_override;
 pub mod dispatched_sessions;

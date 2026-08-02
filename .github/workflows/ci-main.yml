@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      resource_diagnostics:
+        description: Emit PostgreSQL lane memory samples every five seconds
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ci-main-${{ github.ref }}
@@ -14,6 +21,7 @@ env:
   RUSTC_WRAPPER: sccache
   SCCACHE_CACHE_SIZE: 10G
   SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_RW_MODE: READ_WRITE
   POSTGRES_SERVICE_IMAGE: ${{ vars.AGENTDESK_POSTGRES_SERVICE_IMAGE }}
 
 jobs:
@@ -78,7 +86,7 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # Cache only cargo registry/git. `target/` is intentionally NOT cached
       # because sccache (GHA-backed) already caches compiled rustc output and
@@ -86,30 +94,29 @@ jobs:
       # quota, causing constant LRU eviction of sccache shards (observed:
       # Rust hit-rate collapsed from 99.80% → 0.00% over a few hours of
       # merges). See PR description and docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-main-full-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-main-full-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
 
       - name: Policy JS unit tests
         run: npm run test:policies
 
-      # `just check` wraps fmt, staged clippy, cargo check, and the same
-      # targeted non-PG subset that gates PRs in ci-pr.yml, with the same
-      # non-PG filters applied to every cargo test command since this lane has
-      # no Postgres service. PR #1306 (#1237) made production routes PG-only, so a
-      # `--all-targets` non-PG sweep panics in 169 SQLite-fixture tests
-      # that haven't been ported to PG fixtures yet. The PG migration is
+      # `just check` wraps fmt, staged clippy, cargo check, and the targeted
+      # non-PG subset. PR CI runs only the compile/policy portion to keep its
+      # critical path short; this main-push lane retains the test coverage.
+      # The same non-PG filters apply to every cargo test command since this
+      # lane has no Postgres service. PR #1306 (#1237) made production routes
+      # PG-only, so an `--all-targets` non-PG sweep panics in 169 SQLite-fixture
+      # tests that haven't been ported to PG fixtures yet. The PG migration is
       # tracked under #1238; once the bulk of the migration lands, this
       # lane can broaden again.
       - name: just check
@@ -139,6 +146,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -156,19 +164,33 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See ci-main.yml `full_non_pg` for rationale: `target/` excluded so the
       # GHA cache quota is not starved out from under sccache.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-postgres-main-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-postgres-main-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: PostgreSQL lane resource diagnostics
+        if: ${{ inputs.resource_diagnostics == true }}
+        run: |
+          resource_sample() {
+            while true; do
+              printf 'PG_RESOURCE_SAMPLE '
+              date --iso-8601=seconds
+              free -m | awk '/Mem:/ { printf "mem_total_mib=%s mem_used_mib=%s mem_available_mib=%s ", $2, $3, $7 }'
+              docker stats --no-stream --format 'pg_mem={{.MemUsage}}' agentdesk-postgres || true
+              sleep 5
+            done
+          }
+          # No PID handoff: a later step runs in a different shell, so it cannot
+          # `wait` on this sampler. The hosted VM reclaims it when the job ends.
+          resource_sample > "$RUNNER_TEMP/pg-resource-samples.log" 2>&1 &
 
       - name: just test-postgres
         timeout-minutes: 20
@@ -178,6 +200,10 @@ jobs:
           # and serial PostgreSQL suite retain headroom in the bounded step.
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
+
+      - name: Show PostgreSQL lane resource diagnostics
+        if: always() && inputs.resource_diagnostics == true
+        run: cat "$RUNNER_TEMP/pg-resource-samples.log" || true
 
       - name: Stop PostgreSQL service
         if: always()
@@ -201,6 +227,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -213,21 +240,19 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See ci-main.yml `full_non_pg` for rationale.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-recovery-main-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-recovery-main-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: High-risk recovery lane
-        run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
+        run: "cargo test --lib high_risk_recovery:: -- --test-threads=1"
 
       - name: Stop PostgreSQL service
         if: always()
@@ -238,7 +263,9 @@ jobs:
         run: sccache --show-stats || true
 
   scripts:
-    name: Script checks
+    # Distinct from the protected PR `Script checks` context. Main-push CI
+    # cannot enforce pre-merge anti-growth after a commit has already landed.
+    name: Main script checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -250,11 +277,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      # See the matching step in ci-pr.yml: the PyYAML oracle in
+      # `tests/test_check_pg_test_lane_membership.py` is not available on the
+      # clean setup-python interpreter and must be installed explicitly.
+      - name: Install script-test Python deps
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
       - name: Install shellcheck
         run: sudo apt-get install -y shellcheck
 
       - name: Run script checks
         run: ./scripts/ci-script-checks.sh
+        env:
+          # Main-push CI verifies current coverage drift, but relative anti-growth
+          # authority lives in the protected PR candidate's required context.
+          TEST_LANE_BASELINE_REF: HEAD
 
       - name: Upload maintainability audit artifact
         if: always()

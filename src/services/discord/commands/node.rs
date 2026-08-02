@@ -287,8 +287,7 @@ pub(in crate::services::discord) async fn cmd_node(ctx: Context<'_>) -> Result<(
         return Ok(());
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!("  [{ts}] ◀ [{user_name}] /node");
+    log_command_received!(ctx.channel_id().get(), user_name, "/node");
 
     let intake_routing = effective_intake_routing_config();
     if !intake_routing_enforced(&intake_routing) {
@@ -454,9 +453,8 @@ pub(in crate::services::discord) async fn handle_node_picker_interaction(
 mod tests {
     use super::*;
     use crate::config::ClusterIntakeRoutingMode;
-    use crate::services::cluster::intake_router_hook::{
-        IntakeRoutingMode, IntakeRoutingModeSource,
-    };
+    use crate::services::cluster::intake_router_hook::IntakeRoutingMode;
+    use crate::services::cluster::intake_routing_config::IntakeRoutingModeSource;
 
     #[test]
     fn node_unavailable_message_reports_effective_mode_and_source() {
@@ -467,6 +465,8 @@ mod tests {
             yaml_mode: ClusterIntakeRoutingMode::Enforce,
             env_override: Some("observe"),
             warnings: Vec::new(),
+            owner_authority_channel_ids: Vec::new(),
+            owner_authority_config_known: true,
             forward_pre_claim_timeout_secs: 12,
             stale_claim_recovery_secs: 60,
         };

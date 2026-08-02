@@ -8,6 +8,16 @@ use crate::db::session_agent_resolution::{
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::session_activity::SessionActivityResolver;
 
+async fn resolve_session_locator_pg(
+    pool: &PgPool,
+    session_key: &str,
+    operation: &str,
+) -> Result<Option<String>, String> {
+    crate::db::dispatched_session_canonical_identity::resolve_session_key_pg(pool, session_key)
+        .await
+        .map_err(|error| format!("resolve {operation} locator: {error:?}"))
+}
+
 pub(crate) async fn load_dispatch_thread_id_pg(pool: &PgPool, dispatch_id: &str) -> Option<String> {
     let thread_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT thread_id FROM task_dispatches WHERE id = $1",
@@ -45,12 +55,17 @@ pub(crate) async fn load_force_kill_session_pg(
     )>,
     String,
 > {
+    let resolved_session_key =
+        resolve_session_locator_pg(pool, session_key, "force-kill session").await?;
+    let Some(resolved_session_key) = resolved_session_key else {
+        return Ok(None);
+    };
     let row = sqlx::query(
         "SELECT active_dispatch_id, agent_id, thread_channel_id, provider, instance_id
          FROM sessions
          WHERE session_key = $1",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .fetch_optional(pool)
     .await
     .map_err(|error| {
@@ -122,8 +137,15 @@ pub(crate) async fn load_session_channel_id_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> Result<Option<(u64, Option<String>)>, String> {
+    let resolved_key =
+        crate::db::dispatched_session_canonical_identity::resolve_session_key_pg(pool, session_key)
+            .await
+            .map_err(|error| format!("resolve session locator {session_key}: {error:?}"))?;
+    let Some(resolved_key) = resolved_key else {
+        return Ok(None);
+    };
     let row = sqlx::query("SELECT channel_id, instance_id FROM sessions WHERE session_key = $1")
-        .bind(session_key)
+        .bind(&resolved_key)
         .fetch_optional(pool)
         .await
         .map_err(|error| {
@@ -152,6 +174,162 @@ pub(crate) async fn load_session_channel_id_pg(
         return Ok(None);
     };
     Ok(Some((channel_id, instance_id)))
+}
+
+/// Current provider-binding context for a session row, used by the
+/// `/resume` rebind path. Returns the row's `active_dispatch_id` (so the caller
+/// can refuse to rebind a channel with in-flight dispatch work), plus the
+/// currently-bound `cwd` and `claude_session_id` that the rebind will replace.
+/// `Ok(None)` means no session row exists for `session_key`.
+pub(crate) struct SessionRebindContext {
+    pub(crate) resolved_session_key: String,
+    pub(crate) session_id: i64,
+    pub(crate) active_dispatch_id: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) claude_session_id: Option<String>,
+}
+
+pub(crate) async fn load_session_rebind_context_pg(
+    pool: &PgPool,
+    session_key: &str,
+) -> Result<Option<SessionRebindContext>, String> {
+    let resolved_session_key =
+        resolve_session_locator_pg(pool, session_key, "rebind context").await?;
+    let Some(resolved_session_key) = resolved_session_key else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT id, active_dispatch_id, cwd, claude_session_id
+         FROM sessions
+         WHERE session_key = $1",
+    )
+    .bind(&resolved_session_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        format!(
+            "load rebind context for session {session_key}: {}",
+            crate::utils::redact::redact_known_secrets(&error.to_string())
+        )
+    })?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let session_id: i64 = row
+        .try_get("id")
+        .map_err(|error| format!("decode session id: {error}"))?;
+    let active_dispatch_id: Option<String> = row
+        .try_get("active_dispatch_id")
+        .map_err(|error| format!("decode active_dispatch_id for {session_key}: {error}"))?;
+    let cwd: Option<String> = row
+        .try_get("cwd")
+        .map_err(|error| format!("decode cwd for {session_key}: {error}"))?;
+    let claude_session_id: Option<String> = row
+        .try_get("claude_session_id")
+        .map_err(|error| format!("decode claude_session_id for {session_key}: {error}"))?;
+
+    Ok(Some(SessionRebindContext {
+        resolved_session_key,
+        session_id,
+        active_dispatch_id,
+        cwd,
+        claude_session_id,
+    }))
+}
+
+/// #4790 `/resume` auto-select guard: every provider session id that is
+/// *currently bound* to some channel's session row. The auto-select path must
+/// never adopt a transcript that another live channel is actively using —
+/// doing so would repoint two channels at one session id and thrash their
+/// bindings (the #2843 live-binding hazard). A rotated/superseded prior session
+/// is not in this set (its row was overwritten), so it stays selectable.
+pub(crate) async fn load_live_bound_session_ids_pg(
+    pool: &PgPool,
+) -> Result<std::collections::HashSet<String>, String> {
+    let rows = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT claude_session_id FROM sessions
+         WHERE claude_session_id IS NOT NULL AND BTRIM(claude_session_id) <> ''
+         UNION
+         SELECT raw_provider_session_id FROM sessions
+         WHERE raw_provider_session_id IS NOT NULL AND BTRIM(raw_provider_session_id) <> ''",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("load live-bound session ids: {error}"))?;
+    Ok(rows.into_iter().flatten().collect())
+}
+
+/// Rebind a session row to a previous provider session: point `cwd` at the
+/// target worktree and `claude_session_id`/`raw_provider_session_id` at the
+/// target provider session id so the next turn resumes that conversation
+/// (`--resume <id>` in the target cwd). `claude_session_id_recorded_at` is
+/// refreshed when the id actually changes. Returns the number of rows updated
+/// (0 when the `session_key` no longer exists).
+///
+/// N2 caveat: both `claude_session_id` and `raw_provider_session_id` are set to
+/// the same `$3`. The auto-select path is Claude-only, where these coincide. For
+/// an *explicit* non-Claude rebind (e.g. Codex, where the raw provider session
+/// id can differ from the resume selector) this collapses the two ids; callers
+/// needing a distinct raw id must widen this signature. Acceptable today because
+/// the only non-Claude entry is an explicit `session_id` the caller already
+/// treats as the provider resume token.
+pub(crate) async fn rebind_session_provider_pg(
+    pool: &PgPool,
+    session_key: &str,
+    target_cwd: &str,
+    target_session_id: &str,
+) -> Result<u64, String> {
+    let resolved_session_key =
+        resolve_session_locator_pg(pool, session_key, "provider rebind").await?;
+    let Some(resolved_session_key) = resolved_session_key else {
+        return Ok(0);
+    };
+    sqlx::query(
+        "UPDATE sessions
+         SET cwd = $2,
+             claude_session_id = $3,
+             raw_provider_session_id = $3,
+             claude_session_id_recorded_at = CASE
+               WHEN claude_session_id IS DISTINCT FROM $3 THEN NOW()
+               ELSE COALESCE(claude_session_id_recorded_at, NOW())
+             END
+         WHERE session_key = $1",
+    )
+    .bind(&resolved_session_key)
+    .bind(target_cwd)
+    .bind(target_session_id)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("rebind session {session_key} provider binding: {error}"))
+}
+
+pub(crate) async fn rebind_session_provider_by_id_pg(
+    pool: &PgPool,
+    session_id: i64,
+    target_cwd: &str,
+    target_session_id: &str,
+) -> Result<u64, String> {
+    sqlx::query(
+        "UPDATE sessions
+         SET cwd = $2,
+             claude_session_id = $3,
+             raw_provider_session_id = $3,
+             claude_session_id_recorded_at = CASE
+               WHEN claude_session_id IS DISTINCT FROM $3 THEN NOW()
+               ELSE COALESCE(claude_session_id_recorded_at, NOW())
+             END
+         WHERE id = $1",
+    )
+    .bind(session_id)
+    .bind(target_cwd)
+    .bind(target_session_id)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("rebind session #{session_id} provider binding: {error}"))
 }
 
 pub(crate) async fn disconnect_session_and_prepare_retry_pg(
@@ -1098,425 +1276,412 @@ mod selector_cleanup_tests {
                 channel_id: None,
                 claude_session_id,
                 raw_provider_session_id,
+                turn_start_nonce: None,
+                dispatched_origin: false,
             },
         )
         .await
         .expect("upsert selector session"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
     }
 
-    #[tokio::test]
-    async fn disconnect_session_and_prepare_retry_pg_preserves_provider_selectors() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:selector-force-kill";
+    // #4979 S6: session-authority PG tests live below `*_pg_tests` so
+    // `just test-postgres` selects them through its `_pg` filter. That filter
+    // is a substring match on the whole test path, not a module-scope rule —
+    // seven of these tests already carried `_pg` in their own fn names and so
+    // were selected before the move; the module marker is what now covers the
+    // rest.
+    //
+    // Two edits could undo this, and they are protected very differently.
+    // Measured rc, not inferred:
+    //
+    //   1. Renaming the module away from the marker (`…_pg_tests` →
+    //      `…_tests`), keeping the `#[cfg(test)]`:
+    //        membership rc=1  (PG test-lane manifest drift)
+    //        coverage   rc=1  (2 newly uncovered modules)
+    //      Regenerating the manifest silences membership — new rule1/rule2 debt
+    //      is warn-only during the #5071 T0 rollout — but coverage still fails,
+    //      because the renamed nested module becomes a *new* uncovered module
+    //      rather than folding back into the parent. So the marker is well
+    //      guarded; the coverage gate is the signal that survives a regen.
+    //
+    //   2. Removing the nested `#[cfg(test)]` alone:
+    //        membership rc=0, coverage rc=0
+    //      This is harmless for lane selection — the path still contains the
+    //      marker — and the gates stay green because the tests fold back into
+    //      the parent, which `test_lane_coverage_baseline.txt` already carries
+    //      as uncovered debt. So unlike the sibling slices (#5088 S3, #5092 S5)
+    //      where the parent is genuinely covered, this attribute is NOT
+    //      load-bearing here; it is defence-in-depth for when that parent debt
+    //      is repaid. Do not copy a "removing this breaks the gate" claim out
+    //      of this file without checking whether the parent is baselined.
+    #[cfg(test)]
+    mod session_authority_pg_tests {
+        use super::*;
 
-        seed_session_with_selectors(&pool, session_key, "idle", Some("dispatch-1841")).await;
+        #[tokio::test]
+        async fn disconnect_session_and_prepare_retry_pg_preserves_provider_selectors() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:selector-force-kill";
 
-        let retry_meta = disconnect_session_and_prepare_retry_pg(&pool, session_key, None, false)
-            .await
-            .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert!(retry_meta.is_none());
-        assert_cleanup_preserved_selectors(&pool, session_key).await;
+            seed_session_with_selectors(&pool, session_key, "idle", Some("dispatch-1841")).await;
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            let retry_meta =
+                disconnect_session_and_prepare_retry_pg(&pool, session_key, None, false)
+                    .await
+                    .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert!(retry_meta.is_none());
+            assert_cleanup_preserved_selectors(&pool, session_key).await;
 
-    #[tokio::test]
-    async fn gc_stale_fixed_working_sessions_db_pg_preserves_provider_selectors() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:selector-gc-stale";
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-        seed_session_with_selectors(&pool, session_key, "turn_active", Some("dispatch-1841-gc"))
+        #[tokio::test]
+        async fn gc_stale_fixed_working_sessions_db_pg_preserves_provider_selectors() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:selector-gc-stale";
+
+            seed_session_with_selectors(
+                &pool,
+                session_key,
+                "turn_active",
+                Some("dispatch-1841-gc"),
+            )
             .await;
 
-        assert_eq!(gc_stale_fixed_working_sessions_db_pg(&pool).await, 1);
-        assert_cleanup_preserved_selectors(&pool, session_key).await;
+            assert_eq!(gc_stale_fixed_working_sessions_db_pg(&pool).await, 1);
+            assert_cleanup_preserved_selectors(&pool, session_key).await;
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-    #[tokio::test]
-    async fn disconnect_stale_fixed_session_by_key_pg_preserves_provider_selectors() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:selector-stale-by-key";
+        #[tokio::test]
+        async fn disconnect_stale_fixed_session_by_key_pg_preserves_provider_selectors() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:selector-stale-by-key";
 
-        seed_session_with_selectors(&pool, session_key, "turn_active", Some("dispatch-1841-key"))
+            seed_session_with_selectors(
+                &pool,
+                session_key,
+                "turn_active",
+                Some("dispatch-1841-key"),
+            )
             .await;
 
-        assert_eq!(
-            disconnect_stale_fixed_session_by_key_pg(&pool, session_key).await,
-            1
-        );
-        assert_cleanup_preserved_selectors(&pool, session_key).await;
+            assert_eq!(
+                disconnect_stale_fixed_session_by_key_pg(&pool, session_key).await,
+                1
+            );
+            assert_cleanup_preserved_selectors(&pool, session_key).await;
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-    /// #2861: an idle row whose tmux already vanished must be reconciled to
-    /// `disconnected` (selectors preserved) so it leaves the idle-kill pool.
-    #[tokio::test]
-    async fn reconcile_orphaned_tmuxless_session_pg_disconnects_idle_row_preserving_selectors() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:tmuxless-idle-zombie";
+        /// #2861: an idle row whose tmux already vanished must be reconciled to
+        /// `disconnected` (selectors preserved) so it leaves the idle-kill pool.
+        #[tokio::test]
+        async fn reconcile_orphaned_tmuxless_session_pg_disconnects_idle_row_preserving_selectors()
+        {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:tmuxless-idle-zombie";
 
-        seed_session_with_selectors(&pool, session_key, "idle", None).await;
+            seed_session_with_selectors(&pool, session_key, "idle", None).await;
 
-        assert!(reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
-        assert_cleanup_preserved_selectors(&pool, session_key).await;
+            assert!(reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
+            assert_cleanup_preserved_selectors(&pool, session_key).await;
 
-        // Idempotent: an already-disconnected row reports no further transition.
-        assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
+            // Idempotent: an already-disconnected row reports no further transition.
+            assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-    /// #2861: a row with an in-flight dispatch is owned by force-kill / the
-    /// stuck-dispatch watchdog — the stale-tmux reconcile must leave it alone.
-    #[tokio::test]
-    async fn reconcile_orphaned_tmuxless_session_pg_skips_rows_with_active_dispatch() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:tmuxless-with-dispatch";
+        /// #2861: a row with an in-flight dispatch is owned by force-kill / the
+        /// stuck-dispatch watchdog — the stale-tmux reconcile must leave it alone.
+        #[tokio::test]
+        async fn reconcile_orphaned_tmuxless_session_pg_skips_rows_with_active_dispatch() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:tmuxless-with-dispatch";
 
-        seed_session_with_selectors(&pool, session_key, "idle", Some("dispatch-2861")).await;
+            seed_session_with_selectors(&pool, session_key, "idle", Some("dispatch-2861")).await;
 
-        assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
-        let (status, active_dispatch_id, _, _) = session_state(&pool, session_key).await;
-        assert_eq!(status, "idle");
-        assert_eq!(active_dispatch_id.as_deref(), Some("dispatch-2861"));
+            assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
+            let (status, active_dispatch_id, _, _) = session_state(&pool, session_key).await;
+            assert_eq!(status, "idle");
+            assert_eq!(active_dispatch_id.as_deref(), Some("dispatch-2861"));
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-    /// #3052: a tmux-only idle cleanup (the reconcile path `/kill-tmux` runs
-    /// when tmux is already gone) must leave BOTH provider resume selector
-    /// columns intact, and the resume lookup (`load_provider_session_ids_pg`)
-    /// must still surface them so provider-native resume can succeed.
-    #[tokio::test]
-    async fn tmux_only_kill_preserves_resume_selectors() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:tmux-only-resume-selector";
+        /// #3052: a tmux-only idle cleanup (the reconcile path `/kill-tmux` runs
+        /// when tmux is already gone) must leave BOTH provider resume selector
+        /// columns intact, and the resume lookup (`load_provider_session_ids_pg`)
+        /// must still surface them so provider-native resume can succeed.
+        #[tokio::test]
+        async fn tmux_only_kill_preserves_resume_selectors() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:tmux-only-resume-selector";
 
-        seed_session_with_selectors(&pool, session_key, "idle", None).await;
+            seed_session_with_selectors(&pool, session_key, "idle", None).await;
 
-        // Simulate the tmux-only idle cleanup reconcile.
-        assert!(reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
+            // Simulate the tmux-only idle cleanup reconcile.
+            assert!(reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
 
-        // Both selector columns must survive the cleanup.
-        assert_cleanup_preserved_selectors(&pool, session_key).await;
+            // Both selector columns must survive the cleanup.
+            assert_cleanup_preserved_selectors(&pool, session_key).await;
 
-        // The resume lookup used by kill-tmux's resumable check and by the
-        // session-restore fallback must still return both selectors.
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
-            .await
-            .unwrap() // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row must still exist after tmux-only cleanup"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(
-            ids.claude_session_id.as_deref(),
-            Some("claude-selector-1841")
-        );
-        assert_eq!(
-            ids.raw_provider_session_id.as_deref(),
-            Some("raw-selector-1841"),
-            "raw provider selector must survive so native resume can fall back to it"
-        );
+            // The resume lookup used by kill-tmux's resumable check and by the
+            // session-restore fallback must still return both selectors.
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .unwrap() // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row must still exist after tmux-only cleanup"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(
+                ids.claude_session_id.as_deref(),
+                Some("claude-selector-1841")
+            );
+            assert_eq!(
+                ids.raw_provider_session_id.as_deref(),
+                Some("raw-selector-1841"),
+                "raw provider selector must survive so native resume can fall back to it"
+            );
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-    #[tokio::test]
-    async fn same_claude_session_id_heartbeats_do_not_refresh_recorded_at_guard() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:claude-selector-recorded-at";
-        let claude_session_id = "c62c2dc8-0000-4000-8000-000000000000";
+        #[tokio::test]
+        async fn same_claude_session_id_heartbeats_do_not_refresh_recorded_at_guard() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:claude-selector-recorded-at";
+            let claude_session_id = "c62c2dc8-0000-4000-8000-000000000000";
 
-        upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
-        sqlx::query(
-            "UPDATE sessions
+            upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
+            sqlx::query(
+                "UPDATE sessions
                 SET claude_session_id_recorded_at = NOW() - INTERVAL '61 seconds',
                     last_heartbeat = NOW() - INTERVAL '61 seconds'
               WHERE session_key = $1",
-        )
-        .bind(session_key)
-        .execute(&pool)
-        .await
-        .expect("age selector timestamp"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-
-        upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
-        upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
-
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            )
+            .bind(session_key)
+            .execute(&pool)
             .await
-            .expect("load provider ids") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert!(
-            ids.cache_entry_age_secs.unwrap_or_default() >= 60,
-            "same-id heartbeats must not extend the missing-transcript grace window"
-        );
-        let heartbeat_age_secs: i64 = sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - last_heartbeat))::BIGINT
+            .expect("age selector timestamp"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+
+            upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
+            upsert_claude_selector_session(&pool, session_key, Some(claude_session_id), None).await;
+
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert!(
+                ids.cache_entry_age_secs.unwrap_or_default() >= 60,
+                "same-id heartbeats must not extend the missing-transcript grace window"
+            );
+            let heartbeat_age_secs: i64 = sqlx::query_scalar(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - last_heartbeat))::BIGINT
                FROM sessions
               WHERE session_key = $1",
-        )
-        .bind(session_key)
-        .fetch_one(&pool)
-        .await
-        .expect("heartbeat age"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert!(
-            heartbeat_age_secs < 60,
-            "heartbeat should still refresh independently of the selector timestamp"
-        );
-
-        upsert_claude_selector_session(
-            &pool,
-            session_key,
-            Some("48fdb7f3-0000-4000-8000-000000000000"),
-            None,
-        )
-        .await;
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            )
+            .bind(session_key)
+            .fetch_one(&pool)
             .await
-            .expect("load provider ids after selector change") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row after selector change"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert!(
-            ids.cache_entry_age_secs.unwrap_or(i64::MAX) < 60,
-            "a changed cached selector value must restart the short grace window"
-        );
+            .expect("heartbeat age"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert!(
+                heartbeat_age_secs < 60,
+                "heartbeat should still refresh independently of the selector timestamp"
+            );
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            upsert_claude_selector_session(
+                &pool,
+                session_key,
+                Some("48fdb7f3-0000-4000-8000-000000000000"),
+                None,
+            )
+            .await;
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids after selector change") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row after selector change"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert!(
+                ids.cache_entry_age_secs.unwrap_or(i64::MAX) < 60,
+                "a changed cached selector value must restart the short grace window"
+            );
 
-    #[tokio::test]
-    async fn raw_provider_transcript_len_watermark_is_monotonic() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:raw-selector-watermark";
-        let raw_session_id = "48fdb7f3-0000-4000-8000-000000000000";
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-        upsert_claude_selector_session(
-            &pool,
-            session_key,
-            Some("c62c2dc8-0000-4000-8000-000000000000"),
-            Some(raw_session_id),
-        )
-        .await;
+        #[tokio::test]
+        async fn raw_provider_transcript_len_watermark_is_monotonic() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:raw-selector-watermark";
+            let raw_session_id = "48fdb7f3-0000-4000-8000-000000000000";
 
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            10,
-        )
-        .await
-        .expect("write initial watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            8,
-        )
-        .await
-        .expect("write lower watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            upsert_claude_selector_session(
+                &pool,
+                session_key,
+                Some("c62c2dc8-0000-4000-8000-000000000000"),
+                Some(raw_session_id),
+            )
+            .await;
+
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_id,
+                10,
+            )
             .await
-            .expect("load provider ids") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(10));
-        assert_eq!(
-            ids.raw_provider_transcript_watermark_session_id.as_deref(),
-            Some(raw_session_id)
-        );
-        assert!(
-            !ids.raw_provider_transcript_growth_proven,
-            "lower/equal observations do not prove growth"
-        );
-
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            12,
-        )
-        .await
-        .expect("write higher watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            .expect("write initial watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_id,
+                8,
+            )
             .await
-            .expect("load provider ids after growth") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row after growth"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(12));
-        assert!(
-            ids.raw_provider_transcript_growth_proven,
-            "growth proof must stay sticky after the watermark advances to the observed length"
-        );
+            .expect("write lower watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(10));
+            assert_eq!(
+                ids.raw_provider_transcript_watermark_session_id.as_deref(),
+                Some(raw_session_id)
+            );
+            assert!(
+                !ids.raw_provider_transcript_growth_proven,
+                "lower/equal observations do not prove growth"
+            );
 
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            12,
-        )
-        .await
-        .expect("record equal watermark after proof"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_id,
+                12,
+            )
             .await
-            .expect("load provider ids after equal proof") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row after equal proof"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(12));
-        assert!(
-            ids.raw_provider_transcript_growth_proven,
-            "recording the current final length must not erase prior growth proof"
-        );
+            .expect("write higher watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids after growth") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row after growth"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(12));
+            assert!(
+                ids.raw_provider_transcript_growth_proven,
+                "growth proof must stay sticky after the watermark advances to the observed length"
+            );
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn raw_provider_transcript_watermark_raw_id_mismatch_resets_baseline() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:raw-selector-watermark-id-reset";
-        let raw_session_a = "48fdb7f3-0000-4000-8000-000000000000";
-        let raw_session_b = "8f0e3a1c-0000-4000-8000-000000000000";
-
-        upsert_claude_selector_session(
-            &pool,
-            session_key,
-            Some("c62c2dc8-0000-4000-8000-000000000000"),
-            Some(raw_session_a),
-        )
-        .await;
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_a,
-            10_000_000,
-        )
-        .await
-        .expect("write raw A watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_a,
-            10_000_001,
-        )
-        .await
-        .expect("prove raw A growth"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_b,
-            50_000,
-        )
-        .await
-        .expect("raw B mismatch resets baseline"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_id,
+                12,
+            )
             .await
-            .expect("load provider ids after id reset") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row after id reset"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            .expect("record equal watermark after proof"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids after equal proof") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row after equal proof"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(12));
+            assert!(
+                ids.raw_provider_transcript_growth_proven,
+                "recording the current final length must not erase prior growth proof"
+            );
 
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(50_000));
-        assert_eq!(
-            ids.raw_provider_transcript_watermark_session_id.as_deref(),
-            Some(raw_session_b)
-        );
-        assert!(
-            !ids.raw_provider_transcript_growth_proven,
-            "a fresh raw id starts from its own baseline, not the old file's proof"
-        );
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+        #[tokio::test]
+        async fn raw_provider_transcript_watermark_raw_id_mismatch_resets_baseline() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:raw-selector-watermark-id-reset";
+            let raw_session_a = "48fdb7f3-0000-4000-8000-000000000000";
+            let raw_session_b = "8f0e3a1c-0000-4000-8000-000000000000";
 
-    #[tokio::test]
-    async fn raw_provider_transcript_growth_flag_only_observation_does_not_raise_watermark() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:raw-selector-watermark-kill-path";
-        let raw_session_id = "48fdb7f3-0000-4000-8000-000000000000";
-
-        upsert_claude_selector_session(
-            &pool,
-            session_key,
-            Some("c62c2dc8-0000-4000-8000-000000000000"),
-            Some(raw_session_id),
-        )
-        .await;
-        update_raw_provider_transcript_len_watermark_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            10,
-        )
-        .await
-        .expect("write baseline watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-
-        mark_raw_provider_transcript_growth_if_observed_pg(
-            &pool,
-            session_key,
-            Some("claude"),
-            raw_session_id,
-            12,
-        )
-        .await
-        .expect("kill path records sticky proof only"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            upsert_claude_selector_session(
+                &pool,
+                session_key,
+                Some("c62c2dc8-0000-4000-8000-000000000000"),
+                Some(raw_session_a),
+            )
+            .await;
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_a,
+                10_000_000,
+            )
             .await
-            .expect("load provider ids after growth-only observation") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            .expect("session row after growth-only observation"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            .expect("write raw A watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_a,
+                10_000_001,
+            )
+            .await
+            .expect("prove raw A growth"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
 
-        assert_eq!(
-            ids.raw_provider_transcript_len_watermark,
-            Some(10),
-            "kill-path evidence must not record the dead transcript's final length"
-        );
-        assert!(
-            ids.raw_provider_transcript_growth_proven,
-            "kill-path evidence may preserve growth proof without raising the watermark"
-        );
+            update_raw_provider_transcript_len_watermark_pg(
+                &pool,
+                session_key,
+                Some("claude"),
+                raw_session_b,
+                50_000,
+            )
+            .await
+            .expect("raw B mismatch resets baseline"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids after id reset") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row after id reset"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(50_000));
+            assert_eq!(
+                ids.raw_provider_transcript_watermark_session_id.as_deref(),
+                Some(raw_session_b)
+            );
+            assert!(
+                !ids.raw_provider_transcript_growth_proven,
+                "a fresh raw id starts from its own baseline, not the old file's proof"
+            );
 
-    #[tokio::test]
-    async fn clearing_session_ids_resets_raw_transcript_watermark_evidence() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let rows = [
-            (
-                "host:raw-selector-clear-by-id",
-                "48fdb7f3-0000-4000-8000-000000000000",
-            ),
-            (
-                "host:raw-selector-clear-by-key",
-                "8f0e3a1c-0000-4000-8000-000000000000",
-            ),
-        ];
+            pool.close().await;
+            pg_db.drop().await;
+        }
 
-        for (session_key, raw_session_id) in rows {
+        #[tokio::test]
+        async fn raw_provider_transcript_growth_flag_only_observation_does_not_raise_watermark() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:raw-selector-watermark-kill-path";
+            let raw_session_id = "48fdb7f3-0000-4000-8000-000000000000";
+
             upsert_claude_selector_session(
                 &pool,
                 session_key,
@@ -1532,135 +1697,208 @@ mod selector_cleanup_tests {
                 10,
             )
             .await
-            .expect("write baseline before clear"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-            update_raw_provider_transcript_len_watermark_pg(
+            .expect("write baseline watermark"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+
+            mark_raw_provider_transcript_growth_if_observed_pg(
                 &pool,
                 session_key,
                 Some("claude"),
                 raw_session_id,
-                11,
+                12,
             )
             .await
-            .expect("prove growth before clear"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            .expect("kill path records sticky proof only"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+                .await
+                .expect("load provider ids after growth-only observation") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                .expect("session row after growth-only observation"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+
+            assert_eq!(
+                ids.raw_provider_transcript_len_watermark,
+                Some(10),
+                "kill-path evidence must not record the dead transcript's final length"
+            );
+            assert!(
+                ids.raw_provider_transcript_growth_proven,
+                "kill-path evidence may preserve growth proof without raising the watermark"
+            );
+
+            pool.close().await;
+            pg_db.drop().await;
         }
 
-        clear_stale_session_id_pg(&pool, rows[0].1)
-            .await
-            .expect("clear by raw session id"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids =
-            load_provider_session_ids_pg(&pool, "host:raw-selector-clear-by-id", Some("claude"))
+        #[tokio::test]
+        async fn clearing_session_ids_resets_raw_transcript_watermark_evidence() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let rows = [
+                (
+                    "host:raw-selector-clear-by-id",
+                    "48fdb7f3-0000-4000-8000-000000000000",
+                ),
+                (
+                    "host:raw-selector-clear-by-key",
+                    "8f0e3a1c-0000-4000-8000-000000000000",
+                ),
+            ];
+
+            for (session_key, raw_session_id) in rows {
+                upsert_claude_selector_session(
+                    &pool,
+                    session_key,
+                    Some("c62c2dc8-0000-4000-8000-000000000000"),
+                    Some(raw_session_id),
+                )
+                .await;
+                update_raw_provider_transcript_len_watermark_pg(
+                    &pool,
+                    session_key,
+                    Some("claude"),
+                    raw_session_id,
+                    10,
+                )
                 .await
-                .expect("load clear-by-id row") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-                .expect("clear-by-id row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(ids.raw_provider_session_id, None);
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(0));
-        assert_eq!(ids.raw_provider_transcript_watermark_session_id, None);
-        assert!(!ids.raw_provider_transcript_growth_proven);
-
-        clear_session_id_by_key_pg(&pool, "host:raw-selector-clear-by-key")
-            .await
-            .expect("clear by session key"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        let ids =
-            load_provider_session_ids_pg(&pool, "host:raw-selector-clear-by-key", Some("claude"))
+                .expect("write baseline before clear"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+                update_raw_provider_transcript_len_watermark_pg(
+                    &pool,
+                    session_key,
+                    Some("claude"),
+                    raw_session_id,
+                    11,
+                )
                 .await
-                .expect("load clear-by-key row") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-                .expect("clear-by-key row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(ids.raw_provider_session_id, None);
-        assert_eq!(ids.raw_provider_transcript_len_watermark, Some(0));
-        assert_eq!(ids.raw_provider_transcript_watermark_session_id, None);
-        assert!(!ids.raw_provider_transcript_growth_proven);
+                .expect("prove growth before clear"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            }
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+            clear_stale_session_id_pg(&pool, rows[0].1)
+                .await
+                .expect("clear by raw session id"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(
+                &pool,
+                "host:raw-selector-clear-by-id",
+                Some("claude"),
+            )
+            .await
+            .expect("load clear-by-id row") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            .expect("clear-by-id row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(ids.raw_provider_session_id, None);
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(0));
+            assert_eq!(ids.raw_provider_transcript_watermark_session_id, None);
+            assert!(!ids.raw_provider_transcript_growth_proven);
 
-    /// #2861 (review): `/kill-tmux` is a public route, so the reconcile must
-    /// only touch `idle` rows — never terminal (`aborted`) or other live-ish
-    /// states (`turn_active`/`awaiting_user`/`awaiting_bg`). Those must be left
-    /// for force-kill / the dispatch watchdog, not rewritten to `disconnected`.
-    #[tokio::test]
-    async fn reconcile_orphaned_tmuxless_session_pg_only_touches_idle_status() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
+            clear_session_id_by_key_pg(&pool, "host:raw-selector-clear-by-key")
+                .await
+                .expect("clear by session key"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            let ids = load_provider_session_ids_pg(
+                &pool,
+                "host:raw-selector-clear-by-key",
+                Some("claude"),
+            )
+            .await
+            .expect("load clear-by-key row") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            .expect("clear-by-key row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(ids.raw_provider_session_id, None);
+            assert_eq!(ids.raw_provider_transcript_len_watermark, Some(0));
+            assert_eq!(ids.raw_provider_transcript_watermark_session_id, None);
+            assert!(!ids.raw_provider_transcript_growth_proven);
 
-        for non_idle in ["aborted", "turn_active", "awaiting_user", "awaiting_bg"] {
-            let session_key = format!("host:tmuxless-{non_idle}");
-            seed_session_with_selectors(&pool, &session_key, non_idle, None).await;
-
-            assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, &session_key).await);
-            let (status, _, _, _) = session_state(&pool, &session_key).await;
-            assert_eq!(status, non_idle, "non-idle status must not be rewritten");
+            pool.close().await;
+            pg_db.drop().await;
         }
 
-        pool.close().await;
-        pg_db.drop().await;
-    }
+        /// #2861 (review): `/kill-tmux` is a public route, so the reconcile must
+        /// only touch `idle` rows — never terminal (`aborted`) or other live-ish
+        /// states (`turn_active`/`awaiting_user`/`awaiting_bg`). Those must be left
+        /// for force-kill / the dispatch watchdog, not rewritten to `disconnected`.
+        #[tokio::test]
+        async fn reconcile_orphaned_tmuxless_session_pg_only_touches_idle_status() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
 
-    /// #2045 Finding 4 cancelled→failed guard:
-    /// force-kill on a session whose active dispatch is already `cancelled`
-    /// must NOT overwrite the dispatch status, and must NOT synthesize a retry.
-    /// The session row itself is still disconnected (operator intent).
-    #[tokio::test]
-    async fn disconnect_session_and_prepare_retry_pg_skips_cancelled_dispatch() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let session_key = "host:selector-cancelled-guard";
-        let dispatch_id = "dispatch-2045-cancelled-guard";
-        let card_id = "card-2045-cancelled-guard";
+            for non_idle in ["aborted", "turn_active", "awaiting_user", "awaiting_bg"] {
+                let session_key = format!("host:tmuxless-{non_idle}");
+                seed_session_with_selectors(&pool, &session_key, non_idle, None).await;
 
-        // Seed: card + cancelled dispatch + session pointing at it.
-        sqlx::query(
-            "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
+                assert!(!reconcile_orphaned_tmuxless_session_pg(&pool, &session_key).await);
+                let (status, _, _, _) = session_state(&pool, &session_key).await;
+                assert_eq!(status, non_idle, "non-idle status must not be rewritten");
+            }
+
+            pool.close().await;
+            pg_db.drop().await;
+        }
+
+        /// #2045 Finding 4 cancelled→failed guard:
+        /// force-kill on a session whose active dispatch is already `cancelled`
+        /// must NOT overwrite the dispatch status, and must NOT synthesize a retry.
+        /// The session row itself is still disconnected (operator intent).
+        #[tokio::test]
+        async fn disconnect_session_and_prepare_retry_pg_skips_cancelled_dispatch() {
+            let pg_db = TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let session_key = "host:selector-cancelled-guard";
+            let dispatch_id = "dispatch-2045-cancelled-guard";
+            let card_id = "card-2045-cancelled-guard";
+
+            // Seed: card + cancelled dispatch + session pointing at it.
+            sqlx::query(
+                "INSERT INTO kanban_cards (id, title, status, created_at, updated_at)
              VALUES ($1, 'guard card', 'backlog', NOW(), NOW())",
-        )
-        .bind(card_id)
-        .execute(&pool)
-        .await
-        .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        sqlx::query(
-            "INSERT INTO task_dispatches
+            )
+            .bind(card_id)
+            .execute(&pool)
+            .await
+            .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            sqlx::query(
+                "INSERT INTO task_dispatches
              (id, kanban_card_id, dispatch_type, status, title, context,
               created_at, updated_at, completed_at)
              VALUES ($1, $2, 'implementation', 'cancelled', 'guard',
                      '{}', NOW(), NOW(), NOW())",
-        )
-        .bind(dispatch_id)
-        .bind(card_id)
-        .execute(&pool)
-        .await
-        .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        seed_session_with_selectors(&pool, session_key, "idle", Some(dispatch_id)).await;
+            )
+            .bind(dispatch_id)
+            .bind(card_id)
+            .execute(&pool)
+            .await
+            .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            seed_session_with_selectors(&pool, session_key, "idle", Some(dispatch_id)).await;
 
-        // Caller asks for retry=true. Guard must reject both the failure
-        // overwrite and the retry creation.
-        let retry_meta =
-            disconnect_session_and_prepare_retry_pg(&pool, session_key, Some(dispatch_id), true)
-                .await
-                .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert!(
-            retry_meta.is_none(),
-            "cancelled dispatch must not produce retry metadata"
-        );
+            // Caller asks for retry=true. Guard must reject both the failure
+            // overwrite and the retry creation.
+            let retry_meta = disconnect_session_and_prepare_retry_pg(
+                &pool,
+                session_key,
+                Some(dispatch_id),
+                true,
+            )
+            .await
+            .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert!(
+                retry_meta.is_none(),
+                "cancelled dispatch must not produce retry metadata"
+            );
 
-        // Dispatch status remains 'cancelled' (NOT overwritten to 'failed').
-        let dispatch_status: String =
-            sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
-                .bind(dispatch_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
-        assert_eq!(
-            dispatch_status, "cancelled",
-            "force-kill must not overwrite cancelled → failed"
-        );
+            // Dispatch status remains 'cancelled' (NOT overwritten to 'failed').
+            let dispatch_status: String =
+                sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+                    .bind(dispatch_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
+            assert_eq!(
+                dispatch_status, "cancelled",
+                "force-kill must not overwrite cancelled → failed"
+            );
 
-        // Session row is still disconnected (force-kill side effect is fine).
-        let (session_status, active_dispatch_id, _, _) = session_state(&pool, session_key).await;
-        assert_eq!(session_status, "disconnected");
-        assert_eq!(active_dispatch_id, None);
+            // Session row is still disconnected (force-kill side effect is fine).
+            let (session_status, active_dispatch_id, _, _) =
+                session_state(&pool, session_key).await;
+            assert_eq!(session_status, "disconnected");
+            assert_eq!(active_dispatch_id, None);
 
-        pool.close().await;
-        pg_db.drop().await;
+            pool.close().await;
+            pg_db.drop().await;
+        }
     }
 }
 
@@ -1949,6 +2187,18 @@ pub(crate) async fn reconcile_orphaned_tmuxless_session_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> bool {
+    let resolved_session_key =
+        match resolve_session_locator_pg(pool, session_key, "orphan reconcile").await {
+            Ok(Some(resolved_session_key)) => resolved_session_key,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::utils::redact::redact_known_secrets(&error),
+                    "[dispatched-sessions] orphan reconciliation locator resolution failed"
+                );
+                return false;
+            }
+        };
     match sqlx::query(
         "UPDATE sessions
          SET status = 'disconnected'
@@ -1956,7 +2206,7 @@ pub(crate) async fn reconcile_orphaned_tmuxless_session_pg(
            AND status = 'idle'
            AND active_dispatch_id IS NULL",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .execute(pool)
     .await
     {
@@ -1981,10 +2231,14 @@ pub(crate) async fn session_last_seen_unix_nanos_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> Option<i64> {
+    let resolved_session_key = resolve_session_locator_pg(pool, session_key, "last-seen session")
+        .await
+        .ok()
+        .flatten()?;
     let last_seen: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
         "SELECT COALESCE(last_heartbeat, created_at) FROM sessions WHERE session_key = $1",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .fetch_optional(pool)
     .await
     .ok()
@@ -2000,6 +2254,18 @@ pub(crate) async fn refresh_session_heartbeat_by_key_to_unix_nanos_pg(
     session_key: &str,
     unix_nanos: i64,
 ) -> bool {
+    let resolved_session_key =
+        match resolve_session_locator_pg(pool, session_key, "heartbeat session").await {
+            Ok(Some(resolved_session_key)) => resolved_session_key,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::utils::redact::redact_known_secrets(&error),
+                    "[dispatched-sessions] heartbeat locator resolution failed"
+                );
+                return false;
+            }
+        };
     let secs = unix_nanos.div_euclid(1_000_000_000);
     let nanos = unix_nanos.rem_euclid(1_000_000_000) as u32;
     let Some(activity_at) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos) else {
@@ -2013,7 +2279,7 @@ pub(crate) async fn refresh_session_heartbeat_by_key_to_unix_nanos_pg(
          )
          WHERE session_key = $1",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .bind(activity_at)
     .execute(pool)
     .await
@@ -2100,6 +2366,18 @@ pub(crate) async fn disconnect_stale_fixed_session_by_key_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> usize {
+    let resolved_session_key =
+        match resolve_session_locator_pg(pool, session_key, "stale session").await {
+            Ok(Some(resolved_session_key)) => resolved_session_key,
+            Ok(None) => return 0,
+            Err(error) => {
+                tracing::warn!(
+                    error = %crate::utils::redact::redact_known_secrets(&error),
+                    "[dispatched-sessions] stale-session locator resolution failed"
+                );
+                return 0;
+            }
+        };
     let stale_dispatches = match sqlx::query_scalar::<_, String>(
         "SELECT active_dispatch_id
          FROM sessions
@@ -2109,7 +2387,7 @@ pub(crate) async fn disconnect_stale_fixed_session_by_key_pg(
            AND active_dispatch_id IS NOT NULL
            AND COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '6 hours'",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .fetch_all(pool)
     .await
     {
@@ -2155,7 +2433,7 @@ pub(crate) async fn disconnect_stale_fixed_session_by_key_pg(
            AND status IN ('working', 'turn_active')
            AND COALESCE(last_heartbeat, created_at) < NOW() - INTERVAL '6 hours'",
     )
-    .bind(session_key)
+    .bind(&resolved_session_key)
     .execute(pool)
     .await
     {
@@ -2240,6 +2518,8 @@ pub(crate) struct HookSessionUpsert<'a> {
     pub(crate) channel_id: Option<&'a str>,
     pub(crate) claude_session_id: Option<&'a str>,
     pub(crate) raw_provider_session_id: Option<&'a str>,
+    pub(crate) turn_start_nonce: Option<&'a str>,
+    pub(crate) dispatched_origin: bool,
 }
 
 pub(crate) struct DeleteSessionResult {
@@ -2248,6 +2528,7 @@ pub(crate) struct DeleteSessionResult {
 }
 
 pub(crate) struct ProviderSessionIds {
+    pub(crate) resolved_session_key: String,
     pub(crate) claude_session_id: Option<String>,
     pub(crate) raw_provider_session_id: Option<String>,
     pub(crate) cwd: Option<String>,
@@ -2279,86 +2560,10 @@ pub(crate) async fn upsert_hook_session_pg(
     pool: &PgPool,
     params: HookSessionUpsert<'_>,
 ) -> Result<bool, String> {
-    // `tokens` is now an `Option<i64>`. The UPSERT preserves the previous
-    // value when the caller didn't supply one (metadata-only hook), and only
-    // refreshes `tokens_updated_at` when an explicit snapshot arrives.
-    let row = sqlx::query(
-        "INSERT INTO sessions (
-            session_key,
-            instance_id,
-            agent_id,
-            provider,
-            status,
-            session_info,
-            model,
-            tokens,
-            tokens_updated_at,
-            cwd,
-            active_dispatch_id,
-            thread_channel_id,
-            channel_id,
-            claude_session_id,
-            raw_provider_session_id,
-            claude_session_id_recorded_at,
-            last_heartbeat
-         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7,
-            COALESCE($8, 0),
-            CASE WHEN $8 IS NOT NULL THEN NOW() ELSE NULL END,
-            $9, $10, $11, $12, $13, $14,
-            CASE WHEN NULLIF(BTRIM($13), '') IS NOT NULL THEN NOW() ELSE NULL END,
-            NOW()
-         )
-         ON CONFLICT(session_key) DO UPDATE SET
-            status = EXCLUDED.status,
-            instance_id = COALESCE(NULLIF(BTRIM(EXCLUDED.instance_id), ''), sessions.instance_id),
-            provider = EXCLUDED.provider,
-            session_info = COALESCE(EXCLUDED.session_info, sessions.session_info),
-            model = COALESCE(EXCLUDED.model, sessions.model),
-            tokens = CASE WHEN $8 IS NOT NULL THEN EXCLUDED.tokens ELSE sessions.tokens END,
-            tokens_updated_at = CASE WHEN $8 IS NOT NULL THEN NOW() ELSE sessions.tokens_updated_at END,
-            cwd = COALESCE(EXCLUDED.cwd, sessions.cwd),
-            active_dispatch_id = CASE
-              WHEN lower(EXCLUDED.status) IN ('disconnected', 'aborted') THEN NULL
-              WHEN EXCLUDED.active_dispatch_id IS NOT NULL THEN EXCLUDED.active_dispatch_id
-              ELSE sessions.active_dispatch_id
-            END,
-            agent_id = COALESCE(NULLIF(BTRIM(EXCLUDED.agent_id), ''), NULLIF(BTRIM(sessions.agent_id), '')),
-            thread_channel_id = COALESCE(EXCLUDED.thread_channel_id, sessions.thread_channel_id),
-            channel_id = COALESCE(EXCLUDED.channel_id, sessions.channel_id),
-            claude_session_id = COALESCE(EXCLUDED.claude_session_id, sessions.claude_session_id),
-            claude_session_id_recorded_at = CASE
-              WHEN EXCLUDED.claude_session_id IS NULL THEN sessions.claude_session_id_recorded_at
-              WHEN sessions.claude_session_id IS DISTINCT FROM EXCLUDED.claude_session_id THEN NOW()
-              ELSE COALESCE(sessions.claude_session_id_recorded_at, NOW())
-            END,
-            raw_provider_session_id = COALESCE(EXCLUDED.raw_provider_session_id, sessions.raw_provider_session_id),
-            last_heartbeat = NOW()
-         RETURNING (xmax = 0) AS inserted",
-    )
-    .bind(params.session_key)
-    .bind(params.instance_id)
-    .bind(params.agent_id)
-    .bind(params.provider)
-    .bind(params.status)
-    .bind(params.session_info)
-    .bind(params.model)
-    .bind(params.tokens)
-    .bind(params.cwd)
-    .bind(params.active_dispatch_id)
-    .bind(params.thread_channel_id)
-    .bind(params.channel_id)
-    .bind(params.claude_session_id)
-    .bind(params.raw_provider_session_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| format!("upsert postgres session {}: {error}", params.session_key))?;
-    row.try_get::<bool, _>("inserted").map_err(|error| {
-        format!(
-            "decode upsert outcome for session {}: {error}",
-            params.session_key
-        )
-    })
+    crate::db::dispatched_session_canonical_identity::upsert_legacy_hook_session_pg(pool, params)
+        .await
+        .map(|outcome| outcome.inserted)
+        .map_err(|error| format!("upsert postgres session: {error:?}"))
 }
 
 pub(crate) async fn cleanup_disconnected_sessions_pg(pool: &PgPool) -> Result<u64, String> {
@@ -2373,18 +2578,29 @@ pub(crate) async fn delete_session_by_key_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> Result<DeleteSessionResult, String> {
-    let session_id = sqlx::query_scalar::<_, i64>("SELECT id FROM sessions WHERE session_key = $1")
-        .bind(session_key)
-        .fetch_optional(pool)
+    let mut tx = pool
+        .begin()
         .await
-        .map_err(|error| format!("{error}"))?;
-
-    let deleted = sqlx::query("DELETE FROM sessions WHERE session_key = $1")
-        .bind(session_key)
-        .execute(pool)
+        .map_err(|error| format!("begin session delete transaction: {error}"))?;
+    let session_id =
+        crate::db::dispatched_session_canonical_identity::resolve_session_id_for_mutation_pg(
+            &mut tx,
+            session_key,
+        )
         .await
-        .map_err(|error| format!("{error}"))?
-        .rows_affected();
+        .map_err(|error| format!("resolve session delete locator: {error:?}"))?;
+    let deleted = match session_id {
+        Some(session_id) => sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("delete postgres session: {error}"))?
+            .rows_affected(),
+        None => 0,
+    };
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit session delete transaction: {error}"))?;
 
     Ok(DeleteSessionResult {
         session_id,
@@ -2397,6 +2613,11 @@ pub(crate) async fn load_provider_session_ids_pg(
     session_key: &str,
     provider: Option<&str>,
 ) -> Result<Option<ProviderSessionIds>, String> {
+    let resolved_session_key =
+        resolve_session_locator_pg(pool, session_key, "provider-session").await?;
+    let Some(resolved_session_key) = resolved_session_key else {
+        return Ok(None);
+    };
     let result = if let Some(provider) = provider {
         sqlx::query(
             "SELECT claude_session_id, raw_provider_session_id, cwd,
@@ -2408,7 +2629,7 @@ pub(crate) async fn load_provider_session_ids_pg(
              FROM sessions
              WHERE session_key = $1 AND provider = $2",
         )
-        .bind(session_key)
+        .bind(&resolved_session_key)
         .bind(provider)
         .fetch_optional(pool)
         .await
@@ -2423,7 +2644,7 @@ pub(crate) async fn load_provider_session_ids_pg(
              FROM sessions
              WHERE session_key = $1",
         )
-        .bind(session_key)
+        .bind(&resolved_session_key)
         .fetch_optional(pool)
         .await
     };
@@ -2431,6 +2652,7 @@ pub(crate) async fn load_provider_session_ids_pg(
     let row = result.map_err(|error| format!("{error}"))?;
     row.map(|row| {
         Ok(ProviderSessionIds {
+            resolved_session_key: resolved_session_key.clone(),
             claude_session_id: row.try_get("claude_session_id")?,
             raw_provider_session_id: row.try_get("raw_provider_session_id")?,
             cwd: row.try_get("cwd")?,
@@ -2543,21 +2765,39 @@ pub(crate) async fn clear_session_id_by_key_pg(
     pool: &PgPool,
     session_key: &str,
 ) -> Result<u64, String> {
-    sqlx::query(
-        "UPDATE sessions
-         SET claude_session_id = NULL,
-             raw_provider_session_id = NULL,
-             claude_session_id_recorded_at = NULL,
-             raw_provider_transcript_len_watermark = 0,
-             raw_provider_transcript_watermark_session_id = NULL,
-             raw_provider_transcript_growth_proven = FALSE
-         WHERE session_key = $1",
-    )
-    .bind(session_key)
-    .execute(pool)
-    .await
-    .map(|result| result.rows_affected())
-    .map_err(|error| format!("{error}"))
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin session selector clear transaction: {error}"))?;
+    let session_id =
+        crate::db::dispatched_session_canonical_identity::resolve_session_id_for_mutation_pg(
+            &mut tx,
+            session_key,
+        )
+        .await
+        .map_err(|error| format!("resolve session selector clear locator: {error:?}"))?;
+    let cleared = match session_id {
+        Some(session_id) => sqlx::query(
+            "UPDATE sessions
+             SET claude_session_id = NULL,
+                 raw_provider_session_id = NULL,
+                 claude_session_id_recorded_at = NULL,
+                 raw_provider_transcript_len_watermark = 0,
+                 raw_provider_transcript_watermark_session_id = NULL,
+                 raw_provider_transcript_growth_proven = FALSE
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| format!("clear postgres session selectors: {error}"))?
+        .rows_affected(),
+        None => 0,
+    };
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit session selector clear transaction: {error}"))?;
+    Ok(cleared)
 }
 
 pub(crate) async fn update_session_pg(

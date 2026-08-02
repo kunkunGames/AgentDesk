@@ -13,14 +13,60 @@ use super::SharedData;
 /// every queued channel from mailbox snapshots.
 pub(in crate::services::discord) const TURN_COMPLETION_EVENT_BUS_CAPACITY: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::services::discord) enum TurnCompletionPhase {
+    MailboxReleased,
+    QueueEligible,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::services::discord) struct TurnCompletionEvent {
     pub(in crate::services::discord) channel_id: ChannelId,
+    pub(in crate::services::discord) turn_id: Option<u64>,
+    pub(in crate::services::discord) phase: TurnCompletionPhase,
 }
 
 impl TurnCompletionEvent {
     pub(in crate::services::discord) fn new(channel_id: ChannelId) -> Self {
-        Self { channel_id }
+        Self {
+            channel_id,
+            turn_id: None,
+            phase: TurnCompletionPhase::QueueEligible,
+        }
+    }
+
+    pub(in crate::services::discord) fn for_turn(channel_id: ChannelId, turn_id: u64) -> Self {
+        Self {
+            channel_id,
+            turn_id: Some(turn_id),
+            phase: TurnCompletionPhase::QueueEligible,
+        }
+    }
+
+    pub(in crate::services::discord) fn mailbox_released(
+        channel_id: ChannelId,
+        turn_id: Option<u64>,
+    ) -> Self {
+        Self {
+            channel_id,
+            turn_id,
+            phase: TurnCompletionPhase::MailboxReleased,
+        }
+    }
+
+    pub(in crate::services::discord) fn queue_eligible(
+        channel_id: ChannelId,
+        turn_id: Option<u64>,
+    ) -> Self {
+        Self {
+            channel_id,
+            turn_id,
+            phase: TurnCompletionPhase::QueueEligible,
+        }
+    }
+
+    pub(in crate::services::discord) fn queue_is_eligible(&self) -> bool {
+        self.phase == TurnCompletionPhase::QueueEligible
     }
 }
 
@@ -60,13 +106,28 @@ pub(in crate::services::discord) fn subscribe_turn_completion_events(
     shared.turn_completion_events.subscribe()
 }
 
+pub(in crate::services::discord) fn publish_queue_eligible_completion_event(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    turn_id: Option<u64>,
+) {
+    publish_turn_completion_event(
+        shared,
+        TurnCompletionEvent::queue_eligible(channel_id, turn_id),
+    );
+}
+
 pub(in crate::services::discord) fn publish_mailbox_release_completion_event(
     shared: &SharedData,
     channel_id: ChannelId,
+    turn_id: Option<u64>,
     finish: &FinishTurnResult,
 ) {
     if finish.removed_token.is_some() {
-        publish_turn_completion_event(shared, TurnCompletionEvent::new(channel_id));
+        publish_turn_completion_event(
+            shared,
+            TurnCompletionEvent::queue_eligible(channel_id, turn_id),
+        );
     }
 }
 

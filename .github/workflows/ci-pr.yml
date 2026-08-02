@@ -7,11 +7,10 @@ on:
   # compute. Deduping via the concurrency group instead would cancel the older
   # run, but the `*_required_context` mirrors run `if: always()` and FAIL CLOSED
   # on a `cancelled` upstream — so cancellation surfaces spurious required-check
-  # failures. Dropping the redundant push trigger removes the duplicate at the
-  # source with no cancellation. Branch CI is obtained by opening a PR; main is
-  # covered by ci-main.yml.
+  # failures. Dropping both the redundant push trigger and manual dispatch
+  # prevents any non-candidate run from publishing the required `Script checks`
+  # context. Branch CI is obtained by opening a PR; main is covered by ci-main.yml.
   pull_request:
-  workflow_dispatch:
 
 concurrency:
   # A PR number is unique inside the base repository, unlike `head_ref`: two
@@ -31,6 +30,9 @@ env:
   RUSTC_WRAPPER: sccache
   SCCACHE_CACHE_SIZE: 10G
   SCCACHE_GHA_ENABLED: "true"
+  # Pull requests may restore default-branch sccache entries but never write
+  # branch-local shards into the repository-wide 10GB cache budget.
+  SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && 'READ_ONLY' || 'READ_WRITE' }}
   POSTGRES_SERVICE_IMAGE: ${{ vars.AGENTDESK_POSTGRES_SERVICE_IMAGE }}
 
 jobs:
@@ -125,10 +127,39 @@ jobs:
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
               - 'src/services/discord/outbound/source_registry.rs'
+              - 'src/services/queue.rs'
+              - 'src/services/session_forwarding.rs'
+              - 'src/services/session_forwarding/**'
+              - 'src/server/routes/queue_api.rs'
+              - 'src/server/resource_locks.rs'
               # #4460: recovery owns production-shaped PostgreSQL/outbox
               # tests; changes to the owner or its sidecars must run them.
               - 'src/services/discord/health/recovery.rs'
               - 'src/services/discord/health/recovery/**'
+              - 'src/services/discord/watchers/lifecycle/restore_tests.rs'
+              - 'src/services/maintenance/jobs/worktree_orphan_sweep.rs'
+              - 'src/services/pipeline_override.rs'
+              # #5025: terminal-delivery evidence routing and every local
+              # producer/epilogue sibling run in `test_fast`, whose registered
+              # required mirror is `Fast targeted tests (ubuntu-latest)`.
+              - 'src/services/discord/inflight.rs'
+              - 'src/services/discord/inflight/**'
+              - 'src/services/discord/tmux_watcher.rs'
+              - 'src/services/discord/tmux_watcher/**'
+              - 'src/services/discord/turn_bridge/terminal_outcome_delivery.rs'
+              - 'src/services/discord/turn_bridge/terminal_outcome_delivery/**'
+              - 'src/services/scheduled_messages.rs'
+              - 'src/services/scheduled_messages/**'
+              - 'src/services/discord/outbound/source_registry.rs'
+              # #4985: footer marker changes require the protected targeted lane.
+              # Glob rather than a file list: enumerating siblings silently drops
+              # newly extracted modules (footer_only_marker.rs was created by this
+              # PR and missed the list), which skips the lane for the very file
+              # the change lives in.
+              - 'src/services/discord/task_notification_delivery/**'
+              - 'src/services/discord/tmux.rs'
+              - 'src/services/discord/tmux_watcher/discrete_trigger_marker.rs'
+              - 'src/services/discord/tui_prompt_relay/task_notification_prompt.rs'
               - 'src/services/message_outbox.rs'
               - 'src/services/message_outbox_recovery.rs'
               - 'src/services/message_outbox_recovery_support.rs'
@@ -287,14 +318,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
       - name: dashboard build/test
         run: ./scripts/verify-dashboard.sh
 
-  # Ubuntu Rust lane: canonical fast check. Gated on the broad rust_or_policy
+  # Ubuntu Rust lane: canonical fast compile check. Gated on the broad rust_or_policy
   # filter so a `policies/*.js`, `scripts/*.sh`, `.github/workflows/**`, or
   # Node package change still gets a Rust check on Linux.
   #
@@ -303,7 +334,7 @@ jobs:
   # job compiles the `relay_state_contract_refs` blocks, which is the only proof
   # that each contract symbol still exists.
   check_fast:
-    name: Fast check + non-PG tests (${{ matrix.os }})
+    name: Fast compile check (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true'
     runs-on: ${{ matrix.os }}
@@ -326,62 +357,48 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
       # starves the 10GB GHA cache quota, evicting sccache shards (observed
       # Rust hit-rate collapse: 99.80% → 0.00% within hours of merges). See
       # docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
 
       - name: Policy JS unit tests
         run: npm run test:policies
 
-      - name: just check
-        run: just check
-        env:
-          # Cold `cargo test --all-targets` on the 16GB ubuntu runner peaks over
-          # RAM during codegen+link (SIGTERM/143). Two step-scoped levers keep
-          # peak RSS under the ceiling; test semantics are unchanged (neither
-          # affects which tests run or their results). Step-scoped so no other
-          # Rust job's resource envelope is touched.
-          #   1. Cap parallel compile jobs at 2 (default = 4 vCPU) to bound
-          #      concurrent rustc/link.
-          CARGO_BUILD_JOBS: "2"
-          #   2. Drop debuginfo for the dev/test profiles. Linking many
-          #      `--all-targets` test binaries with full debuginfo is the
-          #      dominant peak-memory source; `-j2` alone still OOM'd on the
-          #      link phase, so strip it here. CI test failures still report
-          #      panics/asserts; only source-line debug data is omitted.
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
+      # `lint` owns fmt/clippy in its independent required mirror. Keep this
+      # required Ubuntu lane to compilation and policy tests; main and nightly
+      # retain the longer non-PG test coverage outside the PR critical path.
+      - name: cargo check
+        run: just cargo-check
 
       - name: sccache stats
         if: always()
         shell: bash
         run: sccache --show-stats || true
 
-  # Cross-OS Rust compile lanes: macOS + Windows. Gated on the narrower
-  # rust_compile filter so docs-only, dashboard-only, JS-policy-only,
-  # script-only, workflow-metadata-only, and Node-package-only PRs skip the
-  # ~25 min macOS lane and the ~30 min Windows lane entirely. Nightly still
-  # exercises the full matrix daily, so cross-OS Rust drift cannot land
+  # Cross-OS Rust compile lane. Gated on the narrower rust_compile filter so
+  # docs-only, dashboard-only, JS-policy-only, script-only, workflow-metadata-
+  # only, and Node-package-only PRs skip Windows compilation. Nightly retains
+  # the full macOS/Windows test matrix, so cross-OS Rust drift cannot land
   # silently.
   check_fast_cross_os:
+    # Keep this advisory job name stable: the infrastructure-failure classifier
+    # identifies its non-blocking diagnostics by this exact context string.
     name: Fast check + non-PG tests (${{ matrix.os }})
     needs: changes
     # Advisory (non-required) cross-OS lane. Run only when a Rust-compile
@@ -433,27 +450,26 @@ jobs:
 
       - name: Setup sccache
         if: runner.os != 'macOS'
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
       # starves the 10GB GHA cache quota, evicting sccache shards (observed
       # Rust hit-rate collapse: 99.80% → 0.00% within hours of merges). See
       # docs/ci/sccache-setup.md §4.2.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # Stage 1 keeps Windows inline and default-feature-only instead of
-      # `just check`: this lane's job is cross-OS compile and targeted test
-      # signal, while fmt/staged clippy and full workspace checks are
-      # authoritative in the Ubuntu jobs above.
+      # Keep Windows inline and default-feature-only instead of `just check`.
+      # This PR lane provides cross-OS compile signal only; main-push and
+      # nightly retain the Windows runtime and non-PG test coverage outside the
+      # PR critical path (#4747 option 2). Ubuntu fmt/staged clippy and full
+      # workspace checks remain authoritative in the jobs above.
       - name: cargo check
         shell: bash
         env:
@@ -461,38 +477,6 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: cargo check --workspace --all-targets
-
-      # #4466: compile-only coverage cannot prove Win32 named-mutex ownership
-      # or cross-process blocking. This non-advisory step runs the real child
-      # process proof on the Windows runner.
-      - name: Discord thread-create cross-process lock
-        shell: bash
-        env:
-          BASH_ENV: /dev/null
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo test --lib discord_thread_create -- --test-threads=1
-
-      - name: cargo test (non-PG, targeted subset)
-        # Windows is an advisory anti-rot lane for this Unix-only project; its
-        # known test/runner flakes must not paint the PR red. See #4202/#4423.
-        continue-on-error: true
-        shell: bash
-        env:
-          BASH_ENV: /dev/null
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: |
-          set -euo pipefail
-          cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1
-          cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
-          env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
-          python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
-          cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
-          cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
 
       - name: sccache stats
         if: always() && runner.os != 'macOS'
@@ -584,6 +568,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
       # Preserve the full serial PostgreSQL suite while reducing cold-link
       # time and memory exposure on hosted runners. Assertions and panic text
       # remain available; only native debug symbols are omitted.
@@ -606,19 +591,89 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale: `target/` excluded to protect sccache
       # GHA cache quota.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-fast-tests-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-fast-tests-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Observe curated lane selections
+        timeout-minutes: 20
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -o pipefail
+          python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee "$RUNNER_TEMP/selection-evidence-test-fast.log"
+
+      - name: Require observer summary
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          python3 scripts/check_test_target_integrity.py --verify-selection-evidence "$RUNNER_TEMP/selection-evidence-test-fast.log"
+
+      - name: Footer-only marker regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres
+          cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres
+
+      - name: Trusted session forwarding tests
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres
+
+      # #5040: `intake_dispatch::tests` predates the lane-coverage ratchet and is
+      # baselined debt. Select the telemetry-only admission regressions explicitly
+      # in this branch-protected lane so a zero-test filter cannot pass unnoticed.
+      - name: Telemetry-only intake authority regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres
+
+      # #5025: this job is mirrored by the branch-protected
+      # `Fast targeted tests (ubuntu-latest)` context above. Keep the router test
+      # and both real identity-gate producers together so a red WARN regression
+      # blocks merge instead of remaining advisory.
+      - name: Terminal delivery evidence regressions
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests
+          env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row
+          env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn
 
       - name: just test-postgres
         timeout-minutes: 20
@@ -651,6 +706,7 @@ jobs:
       PGPORT: "5432"
       PGUSER: postgres
       PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -663,21 +719,54 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-recovery-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-recovery-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Observe curated lane selections
+        timeout-minutes: 20
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -o pipefail
+          python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee "$RUNNER_TEMP/selection-evidence-high-risk.log"
+
+      - name: Require observer summary
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          python3 scripts/check_test_target_integrity.py --verify-selection-evidence "$RUNNER_TEMP/selection-evidence-high-risk.log"
 
       - name: High-risk recovery lane
-        run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
+        run: |
+          cargo test --lib high_risk_recovery:: -- --test-threads=1
+          cargo test --lib services::discord::recovery_engine::state_extractors::tests -- --test-threads=1
+          cargo test --lib services::discord::relay_health::tests -- --test-threads=1
+          cargo test --lib services::discord::health::session_enrichment::tests -- --test-threads=1
+          cargo test --lib services::discord::health::relay_dead_reattach::tests -- --test-threads=1
+          cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
+          cargo test --lib services::discord::terminal_ui_obligation::tests -- --test-threads=1
+
+      # #5003: this production-path E2E previously ran only in main's broad
+      # non-PG lane, so test-only fixes could merge without executing it on PRs.
+      - name: Local model durable queue wake regression
+        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1
 
       - name: Stop PostgreSQL service
         if: always()
@@ -688,7 +777,7 @@ jobs:
         run: sccache --show-stats || true
 
   high_risk_recovery_required_context:
-    name: High-risk recovery required context (ubuntu-latest)
+    name: High-risk recovery path-filter mirror (ubuntu-latest)
     needs:
       - changes
       - high-risk-recovery
@@ -697,7 +786,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Mirror high-risk recovery result for branch protection
+      - name: Mirror high-risk recovery result across path-filter skips
         env:
           CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
           FILTER_NAME: high_risk_recovery
@@ -709,7 +798,9 @@ jobs:
   lint:
     name: Lint
     needs: changes
-    if: needs.changes.outputs.rust_or_policy == 'true'
+    # Match check_fast's composite gate so relay-contract-only changes retain
+    # fmt/clippy coverage after duplicate linting was removed from that job.
+    if: needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -726,18 +817,16 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `check_fast` for rationale.
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: just fmt-check
         run: just fmt-check
@@ -762,8 +851,8 @@ jobs:
       - name: Mirror lint result for branch protection
         env:
           CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
-          FILTER_NAME: rust_or_policy
-          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy }}
+          FILTER_NAME: rust_or_policy_or_relay_contract
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true' }}
           UPSTREAM_JOB_NAME: lint
           UPSTREAM_RESULT: ${{ needs.lint.result }}
         run: ./scripts/required-check-mirror.sh
@@ -807,6 +896,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `scripts/check_pg_test_lane_membership.py` stays dependency-free on
+      # purpose, but `tests/test_check_pg_test_lane_membership.py` uses PyYAML
+      # as an independent oracle to prove the hand-written `tests/fixtures/
+      # pg_lane/jobs_*.yml` inputs really are the YAML shapes the dependency-free
+      # parser claims to handle. setup-python gives a clean interpreter, so the
+      # oracle must be installed explicitly or the suite errors on import.
+      - name: Install script-test Python deps
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
       - name: Large file guard
         shell: bash
         run: |
@@ -828,6 +926,10 @@ jobs:
 
       - name: Run script checks
         run: ./scripts/ci-script-checks.sh
+        env:
+          # Required Script checks only run on protected PR candidates. Their
+          # synthetic merge first parent is the exact immutable base snapshot.
+          TEST_LANE_BASELINE_REF: HEAD^1
 
       # Keep high-value relay ratchets as explicit named steps as well as in the
       # aggregate script suite so their failure surface is immediately visible.

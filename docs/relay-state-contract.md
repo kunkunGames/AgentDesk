@@ -17,6 +17,73 @@ If you change relay ownership, every invariant below must continue to hold.
 A regression here is a user-visible relay miss / duplicate, so keep the
 checks loud (debug_assert + observability record) instead of silent.
 
+The persistence and node-ownership status of these values is classified in
+[`relay-live-state-taxonomy.md`](relay-live-state-taxonomy.md). In particular,
+a durable sidecar is host-local unless a PostgreSQL-backed ownership contract
+explicitly says otherwise.
+
+## Canonical owner, dependency, and acceptance contract (Task #32)
+
+This is the release acceptance contract, not a claim that the target authority
+already exists. The **required target** assigns every accepted Discord source
+message ID exactly one immutable terminal intake disposition: `Steered` or
+`DurablyQueued`. `DurablyQueued` survives completion, worker replacement,
+shutdown, and restart until eventual drain; drain does not add or rewrite the
+intake disposition. Current production cannot claim this guarantee because it
+has no canonical disposition authority.
+
+### Current production versus required target
+
+| Surface | Current production authority | Required target / gap | Identity and linearization | Forbidden fallback / acceptance |
+|---|---|---|---|---|
+| Discord intake | Channel mailbox plus host-local `discord_pending_queue/<provider>/<token_hash>/<channel_id>.json`; no PostgreSQL disposition authority | Canonical durable admission store writes exactly one `Steered` or `DurablyQueued` disposition and preserves queued work through replacement/shutdown/restart to eventual drain | Intake starts with provider, channel/source message, turn/dispatch, and exact tmux incarnation when known. Transcript range/frontier is a later delivery-bound identity extension, not an intake prerequisite. One transaction/CAS is the target linearization point. | Reactions, panels, in-memory mailbox state, “busy” inference, or attempted sends are not acceptance. Concurrent replay yields one disposition; every durable queue row drains once. |
+| Terminal body | Single relay owner and shared delivery lease; host-local delivery record/frontier participates in dedup | Replacement-safe durable ownership and dedup authority over the full delivery identity | Full delivery identity is `(provider, channel_id, turn_id, dispatch_id, exact tmux session, generation, spawn nonce, transcript range/frontier)`. Target linearization is confirmed Discord transport plus identity-gated durable frontier commit. | No markerless POST, restored-body/fingerprint guess, legacy in-memory dedup, or fresh POST merely because edit failed. Owner/restart races yield one body and one monotonic frontier. |
+| Terminal ACK | Process-local bounded `RelayMetrics.terminal_outcomes` `VecDeque`; exact-sequence lookup exists but is neither durable nor replacement-safe | Durable exact-sequence typed outcome keyed by full delivery identity; currently unimplemented | Current typed outcomes are `Delivered`, `FreshDelivered`, `NotDelivered`, and `Unknown`-class provenance. Target sequence: pin identity/range and lease → enqueue sequence `N` → transport and commit attempt → durably record outcome `N` → watcher reads exactly `N`. | Never use `>= N`, another turn's ACK, timeout-as-success, blind skip, or blind resend. Every non-confirmed outcome reconciles the committed frontier. |
+| Status panel | Host-local `discord_status_panel_singletons` file stores only current message ID plus generation | `status_panel_transition_v2` journal/CAS model is dormant substrate with **zero production callers**; production transition authority remains unimplemented | Target transition is `Prepared → BindAuthorized → Bound → RetireAuthorized → Retired`, with typed failed/quarantined terminals and provider/channel/turn/candidate/generation/spawn-nonce identity. | Discord success and durable commit are separate. A success→commit crash may not delete the successful panel or create an unjournaled replacement; faults converge to at most one journal-owned panel. |
+| Terminal abort | Watcher calls platform kill by session name; termination audit and exit-reason writes are best-effort/fire-and-forget, with no exact-target revalidation or observed-exit authority | Required sequence, not current behavior: durable typed audit → exact session/pane/PID/generation/spawn-nonce revalidation → kill → bounded confirmation that that exact target exited | Closed typed provenance and full delivery/target identity are mandatory. Timeout, probe failure, or identity change is typed unconfirmed. | No plaintext-substring classification, session-name-only target, fabricated finalizer pin, or unconfirmed kill reported as success. The canonical main orchestration session is never an automatic target. |
+
+Missing or legacy identity fields are explicit typed states, never wildcards. The
+Discord-success↔durable-commit crash window remains `Unknown` until a stable
+nonce/message probe and frontier/journal reconciliation proves success or grants
+one retry. No production caller means no completion credit.
+
+### Verified dependency DAG and evidence boundary
+
+```text
+#4890 → #4911 → #4891 → #4860 → #4889
+#4909 ─────────→ #4891
+#4895 → #4896
+#4874 (independent)
+```
+
+`#4934` (dormant panel reducer), `#4933` (dormant typed completion codec), and
+`#4918` (deploy-gate containment) are substrate/containment only. `#4898` is
+closed-but-incomplete because trusted typed deployment evidence is absent. The
+discarded research commits `7a733441`, `53705ac3`, and `5cf5e7b` are forbidden
+as completion evidence. Closed issues, ancestry, unit tests, and abstractions
+without production callers cannot close a DAG edge.
+
+### Measurable completion gates
+
+1. **Disposition:** concurrent replay gives every accepted source ID exactly one
+   disposition; replacement, shutdown, and restart lose none; queued obligations
+   reach zero and drain once.
+2. **Actual Discord faults:** in a dedicated Discord channel run at least 20
+   accepted messages per injected 429/5xx, ACK delay, edit 404, post-accept
+   connection loss, and process death in the success→commit window. Preserve all
+   IDs, drain within five minutes after recovery, and observe zero duplicate
+   terminal bodies or unjournaled panels.
+3. **Ownership/ACK:** fault bridge, watcher, replacement, shutdown, and restart
+   on both sides of each linearization point; prove one emitter per range,
+   monotonic frontier, exact typed ACK, and reconciliation of every `Unknown`.
+4. **Panel/abort:** fault every panel transition and wrong-target abort race;
+   retain at most one current panel, require exact retire authority, produce zero
+   plaintext/session-name-only kills, and count success only after exact-target
+   exit confirmation.
+5. **Evidence:** each predecessor needs a production caller, focused regression,
+   and linked release evidence; exclude the substrate PRs, `#4898`, and all three
+   discarded commits.
+
 ### Reference format
 
 Code anchors below are **symbol-path references**, not `file:line` (which
@@ -34,8 +101,8 @@ halves, each by the tool that can actually prove its half:
 - **Existence is proven by the compiler.** Every `sym:` anchor here has a
   matching real reference in a `#[cfg(test)] mod relay_state_contract_refs`
   block (in `inflight/store.rs`, `turn_bridge/terminal_delivery.rs`,
-  `tmux_watcher/liveness.rs`, and `router/message_handler/watchdog.rs` — split
-  by module visibility). A reference is a `use <path> as _;` (functions/items),
+  `tmux_watcher/liveness.rs`, `router/message_handler/watchdog.rs`,
+  `mailbox_finish.rs`, and `session_relay_sink.rs` — split by module visibility). A reference is a `use <path> as _;` (functions/items),
   a `let _ = <Type>::<assoc_fn>;` (associated functions), or a
   `let _ = |x: &<Type>| { let _ = &x.<field>; };` (fields — `use` cannot name a
   field). Each fails to **compile** if its symbol is renamed, moved, or removed,
@@ -250,6 +317,170 @@ plan.
     it; standby yields to a live Watcher.
 
 ---
+
+## I7. session-bound parser hands off completed turn state before delivery
+
+- Definition: the session-local parser owns `buffer`, `full_response`, tool state,
+  and task-notification context only until it recognizes the current turn's
+  terminal record (`sym:session_relay_sink::turn_parser::SessionRelayParser::ingest_frame`).
+- Producer: `SessionRelayParser::ingest_frame` moves the completed response and
+  context into `SessionRelayDelivery`, then resets all turn-local fields before
+  returning the delivery to the asynchronous Discord transport.
+- Consumer: the next `StreamFrame` for the same tmux session may be ingested as
+  soon as the current delivery has been handed off; it must start from empty
+  turn-local state while preserving any unprocessed next-turn bytes in `buffer`.
+- Invariant: completed prose belongs exclusively to the emitted delivery. It may
+  not remain parser-owned until POST/edit success, failure, or ACK resolution.
+- Violation surface: a delayed or desynchronized transport lets the next turn
+  append to the completed `full_response`, re-publishing the previous turn as a
+  byte-identical prefix or merging several turns into one Discord message (#4365).
+- Invariant key: `session_parser_turn_handoff` (enforced by parser ownership and
+  regression tests; an observability producer can be added if this boundary
+  becomes fallible).
+
+## I8. mailbox turn cleanup is guarded by durable episode identity (#4595)
+
+- Definition:
+  - every modern `CancelToken` carries one immutable durable nonce
+    (`sym:provider::CancelToken::turn_nonce`), and the mailbox actor copies it
+    into `ChannelMailboxSnapshot::active_turn_nonce`
+    (`sym:turn_orchestrator::ChannelMailboxSnapshot::active_turn_nonce`) when it
+    serializes a turn admission;
+  - the same value is persisted in `InflightTurnState::turn_nonce`
+    (`sym:inflight::model::InflightTurnState::turn_nonce`).
+- Producers: Discord intake, headless intake, TUI-direct synthetic admission,
+  monitor auto-turn admission, and restart restoration bind the actor-owned
+  nonce to the durable row. Restart restoration preserves an explicit legacy
+  `None` instead of minting an unrelated modern episode.
+- Destructive consumer: stale durable-repair paths call
+  `mailbox_finish_turn_if_matches_episode_started_before`
+  (`sym:mailbox_finish::mailbox_finish_turn_if_matches_episode_started_before`),
+  whose single mailbox-actor handler compares `(user_msg_id, turn_nonce)` plus
+  the monotonic start cutoff before taking the active token.
+- Legacy policy: `None` is an exact legacy identity, never a wildcard. A legacy
+  row can finish only a legacy actor claim; it cannot finish a modern claim and
+  a modern row cannot finish a legacy claim.
+- Invariant: cleanup for stale episode A must be a destructive no-op when episode
+  B owns the same message ID under a different nonce, including when B claimed
+  before the sweep cutoff and its durable save is delayed. B's token, owner,
+  message ID, nonce, soft queue, and `global_active` remain unchanged.
+- Violation surface: a stale placeholder sweep or health repair cancels a live
+  same-message-ID successor, drops queued work, decrements `global_active`, and
+  can kill the successor's tmux session.
+- Invariant key: `mailbox_episode_identity_exact` (enforced by the actor predicate
+  and mutation-proven regression tests rather than an observe-only hook).
+
+## I9. every session-bound terminal POST holds the shared delivery lease (#4277)
+
+- Definition: terminal deliveries parsed by
+  `SessionRelayParser::ingest_frame`
+  (`sym:session_relay_sink::turn_parser::SessionRelayParser::ingest_frame`) carry
+  either their strict turn fence, an idle/catch-up ordered JSONL range, or the
+  legacy no-range shape.
+- Producer: `SessionBoundDiscordRelaySink::deliver_response`
+  (`sym:session_relay_sink::SessionBoundDiscordRelaySink::deliver_response`)
+  derives one lease coordinate before any Discord transport. Strict fenced
+  frames use `[turn_start_offset, terminal_consumed_end)`, ordered idle/catch-up
+  frames use their carried range, and unresolvable legacy frames still contend
+  on the degenerate key and zero-width coordinate.
+- Consumer: the sink and watcher share the channel's `DeliveryLeaseCell`; a lost
+  acquire is a deterministic not-delivered result and must never fall through to
+  a markerless POST.
+- Invariant: there is no session-bound terminal POST/edit path without first
+  winning the shared delivery lease. The controller short-replace path owns its
+  own acquire; all other terminal paths use `SinkDeliveryLeaseGuard`.
+- Violation surface: an inflight-less idle-tail frame POSTs without a lease while
+  the watcher independently wins the fallback-keyed lease for the same bytes,
+  producing a duplicate Discord response.
+- Invariant key: `session_terminal_post_lease_required` (enforced structurally by
+  the mandatory acquire and production-entry regression tests).
+- Consumer rule: a confirmed fresh-message POST returned by the controller is
+  preserved as a typed exact-sequence terminal resolution through
+  `sym:cluster::stream_relay::RelaySinkOutcome::terminal_fresh_delivered` and the
+  watcher transport-confirmation predicate.
+  `committed_to=None` and `persistence_recorded=false` describe missing frontier
+  authority or retry metadata; neither erases confirmed transport or authorizes
+  the watcher to acquire the released lease and POST the same body again.
+- Violation surface: folding confirmed fresh transport into `RelaySinkError` loses
+  its provenance; §3.2 then sees `committed < end`, reacquires the shared lease,
+  and sends a duplicate full response.
+
+## I10. idle JSONL cursors consume only classified drops or confirmed commits (#4536)
+
+- Definition: the idle backstop range decision
+  (`sym:session_relay_sink::idle_jsonl::idle_jsonl_suppressed_range_action`)
+  separates intentional classification drops from temporary inflight/grace
+  deferral.
+- Producer: confirmed ranged transport commits through
+  `SessionBoundDiscordRelaySink::advance_idle_range_after_confirmed_post`
+  (`sym:session_relay_sink::SessionBoundDiscordRelaySink::advance_idle_range_after_confirmed_post`),
+  which first persists the generation-scoped frontier via
+  `commit_ordered_jsonl_range`
+  (`sym:outbound::delivery_record::commit_ordered_jsonl_range`) and then advances
+  the in-memory watermark.
+- Consumer: the idle loop advances its local cursor only when the range is an
+  intentional drop or current-generation committed coverage reaches its end;
+  enqueue acceptance alone leaves the pending range retryable.
+- Invariant: active-turn, post-inflight-grace, and new-session-grace suppression
+  never consumes an uncommitted byte. A confirmed ranged POST must match the
+  queued wrapper generation and remain EOF-bounded before either authority is
+  advanced.
+- Violation surface: enqueue followed by transport/commit failure permanently
+  skips a wake/background answer, or a delayed range commits against a replaced
+  transcript and suppresses unrelated output.
+- Invariant key: `idle_cursor_confirmed_commit_only` (enforced structurally and by
+  cursor/commit/generation regression tests).
+
+## I11. edit failure does not authorize a fresh fallback POST (#4508)
+
+- Definition: the formatting layer's edit-only replace primitive
+  (`sym:formatting::replace_long_message_raw_deferred`) returns a typed edit
+  failure without issuing a fallback POST.
+- Producer: before awaiting the edit, the range owner captures the expected
+  watcher output path and nonzero generation. After edit failure it re-reads a
+  stable path+generation+EOF+durable-frontier snapshot with
+  `range_committed_after_edit_failure`
+  (`sym:outbound::delivery_record::range_committed_after_edit_failure`) while the
+  same `DeliveryLease` is still held. The delivery-record lock serializes
+  conforming frontier writes, and post-read path/generation/file-identity checks
+  reject wrapper rotation or transcript replacement during the snapshot.
+- Consumer: controller and legacy watcher short-replace paths suppress fallback
+  delivery only when the pre-edit identity still matches and fresh,
+  generation-matching, EOF-bounded coverage reaches the range end. Missing
+  markers, path or generation changes, unstable file metadata, unknown EOF, and
+  frontier past EOF remain fail-open for delivery and retain the existing
+  one-shot fallback.
+- Invariant: an edit failure is not fresh-send authority. Confirmed committed
+  coverage yields `AlreadyCommittedAfterEditFailure` with zero fallback POSTs and
+  no transport-success commit; watcher reconciliation uses the delivered-anchor-
+  aware guarded cleanup and clears placeholder/orphan tracking only after a
+  committed stale-placeholder delete. The delivered anchor itself and any case
+  without positive delivered-elsewhere proof remain tracked and preserved.
+  Otherwise, only a confirmed fallback POST may run the existing commit/advance
+  path.
+- Violation surface: a restart leaves a stale placeholder target, another owner
+  commits the JSONL range while the edit is awaited, Discord returns Unknown
+  Message, and the stale owner duplicates the already delivered response via a
+  fresh POST.
+- Invariant key: `edit_failure_fallback_requires_fresh_frontier` (enforced by
+  controller mutation-sensitive post-count tests, delivery-record generation/EOF
+  tests, and controller/legacy owner wiring tests).
+
+## I12. Bounded no-progress redrive (#4906)
+
+- Definition: a redrive cannot move below the committed frontier or enqueue the
+  same still-pending frontier twice.
+- Producer: the relay auto-healer computes the requested frontier as the maximum
+  of the watcher snapshot and committed frontier, then rejects already-covered
+  or identical pending requests before mutating watcher state.
+- Consumer: six no-progress actions enter a one-hour degraded backoff and then
+  re-arm the same stalled episode; reaching the cap never abandons recovery
+  permanently.
+- Violation surface: a frozen frontier is enqueued on every health pass, or a
+  capped stalled episode is never reconsidered after its bounded backoff.
+- Tracing events: `redrive_frontier_no_progress` and
+  `redrive_no_progress_capped`. This recovery path currently emits tracing logs
+  rather than `record_invariant_check` observability rows.
 
 ## How to add a new invariant
 

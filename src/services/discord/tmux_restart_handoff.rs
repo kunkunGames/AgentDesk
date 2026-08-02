@@ -61,7 +61,7 @@ fn seed_restart_handoff_session_metadata(
             category_name: None,
             last_active: tokio::time::Instant::now(),
             worktree: None,
-            born_generation: super::runtime_store::load_generation(),
+            born_generation: super::runtime_store::process_generation(),
         });
 
     let mut changed = false;
@@ -238,7 +238,8 @@ async fn clear_restart_handoff_provider_session(
         match build_restart_handoff_session_key(state, &shared.token_hash, provider_kind) {
             Some(key) => Some(key),
             None => {
-                super::adk_session::build_adk_session_key(shared, channel_id, provider_kind).await
+                super::adk_session::build_adk_session_key(shared, channel_id, provider_kind, None)
+                    .await
             }
         };
     let preserved_session_id = {

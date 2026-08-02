@@ -7,17 +7,30 @@
 
 pub(in crate::services::discord) mod anchor_repost;
 pub(in crate::services::discord) mod budget;
+mod destructive_commit;
 mod finalizer_identity;
 #[cfg(test)]
 mod invariant_test_capture;
 mod model;
+pub(in crate::services::discord) mod terminal_delivery_evidence_loss;
 
 // #3479: the pure domain model moved to `model.rs`; re-export every public
 // item at its original visibility so existing `inflight::*` / `super::*`
 // references across the discord module resolve unchanged.
 pub(in crate::services::discord) use model::{
-    InflightTurnIdentity, InflightTurnState, RelayOwnerKind, TurnSource, optional_message_id,
+    InflightTurnIdentity, InflightTurnState, RelayOwnerKind, TurnSource, opt_channel_id,
+    opt_message_id, optional_message_id,
 };
+
+impl InflightTurnState {
+    pub(in crate::services::discord) fn effective_busy_followup_retry_user_msg_id(&self) -> u64 {
+        if self.busy_followup_retry_user_msg_id == 0 {
+            self.user_msg_id
+        } else {
+            self.busy_followup_retry_user_msg_id
+        }
+    }
+}
 
 mod episode_guard;
 mod store;
@@ -29,13 +42,17 @@ mod store;
 // (root callers only) and is brought in via a plain import. `InflightStateFileLock`
 // is named nowhere outside `store` (it only flows as a return type), so it keeps
 // its module-tree visibility there without a parent re-export.
+pub(in crate::services::discord) use destructive_commit::{
+    CommitError, CommitEvidence, DestructiveCancelCommitOutcome, DestructiveCancelPinField,
+    commit_destructive_cancel_locked,
+};
 pub(in crate::services::discord) use episode_guard::{
     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
     adopt_and_lock_inflight_episode, lock_inflight_episode,
 };
 pub(in crate::services::discord) use store::InflightDeliveryRewindReason;
 use store::inflight_provider_dir;
-pub(in crate::services::discord::inflight) use store::inflight_state_path;
+pub(in crate::services::discord) use store::inflight_state_path;
 pub(crate) use store::lock_inflight_state_path;
 
 // #3715 / #3835: the rebind-origin dead-watcher/orphan-lock helpers PLUS the
@@ -47,9 +64,10 @@ mod rebind_reap;
 // discord-module / inflight-core lib code at its original `pub(super)` visibility
 // so `inflight::*` paths stay byte-identical after the #3835 move.
 pub(super) use self::rebind_reap::{
-    INFLIGHT_STALENESS_THRESHOLD_SECS, RebindReapOutcome, emit_reap_abandoned_rebind_origin,
-    inflight_state_is_stale, ownerless_external_input_inflight_is_stale, parse_started_at_unix,
-    parse_updated_at_unix, reap_abandoned_rebind_origin_locked, reap_orphan_inflight_locks,
+    DEAD_WATCHER_PROVEN_DEAD_SECS, INFLIGHT_STALENESS_THRESHOLD_SECS, RebindReapOutcome,
+    emit_reap_abandoned_rebind_origin, inflight_state_is_stale,
+    ownerless_external_input_inflight_is_stale, parse_started_at_unix, parse_updated_at_unix,
+    reap_abandoned_rebind_origin_locked, reap_orphan_inflight_locks,
     rebind_origin_deadline_secs_env, should_reap_abandoned_rebind_origin,
     sweep_reap_dead_watcher_rebind_origin,
 };
@@ -61,13 +79,11 @@ use self::rebind_reap::{reap_abandoned_rebind_origin_locked_in_root, rebind_orig
 // `super::*` unchanged without emitting unused-import warnings in the lib build.
 #[cfg(test)]
 use self::rebind_reap::{
-    DEAD_WATCHER_PROVEN_DEAD_SECS, ORPHAN_LOCK_REAP_MIN_AGE_SECS,
-    REBIND_ORIGIN_DEADLINE_SECS_DEFAULT, WatcherLiveness,
+    ORPHAN_LOCK_REAP_MIN_AGE_SECS, REBIND_ORIGIN_DEADLINE_SECS_DEFAULT, WatcherLiveness,
     ownerless_external_input_inflight_is_stale_at, proven_dead_from_signals,
     reap_dead_watcher_rebind_origin_locked, reap_dead_watcher_rebind_origin_locked_in_root,
     reap_orphan_inflight_locks_in_root, should_reap_dead_watcher_rebind_origin,
 };
-
 mod removal;
 pub(crate) use self::removal::invalidate_stale_generation;
 use self::removal::load_inflight_states_from_root;
@@ -127,30 +143,40 @@ mod save_store;
 // `super::persist_under_lock_preserving_updated_at` and the CAS children resolve
 // `validate_inflight_state_for_save` (via `use super::*`) unchanged.
 use self::store::{
-    load_inflight_state_unlocked, persist_under_lock, persist_under_lock_preserving_updated_at,
-    validate_inflight_state_for_save, validate_inflight_state_for_save_with_delivery_rewind_reason,
+    load_inflight_state_unlocked, persist_readopted_under_lock, persist_under_lock,
+    persist_under_lock_preserving_updated_at, validate_inflight_state_for_save,
+    validate_inflight_state_for_save_with_delivery_rewind_reason,
 };
 
 // Save cluster re-exports (original visibility mirrored). The save child declares
 // these `pub(in crate::services::discord)` (the absolute spelling of the parent's
 // original `pub(super)`), so this `pub(super)` re-export does not widen the surface.
+#[cfg(test)]
+pub(super) use self::save_store::save_inflight_state;
 pub(super) use self::save_store::{
-    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity, save_inflight_state,
+    CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity,
     save_inflight_state_create_new, save_inflight_state_if_absent,
 };
 pub(in crate::services::discord) use self::save_store::{
-    GuardedSaveOutcome, bind_recovery_anchor_if_matches_identity,
+    GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_if_matches_identity,
+    clear_long_running_placeholder_if_matches_identity,
     mark_readopted_from_inflight_if_identity_unchanged,
-    patch_restart_full_response_if_identity_unchanged,
+    patch_bridge_entry_state_if_identity_unchanged,
+    patch_bridge_entry_state_tracking_placeholder_clear,
+    patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
     persist_leak_recovery_response_offset_if_matches_identity_locked,
     persist_recovery_output_path_if_matches_identity_locked,
-    recovery_anchor_msg_id_if_matches_identity,
+    recovery_anchor_message_if_matches_identity, recovery_anchor_msg_id_if_matches_identity,
     save_existing_inflight_rebind_adoption_if_matches_episode,
     save_existing_inflight_rebind_adoption_if_matches_identity,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_episode,
     save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity,
     save_inflight_state_if_identity_matches_allow_output_restamp,
     save_inflight_state_if_identity_unchanged, save_inflight_state_if_matches_identity,
+    save_stream_tick_state_if_bridge_authority,
+    save_stream_tick_state_preserving_current_message_races,
+    stamp_claude_e_process_if_matches_identity, stamp_runtime_handoff_if_matches_identity,
+    touch_inflight_state_if_matches_identity,
 };
 // Explicit-root save seams reached only by the parent's / siblings' test modules.
 #[cfg(test)]
@@ -167,9 +193,11 @@ pub(crate) use self::clear_store::{
     request_inflight_abandon_if_matches_zero_owned,
 };
 pub(in crate::services::discord) use self::clear_store::{
+    archive_inflight_state_if_matches_identity_generation,
     clear_inflight_state_if_matches_identity,
     clear_inflight_state_if_matches_identity_after_delivery,
     clear_inflight_state_if_matches_identity_generation,
+    clear_inflight_state_if_matches_identity_returning_row,
     clear_inflight_state_if_matches_identity_turn_nonce,
     clear_lifecycle_inflight_state_if_matches_identity_after_death_evidence,
     clear_rebind_origin_inflight_state_if_matches_identity,
@@ -481,8 +509,15 @@ pub(super) fn mark_all_inflight_states_restart_mode(
     provider: &ProviderKind,
     restart_mode: InflightRestartMode,
 ) -> usize {
+    mark_all_inflight_states_restart_mode_checked(provider, restart_mode).unwrap_or(0)
+}
+
+pub(super) fn mark_all_inflight_states_restart_mode_checked(
+    provider: &ProviderKind,
+    restart_mode: InflightRestartMode,
+) -> Result<usize, String> {
     let Some(root) = inflight_runtime_root() else {
-        return 0;
+        return Err("runtime root unavailable".to_string());
     };
     // #3860 — set restart_mode via a per-row lock-RMW instead of blind-saving
     // the unlocked snapshot. `load_inflight_states_from_root` reads each row
@@ -502,9 +537,15 @@ pub(super) fn mark_all_inflight_states_restart_mode(
         let path = inflight_state_path(&root, provider, state.channel_id);
         if set_inflight_restart_mode_under_lock(&path, restart_mode) {
             updated += 1;
+        } else {
+            return Err(format!(
+                "failed to persist restart mode for provider={} channel_id={}",
+                provider.as_str(),
+                state.channel_id
+            ));
         }
     }
-    updated
+    Ok(updated)
 }
 
 /// #3860 — RMW the restart-mode marker on one inflight row under its flock.
@@ -552,7 +593,7 @@ pub(super) fn load_inflight_state(
 /// Load a single inflight state without compatibility backfills or cleanup.
 ///
 /// Use this for diagnostic/read-only probes that must not mutate sidecar state.
-pub(super) fn load_inflight_state_read_only(
+pub(in crate::services::discord) fn load_inflight_state_read_only(
     provider: &ProviderKind,
     channel_id: u64,
 ) -> Option<InflightTurnState> {
@@ -592,10 +633,15 @@ pub(crate) fn latest_request_owner_user_id_for_channel(channel_id: u64) -> Optio
 /// listeners need them.
 #[derive(Debug, Clone)]
 pub(in crate::services::discord) enum InflightSignal {
-    /// The turn_bridge task for `channel_id` reached its terminal drop —
-    /// any per-turn relay tasks bound to this channel may now exit.
-    Completed { channel_id: u64 },
+    /// The turn_bridge task for this exact turn reached its terminal drop.
+    /// Channel-scoped relays may use `channel_id`; turn-scoped consumers must
+    /// also match `turn_id` so a late turn cannot stop its successor.
+    Completed { channel_id: u64, turn_id: u64 },
 }
+
+#[cfg(test)]
+#[path = "inflight/save_store/post_loop_identity_guard_tests.rs"]
+mod post_loop_identity_guard_tests;
 
 /// #1446 Layer 1 — `inflight_state_is_stale` is a pure helper with no
 /// filesystem or runtime dependencies, so we keep its test always-on
@@ -1358,6 +1404,46 @@ mod stall_recovery_tests {
             persisted.response_sent_offset <= persisted.full_response.len(),
             "response_sent_offset must stay in bounds"
         );
+    }
+
+    /// A stale watcher terminal commit must exercise the real identity gate and
+    /// return `Skipped` without modifying the newer row. The separate outcome
+    /// routing tests verify the operator-visible WARN for this typed result.
+    #[test]
+    fn watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 50_250_001;
+        let session = "AgentDesk-claude-5025";
+        let stale = seed_watcher_stream_state(temp.path(), channel_id, session, "old body", 100);
+        let stale_identity = InflightTurnIdentity::from_state(&stale);
+
+        let mut newer = stale.clone();
+        newer.user_msg_id = stale.user_msg_id + 1;
+        newer.current_msg_id = stale.current_msg_id + 1;
+        newer.full_response = "new turn body".to_string();
+        newer.response_sent_offset = 0;
+        newer.terminal_delivery_committed = false;
+        force_write_state(temp.path(), &newer);
+
+        let outcome = commit_watcher_terminal_delivery_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &stale_identity,
+            session,
+            WatcherTerminalCommitPatch {
+                full_response: "delivered old body".to_string(),
+                last_offset: 256,
+                last_watcher_relayed_offset: Some(64),
+                last_watcher_relayed_generation_mtime_ns: Some(9),
+            },
+        );
+
+        assert_eq!(outcome, WatcherTerminalCommitOutcome::Skipped);
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(persisted.user_msg_id, newer.user_msg_id);
+        assert_eq!(persisted.full_response, "new turn body");
+        assert!(!persisted.terminal_delivery_committed);
     }
 
     /// #3558: a forward commit (larger watermark than disk) advances normally —
@@ -3646,6 +3732,40 @@ mod stall_recovery_tests {
         assert_eq!(still_there[0].user_msg_id, 4242);
     }
 
+    #[test]
+    fn generation_guarded_sweeper_clear_preserves_row_that_progressed_after_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let snapshot = build_inflight_for_guard_tests(ProviderKind::Claude, 10, 4242);
+        save_inflight_state_in_root(temp.path(), &snapshot).unwrap();
+        let observed = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude)
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let mut progressed = observed.clone();
+        progressed.current_msg_id = progressed.current_msg_id.saturating_add(1);
+        progressed.updated_at = "2099-01-01 00:00:01".to_string();
+        progressed.save_generation = observed.save_generation.saturating_add(1);
+        force_write_state(temp.path(), &progressed);
+
+        let outcome =
+            super::clear_store::clear_inflight_state_if_matches_identity_generation_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                observed.channel_id,
+                &InflightTurnIdentity::from_state(&observed),
+                observed.effective_finalizer_turn_id(),
+                &observed.updated_at,
+                observed.save_generation,
+            );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        let surviving = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].save_generation, progressed.save_generation);
+        assert_eq!(surviving[0].current_msg_id, progressed.current_msg_id);
+    }
+
     /// No on-disk row → `Missing`. Idempotency safety net.
     #[test]
     fn clear_inflight_state_if_matches_missing_is_noop() {
@@ -4475,7 +4595,7 @@ mod wave_a_cleanup_tests {
         // With the root isolated to `temp` (no generation file → 0), the load
         // path's `stale_removal_reason` planned-restart branch hits its
         // generation-match arm and does not auto-evict.
-        let current_runtime_gen = super::super::runtime_store::load_generation();
+        let current_runtime_gen = super::super::runtime_store::process_generation();
 
         let mut planned = make_state(601, 33);
         planned.set_restart_mode(InflightRestartMode::DrainRestart);

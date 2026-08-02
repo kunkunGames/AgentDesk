@@ -238,9 +238,18 @@ pub(super) fn stale_removal_reason(
 ) -> Option<String> {
     match state.restart_mode {
         Some(restart_mode) => {
-            if state.restart_generation != Some(current_generation) {
+            // A planned-restart row is intentionally authored by the outgoing
+            // process and consumed by its immediate replacement. Therefore an
+            // E -> E+1 generation mismatch is the normal handoff shape, not stale
+            // evidence. Retention and the live-pane override below bound orphaned
+            // markers; successful recovery adoption clears the restart marker.
+            let replacement_handoff = state.restart_generation.is_some_and(|generation| {
+                generation == current_generation
+                    || generation.saturating_add(1) == current_generation
+            });
+            if !replacement_handoff {
                 return Some(format!(
-                    "removing {} inflight state from old generation {:?} (current generation {})",
+                    "removing {} inflight state outside replacement generation window {:?} (current generation {})",
                     restart_mode.label(),
                     state.restart_generation,
                     current_generation
@@ -259,7 +268,7 @@ pub(super) fn stale_removal_reason(
                     && let Some(name) = state.tmux_session_name.as_deref()
                     && tmux_pane_alive_for_stale_check(name)
                 {
-                    tracing::warn!(
+                    tracing::info!(
                         "  ⚠ inflight stale-age ({age_secs}s > {max_age}s) overridden — tmux pane '{name}' still alive (channel {})",
                         state.channel_id
                     );
@@ -277,7 +286,7 @@ pub(super) fn stale_removal_reason(
                 if let Some(name) = state.tmux_session_name.as_deref()
                     && tmux_pane_alive_for_stale_check(name)
                 {
-                    tracing::warn!(
+                    tracing::info!(
                         "  ⚠ inflight stale-age ({age_secs}s > {INFLIGHT_MAX_AGE_SECS}s) overridden — tmux pane '{name}' still alive (channel {})",
                         state.channel_id
                     );
@@ -314,7 +323,7 @@ pub(super) fn load_inflight_states_from_root(
     };
     let mut states = Vec::new();
     let mut tmux_owners: HashMap<String, u64> = HashMap::new();
-    let current_generation = crate::services::discord::runtime_store::load_generation();
+    let current_generation = crate::services::discord::runtime_store::process_generation();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {

@@ -117,8 +117,8 @@ pub(super) async fn maybe_create_bridge_separate_status_panel_response<G: TurnGa
     response_sent_offset: usize,
     full_response: &str,
     status_panel_dirty: &mut bool,
-    _shared: &Arc<SharedData>,
-    _provider: &crate::services::provider::ProviderKind,
+    shared: &Arc<SharedData>,
+    provider: &crate::services::provider::ProviderKind,
 ) {
     // #3805 P2 (PR-B): flag ON → create the status panel as a NEW message BELOW
     // the answer (answer-first layout). The ON path is fully mutually exclusive
@@ -134,6 +134,8 @@ pub(super) async fn maybe_create_bridge_separate_status_panel_response<G: TurnGa
         ) {
             super::two_message_panel::create_bridge_two_message_status_panel_below_answer(
                 gateway,
+                shared.as_ref(),
+                provider,
                 channel_id,
                 initial_indicator,
                 *current_msg_id,
@@ -581,10 +583,54 @@ mod tests {
             &ProviderKind::Claude,
         );
 
-        assert!(rendered.starts_with("Bridge body\n\n⠸ 진행 중 — Claude"));
+        assert!(rendered.starts_with("Bridge body\n\n-# ⠸ 진행 중 — Claude"));
         assert!(!rendered.contains("계속 처리 중"));
         assert!(!rendered.contains('🟢'));
-        assert!(rendered.contains("Subagents\n└ review inspect"));
+        assert!(rendered.contains("-# Subagents\n-# └ review inspect"));
+    }
+
+    #[test]
+    fn bridge_mid_turn_placeholder_context_uses_subtext_and_compact_format_4848() {
+        let shared = super::super::make_shared_data_for_tests();
+        let channel_id = ChannelId::new(4_848_301);
+        assert!(
+            shared
+                .ui
+                .placeholder_live_events
+                .set_context_panel_usage(channel_id, None, 460_000, 0, 0, 1_000_000, 50,)
+        );
+
+        let panel_text = shared.ui.placeholder_live_events.render_status_panel(
+            channel_id,
+            &ProviderKind::Claude,
+            1_700_000_000,
+        );
+        let status_block =
+            super::single_message_panel::compose_footer_status_block("⠸", &panel_text);
+        let rendered = super::super::build_turn_bridge_streaming_edit_text(
+            true,
+            "Bridge body",
+            &status_block,
+            &ProviderKind::Claude,
+        );
+        let footer = rendered
+            .split_once("\n\n")
+            .map(|(_, footer)| footer)
+            .expect("mid-turn placeholder footer");
+
+        assert!(
+            footer.contains("-# 📦 460.0k / 1.0M (46%) · auto-compact 50%"),
+            "mid-turn placeholder footer used the wrong context format: {footer:?}"
+        );
+        assert!(!footer.contains("Context"));
+        assert!(!footer.contains("tokens"));
+        assert!(
+            footer
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| line.starts_with("-# ")),
+            "every mid-turn placeholder footer line must be subtext: {footer:?}"
+        );
     }
 
     #[test]
@@ -779,12 +825,12 @@ mod tests {
         // assistant turn ALONE — no chrome, no merge, no truncation; while a
         // Discord-origin turn (block present) still carries the footer.
         let prose = "#3955 머지 완료 — 다음 작업 대기.";
-        let chrome_block = "Context   📦 526.3k / 1.0M tokens (52%) · auto-compact 60%\n\nTasks\n└ TaskUpdate 4 · 머지 완료\n\nSubagents\n└ general-purpose Investigate #3658 — Agent \"Implement #3886\"";
+        let chrome_block = "📦 526.3k / 1.0M (52%) · auto-compact 60%\n\nTasks\n└ TaskUpdate 4 · 머지 완료\n\nSubagents\n└ general-purpose Investigate #3658 — Agent \"Implement #3886\"";
 
         let discord_origin =
             super::single_message_panel::compose_completion_footer_text(prose, Some(chrome_block));
         assert!(discord_origin.starts_with(prose));
-        assert!(discord_origin.contains("Context   📦"));
+        assert!(discord_origin.contains("📦"));
         assert!(discord_origin.contains("Tasks"));
         assert!(discord_origin.contains("Subagents"));
 

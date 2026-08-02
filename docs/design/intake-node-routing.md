@@ -13,6 +13,26 @@
 > [Appendix C (round 3)](#appendix-c-codex-v3-review), and
 > [Appendix D (round 4)](#appendix-d-codex-v4-review).
 
+## Planned handoff target preflight (#4779)
+
+Before a generation-fenced owner transfer, the coordinator evaluates the target
+`worker_nodes` record and its `capabilities.intake_preflight` probe snapshot with
+`services::cluster::intake_preflight::evaluate_target_preflight`. The structured
+report exposes an explicit `pass`/`fail` verdict and stable reason codes for
+Claude/Codex node/provider worker readiness, release
+SHA and config-schema parity, provider binary/credential/quota/access probes,
+workspace policy, disk/memory, recent DB-pool errors, terminal and standby relay,
+and the intake-outbox operator surface. Missing evidence fails closed.
+
+The module exposes only the pure report and `require_ready()` verdict check. It
+cannot invoke a transfer or mutate owner, generation, session, or outbox state;
+the future #4777 planned-handoff caller owns that execution boundary. Workspace
+cleanliness and the #4765 standby relay signal are unconditional checks and
+cannot be disabled by policy. Until portable attachments are available,
+`text_only_pilot` is a passing result with an explicit pre-handoff rejection
+notice; `unsupported` blocks transfer. Probe collection and the #4778
+state-machine caller remain separate interfaces.
+
 ## Background
 
 The AgentDesk Discord control plane has a hard asymmetry between
@@ -275,9 +295,11 @@ CREATE TRIGGER trg_intake_outbox_touch_updated_at
 its own bot token via `credential::read_bot_token()` at startup;
 nothing token-shaped is ever serialized into PG.
 
-**Column note: no attachment payload.** If the original message has
-file uploads, the leader handles it locally (see "Pending uploads"
-below); we never copy uploaded bytes into the outbox.
+**Column note: text-only attachment contract.** The initial routed pilot
+allows no attachment payload. Upload records contain node-local filesystem paths,
+not portable object references. Before any foreign-target `intake_outbox` insert,
+the router explicitly rejects uploads; only text-only requests are eligible for
+cross-node routing (see "Pending uploads" below).
 
 #### B-bis. Canonical state-transition SQL (codex round-2 P1 #3)
 
@@ -581,9 +603,15 @@ cluster:
     # observe: emit decision events but do NOT INSERT outbox rows.
     # enforce: actually forward.
     mode: "observe"
+    # Raw top-level Discord channel IDs selected for owner-authority rollout.
+    # A known-empty list is an explicit opt-out; a missing or unloadable routing
+    # scope is unknown and keeps the admission fence fail-safe.
+    owner_authority_channel_ids:
+      - "123456789012345678"
     # Pre-claim takeover threshold. After this many seconds without
-    # reaching `claimed` (= worker SELECT FOR UPDATE), leader steals
-    # and runs locally. Spawned/accepted rows are NEVER stolen.
+    # reaching `claimed` (= worker SELECT FOR UPDATE), leader atomically
+    # retires the pending row under the channel advisory lock, then runs
+    # locally. Fresh pending and spawned/accepted rows are NEVER stolen.
     forward_pre_claim_timeout_secs: 12
     # Stale claim recovery. After this many seconds in 'claimed'
     # without reaching 'accepted', re-mark pending so another node
@@ -595,10 +623,21 @@ Implemented authority (#3749): `cluster.intake_routing` is the primary
 source of truth. `ADK_INTAKE_ROUTING_MODE` remains as an emergency
 process override and wins over YAML when set (`disabled`/`off`/`false`/`0`,
 `observe`, `enforce`; invalid values fail closed to `disabled`). Operators
-can confirm the effective `mode`, `source`, YAML values, and warning count
-through `/api/health` or `/api/health/detail` under `intake_routing`.
+can confirm the effective `enabled`, `mode`, `source`, allowlist size, recent
+planner-decision count, YAML values, and warning count through `/api/health` or
+`/api/health/detail` under `intake_routing`.
 
-Operational reload note: worker consumers are spawned when the effective mode
+Every Disabled, Observe, and Enforce planner result emits an info-level structured
+`intake_routing_decision` event with stable `reason_code`, `would_assign_target`,
+`preferred_label_match`, `owner_resolution`, and the tri-state
+`authority_channel_opt_in` field. `ADK_INTAKE_ROUTING_MODE=enforce` can change the
+effective planner mode but cannot opt a channel into owner authority; only
+`owner_authority_channel_ids` controls that state. Unknown configuration is
+fail-safe at the admission boundary.
+
+Operational reload note: `owner_authority_channel_ids` is read from the runtime
+config snapshot for every intake decision, so allowlist edits are reflected by
+planner telemetry without a restart. Worker consumers are spawned when the effective mode
 is `observe` or `enforce`. Start from `enabled: true, mode: "observe"` and
 restart once to put consumers on standby; then observe→enforce rollback/promote
 changes are read by the hook and `/node` from the runtime config snapshot. A
@@ -768,10 +807,13 @@ Decision tree (evaluation order is important):
    provider-capable worker advertisement, or two live owners, blocks
    intake. It never falls through to local or preference placement;
    only an explicit session stop/clear makes a new placement safe.
-5. **Non-portable uploads**: a foreign live owner plus raw attachments
-   or queued `pending_uploads` blocks intake. A local owner handles the
-   upload locally; a channel with no owner establishes its first
-   placement locally.
+5. **Text-only routed pilot**: raw attachments or queued `pending_uploads`
+   carry gateway-local filesystem paths, not portable references. Any decision
+   that would route to a foreign live owner, explicit `/node` target, or
+   preferred-label worker blocks before an outbox insert. A local live owner
+   may handle an upload locally. If no foreign route is selected (for example,
+   no eligible worker or no preference), normal local intake behavior remains
+   unchanged; this pilot does not make attachments portable across nodes.
 6. **Explicit `/node`**: only after owner lookup proves `NoOwner`.
    An unavailable explicit target blocks rather than silently falling
    through. `/node` does not migrate an existing tmux session.
@@ -945,17 +987,19 @@ during `handle_text_message` (today) and stores temp paths in
 `shared.pending_uploads`. **These local paths are not portable to
 worker.**
 
-Current policy is owner-aware. A local live owner handles uploads
-locally, and `NoOwner` establishes the first session locally. A live
-foreign owner returns `BlockedNonPortableAttachment`; queued drains
-front-requeue the original Intervention before marker teardown and arm
-only the slow backstop. Stale/conflicting owner blocks take precedence.
-No local absolute upload path is written to `intake_outbox`.
+The routed pilot is explicitly text-only. A local live owner may handle
+uploads locally. When a foreign owner, explicit `/node`, or preferred-label
+placement would route the request, either `NonPortableAttachmentForeignOwner`
+or `NonPortableAttachmentRoutedTarget` blocks before the outbox insert and the
+live notice says: “현재 mac-mini routed session은 파일 첨부를 지원하지
+않습니다.” The one-minute per-channel notice throttle prevents retry spam. Queued
+drains notify and consume a nonportable attachment instead of requeueing it
+forever. Stale/conflicting owner blocks take precedence. No local absolute upload
+path is written to `intake_outbox`.
 
-v2 (out of scope for this PR): forward upload bytes through
-`message_outbox`-style payload table, or have worker re-download
-from Discord CDN (requires re-resolving attachment URLs from the
-message; possibly cleaner).
+Full attachment portability remains out of scope: either stage bytes through a
+durable object/payload store or let the worker securely re-download the Discord
+CDN attachment from its canonical URL.
 
 ### Worker → Discord response
 
@@ -985,7 +1029,7 @@ which is REST-safe and identical on both sides.
 | Mode | Detection | Action |
 |---|---|---|
 | Worker offline (stale heartbeat) | leader-side `worker_nodes.last_heartbeat_at` check at `resolve_intake_target` | route falls through to `Local` |
-| Worker dies before claim | row stays `pending` past `forward_pre_claim_timeout_secs` (12s) | transition 7: leader re-targets to local, bumps retry; on retry exhaustion → `failed_pre_accept` + alert |
+| Worker dies before claim | row stays `pending` past `forward_pre_claim_timeout_secs` (12s) | **Transition 7 is not implemented in the current runtime.** The current guard moves the stale row to `failed_pre_accept`; no local re-target/attempt INSERT occurs, and no automatic consumer currently re-drives this state. Tracked by issue #5057. |
 | Worker dies in `claimed` (cwd validation in flight) | row stuck `claimed` past `stale_claim_recovery_secs` (60s) | transition 8: leader resets to `pending`, increments retry; on exhaustion → `failed_pre_accept` + alert |
 | Worker validation fails (cwd missing, workspace unprovisioned) | worker writes `failed_pre_accept` via transition 6a | leader sweep applies transition 10 to INSERT a fresh attempt with `target_instance_id = local_leader` (linked via `parent_outbox_id`). If `attempt_no >= max_attempts_per_message`, transition 10 refuses → operator alert; further retries require `retry-as-new` via transition 12 |
 | Worker dies in `accepted` | accepted_at > `accepted_unspawned_sla_secs` (default 120s) without `spawned_at` (transition 11) | fast operator alert; **no auto recovery** (round-2 P0 #2). Operator runs `force-fail <row>` (terminal failure) or `retry-as-new <row>` (transition 12, fresh row leader-targeted) |
@@ -993,7 +1037,7 @@ which is REST-safe and identical on both sides.
 | Worker post-accept turn failure (provider error, panic in tmux) | worker writes `failed_post_accept` via transition 6b | terminal; operator decides via CLI |
 | Discord token revoked on worker (REST 401) | worker writes `failed_post_accept` (we already POSTed placeholder under that token) | terminal; operator rotates token + `retry-as-new` |
 | PG pool/owner query unavailable in `Enforce` | central admission dependency guard | block local execution and emit a throttled operator-facing notice; retry after PG/owner visibility recovers |
-| Pending uploads on message | owner-aware admission | local owner/`NoOwner` runs local; foreign owner blocks and queued work is front-requeued |
+| Pending uploads on message | owner-aware admission | local owner/`NoOwner` runs local. Nonportable attachments are blocked before any outbox INSERT on foreign-owner routes **and** on `/node`/preferred-label foreign targets. A live nonportable attachment returns `Blocked`; a queued nonportable attachment (surfaced at `QueuedDrain`) is notified and terminated via `RejectedNonPortableAttachment` (consumed, **not** front-requeued) so it cannot loop |
 | Active session pinned to stale foreign worker | owner classification | block local/label fallback; operator stops/clears the old session before retry |
 | Single-PG-primary assumption violated | startup self-check at boot | refuse to start with intake_routing.enabled=true; log error |
 | Two same-channel forward attempts (round-2 P0 #1) | partial unique index `intake_outbox_one_open_route_per_channel` | same `(channel_id, user_msg_id)` is an idempotent skip; a distinct message returns `DeferredOpenRoute` and is preserved/retried, never executed locally |

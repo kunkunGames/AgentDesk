@@ -25,7 +25,7 @@ use crate::services::tmux_diagnostics::{
 
 use super::formatting::{
     ReplaceLongMessageOutcome, build_streaming_placeholder_text, format_tool_input,
-    plan_streaming_rollover, replace_long_message_raw_with_outcome, truncate_str,
+    plan_streaming_rollover, truncate_str,
 };
 use super::placeholder_cleanup::{PlaceholderCleanupOperation, PlaceholderCleanupOutcome};
 use super::placeholder_live_events::{
@@ -36,12 +36,9 @@ use super::settings::{
     validate_bot_channel_routing_with_provider_channel,
 };
 use super::tmux_error_detect::{
-    detect_provider_overload_message, is_auth_error_message, is_prompt_too_long_message,
+    ProviderProseDiagnostic, classify_provider_prose_diagnostic, is_prompt_too_long_message,
 };
-use super::tmux_overload_retry::{
-    PROVIDER_OVERLOAD_MAX_RETRIES, ProviderOverloadDecision, clear_provider_overload_retry_state,
-    record_provider_overload_retry, schedule_provider_overload_retry,
-};
+use super::tmux_overload_retry::clear_provider_overload_retry_state;
 use super::tmux_restart_handoff::{
     resolve_dispatched_thread_dispatch_from_db, resume_aborted_restart_turn,
 };
@@ -69,11 +66,17 @@ use self::tmux_session_files::{
     preserve_mtime_after_write, reset_stale_local_relay_offset_if_output_regressed,
     sweep_orphan_session_files,
 };
+#[cfg(test)]
+pub(in crate::services::discord) use self::watcher_lifecycle::claim_cross_channel_tmux_watcher_for_test;
 use self::watcher_lifecycle::*;
 pub(in crate::services::discord) use self::watcher_lifecycle::{
-    claim_or_replace_watcher, claim_or_reuse_watcher, clear_recovery_handled_channels,
-    fail_dispatch_for_ready_for_input_stall, refresh_session_heartbeat_from_tmux_output,
-    restore_tmux_watchers, session_belongs_to_current_runtime, store_recovery_handled_channels,
+    ThreadFollowUpParent, claim_or_replace_watcher, claim_or_replace_watcher_with_thread_parent,
+    claim_or_reuse_watcher, claim_or_reuse_watcher_with_thread_parent,
+    clear_recovery_handled_channels, fail_dispatch_for_ready_for_input_stall,
+    refresh_session_heartbeat_from_tmux_output, restore_tmux_watchers,
+    session_belongs_to_current_runtime, store_recovery_handled_channels,
+    thread_follow_up_parent_channel_id, thread_follow_up_parent_from_live,
+    try_claim_watcher_with_thread_parent,
 };
 use super::watcher_lifecycle_decision::*;
 const READY_FOR_INPUT_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
@@ -87,10 +90,9 @@ mod tmux_kill_policy;
 #[allow(unused_imports)]
 pub(super) use self::tmux_kill_policy::{
     CANCEL_TEARDOWN_GRACE_BYTES, MONITOR_AUTO_TURN_DEFERRED_REASON_CODE,
-    MONITOR_AUTO_TURN_REASON_CODE, RECENT_TURN_STOP_METADATA_FALLBACK_TTL,
-    TMUX_LIVENESS_PROBE_INTERVAL, cancel_induced_watcher_death, cancel_induced_watcher_death_async,
-    recent_turn_stop_for_channel, recent_turn_stop_for_watcher_range, record_recent_turn_stop,
-    tmux_output_offset,
+    RECENT_TURN_STOP_METADATA_FALLBACK_TTL, TMUX_LIVENESS_PROBE_INTERVAL,
+    cancel_induced_watcher_death, cancel_induced_watcher_death_async, recent_turn_stop_for_channel,
+    recent_turn_stop_for_watcher_range, record_recent_turn_stop, tmux_output_offset,
 };
 
 pub(in crate::services::discord) async fn sniff_background_agent_pending_for_completion(
@@ -123,10 +125,6 @@ pub(super) struct WatcherLineOutcome {
     pub pre_turn_bytes_skipped: usize,
     pub soft_terminal_candidate: bool,
     pub is_prompt_too_long: bool,
-    pub is_auth_error: bool,
-    pub auth_error_message: Option<String>,
-    pub is_provider_overloaded: bool,
-    pub provider_overload_message: Option<String>,
     pub stale_resume_detected: bool,
     pub auto_compacted: bool,
     pub task_notification_kind: Option<TaskNotificationKind>,
@@ -140,8 +138,6 @@ pub(super) enum WatcherTerminalKind {
     HardResult,
     SoftStopHookSummary,
     SoftUserBoundary,
-    AuthError,
-    ProviderOverload,
 }
 
 impl WatcherTerminalKind {
@@ -150,8 +146,6 @@ impl WatcherTerminalKind {
             Self::HardResult => "hard_result",
             Self::SoftStopHookSummary => "soft_stop_hook_summary",
             Self::SoftUserBoundary => "soft_user_boundary",
-            Self::AuthError => "auth_error",
-            Self::ProviderOverload => "provider_overload",
         }
     }
 }
@@ -181,6 +175,11 @@ pub(super) struct RestoredWatcherTurn {
     /// restart-restored seed, this is the current turn and must not be discarded by
     /// idle direct-prompt stale-seed cleanup.
     same_turn_rewind: bool,
+    /// Immutable source identity captured with the restored clone at watcher
+    /// handoff. The clone can predate the bridge's terminal commit, so this is
+    /// only a lookup key: seed consumption must re-read the durable receipt.
+    /// Missing legacy components preserve the seed.
+    delivery_source: Option<super::outbound::delivery_record::ExactJsonlSourceIdentity>,
 }
 
 #[derive(Debug)]
@@ -235,7 +234,6 @@ pub(super) fn restored_watcher_turn_from_inflight(
     finish_mailbox_on_completion: bool,
 ) -> Option<RestoredWatcherTurn> {
     if state.rebind_origin
-        || state.current_msg_id == 0
         || state
             .tmux_session_name
             .as_deref()
@@ -245,11 +243,40 @@ pub(super) fn restored_watcher_turn_from_inflight(
     }
 
     let provider = state.provider_kind()?;
+    let current_msg_id = super::inflight::opt_message_id(state.current_msg_id)?;
     let response_sent_offset =
         normalize_response_sent_offset(&state.full_response, state.response_sent_offset);
+    let delivery_channel_id = super::inflight::opt_channel_id(state.channel_id).map(ChannelId::get);
+    let offset_authority_channel_id = match state.watcher_owner_channel_id {
+        Some(raw) => super::inflight::opt_channel_id(raw).map(ChannelId::get),
+        None => delivery_channel_id,
+    };
+    let delivery_source = state
+        .turn_start_offset
+        .zip(state.turn_nonce.as_deref())
+        .filter(|(start, nonce)| state.last_offset > *start && !nonce.is_empty())
+        .and_then(|(start, nonce)| {
+            let delivery_channel_id = delivery_channel_id?;
+            let offset_authority_channel_id = offset_authority_channel_id?;
+            let generation_mtime_ns =
+                super::outbound::delivery_record::current_generation_mtime_ns(tmux_session_name);
+            (generation_mtime_ns != 0).then(|| {
+                super::outbound::delivery_record::ExactJsonlSourceIdentity {
+                    provider: provider.as_str().to_string(),
+                    tmux_session_name: tmux_session_name.to_string(),
+                    turn_nonce: nonce.to_string(),
+                    range: (start, state.last_offset),
+                    generation_mtime_ns,
+                    offset_authority_channel_id,
+                    delivery_channel_id,
+                }
+            })
+        });
     Some(RestoredWatcherTurn {
-        current_msg_id: MessageId::new(state.current_msg_id),
-        status_message_id: state.status_message_id.map(MessageId::new),
+        current_msg_id,
+        status_message_id: state
+            .status_message_id
+            .and_then(super::inflight::opt_message_id),
         response_sent_offset,
         full_response: state.full_response.clone(),
         last_edit_text: reconstructed_inflight_placeholder_body(state, &provider),
@@ -261,9 +288,10 @@ pub(super) fn restored_watcher_turn_from_inflight(
             .streaming_rollover_frozen_msg_ids
             .iter()
             .copied()
-            .map(MessageId::new)
+            .filter_map(super::inflight::opt_message_id)
             .collect(),
         same_turn_rewind: false,
+        delivery_source,
     })
 }
 
@@ -316,6 +344,31 @@ fn restored_seed_reassigned_to_different_turn(
     if restored.same_turn_rewind {
         return false;
     }
+    // The restored clone may have been taken before the bridge committed and
+    // cleared its inflight row. Re-read the receipt now, at seed consumption;
+    // only an exact session+generation+nonce+range+owner+destination proof can
+    // turn that stale clone into a discard. Body fingerprints are intentionally
+    // absent from this authority decision.
+    if restored.delivery_source.as_ref().is_some_and(|source| {
+        let Some(provider) = ProviderKind::from_str(&source.provider) else {
+            return false;
+        };
+        let Some(delivery_channel) = super::inflight::opt_channel_id(source.delivery_channel_id)
+        else {
+            return false;
+        };
+        if super::inflight::opt_channel_id(source.offset_authority_channel_id).is_none() {
+            return false;
+        }
+        super::outbound::delivery_record::confirmed_delivery_receipt_exists(
+            &provider,
+            delivery_channel,
+            restored.current_msg_id.get(),
+            source,
+        )
+    }) {
+        return true;
+    }
     if let (Some(seed_anchor), Some(current_anchor)) = (
         restored.injected_prompt_message_id,
         prompt_anchor_message_id,
@@ -334,10 +387,104 @@ fn restored_seed_reassigned_to_different_turn(
 mod restored_seed_discard_tests {
     use super::{
         RestoredWatcherTurn, restored_seed_reassigned_to_different_turn,
-        should_discard_restored_seed_for_idle_direct_prompt, watcher_stream_seed,
+        restored_watcher_turn_from_inflight, should_discard_restored_seed_for_idle_direct_prompt,
+        watcher_stream_seed,
     };
-    use crate::services::discord::inflight::InflightTurnIdentity;
-    use poise::serenity_prelude::MessageId;
+    use crate::services::discord::inflight::{InflightTurnIdentity, InflightTurnState};
+    use crate::services::discord::outbound::delivery_record::{
+        self, ConfirmedDeliveryReceipt, DeliveredCommit,
+    };
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::{ChannelId, MessageId};
+
+    fn touch_generation_marker(tmux_session_name: &str) -> i64 {
+        let path = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).expect("create generation parent");
+        }
+        std::fs::write(&path, "phase-a-generation").expect("write generation marker");
+        delivery_record::current_generation_mtime_ns(tmux_session_name)
+    }
+
+    fn restored_state_fixture(
+        provider: ProviderKind,
+        delivery_channel_id: u64,
+        owner_channel_id: Option<u64>,
+        tmux_session_name: &str,
+    ) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            provider,
+            delivery_channel_id,
+            Some("phase-a".into()),
+            7,
+            49_110,
+            49_111,
+            "turn N".into(),
+            Some("session-4911".into()),
+            Some(tmux_session_name.into()),
+            Some("/tmp/phase-a-4911.jsonl".into()),
+            None,
+            100,
+        );
+        state.last_offset = 200;
+        state.full_response = "N delivered body".into();
+        state.response_sent_offset = 0;
+        state.streaming_rollover_frozen_msg_ids = vec![49_112];
+        state.turn_nonce = Some("turn-nonce-N".into());
+        if let Some(owner_channel_id) = owner_channel_id {
+            if owner_channel_id == 0 {
+                state.watcher_owner_channel_id = Some(0);
+            } else {
+                state.set_watcher_owner_channel_id(owner_channel_id);
+            }
+        }
+        state
+    }
+
+    fn restored_seed_fixture(
+        provider: ProviderKind,
+        delivery_channel: ChannelId,
+        owner_channel: ChannelId,
+        tmux_session_name: &str,
+    ) -> RestoredWatcherTurn {
+        let state = restored_state_fixture(
+            provider,
+            delivery_channel.get(),
+            Some(owner_channel.get()),
+            tmux_session_name,
+        );
+        crate::services::discord::inflight::save_inflight_state(&state)
+            .expect("persist receipt source row");
+        let mut restored = restored_watcher_turn_from_inflight(&state, tmux_session_name, false)
+            .expect("restorable turn");
+        restored.last_edit_text = "stale placeholder body".into();
+        restored
+    }
+
+    fn write_receipt(
+        provider: &ProviderKind,
+        source: delivery_record::ExactJsonlSourceIdentity,
+        message_id: u64,
+    ) -> Result<(), String> {
+        let owner = source.offset_authority_channel_id;
+        let delivery = source.delivery_channel_id;
+        delivery_record::write_confirmed_delivery(
+            provider,
+            owner,
+            DeliveredCommit {
+                range: source.range,
+                generation_mtime_ns: source.generation_mtime_ns,
+                attempts: 1,
+                panel_msg_id: Some(message_id),
+                panel_channel_id: Some(delivery),
+            },
+            ConfirmedDeliveryReceipt {
+                source,
+                delivery_channel_id: delivery,
+                message_id,
+            },
+        )
+    }
 
     #[test]
     fn idle_direct_prompt_preserves_restored_seed_with_undelivered_body() {
@@ -401,6 +548,7 @@ mod restored_seed_discard_tests {
             turn_identity: Some(seed_identity),
             streaming_rollover_frozen_msg_ids: Vec::new(),
             same_turn_rewind: false,
+            delivery_source: None,
         };
 
         let seed_reassigned_to_different_turn = restored_seed_reassigned_to_different_turn(
@@ -420,6 +568,214 @@ mod restored_seed_discard_tests {
         let stream_seed = watcher_stream_seed(None);
         assert!(stream_seed.full_response.is_empty());
         assert_eq!(stream_seed.response_sent_offset, 0);
+    }
+
+    #[test]
+    fn stale_clone_then_bridge_receipt_then_inflight_clear_discards_all_seed_state_4911() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let provider = ProviderKind::Claude;
+        let delivery_channel = ChannelId::new(49_110);
+        let owner_channel = ChannelId::new(49_161);
+        let tmux_session_name = "AgentDesk-claude-phase-a-4911";
+        assert_ne!(touch_generation_marker(tmux_session_name), 0);
+
+        // Clone happens first with N present and response_sent_offset still 0.
+        let restored = restored_seed_fixture(
+            provider.clone(),
+            delivery_channel,
+            owner_channel,
+            tmux_session_name,
+        );
+        assert_eq!(restored.response_sent_offset, 0);
+        assert_eq!(restored.full_response, "N delivered body");
+        let source = restored.delivery_source.clone().expect("captured source");
+
+        // The bridge then commits the exact split-channel receipt and clears the
+        // inflight before the watcher consumes its stale clone.
+        write_receipt(&provider, source, restored.current_msg_id.get())
+            .expect("write exact confirmed receipt");
+        crate::services::discord::inflight::delete_inflight_state_file(
+            &provider,
+            delivery_channel.get(),
+        );
+        assert!(restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+
+        let mut next_payload = watcher_stream_seed(None);
+        assert!(next_payload.full_response.is_empty());
+        assert_eq!(next_payload.response_sent_offset, 0);
+        assert!(next_payload.placeholder_msg_id.is_none());
+        assert!(next_payload.status_panel_msg_id.is_none());
+        assert!(next_payload.last_edit_text.is_empty());
+        assert!(next_payload.streaming_rollover_frozen_msg_ids.is_empty());
+        next_payload.full_response.push_str("N+1 after edit 404");
+        assert_eq!(next_payload.full_response, "N+1 after edit 404");
+        assert!(!next_payload.full_response.contains("N delivered body"));
+    }
+
+    #[test]
+    fn same_body_with_different_nonce_or_range_preserves_restored_seed_4911() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(49_120);
+        let tmux_session_name = "AgentDesk-claude-phase-a-nonce-range";
+        touch_generation_marker(tmux_session_name);
+        let restored = restored_seed_fixture(provider.clone(), channel, channel, tmux_session_name);
+        let source = restored.delivery_source.clone().expect("captured source");
+
+        write_receipt(&provider, source.clone(), restored.current_msg_id.get() + 1)
+            .expect("write destination-mismatch receipt");
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+
+        let mut wrong_nonce = source.clone();
+        wrong_nonce.turn_nonce = "different-turn-same-body".into();
+        write_receipt(&provider, wrong_nonce, restored.current_msg_id.get())
+            .expect("write nonce-mismatch receipt");
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+
+        let mut wrong_range = source;
+        wrong_range.range = (100, 201);
+        write_receipt(&provider, wrong_range, restored.current_msg_id.get())
+            .expect("write range-mismatch receipt");
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+        assert_eq!(
+            watcher_stream_seed(Some(restored)).full_response,
+            "N delivered body"
+        );
+    }
+
+    #[test]
+    fn stale_generation_and_legacy_frontier_preserve_restored_seed_4911() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let provider = ProviderKind::Codex;
+        let channel = ChannelId::new(49_130);
+        let tmux_session_name = "AgentDesk-codex-phase-a-generation";
+        touch_generation_marker(tmux_session_name);
+        let mut restored =
+            restored_seed_fixture(provider.clone(), channel, channel, tmux_session_name);
+        let source = restored.delivery_source.clone().expect("captured source");
+
+        // A legacy frontier with no exact receipt is never seed-removal proof.
+        delivery_record::write_delivered_frontier(
+            &provider,
+            channel.get(),
+            tmux_session_name,
+            DeliveredCommit {
+                range: source.range,
+                generation_mtime_ns: source.generation_mtime_ns,
+                attempts: 1,
+                panel_msg_id: Some(restored.current_msg_id.get()),
+                panel_channel_id: Some(channel.get()),
+            },
+        )
+        .expect("write legacy frontier");
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+
+        // Even a receipt-shaped record from another transcript incarnation is
+        // rejected against the current generation marker.
+        let mut stale_source = source;
+        stale_source.generation_mtime_ns = stale_source.generation_mtime_ns.saturating_add(1);
+        assert!(
+            write_receipt(
+                &provider,
+                stale_source.clone(),
+                restored.current_msg_id.get(),
+            )
+            .is_err(),
+            "the guarded writer must reject stale-incarnation authority"
+        );
+        restored.delivery_source = Some(stale_source);
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+        assert_eq!(
+            watcher_stream_seed(Some(restored)).full_response,
+            "N delivered body"
+        );
+    }
+
+    #[test]
+    fn zero_persisted_delivery_channel_preserves_restored_seed_4911() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let tmux_session_name = "AgentDesk-codex-phase-a-zero-delivery";
+        let generation = touch_generation_marker(tmux_session_name);
+        let state = restored_state_fixture(ProviderKind::Codex, 0, Some(49_141), tmux_session_name);
+        let mut restored = restored_watcher_turn_from_inflight(&state, tmux_session_name, false)
+            .expect("zero destination must not erase the conservative restored body");
+        assert!(restored.delivery_source.is_none());
+        restored.delivery_source = Some(delivery_record::ExactJsonlSourceIdentity {
+            provider: ProviderKind::Codex.as_str().to_string(),
+            tmux_session_name: tmux_session_name.to_string(),
+            turn_nonce: "zero-delivery".into(),
+            range: (100, 200),
+            generation_mtime_ns: generation,
+            offset_authority_channel_id: 49_141,
+            delivery_channel_id: 0,
+        });
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+        assert_eq!(
+            watcher_stream_seed(Some(restored)).full_response,
+            "N delivered body"
+        );
+    }
+
+    #[test]
+    fn zero_persisted_owner_channel_preserves_restored_seed_4911() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let tmux_session_name = "AgentDesk-codex-phase-a-zero-owner";
+        let generation = touch_generation_marker(tmux_session_name);
+        let state = restored_state_fixture(ProviderKind::Codex, 49_151, Some(0), tmux_session_name);
+        let mut restored = restored_watcher_turn_from_inflight(&state, tmux_session_name, false)
+            .expect("zero owner must not erase the conservative restored body");
+        assert!(restored.delivery_source.is_none());
+        restored.delivery_source = Some(delivery_record::ExactJsonlSourceIdentity {
+            provider: ProviderKind::Codex.as_str().to_string(),
+            tmux_session_name: tmux_session_name.to_string(),
+            turn_nonce: "zero-owner".into(),
+            range: (100, 200),
+            generation_mtime_ns: generation,
+            offset_authority_channel_id: 0,
+            delivery_channel_id: 49_151,
+        });
+        assert!(!restored_seed_reassigned_to_different_turn(
+            Some(&restored),
+            None,
+            None,
+        ));
+        assert_eq!(
+            watcher_stream_seed(Some(restored)).full_response,
+            "N delivered body"
+        );
     }
 }
 
@@ -599,53 +955,6 @@ fn terminal_relay_decision(
     }
 }
 
-fn monitor_auto_turn_label(tmux_session_name: &str) -> String {
-    parse_provider_and_channel_from_tmux_name(tmux_session_name)
-        .map(|(_, channel_name)| channel_name)
-        .filter(|channel_name| !channel_name.trim().is_empty())
-        .unwrap_or_else(|| tmux_session_name.to_string())
-}
-
-fn monitor_auto_turn_session_key(channel_id: ChannelId, data_start_offset: u64) -> String {
-    format!(
-        "monitor_auto_turn:ch:{}:off:{}",
-        channel_id.get(),
-        data_start_offset
-    )
-}
-
-/// #1009: Lifecycle-notice variant of the shared monitor summary line. Calls
-/// `format_monitor_suppressed_label` for the trailing summary so the
-/// suppressed-placeholder edit body and the lifecycle notify-outbox row use
-/// identical copy (DRY enforcement). The `label` (channel/tmux session name)
-/// stays as the human-readable scope prefix; `entry_keys` come from the
-/// channel's `MonitoringStore` snapshot.
-fn monitor_auto_turn_completion_notice(
-    label: &str,
-    event_count: usize,
-    entry_keys: &[String],
-) -> String {
-    let summary = format_monitor_suppressed_label(event_count, entry_keys);
-    format!("{summary} · 대상: {label}")
-}
-
-/// #1009: Shared formatter for the monitor auto-turn suppressed-notification
-/// summary line. Produces:
-///   - `🔔 Monitor n회 처리 · 다음 모니터: {key1, key2, ...}` when entries > 0
-///   - `🔔 Monitor n회 처리 · (등록된 모니터 없음)` when entries == 0
-/// Entry keys are emitted in the order the store returns them.
-pub(super) fn format_monitor_suppressed_label(event_count: usize, entry_keys: &[String]) -> String {
-    if entry_keys.is_empty() {
-        format!("🔔 Monitor {}회 처리 · (등록된 모니터 없음)", event_count)
-    } else {
-        format!(
-            "🔔 Monitor {}회 처리 · 다음 모니터: {{{}}}",
-            event_count,
-            entry_keys.join(", ")
-        )
-    }
-}
-
 /// #1009: System-level hint injected once per monitor auto-turn entry so the
 /// agent produces a 1-line summary + next action before terminating. Returned
 /// verbatim at the claim sites; callers log it and record the one-shot flag.
@@ -662,27 +971,6 @@ pub(super) fn consume_monitor_auto_turn_preamble_once(injected: &mut bool) -> Op
         *injected = true;
         Some(MONITOR_AUTO_TURN_PREAMBLE_HINT)
     }
-}
-
-fn enqueue_monitor_auto_turn_suppressed_notification(
-    pg_pool: Option<&sqlx::PgPool>,
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-    data_start_offset: u64,
-    event_count: usize,
-    entry_keys: &[String],
-) -> bool {
-    let target = format!("channel:{}", channel_id.get());
-    let session_key = monitor_auto_turn_session_key(channel_id, data_start_offset);
-    let label = monitor_auto_turn_label(tmux_session_name);
-    let content = monitor_auto_turn_completion_notice(&label, event_count, entry_keys);
-    enqueue_lifecycle_notification_best_effort(
-        pg_pool,
-        target.as_str(),
-        Some(session_key.as_str()),
-        MONITOR_AUTO_TURN_REASON_CODE,
-        content.as_str(),
-    )
 }
 
 fn enqueue_monitor_auto_turn_deferred_notification(
@@ -905,7 +1193,9 @@ fn advance_buffer_start_offset(start_offset: u64, before_len: usize, after_len: 
     start_offset.saturating_add(before_len.saturating_sub(after_len) as u64)
 }
 
-fn ensure_monitor_auto_turn_inflight(
+#[allow(clippy::too_many_arguments)]
+async fn ensure_monitor_auto_turn_inflight(
+    shared: &SharedData,
     provider: &ProviderKind,
     channel_id: ChannelId,
     tmux_session_name: &str,
@@ -935,6 +1225,9 @@ fn ensure_monitor_auto_turn_inflight(
         Some(input_fifo_path.to_string()),
         last_offset,
     );
+    synthetic.turn_nonce = super::mailbox_snapshot(shared, channel_id)
+        .await
+        .active_turn_nonce;
     synthetic.turn_start_offset = Some(turn_start_offset);
     synthetic.rebind_origin = true;
     // #2285 audit trail: monitor pattern fired this turn without an
@@ -989,22 +1282,69 @@ pub(in crate::services::discord) fn advance_watcher_confirmed_end(
     committed_end_offset: u64,
     context: &'static str,
 ) {
+    let generation_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
+    let _ = advance_watcher_confirmed_end_inner(
+        WatcherDeliveryTarget {
+            shared,
+            provider,
+            channel_id,
+            tmux_session_name,
+        },
+        committed_end_offset,
+        (generation_mtime_ns != 0).then_some(generation_mtime_ns),
+        context,
+    );
+}
+
+/// Advance a delivery range only for the immutable source generation captured
+/// with its bytes. Callers hold the relay-frontier mutation guard, so reset
+/// incarnation is stable while this validates and advances.
+pub(in crate::services::discord) fn advance_watcher_confirmed_end_for_generation(
+    target: WatcherDeliveryTarget<'_>,
+    committed_end_offset: u64,
+    source_generation_mtime_ns: i64,
+    context: &'static str,
+) -> bool {
+    if source_generation_mtime_ns == 0
+        || read_generation_file_mtime_ns(target.tmux_session_name) != source_generation_mtime_ns
+    {
+        return false;
+    }
+    advance_watcher_confirmed_end_inner(
+        target,
+        committed_end_offset,
+        Some(source_generation_mtime_ns),
+        context,
+    )
+}
+
+/// The `(shared state, provider, channel, tmux session)` tuple every watcher
+/// delivery advance is scoped to. Bundled so the guarded funnel's helpers stay
+/// within the argument-count ratchet instead of carrying an `allow`.
+#[derive(Clone, Copy)]
+pub(in crate::services::discord) struct WatcherDeliveryTarget<'a> {
+    pub(in crate::services::discord) shared: &'a SharedData,
+    pub(in crate::services::discord) provider: &'a ProviderKind,
+    pub(in crate::services::discord) channel_id: ChannelId,
+    pub(in crate::services::discord) tmux_session_name: &'a str,
+}
+
+fn advance_watcher_confirmed_end_inner(
+    target: WatcherDeliveryTarget<'_>,
+    committed_end_offset: u64,
+    mtime_at_attempt: Option<i64>,
+    context: &'static str,
+) -> bool {
+    let WatcherDeliveryTarget {
+        shared,
+        provider,
+        channel_id,
+        tmux_session_name,
+    } = target;
     let relay_coord = shared.tmux_relay_coord(channel_id);
     let mut cur = relay_coord
         .confirmed_end_offset
         .load(std::sync::atomic::Ordering::Acquire);
-    // #1270 codex P2 (round 4): capture the `.generation` mtime BEFORE
-    // the CAS so the stored mtime reflects what was on disk when we
-    // decided to label `committed_end_offset` as delivered. Reading after
-    // the CAS opens a TOCTOU window where a fresh respawn writes a new
-    // `.generation` between our advance and our marker store, then the
-    // new mtime ends up paired with the OLD offset and the next
-    // regression check mis-classifies the next fresh respawn as
-    // same-wrapper rotation.
-    let mtime_at_attempt = {
-        let m = read_generation_file_mtime_ns(tmux_session_name);
-        if m == 0 { None } else { Some(m) }
-    };
     let mut won_advance = false;
     while cur < committed_end_offset {
         match relay_coord.confirmed_end_offset.compare_exchange(
@@ -1053,6 +1393,7 @@ pub(in crate::services::discord) fn advance_watcher_confirmed_end(
         confirmed_reached_current,
         "watcher confirmed_end_offset must reach committed output end"
     );
+    confirmed_reached_current
 }
 
 async fn drain_watcher_output_tail_to_eof(
@@ -1376,6 +1717,48 @@ mod monitor_auto_turn_signal_tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         signal.mark_done();
         waiter.await.expect("waiter task should not panic");
+    }
+
+    #[tokio::test]
+    async fn monitor_auto_turn_inflight_persists_actor_episode_nonce() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _env = EnvGuard::set_root(root.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_595_240);
+        let synthetic_message_id = MessageId::new(4_595_340);
+        let token = Arc::new(crate::services::provider::CancelToken::new());
+        assert!(
+            crate::services::discord::mailbox_try_start_turn_kinded(
+                &shared,
+                channel_id,
+                token.clone(),
+                UserId::new(1),
+                synthetic_message_id,
+                crate::services::turn_orchestrator::ActiveTurnKind::MonitorAutoTurn,
+            )
+            .await
+        );
+
+        ensure_monitor_auto_turn_inflight(
+            &shared,
+            &provider,
+            channel_id,
+            "AgentDesk-claude-4595",
+            "/tmp/agentdesk-4595.jsonl",
+            "/tmp/agentdesk-4595.fifo",
+            Some("session-4595"),
+            128,
+            256,
+        )
+        .await;
+
+        let persisted = super::super::inflight::load_inflight_state(&provider, channel_id.get())
+            .expect("monitor inflight must persist");
+        assert_eq!(persisted.turn_nonce.as_deref(), token.turn_nonce());
     }
 
     #[tokio::test]
@@ -1836,18 +2219,13 @@ async fn reconcile_orphan_suppressed_placeholder_for_restored_watcher(
     let Some(state) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
         return;
     };
-    // A restored inflight with no current message id (current_msg_id == 0 — e.g. a
-    // TUI-direct/recovery turn that never anchored a Discord placeholder) has no
-    // placeholder message to reconcile, and `MessageId::new(0)` panics. Skip it so
-    // a single such orphan cannot abort startup watcher reconciliation (which would
-    // leave `reconcile_done` stuck false and the provider permanently degraded).
-    if state.current_msg_id == 0 {
+    let Some(placeholder_msg_id) = super::inflight::opt_message_id(state.current_msg_id) else {
         return;
-    }
+    };
     let ctx = PlaceholderSuppressContext {
         origin: PlaceholderSuppressOrigin::OrphanRestartHandoff,
         provider,
-        placeholder_msg_id: Some(MessageId::new(state.current_msg_id)),
+        placeholder_msg_id: Some(placeholder_msg_id),
         response_sent_offset: state.response_sent_offset,
         last_edit_text: "",
         inflight_state: Some(&state),
@@ -1858,7 +2236,7 @@ async fn reconcile_orphan_suppressed_placeholder_for_restored_watcher(
     };
     let decision = decide_placeholder_suppression(&ctx);
     let is_edit = matches!(decision, PlaceholderSuppressDecision::Edit(_));
-    let msg_id = MessageId::new(state.current_msg_id);
+    let msg_id = placeholder_msg_id;
     apply_placeholder_suppression(
         http,
         channel_id,
@@ -1967,6 +2345,7 @@ fn persist_watcher_stream_progress(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_restored_watcher_active_turn(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -2132,6 +2511,14 @@ async fn release_restored_watcher_active_turn_before_panel_edit(
     let Some(token) = finish.removed_token.as_ref() else {
         return false;
     };
+    shared.turn_finalizer.note_mailbox_released(
+        super::turn_finalizer::TurnKey::new(
+            channel_id,
+            finalizer_turn_id,
+            shared.restart.current_generation,
+        ),
+        shared.clone(),
+    );
 
     // #4106 review-fix: cancel the removed token, decrement the counter, AND run
     // the finalizer's D-side channel cleanup here. Hoisting the release ahead of
@@ -2151,6 +2538,14 @@ async fn release_restored_watcher_active_turn_before_panel_edit(
         shared, provider, channel_id,
     )
     .await;
+    super::turn_finalizer::cleanup::rearm_queue_backstop_after_mailbox_release(
+        shared,
+        provider,
+        channel_id,
+        finish.has_pending,
+        "watcher_pre_panel_mailbox_release",
+    )
+    .await;
     if !finish.has_pending {
         super::turn_finalizer::cleanup::remove_owned_role_override(
             shared,
@@ -2164,7 +2559,10 @@ async fn release_restored_watcher_active_turn_before_panel_edit(
 /// Background watcher that continuously tails a tmux output file.
 /// When Claude produces output from terminal input (not Discord), relay it to Discord.
 #[path = "tmux_watcher.rs"]
-mod tmux_watcher;
+#[allow(clippy::too_many_arguments)]
+pub(in crate::services::discord) mod tmux_watcher;
+#[cfg(test)]
+pub(in crate::services::discord) use self::tmux_watcher::pinned_delivery_lease_key_for_test;
 pub(super) use self::tmux_watcher::{
     TuiCompletionGateOutcome, emit_explicit_inflight_cleanup_signal, run_tui_completion_gate,
     tmux_output_watcher, tmux_output_watcher_with_restore,
@@ -2224,6 +2622,50 @@ mod watcher_stream_progress_tests {
     use crate::services::discord::inflight::InflightTurnState;
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::{ChannelId, MessageId};
+
+    fn streaming_tick_persist_order_guard_4104() -> &'static str {
+        let source = include_str!("tmux_watcher/streaming_status_tick.rs");
+        source
+            .split_once("// @persist-order-guard-start #4104")
+            .and_then(|(_, guarded)| {
+                guarded
+                    .split_once("// @persist-order-guard-end #4104")
+                    .map(|(guarded, _)| guarded)
+            })
+            .expect("#4104 persist-order markers must delimit production code")
+    }
+
+    #[test]
+    fn streaming_tick_persists_tool_hold_without_requiring_discord_edit_4104() {
+        let guarded = streaming_tick_persist_order_guard_4104();
+        let hold_persist = guarded
+            .find("persist_watcher_stream_progress(")
+            .expect("tool-hold snapshot must be persisted before render decisions");
+        let render_gate = guarded
+            .find("let raw_current_portion =")
+            .expect("streaming tick render gate");
+
+        assert!(
+            hold_persist < render_gate,
+            "tool-hold persistence must precede the no-edit early return"
+        );
+    }
+
+    #[test]
+    fn streaming_tick_persists_silent_tool_hold_before_render_suppression_4104() {
+        let guarded = streaming_tick_persist_order_guard_4104();
+        let hold_persist = guarded
+            .find("persist_watcher_stream_progress(")
+            .expect("silent tool-hold snapshot must be persisted");
+        let silent_gate = guarded
+            .find("if streaming_silent_turn {")
+            .expect("silent rendering suppression gate");
+
+        assert!(
+            hold_persist < silent_gate,
+            "silent turns must persist tool-hold state before suppressing Discord rendering"
+        );
+    }
 
     #[test]
     fn persist_watcher_stream_progress_persists_tool_hold_witness() {

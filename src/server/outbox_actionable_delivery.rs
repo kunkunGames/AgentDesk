@@ -44,6 +44,8 @@ async fn deliver_with_bot(
         }),
         crate::services::discord::health::ManualOutboundOptions {
             allow_unbound_internal_channel: true,
+            attachment: row.binary_attachment(),
+            ..Default::default()
         },
     )
     .await
@@ -77,8 +79,13 @@ pub(super) async fn deliver(
         primary_error = %error,
         "actionable ops alert announce delivery failed; falling back to notify bot"
     );
-    let (fallback_status, fallback_error) =
-        deliver_with_bot(registry, pg_pool, row, "notify").await;
+    let (fallback_status, fallback_error) = deliver_with_bot(
+        registry,
+        pg_pool,
+        row,
+        crate::services::discord::bot_role::UtilityBotRole::Notify.alias(),
+    )
+    .await;
     (fallback_status.to_string(), fallback_error)
 }
 

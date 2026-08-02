@@ -5,29 +5,27 @@ use axum::{
 };
 use serde_json::{Value, json};
 
+use super::super::AppState;
+use super::audit::audit_routine_delete;
+use super::helpers::{
+    ensure_routine_runtime_runnable, fallback_name, initial_attach_status,
+    migrated_launchd_metadata_for_state, normalize_routine_run_limit, normalize_script_ref,
+    routine_agent_executor, routine_discord_logger, routine_session_controller, routine_store,
+    validate_agent_id_request, validate_distinct_fallback_agent,
+    validate_execution_strategy_request, validate_max_retries_request, validate_run_status_filter,
+    validate_schedule_request, validate_timeout_request,
+};
+use super::responses::{delete_routine_response, session_control_error, store_error};
+use super::{
+    AttachRoutineBody, ListRoutinesQuery, ListRunsQuery, PatchRoutineBody, ResumeRoutineBody,
+    RoutineMetricsQuery, SearchRoutineRunResultsQuery,
+};
 use crate::api_caller_observability::RequestPrincipal;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineLifecycleEvent, RoutineScriptLoader, RoutineSessionCommand,
     execute_claimed_script_run, is_migrated_launchd_script_ref,
     validate_migrated_launchd_activation,
-};
-use crate::utils::api::clamp_api_limit;
-
-use super::super::AppState;
-use super::audit::audit_routine_delete;
-use super::helpers::{
-    ensure_routine_runtime_runnable, fallback_name, initial_attach_status,
-    migrated_launchd_metadata_for_state, normalize_script_ref, routine_agent_executor,
-    routine_discord_logger, routine_session_controller, routine_store, validate_agent_id_request,
-    validate_distinct_fallback_agent, validate_execution_strategy_request,
-    validate_max_retries_request, validate_run_status_filter, validate_schedule_request,
-    validate_timeout_request,
-};
-use super::responses::{delete_routine_response, session_control_error, store_error};
-use super::{
-    AttachRoutineBody, ListRoutinesQuery, ListRunsQuery, PatchRoutineBody, ResumeRoutineBody,
-    RoutineMetricsQuery, SearchRoutineRunResultsQuery,
 };
 
 pub async fn list_routines(
@@ -75,7 +73,7 @@ pub async fn search_routine_run_results(
         validate_run_status_filter(status)?;
     }
     let store = routine_store(&state)?;
-    let limit = clamp_api_limit(Some(query.limit.unwrap_or(20).max(0) as usize)) as i64;
+    let limit = normalize_routine_run_limit(query.limit);
     let runs = store
         .search_run_results(
             q,
@@ -130,8 +128,9 @@ pub async fn list_routine_runs(
             "routine {routine_id} not found"
         )));
     }
+    let limit = normalize_routine_run_limit(query.limit);
     let runs = store
-        .list_runs(&routine_id, query.limit.unwrap_or(20))
+        .list_runs(&routine_id, limit)
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "runs": runs })))
@@ -267,7 +266,7 @@ pub async fn resume_routine(
             "paused routine {routine_id} not found"
         )));
     }
-    let metadata = migrated_launchd_metadata_for_state(&state, &routine.script_ref)?;
+    let metadata = migrated_launchd_metadata_for_state(&state, &routine.script_ref).await?;
     let routine_script_dirs = state.config.routines.script_dirs();
     validate_migrated_launchd_activation(
         &routine.script_ref,
@@ -348,24 +347,33 @@ pub async fn run_routine_now(
         )));
     };
 
-    let loader = RoutineScriptLoader::new().map_err(|error| {
-        AppError::internal(format!("routine script loader init failed: {error}"))
-            .with_code(ErrorCode::Internal)
-    })?;
     let routine_script_dirs = state.config.routines.script_dirs();
-    loader.load_dirs(&routine_script_dirs).map_err(|error| {
-        AppError::internal(format!("routine script registry load failed: {error}"))
-            .with_code(ErrorCode::Config)
-    })?;
-    let metadata = if is_migrated_launchd_script_ref(&routine.script_ref) {
-        let Some(script) = loader.get_script(&routine.script_ref).map_err(|error| {
-            AppError::internal(format!("routine script lookup failed: {error}"))
-                .with_code(ErrorCode::Config)
-        })?
-        else {
+    let script_dirs_for_task = routine_script_dirs.clone();
+    let requested_script_ref = routine.script_ref.clone();
+    let script_ref_for_task = requested_script_ref.clone();
+    let (loader, script) = tokio::task::spawn_blocking(move || {
+        let loader = RoutineScriptLoader::new_shared(&script_dirs_for_task)
+            .map_err(|error| format!("routine script loader init failed: {error}"))?;
+        loader
+            .load_dirs(&script_dirs_for_task)
+            .map_err(|error| format!("routine script registry load failed: {error}"))?;
+        let script = loader
+            .get_script(&script_ref_for_task)
+            .map_err(|error| format!("routine script lookup failed: {error}"))?;
+        Ok::<_, String>((loader, script))
+    })
+    .await
+    .map_err(|error| {
+        AppError::internal(format!(
+            "routine script registry blocking task failed: {error}"
+        ))
+        .with_code(ErrorCode::Internal)
+    })?
+    .map_err(|error| AppError::internal(error).with_code(ErrorCode::Config))?;
+    let metadata = if is_migrated_launchd_script_ref(&requested_script_ref) {
+        let Some(script) = script else {
             return Err(AppError::conflict(format!(
-                "migrated routine {} is invalid: routine script not loaded",
-                routine.script_ref
+                "migrated routine {requested_script_ref} is invalid: routine script not loaded"
             )));
         };
         Some(script.metadata)

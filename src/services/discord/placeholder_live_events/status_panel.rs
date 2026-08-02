@@ -54,46 +54,21 @@ pub(super) struct SubagentSlot {
     /// silent longer than `STUCK_BACKGROUND_TASK_TTL`.
     pub(super) started_at: std::time::Instant,
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) enum DerivedStatus {
-    #[default]
-    Running,
-    MonitorWait,
-    ScheduleWakeup(Option<u64>),
-    Completed {
-        kind: CompletedKind,
-    },
-    ToolRunning {
-        name: String,
-        summary: Option<String>,
-    },
-    SubagentRunning {
-        desc: String,
-    },
-    WorkflowRunning {
-        label: String,
-    },
-}
+mod completed_kind;
+mod derived_status;
+pub(super) use completed_kind::CompletedKind;
+pub(super) use derived_status::DerivedStatus;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompletedKind {
-    Foreground,
-    Background,
-}
-
-impl CompletedKind {
-    fn from_background(background: bool) -> Self {
-        if background {
-            Self::Background
-        } else {
-            Self::Foreground
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LastToolCall {
+    pub(super) name: String,
+    pub(super) summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct StatusPanelState {
     pub(super) status: DerivedStatus,
+    pub(super) last_tool: Option<LastToolCall>,
     pub(super) session: Option<SessionPanelSnapshot>,
     pub(super) task: Option<TaskPanelSnapshot>,
     pub(super) context: Option<ContextPanelSnapshot>,
@@ -124,6 +99,7 @@ impl StatusPanelState {
     /// context/token usage + session snapshots and the ordinal counter.
     pub(super) fn reset_session_content(&mut self) {
         self.status = DerivedStatus::Running;
+        self.last_tool = None;
         self.todos.clear();
         self.tasks.clear();
         // #4396 r3: the cleared subagents leave the state — tombstone their keys
@@ -242,6 +218,10 @@ impl StatusPanelState {
     pub(super) fn apply(&mut self, event: StatusEvent) {
         match event {
             StatusEvent::ToolStart { name, args_summary } => {
+                self.last_tool = Some(LastToolCall {
+                    name: name.clone(),
+                    summary: args_summary.clone(),
+                });
                 if is_schedule_wakeup_tool(&name) {
                     self.status =
                         DerivedStatus::ScheduleWakeup(parse_eta_secs(args_summary.as_deref()));
@@ -600,35 +580,53 @@ impl StatusPanelState {
 pub(super) fn render_status_panel(
     snapshot: StatusPanelState,
     provider: &ProviderKind,
-    // #3983 item 2: precomputed `마지막 업데이트 : … / 턴 시작 : …` time line (line 2).
+    // #4601: precomputed `턴 시작 : …\n마지막 업데이트 : …` time lines.
     time_line: String,
-    // #3983 item 3: precomputed `턴 트리거:` deeplink, appended as the LAST footer
-    // line (or `None` for headless/synthetic/id-0 turns with no real user message).
+    // #4601: precomputed `턴 트리거:` deeplink, rendered immediately after the
+    // activity line (or `None` for headless/synthetic/id-0 turns).
     turn_trigger_line: Option<String>,
 ) -> String {
-    let header_status = if matches!(provider, ProviderKind::Codex)
-        && matches!(snapshot.status, DerivedStatus::SubagentRunning { .. })
-    {
+    let codex_subagent_projection = matches!(provider, ProviderKind::Codex)
+        && matches!(snapshot.status, DerivedStatus::SubagentRunning { .. });
+    let codex_task_projection = matches!(provider, ProviderKind::Codex)
+        && snapshot
+            .last_tool
+            .as_ref()
+            .is_some_and(|tool| super::status_events::is_task_tool(&tool.name));
+    let header_status = if codex_subagent_projection || codex_task_projection {
         DerivedStatus::Running
     } else {
         snapshot.status.clone()
     };
-    // #3983: line 1 = derived-status ACTIVITY label, line 2 = relative TIME line
-    // (both built in the colocated `freshness` module — status_panel.rs is at the
-    // namespace cap). The pre-#3983 confidence line + `진행 중 — provider` header is
-    // retired (item 2); the request anchor no longer prepends here (item 3, see the
-    // trailing `턴 트리거:` push below).
-    let mut sections = vec![
-        super::freshness::render_activity_line(&header_status),
-        time_line,
-    ];
+    // #4601: the header opens with the derived-status ACTIVITY label, followed by
+    // the request anchor when present, then the start/update TIME fields. Keep the
+    // entire header in one section so each field occupies the immediately following
+    // physical line and section-wise truncation preserves the header atomically.
+    // #4367: Codex subagent evidence stays hidden after launch acknowledgement,
+    // terminal completion, and later turns. Status alone cannot provide the gate
+    // because `last_tool` persists for the provider session.
+    let visible_last_tool = (!codex_task_projection)
+        .then_some(snapshot.last_tool.as_ref())
+        .flatten();
+    let activity_line =
+        super::freshness::render_activity_line_with_last_tool(&header_status, visible_last_tool);
+    let time_lines = time_line.lines().collect::<Vec<_>>();
+    let mut header_lines = std::iter::once(activity_line.as_str())
+        .chain(time_lines)
+        .collect::<Vec<_>>();
+    let trigger = turn_trigger_line.filter(|line| !line.trim().is_empty());
+    if let Some(trigger) = trigger.as_deref() {
+        header_lines.insert(1, trigger);
+    }
+    let header_lines =
+        crate::services::terminal_status_formatting::format_subtext_lines(header_lines);
+    let mut sections = vec![header_lines.join("\n")];
 
     // #3983 item4: the session line is NO LONGER rendered in the every-tick
     // footer. It is composed once at the top of the first answer message via
     // `session_banner.rs`, so the
     // repeated per-tick footer echo of `🆕 새 세션 시작 · provider session … · tmux …`
-    // is retired. Track A's 3-line header (activity / time / 턴 트리거) is
-    // unaffected.
+    // is retired. Track A's header is unaffected.
 
     if let Some(task) = snapshot.task.as_ref() {
         sections.push(render_task_panel_line(task));
@@ -689,14 +687,18 @@ pub(super) fn render_status_panel(
         }
     }
 
-    // #3983 item 3: the `턴 트리거:` original-request deeplink is the LAST footer
-    // line (it previously prepended above the header). Absent for headless /
-    // synthetic / id-0 turns that carry no real Discord user message.
-    if let Some(trigger) = turn_trigger_line.filter(|line| !line.trim().is_empty()) {
-        sections.push(trigger);
-    }
+    format_and_truncate_status_panel_sections(sections)
+}
 
-    truncate_status_panel_sections(sections)
+pub(super) fn format_and_truncate_status_panel_sections(sections: Vec<String>) -> String {
+    truncate_status_panel_sections(
+        sections
+            .into_iter()
+            .map(|section| {
+                crate::services::terminal_status_formatting::format_subtext_block(&section)
+            })
+            .collect(),
+    )
 }
 
 fn join_status_panel_sections(sections: &[String]) -> String {
@@ -722,7 +724,7 @@ pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> Strin
 }
 
 impl SubagentSlot {
-    fn is_unfinished_background(&self) -> bool {
+    pub(super) fn is_unfinished_background(&self) -> bool {
         self.background && self.finished.is_none()
     }
 

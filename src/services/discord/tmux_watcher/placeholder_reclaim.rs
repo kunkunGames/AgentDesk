@@ -44,7 +44,7 @@ pub(super) async fn reclaim_orphan_external_input_placeholder(
     let Some(msg_id) = *placeholder_msg_id else {
         return true;
     };
-    if let Some((nudged_at_millis, frontier_at_nudge, shield_identity)) =
+    if let Some((nudged_at_millis, frontier_token, shield_identity)) =
         shared.redrive_placeholder_shield_context(provider, channel_id)
         && shield_identity.is_some()
         && shield_identity
@@ -52,10 +52,12 @@ pub(super) async fn reclaim_orphan_external_input_placeholder(
                 .map(|state| {
                     crate::services::discord::inflight::InflightTurnIdentity::from_state(&state)
                 })
+        && shared.relay_frontier_token(channel_id).reset_incarnation
+            == frontier_token.reset_incarnation
         && super::panel_decisions::redrive_shielded_placeholder(
             nudged_at_millis,
             msg_id.created_at().timestamp_millis(),
-            shared.committed_relay_offset(channel_id) <= frontier_at_nudge,
+            shared.committed_relay_offset(channel_id) <= frontier_token.committed_offset,
             chrono::Utc::now().timestamp_millis(),
         )
     {
@@ -64,7 +66,7 @@ pub(super) async fn reclaim_orphan_external_input_placeholder(
             event = "redrive_placeholder_reclaim_shielded",
             channel_id = channel_id.get(),
             message_id = msg_id.get(),
-            frontier_at_nudge,
+            frontier_at_nudge = frontier_token.committed_offset,
             "redrive-created placeholder preserved while the frontier is frozen"
         );
         return false;
@@ -234,22 +236,22 @@ mod redrive_reclaim_e2e_tests {
             let mut creates = 0;
             let mut deletes = 0;
             let mut nudges = 0;
-            for pass in 0..20 {
+            for elapsed in [0, 30, 90, 210, 450] {
                 let nudged = registry
                     .redrive_undelivered_backlog_at(
                         &provider,
                         shared.clone(),
                         channel_id,
-                        base + i64::from(pass) * 30,
+                        base + elapsed,
                     )
                     .await
                     .expect("redrive pass");
-                if nudged {
-                    nudges += 1;
-                    if placeholder_msg_id.is_none() {
-                        placeholder_msg_id = Some(message_id_at(base + 300, 2));
-                        creates += 1;
-                    }
+                assert!(nudged, "scheduled redrive must fire at +{elapsed}s");
+                nudges += 1;
+                *resume_offset.lock().expect("resume offset") = None;
+                if placeholder_msg_id.is_none() {
+                    placeholder_msg_id = Some(message_id_at(base + 300, 2));
+                    creates += 1;
                 }
                 if placeholder_msg_id.is_some() {
                     let reclaimed = reclaim_orphan_external_input_placeholder(
@@ -290,6 +292,7 @@ mod redrive_reclaim_e2e_tests {
                     .expect("sixth redrive pass")
             );
             nudges += 1;
+            *resume_offset.lock().expect("resume offset") = None;
             assert!(
                 !registry
                     .redrive_undelivered_backlog_at(
@@ -301,6 +304,29 @@ mod redrive_reclaim_e2e_tests {
                     .await
                     .expect("capped redrive pass")
             );
+            assert!(
+                !registry
+                    .redrive_undelivered_backlog_at(
+                        &provider,
+                        shared.clone(),
+                        channel_id,
+                        base + 4_529,
+                    )
+                    .await
+                    .expect("pre-rearm boundary pass")
+            );
+            assert!(
+                registry
+                    .redrive_undelivered_backlog_at(
+                        &provider,
+                        shared.clone(),
+                        channel_id,
+                        base + 4_530,
+                    )
+                    .await
+                    .expect("post-rearm boundary pass")
+            );
+            nudges += 1;
             (creates, deletes, nudges)
         });
 
@@ -309,7 +335,10 @@ mod redrive_reclaim_e2e_tests {
             delete_count, 0,
             "no post-nudge placeholder may churn inside 900s"
         );
-        assert_eq!(nudge_count, 6, "redrive must stop permanently at the cap");
+        assert_eq!(
+            nudge_count, 7,
+            "redrive must remain capped for one hour, then re-arm"
+        );
         assert_eq!(*resume_offset.lock().unwrap(), Some(0));
         if let Some((_, handle)) = shared.tmux_watchers.remove(&channel_id) {
             handle.cancel.store(true, Ordering::Release);

@@ -1,39 +1,72 @@
 use super::*;
 
-/// #family-profile-probe: should this headless turn start from a FRESH provider
-/// session? This is the INTENDED runtime contract for `execution_strategy=fresh`
-/// DM routine turns: a fresh-strategy DM routine run must NOT resume the
-/// per-channel provider session — each run is a fresh provider context with
-/// memento (caseId) as the only cross-run continuity. The per-channel session
-/// cache otherwise keeps resuming the same Claude session, accumulating context
-/// and leaking intermediate narrative across runs.
-///
-/// Scope is deliberately ALL fresh DM routine turns, not just family-profile-
-/// probe (today only the two probe scripts use `dmUserId`, but any future
-/// fresh-strategy DM routine inherits the same correct fresh-context semantics).
-/// Gated to DM turns (`is_dm`, set only by the routine agent-executor for
-/// `dmUserId` actions); user-facing DM messages carry no routine metadata, and
-/// non-DM / explicitly-"persistent" routine turns return false and keep their
-/// resumed session.
-fn dm_fresh_routine_turn(metadata: Option<&serde_json::Value>) -> bool {
-    let Some(metadata) = metadata else {
+fn valid_routine_metadata(metadata: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
+    let metadata = metadata?;
+    metadata
+        .get("routine_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(metadata)
+}
+
+fn routine_metadata_agent_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    valid_routine_metadata(metadata)?
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// #4658: the isolated session-key basis for a scheduled-snapshot turn. When
+/// present, the turn (a) derives its ADK session key from this label instead of
+/// the channel name and (b) severs provider/transcript continuity so the frozen
+/// snapshot is the only conversation context. Absent for every other caller.
+fn scheduled_snapshot_session_label(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata?
+        .get("scheduled_snapshot_session_label")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether an explicit routine turn must sever provider and transcript continuity.
+/// Only `persistent` routines retain continuity; absent strategy preserves the
+/// legacy routine default of `fresh`. Non-routine metadata must never reset a
+/// provider session.
+fn fresh_routine_turn(metadata: Option<&serde_json::Value>) -> bool {
+    let Some(metadata) = valid_routine_metadata(metadata) else {
         return false;
     };
-    let is_dm = metadata
-        .get("is_dm")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    if !is_dm {
-        return false;
-    }
-    // Only an explicit "persistent" strategy keeps the resumed session; an absent
-    // or "fresh" strategy resets (the routine default is "fresh").
     metadata
         .get("execution_strategy")
         .and_then(|value| value.as_str())
         != Some("persistent")
 }
 
+async fn persist_boundary_before_provider_clear<B, BFut, C, CFut, E>(
+    persist_boundary: bool,
+    clear_provider: bool,
+    boundary: B,
+    clear: C,
+) -> Result<(), E>
+where
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    if persist_boundary {
+        boundary().await?;
+    }
+    if clear_provider {
+        clear().await;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn start_headless_turn(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -101,13 +134,8 @@ fn routine_metadata_role_binding(
     metadata: Option<&serde_json::Value>,
     provider: &ProviderKind,
 ) -> Option<settings::RoleBinding> {
-    let metadata = metadata?;
-    metadata.get("routine_id")?;
-    let agent_id = metadata
-        .get("agent_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let metadata = valid_routine_metadata(metadata)?;
+    let agent_id = routine_metadata_agent_id(Some(metadata))?;
     // Resolve the agent's configured prompt path instead of hardcoding
     // IDENTITY.md under config/agents: `default_prompt_path` reads the managed
     // agents root and falls back to the legacy `<id>.prompt.md` layout, so
@@ -129,6 +157,7 @@ fn routine_metadata_role_binding(
 }
 
 #[allow(dead_code)] // #3034: exported voice entry point, wired-but-dormant (no live dispatch yet).
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn start_voice_headless_turn(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -273,6 +302,16 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             status: HeadlessTurnStartStatus::Consumed,
         });
     }
+    let session_transition_guard = shared
+        .acquire_session_transition(channel_id)
+        .await
+        .map_err(|_| {
+            HeadlessTurnStartError::Conflict(format!(
+                "session transition stayed busy for {} seconds on channel {}",
+                super::super::super::SESSION_TRANSITION_LOCK_WAIT_TIMEOUT.as_secs(),
+                channel_id.get()
+            ))
+        })?;
     let cancel_token = Arc::new(CancelToken::new());
     let started = super::super::super::mailbox_try_start_turn(
         shared,
@@ -288,21 +327,12 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             channel_id.get()
         )));
     }
-    // #family-profile-probe: is this a fresh-strategy DM routine turn that must
-    // start from a fresh provider context? Computed once at the turn-start
-    // boundary; the full fresh-session handling (thorough clear + restore skip +
-    // launch fresh flag) is routed through the shared `/goal fresh` machinery
-    // below. memento (caseId) is the only cross-run continuity.
-    let dm_fresh = dm_fresh_routine_turn(metadata.as_ref());
+    // Compute the routine continuity policy once at the turn-start boundary.
+    // The shared `/goal fresh` machinery below clears every provider restore path
+    // and leaves memento (caseId) as the only cross-run continuity.
+    let fresh_routine = fresh_routine_turn(metadata.as_ref());
     let (mut session_id, mut memento_context_loaded, mut current_path) = {
         let mut data = shared.core.lock().await;
-        // Defense: pre-clear the in-memory per-channel session before load so no
-        // stale resume id flows through the load bookkeeping. The authoritative
-        // clear (in-memory + DB + stale id) is `clear_codex_goal_start_provider_
-        // session` further down, gated on the same `dm_fresh`.
-        if dm_fresh && let Some(session) = data.sessions.get_mut(&channel_id) {
-            session.clear_provider_session();
-        }
         if let Some(info) = load_session_runtime_state(&mut data.sessions, channel_id) {
             // Existing sessions retain their child-channel runtime identity.
             if let Some(channel_name) = resolved_channel_name_for_session.as_ref()
@@ -370,7 +400,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                     channel_id: Some(channel_id.get()),
                     last_active: tokio::time::Instant::now(),
                     worktree: None,
-                    born_generation: super::super::super::runtime_store::load_generation(),
+                    born_generation: super::super::super::runtime_store::process_generation(),
                 });
             session.current_path = Some(canonical.clone());
             if session.channel_name.is_none() {
@@ -430,23 +460,14 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         .as_ref()
         .and_then(|binding| binding.provider.clone())
         .unwrap_or(settings_provider);
-    let routine_metadata_agent_id = metadata
-        .as_ref()
-        .and_then(|value| value.get("agent_id"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let routine_targets_resolved_role = metadata
-        .as_ref()
-        .and_then(|value| value.get("routine_id"))
-        .is_some()
-        && routine_metadata_agent_id
-            .zip(
-                role_binding
-                    .as_ref()
-                    .map(|binding| binding.role_id.as_str()),
-            )
-            .is_some_and(|(metadata_agent_id, role_id)| metadata_agent_id == role_id);
+    let routine_metadata_agent_id = routine_metadata_agent_id(metadata.as_ref());
+    let routine_targets_resolved_role = routine_metadata_agent_id
+        .zip(
+            role_binding
+                .as_ref()
+                .map(|binding| binding.role_id.as_str()),
+        )
+        .is_some_and(|(metadata_agent_id, role_id)| metadata_agent_id == role_id);
     let routine_agent_identity_changed = if routine_targets_resolved_role {
         if let Some(channel_name_hint) = channel_name_hint
             .as_ref()
@@ -524,7 +545,8 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         )
     };
 
-    let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, early_thread_parent);
+    let fast_mode_channel_id =
+        effective_fast_mode_channel_id(channel_id, early_thread_parent.clone());
     super::super::super::commands::reset_provider_session_if_pending(
         &ctx.http,
         shared,
@@ -568,11 +590,20 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             .and_then(|session| session.category_name.clone());
         (channel_name, tmux_session_name, category_name)
     };
-    let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
-    if metadata
-        .as_ref()
-        .and_then(|value| value.get("routine_id"))
-        .is_some()
+    // #4658: scheduled-snapshot turns key their session off the reservation
+    // label so they never share (and thus never overwrite) the channel's live
+    // session_key row.
+    let scheduled_snapshot_label = scheduled_snapshot_session_label(metadata.as_ref());
+    let scheduled_snapshot_turn = scheduled_snapshot_label.is_some();
+    let adk_session_key = build_adk_session_key(
+        shared,
+        channel_id,
+        &provider,
+        scheduled_snapshot_label.as_deref(),
+    )
+    .await;
+    if !scheduled_snapshot_turn
+        && valid_routine_metadata(metadata.as_ref()).is_some()
         && let (Some(pool), Some(binding), Some(session_key)) = (
             shared.pg_pool.as_ref(),
             role_binding.as_ref(),
@@ -636,46 +667,55 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let retry_context = session_retry_context.as_ref();
     let reply_context = retry_context.map(|c| c.formatted_context.clone());
     let goal_fresh = matches!(headless_goal_kind, GoalCommandKind::FreshStart);
-    // Routine metadata deterministically reasserts `dm_fresh` on routine runs,
-    // but a later user-authored turn in the same DM has no routine metadata.
-    // Persist both deliberate severances so that a later plain fresh turn cannot
-    // inject transcript pairs from before either one.
-    if (goal_fresh || dm_fresh)
-        && let Err(error) = record_fresh_session_context_boundary(shared, channel_id).await
-    {
+    // Routine metadata reasserts the fresh boundary on every routine run, while
+    // later user-authored turns carry no routine marker. Persist both deliberate
+    // severances so no later turn can re-inject transcript pairs from before one.
+    // #4658: a scheduled-snapshot turn must NOT join the channel-mutating
+    // `fresh_context_severance` path — that path records a DURABLE channel clear
+    // boundary (breaking future live turns' recent-context) and wipes the
+    // CHANNEL's in-memory provider session. The snapshot turn is isolated by its
+    // distinct `session_key` (adk_session_key override) alone: the DB `sessions`
+    // writeback is keyed by session_key, so it never touches the channel row.
+    // Its cold start + live-context suppression are handled separately below,
+    // WITHOUT disturbing the channel (F1: non-disruption is the design contract).
+    let fresh_context_severance = goal_fresh || fresh_routine;
+    // Fresh routines use the same provider-severance machinery as `/goal fresh`:
+    // clear in-memory, DB, stale IDs, and live-TUI bindings; skip restoration;
+    // and force a cold provider launch. Prompt rewriting remains goal-only.
+    let force_fresh_provider_session = fresh_context_severance || routine_agent_identity_changed;
+    let severance = persist_boundary_before_provider_clear(
+        fresh_context_severance,
+        force_fresh_provider_session,
+        || record_fresh_session_context_boundary(shared, channel_id),
+        || {
+            clear_codex_goal_start_provider_session(
+                shared,
+                channel_id,
+                adk_session_key.as_deref(),
+                &mut session_id,
+                &mut memento_context_loaded,
+                &mut session_strategy_reason,
+            )
+        },
+    )
+    .await;
+    if let Err(error) = severance {
         let _ = release_mailbox_after_placeholder_post_failure(shared, &provider, channel_id).await;
         return Err(HeadlessTurnStartError::Internal(format!(
             "failed to persist fresh-session context boundary: {error}"
         )));
     }
-    // #family-profile-probe (codex review P1/R2): a fresh DM routine turn must
-    // route through the SAME proven fresh-session machinery as `/goal fresh`, so
-    // it (a) thoroughly clears in-memory + DB + stale provider session via
-    // `clear_codex_goal_start_provider_session`, (b) skips the DB/live-TUI
-    // restore below, AND (c) passes the fresh flag to the provider launch so the
-    // live tmux pane is not reused (Claude TUI would otherwise recover a runtime
-    // binding and flip back to resume; the Codex wrapper reuses on
-    // `!force_fresh_provider_session`). Clearing the in-memory id alone is
-    // insufficient on all three counts. Only the `/goal fresh` PROMPT REWRITE is
-    // gated separately (goal-only) — the probe prompt must be sent verbatim.
-    let force_fresh_provider_session = goal_fresh || dm_fresh || routine_agent_identity_changed;
     if force_fresh_provider_session {
-        clear_codex_goal_start_provider_session(
-            shared,
-            channel_id,
-            adk_session_key.as_deref(),
-            &mut session_id,
-            &mut memento_context_loaded,
-            &mut session_strategy_reason,
-        )
-        .await;
-        // #family-profile-probe (codex review R3): the in-memory/DB/stale clears
-        // above do NOT touch the Claude TUI runtime binding. With a live tmux
-        // pane, `recover_claude_tui_session_resolution_from_runtime_binding`
-        // (claude.rs) flips `resume` back on even when `session_id` is None, so
-        // the pane is warm-reused. Clear that binding too so a fresh DM/goal turn
-        // cold-starts instead of resuming the live pane. (The Codex wrapper path
-        // already honors `force_fresh_provider_session` at launch.)
+        session_strategy_reason = if goal_fresh {
+            "goal_fresh_provider_session"
+        } else if routine_agent_identity_changed {
+            "routine_agent_identity_changed"
+        } else {
+            "fresh_routine_provider_session"
+        };
+        // The provider-state clear does not remove Claude's live-TUI runtime
+        // binding. Clear it explicitly so fresh routine and goal turns cannot
+        // recover resume mode from a warm tmux pane.
         if let Some(ref tmux_session) = tmux_session_name {
             crate::services::tui_prompt_dedupe::clear_tmux_runtime_binding(tmux_session);
         }
@@ -685,15 +725,31 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     } else {
         std::borrow::Cow::Borrowed(prompt)
     };
+    // #4658: cold-start the isolated snapshot session WITHOUT disturbing the
+    // channel. Drop the channel's in-memory session_id locally (do NOT mutate
+    // `shared.core.sessions` and do NOT clear the channel's stale id) so this
+    // turn neither resumes the live channel session nor a prior fire's scheduled
+    // session (AC-3 per-fire independence). The isolated tmux pane binding is
+    // cleared so a warm pane from a previous fire cannot recover resume mode.
+    if scheduled_snapshot_turn {
+        session_id = None;
+        memento_context_loaded = false;
+        session_strategy_reason = "scheduled_snapshot_context";
+        if let Some(ref tmux_session) = tmux_session_name {
+            crate::services::tui_prompt_dedupe::clear_tmux_runtime_binding(tmux_session);
+        }
+    }
     if session_id.is_none() {
-        if force_fresh_provider_session {
+        if force_fresh_provider_session || scheduled_snapshot_turn {
             let ts = chrono::Local::now().format("%H:%M:%S");
             let reason = if goal_fresh {
                 "/goal fresh session request"
             } else if routine_agent_identity_changed {
                 "routine agent identity change"
+            } else if scheduled_snapshot_turn {
+                "scheduled snapshot turn"
             } else {
-                "fresh DM routine turn"
+                "fresh routine turn"
             };
             tracing::info!(
                 "  [{ts}] ↻ Skipping DB/live provider session restore for headless channel {} due to {reason}",
@@ -788,6 +844,8 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     )
     .await;
 
+    drop(session_transition_guard);
+
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
     let memento_recall_gate = memento_recall_gate_decision(
         &memory_settings,
@@ -874,6 +932,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         session_id.as_deref(),
         force_fresh_provider_session,
         session_was_cleared,
+        scheduled_snapshot_turn,
         dispatch_profile,
         None,
         session_retry_context.as_ref(),
@@ -940,7 +999,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         token,
         role_binding.as_ref(),
         false,
-        dispatch_profile,
+        PromptProfiles::headless(dispatch_profile),
         None,
         None,
         sak_for_system,
@@ -1029,7 +1088,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let adk_thread_channel_id = adk_session_name
         .as_deref()
         .and_then(super::super::super::adk_session::parse_thread_channel_id_from_name);
-    post_adk_session_status(
+    post_adk_session_status_with_canonical_identity(
         adk_session_key.as_deref(),
         adk_session_name.as_deref(),
         model_for_turn.as_deref(),
@@ -1044,42 +1103,19 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         role_binding
             .as_ref()
             .map(|binding| binding.role_id.as_str()),
+        &shared.token_hash,
+        scheduled_snapshot_turn,
         shared.api_port,
     )
     .await;
 
-    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) = {
-        #[cfg(unix)]
-        {
-            if remote_profile.is_none()
-                && provider.uses_managed_tmux_backend()
-                && claude::is_tmux_available()
-            {
-                if let Some(ref tmux_name) = tmux_session_name {
-                    let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
-                    let session_exists =
-                        crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
-                    let last_offset = std::fs::metadata(&output_path)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    (
-                        Some(tmux_name.clone()),
-                        Some(output_path),
-                        Some(input_fifo_path),
-                        if session_exists { last_offset } else { 0 },
-                    )
-                } else {
-                    (None, None, None, 0)
-                }
-            } else {
-                (None, None, None, 0)
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            (None, None, None, 0u64)
-        }
-    };
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) =
+        prelaunch_inflight_runtime_seed(
+            &provider,
+            remote_profile.is_none(),
+            tmux_session_name.as_deref(),
+            prelaunch_runtime_kind,
+        );
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
 
@@ -1097,6 +1133,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
+    inflight_state.turn_nonce = cancel_token.turn_nonce().map(str::to_owned);
     apply_prelaunch_runtime_kind(&mut inflight_state, prelaunch_runtime_kind);
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
@@ -1118,10 +1155,11 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     inflight_state.delivery_bot = metadata_delivery_bot(metadata.as_ref());
     inflight_state.silent_turn = metadata_silent_flag(metadata.as_ref());
     inflight_state.source = metadata_turn_source(source, metadata.as_ref());
-    if let Err(error) = save_inflight_state(&inflight_state) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!("  [{ts}]   ⚠ inflight state save failed: {error}");
-    }
+    super::intake_turn::inflight_create_log::log_create_new_inflight_outcome(
+        crate::services::discord::inflight::save_inflight_state_create_new(&inflight_state),
+        &provider,
+        &inflight_state,
+    );
 
     let _ = attach_paused_turn_watcher_for_inflight(
         shared,
@@ -1132,6 +1170,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         watcher_output_path,
         inflight_offset,
         "turn_start_headless",
+        early_thread_parent.map(|(parent_channel_id, _)| parent_channel_id),
         &mut inflight_state,
     );
     let (tx, rx) = mpsc::channel();
@@ -1185,6 +1224,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let compact_percent = ctx_thresholds.compact_pct_for(&provider);
     let model_context_window = provider.resolve_context_window(model_for_turn.as_deref());
     let compact_percent_for_claude = Some(ctx_thresholds.compact_pct_for(&provider));
+    let compact_lower_bound_tokens = ctx_thresholds.compact_lower_bound_tokens;
     let compact_token_limit_for_codex = {
         let cli_config = provider.compact_cli_config(compact_percent, model_context_window);
         cli_config
@@ -1233,6 +1273,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
                             compact_percent_for_claude,
+                            compact_lower_bound_tokens,
                             cache_ttl_minutes,
                             None,
                         ),
@@ -1332,7 +1373,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                 } else {
                     "unknown panic".to_string()
                 };
-                tracing::warn!("  [headless streaming] PANIC: {}", msg);
+                tracing::error!("  [headless streaming] PANIC: {}", msg);
                 let _ = tx.send(StreamMessage::Error {
                     message: format!("Internal error (panic): {}", msg),
                     stdout: String::new(),
@@ -1343,6 +1384,14 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         }
     });
 
+    if !inflight_state.silent_turn {
+        super::typing_indicator::spawn_native_typing_indicator(
+            shared,
+            ctx.http.clone(),
+            channel_id,
+            inflight_state.effective_finalizer_turn_id(),
+        );
+    }
     spawn_turn_bridge(
         shared.clone(),
         cancel_token,
@@ -1385,6 +1434,12 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
 
 #[cfg(test)]
 mod recovery_context_take_order_tests {
+    use super::super::super::super::prompt_builder::{
+        DispatchProfile, PromptProfiles, build_system_prompt_with_manifest,
+    };
+    use super::super::super::super::settings::RoleBinding;
+    use poise::serenity_prelude::ChannelId;
+
     fn recovery_context_take_call() -> String {
         format!(
             "{}{}",
@@ -1461,6 +1516,78 @@ mod recovery_context_take_order_tests {
             take_pos < manifest_use_pos,
             "headless real turn must take recovery context before prompt manifest capture"
         );
+    }
+
+    #[test]
+    fn actual_headless_assembly_selects_only_all_and_headless_shared_sections() {
+        let module_src = include_str!("headless_turn.rs");
+        let builder_pos = module_src
+            .find("let built_system_prompt = build_system_prompt_with_manifest(")
+            .expect("headless prompt assembly exists");
+        let builder_call = &module_src[builder_pos..];
+        let call_end = builder_call
+            .find("\n    );")
+            .expect("headless prompt assembly call closes");
+        let builder_call = &builder_call[..call_end];
+        assert!(builder_call.contains("PromptProfiles::headless(dispatch_profile)"));
+        assert!(!builder_call.contains("PromptProfiles::foreground"));
+
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _runtime_guard = crate::config::set_agentdesk_root_for_test(runtime_root.path());
+        let shared_prompt_path = crate::runtime_layout::shared_prompt_path(runtime_root.path());
+        std::fs::create_dir_all(shared_prompt_path.parent().expect("shared prompt parent"))
+            .expect("create shared prompt parent");
+        std::fs::write(
+            shared_prompt_path,
+            "<!-- profile: all -->\nHEADLESS ACTUAL ALL 4560\n<!-- /profile -->\n\
+             <!-- profile: full -->\nHEADLESS ACTUAL FULL 4560\n<!-- /profile -->\n\
+             <!-- profile: headless -->\nHEADLESS ACTUAL HEADLESS 4560\n<!-- /profile -->\n",
+        )
+        .expect("write shared prompt");
+        let binding = RoleBinding {
+            role_id: "headless-actual-profile-4560".to_string(),
+            prompt_file: runtime_root
+                .path()
+                .join("missing-role-prompt.md")
+                .display()
+                .to_string(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            peer_agents_enabled: false,
+            quality_feedback_injection_enabled: false,
+            memory: Default::default(),
+        };
+        let built = build_system_prompt_with_manifest(
+            "ctx",
+            &[],
+            "/nonexistent-headless-workspace-4560",
+            ChannelId::new(1),
+            ChannelId::new(1),
+            "tok",
+            Some(&binding),
+            false,
+            PromptProfiles::headless(DispatchProfile::Full),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            Some("turn-headless-actual-profile-4560"),
+        );
+
+        assert!(built.system_prompt.contains("HEADLESS ACTUAL ALL 4560"));
+        assert!(
+            built
+                .system_prompt
+                .contains("HEADLESS ACTUAL HEADLESS 4560")
+        );
+        assert!(!built.system_prompt.contains("HEADLESS ACTUAL FULL 4560"));
     }
 }
 
@@ -1558,75 +1685,177 @@ mod headless_hard_ceiling_tests {
 }
 
 #[cfg(test)]
-mod dm_fresh_routine_tests {
-    //! #family-profile-probe: the discriminator that decides whether a headless
-    //! turn clears its resumed per-channel provider session at turn start. A DM
-    //! routine turn (default/"fresh" strategy) must reset so each probe run is a
-    //! fresh provider context; only an explicit "persistent" strategy or a
-    //! non-DM turn keeps the resumed session.
-    use super::dm_fresh_routine_turn;
+mod fresh_routine_tests {
+    use super::{
+        fresh_routine_turn, persist_boundary_before_provider_clear, routine_metadata_agent_id,
+        routine_metadata_role_binding,
+    };
+    use crate::services::provider::ProviderKind;
     use serde_json::json;
+    use std::cell::RefCell;
 
     #[test]
-    fn dm_turn_without_strategy_is_fresh() {
-        // The probe routines omit execution_strategy (default fresh) → reset.
-        assert!(dm_fresh_routine_turn(Some(&json!({ "is_dm": true }))));
+    fn legacy_routine_without_strategy_is_fresh() {
+        assert!(fresh_routine_turn(Some(&json!({
+            "routine_id": "routine-1",
+            "is_dm": true
+        }))));
     }
 
     #[test]
-    fn dm_turn_with_fresh_strategy_is_fresh() {
-        assert!(dm_fresh_routine_turn(Some(&json!({
+    fn explicit_fresh_routine_is_fresh_for_every_channel_path() {
+        assert!(fresh_routine_turn(Some(&json!({
+            "routine_id": "routine-1",
             "is_dm": true,
+            "execution_strategy": "fresh"
+        }))));
+        assert!(fresh_routine_turn(Some(&json!({
+            "routine_id": "routine-1",
+            "is_dm": false,
+            "execution_strategy": "fresh"
+        }))));
+        assert!(fresh_routine_turn(Some(&json!({
+            "routine_id": "routine-1",
             "execution_strategy": "fresh"
         }))));
     }
 
     #[test]
-    fn dm_turn_with_persistent_strategy_keeps_session() {
-        // Only an explicit "persistent" DM routine preserves its resumed session.
-        assert!(!dm_fresh_routine_turn(Some(&json!({
-            "is_dm": true,
+    fn persistent_routine_keeps_provider_continuity() {
+        assert!(!fresh_routine_turn(Some(&json!({
+            "routine_id": "routine-1",
             "execution_strategy": "persistent"
         }))));
     }
 
     #[test]
-    fn non_dm_turn_is_never_reset() {
-        // A non-DM (channel/thread) headless turn keeps its resumed session even
-        // with a fresh strategy — scoped strictly to DM turns.
-        assert!(!dm_fresh_routine_turn(Some(&json!({
-            "is_dm": false,
-            "execution_strategy": "fresh"
-        }))));
-        // is_dm absent ⇒ treated as non-DM.
-        assert!(!dm_fresh_routine_turn(Some(&json!({
-            "execution_strategy": "fresh"
-        }))));
+    fn malformed_routine_metadata_cannot_enter_routine_paths() {
+        for metadata in [
+            json!({ "agent_id": "other-agent", "execution_strategy": "fresh" }),
+            json!({ "routine_id": null, "agent_id": "other-agent" }),
+            json!({ "routine_id": 7, "agent_id": "other-agent" }),
+            json!({ "routine_id": " ", "agent_id": "other-agent" }),
+        ] {
+            assert!(!fresh_routine_turn(Some(&metadata)));
+            assert!(routine_metadata_agent_id(Some(&metadata)).is_none());
+            assert!(
+                routine_metadata_role_binding(Some(&metadata), &ProviderKind::Claude).is_none()
+            );
+        }
+        assert!(!fresh_routine_turn(None));
     }
 
+    // #4658 F1 (non-disruption contract): a scheduled-snapshot turn must NOT join
+    // `fresh_context_severance`. That path records a DURABLE channel clear
+    // boundary and wipes the CHANNEL's in-memory provider session — disturbing
+    // future live turns. The snapshot turn is isolated by its distinct
+    // session_key alone and cold-starts by dropping the LOCAL session_id, never
+    // by mutating the shared channel map. Mutation proof: re-add
+    // `|| scheduled_snapshot_turn` to fresh_context_severance and this fails.
     #[test]
-    fn absent_metadata_is_not_reset() {
-        assert!(!dm_fresh_routine_turn(None));
-    }
-
-    #[test]
-    fn fresh_dm_path_records_durable_boundary_before_provider_clear() {
-        let module_src = include_str!("headless_turn.rs");
-        let branch = module_src
-            .find("if (goal_fresh || dm_fresh)")
-            .expect("fresh DM/goal durable-boundary branch exists");
-        let branch_body = &module_src[branch..];
-        let boundary_call = format!("{}{}", "record_fresh_session_", "context_boundary(");
-        let boundary = branch_body
-            .find(&boundary_call)
-            .expect("fresh DM path records a durable transcript boundary");
-        let provider_clear = branch_body
-            .find("clear_codex_goal_start_provider_session(")
-            .expect("fresh DM path clears provider state");
-
-        assert!(
-            boundary < provider_clear,
-            "fresh DM durable boundary must be recorded before provider state is cleared"
+    fn scheduled_snapshot_turn_stays_out_of_channel_mutating_severance() {
+        let src = include_str!("headless_turn.rs");
+        // Needles are assembled by concatenation so their full literal never
+        // appears in this test body — otherwise `include_str!` would self-match.
+        let severance_excludes_snapshot = format!(
+            "{}{}",
+            "let fresh_context_severance = goal_fresh ", "|| fresh_routine;"
         );
+        let severance_includes_snapshot = format!(
+            "{}{}",
+            "goal_fresh || fresh_routine ", "|| scheduled_snapshot_turn"
+        );
+        let local_cold_start = format!(
+            "{}{}",
+            "if scheduled_snapshot_turn {\n        ", "session_id = None;"
+        );
+        assert!(
+            src.contains(&severance_excludes_snapshot),
+            "fresh_context_severance must exclude scheduled_snapshot_turn"
+        );
+        assert!(
+            !src.contains(&severance_includes_snapshot),
+            "scheduled_snapshot_turn must never re-join the channel-clearing severance"
+        );
+        // Cold start is local-only: drops session_id without touching the shared
+        // channel session map or recording a channel clear boundary.
+        assert!(
+            src.contains(&local_cold_start),
+            "snapshot cold-start must null the LOCAL session_id, not wipe the channel"
+        );
+    }
+
+    // #4913 GO-A1: snapshot metadata must gate the legacy channel-key refresh.
+    // Mutation proof: remove `!scheduled_snapshot_turn &&` from the production
+    // guard and this source-contract test fails before a snapshot can rewrite the
+    // live channel row by channel_id.
+    #[test]
+    fn scheduled_snapshot_skips_channel_session_key_refresh() {
+        let src = include_str!("headless_turn.rs");
+        let guarded_refresh = format!(
+            "{}{}",
+            "if !scheduled_snapshot_turn\n        && ",
+            "valid_routine_metadata(metadata.as_ref()).is_some()"
+        );
+        assert!(
+            src.contains(&guarded_refresh),
+            "scheduled snapshots must not enter the channel-scoped session_key refresh"
+        );
+    }
+
+    #[test]
+    fn scheduled_snapshot_session_label_reads_metadata_marker() {
+        use super::scheduled_snapshot_session_label;
+        assert_eq!(
+            scheduled_snapshot_session_label(Some(&json!({
+                "scheduled_snapshot_session_label": "scheduled:smsg_abc"
+            })))
+            .as_deref(),
+            Some("scheduled:smsg_abc")
+        );
+        assert!(scheduled_snapshot_session_label(Some(&json!({ "routine_id": "r" }))).is_none());
+        assert!(scheduled_snapshot_session_label(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_routine_path_records_durable_boundary_before_provider_clear() {
+        let events = RefCell::new(Vec::new());
+
+        let result = persist_boundary_before_provider_clear(
+            true,
+            true,
+            || async {
+                events.borrow_mut().push("boundary");
+                Ok::<_, &'static str>(())
+            },
+            || async {
+                events.borrow_mut().push("clear");
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events.into_inner(), vec!["boundary", "clear"]);
+    }
+
+    #[tokio::test]
+    async fn fresh_routine_path_does_not_clear_provider_when_boundary_fails() {
+        let events = RefCell::new(Vec::new());
+
+        let result = persist_boundary_before_provider_clear(
+            true,
+            true,
+            || async {
+                events.borrow_mut().push("boundary");
+                Err::<(), _>("persistence failed")
+            },
+            || async {
+                events.borrow_mut().push("clear");
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("persistence failed"));
+        assert_eq!(events.into_inner(), vec!["boundary"]);
     }
 }

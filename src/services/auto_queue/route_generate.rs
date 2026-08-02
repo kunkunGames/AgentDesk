@@ -1,5 +1,9 @@
 use super::*;
 
+fn unresolved_external_dependency_label(issue_number: i64, status: Option<&str>) -> Option<String> {
+    (status != Some("done")).then(|| format!("#{issue_number}:{}", status.unwrap_or("missing")))
+}
+
 /// POST /api/queue/generate
 ///
 /// Creates a queue run from ready cards, ordered by priority.
@@ -13,7 +17,7 @@ use super::*;
 pub async fn generate(
     State(state): State<AppState>,
     Json(body): Json<GenerateBody>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let guild_id = state
         .config
         .onboarding
@@ -22,7 +26,7 @@ pub async fn generate(
     let force = body.force.unwrap_or(false);
     let review_mode = match normalize_auto_queue_review_mode(body.review_mode.as_deref()) {
         Ok(mode) => mode,
-        Err(err) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": err }))),
+        Err(err) => return Err(AppError::bad_request(err).with_code(ErrorCode::AutoQueue)),
     };
     // Validate the request body BEFORE the PG availability check so callers
     // get a 400 with the actual error (e.g. unknown phase_gate_kind) instead
@@ -30,11 +34,11 @@ pub async fn generate(
     let requested_entries = match normalize_generate_entries(&body) {
         Ok(entries) => entries,
         Err(err) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
+            return Err(AppError::bad_request(err).with_code(ErrorCode::AutoQueue));
         }
     };
     let Some(pool) = state.pg_pool_ref() else {
-        return pg_unavailable_response();
+        return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     let requested_issue_numbers = requested_entries
         .as_ref()
@@ -56,12 +60,14 @@ pub async fn generate(
         let mut cards =
             match resolve_dispatch_cards_with_pg(pool, body.repo.as_deref(), issue_numbers).await {
                 Ok(cards) => cards,
-                Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+                Err(error) => {
+                    return Err(AppError::bad_request(error).with_code(ErrorCode::AutoQueue));
+                }
             };
         if let Err(error) =
             apply_dispatch_agent_assignments_with_pg(pool, &mut cards, Some(agent_id), true).await
         {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+            return Err(AppError::bad_request(error).with_code(ErrorCode::AutoQueue));
         }
     }
     // (index, batch_phase, thread_group, phase_gate_kind)
@@ -96,15 +102,12 @@ pub async fn generate(
         {
             Ok(runs) => runs,
             Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
+                return Err(AppError::internal(error).with_code(ErrorCode::AutoQueue));
             }
         };
         if let Some((run_id, status)) = conflicting_live_runs.first() {
             if !force {
-                return existing_live_run_conflict_response(run_id, status);
+                return Ok(existing_live_run_conflict_response(run_id, status));
             }
             let target_run_ids: Vec<String> = conflicting_live_runs
                 .iter()
@@ -118,10 +121,7 @@ pub async fn generate(
             )
             .await
             {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
+                return Err(AppError::internal(error).with_code(ErrorCode::AutoQueue));
             }
         }
 
@@ -148,7 +148,7 @@ pub async fn generate(
                     github_issue_number: card.github_issue_number,
                 })
                 .collect(),
-            Err(error) => return error.into_json_response(),
+            Err(error) => return Err(error),
         }
     };
 
@@ -200,15 +200,11 @@ pub async fn generate(
                 }
                 Ok(None) => retained.push(card),
                 Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!(
-                                "active-dispatch lookup failed for card {}: {error}",
-                                card.card_id
-                            ),
-                        })),
-                    );
+                    return Err(AppError::internal(format!(
+                        "active-dispatch lookup failed for card {}: {error}",
+                        card.card_id
+                    ))
+                    .with_code(ErrorCode::AutoQueue));
                 }
             }
         }
@@ -278,23 +274,32 @@ pub async fn generate(
     if cards.is_empty() {
         let mut counts_map = serde_json::Map::new();
         if let Some(pipeline) = crate::pipeline::try_get() {
-            for pipeline_state in &pipeline.states {
-                if !pipeline_state.terminal {
-                    let c = state
-                        .auto_queue_service()
-                        .count_cards_by_status_with_pg(
-                            pool,
-                            body.repo.as_deref(),
-                            body.agent_id.as_deref(),
-                            &pipeline_state.id,
-                        )
-                        .await
-                        .unwrap_or(0);
-                    counts_map.insert(pipeline_state.id.clone(), serde_json::json!(c));
+            let statuses: Vec<String> = pipeline
+                .states
+                .iter()
+                .filter(|s| !s.terminal)
+                .map(|s| s.id.clone())
+                .collect();
+
+            if !statuses.is_empty() {
+                let grouped = state
+                    .auto_queue_service()
+                    .count_cards_by_status_grouped_with_pg(
+                        pool,
+                        body.repo.as_deref(),
+                        body.agent_id.as_deref(),
+                        &statuses,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                for status in statuses {
+                    let count = grouped.get(&status).copied().unwrap_or(0);
+                    counts_map.insert(status, serde_json::json!(count));
                 }
             }
         }
-        return (
+        return Ok((
             StatusCode::OK,
             Json(json!({
                 "run": null,
@@ -306,7 +311,7 @@ pub async fn generate(
                 "skipped_due_to_dependency": Vec::<serde_json::Value>::new(),
                 "skipped_due_to_filter": skip_breakdown.filter,
             })),
-        );
+        ));
     }
 
     let issue_to_idx: HashMap<i64, usize> = cards
@@ -343,8 +348,8 @@ pub async fn generate(
                 continue;
             }
 
-            let dep_status = if let Some(status) = dependency_status_cache.get(dep_num) {
-                status.clone()
+            let unresolved_dependency = if let Some(status) = dependency_status_cache.get(dep_num) {
+                unresolved_external_dependency_label(*dep_num, status.as_deref())
             } else {
                 let status = sqlx::query_scalar::<_, String>(
                     "SELECT status
@@ -358,15 +363,14 @@ pub async fn generate(
                 .await
                 .ok()
                 .flatten();
-                dependency_status_cache.insert(*dep_num, status.clone());
-                status
+                let unresolved_dependency =
+                    unresolved_external_dependency_label(*dep_num, status.as_deref());
+                dependency_status_cache.insert(*dep_num, status);
+                unresolved_dependency
             };
 
-            if dep_status.as_deref() != Some("done") {
-                unresolved_external_dependencies.push(format!(
-                    "#{dep_num}:{}",
-                    dep_status.as_deref().unwrap_or("missing")
-                ));
+            if let Some(unresolved_dependency) = unresolved_dependency {
+                unresolved_external_dependencies.push(unresolved_dependency);
             }
         }
 
@@ -396,7 +400,7 @@ pub async fn generate(
     }
 
     if filtered_cards.is_empty() {
-        return (
+        return Ok((
             StatusCode::OK,
             Json(json!({
                 "run": null,
@@ -406,7 +410,7 @@ pub async fn generate(
                 "skipped_due_to_dependency": skipped_due_to_dependency,
                 "skipped_due_to_filter": skip_breakdown.filter,
             })),
-        );
+        ));
     }
 
     let plan = build_group_plan(&filtered_cards);
@@ -501,10 +505,10 @@ pub async fn generate(
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
         Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("begin auto-queue generate transaction: {error}")})),
-            );
+            return Err(AppError::internal(format!(
+                "begin auto-queue generate transaction: {error}"
+            ))
+            .with_code(ErrorCode::AutoQueue));
         }
     };
     if let Err(error) = sqlx::query(
@@ -525,10 +529,7 @@ pub async fn generate(
     .execute(&mut *tx)
     .await
     {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("create auto-queue run: {error}")})),
-        );
+        return Err(AppError::internal(format!("create auto-queue run: {error}")).with_code(ErrorCode::AutoQueue));
     }
 
     let mut entry_ids = Vec::new();
@@ -563,17 +564,14 @@ pub async fn generate(
         .execute(&mut *tx)
         .await
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("create auto-queue entry: {error}")})),
-            );
+            return Err(AppError::internal(format!("create auto-queue entry: {error}")).with_code(ErrorCode::AutoQueue));
         }
         entry_ids.push(entry_id);
     }
     if let Err(error) = tx.commit().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("commit auto-queue generate transaction: {error}")})),
+        return Err(
+            AppError::internal(format!("commit auto-queue generate transaction: {error}"))
+                .with_code(ErrorCode::AutoQueue),
         );
     };
 
@@ -594,7 +592,7 @@ pub async fn generate(
         .await
         .unwrap_or(serde_json::Value::Null);
 
-    (
+    Ok((
         StatusCode::OK,
         Json(json!({
             "run": run,
@@ -603,7 +601,7 @@ pub async fn generate(
             "skipped_due_to_dependency": skipped_due_to_dependency,
             "skipped_due_to_filter": skip_breakdown.filter,
         })),
-    )
+    ))
 }
 
 /// Structured skip-reason breakdown for `/api/queue/generate` (#1442).
@@ -731,4 +729,119 @@ pub(crate) async fn active_dispatch_id_for_card_pg(
     .bind(card_id)
     .fetch_optional(pool)
     .await
+}
+
+#[cfg(test)]
+mod deploy_gate_request_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn dependency_label_preserves_done_pending_and_missing_semantics() {
+        assert_eq!(unresolved_external_dependency_label(41, Some("done")), None);
+        assert_eq!(
+            unresolved_external_dependency_label(42, Some("in_progress")),
+            Some("#42:in_progress".to_string())
+        );
+        assert_eq!(
+            unresolved_external_dependency_label(43, None),
+            Some("#43:missing".to_string())
+        );
+    }
+
+    fn body(kind: &str) -> GenerateBody {
+        GenerateBody {
+            repo: Some("itismyfield/AgentDesk".to_string()),
+            agent_id: Some("project-agentdesk".to_string()),
+            auto_assign_agent: None,
+            issue_numbers: None,
+            entries: Some(vec![GenerateEntryBody {
+                issue_number: 4898,
+                batch_phase: Some(0),
+                thread_group: Some(1),
+                phase_gate_kind: Some(kind.to_string()),
+            }]),
+            review_mode: None,
+            mode: None,
+            unified_thread: None,
+            parallel: None,
+            max_concurrent_threads: None,
+            force: None,
+            max_concurrent_per_agent: None,
+        }
+    }
+
+    fn state_with_postgres(pg_pool: Option<sqlx::PgPool>) -> AppState {
+        let config = crate::config::Config::default();
+        let broadcast_tx = crate::eventbus::new_broadcast();
+        let batch_buffer = crate::eventbus::spawn_batch_flusher(broadcast_tx.clone());
+        AppState {
+            pg_pool,
+            engine: crate::engine::PolicyEngine::new(&config)
+                .expect("construct policy engine for validation test"), // agentdesk-audit: allow-unwrap — test fixture construction
+            config: Arc::new(config),
+            broadcast_tx,
+            batch_buffer,
+            health_registry: None,
+            cluster_instance_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_deploy_gate_is_a_typed_client_error_before_database_access() {
+        let error = generate(State(state_with_postgres(None)), Json(body("deploy-gate")))
+            .await
+            .expect_err("unavailable deploy-gate must be rejected");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), ErrorCode::AutoQueue);
+        assert_eq!(
+            error.message(),
+            crate::phase_gate::DEPLOY_GATE_UNAVAILABLE_REASON
+        );
+    }
+
+    #[cfg(test)]
+    mod postgres_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn unavailable_deploy_gate_creates_no_database_rows() {
+            let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+            let pool = pg_db.connect_and_migrate().await;
+            let runs_before =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_runs")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue runs before request"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+            let entries_before =
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_entries")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue entries before request"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+
+            let error = generate(
+                State(state_with_postgres(Some(pool.clone()))),
+                Json(body("deploy-gate")),
+            )
+            .await
+            .expect_err("unavailable deploy-gate must be rejected");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_runs")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue runs after request"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+                runs_before
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::BIGINT FROM auto_queue_entries")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count auto-queue entries after request"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+                entries_before
+            );
+
+            pool.close().await;
+            pg_db.drop().await;
+        }
+    }
 }

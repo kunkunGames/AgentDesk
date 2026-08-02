@@ -1,38 +1,10 @@
+use super::injected_prompt_policy::slash_command_control_kind;
+use super::observed_prompt_decision::is_local_only_slash_command_prompt;
 use super::*;
 use crate::services::discord::gateway::TurnGateway;
 
 fn compact_command_name_first_stub() -> &'static str {
     "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
-}
-
-/// Scoped env-var override for inflight persistence tests. `AGENTDESK_ROOT_DIR`
-/// is process-global, so serialize it with the shared test env lock.
-struct EnvRootGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvRootGuard {
-    fn set(path: &std::path::Path) -> Self {
-        let lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for EnvRootGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-    }
 }
 
 // ====================================================================
@@ -405,7 +377,12 @@ async fn owner_channel_chokepoint_triggers_drift_repair_on_drift_drop() {
 
     crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner.get());
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         None,
         "registry miss + mirror hit still drops rather than routing from the mirror"
     );
@@ -442,7 +419,12 @@ fn live_session_relay_self_heals_via_authoritative_registry_not_mirror() {
     // (1)+(2): the mirror alone must never be used as the delivery owner —
     // the resolver drops (the #3018 single-authority rule stays intact).
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         None,
         "registry miss + dedupe mirror hit must drop, never route from the mirror"
     );
@@ -457,7 +439,12 @@ fn live_session_relay_self_heals_via_authoritative_registry_not_mirror() {
         "first restore reports a change (single bounded incident)"
     );
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         Some(owner),
         "after authoritative re-registration the live session must route again"
     );
@@ -491,7 +478,12 @@ fn drift_triggered_restore_makes_routine_session_route_again() {
     // Drift precondition: mirror holds a mapping, registry misses ⇒ drop.
     crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner.get());
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         None,
         "registry miss + mirror hit must drop (drift), never route from mirror"
     );
@@ -504,7 +496,12 @@ fn drift_triggered_restore_makes_routine_session_route_again() {
         .restore_owner_channel_for_tmux_session(tmux, owner);
     assert!(repaired, "first drift-triggered restore reports a change");
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         Some(owner),
         "after the drift-triggered authoritative restore the session routes again"
     );
@@ -573,7 +570,12 @@ fn dead_orphaned_session_mirror_is_evicted_and_stops_drift_spam() {
         "precondition: dead session's binding is in the relay loop's iteration set"
     );
     assert_eq!(
-        owner_channel_for_tmux_session(&shared, &ProviderKind::Claude, tmux),
+        owner_channel_for_tmux_session(
+            &shared,
+            &ProviderKind::Claude,
+            tmux,
+            RelayEmissionKind::Poll
+        ),
         None,
         "precondition: registry misses + mirror hit == the drift the relay loop hits"
     );
@@ -663,7 +665,7 @@ fn transient_pane_flake_on_live_session_is_not_dead_orphaned() {
     let is_dead = pane_is_confirmed_dead_orphaned(
         || live_reads.borrow_mut().next().unwrap_or(true),
         // session_exists must NOT even be consulted once a live pane is seen.
-        || panic!("session_exists must not be probed once a live pane is observed"),
+        || panic!("session liveness must not be probed once a live pane is observed"),
         DEAD_ORPHANED_PANE_PROBE_SAMPLES,
         None,
     );
@@ -688,7 +690,7 @@ fn genuinely_gone_session_is_still_dead_orphaned_after_retries() {
             probe_count.set(probe_count.get() + 1);
             false // never a live pane
         },
-        || false, // hard has-session: session truly gone
+        || crate::services::platform::tmux::PaneLiveness::DeadOrAbsent,
         DEAD_ORPHANED_PANE_PROBE_SAMPLES,
         None,
     );
@@ -713,13 +715,28 @@ fn genuinely_gone_session_is_still_dead_orphaned_after_retries() {
 fn confirmed_existing_session_is_not_dead_even_if_pane_probes_flake() {
     let is_dead = pane_is_confirmed_dead_orphaned(
         || false, // soft pane probe: reads dead on every sample
-        || true,  // hard has-session: the session IS present on this host
+        || crate::services::platform::tmux::PaneLiveness::Live,
         DEAD_ORPHANED_PANE_PROBE_SAMPLES,
         None,
     );
     assert!(
         !is_dead,
         "a session still present per has-session must not be evicted on soft pane reads alone"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hard_probe_failure_preserves_dead_looking_session() {
+    let is_dead = pane_is_confirmed_dead_orphaned(
+        || false,
+        || crate::services::platform::tmux::PaneLiveness::ProbeError,
+        DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+        None,
+    );
+    assert!(
+        !is_dead,
+        "a failed hard probe is unknown and must not evict the runtime mirror"
     );
 }
 
@@ -795,9 +812,60 @@ fn classify_injected_prompt_human_direct_input() {
     assert!(classify_injected_prompt("hi").is_human_active_turn());
 }
 
-// #3099: a `<task-notification>` auto-turn is a real provider turn (it earns
-// a `⏳`) but is not human-driven; its completion cleanup is anchored on the
-// injected message id, so it is classified distinctly from human input.
+// #4567: a `<task-notification>` is a status/card event, not positive
+// human-input provenance; it must not claim an external user-turn lifecycle.
+#[test]
+fn task_notification_lifecycle_is_not_an_external_turn() {
+    let decision = relay_observed_prompt_injected_prompt_decision(
+        "<task-notification><status>killed</status></task-notification>",
+    );
+    assert_eq!(
+        decision.injected_class,
+        InjectedPromptClass::TaskNotificationEvent
+    );
+    assert!(
+        !decision.starts_external_turn_lifecycle(),
+        "killed task status must not claim synthetic ownership"
+    );
+}
+
+#[tokio::test]
+async fn task_notification_status_only_preserves_existing_turn_request_anchor() {
+    let shared = super::super::make_shared_data_for_tests();
+    let channel_id = ChannelId::new(940_000_000_004_567);
+    let existing_anchor = 940_000_000_004_568;
+    let tmux = "AgentDesk-claude-4567-status-only-anchor";
+    shared
+        .tmux_watchers
+        .restore_owner_channel_for_tmux_session(tmux, channel_id);
+    shared
+        .ui
+        .placeholder_live_events
+        .set_turn_request_anchor(channel_id, Some(existing_anchor));
+    let prompt = ObservedTuiPrompt {
+        provider: ProviderKind::Claude.as_str().to_string(),
+        tmux_session_name: tmux.to_string(),
+        prompt: "<task-notification><status>killed</status></task-notification>".to_string(),
+        source_event_id: None,
+        observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+    };
+
+    relay_observed_prompt(&shared, prompt).await;
+
+    assert_eq!(
+        shared
+            .ui
+            .placeholder_live_events
+            .request_user_msg_id_for_test(channel_id),
+        Some(existing_anchor),
+        "status-only task notifications must not clear or replace the existing Discord turn request anchor",
+    );
+}
+
 #[test]
 fn classify_injected_prompt_task_notification_event() {
     let bare = "<task-notification><status>completed</status><task_id>codex-background-event</task_id></task-notification>";
@@ -1735,36 +1803,106 @@ fn slash_command_control_turn_dedupes_double_post_but_not_distinct_commands() {
     ));
 }
 
-#[test]
-fn compact_replay_kind_note_suppression_is_session_scoped_and_expires() {
-    let now = std::time::Instant::now();
-    let recent = now - Duration::from_secs(29);
-    let expired = now - Duration::from_secs(31);
+fn local_control_prompt(tmux: &str, body: &str, entry_id: &str) -> ObservedTuiPrompt {
+    ObservedTuiPrompt {
+        provider: "claude".to_string(),
+        tmux_session_name: tmux.to_string(),
+        prompt: body.to_string(),
+        source_event_id: Some(entry_id.to_string()),
+        observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+    }
+}
 
-    assert!(should_suppress_local_only_kind_note_after_continuation(
-        "/compact",
-        Some(recent),
-        now,
-    ));
-    assert!(should_suppress_local_only_kind_note_after_continuation(
-        "slash",
-        Some(recent),
-        now,
-    ));
+#[test]
+fn local_slash_control_note_emission_is_wired_through_prepare_gate() {
+    let relay_source = include_str!("../tui_prompt_relay.rs");
     assert!(
-        !should_suppress_local_only_kind_note_after_continuation("/compact", None, now),
-        "a different session with no continuation timestamp must not suppress",
+        relay_source.contains(
+            "let Some(note) = prepare_local_only_slash_control_note(&prompt, kind) else {"
+        ),
+        "relay_observed_prompt must consume the gated note outcome before channel delivery"
     );
-    assert!(!should_suppress_local_only_kind_note_after_continuation(
-        "/compact",
-        Some(expired),
-        now,
-    ));
-    assert!(!should_suppress_local_only_kind_note_after_continuation(
-        "/cost",
-        Some(recent),
-        now,
-    ));
+}
+
+#[test]
+fn local_slash_control_note_path_dedupes_and_seals_dropped_half() {
+    let sess = format!("local-control-note-path-{:p}", &0u8 as *const u8);
+    let raw = local_control_prompt(&sess, "/compact", "compact-half-a");
+    let envelope = local_control_prompt(&sess, compact_command_name_first_stub(), "compact-half-b");
+
+    assert!(
+        prepare_local_only_slash_control_note(&raw, "/compact").is_some(),
+        "the first transcript half must render one Discord marker"
+    );
+    assert!(
+        prepare_local_only_slash_control_note(&envelope, "/compact").is_none(),
+        "the near-simultaneous envelope half must not render a second marker"
+    );
+    assert_eq!(
+        crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_entry_id_at(
+            "claude",
+            &sess,
+            compact_command_name_first_stub(),
+            Some("compact-half-b"),
+            chrono::Utc::now(),
+        ),
+        crate::services::tui_prompt_dedupe::PromptObservation::SuppressedReplayedEntry,
+        "the dropped half must be sealed against watermark-reset replay"
+    );
+
+    let loop_prompt = local_control_prompt(&sess, "/loop", "loop-entry");
+    assert!(
+        prepare_local_only_slash_control_note(&loop_prompt, "/loop").is_some(),
+        "different command kinds must remain independent"
+    );
+}
+
+#[test]
+fn local_slash_control_note_allows_same_kind_after_window() {
+    let sess = format!("local-control-note-window-{:p}", &0u8 as *const u8);
+    let first = local_control_prompt(&sess, "/compact", "compact-window-a");
+    assert!(prepare_local_only_slash_control_note(&first, "/compact").is_some());
+
+    let key = format!("{sess}\u{0}/compact");
+    SLASH_COMMAND_CONTROL_LAST_POSTED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            key,
+            std::time::Instant::now() - SLASH_COMMAND_CONTROL_DEDUPE_WINDOW,
+        );
+
+    let later = local_control_prompt(&sess, "/compact", "compact-window-b");
+    assert!(
+        prepare_local_only_slash_control_note(&later, "/compact").is_some(),
+        "the local note gate must allow a genuine command after the dedupe window"
+    );
+}
+
+#[test]
+fn local_compact_still_bypasses_the_external_replay_classifier() {
+    let sess = format!("local-compact-external-gate-{:p}", &0u8 as *const u8);
+    let compact = relay_observed_prompt_injected_prompt_decision("/compact");
+    assert!(compact.local_only_slash);
+    assert!(
+        !slash_command_control_turn_is_duplicate_external_replay(&compact, &sess),
+        "local controls must remain outside the external replay classifier"
+    );
+
+    let loop_control = relay_observed_prompt_injected_prompt_decision("/loop 5m inspect status");
+    assert!(!loop_control.local_only_slash);
+    assert!(
+        !slash_command_control_turn_is_duplicate_external_replay(&loop_control, &sess),
+        "the first external slash control proceeds"
+    );
+    assert!(
+        slash_command_control_turn_is_duplicate_external_replay(&loop_control, &sess),
+        "the existing external /loop raw-wrapper replay guard remains intact"
+    );
 }
 
 // #3178 (codex P2 fix): the kind is the REAL command name, so two distinct
@@ -1848,18 +1986,20 @@ fn system_continuation_suppresses_external_turn_lifecycle() {
     assert!(!subagent.still_delivers_assistant_output());
     assert!(!subagent.is_human_active_turn());
 
-    // Human + task-notification turns keep their user-turn lifecycle AND deliver
-    // output.
-    for active in [
-        InjectedPromptClass::HumanTuiDirect,
-        InjectedPromptClass::TaskNotificationEvent,
-    ] {
-        assert!(
-            !active.suppresses_user_turn_lifecycle(),
-            "{active:?} must keep its user-turn lifecycle"
-        );
-        assert!(active.still_delivers_assistant_output());
-    }
+    let human = InjectedPromptClass::HumanTuiDirect;
+    assert!(!human.suppresses_user_turn_lifecycle());
+    assert!(human.still_delivers_assistant_output());
+
+    let task = InjectedPromptClass::TaskNotificationEvent;
+    assert!(
+        task.suppresses_user_turn_lifecycle(),
+        "task lifecycle records must never claim a user-turn lifecycle"
+    );
+    assert!(
+        !task.still_delivers_assistant_output(),
+        "task lifecycle records must not spawn an output bridge tail"
+    );
+    assert!(!task.is_human_active_turn());
 }
 
 // #3100 codex re-review (P2): a human message that merely *quotes* the
@@ -2082,13 +2222,12 @@ fn system_continuation_note_is_neutral_not_active_turn() {
     let prompt = "This session is being continued from a previous conversation. Summary: ...";
     let note = format_system_continuation_note("AgentDesk-claude-adk-cc", prompt);
     assert!(!note.contains("터미널에 직접 주입된 입력"));
-    assert!(note.contains("세션 컨텍스트 이어가기"));
-    assert!(note.contains("활성 턴 아님"));
-    assert!(note.contains("(tmux : `AgentDesk-claude-adk-cc`)"));
+    assert_eq!(
+        note,
+        "🧩 Session continued (compact/resume) · tmux: `AgentDesk-claude-adk-cc`"
+    );
     assert!(!note.contains("```text"));
     assert!(!note.contains("Summary:"));
-    assert!(note.contains(&format!("요약 {}자 생략", prompt.chars().count())));
-    assert!(note.contains("채널 기록과 동일 내용"));
 }
 
 #[cfg(unix)]
@@ -2450,7 +2589,7 @@ fn claude_bridge_lease_clears_when_tail_dedup_skips_spawn() {
 #[tokio::test]
 async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -2462,6 +2601,10 @@ async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
         prompt: "direct input without runtime binding".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2530,6 +2673,10 @@ fn task_notification_repeat_clears_its_recorded_external_lease() {
         prompt: "<task-notification><task-id>repeat-x</task-id><status>completed</status></task-notification>".to_string(),
         source_event_id: None,
             observed_at: chrono::Utc::now(),
+            external_input_lease_generation:
+                crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+            ssh_direct_observation_generation:
+                crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2587,6 +2734,10 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
         prompt: "<task-notification><task-id>repeat-y</task-id></task-notification>".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let repeat_lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -3042,7 +3193,7 @@ fn codex_external_input_relay_output_path_uses_rollout_not_wrapper() {
 #[test]
 fn codex_external_input_binding_refreshes_from_live_rollout_marker() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -3093,7 +3244,7 @@ fn codex_external_input_binding_refreshes_from_live_rollout_marker() {
 #[test]
 fn codex_ownerless_external_input_undelivered_turn_needs_rollout_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let _env = EnvRootGuard::set(dir.path());
+    let _env = crate::config::set_agentdesk_root_for_test(dir.path());
     let rollout_path = dir.path().join("rollout.jsonl");
     std::fs::write(
         &rollout_path,
@@ -3224,7 +3375,7 @@ fn idle_bridge_stands_down_for_every_resolved_non_bridge_synthetic_claim() {
     use super::synthetic_start::tui_direct_synthetic_non_bridge_owner_matches;
 
     let root = tempfile::tempdir().expect("runtime root");
-    let _env = EnvRootGuard::set(root.path());
+    let _env = crate::config::set_agentdesk_root_for_test(root.path());
     let tmux = "AgentDesk-codex-adk-cdx-4455";
     let channel = ChannelId::new(1_479_671_301_387_059_200);
     let lease = ExternalInputRelayLease::unassigned(Some(channel.get()));
@@ -3383,10 +3534,85 @@ fn external_turn_test_lease(
     }
 }
 
+#[test]
+fn synthetic_lifecycle_anchor_uses_posted_placeholder() {
+    let notification_anchor = MessageId::new(940_000_000_004_180);
+    let placeholder_anchor = MessageId::new(940_000_000_004_181);
+
+    let anchor = synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+        notification_anchor,
+        &Ok(placeholder_anchor),
+    );
+    assert_eq!(
+        anchor.message_id, placeholder_anchor,
+        "successful synthetic placeholder delivery must replace the notification anchor"
+    );
+    assert!(
+        anchor.owned_placeholder,
+        "a posted placeholder must remain cleanup-owned until the synthetic claim succeeds"
+    );
+}
+
+#[test]
+fn synthetic_lifecycle_anchor_falls_back_after_placeholder_failure() {
+    let notification_anchor = MessageId::new(940_000_000_004_280);
+
+    let anchor = synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+        notification_anchor,
+        &Err("delivery failed".to_string()),
+    );
+    assert_eq!(
+        anchor.message_id, notification_anchor,
+        "failed synthetic placeholder delivery must preserve the notification anchor"
+    );
+    assert!(
+        !anchor.owned_placeholder,
+        "the fallback notification anchor must never be selected for placeholder cleanup"
+    );
+}
+
+#[test]
+fn failed_synthetic_claim_cleans_only_owned_placeholder() {
+    let anchor = MessageId::new(940_000_000_004_380);
+
+    assert_eq!(
+        synthetic_start_wiring::failed_synthetic_placeholder_cleanup_target(anchor, true),
+        Some(anchor),
+        "a freshly posted synthetic placeholder must be selected for cleanup after claim failure"
+    );
+    assert_eq!(
+        synthetic_start_wiring::failed_synthetic_placeholder_cleanup_target(anchor, false),
+        None,
+        "a fallback notification/task-card anchor must never be deleted after claim failure"
+    );
+}
+
+#[test]
+fn failed_synthetic_placeholder_delete_is_terminal_cleanup_guarded() {
+    let helper_src = include_str!("synthetic_start_wiring.rs");
+    let guard_needle = ["terminal_cleanup_", "protects_delete("].concat();
+    let delete_needle = [".delete_", "message(&http, anchor_message_id)"].concat();
+    let result_needle = ["emit_relay_delete_", "result("].concat();
+    let guard = helper_src
+        .find(&guard_needle)
+        .expect("rejected synthetic cleanup must consult terminal cleanup protection");
+    let delete = helper_src
+        .find(&delete_needle)
+        .expect("rejected synthetic cleanup must retain its owned-placeholder delete");
+    let result = helper_src
+        .find(&result_needle)
+        .expect("rejected synthetic cleanup delete result must be durably observed");
+
+    assert!(
+        guard < delete && delete < result,
+        "committed and retry-pending terminal placeholders must be skipped before delete"
+    );
+}
+
 #[tokio::test]
 async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(940_000_000_004_082);
@@ -3400,6 +3626,10 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
         prompt: prompt_text.to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(
@@ -3418,6 +3648,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
         channel_id,
         &prompt,
         anchor_id,
+        false,
         &decision,
         &mut lease,
     )
@@ -3455,7 +3686,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
 #[tokio::test]
 async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap();
@@ -3464,13 +3695,18 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(940_000_000_004_083);
     let tmux = "AgentDesk-claude-4082-genuine-typed";
-    let anchor_id = MessageId::new(940_000_000_004_183);
+    let notification_anchor_id = MessageId::new(940_000_000_004_183);
+    let placeholder_anchor_id = MessageId::new(940_000_000_004_283);
     let prompt = ObservedTuiPrompt {
         provider: provider.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "please review PR #1234".to_string(),
         source_event_id: None,
         observed_at: chrono::Utc::now(),
+        external_input_lease_generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        ssh_direct_observation_generation:
+            crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(decision.injected_class, InjectedPromptClass::HumanTuiDirect);
@@ -3493,6 +3729,12 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         },
     );
 
+    let synthetic_anchor =
+        synthetic_start_wiring::synthetic_lifecycle_anchor_from_placeholder_result(
+            notification_anchor_id,
+            &Ok(placeholder_anchor_id),
+        );
+    let anchor_id = synthetic_anchor.message_id;
     let mut lease = external_turn_test_lease(channel_id, tmux);
     let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
         &shared,
@@ -3500,6 +3742,7 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         channel_id,
         &prompt,
         anchor_id,
+        synthetic_anchor.owned_placeholder,
         &decision,
         &mut lease,
     )
@@ -3509,14 +3752,22 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         "no prior turn exists, so the claim should be inline"
     );
 
+    assert_eq!(
+        anchor_id, placeholder_anchor_id,
+        "the synthetic claim must receive the posted placeholder identity"
+    );
+    assert_ne!(
+        anchor_id, notification_anchor_id,
+        "the notification/task-card identity must not remain the streaming anchor after placeholder success"
+    );
     let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
-    assert_eq!(snapshot.active_user_message_id, Some(anchor_id));
+    assert_eq!(snapshot.active_user_message_id, Some(placeholder_anchor_id));
     assert!(snapshot.cancel_token.is_some());
     let state = super::super::inflight::load_inflight_state(&provider, channel_id.get())
         .expect("typed TUI prompt must create synthetic inflight");
     assert_eq!(state.turn_source, TurnSource::ExternalInput);
     assert_eq!(state.tmux_session_name.as_deref(), Some(tmux));
-    assert_eq!(state.user_msg_id, anchor_id.get());
+    assert_eq!(state.user_msg_id, placeholder_anchor_id.get());
     assert!(
         !state.relay_ownership_only,
         "human typed input must remain a full synthetic external turn"
@@ -3589,7 +3840,7 @@ fn save_ownerless_tui_direct_inflight_for_mailbox_release_test(
 #[tokio::test]
 async fn stale_ownerless_tui_direct_mailbox_release_allows_new_synthetic_claim() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Codex;
     let channel_id = ChannelId::new(940_000_000_000_009);
@@ -3654,7 +3905,7 @@ async fn stale_ownerless_tui_direct_mailbox_release_allows_new_synthetic_claim()
 #[tokio::test]
 async fn stale_ownerless_tui_direct_mailbox_release_preserves_fresh_owner() {
     let temp = tempfile::tempdir().expect("temp runtime root");
-    let _env = EnvRootGuard::set(temp.path());
+    let _env = crate::config::set_agentdesk_root_for_test(temp.path());
     let shared = super::super::make_shared_data_for_tests();
     let provider = ProviderKind::Codex;
     let channel_id = ChannelId::new(940_000_000_000_010);
@@ -3820,33 +4071,190 @@ fn claude_rehydrate_start_offset_uses_current_eof() {
     );
 }
 
-// U-17 Claude transcript scan must restart from offset 0 when the
-// recorded offset is past the current file length — this is the
-// /compact path, where Claude rewrites the transcript and our
-// previously-persisted offset would otherwise leak past the EOF and
-// skip all newly-written prompts.
+// #4549/#4841: `/compact` rewrites the same transcript path to a shorter
+// historical snapshot. Either direct cursor regression or its same-generation
+// durable evidence must fast-forward to the new EOF instead of restarting at
+// zero, which would mirror an old direct prompt again.
 #[test]
-fn claude_idle_transcript_scan_restarts_when_file_shrinks() {
+fn claude_idle_transcript_scan_fast_forwards_when_compaction_shrinks_file() {
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 99_999, 250, false),
+        Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset: 250 })
+    );
+}
+
+#[test]
+fn claude_idle_transcript_scan_reanchors_after_restart_rehydrates_cursor_at_eof() {
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 250, true),
+        Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset: 250 })
+    );
+}
+
+#[test]
+fn claude_idle_transcript_scan_replays_full_prompt_after_mid_line_shrink() {
     let dir = tempfile::tempdir().expect("temp dir");
     let transcript = dir.path().join("transcript.jsonl");
-    let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"after compact\"}]},\"sessionId\":\"s1\"}\n";
-    std::fs::write(&transcript, prompt).expect("write transcript");
+    let compact = "{\"type\":\"system\",\"subtype\":\"compact\",\"sessionId\":\"s1\"}\n";
+    let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"prompt crossing reanchor\"}]},\"sessionId\":\"s1\"}\n";
+    let split = prompt.len() / 2;
+    std::fs::write(&transcript, format!("{compact}{}", &prompt[..split]))
+        .expect("write compacted transcript with partial prompt");
+    let mid_line_eof = std::fs::metadata(&transcript).unwrap().len();
+    let safe_offset = claude_idle_safe_reanchor_offset(&transcript, mid_line_eof)
+        .expect("resolve safe reanchor boundary");
+    assert_eq!(
+        safe_offset,
+        compact.len() as u64,
+        "partial JSONL must re-read from its own line start"
+    );
+    let anchored = match claude_idle_compaction_reanchor(false, 99_999, safe_offset, true) {
+        Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset }) => offset,
+        other => panic!("expected compaction anchor, got {other:?}"),
+    };
 
-    let scan = scan_claude_idle_transcript_for_prompt(&transcript, 99_999)
-        .expect("scan shrunken transcript");
-    match scan {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open partial transcript")
+        .write_all(prompt[split..].as_bytes())
+        .expect("finish prompt line");
+
+    assert_eq!(
+        scan_claude_idle_transcript_for_prompt(&transcript, anchored)
+            .expect("scan completed prompt from safe boundary"),
         ClaudeIdleTranscriptScan::Prompt {
-            prompt: text,
-            line_end_offset,
-            prompt_start_offset,
-            ..
-        } => {
-            assert_eq!(text, "after compact");
-            assert_eq!(line_end_offset, prompt.len() as u64);
-            assert_eq!(prompt_start_offset, 0);
+            prompt: "prompt crossing reanchor".to_string(),
+            prompt_start_offset: compact.len() as u64,
+            line_end_offset: (compact.len() + prompt.len()) as u64,
+            entry_id: None,
         }
-        other => panic!("expected Prompt, got {other:?}"),
+    );
+}
+
+#[test]
+fn claude_idle_safe_reanchor_handles_exact_backward_chunk_boundaries() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("chunk-boundary.jsonl");
+    const CHUNK: usize = 8 * 1024;
+
+    for (newline_at, current_eof, expected) in [
+        (CHUNK - 2, 2 * CHUNK, CHUNK - 1),
+        (CHUNK - 1, 2 * CHUNK, CHUNK),
+        (CHUNK, 2 * CHUNK, CHUNK + 1),
+        (CHUNK - 1, CHUNK, CHUNK),
+        (CHUNK - 1, 2 * CHUNK - 1, CHUNK),
+        (CHUNK - 1, 2 * CHUNK, CHUNK),
+        (CHUNK - 1, 2 * CHUNK + 1, CHUNK),
+    ] {
+        let mut bytes = vec![b'x'; current_eof];
+        bytes[newline_at] = b'\n';
+        std::fs::write(&transcript, bytes).expect("write boundary transcript");
+        assert_eq!(
+            claude_idle_safe_reanchor_offset(&transcript, current_eof as u64)
+                .expect("resolve chunk boundary"),
+            expected as u64,
+            "newline_at={newline_at}, current_eof={current_eof}"
+        );
     }
+}
+
+#[test]
+fn claude_idle_transcript_scan_relays_prompt_appended_after_compaction_anchor() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("transcript.jsonl");
+    let compact = "{\"type\":\"system\",\"subtype\":\"compact\",\"sessionId\":\"s1\"}\n";
+    let historical_prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"historical direct prompt\"}]},\"sessionId\":\"s1\"}\n";
+    let compacted = format!("{compact}{historical_prompt}");
+    std::fs::write(&transcript, &compacted).expect("write compacted transcript");
+    let anchored =
+        match claude_idle_compaction_reanchor(false, 99_999, compacted.len() as u64, true) {
+            Some(ClaudeIdleTranscriptScan::CompactionReanchor { offset }) => offset,
+            other => panic!("expected compaction anchor, got {other:?}"),
+        };
+
+    let fresh_prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fresh prompt after compact\"}]},\"sessionId\":\"s1\"}\n";
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .expect("open compacted transcript")
+        .write_all(fresh_prompt.as_bytes())
+        .expect("append fresh prompt");
+
+    assert_eq!(
+        scan_claude_idle_transcript_for_prompt(&transcript, anchored)
+            .expect("scan post-compact growth"),
+        ClaudeIdleTranscriptScan::Prompt {
+            prompt: "fresh prompt after compact".to_string(),
+            prompt_start_offset: anchored,
+            line_end_offset: anchored + fresh_prompt.len() as u64,
+            entry_id: None,
+        }
+    );
+}
+
+#[test]
+fn claude_idle_transcript_scan_preserves_normal_growth() {
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 100, 250, false),
+        None
+    );
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 400, false),
+        None,
+        "an append-only EOF advance must never re-anchor"
+    );
+    assert_eq!(
+        claude_idle_compaction_reanchor(false, 250, 400, true),
+        None,
+        "a stale-high durable frontier must not swallow bytes appended after rehydration"
+    );
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("transcript.jsonl");
+    let before = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"sessionId\":\"s1\"}\n";
+    let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"normally appended prompt\"}]},\"sessionId\":\"s1\"}\n";
+    std::fs::write(&transcript, format!("{before}{prompt}")).expect("write transcript");
+
+    assert_eq!(
+        scan_claude_idle_transcript_for_prompt(&transcript, before.len() as u64)
+            .expect("scan normal growth"),
+        ClaudeIdleTranscriptScan::Prompt {
+            prompt: "normally appended prompt".to_string(),
+            prompt_start_offset: before.len() as u64,
+            line_end_offset: (before.len() + prompt.len()) as u64,
+            entry_id: None,
+        }
+    );
+}
+
+#[test]
+fn claude_idle_transcript_rotation_lookback_still_observes_new_file_prompt() {
+    // A path/session rotation must never be mistaken for in-place compaction,
+    // even if the prior binding offset and durable frontier exceed the new EOF.
+    assert_eq!(
+        claude_idle_compaction_reanchor(true, 99_999, 250, true),
+        None
+    );
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let transcript = dir.path().join("new-session.jsonl");
+    let before = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s2\"}\n";
+    let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fresh rotation prompt\"}]},\"sessionId\":\"s2\"}\n";
+    std::fs::write(&transcript, format!("{before}{prompt}")).expect("write transcript");
+
+    assert_eq!(
+        scan_claude_idle_transcript_for_last_prompt(&transcript, 0)
+            .expect("scan replacement transcript lookback"),
+        ClaudeIdleTranscriptScan::Prompt {
+            prompt: "fresh rotation prompt".to_string(),
+            prompt_start_offset: before.len() as u64,
+            line_end_offset: (before.len() + prompt.len()) as u64,
+            entry_id: None,
+        }
+    );
 }
 
 #[cfg(unix)]

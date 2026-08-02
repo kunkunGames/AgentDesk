@@ -5,6 +5,9 @@ const DISCORD_GATEWAY_LOCK_PREFIX: u64 = 0x0443_0000_0000_0000;
 /// How often a yielding node re-checks whether the preferred gateway node has
 /// taken the lease, and how often the preferred node retries acquiring it.
 const GATEWAY_PREFERENCE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+use super::gateway_lease_recovery::{
+    gateway_lease_application_name, reap_orphaned_gateway_lease_once,
+};
 
 /// #4351: resolved view of `cluster.gateway_preferred_instance_id` for this node.
 struct GatewayPreference {
@@ -215,7 +218,12 @@ async fn acquire_as_preferred_gateway(
 
     let mut attempts: u64 = 0;
     loop {
-        match try_acquire_discord_gateway_lease(pool, token_hash, provider).await {
+        let acquired = if attempts == 0 {
+            try_acquire_with_startup_orphan_reap(pool, token_hash, provider).await
+        } else {
+            try_acquire_discord_gateway_lease(pool, token_hash, provider).await
+        };
+        match acquired {
             // Keep the waiter signal registered: we now hold the gateway, and a
             // peer that sees it will not try to take it from us anyway.
             Ok(Some(lease)) => return Ok(Some(lease)),
@@ -268,17 +276,35 @@ fn discord_gateway_lock_id(token_hash: &str) -> i64 {
     (DISCORD_GATEWAY_LOCK_PREFIX | suffix) as i64
 }
 
-async fn try_acquire_discord_gateway_lease(
+pub(super) async fn try_acquire_discord_gateway_lease(
     pool: &sqlx::PgPool,
     token_hash: &str,
     provider: &ProviderKind,
 ) -> Result<Option<crate::db::postgres::AdvisoryLockLease>, String> {
-    crate::db::postgres::AdvisoryLockLease::try_acquire(
+    crate::db::postgres::AdvisoryLockLease::try_acquire_named(
         pool,
         discord_gateway_lock_id(token_hash),
         format!("discord gateway {}", provider.as_str()),
+        gateway_lease_application_name(provider),
     )
     .await
+}
+
+async fn try_acquire_with_startup_orphan_reap(
+    pool: &sqlx::PgPool,
+    token_hash: &str,
+    provider: &ProviderKind,
+) -> Result<Option<crate::db::postgres::AdvisoryLockLease>, String> {
+    let first = try_acquire_discord_gateway_lease(pool, token_hash, provider).await?;
+    if first.is_some() {
+        return Ok(first);
+    }
+    if reap_orphaned_gateway_lease_once(pool, discord_gateway_lock_id(token_hash), provider).await?
+    {
+        try_acquire_discord_gateway_lease(pool, token_hash, provider).await
+    } else {
+        Ok(None)
+    }
 }
 
 /// Outcome of the gateway singleton-lease acquisition phase.
@@ -286,17 +312,28 @@ pub(super) enum GatewayLeaseOutcome {
     /// Either the lease was acquired (`Some`) or there is no PG pool (`None`,
     /// the standalone/no-DB path). Either way, startup proceeds.
     Proceed(Option<crate::db::postgres::AdvisoryLockLease>),
-    /// Lease is held elsewhere, or acquisition failed. The startup diagnostic
-    /// has already run; run_bot must decrement the shutdown barrier and return.
-    Skip,
+    /// Another node owns the lease, so this provider is a confirmed standby.
+    /// The startup diagnostic has already run; run_bot must expose the standby
+    /// runtime and leave its shutdown-barrier slot for the marker poller.
+    Standby,
+    /// Lease ownership is unknown because acquisition failed. The startup
+    /// diagnostic has already run; run_bot must fail closed and return without
+    /// classifying this provider as standby.
+    Failed,
+}
+
+impl GatewayLeaseOutcome {
+    pub(super) fn starts_provider_runtime(&self) -> bool {
+        !matches!(self, Self::Failed)
+    }
 }
 
 /// Acquire the Discord gateway singleton lease (advisory lock) when a PG pool
 /// is present. Returns `Proceed(Some(lease))` on success, `Proceed(None)` when
-/// there is no PG pool (standalone path), or `Skip` when the lease is held
-/// elsewhere / acquisition failed. On the `Skip` paths this runs the
-/// post-reconcile startup diagnostic exactly as the original early-returns did,
-/// before returning; run_bot then decrements the shutdown barrier and returns.
+/// there is no PG pool (standalone path), `Standby` when the lease is confirmed
+/// held elsewhere, or `Failed` when ownership could not be determined. Both
+/// non-proceed paths run the post-reconcile startup diagnostic exactly as the
+/// original early-returns did before run_bot decrements the shutdown barrier.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_bot_acquire_gateway_lease(
     shared: &Arc<SharedData>,
@@ -317,9 +354,9 @@ pub(super) async fn run_bot_acquire_gateway_lease(
                 }
                 Some(pref) => {
                     yield_to_preferred_gateway(pool, pref, provider, shared).await;
-                    try_acquire_discord_gateway_lease(pool, token_hash, provider).await
+                    try_acquire_with_startup_orphan_reap(pool, token_hash, provider).await
                 }
-                None => try_acquire_discord_gateway_lease(pool, token_hash, provider).await,
+                None => try_acquire_with_startup_orphan_reap(pool, token_hash, provider).await,
             };
             match acquired {
                 Ok(Some(lease)) => {
@@ -339,11 +376,11 @@ pub(super) async fn run_bot_acquire_gateway_lease(
                     )
                     .await;
                     let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
+                    tracing::info!(
                         "  [{ts}] ⏭ GATEWAY-LEASE: {} launch skipped — singleton lease held elsewhere",
                         provider.display_name()
                     );
-                    GatewayLeaseOutcome::Skip
+                    GatewayLeaseOutcome::Standby
                 }
                 Err(error) => {
                     run_startup_diagnostic_after_reconcile_barrier(
@@ -359,7 +396,7 @@ pub(super) async fn run_bot_acquire_gateway_lease(
                         provider.display_name(),
                         error
                     );
-                    GatewayLeaseOutcome::Skip
+                    GatewayLeaseOutcome::Failed
                 }
             }
         }
@@ -501,7 +538,7 @@ pub(super) fn run_bot_spawn_gateway_lease_keepalive(
                         .await
                         {
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            tracing::warn!(
+                            tracing::info!(
                                 "  [{ts}] 🤝 GATEWAY-LEASE: {} yielding gateway to preferred node {} — self-fencing",
                                 provider_for_lease.display_name(),
                                 pref.preferred_instance_id

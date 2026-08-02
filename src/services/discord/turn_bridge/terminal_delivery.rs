@@ -57,19 +57,26 @@ pub(super) fn record_stopped_turn_terminal_replace_delivery(
     shared: &SharedData,
     provider: &ProviderKind,
     watcher_owner_channel_id: ChannelId,
+    tmux_session_name: Option<&str>,
     range: (u64, u64),
     terminal_anchor_msg_id: MessageId,
     terminal_anchor_channel_id: ChannelId,
     raw_response_body: &str,
+    // #4564: inbound turn id of the delivered (stopped) turn, from the caller's
+    // inflight snapshot. The completed-turn ledger is keyed by the delivery channel
+    // (`terminal_anchor_channel_id`), NOT `watcher_owner_channel_id`.
+    ledger_user_msg_id: u64,
 ) {
     super::super::outbound::delivery_record::record_delivered_frontier_with_body(
         shared,
         provider,
         watcher_owner_channel_id,
+        tmux_session_name,
         range,
         terminal_anchor_msg_id.get(),
         terminal_anchor_channel_id.get(),
         raw_response_body,
+        Some(ledger_user_msg_id),
     );
 }
 
@@ -85,6 +92,7 @@ pub(super) fn record_stopped_turn_terminal_replace_delivery(
 /// (always true on `Ok`, since the empty-Vec case errors in
 /// `send_ordered_long_terminal_chunks`); callers treat `None` as "no anchor,
 /// record range only" (safe, identical to the absent-status-panel case).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_ordered_long_terminal_response(
     shared: &SharedData,
     gateway: &dyn TurnGateway,
@@ -158,6 +166,7 @@ async fn send_ordered_long_terminal_chunks(
     Ok((first_msg_id, last_msg_id, delete_result))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn turn_bridge_replace_outcome_committed(
     shared: &SharedData,
     provider: &ProviderKind,
@@ -845,6 +854,9 @@ mod tests {
             _intervention: &'a crate::services::discord::Intervention,
             _request_owner_name: &'a str,
             _has_more_queued_turns: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async { Ok(()) })
         }
@@ -1284,10 +1296,12 @@ mod tests {
             &shared,
             &provider,
             channel_id,
+            Some(session),
             (0, raw_body.len() as u64),
             MessageId::new(94_084),
             channel_id,
             raw_body,
+            0,
         );
 
         let degenerate_key =

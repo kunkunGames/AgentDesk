@@ -1,6 +1,7 @@
 pub(crate) mod cluster;
 pub(crate) mod cluster_session_routing;
 pub(crate) mod cron_catalog;
+mod dashboard_provision;
 pub mod dto;
 pub(crate) mod issue_specs;
 pub(crate) mod maintenance;
@@ -9,8 +10,10 @@ mod outbox_actionable_delivery;
 mod outbox_delivery_alert;
 pub(crate) mod resource_locks;
 pub mod routes;
+mod startup_preflight;
 pub(crate) mod task_dispatch_claims;
 pub(crate) mod test_phase_runs;
+mod worker_recovery;
 mod worker_registry;
 pub mod ws;
 
@@ -20,8 +23,9 @@ use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
 use serde::Serialize;
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgPool, Row};
+
+use crate::db::postgres::AdvisoryLockLease;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tower_http::services::{ServeDir, ServeFile};
@@ -117,29 +121,12 @@ async fn try_acquire_pg_singleton_lock(
     pool: &PgPool,
     lock_id: i64,
     job_name: &str,
-) -> std::result::Result<Option<PoolConnection<Postgres>>, String> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|error| format!("{job_name} acquire advisory lock connection: {error}"))?;
-    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|error| format!("{job_name} try advisory lock: {error}"))?;
-    if acquired { Ok(Some(conn)) } else { Ok(None) }
+) -> std::result::Result<Option<AdvisoryLockLease>, String> {
+    AdvisoryLockLease::try_acquire(pool, lock_id, job_name).await
 }
 
-async fn release_pg_singleton_lock(
-    mut conn: PoolConnection<Postgres>,
-    lock_id: i64,
-    job_name: &str,
-) {
-    if let Err(error) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .execute(&mut *conn)
-        .await
-    {
+async fn release_pg_singleton_lock(lease: AdvisoryLockLease, lock_id: i64, job_name: &str) {
+    if let Err(error) = lease.unlock().await {
         tracing::warn!("[{job_name}] failed to release advisory lock {lock_id}: {error}");
     }
 }
@@ -343,30 +330,7 @@ pub(crate) async fn run(
             None
         };
 
-    // Issue #2210 item 2: one-shot startup self-check on the Codex hook trust
-    // hash canonicalization. Runs only when the Codex CLI is detected on PATH;
-    // never blocks startup but emits a clear operator warning if AgentDesk's
-    // own invariants don't hold or the detected Codex CLI version isn't on
-    // AgentDesk's verified allowlist (so the SessionStart-silently-disabled
-    // failure mode is at least surfaced before users hit it on a Codex bump).
-    //
-    // The probe deliberately runs against `resolve_codex_path()` — the same
-    // resolution session launches use today via `resolve_codex_binary()`. If a
-    // session ever points at a different Codex binary, the warning will be
-    // off by one binary; tracked alongside the real cross-CLI verification
-    // (#2259) as a known limitation.
-    {
-        let codex_cli_path = crate::services::codex::resolve_codex_path();
-        let codex_cli_present = codex_cli_path.is_some();
-        let codex_cli_version = codex_cli_path
-            .as_deref()
-            .and_then(crate::services::claude_tui::hook_bundle::probe_codex_cli_version);
-        let _ = crate::services::claude_tui::hook_bundle::run_codex_hook_startup_self_check(
-            codex_cli_present,
-            codex_cli_version.as_deref(),
-            codex_cli_path.as_deref(),
-        );
-    }
+    startup_preflight::run();
     let cluster_runtime = cluster::bootstrap(&config, pg_pool.clone()).await;
     let cluster_instance_id = cluster_runtime.instance_id().to_string();
     if let Some(pool) = pg_pool.clone() {
@@ -412,33 +376,7 @@ pub(crate) async fn run(
         .map(|r| r.join("dashboard/dist"))
         .unwrap_or_else(|| std::path::PathBuf::from("dashboard/dist"));
 
-    // Auto-provision: if runtime dist is missing, copy from workspace source
-    if !dashboard_dir.join("index.html").exists() {
-        let workspace_dist =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dashboard/dist");
-        if workspace_dist.join("index.html").exists() {
-            tracing::info!(
-                "Dashboard dist missing at {:?}, copying from workspace {:?}",
-                dashboard_dir,
-                workspace_dist
-            );
-            if let Some(parent) = dashboard_dir.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Remove stale dist dir if it exists but is incomplete
-            let _ = std::fs::remove_dir_all(&dashboard_dir);
-            match copy_dir_recursive(&workspace_dist, &dashboard_dir) {
-                Ok(n) => tracing::info!("Dashboard dist copied ({n} files)"),
-                Err(e) => tracing::warn!("Failed to copy dashboard dist: {e}"),
-            }
-        } else {
-            tracing::warn!(
-                "Dashboard dist not found at {:?} or {:?} — dashboard will be unavailable",
-                dashboard_dir,
-                workspace_dist
-            );
-        }
-    }
+    dashboard_provision::provision_off_runtime(dashboard_dir.clone()).await;
 
     tracing::info!("Serving dashboard from {:?}", dashboard_dir);
 
@@ -635,6 +573,21 @@ async fn policy_tick_loop(
         if count % 2 == 0 {
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick1min", "1min").await;
             if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
+                match crate::services::stale_turn_reconciler::reconcile_stale_turns_pg(pool).await {
+                    Ok(reconciled) if reconciled > 0 => {
+                        tracing::warn!(
+                            reconciled,
+                            "[policy-tick] reconciled stale busy sessions blocking mailbox injection"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "[policy-tick] stale busy session reconcile failed: {error}"
+                        );
+                    }
+                }
+
                 match crate::reconcile::reconcile_auto_queue_pending_delivery_orphans_pg(pool).await
                 {
                     Ok(stats) if stats.touched() => {
@@ -1490,45 +1443,149 @@ async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>,
     }
 
     let data: serde_json::Value = resp.json().await?;
+    Ok(parse_claude_oauth_usage_buckets(&data))
+}
+
+fn push_claude_oauth_usage_bucket(
+    buckets: &mut Vec<serde_json::Value>,
+    bucket: &serde_json::Value,
+    label: &str,
+    utilization_field: &str,
+) {
+    let Some(utilization) = bucket
+        .get(utilization_field)
+        .and_then(serde_json::Value::as_f64)
+    else {
+        return;
+    };
+    let resets_at = bucket
+        .get("resets_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    // Convert utilization (0-100 float) to used/limit format for
+    // consistency, but keep the precise value so the dispatch gate does
+    // not round 99.5% into a false 100% saturation.
+    let limit = 100i64;
+    let used = utilization.floor().clamp(0.0, 100.0) as i64;
+    let reset_ts = chrono::DateTime::parse_from_rfc3339(resets_at)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    buckets.push(serde_json::json!({
+        "name": label,
+        "limit": limit,
+        "used": used,
+        "remaining": limit - used,
+        "utilization": utilization,
+        "reset": reset_ts,
+    }));
+}
+
+fn parse_claude_oauth_usage_buckets(data: &serde_json::Value) -> Vec<serde_json::Value> {
     let mut buckets = Vec::new();
-
-    for key in &["five_hour", "seven_day", "seven_day_sonnet"] {
+    for (key, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
         if let Some(bucket) = data.get(key) {
-            let utilization = bucket
-                .get("utilization")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let resets_at = bucket
-                .get("resets_at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let label = match *key {
-                "five_hour" => "5h",
-                "seven_day" => "7d",
-                "seven_day_sonnet" => "7d Sonnet",
-                _ => key,
-            };
-            // Convert utilization (0-100 float) to used/limit format for
-            // consistency, but keep the precise value so the dispatch gate does
-            // not round 99.5% into a false 100% saturation.
-            let limit = 100i64;
-            let used = utilization.floor().clamp(0.0, 100.0) as i64;
-            let reset_ts = chrono::DateTime::parse_from_rfc3339(resets_at)
-                .map(|dt| dt.timestamp())
-                .unwrap_or(0);
+            push_claude_oauth_usage_bucket(&mut buckets, bucket, label, "utilization");
+        }
+    }
+    if let Some(bucket) = data
+        .get("limits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|limits| {
+            limits.iter().find(|bucket| {
+                bucket.get("kind").and_then(serde_json::Value::as_str) == Some("weekly_scoped")
+                    && bucket
+                        .pointer("/scope/model/display_name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("Fable")
+                    && bucket
+                        .get("percent")
+                        .and_then(serde_json::Value::as_f64)
+                        .is_some()
+            })
+        })
+    {
+        push_claude_oauth_usage_bucket(&mut buckets, bucket, "7d Fable", "percent");
+    }
+    buckets
+}
 
-            buckets.push(serde_json::json!({
-                "name": label,
-                "limit": limit,
-                "used": used,
-                "remaining": limit - used,
-                "utilization": utilization,
-                "reset": reset_ts,
-            }));
+#[cfg(test)]
+mod claude_oauth_usage_tests {
+    use super::parse_claude_oauth_usage_buckets;
+
+    #[test]
+    fn maps_fable_weekly_scoped_limit_without_synthesizing_missing_sonnet() {
+        let data = serde_json::json!({
+            "five_hour": {"utilization": 5.0, "resets_at": "2026-07-24T00:00:00Z"},
+            "seven_day": {"utilization": 58.0, "resets_at": "2026-07-28T00:00:00Z"},
+            "seven_day_sonnet": null,
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 55.0,
+                "resets_at": "2026-07-28T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}}
+            }]
+        });
+
+        let buckets = parse_claude_oauth_usage_buckets(&data);
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[2]["name"], "7d Fable");
+        assert_eq!(buckets[2]["used"], 55);
+    }
+
+    #[test]
+    fn omits_fable_bucket_when_percent_is_missing_null_or_non_numeric() {
+        for invalid_percent in [
+            serde_json::Value::Null,
+            serde_json::json!("55"),
+            serde_json::json!({"renamed": 55.0}),
+        ] {
+            let mut fable = serde_json::json!({
+                "kind": "weekly_scoped",
+                "resets_at": "2026-07-28T00:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}}
+            });
+            if !invalid_percent.is_object() {
+                fable["percent"] = invalid_percent;
+            }
+            let data = serde_json::json!({"limits": [fable]});
+
+            assert!(
+                parse_claude_oauth_usage_buckets(&data).is_empty(),
+                "invalid Fable usage must not synthesize 0%: {data}"
+            );
         }
     }
 
-    Ok(buckets)
+    #[test]
+    fn selects_numeric_fable_from_multiple_scoped_limits() {
+        let data = serde_json::json!({
+            "limits": [
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 73.0,
+                    "scope": {"model": {"display_name": "Sonnet"}}
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": null,
+                    "scope": {"model": {"display_name": "Fable"}}
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 41.5,
+                    "scope": {"model": {"display_name": "Fable"}}
+                }
+            ]
+        });
+
+        let buckets = parse_claude_oauth_usage_buckets(&data);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0]["name"], "7d Fable");
+        assert_eq!(buckets[0]["utilization"], 41.5);
+        assert_eq!(buckets[0]["used"], 41);
+    }
 }
 
 /// Fetch Codex usage via chatgpt.com backend API (subscription-based, no API key needed).
@@ -2015,24 +2072,6 @@ async fn github_sync_loop(pg_pool: Arc<PgPool>, interval_minutes: u64) {
     }
 }
 
-/// Recursively copy a directory tree. Returns the number of files copied.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
-    std::fs::create_dir_all(dst)?;
-    let mut count = 0;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dest_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            count += copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path)?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// Async worker that drains the message_outbox table via the in-process Discord delivery path (#120).
 /// Runs every 2 seconds, processes up to 10 messages per tick.
 #[derive(Clone, Debug)]
@@ -2044,9 +2083,33 @@ struct PendingMessageOutboxRow {
     source: String,
     reason_code: Option<String>,
     session_key: Option<String>,
+    attachment_filename: Option<String>,
+    attachment_content_type: Option<String>,
+    attachment_data: Option<Vec<u8>>,
     retry_count: i64,
     claim_owner: String,
     claimed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PendingMessageOutboxRow {
+    fn binary_attachment(
+        &self,
+    ) -> Option<crate::services::discord::outbound::manual_delivery::ManualOutboundAttachment> {
+        match (
+            self.attachment_filename.as_deref(),
+            self.attachment_content_type.as_deref(),
+            self.attachment_data.as_ref(),
+        ) {
+            (Some(filename), Some(content_type), Some(data)) => Some(
+                crate::services::discord::outbound::manual_delivery::ManualOutboundAttachment {
+                    filename: filename.to_string(),
+                    content_type: content_type.to_string(),
+                    data: data.clone(),
+                },
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2213,6 +2276,9 @@ mod message_outbox_retry_tests {
             source: source.to_string(),
             reason_code: None,
             session_key: Some("sess-1".to_string()),
+            attachment_filename: None,
+            attachment_content_type: None,
+            attachment_data: None,
             retry_count: 5,
             claim_owner: "owner".to_string(),
             claimed_at: chrono::Utc::now(),
@@ -2460,6 +2526,7 @@ mod message_outbox_retry_tests {
                 source: "stall_watchdog",
                 reason_code: Some("stall_watchdog_suspected_stall"),
                 session_key: Some(session_key),
+                attachment: None,
             },
             1800,
         )
@@ -2504,6 +2571,128 @@ mod message_outbox_retry_tests {
                 .await
                 .expect("load drained stall alert status");
         assert_eq!(status, "sent");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// #4615 S3b mutation sentinel: a claimed circuit row whose authority is
+    /// superseded (here: no matching authority row) must be fenced by the drain
+    /// loop — never handed to `deliver()` — and left `cancelled` with
+    /// `delivery_fence_checked_at` stamped. Removing the fence call regresses
+    /// this into a delivery + `sent`.
+    #[tokio::test]
+    async fn drain_fences_superseded_circuit_row_before_delivery_pg() {
+        let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
+            "agentdesk_drain_delivery_fence",
+            "worker delivery fence drain integration",
+        )
+        .await
+        else {
+            return;
+        };
+        let pool = pg_db.connect_and_migrate().await;
+        // Build a genuine circuit-stamped pending row through the validated S3a
+        // producers (whose inserts live in the exempt `services::message_outbox_*`
+        // boundary — #4424), then supersede its authority so the fence must
+        // cancel it at delivery instead of sending.
+        use crate::services::message_outbox_circuit_authority as circuit;
+        sqlx::query(
+            "INSERT INTO intake_session_owners(provider,raw_channel_id,owner_instance_id,generation,status)
+             VALUES('discord','777','node-a',7,'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed active intake owner");
+        let coord = match circuit::reserve_next_authority(
+            &pool, "discord", "777", "node-a", 7, "e1", 10, 1, None,
+        )
+        .await
+        .expect("reserve authority")
+        {
+            circuit::AuthorityReservation::Reserved(coordinate) => coordinate,
+            other => panic!("unexpected reservation: {other:?}"),
+        };
+        let id = match circuit::stage_held(
+            &pool,
+            crate::services::message_outbox::OutboxMessage {
+                target: "channel:777",
+                content: "fenced body",
+                bot: "notify",
+                source: "system",
+                reason_code: Some("fence"),
+                session_key: Some("channel:777"),
+                attachment: None,
+            },
+            &coord,
+            300,
+        )
+        .await
+        .expect("stage held circuit row")
+        {
+            circuit::StageHeldOutcome::Staged { id } => id,
+            other => panic!("unexpected stage outcome: {other:?}"),
+        };
+        assert_eq!(
+            circuit::activate_fenced(&pool, id, &coord)
+                .await
+                .expect("activate"),
+            circuit::CircuitActivation::Activated
+        );
+        // A newer episode reserves epoch 2, superseding the row's stamped epoch 1.
+        assert!(matches!(
+            circuit::reserve_next_authority(
+                &pool,
+                "discord",
+                "777",
+                "node-a",
+                7,
+                "e2",
+                10,
+                1,
+                Some(1)
+            )
+            .await
+            .expect("supersede authority"),
+            circuit::AuthorityReservation::Reserved(_)
+        ));
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let observed_delivery = observed.clone();
+        let drained = drain_message_outbox_batch_once(&pool, Some("fence-drain-test"), {
+            move |row| {
+                let observed_delivery = observed_delivery.clone();
+                async move {
+                    observed_delivery
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(row.id);
+                    ("200 OK".to_string(), String::new())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(drained, 1, "the row is claimed and accounted for");
+        assert!(
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a superseded circuit row must never reach deliver()"
+        );
+        let row =
+            sqlx::query("SELECT status,delivery_fence_checked_at FROM message_outbox WHERE id=$1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("load fenced row");
+        assert_eq!(row.get::<String, _>("status"), "cancelled");
+        assert!(
+            row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("delivery_fence_checked_at")
+                .is_some(),
+            "the fenced row must stamp delivery_fence_checked_at"
+        );
 
         pool.close().await;
         pg_db.drop().await;
@@ -2722,7 +2911,9 @@ async fn claim_pending_message_outbox_batch_pg(
                error = NULL
           FROM claimed
          WHERE mo.id = claimed.id
-        RETURNING mo.id, mo.target, mo.content, mo.bot, mo.source, mo.reason_code, mo.session_key, mo.retry_count, mo.claim_owner, mo.claimed_at",
+        RETURNING mo.id, mo.target, mo.content, mo.bot, mo.source, mo.reason_code, mo.session_key,
+                  mo.attachment_filename, mo.attachment_content_type, mo.attachment_data,
+                  mo.retry_count, mo.claim_owner, mo.claimed_at",
     )
     .bind(MESSAGE_OUTBOX_CLAIM_STALE_SECS)
     .bind(claim_owner)
@@ -2747,6 +2938,13 @@ async fn claim_pending_message_outbox_batch_pg(
                 source: row.try_get::<String, _>("source").ok()?,
                 reason_code: row.try_get::<Option<String>, _>("reason_code").ok()?,
                 session_key: row.try_get::<Option<String>, _>("session_key").ok()?,
+                attachment_filename: row
+                    .try_get::<Option<String>, _>("attachment_filename")
+                    .ok()?,
+                attachment_content_type: row
+                    .try_get::<Option<String>, _>("attachment_content_type")
+                    .ok()?,
+                attachment_data: row.try_get::<Option<Vec<u8>>, _>("attachment_data").ok()?,
                 retry_count: row.try_get::<i64, _>("retry_count").unwrap_or(0),
                 claim_owner: row.try_get::<String, _>("claim_owner").ok()?,
                 claimed_at: row
@@ -2776,6 +2974,48 @@ where
     }
 
     for row in &pending {
+        // #4615 S3b: re-validate circuit authority under the claim lease before
+        // the Discord send. A row whose circuit episode/authority was superseded
+        // or revoked after it was claimed (and therefore escaped
+        // `revoke_on_fresh_vouch`, which only cancels held/pending rows) is
+        // fenced off instead of delivered. Non-circuit rows clear trivially. The
+        // fence fails closed: a lease-loss or DB error skips this row this cycle
+        // rather than risk delivering an un-validated alert.
+        use crate::services::message_outbox_circuit_authority::DeliveryFenceOutcome;
+        match crate::services::message_outbox_circuit_authority::fence_claimed_delivery(
+            pg_pool,
+            row.id,
+            &row.claim_owner,
+            row.claimed_at,
+        )
+        .await
+        {
+            Ok(DeliveryFenceOutcome::Cleared) => {}
+            Ok(DeliveryFenceOutcome::Fenced) => {
+                tracing::info!(
+                    outbox_id = row.id,
+                    target = %row.target,
+                    "[outbox] delivery fenced: circuit authority superseded before send"
+                );
+                continue;
+            }
+            Ok(DeliveryFenceOutcome::LeaseLost) => {
+                tracing::warn!(
+                    outbox_id = row.id,
+                    claim_owner = %row.claim_owner,
+                    "[outbox] delivery fence: stale lease, skipping send"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    outbox_id = row.id,
+                    %error,
+                    "[outbox] delivery fence db error, deferring send this cycle"
+                );
+                continue;
+            }
+        }
         let (status, err_text) = deliver(row.clone()).await;
         if status == "200 OK" {
             if mark_message_outbox_sent_pg(pg_pool, row.id, &row.claim_owner, row.claimed_at)
@@ -2978,18 +3218,28 @@ async fn routine_runtime_loop(
     let _routine_action_validator: fn(serde_json::Value) -> anyhow::Result<RoutineAction> =
         crate::services::routines::validate_routine_action;
 
-    let script_loader = match RoutineScriptLoader::new() {
-        Ok(loader) => loader,
+    let routine_script_dirs = routines_config.script_dirs();
+    let initial_script_dirs = routine_script_dirs.clone();
+    let script_loader = match tokio::task::spawn_blocking(move || {
+        let loader = Arc::new(RoutineScriptLoader::new_shared(&initial_script_dirs)?);
+        let count = loader.load_dirs(&initial_script_dirs)?;
+        Ok::<_, anyhow::Error>((loader, count))
+    })
+    .await
+    {
+        Ok(Ok((loader, count))) => {
+            tracing::info!(count, "routine script registry initialized");
+            loader
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "routine runtime not started: script registry initialization failed");
+            return;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "routine runtime not started: script loader init failed");
+            tracing::warn!(error = %e, "routine runtime not started: script registry blocking task failed");
             return;
         }
     };
-    let routine_script_dirs = routines_config.script_dirs();
-    match script_loader.load_dirs(&routine_script_dirs) {
-        Ok(count) => tracing::info!(count, "routine script registry initialized"),
-        Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
-    }
 
     let store = RoutineStore::new_with_timezone_and_checkpoint_limit(
         pg_pool.clone(),
@@ -3058,12 +3308,20 @@ async fn routine_runtime_loop(
             Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
         }
         if routines_config.hot_reload {
-            match script_loader.load_dirs(&routine_script_dirs) {
-                Ok(count) if count > 0 => {
+            let reload_dirs = routine_script_dirs.clone();
+            let loader = Arc::clone(&script_loader);
+            match tokio::task::spawn_blocking(move || loader.load_dirs(&reload_dirs)).await {
+                Ok(Ok(count)) if count > 0 => {
                     tracing::debug!(count, "routine script registry hot-reload pass complete")
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "routine script registry hot-reload failed")
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "routine script registry hot-reload blocking task failed"
+                ),
             }
         }
         // #3564: surface routines that have been stuck in `paused` past the

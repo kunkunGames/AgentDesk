@@ -54,6 +54,13 @@ pub(super) async fn do_finalize(
     // nothing — their guarantee runs at submit time from the pre-clear snapshot
     // (`submit_terminal_with_claim_snapshot`); rationale/gates: cleanup.rs.
     super::cleanup::ensure_synthetic_claim_marker_before_clear(key, &provider, submit_snapshot);
+    super::cleanup::enqueue_terminal_status_panel_reconcile(
+        key,
+        &provider,
+        event,
+        submit_snapshot,
+        shared.as_ref(),
+    );
     let skip_completion_reaction =
         super::cleanup::relay_ownership_only_for_finalize(key, &provider, submit_snapshot);
     let relay_owner_kind =
@@ -217,10 +224,19 @@ pub(super) async fn do_finalize(
         }
 
         // (E) Queue kickoff is owned by the #4048 completion-event listener. The
-        // mailbox release primitive publishes the channel event as soon as it
-        // removes the active token, and the listener kicks from a fresh mailbox
-        // snapshot. That keeps completion rendering and queue drain timing
-        // decoupled while preserving the real-turn safety gates.
+        // actor publishes QueueEligible only after the declared terminal barriers
+        // settle. Independently arm the channel-coalesced slow backstop whenever
+        // mailbox release leaves backlog, so a lost or late admission edge cannot
+        // strand work. The backstop snapshots again before dispatch and therefore
+        // never bypasses a newer active turn or directly double-dequeues.
+        super::cleanup::rearm_queue_backstop_after_mailbox_release(
+            shared,
+            &provider,
+            channel_id,
+            has_pending_after_voice,
+            "turn_finalizer_mailbox_release",
+        )
+        .await;
         has_pending_after_voice
     };
 

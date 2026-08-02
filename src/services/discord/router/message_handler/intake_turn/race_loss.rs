@@ -1,6 +1,20 @@
 use super::*;
 
-mod mailbox_reaction;
+pub(in crate::services::discord::router::message_handler) mod mailbox_reaction;
+
+fn race_loss_persistence_failure(
+    channel_id: ChannelId,
+    persistence_error: Option<&str>,
+) -> Result<(), Error> {
+    let Some(persistence_error) = persistence_error else {
+        return Ok(());
+    };
+    Err(std::io::Error::other(format!(
+        "failed to persist queued intake for channel {}: {persistence_error}",
+        channel_id.get()
+    ))
+    .into())
+}
 
 async fn enqueue_race_loss_requeued_intervention(
     shared: &Arc<SharedData>,
@@ -19,21 +33,37 @@ async fn enqueue_race_loss_requeued_intervention(
     )
     .await;
     if outcome.persistence_error.is_some() {
-        crate::services::discord::mailbox_clear_pending_dispatch_reservation(
+        let cleared = crate::services::discord::mailbox_clear_pending_dispatch_reservation(
             shared,
             provider,
             channel_id,
             user_msg_id,
         )
         .await;
+        if !cleared {
+            tracing::error!(
+                provider = provider.as_str(),
+                channel_id = channel_id.get(),
+                user_message_id = user_msg_id.get(),
+                "race-loss persistence rollback could not clear the pending dispatch reservation"
+            );
+        }
     } else {
-        crate::services::discord::mailbox_abandon_pending_dispatch(
+        let abandoned = crate::services::discord::mailbox_abandon_pending_dispatch(
             shared,
             provider,
             channel_id,
             user_msg_id,
         )
         .await;
+        if !abandoned {
+            tracing::debug!(
+                provider = provider.as_str(),
+                channel_id = channel_id.get(),
+                user_message_id = user_msg_id.get(),
+                "race-loss enqueue had no matching pending dispatch reservation to abandon"
+            );
+        }
     }
     if outcome.enqueued && outcome.persistence_error.is_none() {
         crate::services::discord::queue_io::schedule_race_loss_requeue_post_enqueue_idle_recheck(
@@ -44,7 +74,6 @@ async fn enqueue_race_loss_requeued_intervention(
     }
     outcome
 }
-
 /// #3837 decomposition: the start-turn race-loss enqueue path lifted verbatim
 /// from `handle_text_message`. Behavior-preserving — this is the exact body of
 /// the `if !started { ... }` block (mailbox enqueue, queued-placeholder render,
@@ -52,6 +81,7 @@ async fn enqueue_race_loss_requeued_intervention(
 /// mailbox start-turn claim. Its `return Ok(())` / `return Err(..)` statements
 /// map 1:1 onto the original inline returns, so the caller does
 /// `if !started { return handle_race_loss_enqueue(..).await; }`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_race_loss_enqueue(
     http: &Arc<serenity::http::Http>,
     shared: &Arc<SharedData>,
@@ -143,19 +173,38 @@ pub(super) async fn handle_race_loss_enqueue(
     // holder => stay silent and let its completion event wake us; already-idle
     // channel => one missed-completion kick.
 
-    // If the enqueue was rejected (dedup / duplicate) there is nothing
-    // for the dispatch path to pick up. Skip the placeholder POST + the
-    // mapping insert entirely — POSTing a fresh card here would orphan
-    // it. `📬` reaction is also skipped (the prior live enqueue already
-    // owns the card and emoji). Just clean up `⏳` and return.
-    if !enqueue_outcome.enqueued {
-        crate::services::discord::turn_view_reconciler::note_intake_turn_cleared(
+    if let Some(persistence_error) = enqueue_outcome.persistence_error.as_ref() {
+        mailbox_reaction::clear_rejected_attempt_pending(
             shared,
             http,
             channel_id,
             user_msg_id,
-            shared.restart.current_generation,
-            "race_loss_enqueue_rejected",
+            turn_start_attempt,
+        )
+        .await;
+        tracing::error!(
+            provider = provider.as_str(),
+            channel_id = channel_id.get(),
+            user_message_id = user_msg_id.get(),
+            error = %persistence_error,
+            "race-lost intake could not be persisted; returning failure to the caller"
+        );
+        return race_loss_persistence_failure(channel_id, Some(persistence_error));
+    }
+
+    // If the enqueue was rejected (dedup / duplicate) there is nothing
+    // for the dispatch path to pick up. Skip the placeholder POST + the
+    // mapping insert entirely — POSTing a fresh card here would orphan
+    // it. `📬` reaction is also skipped (the prior live enqueue already
+    // owns the card and emoji). Only the matching start attempt may clear its
+    // own pending `⏳`; a delayed attempt must not erase a newer attempt's state.
+    if !enqueue_outcome.enqueued {
+        mailbox_reaction::clear_rejected_attempt_pending(
+            shared,
+            http,
+            channel_id,
+            user_msg_id,
+            turn_start_attempt,
         )
         .await;
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -171,6 +220,9 @@ pub(super) async fn handle_race_loss_enqueue(
         );
         return Ok(());
     }
+
+    let want_queued_card = want_queued_card
+        && super::super::super::queue_status_presentation::queue_status_card_enabled();
 
     // codex review round-5 P2 (finding 2 — re-queue reuse): if a queued
     // placeholder mapping already exists for `(channel_id, user_msg_id)`
@@ -228,11 +280,10 @@ pub(super) async fn handle_race_loss_enqueue(
                 // later kickoff (or the deferred idle drain scheduled
                 // above) will dispatch it — `dispatch_queued_turn` ->
                 // `handle_text_message` will POST its own fresh card
-                // through the missing-mapping fallback. The user
-                // briefly sees `⏳` only and no `📬`, but the message
-                // WILL be processed correctly. Roll back the `⏳`
-                // sentinel so the user knows we did not silently
-                // accept the message.
+                // through the missing-mapping fallback. The user briefly
+                // sees no queue marker, but the message WILL be processed
+                // correctly. Roll back the pending `⏳` to the marker-only
+                // queued state so the user knows the message remains queued.
                 if let Some(turn_start_attempt) = turn_start_attempt {
                     crate::services::discord::turn_view_reconciler::note_intake_start_rolled_back_to_queued(
                         shared,
@@ -336,8 +387,8 @@ pub(super) async fn handle_race_loss_enqueue(
             // In all cases our POSTed placeholder is an orphan that no
             // future dispatch or queue-exit cleanup will ever reference
             // — drop the lock before the HTTP DELETE await, delete the
-            // orphan, remove the `⏳` reaction, and skip the mapping
-            // insert.
+            // orphan, clear the matching pending attempt, and skip the
+            // mapping insert.
             drop(persist_guard);
             let _ = channel_id.delete_message(http, placeholder_msg_id).await;
             crate::services::discord::turn_view_reconciler::note_intake_turn_cleared_current_if_attempt_matches(
@@ -397,6 +448,7 @@ pub(super) async fn handle_race_loss_enqueue(
             user_msg_id,
             emoji,
             turn_start_attempt,
+            "race_loss_message_queued",
         )
         .await;
         // #2036 Surface 3: detect queue→start races where the
@@ -597,100 +649,8 @@ pub(super) async fn handle_race_loss_enqueue(
 }
 
 #[cfg(test)]
-mod race_loss_requeue_tests {
-    use super::*;
-
-    struct EnvReset(Option<std::ffi::OsString>);
-
-    impl Drop for EnvReset {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
-
-    fn user_intervention(id: u64, text: &str) -> Intervention {
-        Intervention {
-            author_id: UserId::new(id),
-            author_is_bot: false,
-            message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
-            source_message_ids: vec![MessageId::new(id)],
-            source_message_queued_generations: Vec::new(),
-            source_text_segments: Vec::new(),
-            text: text.to_string(),
-            mode: InterventionMode::Soft,
-            created_at: Instant::now(),
-            reply_context: None,
-            has_reply_boundary: false,
-            merge_consecutive: false,
-            pending_uploads: Vec::new(),
-            voice_announcement: None,
-        }
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn race_loss_requeue_suppresses_post_enqueue_idle_kick_while_holder_active() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let tmp = tempfile::tempdir().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
-
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(4_078_100);
-        let holder_msg = MessageId::new(4_078_102);
-
-        assert!(
-            crate::services::discord::mailbox_try_start_turn(
-                &shared,
-                channel_id,
-                Arc::new(CancelToken::new()),
-                UserId::new(4_078_102),
-                holder_msg,
-            )
-            .await,
-            "seed the active holder that owns the completion wake edge"
-        );
-
-        let outcome = enqueue_race_loss_requeued_intervention(
-            &shared,
-            &provider,
-            channel_id,
-            MessageId::new(4_078_101),
-            user_intervention(4_078_101, "race loss requeue"),
-        )
-        .await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
-
-        assert!(outcome.enqueued);
-        assert_eq!(
-            shared
-                .restart
-                .deferred_hook_backlog
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "race-loss requeue must not arm a post-enqueue kick/backstop"
-        );
-        assert!(
-            !shared
-                .restart
-                .deferred_hook_channels
-                .contains_key(&channel_id),
-            "race-loss requeue must not arm a post-enqueue kick/backstop"
-        );
-        let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel_id).await;
-        assert!(snapshot.cancel_token.is_some());
-        assert_eq!(snapshot.active_user_message_id, Some(holder_msg));
-        assert_eq!(snapshot.intervention_queue.len(), 1);
-    }
-}
+#[path = "race_loss/requeue_tests.rs"]
+mod race_loss_requeue_tests;
 
 #[cfg(test)]
 mod mailbox_reaction_tests;

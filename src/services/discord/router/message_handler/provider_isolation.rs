@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::discord::session_runtime::reconstruct_managed_worktree_metadata;
 
 pub(super) fn metadata_parent_channel_id(
     metadata: Option<&serde_json::Value>,
@@ -126,6 +127,68 @@ pub(super) fn prelaunch_runtime_kind_for_managed_session(
     None
 }
 
+/// Seeds the durable inflight runtime fields before runtime handoff binds the
+/// provider-owned transcript path.
+fn prelaunch_inflight_runtime_seed_from_paths(
+    tmux_name: &str,
+    output_path: String,
+    input_fifo_path: String,
+    session_exists: bool,
+    prelaunch_runtime_kind: Option<RuntimeHandoffKind>,
+) -> (Option<String>, Option<String>, Option<String>, u64) {
+    let is_claude_tui = prelaunch_runtime_kind == Some(RuntimeHandoffKind::ClaudeTui);
+    let last_offset = (!is_claude_tui)
+        .then(|| {
+            std::fs::metadata(&output_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    (
+        Some(tmux_name.to_string()),
+        (!is_claude_tui).then_some(output_path),
+        Some(input_fifo_path),
+        session_exists.then_some(last_offset).unwrap_or(0),
+    )
+}
+
+pub(super) fn prelaunch_inflight_runtime_seed(
+    provider: &ProviderKind,
+    remote_profile_is_none: bool,
+    tmux_session_name: Option<&str>,
+    prelaunch_runtime_kind: Option<RuntimeHandoffKind>,
+) -> (Option<String>, Option<String>, Option<String>, u64) {
+    #[cfg(unix)]
+    {
+        if remote_profile_is_none
+            && provider.uses_managed_tmux_backend()
+            && claude::is_tmux_available()
+            && let Some(tmux_name) = tmux_session_name
+        {
+            let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
+            let session_exists =
+                crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
+            return prelaunch_inflight_runtime_seed_from_paths(
+                tmux_name,
+                output_path,
+                input_fifo_path,
+                session_exists,
+                prelaunch_runtime_kind,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            provider,
+            remote_profile_is_none,
+            tmux_session_name,
+            prelaunch_runtime_kind,
+        );
+    }
+    (None, None, None, 0)
+}
+
 #[cfg(unix)]
 pub(super) fn observed_runtime_kind_for_managed_tmux(
     provider: &ProviderKind,
@@ -222,7 +285,7 @@ pub(super) async fn restore_live_tui_provider_session_from_binding(
         .await;
     }
     let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::warn!(
+    tracing::info!(
         "  [{ts}] ↻ Recovered provider session_id from live TUI runtime binding for channel {}: tmux={} transcript={}",
         channel_id.get(),
         tmux_session_name.unwrap_or("(none)"),
@@ -471,6 +534,20 @@ pub(super) struct ProviderWorktreeIsolationOutcome {
     stale_session_id: Option<String>,
 }
 
+fn reconstruct_unowned_managed_worktree(
+    session: &mut DiscordSession,
+    conflict: Option<&str>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    canonical: &str,
+) -> bool {
+    if conflict.is_some() {
+        return false;
+    }
+    reconstruct_managed_worktree_metadata(session, provider, channel_id, canonical);
+    session.worktree.is_some()
+}
+
 pub(super) async fn ensure_provider_worktree_isolation(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -502,21 +579,35 @@ pub(super) async fn ensure_provider_worktree_isolation(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| current_path.clone());
 
-    let (already_isolated, session_channel_name, conflict) = {
-        let data = shared.core.lock().await;
+    let (already_isolated, reconstructed, session_channel_name, conflict) = {
+        let mut data = shared.core.lock().await;
+        let conflict = detect_worktree_conflict(&data.sessions, &canonical, channel_id);
         let already_isolated = data
             .sessions
             .get(&channel_id)
             .and_then(|session| session.worktree.as_ref())
             .is_some();
+        let reconstructed = data.sessions.get_mut(&channel_id).is_some_and(|session| {
+            reconstruct_unowned_managed_worktree(
+                session,
+                conflict.as_deref(),
+                provider,
+                channel_id,
+                &canonical,
+            )
+        });
         let session_channel_name = data
             .sessions
             .get(&channel_id)
             .and_then(|session| session.channel_name.clone());
-        let conflict = detect_worktree_conflict(&data.sessions, &canonical, channel_id);
-        (already_isolated, session_channel_name, conflict)
+        (
+            already_isolated,
+            reconstructed,
+            session_channel_name,
+            conflict,
+        )
     };
-    if already_isolated {
+    if already_isolated || (conflict.is_none() && reconstructed) {
         return ProviderWorktreeIsolationOutcome::default();
     }
 
@@ -553,7 +644,10 @@ pub(super) async fn ensure_provider_worktree_isolation(
             Some(branch_name.clone()),
             base_commit,
         );
-        let _ = super::super::super::inflight::save_inflight_state(&inflight);
+        let _ = super::super::super::inflight::save_inflight_state_if_identity_unchanged(
+            &inflight,
+            "provider_worktree_isolation",
+        );
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -589,7 +683,7 @@ pub(super) async fn reset_provider_session_after_worktree_isolation(
     if !outcome.applied {
         return;
     }
-    if let Some(key) = build_adk_session_key(shared, channel_id, provider).await {
+    if let Some(key) = build_adk_session_key(shared, channel_id, provider, None).await {
         super::super::super::adk_session::clear_provider_session_id(&key, shared.api_port).await;
     }
     if let Some(stale_session_id) = outcome.stale_session_id.as_deref() {
@@ -602,6 +696,125 @@ pub(super) async fn reset_provider_session_after_worktree_isolation(
 #[cfg(test)]
 mod thread_role_inheritance_tests {
     use super::*;
+
+    #[test]
+    fn prelaunch_claude_tui_seed_omits_wrapper_output_but_preserves_fifo() {
+        let seed = prelaunch_inflight_runtime_seed_from_paths(
+            "AgentDesk-claude-seed",
+            "/runtime/wrapper-stream.log".to_string(),
+            "/runtime/input.fifo".to_string(),
+            true,
+            Some(RuntimeHandoffKind::ClaudeTui),
+        );
+        assert_eq!(seed.0.as_deref(), Some("AgentDesk-claude-seed"));
+        assert_eq!(
+            seed.1, None,
+            "ClaudeTui must wait for RuntimeReady transcript binding"
+        );
+        assert_eq!(seed.2.as_deref(), Some("/runtime/input.fifo"));
+        assert_eq!(seed.3, 0);
+    }
+
+    #[test]
+    fn prelaunch_seed_is_identical_for_intake_and_headless_callers() {
+        let intake = prelaunch_inflight_runtime_seed_from_paths(
+            "AgentDesk-claude-symmetric",
+            "/runtime/wrapper-stream.log".to_string(),
+            "/runtime/input.fifo".to_string(),
+            true,
+            Some(RuntimeHandoffKind::ClaudeTui),
+        );
+        let headless = prelaunch_inflight_runtime_seed_from_paths(
+            "AgentDesk-claude-symmetric",
+            "/runtime/wrapper-stream.log".to_string(),
+            "/runtime/input.fifo".to_string(),
+            true,
+            Some(RuntimeHandoffKind::ClaudeTui),
+        );
+        assert_eq!(intake, headless);
+    }
+
+    #[test]
+    fn managed_linked_worktree_skips_provider_reisolation_without_session_state() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+
+        let git = |args: &[&str]| {
+            crate::services::git::GitCommand::new()
+                .repo(&repo)
+                .args(args)
+                .run_output()
+                .unwrap();
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "provider-isolation@test.invalid"]);
+        git(&["config", "user.name", "Provider Isolation Test"]);
+        std::fs::write(repo.join("README"), "test").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-m", "initial"]);
+
+        let (worktree_path, _) = create_git_worktree(
+            repo.to_str().unwrap(),
+            "restart-reisolation",
+            "test-provider",
+        )
+        .unwrap();
+
+        let mut session = DiscordSession {
+            session_id: Some("preserved-session".to_string()),
+            memento_context_loaded: true,
+            memento_reflected: false,
+            current_path: Some(worktree_path.clone()),
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            cleared: false,
+            remote_profile_name: None,
+            channel_id: Some(43_170_001),
+            channel_name: Some("restart-reisolation".to_string()),
+            category_name: None,
+            last_active: tokio::time::Instant::now(),
+            worktree: None,
+            born_generation: 0,
+        };
+        reconstruct_managed_worktree_metadata(
+            &mut session,
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_001),
+            &worktree_path,
+        );
+
+        assert!(session.worktree.is_some());
+        assert_eq!(session.session_id.as_deref(), Some("preserved-session"));
+
+        let mut conflicted_session = DiscordSession {
+            worktree: None,
+            ..session.clone()
+        };
+        assert!(!reconstruct_unowned_managed_worktree(
+            &mut conflicted_session,
+            Some("owner-channel"),
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_003),
+            &worktree_path,
+        ));
+        assert!(conflicted_session.worktree.is_none());
+
+        git(&["-C", &worktree_path, "checkout", "--detach"]);
+        let mut detached_session = DiscordSession {
+            worktree: None,
+            ..session.clone()
+        };
+        reconstruct_managed_worktree_metadata(
+            &mut detached_session,
+            &ProviderKind::Claude,
+            ChannelId::new(43_170_002),
+            &worktree_path,
+        );
+        assert!(detached_session.worktree.is_none());
+    }
+
     fn bind_parent(
         root: &std::path::Path,
         id: ChannelId,
@@ -655,7 +868,9 @@ mod thread_role_inheritance_tests {
             "token",
             Some(binding),
             false,
-            DispatchProfile::Full,
+            super::super::super::super::prompt_builder::PromptProfiles::foreground(
+                DispatchProfile::Full,
+            ),
             None,
             None,
             None,

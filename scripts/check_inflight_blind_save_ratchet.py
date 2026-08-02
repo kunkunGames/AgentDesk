@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Ratchet guard for blind `save_inflight_state(...)` writes (#4259).
 
-`save_inflight_state` is the store-side "blind whole-blob write" half of the
+`save_inflight_state` was the store-side "blind whole-blob write" half of the
 inflight sidecar contract (src/services/discord/inflight/save_store.rs): it
 serializes the WHOLE `InflightTurnState` row and clobbers whatever is on disk,
 with no compare-and-set on turn identity. A concurrent turn that legitimately
 re-owns the channel between a caller's snapshot and its write is silently
-overwritten. The drop-in guarded variant
+overwritten. The identity-guarded variant
 `save_inflight_state_if_identity_unchanged(state, caller)`
-(save_store/identity_gate.rs) refuses that race (returns `GuardedSaveOutcome`),
-and every remaining blind caller holds a snapshot local it can pin an identity
-against.
+(save_store/identity_gate.rs) refuses cross-turn re-ownership (returns
+`GuardedSaveOutcome`); callers that can race same-turn writers must use a
+lock-held narrow patch like the R4 bridge-entry seam so watcher progress is
+preserved too.
 
 This guard is a monotonic ceiling on the number of *production* blind
 `save_inflight_state(` call sites. It may only ever go DOWN: converting a site
 to the guarded variant (or a `_if_absent` / `_create_new` create-shaped variant)
 drops the count, and the ceiling is lowered to match. It can never grow back, so
 the blind-write debt converges to zero (#4259 PR-2..N do the per-track
-conversions) without anyone having to remember to chase it.
+conversions) without anyone having to remember to chase it. At baseline zero,
+the blind helper and its facade re-export are `#[cfg(test)]`: production code
+cannot name the API, so the compiler is the authoritative boundary and this
+script remains the source inventory tripwire.
 
 Only `src/services/discord/**/*.rs` is scanned. Test surfaces are excluded:
 files named `tests.rs` / `*_tests.rs`, and `#[cfg(test)]` / `#[cfg(all(test, ...))]`
@@ -52,31 +56,20 @@ from pathlib import Path
 # call sites permitted under src/services/discord. Lower this as sites convert
 # to the identity-guarded variant; never raise it casually.
 #
-# #4259 PR-1 baseline = 29; PR-2a lowered to 26. Track decomposition
-# (convert + lower per PR-2..N):
-#   turn_bridge/runtime_handoff_loop.rs .. 6  (PR-2a: 3 of 9 converted)
-#   turn_bridge/stream_tick.rs .......... 5
-#   turn_bridge/stream_loop.rs .......... 2
-#   turn_bridge/post_loop_finalize.rs ... 4
-#   turn_bridge/mod.rs (hotfile, solo) .. 1
-#   external (router/session/tui) ....... 8
-#     (headless_turn, intake_turn, provider_isolation, watchdog,
-#      session_runtime/worktree, tui_prompt_relay/synthetic_start x2,
-#      tui_prompt_relay/codex_idle_rollout)
+# #4259 PR-1 baseline = 29; PR-2a lowered to 26; #4596 lowered to 25;
+# post-loop-finalize lowered to 21; external writers lowered to 13; R1 stream
+# tick lowered to 8; R2 runtime-handoff atomic stamps lower to 3; R3 stream-loop
+# terminal/cancel patches lower to 1. Remaining:
+#   turn_bridge/runtime_handoff_loop.rs .. 0  (R2 field-scoped locked stamp)
+#   turn_bridge/stream_tick.rs .......... 0  (R1)
+#   turn_bridge/stream_loop.rs .......... 0  (R3 narrow locked patches)
+#   turn_bridge/post_loop_finalize.rs ... 0
+#   turn_bridge/mod.rs (hotfile, solo) .. 0  (R4)
+#   external (router/session/tui) ....... 0
 #
-# #4259 PR-2a: the 3 converted runtime_handoff_loop sites are the legacy
-# tmux-wrapper `TmuxReady` stamps, converted to
-# `save_inflight_state_if_identity_matches_allow_output_restamp` (codex r1):
-# the 4-field turn identity is stable across the stamp (declines only on
-# concurrent re-own), while `output_path` may legitimately restamp to the
-# resolved legacy /tmp session path on a warm follow-up
-# (`resolve_session_temp_path`). The 6 that REMAIN blind (RuntimeReady
-# ProcessBackend/ClaudeEAdapter/ClaudeTui/CodexTui + ProcessReady + the
-# watcher-handoff helper) also (re)write identity-pinned `tmux_session_name`
-# (ClaudeEAdapter clears it to None) — beyond what the output-restamp variant
-# tolerates — so each needs per-flow session-name-stability verification or an
-# adoption-aware variant before converting. Held for a follow-up PR.
-BASELINE = 26
+# R4 converts the final bridge-entry whole-row write to a lock-held narrow RMW,
+# then removes the blind helper from production compilation entirely.
+BASELINE = 0
 
 SCAN_ROOT = Path("src") / "services" / "discord"
 
@@ -261,9 +254,9 @@ def main() -> int:
             file=sys.stderr,
         )
         print(
-            "      The blind-write count may only decrease. Convert a site to "
-            "`save_inflight_state_if_identity_unchanged` (or a `_if_absent` / "
-            "`_create_new` create variant) instead of adding a blind write.",
+            "      The blind-write count may only decrease. Use a field-scoped "
+            "lock-held RMW (or a `_if_absent` / `_create_new` create variant) "
+            "instead of adding a blind write.",
             file=sys.stderr,
         )
         for loc in locations:

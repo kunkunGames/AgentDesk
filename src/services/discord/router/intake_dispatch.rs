@@ -1,16 +1,20 @@
 use super::message_handler::{self, IntakeDeps, IntakeRequest};
 use crate::services::cluster::intake_router_hook::{
-    IntakeBlockedReason, IntakeRouterContext, IntakeRouterDecision, effective_intake_routing_mode,
+    IntakeBlockedReason, IntakeRouterContext, IntakeRouterDecision, ResolvedSessionOwner,
     try_route_intake,
 };
+use crate::services::cluster::intake_routing_config::OwnerAuthorityChannelOptIn;
 use crate::services::provider::ProviderKind;
+use poise::serenity_prelude as serenity;
 
+mod attachment;
 mod notice;
 mod queued;
 mod skill;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use attachment::{prepare_admitted_live_attachments, resolve_attachment_admission};
 use notice::notify_blocked_intake;
 pub(crate) use queued::{
     QueuedAdmissionDisposition, admit_queued_intake, finish_admitted_queued_intake,
@@ -23,11 +27,17 @@ pub(crate) enum IntakeOrigin {
     QueuedDrain,
     SlashSkill,
     TextSkill,
+    RawAttachment,
 }
 
 impl IntakeOrigin {
-    fn should_notify_blocked(self) -> bool {
+    fn should_notify_blocked(self, reason: &IntakeBlockedReason) -> bool {
         !matches!(self, Self::QueuedDrain)
+            || matches!(
+                reason,
+                IntakeBlockedReason::NonPortableAttachmentForeignOwner { .. }
+                    | IntakeBlockedReason::NonPortableAttachmentRoutedTarget { .. }
+            )
     }
 }
 
@@ -37,12 +47,30 @@ pub(crate) struct IntakeSubmission {
     pub(crate) origin: IntakeOrigin,
     pub(crate) preserve_on_cancel: bool,
     pub(crate) has_nonportable_uploads: bool,
+    pub(crate) attachments: Vec<message_handler::AttachmentDescriptor>,
     pub(crate) preloaded_uploads: Vec<String>,
     pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 }
 
 #[derive(Debug)]
-pub(crate) struct LocalAdmissionPermit(());
+pub(crate) struct LocalAdmissionPermit {
+    channel_id: serenity::ChannelId,
+    request_owner: serenity::UserId,
+}
+
+impl LocalAdmissionPermit {
+    fn for_submission(submission: &IntakeSubmission) -> Self {
+        Self {
+            channel_id: submission.request.channel_id,
+            request_owner: submission.request.request_owner,
+        }
+    }
+
+    fn permits_submission(&self, submission: &IntakeSubmission) -> bool {
+        self.channel_id == submission.request.channel_id
+            && self.request_owner == submission.request.request_owner
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum IntakeAdmission {
@@ -64,26 +92,55 @@ pub(crate) async fn admit_text_intake(
     deps: &IntakeDeps<'_>,
     submission: &IntakeSubmission,
 ) -> IntakeAdmission {
-    let mode = effective_intake_routing_mode();
+    let effective_config =
+        crate::services::cluster::intake_router_hook::effective_intake_routing_config();
+    let mode = effective_config.mode;
+    let channel_id = submission.request.channel_id.get().to_string();
+    let user_msg_id = submission.request.user_msg_id.get().to_string();
+    let authority_channel_opt_in = effective_config.owner_authority_channel_opt_in(&channel_id);
     let Some(pool) = deps.shared.pg_pool.as_ref() else {
-        if matches!(
+        let decision = if matches!(
             mode,
             crate::services::cluster::intake_router_hook::IntakeRoutingMode::Enforce
         ) {
-            return IntakeAdmission::Blocked {
+            IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::RoutingDependencyFailed {
                     detail: "Postgres pool unavailable for owner lookup".to_string(),
                 },
-            };
-        }
-        return IntakeAdmission::Local(LocalAdmissionPermit(()));
+            }
+        } else {
+            IntakeRouterDecision::RanLocal {
+                reason: if matches!(
+                    mode,
+                    crate::services::cluster::intake_router_hook::IntakeRoutingMode::Disabled
+                ) {
+                    crate::services::cluster::intake_router_hook::RanLocalReason::HookDisabled
+                } else {
+                    crate::services::cluster::intake_router_hook::RanLocalReason::DbErrorFellBackToLocal {
+                        detail: "Postgres pool unavailable for owner-aware planning".to_string(),
+                    }
+                },
+            }
+        };
+        crate::services::cluster::intake_routing_telemetry::record_decision(
+            mode,
+            &channel_id,
+            &user_msg_id,
+            authority_channel_opt_in,
+            &decision,
+        );
+        return match decision {
+            IntakeRouterDecision::Blocked { reason } => IntakeAdmission::Blocked { reason },
+            IntakeRouterDecision::RanLocal { .. } => {
+                IntakeAdmission::Local(LocalAdmissionPermit::for_submission(submission))
+            }
+            _ => unreachable!("dependency-free admission creates only blocked or local decisions"),
+        };
     };
 
     let request = &submission.request;
-    let leader_instance_id =
+    let self_instance_id =
         crate::services::cluster::node_registry::resolve_self_instance_id_without_config();
-    let channel_id = request.channel_id.get().to_string();
-    let user_msg_id = request.user_msg_id.get().to_string();
     let request_owner_id = request.request_owner.get().to_string();
     let node_override =
         super::super::commands::channel_node_override(deps.shared, request.channel_id);
@@ -93,7 +150,7 @@ pub(crate) async fn admit_text_intake(
     };
     let ctx = IntakeRouterContext {
         mode,
-        leader_instance_id: &leader_instance_id,
+        leader_instance_id: &self_instance_id,
         provider: submission.provider.as_str(),
         channel_id: &channel_id,
         user_msg_id: &user_msg_id,
@@ -108,46 +165,126 @@ pub(crate) async fn admit_text_intake(
         reply_to_user_message: request.reply_to_user_message,
         defer_watcher_resume: request.defer_watcher_resume,
         wait_for_completion: request.wait_for_completion,
+        preserve_on_cancel: submission.preserve_on_cancel,
         node_override_instance_id: node_override.as_deref(),
         has_nonportable_uploads: submission.has_nonportable_uploads
+            || !submission.attachments.is_empty()
             || !submission.preloaded_uploads.is_empty(),
     };
 
     let decision = try_route_intake(pool, &ctx).await;
-    let admission = match decision {
-        IntakeRouterDecision::RanLocal { reason } => {
-            tracing::debug!(
-                ?reason,
-                channel_id,
-                user_msg_id,
-                "[intake_dispatch] admitted local"
-            );
-            IntakeAdmission::Local(LocalAdmissionPermit(()))
+    crate::services::cluster::intake_routing_telemetry::record_decision(
+        mode,
+        &channel_id,
+        &user_msg_id,
+        authority_channel_opt_in,
+        &decision,
+    );
+    let stale_recovery = match &decision {
+        IntakeRouterDecision::DeferredOpenRoute {
+            open_route_id: Some(route_id),
+            open_route_status,
+            open_route_age_secs: Some(age_secs),
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+            ..
+        } if matches!(authority_channel_opt_in, OwnerAuthorityChannelOptIn::NotOptedIn)
+            && open_route_status == "pending"
+            && *age_secs as u64 >= effective_config.forward_pre_claim_timeout_secs =>
+        {
+            match crate::services::cluster::intake_router_hook::owner_record::
+                retire_stale_pending_route_for_local(
+                    pool,
+                    submission.provider.as_str(),
+                    &channel_id,
+                    *route_id,
+                    effective_config.forward_pre_claim_timeout_secs,
+                )
+                .await
+            {
+                Ok(retired) => retired,
+                Err(error) => {
+                    tracing::warn!(%error, route_id, "[intake_dispatch] stale route retirement failed; retaining fence");
+                    false
+                }
+            }
         }
-        IntakeRouterDecision::ObservedWouldForward { target_instance_id } => {
-            tracing::info!(
-                %target_instance_id,
-                channel_id,
-                user_msg_id,
-                "[intake_dispatch] observe-only route admitted local"
-            );
-            IntakeAdmission::Local(LocalAdmissionPermit(()))
+        _ => true,
+    };
+    let admission = if !stale_recovery {
+        match decision {
+            IntakeRouterDecision::DeferredOpenRoute {
+                target_instance_id, ..
+            } => IntakeAdmission::DeferredOpenRoute { target_instance_id },
+            other => admission_for_decision(
+                authority_channel_opt_in,
+                effective_config.forward_pre_claim_timeout_secs,
+                other,
+                submission,
+            ),
+        }
+    } else {
+        admission_for_decision(
+            authority_channel_opt_in,
+            effective_config.forward_pre_claim_timeout_secs,
+            decision,
+            submission,
+        )
+    };
+
+    log_nonlocal_admission(&admission, &channel_id, &user_msg_id);
+    admission
+}
+
+fn admission_for_decision(
+    authority_channel_opt_in: OwnerAuthorityChannelOptIn,
+    forward_pre_claim_timeout_secs: u64,
+    decision: IntakeRouterDecision,
+    submission: &IntakeSubmission,
+) -> IntakeAdmission {
+    match decision {
+        IntakeRouterDecision::RanLocal { .. } | IntakeRouterDecision::Observed { .. } => {
+            IntakeAdmission::Local(LocalAdmissionPermit::for_submission(submission))
         }
         IntakeRouterDecision::Forwarded {
             target_instance_id,
             outbox_id,
+            ..
         } => IntakeAdmission::Forwarded {
             target_instance_id,
             outbox_id,
         },
-        IntakeRouterDecision::SkippedDuplicate => IntakeAdmission::SkippedDuplicate,
-        IntakeRouterDecision::DeferredOpenRoute { target_instance_id } => {
-            IntakeAdmission::DeferredOpenRoute { target_instance_id }
+        IntakeRouterDecision::SkippedDuplicate { .. } => IntakeAdmission::SkippedDuplicate,
+        // A pending row has not crossed the worker claim boundary; claimed,
+        // accepted, and spawned rows may already be executing and remain
+        // fenced. Local recovery retires only a stale pending row before
+        // execution begins. The retirement CAS relies on the pending status
+        // predicate and PostgreSQL row lock, not advisory-lock coverage.
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id,
+            open_route_status,
+            open_route_age_secs,
+            resolved_owner: ResolvedSessionOwner::LiveLocal,
+            ..
+        } if open_route_status == "pending"
+            && open_route_age_secs.is_some_and(|age| age >= forward_pre_claim_timeout_secs)
+            && matches!(
+                authority_channel_opt_in,
+                OwnerAuthorityChannelOptIn::NotOptedIn
+            ) =>
+        {
+            tracing::warn!(
+                %target_instance_id,
+                open_route_status,
+                authority_channel_opt_in = authority_channel_opt_in.as_str(),
+                "[intake_dispatch] admitted local live owner despite pending open route; stale-route recovery exception"
+            );
+            IntakeAdmission::Local(LocalAdmissionPermit::for_submission(submission))
         }
+        IntakeRouterDecision::DeferredOpenRoute {
+            target_instance_id, ..
+        } => IntakeAdmission::DeferredOpenRoute { target_instance_id },
         IntakeRouterDecision::Blocked { reason } => IntakeAdmission::Blocked { reason },
-    };
-    log_nonlocal_admission(&admission, &channel_id, &user_msg_id);
-    admission
+    }
 }
 
 /// Common convenience path for producers that do not already own a durable
@@ -158,14 +295,32 @@ pub(crate) async fn dispatch_text_intake(
     submission: IntakeSubmission,
 ) -> Result<(), super::super::Error> {
     let admission = admit_text_intake(deps, &submission).await;
+    finish_text_intake_admission(deps, admission, submission).await
+}
+
+pub(crate) async fn finish_text_intake_admission(
+    deps: &IntakeDeps<'_>,
+    admission: IntakeAdmission,
+    submission: IntakeSubmission,
+) -> Result<(), super::super::Error> {
     match admission {
         IntakeAdmission::Local(permit) => {
             finish_admitted_local(deps, permit, submission).await?;
         }
+        IntakeAdmission::DeferredOpenRoute {
+            ref target_instance_id,
+        } if matches!(submission.origin, IntakeOrigin::RawAttachment) => {
+            let reason = IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
+                target_instance_id: target_instance_id.clone(),
+            };
+            notify_blocked_intake(deps, &submission, &reason).await;
+        }
         IntakeAdmission::DeferredOpenRoute { .. } => {
             defer_live_submission(deps, submission).await;
         }
-        IntakeAdmission::Blocked { ref reason } if submission.origin.should_notify_blocked() => {
+        IntakeAdmission::Blocked { ref reason }
+            if submission.origin.should_notify_blocked(reason) =>
+        {
             notify_blocked_intake(deps, &submission, reason).await;
         }
         IntakeAdmission::Forwarded { .. }
@@ -175,16 +330,36 @@ pub(crate) async fn dispatch_text_intake(
     Ok(())
 }
 
-pub(crate) async fn finish_admitted_local(
+pub(crate) async fn finish_admitted_text_intake(
     deps: &IntakeDeps<'_>,
-    _permit: LocalAdmissionPermit,
+    permit: LocalAdmissionPermit,
     submission: IntakeSubmission,
 ) -> Result<(), super::super::Error> {
+    finish_admitted_local(deps, permit, submission).await
+}
+
+pub(crate) async fn finish_admitted_local(
+    deps: &IntakeDeps<'_>,
+    permit: LocalAdmissionPermit,
+    submission: IntakeSubmission,
+) -> Result<(), super::super::Error> {
+    if !permit.permits_submission(&submission) {
+        tracing::error!(
+            admitted_channel_id = permit.channel_id.get(),
+            submitted_channel_id = submission.request.channel_id.get(),
+            admitted_request_owner = permit.request_owner.get(),
+            submitted_request_owner = submission.request.request_owner.get(),
+            "local admission permit does not match intake submission"
+        );
+        return Ok(());
+    }
     let preserve_on_cancel = submission.preserve_on_cancel;
+    let queued_drain = matches!(submission.origin, IntakeOrigin::QueuedDrain);
     message_handler::finish_admitted_local(
         deps,
         submission.request,
         preserve_on_cancel,
+        queued_drain,
         submission.preloaded_uploads,
         submission.voice_announcement,
     )

@@ -565,15 +565,26 @@ fn build_queue_report_sync(
                 let age = now.duration_since(item.created_at).as_secs();
                 let preview = truncate_str(&item.text, 60);
                 lines.push(format!(
-                    "    {}. `<@{}>` {}s ago: {}",
+                    "    {}. message_id `{}` — `<@{}>` {}s ago: {}",
                     i + 1,
+                    item.message_id,
                     item.author_id,
                     age,
                     preview
                 ));
             }
             if queue.len() > 5 {
-                lines.push(format!("    ... +{} more", queue.len() - 5));
+                let hidden_ids = queue
+                    .iter()
+                    .skip(5)
+                    .map(|item| format!("`{}`", item.message_id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!(
+                    "    ... +{} more; message_ids: {}",
+                    queue.len() - 5,
+                    hidden_ids
+                ));
             }
         }
     }
@@ -662,6 +673,79 @@ fn build_queue_report_sync(
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod queue_report_tests {
+    use super::*;
+    use crate::services::discord::commands::control::parse_queued_message_id;
+    use crate::services::turn_orchestrator::{InterventionMode, SourceMessageQueuedGeneration};
+    use poise::serenity_prelude::{MessageId, UserId};
+
+    fn queued_intervention(message_id: u64) -> Intervention {
+        Intervention {
+            author_id: UserId::new(2),
+            author_is_bot: false,
+            message_id: MessageId::new(message_id),
+            queued_generation: 1,
+            source_message_ids: vec![MessageId::new(message_id)],
+            source_message_queued_generations: vec![SourceMessageQueuedGeneration::new(
+                MessageId::new(message_id),
+                1,
+            )],
+            source_text_segments: Vec::new(),
+            text: "queued prompt".to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            pending_uploads: Vec::new(),
+            voice_announcement: None,
+        }
+    }
+
+    #[test]
+    fn queue_report_exposes_all_primary_ids_as_cancel_queued_inputs() {
+        let channel_id = ChannelId::new(7);
+        let expected_ids = (1_000..1_030).collect::<Vec<_>>();
+        let mut queues = std::collections::HashMap::new();
+        queues.insert(
+            channel_id,
+            expected_ids
+                .iter()
+                .copied()
+                .map(queued_intervention)
+                .collect::<Vec<_>>(),
+        );
+
+        let report = build_queue_report_sync(
+            &queues,
+            &ProviderKind::Claude,
+            "queue-report-test-token",
+            channel_id,
+            false,
+        );
+        let rendered_ids = report
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered_ids.len(), expected_ids.len());
+        assert_eq!(rendered_ids.last().map(String::as_str), Some("1029"));
+        assert!(
+            rendered_ids.iter().all(|id| parse_queued_message_id(id)
+                .is_some_and(|parsed| parsed.get().to_string() == *id)),
+            "every rendered primary ID must be accepted by /cancel-queued"
+        );
+        assert!(
+            report.len() <= 2_000,
+            "a maximum-size queue report must fit Discord's message limit"
+        );
+    }
 }
 
 pub(in crate::services::discord) async fn build_queue_report(

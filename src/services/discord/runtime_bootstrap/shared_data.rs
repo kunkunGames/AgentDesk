@@ -46,7 +46,7 @@ pub(super) struct RestoredSessionState<'a> {
 
 /// Build all owned `SharedData` fields and wrap in an `Arc`. Side-effecting
 /// initializers (`TurnFinalizer::spawn`,
-/// `runtime_store::load_generation`, `load_queue_exit_placeholder_clears`,
+/// `runtime_store::allocate_process_generation`, `load_queue_exit_placeholder_clears`,
 /// the `inflight_signals` and `turn_completion_events` broadcast channels) run here in the exact same order
 /// as the original inline struct literal. `bot_settings`, `services.initial_skills`,
 /// `counters.global_active`, `counters.global_finalizing`, `services.pg_pool`, and
@@ -90,12 +90,14 @@ pub(super) fn run_bot_build_shared_data(
         codex_goals_channels: restored_codex_goals_channels,
         codex_goals_reset_channels: restored_codex_goals_reset_channels,
     } = restored;
+    let process_generation = runtime_store::allocate_process_generation();
     Arc::new(SharedData {
         core: Mutex::new(CoreState {
             sessions: HashMap::new(),
             active_meetings: HashMap::new(),
         }),
         mailboxes: ChannelMailboxRegistry::default(),
+        session_transition_locks: dashmap::DashMap::new(),
         settings: tokio::sync::RwLock::new(bot_settings),
         api_timestamps: dashmap::DashMap::new(),
         skills_cache: tokio::sync::RwLock::new(initial_skills),
@@ -144,14 +146,16 @@ pub(super) fn run_bot_build_shared_data(
         // calls, but all three are side-effect-free initializers (parameter
         // move, `Arc::clone`, const constructor), so the relative order of
         // every side-effecting initializer
-        // (`load_queue_exit_placeholder_clears` ↔ `load_generation` ↔
+        // (`load_queue_exit_placeholder_clears` ↔ `process_generation` ↔
         // `Instant::now` ↔ `TurnFinalizer::spawn` ↔ `broadcast::channel`) is
         // preserved.
         restart: RestartLifecycle {
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            intake_worker_lifecycle:
+                crate::services::cluster::intake_worker::IntakeWorkerLifecycle::default(),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            current_generation: runtime_store::load_generation(),
+            current_generation: process_generation,
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
@@ -162,6 +166,7 @@ pub(super) fn run_bot_build_shared_data(
             global_finalizing,
             shutdown_remaining,
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+            shutdown_slot_consumed: std::sync::atomic::AtomicBool::new(false),
         },
         turn_finalizer: crate::services::discord::turn_finalizer::TurnFinalizer::spawn(),
         // #3479 Item 3: dispatch intake/routing cluster. All three members are

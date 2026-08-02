@@ -29,9 +29,9 @@ mod outbound_messages;
 #[cfg(test)]
 use self::outbound_messages::await_answer_flush_if_queued_notice;
 pub(super) use self::outbound_messages::{
-    ClassifiedOutboundEditError, ClassifiedOutboundPostError, edit_outbound_message,
-    edit_outbound_message_classified, send_intake_placeholder, send_outbound_message,
-    send_outbound_message_with_nonce_classified,
+    ClassifiedOutboundEditError, ClassifiedOutboundPostError, edit_intake_placeholder,
+    edit_outbound_message, edit_outbound_message_classified, send_intake_placeholder,
+    send_outbound_message, send_outbound_message_with_nonce_classified,
 };
 
 pub(super) type GatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -141,6 +141,22 @@ pub(super) trait TurnGateway: Send + Sync {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>>;
 
+    /// Attempt only the edit phase of a replace. An edit failure is returned as a
+    /// typed outcome so a range owner can revalidate durable delivery authority
+    /// before deciding whether a fresh fallback POST is still allowed.
+    fn replace_message_deferred<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<formatting::DeferredReplaceLongMessageOutcome, String>> {
+        Box::pin(async move {
+            self.replace_message_with_outcome(channel_id, message_id, content)
+                .await
+                .map(formatting::DeferredReplaceLongMessageOutcome::Edited)
+        })
+    }
+
     fn schedule_retry_with_history<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -182,6 +198,7 @@ pub(super) trait TurnGateway: Send + Sync {
         intervention: &'a Intervention,
         request_owner_name: &'a str,
         has_more_queued_turns: bool,
+        dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>>;
 
     fn validate_live_routing<'a>(
@@ -351,14 +368,9 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
             )
         })?;
         rate_limit_wait(&self.shared, channel_id).await;
-        // #740 steer / robustness: degrade to a normal (non-reply) send when the
-        // referenced message no longer exists. A queued `/steer` intervention
-        // carries the slash *interaction* id as its `message_id` (a dedup/cancel
-        // token, not a real channel message), so replying to it with the Discord
-        // default `fail_if_not_exists=true` would 10008 and bubble an Err up
-        // through `handle_text_message`, requeue-looping the steer so it never
-        // reaches the agent. `fail_if_not_exists(false)` also hardens every other
-        // reply against a since-deleted target.
+        // Degrade to a normal (non-reply) send when the referenced message no
+        // longer exists. This also hardens every reply against a since-deleted
+        // target.
         channel_id
             .send_message(
                 &self.http,
@@ -636,6 +648,26 @@ impl TurnGateway for DiscordGateway {
         })
     }
 
+    fn replace_message_deferred<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<formatting::DeferredReplaceLongMessageOutcome, String>> {
+        Box::pin(async move {
+            formatting::replace_long_message_raw_deferred(
+                &self.http,
+                channel_id,
+                message_id,
+                content,
+                &self.shared,
+                &mut None,
+            )
+            .await
+            .map_err(|error| watcher_classified_error_string(error.as_ref()))
+        })
+    }
+
     fn delete_message<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -702,6 +734,7 @@ impl TurnGateway for DiscordGateway {
         intervention: &'a Intervention,
         request_owner_name: &'a str,
         has_more_queued_turns: bool,
+        dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>> {
         Box::pin(async move {
             // #4270 A — pre-drain hosted-TUI readiness gate: a busy TUI defers
@@ -713,6 +746,9 @@ impl TurnGateway for DiscordGateway {
                 &self.provider,
                 channel_id,
                 intervention,
+                dispatch_lease
+                    .clone()
+                    .ok_or_else(|| "queued dispatch is missing its dispatch lease".to_string())?,
             )
             .await
             {
@@ -744,11 +780,18 @@ impl TurnGateway for DiscordGateway {
                 has_more_queued_turns,
                 true,
                 "intake_admission_pre_drain_defer",
+                dispatch_lease.clone(),
             )
             .await
             {
                 router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
-                router::QueuedAdmissionDisposition::Deferred => return Ok(()),
+                router::QueuedAdmissionDisposition::Deferred
+                | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment => {
+                    return Ok(());
+                }
+                router::QueuedAdmissionDisposition::RejectedRestore => {
+                    return Err("queued admission failed to restore dequeued head".to_string());
+                }
             };
 
             let source_message_generations = intervention.source_message_queued_generations();
@@ -909,6 +952,7 @@ impl TurnGateway for HeadlessGateway {
         _intervention: &'a Intervention,
         _request_owner_name: &'a str,
         _has_more_queued_turns: bool,
+        _dispatch_lease: Option<std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>>,
     ) -> GatewayFuture<'a, Result<(), String>> {
         Box::pin(
             async move { Err("headless turns do not dispatch queued turns locally".to_string()) },
@@ -1020,6 +1064,9 @@ mod tests {
             _intervention: &'a Intervention,
             _request_owner_name: &'a str,
             _has_more_queued_turns: bool,
+            _dispatch_lease: Option<
+                std::sync::Arc<crate::services::turn_orchestrator::DispatchLease>,
+            >,
         ) -> GatewayFuture<'a, Result<(), String>> {
             Box::pin(async { Ok(()) })
         }
@@ -1141,7 +1188,7 @@ mod tests {
             author_id: UserId::new(id),
             author_is_bot: false,
             message_id: MessageId::new(id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),
@@ -1227,7 +1274,13 @@ mod tests {
                 .intervention
                 .unwrap_or_else(|| panic!("cycle {cycle}: the head must still be promotable"));
             let result = gateway
-                .dispatch_queued_turn(channel_id, &intervention, "tester", false)
+                .dispatch_queued_turn(
+                    channel_id,
+                    &intervention,
+                    "tester",
+                    false,
+                    taken.dispatch_lease,
+                )
                 .await;
             assert!(
                 result.is_ok(),
@@ -1273,6 +1326,88 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_promote_gate_capped_busy_retry_skips_backstop_4888() {
+        let _root = scoped_runtime_root();
+        let _busy = crate::services::discord::router::set_hosted_tui_promote_busy_for_tests(true);
+
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let http = Arc::new(serenity::Http::new("Bot test-token"));
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(100_000_004_888_600);
+        let user_msg = MessageId::new(100_000_004_888_601);
+        crate::services::discord::busy_followup_retry_store::bind_notice_if_absent(
+            &provider,
+            channel_id.get(),
+            user_msg.get(),
+            user_msg.get() + 1,
+        )
+        .expect("bind busy notice");
+        for _ in 0..crate::services::discord::busy_followup_retry_store::MAX_BUSY_RETRY_COUNT {
+            crate::services::discord::busy_followup_retry_store::record_busy_retry(
+                &provider,
+                channel_id.get(),
+                user_msg.get(),
+                user_msg.get() + 1,
+            )
+            .expect("record busy retry");
+        }
+        assert!(
+            crate::services::discord::busy_followup_retry_store::is_capped(
+                &provider,
+                channel_id.get(),
+                user_msg.get(),
+            )
+        );
+
+        let persistence =
+            crate::services::discord::queue_persistence_context(&shared, &provider, channel_id);
+        shared
+            .mailbox(channel_id)
+            .replace_queue(
+                vec![promoted_intervention(
+                    user_msg.get(),
+                    "capped busy promote head",
+                )],
+                persistence.clone(),
+            )
+            .await;
+        let taken = shared.mailbox(channel_id).take_next_soft(persistence).await;
+        let intervention = taken.intervention.expect("soft-take promotes the head");
+        let gateway = DiscordGateway::new(http, shared.clone(), provider, None);
+
+        assert!(
+            gateway
+                .dispatch_queued_turn(
+                    channel_id,
+                    &intervention,
+                    "tester",
+                    false,
+                    taken.dispatch_lease,
+                )
+                .await
+                .is_ok()
+        );
+        let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel_id).await;
+        assert_eq!(snapshot.intervention_queue.len(), 1);
+        assert_eq!(snapshot.intervention_queue[0].message_id, user_msg);
+        assert_eq!(
+            shared
+                .restart
+                .deferred_hook_backlog
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a capped busy retry must preserve the queue entry without arming the slow backstop"
+        );
+        assert!(
+            !shared
+                .restart
+                .deferred_hook_channels
+                .contains_key(&channel_id),
+            "a capped busy retry must not register a deferred backstop task"
+        );
+    }
+
     /// #4270 pin (entrypoint, ready) — with the hosted TUI ready the promote
     /// gate returns `false` and `dispatch_queued_turn` proceeds INTO the
     /// dispatch body (proven by reaching the live-context requirement past the
@@ -1304,7 +1439,13 @@ mod tests {
 
         let gateway = DiscordGateway::new(http.clone(), shared.clone(), provider.clone(), None);
         let result = gateway
-            .dispatch_queued_turn(channel_id, &intervention, "tester", false)
+            .dispatch_queued_turn(
+                channel_id,
+                &intervention,
+                "tester",
+                false,
+                taken.dispatch_lease,
+            )
             .await;
         let error = result.expect_err(
             "gate pass-through must continue into the dispatch body, which requires live context",

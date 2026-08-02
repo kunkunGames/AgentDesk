@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::{Json, http::HeaderMap};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
@@ -134,16 +135,6 @@ async fn force_purge_channel_mailbox(
 #[derive(Clone)]
 pub struct QueueService {
     pg_pool: Option<PgPool>,
-}
-
-#[derive(Debug)]
-struct CancelTurnSessionInfo {
-    session_key: String,
-    dispatch_id: Option<String>,
-    provider_name: Option<String>,
-    agent_id: Option<String>,
-    requested_provider: Option<String>,
-    match_rank: i64,
 }
 
 #[derive(Debug)]
@@ -466,9 +457,46 @@ impl QueueService {
         health_registry: Option<&Arc<HealthRegistry>>,
         channel_id: &str,
         force: bool,
+        headers: &HeaderMap,
+        forward_context: &crate::services::session_forwarding::ForwardCallerContext,
     ) -> ServiceResult<Value> {
+        if let Some(response) =
+            crate::services::session_forwarding::forward_remote_cancel_if_needed(
+                forward_context,
+                headers,
+                channel_id,
+                force,
+            )
+            .await?
+        {
+            return Ok(response);
+        }
+
+        let pool = self.pg_pool.as_ref().ok_or_else(|| {
+            ServiceError::internal("postgres pool unavailable for cancel_turn session lookup")
+                .with_code(ErrorCode::Database)
+                .with_operation("cancel_turn.query_active_session.no_pool")
+                .with_context("channel_id", channel_id)
+        })?;
+        let session_info =
+            crate::services::session_forwarding::load_cancel_turn_session(pool, channel_id).await?;
+
+        let owner = session_info
+            .as_ref()
+            .and_then(|session| session.owner_instance_id.as_deref());
+        if let Err((_, Json(body))) = crate::services::session_forwarding::enforce_receiver_fence(
+            headers,
+            owner,
+            forward_context.cluster_instance_id.as_deref(),
+        ) {
+            return Err(ServiceError::conflict(
+                "forwarded cancel owner changed before local mutation",
+            )
+            .with_context("channel_id", channel_id)
+            .with_context("forward_fence", body));
+        }
+
         let channel_target = self.resolve_cancel_turn_channel_target(channel_id).await?;
-        let session_info = self.load_cancel_turn_session(channel_id).await?;
 
         let (session_key, dispatch_id, provider_name, agent_id, requested_provider, match_rank) =
             if let Some(session_info) = session_info {
@@ -492,8 +520,15 @@ impl QueueService {
             } else {
                 return Err(
                     ServiceError::not_found("no active turn found for this channel")
-                        .with_code(ErrorCode::Queue)
-                        .with_context("channel_id", channel_id),
+                        .with_context("channel_id", channel_id)
+                        .with_context(
+                            "expected_owner_instance_id",
+                            crate::services::session_forwarding::forwarded_session_owner(headers),
+                        )
+                        .with_context(
+                            "receiver_instance_id",
+                            forward_context.cluster_instance_id.as_deref(),
+                        ),
                 );
             };
 
@@ -504,10 +539,20 @@ impl QueueService {
         {
             return Err(
                 ServiceError::not_found("no active turn found for this channel")
-                    .with_code(ErrorCode::Queue)
-                    .with_context("channel_id", channel_id),
+                    .with_context("channel_id", channel_id)
+                    .with_context(
+                        "owner_instance_id",
+                        forward_context.cluster_instance_id.as_deref(),
+                    ),
             );
         }
+
+        crate::services::session_forwarding::revalidate_local_cancel_owner(
+            forward_context,
+            channel_id,
+            session_key.as_deref(),
+        )
+        .await?;
 
         let tmux_name = session_key
             .as_deref()
@@ -731,102 +776,6 @@ impl QueueService {
         })
     }
 
-    async fn load_cancel_turn_session(
-        &self,
-        channel_id: &str,
-    ) -> ServiceResult<Option<CancelTurnSessionInfo>> {
-        let Some(pool) = self.pg_pool.as_ref() else {
-            return Err(ServiceError::internal(
-                "postgres pool unavailable for cancel_turn session lookup",
-            )
-            .with_code(ErrorCode::Database)
-            .with_operation("cancel_turn.query_active_session.no_pool")
-            .with_context("channel_id", channel_id));
-        };
-        sqlx::query_as::<
-            _,
-            (
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                i64,
-            ),
-        >(
-            "WITH channel_agent AS (
-               SELECT id AS agent_id,
-                      CASE
-                        WHEN discord_channel_cc = $1 OR discord_channel_id = $1 THEN 'claude'
-                        WHEN discord_channel_cdx = $1 OR discord_channel_alt = $1 THEN 'codex'
-                        ELSE NULL
-                      END AS requested_provider
-               FROM agents
-               WHERE discord_channel_id = $1
-                  OR discord_channel_alt = $1
-                  OR discord_channel_cc = $1
-                  OR discord_channel_cdx = $1
-               LIMIT 1
-             )
-             SELECT s.session_key,
-                    s.active_dispatch_id,
-                    s.provider,
-                    s.agent_id,
-                    ca.requested_provider,
-                    CASE
-                      WHEN COALESCE(s.thread_channel_id, '') = $1 THEN 0
-                      WHEN s.session_key LIKE '%' || $1 || '%' THEN 1
-                      WHEN ca.requested_provider IS NOT NULL
-                           AND COALESCE(s.provider, '') = ca.requested_provider THEN 2
-                      ELSE 3
-                    END::BIGINT AS match_rank
-             FROM sessions s
-             LEFT JOIN channel_agent ca ON s.agent_id = ca.agent_id
-             WHERE s.status IN ('turn_active', 'working')
-               AND (
-                 COALESCE(s.thread_channel_id, '') = $1
-                 OR s.session_key LIKE '%' || $1 || '%'
-                 OR (
-                   ca.agent_id IS NOT NULL
-                   AND (
-                     ca.requested_provider IS NULL
-                     OR COALESCE(s.provider, '') = ca.requested_provider
-                   )
-                 )
-               )
-             ORDER BY match_rank ASC, s.last_heartbeat DESC
-             LIMIT 1",
-        )
-        .bind(channel_id)
-        .fetch_optional(pool)
-        .await
-        .map(|row| {
-            row.map(
-                |(
-                    session_key,
-                    dispatch_id,
-                    provider_name,
-                    agent_id,
-                    requested_provider,
-                    match_rank,
-                )| CancelTurnSessionInfo {
-                    session_key,
-                    dispatch_id,
-                    provider_name,
-                    agent_id,
-                    requested_provider,
-                    match_rank,
-                },
-            )
-        })
-        .map_err(|error| {
-            ServiceError::internal(format!("load postgres active turn: {error}"))
-                .with_code(ErrorCode::Database)
-                .with_operation("cancel_turn.query_active_session_pg")
-                .with_context("channel_id", channel_id)
-        })
-    }
-
     async fn load_cancel_dispatch_turn_session(
         &self,
         pool: &PgPool,
@@ -901,7 +850,7 @@ mod tests {
             author_id: UserId::new(1),
             author_is_bot: false,
             message_id: MessageId::new(message_id),
-            queued_generation: crate::services::discord::runtime_store::load_generation(),
+            queued_generation: crate::services::discord::runtime_store::process_generation(),
             source_message_ids: vec![MessageId::new(message_id)],
             source_message_queued_generations: Vec::new(),
             source_text_segments: Vec::new(),

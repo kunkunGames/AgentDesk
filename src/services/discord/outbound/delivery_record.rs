@@ -65,6 +65,7 @@ use std::sync::atomic::Ordering;
 use poise::serenity_prelude::ChannelId;
 use serde::{Deserialize, Serialize};
 
+use super::completed_turn_ledger;
 use super::turn_output_controller::DeliveryOutcome;
 use crate::services::discord::runtime_store;
 use crate::services::provider::ProviderKind;
@@ -73,9 +74,11 @@ use crate::services::provider::ProviderKind;
 /// MUST NOT be `discord_inflight` (that dir is the old-binary reaper's scan
 /// target); the isolation proof test asserts this segment differs.
 const DELIVERY_RECORDS_DIR: &str = "discord_delivery_records";
+const FRESH_SEND_RECORDS_DIR: &str = "discord_fresh_send_records";
 const DELIVERY_OWNER_CONTEXT_DIR: &str = "discord_delivery_owner_context";
 const RECENT_DELIVERED_CONTENT_LIMIT: usize = 16;
 const RECENT_DELIVERED_CONTENT_WINDOW_MS: u64 = 15 * 60 * 1000;
+const CONFIRMED_DELIVERY_RECEIPT_LIMIT: usize = 32;
 
 /// Durable per-turn delivery record (design §4.3). Two **independent** durable
 /// fields, deliberately not folded into one state machine: the lease is the
@@ -95,6 +98,78 @@ pub(in crate::services::discord) struct DeliveryRecord {
     /// Bounded byte-content fingerprints for degenerate lease fallback dedup.
     #[serde(default)]
     pub recent_delivered_contents: Vec<DeliveredContentFingerprint>,
+    /// Exact confirmed-delivery proofs. Unlike the monotonic frontier, these
+    /// retain individual turn/range identity so a later turn advancing the
+    /// frontier cannot erase the proof needed by a stale restored watcher seed.
+    ///
+    /// `#[serde(default)]` is deliberately fail-safe for mixed binaries: a
+    /// legacy record has no receipts and therefore can never authorize seed
+    /// removal. Older binaries may drop this unknown field when rewriting the
+    /// sidecar; that loses dedup authority (and preserves the seed) rather than
+    /// creating false delivery authority.
+    #[serde(default)]
+    pub confirmed_deliveries: Vec<ConfirmedDeliveryReceipt>,
+}
+
+/// Immutable JSONL coordinates shared by confirmed terminal receipts and the
+/// restored-watcher seed adapter. Phase B can reuse this exact source identity
+/// for subordinate assistant-text segment receipts without inventing another
+/// turn/incarnation coordinate system.
+///
+/// Every field is serde-defaulted so partially populated newer records remain
+/// readable by mixed binaries. [`ExactJsonlSourceIdentity::is_authoritative`]
+/// rejects every default/missing component; compatibility must never become a
+/// false delivered proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::services::discord) struct ExactJsonlSourceIdentity {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub tmux_session_name: String,
+    #[serde(default)]
+    pub turn_nonce: String,
+    #[serde(default)]
+    pub range: (u64, u64),
+    #[serde(default)]
+    pub generation_mtime_ns: i64,
+    #[serde(default)]
+    pub offset_authority_channel_id: u64,
+    #[serde(default)]
+    pub delivery_channel_id: u64,
+}
+
+impl ExactJsonlSourceIdentity {
+    fn is_authoritative(&self) -> bool {
+        ProviderKind::from_str(&self.provider).is_some()
+            && !self.tmux_session_name.is_empty()
+            && !self.turn_nonce.is_empty()
+            && self.range.1 > self.range.0
+            && self.generation_mtime_ns != 0
+            && self.offset_authority_channel_id != 0
+            && self.delivery_channel_id != 0
+    }
+}
+
+/// A confirmed Discord delivery bound to an exact immutable JSONL source.
+/// `delivery_channel_id` and `message_id` identify what the user actually saw;
+/// the source's `offset_authority_channel_id` identifies the record key. Those
+/// channels intentionally differ for reused-watcher bridge handoffs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::services::discord) struct ConfirmedDeliveryReceipt {
+    #[serde(default)]
+    pub source: ExactJsonlSourceIdentity,
+    #[serde(default)]
+    pub delivery_channel_id: u64,
+    #[serde(default)]
+    pub message_id: u64,
+}
+
+impl ConfirmedDeliveryReceipt {
+    fn is_authoritative(&self) -> bool {
+        self.source.is_authoritative()
+            && self.delivery_channel_id == self.source.delivery_channel_id
+            && self.message_id != 0
+    }
 }
 
 /// The offset-authority channel for a delivery channel and tmux generation.
@@ -169,6 +244,10 @@ fn delivery_records_root() -> Option<PathBuf> {
     runtime_store::runtime_root().map(|root| root.join(DELIVERY_RECORDS_DIR))
 }
 
+fn fresh_send_records_root() -> Option<PathBuf> {
+    runtime_store::runtime_root().map(|root| root.join(FRESH_SEND_RECORDS_DIR))
+}
+
 fn delivery_owner_context_root() -> Option<PathBuf> {
     runtime_store::runtime_root().map(|root| root.join(DELIVERY_OWNER_CONTEXT_DIR))
 }
@@ -193,6 +272,13 @@ pub(in crate::services::discord) fn delivery_record_path(
     channel_id: u64,
 ) -> Option<PathBuf> {
     delivery_records_root().map(|root| {
+        root.join(provider.as_str())
+            .join(format!("{channel_id}.json"))
+    })
+}
+
+fn fresh_send_record_path(provider: &ProviderKind, channel_id: u64) -> Option<PathBuf> {
+    fresh_send_records_root().map(|root| {
         root.join(provider.as_str())
             .join(format!("{channel_id}.json"))
     })
@@ -225,7 +311,7 @@ fn delivery_owner_context_path(provider: &ProviderKind, channel_id: u64) -> Opti
 // dir, still outside the inflight scan path.
 // ---------------------------------------------------------------------------
 
-struct DeliveryRecordLock {
+pub(in crate::services::discord::outbound) struct DeliveryRecordLock {
     _file: fs::File,
 }
 
@@ -240,7 +326,9 @@ impl Drop for DeliveryRecordLock {
     }
 }
 
-fn lock_record_path(record_path: &Path) -> Result<DeliveryRecordLock, String> {
+pub(in crate::services::discord::outbound) fn lock_record_path(
+    record_path: &Path,
+) -> Result<DeliveryRecordLock, String> {
     let lock_path = record_path.with_extension("json.lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -335,19 +423,387 @@ pub(in crate::services::discord) fn upsert_lease(
     upsert_lease_at(&record_path_or_err(provider, channel_id)?, lease)
 }
 
-/// Advance the delivered frontier. The ONLY writer of `delivered_frontier`
-/// (I2 — only a `Delivered` outcome calls this). Preserves the current lease.
+/// Raw path writer retained for record-shape tests and narrowly-scoped repair
+/// helpers. Production confirmed-delivery entry points must use the
+/// generation-guarded writers below.
+#[cfg(test)]
 fn write_delivered_frontier_at(path: &Path, frontier: DeliveredCommit) -> Result<(), String> {
     mutate_record_at(path, |record| record.delivered_frontier = Some(frontier))
 }
 
-#[allow(dead_code)] // #3089 B1 uses the `_at` core directly; the provider/channel form is wired in B2.
+fn merge_confirmed_frontier(
+    existing: Option<&DeliveredCommit>,
+    incoming: DeliveredCommit,
+) -> DeliveredCommit {
+    // The highest END wins, with the existing commit winning ties. Keep that
+    // winner whole: its START, attempts, and panel anchor describe one confirmed
+    // delivery and must never be combined with an unrelated commit's fields.
+    match existing {
+        Some(existing)
+            if existing.generation_mtime_ns == incoming.generation_mtime_ns
+                && existing.range.1 >= incoming.range.1 =>
+        {
+            existing.clone()
+        }
+        _ => incoming,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EqualRangeAnchorPolicy {
+    PreserveExisting,
+    ReplaceProvenGone {
+        expected_panel_channel_id: u64,
+        expected_panel_msg_id: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
+/// The identity a watcher/sink delivery is allowed to write under, revalidated
+/// after the record flock. #4911 R10: the load-bearing authority is the
+/// lease-time source generation plus the reset incarnation — deliberately NOT the
+/// full frontier token. Requiring `committed_offset` equality here would let one
+/// harmless concurrent advance discard an otherwise valid delivery.
+struct WatcherFrontierLockAuthority<'a> {
+    shared: &'a crate::services::discord::SharedData,
+    channel: ChannelId,
+    lease_reset_incarnation: u64,
+    generation_mtime_ns: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::services::discord) struct WatcherDeliveryRecordAuthority {
+    pub(in crate::services::discord) lease_reset_incarnation: u64,
+    pub(in crate::services::discord) generation_mtime_ns: i64,
+    pub(in crate::services::discord) ledger_user_msg_id: Option<u64>,
+}
+
+fn write_confirmed_frontier_guarded_at_with_before_lock(
+    path: &Path,
+    tmux_session_name: &str,
+    frontier: DeliveredCommit,
+    receipt: Option<ConfirmedDeliveryReceipt>,
+    equal_range_anchor_policy: EqualRangeAnchorPolicy,
+    before_lock: impl FnOnce(),
+) -> Result<(), String> {
+    write_confirmed_frontier_guarded_at_with_lock_authority(
+        path,
+        tmux_session_name,
+        frontier,
+        receipt,
+        equal_range_anchor_policy,
+        None,
+        before_lock,
+    )
+}
+
+fn write_confirmed_frontier_guarded_at_with_lock_authority(
+    path: &Path,
+    tmux_session_name: &str,
+    frontier: DeliveredCommit,
+    receipt: Option<ConfirmedDeliveryReceipt>,
+    equal_range_anchor_policy: EqualRangeAnchorPolicy,
+    lock_authority: Option<WatcherFrontierLockAuthority<'_>>,
+    before_lock: impl FnOnce(),
+) -> Result<(), String> {
+    if tmux_session_name.is_empty()
+        || frontier.generation_mtime_ns == 0
+        || frontier.range.1 <= frontier.range.0
+    {
+        return Err("delivery_record: refusing incomplete confirmed frontier authority".into());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    before_lock();
+    let _lock = lock_record_path(path)?;
+
+    // Receipt construction (or the receipt-less frontier fallback) can race a
+    // wrapper rotation while waiting for the record lock. Revalidate only after
+    // acquiring that lock so a stale incarnation can never replace the current
+    // one, regardless of which confirmed-delivery path reached this writer.
+    let current_generation = current_generation_mtime_ns(tmux_session_name);
+    if current_generation == 0 || current_generation != frontier.generation_mtime_ns {
+        return Err("delivery_record: refusing frontier from a stale JSONL incarnation".into());
+    }
+    if let Some(authority) = lock_authority {
+        let coord = authority.shared.tmux_relay_coord(authority.channel);
+        let current_token = coord.frontier_token();
+        let current_coord_generation = coord
+            .confirmed_end_generation_mtime_ns
+            .load(Ordering::Acquire);
+        // #4911 R10: incarnation + generation only. A concurrent delivery that
+        // advanced `committed_offset` between the caller's token read and this
+        // flock is HARMLESS — it does not change which source incarnation these
+        // bytes came from — so it must not discard this record.
+        if current_token.reset_incarnation != authority.lease_reset_incarnation
+            || current_coord_generation != authority.generation_mtime_ns
+            || current_generation != authority.generation_mtime_ns
+        {
+            return Err(
+                "delivery_record: watcher frontier mutation authority changed before record lock"
+                    .into(),
+            );
+        }
+    }
+
+    let mut record = read_record_at(path).unwrap_or_default();
+    match equal_range_anchor_policy {
+        EqualRangeAnchorPolicy::PreserveExisting => {
+            record.delivered_frontier = Some(merge_confirmed_frontier(
+                record.delivered_frontier.as_ref(),
+                frontier,
+            ));
+        }
+        EqualRangeAnchorPolicy::ReplaceProvenGone {
+            expected_panel_channel_id,
+            expected_panel_msg_id,
+        } => {
+            let expected_anchor_still_current =
+                record.delivered_frontier.as_ref().is_some_and(|existing| {
+                    existing.generation_mtime_ns == frontier.generation_mtime_ns
+                        && existing.range == frontier.range
+                        && existing.panel_channel_id == Some(expected_panel_channel_id)
+                        && existing.panel_msg_id == Some(expected_panel_msg_id)
+                });
+            if expected_anchor_still_current
+                && frontier.panel_msg_id.is_some()
+                && frontier.panel_channel_id.is_some()
+            {
+                // The exact anchor proved gone is still current under this lock.
+                // Any concurrent re-anchor makes the comparison fail and leaves
+                // that newer whole commit untouched.
+                record.delivered_frontier = Some(frontier);
+            } else {
+                tracing::warn!(
+                    record_path = %path.display(),
+                    expected_generation_mtime_ns = frontier.generation_mtime_ns,
+                    expected_range = ?frontier.range,
+                    expected_panel_channel_id,
+                    expected_panel_msg_id,
+                    current_frontier = ?record.delivered_frontier,
+                    outcome = "preserved_current_frontier",
+                    "recovery proven-gone frontier CAS did not match"
+                );
+            }
+        }
+    }
+
+    if let Some(receipt) = receipt {
+        // A delayed, lower-range receipt remains exact proof for its own restored
+        // seed. Append it even when the monotonic frontier correctly stays put.
+        record
+            .confirmed_deliveries
+            .retain(|existing| existing != &receipt);
+        record.confirmed_deliveries.push(receipt);
+        let excess = record
+            .confirmed_deliveries
+            .len()
+            .saturating_sub(CONFIRMED_DELIVERY_RECEIPT_LIMIT);
+        if excess > 0 {
+            record.confirmed_deliveries.drain(..excess);
+        }
+    }
+    write_record_at(path, &record)
+}
+
+fn write_confirmed_frontier_guarded_at(
+    path: &Path,
+    tmux_session_name: &str,
+    frontier: DeliveredCommit,
+    receipt: Option<ConfirmedDeliveryReceipt>,
+) -> Result<(), String> {
+    write_confirmed_frontier_guarded_at_with_before_lock(
+        path,
+        tmux_session_name,
+        frontier,
+        receipt,
+        EqualRangeAnchorPolicy::PreserveExisting,
+        || {},
+    )
+}
+
+fn write_delivered_frontier_guarded_at_with_before_lock(
+    path: &Path,
+    tmux_session_name: &str,
+    frontier: DeliveredCommit,
+    before_lock: impl FnOnce(),
+) -> Result<(), String> {
+    write_confirmed_frontier_guarded_at_with_before_lock(
+        path,
+        tmux_session_name,
+        frontier,
+        None,
+        EqualRangeAnchorPolicy::PreserveExisting,
+        before_lock,
+    )
+}
+
+/// Persist a confirmed frontier through the current tmux incarnation guard.
+/// Delayed lower/equal-END writers preserve the existing winning commit whole.
 pub(in crate::services::discord) fn write_delivered_frontier(
     provider: &ProviderKind,
     channel_id: u64,
+    tmux_session_name: &str,
     frontier: DeliveredCommit,
 ) -> Result<(), String> {
-    write_delivered_frontier_at(&record_path_or_err(provider, channel_id)?, frontier)
+    write_delivered_frontier_guarded_at_with_before_lock(
+        &record_path_or_err(provider, channel_id)?,
+        tmux_session_name,
+        frontier,
+        || {},
+    )
+}
+
+/// Recovery-only equal-range replacement after Discord has proved the recorded
+/// anchor gone. All other range relationships retain the normal monotonic merge.
+pub(in crate::services::discord) fn write_proven_gone_equal_range_frontier(
+    provider: &ProviderKind,
+    channel_id: u64,
+    tmux_session_name: &str,
+    expected_gone_anchor: (u64, u64),
+    frontier: DeliveredCommit,
+) -> Result<(), String> {
+    write_proven_gone_equal_range_frontier_at_with_before_lock(
+        &record_path_or_err(provider, channel_id)?,
+        tmux_session_name,
+        expected_gone_anchor,
+        frontier,
+        || {},
+    )
+}
+
+fn write_proven_gone_equal_range_frontier_at_with_before_lock(
+    path: &Path,
+    tmux_session_name: &str,
+    expected_gone_anchor: (u64, u64),
+    frontier: DeliveredCommit,
+    before_lock: impl FnOnce(),
+) -> Result<(), String> {
+    write_confirmed_frontier_guarded_at_with_before_lock(
+        path,
+        tmux_session_name,
+        frontier,
+        None,
+        EqualRangeAnchorPolicy::ReplaceProvenGone {
+            expected_panel_channel_id: expected_gone_anchor.0,
+            expected_panel_msg_id: expected_gone_anchor.1,
+        },
+        before_lock,
+    )
+}
+
+fn write_confirmed_delivery_at(
+    path: &Path,
+    frontier: DeliveredCommit,
+    receipt: ConfirmedDeliveryReceipt,
+) -> Result<(), String> {
+    write_confirmed_delivery_at_with_lock_authority(path, frontier, receipt, None)
+}
+
+fn write_confirmed_delivery_at_with_lock_authority(
+    path: &Path,
+    frontier: DeliveredCommit,
+    receipt: ConfirmedDeliveryReceipt,
+    lock_authority: Option<WatcherFrontierLockAuthority<'_>>,
+) -> Result<(), String> {
+    if !receipt.is_authoritative()
+        || receipt.source.range != frontier.range
+        || receipt.source.generation_mtime_ns != frontier.generation_mtime_ns
+        || frontier.panel_msg_id != Some(receipt.message_id)
+        || frontier.panel_channel_id != Some(receipt.delivery_channel_id)
+    {
+        return Err("delivery_record: refusing incomplete or frontier-mismatched receipt".into());
+    }
+    let tmux_session_name = receipt.source.tmux_session_name.clone();
+    write_confirmed_frontier_guarded_at_with_lock_authority(
+        path,
+        &tmux_session_name,
+        frontier,
+        Some(receipt),
+        EqualRangeAnchorPolicy::PreserveExisting,
+        lock_authority,
+        || {},
+    )
+}
+
+/// Atomically persist the monotonic frontier and the exact Discord receipt.
+/// This is delivery authority, never rollout telemetry, so callers must invoke
+/// it after a confirmed POST regardless of the shadow flag.
+pub(in crate::services::discord) fn write_confirmed_delivery(
+    provider: &ProviderKind,
+    offset_authority_channel_id: u64,
+    frontier: DeliveredCommit,
+    receipt: ConfirmedDeliveryReceipt,
+) -> Result<(), String> {
+    if receipt.source.offset_authority_channel_id != offset_authority_channel_id {
+        return Err("delivery_record: receipt owner does not match record key".into());
+    }
+    if receipt.source.provider != provider.as_str() {
+        return Err("delivery_record: receipt provider does not match record key".into());
+    }
+    write_confirmed_delivery_at(
+        &record_path_or_err(provider, offset_authority_channel_id)?,
+        frontier,
+        receipt,
+    )
+}
+
+fn commit_ordered_jsonl_range_at(
+    path: &Path,
+    tmux_session_name: &str,
+    range: (u64, u64),
+    generation_mtime_ns: i64,
+) -> Result<bool, String> {
+    commit_ordered_jsonl_range_at_with_before_lock(
+        path,
+        tmux_session_name,
+        range,
+        generation_mtime_ns,
+        || {},
+    )
+}
+
+fn commit_ordered_jsonl_range_at_with_before_lock(
+    path: &Path,
+    tmux_session_name: &str,
+    range: (u64, u64),
+    generation_mtime_ns: i64,
+    before_lock: impl FnOnce(),
+) -> Result<bool, String> {
+    if generation_mtime_ns == 0 || range.1 <= range.0 {
+        return Ok(false);
+    }
+    write_delivered_frontier_guarded_at_with_before_lock(
+        path,
+        tmux_session_name,
+        DeliveredCommit {
+            range,
+            generation_mtime_ns,
+            attempts: 1,
+            panel_msg_id: None,
+            panel_channel_id: None,
+        },
+        before_lock,
+    )?;
+    Ok(true)
+}
+
+/// Durably commit a confirmed idle/catch-up JSONL range. Unlike the rollout
+/// shadow writer, this is delivery authority and is therefore flag-independent.
+pub(in crate::services::discord) fn commit_ordered_jsonl_range(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    range: (u64, u64),
+    generation_mtime_ns: i64,
+) -> Result<bool, String> {
+    commit_ordered_jsonl_range_at(
+        &record_path_or_err(provider, channel.get())?,
+        tmux_session_name,
+        range,
+        generation_mtime_ns,
+    )
 }
 
 fn write_watcher_owner_context_at(
@@ -432,6 +888,59 @@ pub(in crate::services::discord) fn watcher_owner_channel_for_delivery_channel(
     .map(ChannelId::new)
 }
 
+fn resolved_receipt_owner_channel(
+    provider: &ProviderKind,
+    delivery_channel: ChannelId,
+    source: &ExactJsonlSourceIdentity,
+) -> Option<ChannelId> {
+    if !source.is_authoritative()
+        || current_generation_mtime_ns(&source.tmux_session_name) != source.generation_mtime_ns
+    {
+        return None;
+    }
+
+    let captured_owner =
+        crate::services::discord::inflight::opt_channel_id(source.offset_authority_channel_id)?;
+    match watcher_owner_channel_for_delivery_channel(
+        provider,
+        delivery_channel,
+        &source.tmux_session_name,
+    ) {
+        Some(resolved) if resolved == captured_owner => Some(resolved),
+        // Same-channel delivery is the deterministic default and predates the
+        // split-channel owner-context sidecar. A split receipt, however, is
+        // never trusted without the exact current context mapping.
+        None if captured_owner == delivery_channel => Some(delivery_channel),
+        _ => None,
+    }
+}
+
+/// Re-read the durable receipt at restored-seed consumption time and require an
+/// exact match on both JSONL source identity and Discord destination identity.
+/// Missing/legacy/partially populated records fail closed (seed is preserved).
+pub(in crate::services::discord) fn confirmed_delivery_receipt_exists(
+    provider: &ProviderKind,
+    delivery_channel: ChannelId,
+    message_id: u64,
+    source: &ExactJsonlSourceIdentity,
+) -> bool {
+    if message_id == 0 {
+        return false;
+    }
+    let Some(owner_channel) = resolved_receipt_owner_channel(provider, delivery_channel, source)
+    else {
+        return false;
+    };
+    read_record(provider, owner_channel.get()).is_some_and(|record| {
+        record.confirmed_deliveries.iter().any(|receipt| {
+            receipt.is_authoritative()
+                && receipt.source == *source
+                && receipt.delivery_channel_id == delivery_channel.get()
+                && receipt.message_id == message_id
+        })
+    })
+}
+
 /// Release: clear the lease ONLY. `delivered_frontier` survives (design §4.3).
 fn clear_lease_at(path: &Path) -> Result<(), String> {
     mutate_record_at(path, |record| record.delivery_lease = None)
@@ -462,18 +971,17 @@ pub(in crate::services::discord) fn delete_record(
 }
 
 // ---------------------------------------------------------------------------
-// #3089 B1 — shadow-write the delivered frontier (observe-only, default OFF).
+// #3089 B1 / #4911 Phase A — persist confirmed delivery authority.
 //
-// B1 mirrors the in-memory `confirmed_end_offset` authority into the durable
-// sidecar AFTER a confirmed `Delivered` commit, and asserts the durable END
-// tracks it (design §5 / M4 — END is the risky datum). Read-authority STAYS the
-// legacy markers; this is a parallel "shadow" so B2 can later flip to it with
-// confidence. OFF (default) → zero extraction, zero write → behavioral no-op.
+// A confirmed `Delivered` commit always persists the generation-scoped frontier
+// and, when complete turn/destination identity is available, an exact receipt.
+// The legacy shadow flag now controls only the durable-END divergence signal;
+// read-authority rollout remains separately gated below.
 // ---------------------------------------------------------------------------
 
 /// #3089 B1 shadow-write flag (`AGENTDESK_DELIVERY_RECORD_SHADOW`, OnceLock,
-/// default OFF). Telemetry ONLY when enabled (the default-OFF first eval has no
-/// observable side effect — deploy no-op), mirroring the A-phase flag idiom.
+/// default OFF). Divergence telemetry only; confirmed persistence never consults
+/// this flag.
 pub(in crate::services::discord) fn delivery_record_shadow_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = shadow_test_seam::current_override() {
@@ -803,6 +1311,89 @@ pub(in crate::services::discord) fn delivered_frontier_end_current_generation(
         .unwrap_or(0)
 }
 
+fn current_generation_frontier_exceeding_eof_at(
+    path: &Path,
+    current_gen_mtime: i64,
+    current_transcript_eof: u64,
+) -> Option<u64> {
+    read_record_at(path)
+        .and_then(|record| record.delivered_frontier)
+        .filter(|frontier| {
+            durable_frontier_generation_current(frontier.generation_mtime_ns, current_gen_mtime)
+                && frontier.range.1 > current_transcript_eof
+        })
+        .map(|frontier| frontier.range.1)
+}
+
+/// #4549: detect the exact same-generation frontier/EOF regression that the
+/// ordinary durable reader distrusts. The Claude idle scanner uses this signal
+/// only on an unchanged transcript path to re-anchor its scan cursor at EOF after
+/// an in-place `/compact` rewrite. A rotated UUID/path bypasses this predicate and
+/// keeps the fresh-transcript lookback path, so replacement-file prompts are not
+/// lost.
+pub(in crate::services::discord) fn delivered_frontier_exceeding_current_eof(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    current_transcript_eof: u64,
+) -> Option<u64> {
+    let path = delivery_record_path(provider, channel.get())?;
+    current_generation_frontier_exceeding_eof_at(
+        &path,
+        current_generation_mtime_ns(tmux_session_name),
+        current_transcript_eof,
+    )
+}
+
+fn reanchor_current_generation_frontier_at(
+    path: &Path,
+    current_gen_mtime: i64,
+    expected_frontier_end: u64,
+    reanchor_offset: u64,
+) -> Result<bool, String> {
+    let _lock = lock_record_path(path)?;
+    let Some(mut record) = read_record_at(path) else {
+        return Ok(false);
+    };
+    let Some(frontier) = record.delivered_frontier.as_mut() else {
+        return Ok(false);
+    };
+    if !durable_frontier_generation_current(frontier.generation_mtime_ns, current_gen_mtime)
+        || frontier.range.1 != expected_frontier_end
+        || frontier.range.1 <= reanchor_offset
+    {
+        return Ok(false);
+    }
+    frontier.range.1 = reanchor_offset;
+    if frontier.range.0 > reanchor_offset {
+        frontier.range.0 = reanchor_offset;
+    }
+    write_record_at(path, &record)?;
+    Ok(true)
+}
+
+/// #4841: converge a stale same-generation durable frontier after an in-place
+/// `/compact`. This is a correction of already-confirmed coordinate space, not a
+/// new delivery: it preserves the record's generation/attempt/anchor identity and
+/// only lowers the END after the caller proved the current transcript boundary.
+pub(in crate::services::discord) fn reanchor_current_generation_frontier(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    expected_frontier_end: u64,
+    reanchor_offset: u64,
+) -> Result<bool, String> {
+    let Some(path) = delivery_record_path(provider, channel.get()) else {
+        return Ok(false);
+    };
+    reanchor_current_generation_frontier_at(
+        &path,
+        current_generation_mtime_ns(tmux_session_name),
+        expected_frontier_end,
+        reanchor_offset,
+    )
+}
+
 /// #3089 B2b: the effective "already-committed" offset the dedup/skip gates read.
 /// Flag OFF (default) → the legacy in-memory `committed_relay_offset` verbatim
 /// (no record read → deploy no-op). Flag ON → `max(delivered_frontier.end,
@@ -874,6 +1465,138 @@ pub(in crate::services::discord) fn committed_floor_for_resend_dedup(
         tmux_session_name,
         current_transcript_eof,
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::services::discord) struct EditFailureTranscriptIdentity {
+    output_path: PathBuf,
+    generation_mtime_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptFileSnapshot {
+    eof: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn transcript_file_snapshot(path: &Path) -> Option<TranscriptFileSnapshot> {
+    let metadata = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(TranscriptFileSnapshot {
+        eof: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+/// Capture the transcript identity before the Discord edit await. A missing
+/// watcher path or generation marker cannot establish range identity and leaves
+/// fallback delivery enabled.
+pub(in crate::services::discord) fn capture_edit_failure_transcript_identity(
+    shared: &crate::services::discord::SharedData,
+    tmux_session_name: &str,
+) -> Option<EditFailureTranscriptIdentity> {
+    let output_path = PathBuf::from(
+        shared
+            .tmux_watchers
+            .watcher_output_path(tmux_session_name)?,
+    );
+    let generation_mtime_ns = current_generation_mtime_ns(tmux_session_name);
+    if generation_mtime_ns == 0 {
+        return None;
+    }
+    Some(EditFailureTranscriptIdentity {
+        output_path,
+        generation_mtime_ns,
+    })
+}
+
+fn stable_edit_failure_frontier_at<P, G, H>(
+    record_path: &Path,
+    expected: &EditFailureTranscriptIdentity,
+    mut current_output_path: P,
+    mut current_generation: G,
+    after_first_snapshot: H,
+) -> Option<DeliveredCommit>
+where
+    P: FnMut() -> Option<PathBuf>,
+    G: FnMut() -> i64,
+    H: FnOnce(),
+{
+    let _lock = lock_record_path(record_path).ok()?;
+    if current_output_path().as_deref() != Some(expected.output_path.as_path())
+        || current_generation() != expected.generation_mtime_ns
+    {
+        return None;
+    }
+    let before = transcript_file_snapshot(&expected.output_path)?;
+    after_first_snapshot();
+
+    let frontier = read_record_at(record_path)?.delivered_frontier?;
+    if !durable_frontier_generation_current(
+        frontier.generation_mtime_ns,
+        expected.generation_mtime_ns,
+    ) || frontier.range.1 > before.eof
+    {
+        return None;
+    }
+
+    let after_path = current_output_path()?;
+    let after_generation = current_generation();
+    let after = transcript_file_snapshot(&expected.output_path)?;
+    if after_path != expected.output_path
+        || after_generation != expected.generation_mtime_ns
+        || after != before
+    {
+        return None;
+    }
+    Some(frontier)
+}
+
+/// Re-read a stable path+generation+EOF+frontier snapshot after an edit failure
+/// and decide whether a fallback POST would duplicate a confirmed JSONL range.
+/// The expected path and generation were captured before the edit await. The
+/// record lock serializes conforming frontier writers, while the post-read
+/// identity check detects wrapper rotation or transcript replacement during the
+/// snapshot. Any missing or changing component fails open for delivery.
+pub(in crate::services::discord) fn range_committed_after_edit_failure(
+    shared: &crate::services::discord::SharedData,
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    expected: Option<&EditFailureTranscriptIdentity>,
+    range_end: u64,
+) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(record_path) = delivery_record_path(provider, channel.get()) else {
+        return false;
+    };
+    let frontier = stable_edit_failure_frontier_at(
+        &record_path,
+        expected,
+        || {
+            shared
+                .tmux_watchers
+                .watcher_output_path(tmux_session_name)
+                .map(PathBuf::from)
+        },
+        || current_generation_mtime_ns(tmux_session_name),
+        || {},
+    );
+    range_already_committed(
+        range_end,
+        frontier.map(|frontier| frontier.range.1).unwrap_or(0),
+    )
 }
 
 /// #3593 JSONL-space monotonic dedup predicate (pure, testable). `range_end` is the
@@ -1001,6 +1724,9 @@ fn recent_delivered_content_matches_at(
         .is_some_and(|record| recent_content_fingerprint_matches(record, &fingerprint, now_ms))
 }
 
+// #4046 S1r-1 P3-2: module-local only — the sole callers are the two fresh-send
+// record sites in this file. Reverted from the transient `pub(in ...::outbound)`
+// widening (no caller outside this module; behavior unchanged).
 fn record_delivered_content_fingerprint_for_generation(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1035,6 +1761,41 @@ fn record_delivered_content_fingerprint_for_generation(
     }
 }
 
+pub(in crate::services::discord::outbound) fn record_fresh_send_content_fingerprint(
+    provider: &ProviderKind,
+    channel_id: u64,
+    body: &str,
+    generation_mtime_ns: i64,
+) -> Result<(), String> {
+    let path = fresh_send_record_path(provider, channel_id)
+        .ok_or_else(|| "fresh_send_record: runtime root unavailable".to_string())?;
+    record_delivered_content_fingerprint_at(
+        &path,
+        channel_id,
+        body,
+        generation_mtime_ns,
+        now_epoch_ms(),
+    )
+}
+
+pub(in crate::services::discord::outbound) fn recent_fresh_send_content_matches(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    tmux_session_name: &str,
+    body: &str,
+) -> bool {
+    let Some(path) = fresh_send_record_path(provider, channel.get()) else {
+        return false;
+    };
+    recent_delivered_content_matches_at(
+        &path,
+        channel.get(),
+        body,
+        current_generation_mtime_ns(tmux_session_name),
+        now_epoch_ms(),
+    )
+}
+
 pub(in crate::services::discord) fn record_delivered_content_fingerprint(
     provider: &ProviderKind,
     channel: ChannelId,
@@ -1067,8 +1828,9 @@ pub(in crate::services::discord) fn recent_delivered_content_matches(
     )
 }
 
-/// I2 outcome map (pure, testable): the shadow-write fires ONLY for a confirmed
-/// `Delivered`. Every other outcome means the controller did NOT advance the
+/// I2 outcome map (pure, testable): the confirmed-delivery funnel fires ONLY for
+/// `Delivered`. The historical function name is retained for hotfile callers.
+/// Every other outcome means the controller did NOT advance the
 /// offset — `NotDelivered` (identity gate refused), `Transient`/`Unknown`
 /// (ambiguous), `Skipped` (no-op) — so the durable frontier must NOT advance
 /// (I2, the #3143/#3416 class). This pins the owner call-site's outcome decision
@@ -1078,10 +1840,8 @@ pub(in crate::services::discord) fn outcome_is_shadow_delivered(outcome: &Delive
     matches!(outcome, DeliveryOutcome::Delivered { .. })
 }
 
-/// I2 gate (pure, testable): shadow-mirror ONLY for a confirmed `Delivered`
-/// outcome AND only when the flag is enabled. Dropping the `is_delivered`
-/// conjunct would let an ambiguous outcome advance the durable frontier — the
-/// exact #3143/#3416 class — so the test pins this conjunction.
+/// Divergence-telemetry gate. Confirmed frontier/receipt persistence does not
+/// consult this flag; only the observe-only comparison does.
 fn should_shadow_mirror(is_delivered: bool, enabled: bool) -> bool {
     is_delivered && enabled
 }
@@ -1096,6 +1856,7 @@ fn delivered_frontier_end_diverged(durable_end: u64, in_memory_confirmed_end: u6
 /// diverged from the in-memory authority. `Err` only when the durable write
 /// itself failed. Caller invokes this ONLY for a confirmed `Delivered` (I2).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn record_delivered_frontier_shadow_at(
     path: &Path,
     range: (u64, u64),
@@ -1121,65 +1882,99 @@ fn record_delivered_frontier_shadow_at(
     ))
 }
 
-/// provider/channel core: resolve the sidecar path, shadow-write, and emit the
-/// observe-only signals. NEVER panics, NEVER changes delivery (the relay had
-/// incidents; B1 only observes). Caller invokes this ONLY for `Delivered` (I2).
-#[allow(clippy::too_many_arguments)]
-fn record_delivered_frontier_shadow(
+fn exact_receipt_from_inflight(
     provider: &ProviderKind,
-    channel_id: u64,
+    fresh: Option<&crate::services::discord::inflight::InflightTurnState>,
+    offset_authority_channel: ChannelId,
+    delivery_channel: ChannelId,
+    message_id: Option<u64>,
     range: (u64, u64),
     generation_mtime_ns: i64,
-    attempts: u32,
-    panel_msg_id: Option<u64>,
-    panel_channel_id: Option<u64>,
-    in_memory_confirmed_end: u64,
-) {
-    let path = match record_path_or_err(provider, channel_id) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::error!(
-                provider = provider.as_str(),
-                channel_id,
-                error = %error,
-                "#3089 B1: shadow delivery-record path unavailable (observe-only)"
-            );
-            return;
-        }
-    };
-    match record_delivered_frontier_shadow_at(
-        &path,
-        range,
-        generation_mtime_ns,
-        attempts,
-        panel_msg_id,
-        panel_channel_id,
-        in_memory_confirmed_end,
-    ) {
-        Ok(false) => {}
-        Ok(true) => tracing::error!(
-            provider = provider.as_str(),
-            channel_id,
-            durable_end = range.1,
-            in_memory_confirmed_end,
+) -> Option<ConfirmedDeliveryReceipt> {
+    let fresh = fresh?;
+    let message_id = message_id.filter(|id| *id != 0)?;
+    let tmux_session_name = fresh
+        .tmux_session_name
+        .as_deref()
+        .filter(|name| !name.is_empty())?;
+    let turn_nonce = fresh
+        .turn_nonce
+        .as_deref()
+        .filter(|nonce| !nonce.is_empty())?;
+    if fresh.provider_kind().as_ref() != Some(provider)
+        || fresh.channel_id != delivery_channel.get()
+        || fresh.delivery_record_owner_channel_id() != offset_authority_channel.get()
+        || fresh.turn_start_offset != Some(range.0)
+        || fresh.last_offset != range.1
+        || range.1 <= range.0
+        || generation_mtime_ns == 0
+        || current_generation_mtime_ns(tmux_session_name) != generation_mtime_ns
+    {
+        return None;
+    }
+    Some(ConfirmedDeliveryReceipt {
+        source: ExactJsonlSourceIdentity {
+            provider: provider.as_str().to_string(),
+            tmux_session_name: tmux_session_name.to_string(),
+            turn_nonce: turn_nonce.to_string(),
+            range,
             generation_mtime_ns,
-            "#3089 B1: shadow delivered_frontier END diverged from in-memory confirmed_end_offset (observe-only)"
-        ),
-        Err(error) => tracing::error!(
-            provider = provider.as_str(),
-            channel_id,
-            error = %error,
-            "#3089 B1: shadow delivery-record write failed (observe-only)"
-        ),
+            offset_authority_channel_id: offset_authority_channel.get(),
+            delivery_channel_id: delivery_channel.get(),
+        },
+        delivery_channel_id: delivery_channel.get(),
+        message_id,
+    })
+}
+
+fn persist_confirmed_frontier_and_receipt(
+    provider: &ProviderKind,
+    offset_authority_channel: ChannelId,
+    tmux_session_name: Option<&str>,
+    frontier: DeliveredCommit,
+    receipt: Option<ConfirmedDeliveryReceipt>,
+    lock_authority: Option<WatcherFrontierLockAuthority<'_>>,
+) -> Result<(), String> {
+    match receipt {
+        Some(receipt) => {
+            if receipt.source.offset_authority_channel_id != offset_authority_channel.get() {
+                return Err("delivery_record: receipt owner does not match record key".into());
+            }
+            if receipt.source.provider != provider.as_str() {
+                return Err("delivery_record: receipt provider does not match record key".into());
+            }
+            write_confirmed_delivery_at_with_lock_authority(
+                &record_path_or_err(provider, offset_authority_channel.get())?,
+                frontier,
+                receipt,
+                lock_authority,
+            )
+        }
+        None => {
+            let tmux_session_name = tmux_session_name
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    "delivery_record: receipt-less frontier lacks tmux incarnation identity"
+                        .to_string()
+                })?;
+            write_confirmed_frontier_guarded_at_with_lock_authority(
+                &record_path_or_err(provider, offset_authority_channel.get())?,
+                tmux_session_name,
+                frontier,
+                None,
+                EqualRangeAnchorPolicy::PreserveExisting,
+                lock_authority,
+                || {},
+            )
+        }
     }
 }
 
-/// Integration wrapper for owner `Delivered` arms. Gated by [`should_shadow_mirror`]
-/// (flag ON AND `is_delivered`, I2). When it fires it extracts the in-memory
-/// authority (`confirmed_end_offset` + `confirmed_end_generation_mtime_ns`) from
-/// the relay coord and the `attempts` mirror from the fresh inflight, then
-/// shadow-writes. OFF or non-`Delivered` → returns immediately (no coord/inflight
-/// access, no write) → behavioral no-op.
+/// Integration wrapper for owner `Delivered` arms. A confirmed outcome always
+/// persists the frontier, and atomically appends an exact receipt when the
+/// delivery-channel inflight still exposes a complete turn identity. The
+/// rollout flag controls only post-write divergence telemetry. Non-`Delivered`
+/// outcomes never write delivery authority (I2).
 ///
 /// #3610 (Phase B PR-1): `terminal_anchor_msg_id` is the durable TERMINAL ANCHOR
 /// the caller resolved — the Discord message id terminal-replace edits in place
@@ -1200,23 +1995,153 @@ fn record_delivered_frontier_shadow(
 /// Same-channel callers (sink, watcher) pass `Some(channel.get())`; the bridge
 /// cutover passes the edit-target `channel_id` it actually edits. `None`/`None`
 /// writes a null anchor pair (unchanged from the absent-status-panel case), so
-/// OFF/None paths stay behaviorally identical.
+/// A missing anchor cannot produce an exact receipt, but the generation-scoped
+/// frontier remains durable.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) fn shadow_mirror_delivered_frontier(
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
     channel: ChannelId,
+    authoritative_tmux_session_name: Option<&str>,
     range: (u64, u64),
     is_delivered: bool,
     terminal_anchor_msg_id: Option<u64>,
     terminal_anchor_channel_id: Option<u64>,
     delivered_body: Option<&str>,
+    ledger_user_msg_id: Option<u64>,
 ) {
+    let _ = shadow_mirror_delivered_frontier_inner(
+        shared,
+        provider,
+        channel,
+        authoritative_tmux_session_name,
+        range,
+        is_delivered,
+        terminal_anchor_msg_id,
+        terminal_anchor_channel_id,
+        delivered_body,
+        ledger_user_msg_id,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shadow_mirror_delivered_frontier_inner(
+    shared: &crate::services::discord::SharedData,
+    provider: &ProviderKind,
+    channel: ChannelId,
+    authoritative_tmux_session_name: Option<&str>,
+    range: (u64, u64),
+    is_delivered: bool,
+    terminal_anchor_msg_id: Option<u64>,
+    terminal_anchor_channel_id: Option<u64>,
+    delivered_body: Option<&str>,
+    ledger_user_msg_id: Option<u64>,
+    watcher_authority: Option<WatcherDeliveryRecordAuthority>,
+) -> bool {
     let channel_id = channel.get();
     let coord = shared.tmux_relay_coord(channel);
-    let generation_mtime_ns = coord
-        .confirmed_end_generation_mtime_ns
-        .load(Ordering::Acquire);
-    if is_delivered && let Some(body) = delivered_body {
+    let generation_mtime_ns = watcher_authority
+        .map(|authority| authority.generation_mtime_ns)
+        .unwrap_or_else(|| {
+            coord
+                .confirmed_end_generation_mtime_ns
+                .load(Ordering::Acquire)
+        });
+    if !is_delivered {
+        return false;
+    }
+    if generation_mtime_ns == 0 || range.1 <= range.0 {
+        tracing::warn!(
+            provider = provider.as_str(),
+            channel_id,
+            range = ?range,
+            generation_mtime_ns,
+            "confirmed delivery lacks an authoritative JSONL incarnation/range; preserving prior durable frontier"
+        );
+        return false;
+    }
+    let in_memory_confirmed_end = coord.confirmed_end_offset.load(Ordering::Acquire);
+    let delivery_channel_id = terminal_anchor_channel_id.unwrap_or(channel_id);
+    let delivery_channel = ChannelId::new(delivery_channel_id);
+    // Capture the delivered turn's nonce/session from its DELIVERY-channel row,
+    // never from the offset-authority row. In a channel split the latter can be
+    // a different, unanswered turn. This synchronous read+write happens before
+    // the caller's inflight clear and closes the clear-before-seed-consume race.
+    let fresh =
+        crate::services::discord::inflight::load_inflight_state(provider, delivery_channel_id);
+    let attempts = fresh
+        .as_ref()
+        .map(|f| f.recovery_relay_attempts)
+        .unwrap_or(0);
+    // The caller already owns the delivery incarnation while committing its
+    // lease. Keep that identity independent of the inflight row: the row may be
+    // cleared immediately after the confirmed POST. A fresh exact row remains
+    // mandatory for receipt construction below; caller authority only supplies
+    // the receipt-less frontier fallback and can never synthesize a receipt.
+    let tmux_session_name = authoritative_tmux_session_name
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            fresh
+                .as_ref()
+                .and_then(|state| state.tmux_session_name.as_deref())
+                .filter(|name| !name.is_empty())
+        });
+    let frontier = DeliveredCommit {
+        range,
+        generation_mtime_ns,
+        attempts,
+        panel_msg_id: terminal_anchor_msg_id,
+        panel_channel_id: terminal_anchor_channel_id,
+    };
+    let receipt = exact_receipt_from_inflight(
+        provider,
+        fresh.as_ref(),
+        channel,
+        delivery_channel,
+        terminal_anchor_msg_id,
+        range,
+        generation_mtime_ns,
+    );
+    // A ledger id is safe only when the caller pinned it to this delivery or
+    // the same fresh row produced the exact receipt above. Never guess from an
+    // unqualified current row: a delayed A could otherwise settle newer B.
+    let safe_ledger_user_msg_id = watcher_authority
+        .and_then(|authority| authority.ledger_user_msg_id)
+        .or(ledger_user_msg_id)
+        .filter(|user_msg_id| *user_msg_id != 0)
+        .or_else(|| {
+            receipt
+                .as_ref()
+                .and_then(|_| fresh.as_ref().map(|state| state.user_msg_id))
+                .filter(|user_msg_id| *user_msg_id != 0)
+        });
+    let lock_authority = watcher_authority.map(|authority| WatcherFrontierLockAuthority {
+        shared,
+        channel,
+        lease_reset_incarnation: authority.lease_reset_incarnation,
+        generation_mtime_ns: authority.generation_mtime_ns,
+    });
+    if let Err(error) = persist_confirmed_frontier_and_receipt(
+        provider,
+        channel,
+        tmux_session_name,
+        frontier,
+        receipt,
+        lock_authority,
+    ) {
+        tracing::error!(
+            provider = provider.as_str(),
+            channel_id,
+            error = %error,
+            "confirmed delivery frontier/receipt write failed"
+        );
+        return false;
+    }
+
+    // Retry evidence and completed-turn settlement become visible only after
+    // the guarded frontier/receipt mutation succeeds.
+    if let Some(body) = delivered_body {
         record_delivered_content_fingerprint_for_generation(
             provider,
             channel_id,
@@ -1224,45 +2149,49 @@ pub(in crate::services::discord) fn shadow_mirror_delivered_frontier(
             generation_mtime_ns,
         );
     }
-    if !should_shadow_mirror(is_delivered, delivery_record_shadow_enabled()) {
-        return;
+    if let Some(user_msg_id) = safe_ledger_user_msg_id {
+        completed_turn_ledger::append_completed_turn(provider, delivery_channel_id, user_msg_id);
     }
-    let in_memory_confirmed_end = coord.confirmed_end_offset.load(Ordering::Acquire);
-    let fresh = crate::services::discord::inflight::load_inflight_state(provider, channel_id);
-    let attempts = fresh
-        .as_ref()
-        .map(|f| f.recovery_relay_attempts)
-        .unwrap_or(0);
-    record_delivered_frontier_shadow(
-        provider,
-        channel_id,
-        range,
-        generation_mtime_ns,
-        attempts,
-        terminal_anchor_msg_id,
-        terminal_anchor_channel_id,
-        in_memory_confirmed_end,
-    );
+
+    // The flag controls only divergence telemetry. The confirmed frontier and
+    // exact receipt above are delivery authority and are always persisted.
+    if should_shadow_mirror(true, delivery_record_shadow_enabled())
+        && delivered_frontier_end_diverged(range.1, in_memory_confirmed_end)
+    {
+        tracing::error!(
+            provider = provider.as_str(),
+            channel_id,
+            durable_end = range.1,
+            in_memory_confirmed_end,
+            generation_mtime_ns,
+            "#3089 B1: delivered_frontier END diverged from in-memory confirmed_end_offset (observe-only)"
+        );
+    }
+    true
 }
 
 pub(in crate::services::discord) fn record_delivered_frontier_with_body(
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
     channel: ChannelId,
+    tmux_session_name: Option<&str>,
     range: (u64, u64),
     terminal_anchor_msg_id: u64,
     terminal_anchor_channel_id: u64,
     body: &str,
+    ledger_user_msg_id: Option<u64>,
 ) {
     shadow_mirror_delivered_frontier(
         shared,
         provider,
         channel,
+        tmux_session_name,
         range,
         true,
         Some(terminal_anchor_msg_id),
         Some(terminal_anchor_channel_id),
         Some(body),
+        ledger_user_msg_id,
     );
 }
 
@@ -1270,20 +2199,24 @@ pub(in crate::services::discord) fn shadow_mirror_same_channel_frontier_with_bod
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
     channel: ChannelId,
+    tmux_session_name: &str,
     range: (u64, u64),
     is_delivered: bool,
     terminal_anchor_msg_id: u64,
     body: &str,
+    ledger_user_msg_id: u64,
 ) {
     shadow_mirror_delivered_frontier(
         shared,
         provider,
         channel,
+        Some(tmux_session_name),
         range,
         is_delivered,
         Some(terminal_anchor_msg_id),
         Some(channel.get()),
         Some(body),
+        (ledger_user_msg_id != 0).then_some(ledger_user_msg_id),
     );
 }
 
@@ -1315,29 +2248,69 @@ pub(in crate::services::discord) fn shadow_mirror_same_channel_frontier_with_bod
 /// delivery lease acquired/committed (offset-space consistent — never mix spaces).
 /// `last_chunk_anchor_msg_id = None` (empty chunk Vec — impossible on the `Ok`
 /// path, but type-honest) records the range with a null anchor, identical to the
-/// absent-status-panel case. The delivered-frontier mirror still obeys the shadow
-/// flag, while the #4081 recent-content fingerprint is recorded for confirmed
-/// deliveries so degenerate-key phantom re-relays can be refused even before the
-/// durable frontier authority is enabled.
+/// absent-status-panel case. The delivered frontier is flag-independent; an
+/// exact receipt additionally requires a real tail anchor and complete inflight
+/// identity. The #4081 recent-content fingerprint remains non-authoritative
+/// retry metadata and is never used for restored-seed removal.
 pub(in crate::services::discord) fn record_long_chunk_terminal_delivery(
     shared: &crate::services::discord::SharedData,
     provider: &ProviderKind,
     watcher_owner_channel_id: ChannelId,
     delivery_channel_id: ChannelId,
+    tmux_session_name: Option<&str>,
     range: (u64, u64),
     last_chunk_anchor_msg_id: Option<u64>,
     delivered_body: &str,
+    ledger_user_msg_id: Option<u64>,
 ) {
     shadow_mirror_delivered_frontier(
         shared,
         provider,
         watcher_owner_channel_id,
+        tmux_session_name,
         range,
         true,
         last_chunk_anchor_msg_id,
         Some(delivery_channel_id.get()),
         Some(delivered_body),
+        ledger_user_msg_id,
     );
+}
+
+/// Watcher-only terminal-delivery funnel. The caller captures generation and turn
+/// identity with its delivery lease, while the wrapper holds the matching relay
+/// frontier mutation guard through this durable mutation.
+pub(in crate::services::discord) fn record_watcher_terminal_delivery(
+    shared: &crate::services::discord::SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    authority: WatcherDeliveryRecordAuthority,
+    range: (u64, u64),
+    last_chunk_anchor_msg_id: Option<u64>,
+    delivered_body: &str,
+) -> bool {
+    shadow_mirror_delivered_frontier_inner(
+        shared,
+        provider,
+        channel_id,
+        Some(tmux_session_name),
+        range,
+        true,
+        last_chunk_anchor_msg_id,
+        Some(channel_id.get()),
+        Some(delivered_body),
+        None,
+        Some(authority),
+    )
+}
+
+#[cfg(test)]
+mod relay_state_contract_refs {
+    #[test]
+    fn contract_symbols_exist() {
+        use super::range_committed_after_edit_failure as _;
+    }
 }
 
 #[cfg(test)]
@@ -1367,12 +2340,94 @@ mod tests {
         }
     }
 
+    fn set_phase_a_generation(tmux_session_name: &str, unix_secs: i64) -> i64 {
+        let path = crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
+        if let Some(parent) = Path::new(&path).parent() {
+            fs::create_dir_all(parent).expect("create generation parent");
+        }
+        fs::write(&path, "phase-a-r2").expect("write generation marker");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(unix_secs, 123))
+            .expect("set deterministic generation mtime");
+        current_generation_mtime_ns(tmux_session_name)
+    }
+
+    fn exact_delivery_fixture(
+        provider: &ProviderKind,
+        tmux_session_name: &str,
+        turn_nonce: &str,
+        range: (u64, u64),
+        generation_mtime_ns: i64,
+        channels: (u64, u64),
+        message_id: u64,
+    ) -> (DeliveredCommit, ConfirmedDeliveryReceipt) {
+        let (owner_channel_id, delivery_channel_id) = channels;
+        (
+            DeliveredCommit {
+                range,
+                generation_mtime_ns,
+                attempts: 1,
+                panel_msg_id: Some(message_id),
+                panel_channel_id: Some(delivery_channel_id),
+            },
+            ConfirmedDeliveryReceipt {
+                source: ExactJsonlSourceIdentity {
+                    provider: provider.as_str().to_string(),
+                    tmux_session_name: tmux_session_name.to_string(),
+                    turn_nonce: turn_nonce.to_string(),
+                    range,
+                    generation_mtime_ns,
+                    offset_authority_channel_id: owner_channel_id,
+                    delivery_channel_id,
+                },
+                delivery_channel_id,
+                message_id,
+            },
+        )
+    }
+
+    #[test]
+    fn ordered_jsonl_commit_is_generation_scoped_and_monotonic() {
+        let _root = IsolatedRoot::new();
+        let path = record_path_or_err(&ProviderKind::Claude, 2_115).expect("record path");
+        let tmux = "AgentDesk-claude-ordered-monotonic";
+        let generation_1 = set_phase_a_generation(tmux, 1_700_002_115);
+
+        assert!(commit_ordered_jsonl_range_at(&path, tmux, (100, 200), generation_1).unwrap());
+        assert!(commit_ordered_jsonl_range_at(&path, tmux, (150, 180), generation_1).unwrap());
+        assert_eq!(
+            read_record_at(&path).unwrap().delivered_frontier.unwrap(),
+            DeliveredCommit {
+                range: (100, 200),
+                generation_mtime_ns: generation_1,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            }
+        );
+
+        let generation_2 = set_phase_a_generation(tmux, 1_700_002_116);
+        assert_ne!(generation_1, generation_2);
+        assert!(commit_ordered_jsonl_range_at(&path, tmux, (0, 50), generation_2).unwrap());
+        assert_eq!(
+            read_record_at(&path)
+                .unwrap()
+                .delivered_frontier
+                .unwrap()
+                .range,
+            (0, 50),
+            "a replacement wrapper starts a new coordinate space"
+        );
+        assert!(!commit_ordered_jsonl_range_at(&path, tmux, (50, 50), generation_2).unwrap());
+        assert!(!commit_ordered_jsonl_range_at(&path, tmux, (50, 60), 0).unwrap());
+    }
+
     #[test]
     fn delivery_record_serde_roundtrip() {
         let record = DeliveryRecord {
             delivery_lease: Some(sample_lease()),
             delivered_frontier: Some(sample_frontier()),
             recent_delivered_contents: Vec::new(),
+            confirmed_deliveries: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&record).unwrap();
         let back: DeliveryRecord = serde_json::from_str(&json).unwrap();
@@ -1395,6 +2450,7 @@ mod tests {
             delivery_lease: Some(sample_lease()),
             delivered_frontier: Some(sample_frontier()),
             recent_delivered_contents: Vec::new(),
+            confirmed_deliveries: Vec::new(),
         };
         write_record_at(&path, &record).unwrap();
         assert_eq!(read_record_at(&path), Some(record));
@@ -1652,6 +2708,14 @@ mod tests {
         assert_ne!(DELIVERY_RECORDS_DIR, "discord_inflight");
         assert_ne!(DELIVERY_OWNER_CONTEXT_DIR, "discord_inflight");
         assert_ne!(DELIVERY_OWNER_CONTEXT_DIR, DELIVERY_RECORDS_DIR);
+        // #4046 S1r-1 P3-1: pin the fresh-send sidecar dir out of the reaper's scan set
+        // too. The reaper scans `discord_inflight`; a regression that renamed
+        // `FRESH_SEND_RECORDS_DIR` to `"discord_inflight"` (or collided it with the
+        // delivery-records dir) would make the reaper reap live fresh-send records, and
+        // fresh_send_tests' behavioral isolation does NOT cover the dir-name identity.
+        // This const pin does.
+        assert_ne!(FRESH_SEND_RECORDS_DIR, "discord_inflight");
+        assert_ne!(FRESH_SEND_RECORDS_DIR, DELIVERY_RECORDS_DIR);
     }
 
     // ---- #3089 B1 shadow-write ----------------------------------------------
@@ -1668,6 +2732,12 @@ mod tests {
             new_chunks: None,
         }));
         assert!(!outcome_is_shadow_delivered(
+            &DeliveryOutcome::FreshDelivered {
+                committed_to: Some(5),
+                persistence_recorded: false,
+            }
+        ));
+        assert!(!outcome_is_shadow_delivered(
             &DeliveryOutcome::NotDelivered { committed_from: 5 }
         ));
         assert!(!outcome_is_shadow_delivered(&DeliveryOutcome::Transient {
@@ -1681,11 +2751,11 @@ mod tests {
 
     #[test]
     fn should_shadow_mirror_requires_delivered_and_enabled() {
-        // I2: a non-Delivered outcome must NEVER advance the durable frontier,
-        // and OFF is a no-op. Pins the AND of both conjuncts.
+        // The legacy flag gates only divergence telemetry. Confirmed authority
+        // persistence is pinned independently by the Phase A test below.
         assert!(should_shadow_mirror(true, true));
-        assert!(!should_shadow_mirror(false, true)); // not delivered → no write (I2)
-        assert!(!should_shadow_mirror(true, false)); // flag OFF → no write
+        assert!(!should_shadow_mirror(false, true));
+        assert!(!should_shadow_mirror(true, false));
         assert!(!should_shadow_mirror(false, false));
     }
 
@@ -2109,6 +3179,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn current_generation_frontier_eof_regression_signal_is_exact_4549() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4549);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (0, 900),
+                generation_mtime_ns: 700,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250),
+            Some(900)
+        );
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 701, 250),
+            None
+        );
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 900),
+            None
+        );
+    }
+
+    #[test]
+    fn same_generation_frontier_reanchor_converges_once_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 4841);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (80, 900),
+                generation_mtime_ns: 700,
+                attempts: 3,
+                panel_msg_id: Some(42),
+                panel_channel_id: Some(84),
+            },
+        )
+        .unwrap();
+
+        assert!(reanchor_current_generation_frontier_at(&path, 700, 900, 250).unwrap());
+        let rewritten = read_record_at(&path).unwrap().delivered_frontier.unwrap();
+        assert_eq!(rewritten.range, (80, 250));
+        assert_eq!(rewritten.generation_mtime_ns, 700);
+        assert_eq!(rewritten.attempts, 3);
+        assert_eq!(rewritten.panel_msg_id, Some(42));
+        assert_eq!(rewritten.panel_channel_id, Some(84));
+        assert_eq!(
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250),
+            None
+        );
+        assert!(!reanchor_current_generation_frontier_at(&path, 700, 900, 250).unwrap());
+    }
+
+    #[test]
+    fn frontier_reanchor_defers_when_concurrent_commit_wins_lock_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 48_411);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (0, 900),
+                generation_mtime_ns: 700,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+        let observed_frontier =
+            current_generation_frontier_exceeding_eof_at(&path, 700, 250).unwrap();
+
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (250, 400),
+                generation_mtime_ns: 700,
+                attempts: 2,
+                panel_msg_id: Some(42),
+                panel_channel_id: Some(84),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !reanchor_current_generation_frontier_at(&path, 700, observed_frontier, 250).unwrap()
+        );
+        let winner = read_record_at(&path).unwrap().delivered_frontier.unwrap();
+        assert_eq!(winner.range, (250, 400));
+        assert_eq!(winner.attempts, 2);
+        assert_eq!(winner.panel_msg_id, Some(42));
+    }
+
+    #[test]
+    fn frontier_reanchor_rejects_stale_generation_4841() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = delivery_record_path_in_root(dir.path(), &ProviderKind::Claude, 48_412);
+        write_delivered_frontier_at(
+            &path,
+            DeliveredCommit {
+                range: (0, 900),
+                generation_mtime_ns: 700,
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!reanchor_current_generation_frontier_at(&path, 701, 900, 250).unwrap());
+        assert_eq!(
+            read_record_at(&path)
+                .unwrap()
+                .delivered_frontier
+                .unwrap()
+                .range,
+            (0, 900)
+        );
+    }
+
     /// I3 conservatism: an absent or malformed record yields no durable floor
     /// (`None` → fuse contributes 0), so the fusion degrades to pure in-memory —
     /// never an "assume delivered" that would drop a message.
@@ -2438,12 +3634,718 @@ mod tests {
 
     #[test]
     fn shadow_off_is_anchor_noop_3610() {
-        // SHADOW OFF → no write at all, so the anchor (whatever the caller resolves)
-        // is never recorded. `shadow_mirror_delivered_frontier`'s first gate is
-        // `should_shadow_mirror(is_delivered, enabled)`; OFF short-circuits before
-        // any coord/inflight access or write. Pinned here at the gate level.
-        assert!(!should_shadow_mirror(true, false)); // flag OFF → no anchor write
+        // Phase A: the old gate now controls divergence telemetry only. It must
+        // remain false under OFF, but confirmed delivery authority is written by
+        // the flag-independent funnel tested below.
+        assert!(!should_shadow_mirror(true, false)); // no divergence telemetry
         assert!(!should_shadow_mirror(false, true)); // not delivered → no anchor write (I2)
+    }
+
+    #[test]
+    fn shadow_off_confirmed_delivery_writes_exact_split_channel_authority_4911() {
+        let root = IsolatedRoot::new();
+        let _shadow_off = shadow_test_seam::force(false);
+        let provider = ProviderKind::Claude;
+        let owner = ChannelId::new(4_911_001);
+        let delivery = ChannelId::new(4_911_002);
+        let message_id = 4_911_003;
+        let tmux = "AgentDesk-claude-phase-a-flag-off";
+        let gen_path = crate::services::tmux_common::session_temp_path(tmux, "generation");
+        if let Some(parent) = Path::new(&gen_path).parent() {
+            fs::create_dir_all(parent).expect("create generation parent");
+        }
+        fs::write(&gen_path, "phase-a").expect("write generation marker");
+        let generation = current_generation_mtime_ns(tmux);
+        assert_ne!(generation, 0);
+
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            provider.clone(),
+            delivery.get(),
+            Some("phase-a".into()),
+            7,
+            49_110,
+            message_id,
+            "flag independent".into(),
+            Some("session-4911".into()),
+            Some(tmux.into()),
+            Some("/tmp/phase-a-flag-off.jsonl".into()),
+            None,
+            100,
+        );
+        state.last_offset = 200;
+        state.turn_nonce = Some("flag-off-turn-nonce".into());
+        state.set_watcher_owner_channel_id(owner.get());
+        crate::services::discord::inflight::save_inflight_state(&state)
+            .expect("save delivered turn identity");
+
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let coord = shared.tmux_relay_coord(owner);
+        coord.confirmed_end_offset.store(200, Ordering::Release);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(generation, Ordering::Release);
+        shadow_mirror_delivered_frontier(
+            &shared,
+            &provider,
+            owner,
+            Some(tmux),
+            (100, 200),
+            true,
+            Some(message_id),
+            Some(delivery.get()),
+            Some("same body is not authority"),
+            Some(49_110),
+        );
+
+        let record = read_record(&provider, owner.get()).expect("flag-off record");
+        assert_eq!(record.delivered_frontier.unwrap().range, (100, 200));
+        assert_eq!(record.confirmed_deliveries.len(), 1);
+        let source = &record.confirmed_deliveries[0].source;
+        assert_eq!(source.offset_authority_channel_id, owner.get());
+        assert_eq!(source.delivery_channel_id, delivery.get());
+        assert!(confirmed_delivery_receipt_exists(
+            &provider, delivery, message_id, source,
+        ));
+        assert!(
+            delivery_record_path(&provider, owner.get())
+                .expect("owner record path")
+                .starts_with(root.path())
+        );
+    }
+
+    #[test]
+    fn confirmed_receipts_reverse_order_merge_without_frontier_regression_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_101;
+        let delivery = 4_911_102;
+        let tmux = "AgentDesk-claude-phase-a-r2-reverse";
+        let generation = set_phase_a_generation(tmux, 1_700_491_101);
+
+        let (newer_frontier, newer_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "newer-turn",
+            (100, 300),
+            generation,
+            (owner, delivery),
+            4_911_103,
+        );
+        write_confirmed_delivery(&provider, owner, newer_frontier, newer_receipt)
+            .expect("write newer receipt first");
+
+        let (older_frontier, older_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "delayed-older-turn",
+            (0, 200),
+            generation,
+            (owner, delivery),
+            4_911_104,
+        );
+        write_confirmed_delivery(&provider, owner, older_frontier, older_receipt)
+            .expect("append delayed lower receipt without regressing frontier");
+
+        let (equal_frontier, equal_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "delayed-equal-end-turn",
+            (50, 300),
+            generation,
+            (owner, delivery),
+            4_911_105,
+        );
+        write_confirmed_delivery(&provider, owner, equal_frontier, equal_receipt)
+            .expect("append delayed equal-end receipt without replacing frontier metadata");
+
+        let record = read_record(&provider, owner).expect("merged record");
+        let frontier = record.delivered_frontier.expect("monotonic frontier");
+        assert_eq!(frontier.range, (100, 300));
+        assert_eq!(frontier.panel_msg_id, Some(4_911_103));
+        assert_eq!(record.confirmed_deliveries.len(), 3);
+        assert_eq!(
+            record
+                .confirmed_deliveries
+                .iter()
+                .map(|receipt| receipt.message_id)
+                .collect::<Vec<_>>(),
+            vec![4_911_103, 4_911_104, 4_911_105]
+        );
+    }
+
+    #[test]
+    fn receiptless_confirmed_frontiers_reverse_order_keep_winner_identity_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = ChannelId::new(4_911_401);
+        let tmux = "AgentDesk-claude-phase-a-r3-receiptless-reverse";
+        let generation = set_phase_a_generation(tmux, 1_700_491_401);
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
+            provider.clone(),
+            owner.get(),
+            Some("phase-a-r3".into()),
+            7,
+            49_114,
+            4_911_402,
+            "receipt unavailable".into(),
+            Some("session-r3".into()),
+            Some(tmux.into()),
+            Some("/tmp/phase-a-r3-receiptless.jsonl".into()),
+            None,
+            100,
+        );
+        state.last_offset = 300;
+        state.turn_nonce = None;
+        crate::services::discord::inflight::save_inflight_state(&state)
+            .expect("persist receipt-less delivery incarnation");
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let coord = shared.tmux_relay_coord(owner);
+        coord.confirmed_end_offset.store(300, Ordering::Release);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(generation, Ordering::Release);
+        let newer = DeliveredCommit {
+            range: (100, 300),
+            generation_mtime_ns: generation,
+            attempts: 0,
+            panel_msg_id: Some(4_911_402),
+            panel_channel_id: Some(owner.get()),
+        };
+        shadow_mirror_delivered_frontier(
+            &shared,
+            &provider,
+            owner,
+            Some(tmux),
+            newer.range,
+            true,
+            newer.panel_msg_id,
+            newer.panel_channel_id,
+            None,
+            Some(state.user_msg_id),
+        );
+
+        for (range, message_id) in [((0, 200), 4_911_404), ((50, 300), 4_911_406)] {
+            shadow_mirror_delivered_frontier(
+                &shared,
+                &provider,
+                owner,
+                Some(tmux),
+                range,
+                true,
+                Some(message_id),
+                Some(owner.get()),
+                None,
+                Some(state.user_msg_id),
+            );
+        }
+
+        let record = read_record(&provider, owner.get()).expect("receipt-less record");
+        assert_eq!(record.delivered_frontier, Some(newer));
+        assert!(record.confirmed_deliveries.is_empty());
+    }
+
+    #[test]
+    fn cleared_inflight_current_generation_persists_frontier_without_receipt_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = ChannelId::new(4_911_601);
+        let delivery = ChannelId::new(4_911_602);
+        let tmux = "AgentDesk-claude-phase-a-r4-cleared-current";
+        let generation = set_phase_a_generation(tmux, 1_700_491_601);
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let coord = shared.tmux_relay_coord(owner);
+        coord.confirmed_end_offset.store(240, Ordering::Release);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(generation, Ordering::Release);
+
+        // No inflight row exists: the caller-held incarnation is sufficient for
+        // the frontier, but cannot manufacture exact turn/nonce receipt proof.
+        shadow_mirror_delivered_frontier(
+            &shared,
+            &provider,
+            owner,
+            Some(tmux),
+            (120, 240),
+            true,
+            Some(4_911_603),
+            Some(delivery.get()),
+            Some("confirmed after inflight clear"),
+            Some(49_116),
+        );
+
+        let record = read_record(&provider, owner.get()).expect("receipt-less frontier record");
+        assert_eq!(
+            record.delivered_frontier,
+            Some(DeliveredCommit {
+                range: (120, 240),
+                generation_mtime_ns: generation,
+                attempts: 0,
+                panel_msg_id: Some(4_911_603),
+                panel_channel_id: Some(delivery.get()),
+            })
+        );
+        assert!(
+            record.confirmed_deliveries.is_empty(),
+            "caller-held session identity must not synthesize an exact receipt"
+        );
+    }
+
+    #[test]
+    fn cleared_inflight_stale_caller_generation_rejects_frontier_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Codex;
+        let owner = ChannelId::new(4_911_611);
+        let tmux = "AgentDesk-codex-phase-a-r4-cleared-stale";
+        let stale_generation = set_phase_a_generation(tmux, 1_700_491_611);
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let coord = shared.tmux_relay_coord(owner);
+        coord.confirmed_end_offset.store(200, Ordering::Release);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(stale_generation, Ordering::Release);
+        let current_generation = set_phase_a_generation(tmux, 1_700_491_612);
+        assert_ne!(stale_generation, current_generation);
+
+        shadow_mirror_delivered_frontier(
+            &shared,
+            &provider,
+            owner,
+            Some(tmux),
+            (0, 200),
+            true,
+            Some(4_911_612),
+            Some(owner.get()),
+            None,
+            Some(49_117),
+        );
+
+        assert!(
+            read_record(&provider, owner.get()).is_none(),
+            "post-lock generation validation must reject stale caller authority"
+        );
+    }
+
+    #[test]
+    fn legacy_frontier_reverse_order_split_channel_keeps_winner_whole_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_621;
+        let tmux = "AgentDesk-claude-phase-a-r4-legacy-reverse";
+        let generation = set_phase_a_generation(tmux, 1_700_491_621);
+        let winner = DeliveredCommit {
+            range: (100, 300),
+            generation_mtime_ns: generation,
+            attempts: 9,
+            panel_msg_id: Some(4_911_622),
+            panel_channel_id: Some(4_911_623),
+        };
+        write_delivered_frontier(&provider, owner, tmux, winner.clone())
+            .expect("write winning split-channel frontier");
+
+        for frontier in [
+            DeliveredCommit {
+                range: (0, 200),
+                generation_mtime_ns: generation,
+                attempts: 2,
+                panel_msg_id: Some(4_911_624),
+                panel_channel_id: Some(4_911_625),
+            },
+            DeliveredCommit {
+                range: (50, 300),
+                generation_mtime_ns: generation,
+                attempts: 3,
+                panel_msg_id: Some(4_911_626),
+                panel_channel_id: Some(4_911_627),
+            },
+        ] {
+            write_delivered_frontier(&provider, owner, tmux, frontier)
+                .expect("merge delayed legacy frontier");
+        }
+
+        assert_eq!(
+            read_record(&provider, owner)
+                .expect("legacy record")
+                .delivered_frontier,
+            Some(winner),
+            "lower/equal legacy writes must not union START or replace split-channel anchor"
+        );
+    }
+
+    #[test]
+    fn ordered_jsonl_reverse_order_preserves_split_channel_anchor_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Codex;
+        let owner = ChannelId::new(4_911_631);
+        let tmux = "AgentDesk-codex-phase-a-r4-ordered-reverse";
+        let generation = set_phase_a_generation(tmux, 1_700_491_631);
+        let winner = DeliveredCommit {
+            range: (100, 300),
+            generation_mtime_ns: generation,
+            attempts: 7,
+            panel_msg_id: Some(4_911_632),
+            panel_channel_id: Some(4_911_633),
+        };
+        write_delivered_frontier(&provider, owner.get(), tmux, winner.clone())
+            .expect("seed split-channel winner");
+
+        for range in [(0, 200), (50, 300)] {
+            assert!(
+                commit_ordered_jsonl_range(&provider, owner, tmux, range, generation)
+                    .expect("merge delayed ordered range")
+            );
+        }
+
+        assert_eq!(
+            read_record(&provider, owner.get())
+                .expect("ordered record")
+                .delivered_frontier,
+            Some(winner),
+            "ordered commits must not union ranges or clear an existing anchor"
+        );
+    }
+
+    #[test]
+    fn legacy_frontier_blocked_writer_revalidates_after_rotation_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_641;
+        let tmux = "AgentDesk-claude-phase-a-r4-legacy-race";
+        let stale_generation = set_phase_a_generation(tmux, 1_700_491_641);
+        let path = record_path_or_err(&provider, owner).expect("record path");
+        let held_lock = lock_record_path(&path).expect("hold record lock");
+        let stale_path = path.clone();
+        let stale_tmux = tmux.to_string();
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::channel();
+        let stale_writer = std::thread::spawn(move || {
+            write_delivered_frontier_guarded_at_with_before_lock(
+                &stale_path,
+                &stale_tmux,
+                DeliveredCommit {
+                    range: (0, 900),
+                    generation_mtime_ns: stale_generation,
+                    attempts: 5,
+                    panel_msg_id: Some(4_911_642),
+                    panel_channel_id: Some(4_911_643),
+                },
+                || about_to_lock_tx.send(()).expect("signal lock attempt"),
+            )
+        });
+        about_to_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("legacy writer reached record lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!stale_writer.is_finished(), "legacy writer must be blocked");
+
+        let current_generation = set_phase_a_generation(tmux, 1_700_491_642);
+        let current_record = DeliveryRecord {
+            delivered_frontier: Some(DeliveredCommit {
+                range: (100, 200),
+                generation_mtime_ns: current_generation,
+                attempts: 1,
+                panel_msg_id: Some(4_911_644),
+                panel_channel_id: Some(4_911_645),
+            }),
+            ..DeliveryRecord::default()
+        };
+        write_record_at(&path, &current_record).expect("install rotated record");
+        drop(held_lock);
+
+        assert!(stale_writer.join().expect("join legacy writer").is_err());
+        assert_eq!(read_record_at(&path), Some(current_record));
+    }
+
+    #[test]
+    fn proven_gone_reanchor_blocked_writer_preserves_concurrent_anchor_swap_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_661;
+        let tmux = "AgentDesk-claude-phase-a-r5-reanchor-race";
+        let generation = set_phase_a_generation(tmux, 1_700_491_661);
+        let path = record_path_or_err(&provider, owner).expect("record path");
+        let range = (100, 300);
+        let gone_anchor = (4_911_662, 4_911_663);
+        write_delivered_frontier(
+            &provider,
+            owner,
+            tmux,
+            DeliveredCommit {
+                range,
+                generation_mtime_ns: generation,
+                attempts: 1,
+                panel_channel_id: Some(gone_anchor.0),
+                panel_msg_id: Some(gone_anchor.1),
+            },
+        )
+        .expect("seed anchor later proved gone");
+
+        let held_lock = lock_record_path(&path).expect("hold record lock");
+        let stale_path = path.clone();
+        let stale_tmux = tmux.to_string();
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::channel();
+        let stale_writer = std::thread::spawn(move || {
+            write_proven_gone_equal_range_frontier_at_with_before_lock(
+                &stale_path,
+                &stale_tmux,
+                gone_anchor,
+                DeliveredCommit {
+                    range,
+                    generation_mtime_ns: generation,
+                    attempts: 2,
+                    panel_channel_id: Some(4_911_664),
+                    panel_msg_id: Some(4_911_665),
+                },
+                || about_to_lock_tx.send(()).expect("signal lock attempt"),
+            )
+        });
+        about_to_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("re-anchor writer reached record lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!stale_writer.is_finished(), "re-anchor writer must block");
+
+        let swapped_frontier = DeliveredCommit {
+            range,
+            generation_mtime_ns: generation,
+            attempts: 3,
+            panel_channel_id: Some(4_911_666),
+            panel_msg_id: Some(4_911_667),
+        };
+        let swapped_record = DeliveryRecord {
+            delivered_frontier: Some(swapped_frontier),
+            ..DeliveryRecord::default()
+        };
+        write_record_at(&path, &swapped_record).expect("install concurrent anchor swap");
+        drop(held_lock);
+
+        stale_writer
+            .join()
+            .expect("join re-anchor writer")
+            .expect("anchor mismatch is a conservative no-op");
+        assert_eq!(
+            read_record_at(&path),
+            Some(swapped_record),
+            "the under-lock anchor CAS must preserve the concurrent whole commit"
+        );
+    }
+
+    #[test]
+    fn proven_gone_reanchor_missing_frontier_is_conservative_noop_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_681;
+        let tmux = "AgentDesk-claude-phase-a-r6-reanchor-missing";
+        let generation = set_phase_a_generation(tmux, 1_700_491_681);
+        let path = record_path_or_err(&provider, owner).expect("record path");
+        let record_without_frontier = DeliveryRecord::default();
+        write_record_at(&path, &record_without_frontier).expect("seed record without frontier");
+
+        write_proven_gone_equal_range_frontier(
+            &provider,
+            owner,
+            tmux,
+            (4_911_682, 4_911_683),
+            DeliveredCommit {
+                range: (100, 300),
+                generation_mtime_ns: generation,
+                attempts: 1,
+                panel_channel_id: Some(4_911_684),
+                panel_msg_id: Some(4_911_685),
+            },
+        )
+        .expect("missing frontier remains a diagnosed conservative no-op");
+        assert_eq!(read_record_at(&path), Some(record_without_frontier));
+    }
+
+    #[test]
+    fn ordered_jsonl_blocked_writer_revalidates_after_rotation_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Codex;
+        let owner = 4_911_651;
+        let tmux = "AgentDesk-codex-phase-a-r4-ordered-race";
+        let stale_generation = set_phase_a_generation(tmux, 1_700_491_651);
+        let path = record_path_or_err(&provider, owner).expect("record path");
+        let held_lock = lock_record_path(&path).expect("hold record lock");
+        let stale_path = path.clone();
+        let stale_tmux = tmux.to_string();
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::channel();
+        let stale_writer = std::thread::spawn(move || {
+            commit_ordered_jsonl_range_at_with_before_lock(
+                &stale_path,
+                &stale_tmux,
+                (0, 900),
+                stale_generation,
+                || about_to_lock_tx.send(()).expect("signal lock attempt"),
+            )
+        });
+        about_to_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("ordered writer reached record lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !stale_writer.is_finished(),
+            "ordered writer must be blocked"
+        );
+
+        let current_generation = set_phase_a_generation(tmux, 1_700_491_652);
+        let current_record = DeliveryRecord {
+            delivered_frontier: Some(DeliveredCommit {
+                range: (100, 200),
+                generation_mtime_ns: current_generation,
+                attempts: 1,
+                panel_msg_id: Some(4_911_652),
+                panel_channel_id: Some(4_911_653),
+            }),
+            ..DeliveryRecord::default()
+        };
+        write_record_at(&path, &current_record).expect("install rotated record");
+        drop(held_lock);
+
+        assert!(stale_writer.join().expect("join ordered writer").is_err());
+        assert_eq!(read_record_at(&path), Some(current_record));
+    }
+
+    #[test]
+    fn receiptless_blocked_writer_revalidates_after_rotation_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Codex;
+        let owner = 4_911_501;
+        let delivery = 4_911_502;
+        let tmux = "AgentDesk-codex-phase-a-r3-receiptless-race";
+        let old_generation = set_phase_a_generation(tmux, 1_700_491_501);
+        let path = record_path_or_err(&provider, owner).expect("record path");
+        let held_lock = lock_record_path(&path).expect("hold record lock");
+        let stale_frontier = DeliveredCommit {
+            range: (0, 900),
+            generation_mtime_ns: old_generation,
+            attempts: 7,
+            panel_msg_id: Some(4_911_503),
+            panel_channel_id: Some(delivery),
+        };
+        let stale_path = path.clone();
+        let stale_tmux = tmux.to_string();
+        let (about_to_lock_tx, about_to_lock_rx) = std::sync::mpsc::channel();
+        let stale_writer = std::thread::spawn(move || {
+            write_confirmed_frontier_guarded_at_with_before_lock(
+                &stale_path,
+                &stale_tmux,
+                stale_frontier,
+                None,
+                EqualRangeAnchorPolicy::PreserveExisting,
+                || about_to_lock_tx.send(()).expect("signal lock attempt"),
+            )
+        });
+        about_to_lock_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("stale writer reached the record lock");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !stale_writer.is_finished(),
+            "stale writer must be lock-blocked"
+        );
+
+        let current_generation = set_phase_a_generation(tmux, 1_700_491_502);
+        let (current_frontier, current_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "current-after-rotation",
+            (100, 200),
+            current_generation,
+            (owner, delivery),
+            4_911_504,
+        );
+        let current_record = DeliveryRecord {
+            delivered_frontier: Some(current_frontier),
+            confirmed_deliveries: vec![current_receipt],
+            ..DeliveryRecord::default()
+        };
+        write_record_at(&path, &current_record).expect("install current incarnation under lock");
+        drop(held_lock);
+
+        assert!(
+            stale_writer.join().expect("join stale writer").is_err(),
+            "stale receipt-less writer must reject after acquiring the lock"
+        );
+        assert_eq!(read_record_at(&path), Some(current_record));
+    }
+
+    #[test]
+    fn rotate_after_receipt_validation_preserves_current_incarnation_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Codex;
+        let owner = 4_911_201;
+        let delivery = 4_911_202;
+        let tmux = "AgentDesk-codex-phase-a-r2-rotate";
+        let old_generation = set_phase_a_generation(tmux, 1_700_491_201);
+        let (delayed_frontier, delayed_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "validated-before-rotate",
+            (0, 400),
+            old_generation,
+            (owner, delivery),
+            4_911_203,
+        );
+        assert!(delayed_receipt.is_authoritative());
+
+        let current_generation = set_phase_a_generation(tmux, 1_700_491_202);
+        assert_ne!(old_generation, current_generation);
+        let (current_frontier, current_receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "current-incarnation",
+            (0, 100),
+            current_generation,
+            (owner, delivery),
+            4_911_204,
+        );
+        write_confirmed_delivery(&provider, owner, current_frontier, current_receipt)
+            .expect("write current incarnation");
+        let before = read_record(&provider, owner).expect("current record");
+
+        assert!(
+            write_confirmed_delivery(&provider, owner, delayed_frontier, delayed_receipt).is_err(),
+            "the guarded writer must recheck generation after receipt construction"
+        );
+        assert_eq!(read_record(&provider, owner), Some(before));
+    }
+
+    #[test]
+    fn confirmed_receipt_write_rejects_destination_owner_and_provider_mismatch_4911() {
+        let _root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let owner = 4_911_301;
+        let delivery = 4_911_302;
+        let tmux = "AgentDesk-claude-phase-a-r2-mismatch";
+        let generation = set_phase_a_generation(tmux, 1_700_491_301);
+        let (frontier, receipt) = exact_delivery_fixture(
+            &provider,
+            tmux,
+            "mismatch-turn",
+            (0, 100),
+            generation,
+            (owner, delivery),
+            4_911_303,
+        );
+
+        let mut wrong_destination = receipt.clone();
+        wrong_destination.delivery_channel_id = delivery + 1;
+        assert!(
+            write_confirmed_delivery(&provider, owner, frontier.clone(), wrong_destination,)
+                .is_err()
+        );
+        let mut missing_anchor_channel = frontier.clone();
+        missing_anchor_channel.panel_channel_id = None;
+        assert!(
+            write_confirmed_delivery(&provider, owner, missing_anchor_channel, receipt.clone(),)
+                .is_err()
+        );
+        assert!(
+            write_confirmed_delivery(&provider, owner + 1, frontier.clone(), receipt.clone())
+                .is_err()
+        );
+        assert!(write_confirmed_delivery(&ProviderKind::Codex, owner, frontier, receipt).is_err());
+        assert!(read_record(&provider, owner).is_none());
     }
 
     // ---- #3610 PR-1c: long-chunk terminal arm anchor recording -----------------
@@ -2544,32 +4446,33 @@ mod tests {
         // call site lives ONLY inside the full-commit `Ok` arm — the long-chunk send
         // (`send_long_message_with_rollback`) rolls back and returns `Err` on ANY
         // chunk failure, so a partial delivery NEVER reaches the helper. The shadow
-        // gate then still requires the flag ON. This pins that an ambiguous/failed
-        // outcome (modelled here as `is_delivered = false`) can never advance the
-        // durable frontier, and that OFF is a full no-op.
-        assert!(!should_shadow_mirror(false, true)); // not-delivered → no anchor (I2)
-        assert!(!should_shadow_mirror(true, false)); // flag OFF → no anchor (deploy no-op)
+        // outcome (modelled here as `is_delivered = false`) can never reach either
+        // persistence or divergence telemetry.
+        assert!(!should_shadow_mirror(false, true));
     }
 
     #[test]
     fn record_long_chunk_terminal_delivery_off_is_noop_3610c() {
-        // The REAL helper end-to-end under the forced-OFF shadow flag: it must be a
-        // complete no-op (no panic, no write) regardless of the resolved anchor.
+        // Legacy test name retained: the synthetic coord has no generation, so
+        // Phase A must fail closed without overwriting a prior authoritative
+        // frontier. The shadow flag itself controls only telemetry.
         // The scoped root holds the crate-wide test-env lock, so both the helper and
         // the assertions stay inside one throw-away tree and can never inspect the
         // operator's runtime.
         let root = IsolatedRoot::new();
         let _shadow_off = shadow_test_seam::force(false);
         let shared = crate::services::discord::make_shared_data_for_tests();
-        // Does not panic; OFF → writes nothing.
+        // Does not panic; missing generation → writes nothing.
         super::record_long_chunk_terminal_delivery(
             &shared,
             &ProviderKind::Claude,
             ChannelId::new(100_200_300), // owner (frontier key)
             ChannelId::new(900_800_700), // delivery (anchor home)
+            None,
             (0, 4096),
             Some(912_345_678),
             "",
+            None,
         );
         // No durable record was created for either channel under the test root.
         for channel_id in [100_200_300, 900_800_700] {
@@ -2584,13 +4487,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ledger_append_keys_by_delivery_channel_not_watcher_owner_4564() {
+        // #4564 channel-split silent-loss regression (counter-model finding). A
+        // recovered/reused-watcher bridge delivers channel Y's answered turn while
+        // reusing channel X's tmux session, so the funnel is invoked with
+        // `channel = watcher_owner_channel_id = X` even though the delivered turn
+        // belongs to Y. X still holds a PRESERVED, UNANSWERED inflight row
+        // (user_msg_id = B). The completed-turn ledger MUST key by the delivery
+        // channel Y and record Y's EXPLICIT user_msg_id (A) — it must NOT reload X's
+        // row and false-Settle B (which would make catch-up skip B's recovery on the
+        // next restart = silent loss, the #4600 class re-introduced by a new vector).
+        let _root = IsolatedRoot::new();
+        let _shadow_off = shadow_test_seam::force(false);
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let watcher_owner_x = ChannelId::new(4_564_100); // offset-authority / session owner
+        let delivery_y = ChannelId::new(4_564_200); // where the answered user msg lives
+        let unanswered_b: u64 = 88_000_001; // X's preserved, un-delivered turn
+        let answered_a: u64 = 99_000_002; // Y's delivered turn
+
+        // X carries a preserved UNANSWERED inflight row for B.
+        let mut x_state = crate::services::discord::inflight::InflightTurnState::new(
+            provider.clone(),
+            watcher_owner_x.get(),
+            Some("adk-test".to_string()),
+            343_742_347_365_974_026,
+            unanswered_b,
+            0,
+            "미답변 메시지".to_string(),
+            Some("session-x".to_string()),
+            Some("AgentDesk-codex-adk-test".to_string()),
+            Some("/tmp/4564-split.jsonl".to_string()),
+            None,
+            128,
+        );
+        x_state.turn_start_offset = Some(0);
+        crate::services::discord::inflight::save_inflight_state(&x_state).expect("save X inflight");
+        let tmux_session_name = x_state.tmux_session_name.as_deref().expect("tmux session");
+        let generation_mtime_ns = set_phase_a_generation(tmux_session_name, 1_700_456_400);
+        let coord = shared.tmux_relay_coord(watcher_owner_x);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(generation_mtime_ns, Ordering::Release);
+        coord.confirmed_end_offset.store(128, Ordering::Release);
+
+        // Y's answered turn commits terminally while reusing X's session.
+        shadow_mirror_delivered_frontier(
+            &shared,
+            &provider,
+            watcher_owner_x, // funnel `channel` = offset-authority X
+            Some(tmux_session_name),
+            (0, 128),
+            true, // is_delivered
+            Some(77_001),
+            Some(delivery_y.get()), // terminal_anchor_channel_id = delivery channel Y
+            Some("answer"),
+            Some(answered_a), // explicit inbound turn id from Y's snapshot
+        );
+
+        // (b) Y's answered turn is recorded under Y.
+        assert!(
+            completed_turn_ledger::settled_user_msg_ids(&provider, delivery_y.get())
+                .contains(&answered_a),
+            "the answered turn's user_msg_id must be recorded under the delivery channel Y"
+        );
+        // (a) X's UNANSWERED turn must NOT be false-Settled.
+        let x_settled =
+            completed_turn_ledger::settled_user_msg_ids(&provider, watcher_owner_x.get());
+        assert!(
+            !x_settled.contains(&unanswered_b),
+            "MUTATION: reverting to a commit-time reload of `channel`=X would append X's \
+             unanswered B here — silently losing B on restart (#4600 class)"
+        );
+        assert!(
+            x_settled.is_empty(),
+            "no ledger entry may be written under the offset-authority channel X"
+        );
+    }
+
     // ---- #3610 PR-1d: WATCHER legacy long-chunk arm (same-channel) --------------
     // The watcher long-chunk fallback arm (tmux_watcher.rs — the
     // `watcher_should_send_ordered_new_chunks_for_terminal_fallback` branch) is the
     // watcher-owned counterpart of the bridge arm above. Its sibling helper
-    // `terminal_send::record_watcher_long_chunk_terminal_delivery` is SAME-CHANNEL:
-    // it forwards `watcher_owner_channel_id == delivery_channel_id == channel_id`
-    // into `record_long_chunk_terminal_delivery`. So the frontier key (record path)
+    // `terminal_long_chunks::record_watcher_terminal_delivery` is SAME-CHANNEL:
+    // it preserves `watcher_owner_channel_id == delivery_channel_id == channel_id`.
+    // So the frontier key (record path)
     // and the recorded `panel_channel_id` are the SAME channel — UNLIKE the bridge's
     // cross-channel `long_chunk_cross_channel_separates_owner_and_delivery_3610c`.
     // Pinned here via the path-core (the helper's flag is env-global OnceLock).
@@ -2631,10 +4613,8 @@ mod tests {
         // only when the anchor is `Some` (the full-commit `Ok` arm of
         // `send_long_message_raw_with_rollback`, which is all-or-nothing — a partial
         // chunk failure rolls back and returns `Err`). So a non-advanced commit
-        // (modelled as `is_delivered = false`) NEVER reaches the durable write, and
-        // OFF is a full no-op. Same gate the shared helper enforces.
-        assert!(!should_shadow_mirror(false, true)); // not-advanced/partial → no record (M4/I2)
-        assert!(!should_shadow_mirror(true, false)); // flag OFF → no record (deploy no-op)
+        // (modelled as `is_delivered = false`) NEVER reaches the durable write.
+        assert!(!should_shadow_mirror(false, true));
     }
 
     // ---- #3933 item 1: read-authority (authority-ON) end-to-end wiring --------
@@ -2710,6 +4690,41 @@ mod tests {
         )
         .expect("seed durable frontier");
         gen_ns
+    }
+
+    fn seed_edit_failure_transcript(
+        root: &IsolatedRoot,
+        tmux_session_name: &str,
+        generation_mtime_ns: i64,
+        eof: u64,
+    ) -> EditFailureTranscriptIdentity {
+        let output_path = root.path().join(format!("{tmux_session_name}.jsonl"));
+        fs::write(&output_path, vec![b'x'; eof as usize]).expect("seed transcript");
+        EditFailureTranscriptIdentity {
+            output_path,
+            generation_mtime_ns,
+        }
+    }
+
+    fn stable_edit_failure_committed_at(
+        provider: &ProviderKind,
+        channel: ChannelId,
+        expected: &EditFailureTranscriptIdentity,
+        range_end: u64,
+    ) -> bool {
+        let record_path =
+            delivery_record_path(provider, channel.get()).expect("delivery record path");
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            expected,
+            || Some(expected.output_path.clone()),
+            || expected.generation_mtime_ns,
+            || {},
+        );
+        range_already_committed(
+            range_end,
+            frontier.map(|frontier| frontier.range.1).unwrap_or(0),
+        )
     }
 
     fn shared_with_committed(
@@ -2846,6 +4861,186 @@ mod tests {
         // Watchdog re-relay of the delivered body → suppressed (dup guard).
         assert!(range_already_committed(500_000, floor));
         assert!(range_already_committed(durable_end, floor)); // inclusive boundary
+    }
+
+    #[test]
+    fn edit_failure_recheck_suppresses_only_stable_fresh_bounded_commit_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_001);
+        let tmux = "AgentDesk-claude-4508";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+
+        assert!(stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end + 1,
+        ));
+
+        fs::write(
+            &expected.output_path,
+            vec![b'x'; (committed_end - 1) as usize],
+        )
+        .expect("truncate transcript");
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_distrusts_prior_generation_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_002);
+        let tmux = "AgentDesk-claude-4508-stale";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+        write_delivered_frontier_at(
+            &record_path,
+            DeliveredCommit {
+                range: (0, committed_end),
+                generation_mtime_ns: generation.saturating_add(1),
+                attempts: 1,
+                panel_msg_id: None,
+                panel_channel_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &expected,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_requires_durable_proof_despite_high_memory_floor_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_003);
+        let tmux = "AgentDesk-claude-4508-unverifiable";
+        let committed_end = 900_u64;
+        let shared = shared_with_committed(channel, committed_end);
+
+        assert!(!range_committed_after_edit_failure(
+            shared.as_ref(),
+            &provider,
+            channel,
+            tmux,
+            None,
+            committed_end,
+        ));
+
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let missing_output = EditFailureTranscriptIdentity {
+            output_path: root.path().join("missing.jsonl"),
+            generation_mtime_ns: generation,
+        };
+        assert!(!stable_edit_failure_committed_at(
+            &provider,
+            channel,
+            &missing_output,
+            committed_end,
+        ));
+    }
+
+    #[test]
+    fn edit_failure_recheck_detects_rotate_between_eof_and_frontier_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_004);
+        let tmux = "AgentDesk-claude-4508-rotate";
+        let committed_end = 900_u64;
+        let old_generation =
+            seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, old_generation, committed_end);
+        let new_path = root.path().join("replacement.jsonl");
+        fs::write(&new_path, vec![b'n'; committed_end as usize]).expect("seed replacement");
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+        let current_path = std::cell::RefCell::new(expected.output_path.clone());
+        let current_generation = std::cell::Cell::new(old_generation);
+
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            &expected,
+            || Some(current_path.borrow().clone()),
+            || current_generation.get(),
+            || {
+                current_path.replace(new_path.clone());
+                current_generation.set(old_generation.saturating_add(1));
+                write_record_at(
+                    &record_path,
+                    &DeliveryRecord {
+                        delivery_lease: None,
+                        delivered_frontier: Some(DeliveredCommit {
+                            range: (0, committed_end),
+                            generation_mtime_ns: old_generation.saturating_add(1),
+                            attempts: 1,
+                            panel_msg_id: None,
+                            panel_channel_id: None,
+                        }),
+                        recent_delivered_contents: Vec::new(),
+                        confirmed_deliveries: Vec::new(),
+                    },
+                )
+                .expect("seed unrelated new frontier");
+            },
+        );
+        assert!(
+            frontier.is_none(),
+            "wrapper rotation after EOF sampling must fail open for fallback delivery"
+        );
+    }
+
+    /// Same-name transcript truncate/replace WITHOUT a generation-marker bump:
+    /// the durable frontier still carries the expected generation and stays
+    /// within the pre-truncate EOF, so ONLY the post-read file-identity check
+    /// can detect the race. Mutation-sensitive for the second snapshot
+    /// comparison in `stable_edit_failure_frontier_at`.
+    #[test]
+    fn edit_failure_recheck_detects_same_generation_truncate_during_snapshot_4508() {
+        let root = IsolatedRoot::new();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(45_080_005);
+        let tmux = "AgentDesk-claude-4508-truncate-race";
+        let committed_end = 900_u64;
+        let generation = seed_current_generation_frontier(&provider, channel, tmux, committed_end);
+        let expected = seed_edit_failure_transcript(&root, tmux, generation, committed_end);
+        let record_path = delivery_record_path(&provider, channel.get()).unwrap();
+
+        let frontier = stable_edit_failure_frontier_at(
+            &record_path,
+            &expected,
+            || Some(expected.output_path.clone()),
+            || expected.generation_mtime_ns,
+            || {
+                fs::write(
+                    &expected.output_path,
+                    vec![b't'; (committed_end - 1) as usize],
+                )
+                .expect("truncate transcript during snapshot");
+            },
+        );
+        assert!(
+            frontier.is_none(),
+            "same-generation transcript truncation during the snapshot must fail open"
+        );
     }
 
     /// Even with authority ON, a STALE prior-generation durable frontier is

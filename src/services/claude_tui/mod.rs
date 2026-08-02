@@ -1,3 +1,4 @@
+pub(crate) mod composer_lock;
 pub mod hook_bundle;
 pub(crate) mod hook_output_guard;
 #[cfg(test)]
@@ -11,6 +12,7 @@ mod hook_server_memento_tests;
 pub(crate) mod hosting;
 pub mod input;
 pub(crate) mod memento_feedback;
+pub(super) mod prompt_readiness;
 pub mod session;
 pub(crate) mod startup_dialog;
 pub mod transcript_tail;

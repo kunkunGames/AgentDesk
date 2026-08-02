@@ -60,6 +60,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("provider {provider} is disconnected"),
             next_step: format!("check {provider} Discord token, gateway status, and dcserver logs"),
         },
+        ["provider", provider, "gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "provider_runtime",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("provider {provider} is in gateway standby mode"),
+            next_step: "verify primary gateway node is healthy".to_string(),
+        },
         ["provider", provider, "restart_pending"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_runtime",
@@ -170,6 +179,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: "no providers are currently registered".to_string(),
             next_step: "register a provider via the dashboard or check agentdesk.yaml".to_string(),
         },
+        ["gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: "cluster is in standby mode without a gateway connection".to_string(),
+            next_step: "verify cluster configuration and gateway node health".to_string(),
+        },
         ["startup_doctor_failed", count] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "startup_doctor",
@@ -204,7 +222,45 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres/SQLite availability and server logs".to_string(),
+            next_step: "check PostgreSQL availability and agentdesk dcserver logs".to_string(),
+        },
+        // #4515 PR2: worker-local recovery circuit reasons.
+        ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "worker_recovery",
+            severity: Severity::Error,
+            fix_safety: FixSafety::ExplicitRestartRequired,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!(
+                "worker-local worker {worker} exhausted its restart budget and is permanently stopped"
+            ),
+            next_step: format!(
+                "inspect dcserver logs for {worker} crash cause; the process exits for launchd KeepAlive restart unless the cross-process crash-loop guard held it"
+            ),
+        },
+        ["worker_local_loop_owned_terminated", worker] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "worker_recovery",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ExplicitRestartRequired,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!(
+                "un-migrated LoopOwned worker {worker} terminated unexpectedly and is not auto-restarted"
+            ),
+            next_step: format!(
+                "inspect dcserver logs for {worker}; a dcserver restart is required to recover it"
+            ),
+        },
+        ["worker_local_restart_flapping", worker, count] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "worker_recovery",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!(
+                "worker-local worker {worker} restarted {count} time(s) within the budget window"
+            ),
+            next_step: format!("inspect dcserver logs for repeated {worker} exits"),
         },
         _ => ClassifiedReason {
             raw: raw.to_string(),
@@ -250,7 +306,7 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 
 #[cfg(test)]
 mod health_classification_tests {
-    use super::super::contract::{FixSafety, Severity};
+    use super::super::contract::{FixSafety, SecurityExposure, Severity};
     use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
 
     #[test]
@@ -300,6 +356,37 @@ mod health_classification_tests {
     }
 
     #[test]
+    fn worker_recovery_reason_codes_classify() {
+        // #4515 PR2: budget exhaustion is a fatal, restart-required error.
+        let exhausted =
+            classify_degraded_reason("worker_local_restart_budget_exhausted:dispatch_outbox");
+        assert_eq!(exhausted.subsystem, "worker_recovery");
+        assert_eq!(exhausted.severity, Severity::Error);
+        assert_eq!(exhausted.fix_safety, FixSafety::ExplicitRestartRequired);
+        assert!(exhausted.summary.contains("dispatch_outbox"));
+        assert_ne!(exhausted.summary, exhausted.raw);
+
+        // An un-migrated LoopOwned worker death is a warning needing a restart.
+        let terminated =
+            classify_degraded_reason("worker_local_loop_owned_terminated:watcher_supervisor");
+        assert_eq!(terminated.subsystem, "worker_recovery");
+        assert_eq!(terminated.severity, Severity::Warning);
+        assert_eq!(terminated.fix_safety, FixSafety::ExplicitRestartRequired);
+        assert!(terminated.summary.contains("watcher_supervisor"));
+        assert_ne!(terminated.summary, terminated.raw);
+
+        // Flapping is read-only informational.
+        let flapping =
+            classify_degraded_reason("worker_local_restart_flapping:session_discovery:3");
+        assert_eq!(flapping.subsystem, "worker_recovery");
+        assert_eq!(flapping.severity, Severity::Warning);
+        assert_eq!(flapping.fix_safety, FixSafety::ReadOnly);
+        assert!(flapping.summary.contains("session_discovery"));
+        assert!(flapping.summary.contains('3'));
+        assert_ne!(flapping.summary, flapping.raw);
+    }
+
+    #[test]
     fn global_active_counter_reason_is_actionable() {
         let reason = classify_degraded_reason(
             "global_active_counter_out_of_bounds:raw=4:provider_active_turns=2:global_finalizing=1",
@@ -313,6 +400,59 @@ mod health_classification_tests {
         assert_eq!(
             reason.next_step,
             "inspect global active counter tracking in dcserver logs"
+        );
+    }
+
+    #[test]
+    fn gateway_standby_reason_codes_classify() {
+        let provider_standby = classify_degraded_reason("provider:codex:gateway_standby");
+        assert_eq!(provider_standby.subsystem, "provider_runtime");
+        assert_eq!(provider_standby.severity, Severity::Warning);
+        assert_eq!(provider_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            provider_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
+            provider_standby.summary,
+            "provider codex is in gateway standby mode"
+        );
+        assert_eq!(
+            provider_standby.next_step,
+            "verify primary gateway node is healthy"
+        );
+        assert_ne!(provider_standby.summary, provider_standby.raw);
+
+        let cluster_standby = classify_degraded_reason("gateway_standby");
+        assert_eq!(cluster_standby.subsystem, "health");
+        assert_eq!(cluster_standby.severity, Severity::Warning);
+        assert_eq!(cluster_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            cluster_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
+            cluster_standby.summary,
+            "cluster is in standby mode without a gateway connection"
+        );
+        assert_eq!(
+            cluster_standby.next_step,
+            "verify cluster configuration and gateway node health"
+        );
+        assert_ne!(cluster_standby.summary, cluster_standby.raw);
+    }
+
+    #[test]
+    fn db_unavailable_reason_is_actionable() {
+        let reason = classify_degraded_reason("db_unavailable");
+
+        assert_eq!(reason.subsystem, "postgres");
+        assert_eq!(reason.severity, Severity::Error);
+        assert_eq!(reason.fix_safety, FixSafety::NotFixable);
+        assert_eq!(reason.summary, "database is unavailable");
+        assert_eq!(
+            reason.next_step,
+            "check PostgreSQL availability and agentdesk dcserver logs"
         );
     }
 }

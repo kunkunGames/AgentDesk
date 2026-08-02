@@ -1,32 +1,53 @@
 //! Inflight turn-state domain model (#3479 extraction).
 //!
-//! Pure data types for the inflight turn state contract: the
-//! [`InflightTurnState`] row, its turn-identity projection
-//! [`InflightTurnIdentity`], the [`TurnSource`] / [`RelayOwnerKind`] audit
-//! enums, the `optional_message_id` zero-id helper, and the version-tolerant
-//! serde adapters. Behaviour-preserving move out of `inflight.rs`; the parent
-//! re-exports every public item so existing `inflight::*` paths still resolve.
+//! Inflight state, turn identity, relay ownership, zero-id helpers, and
+//! version-tolerant serde adapters extracted from `inflight.rs`.
+
+use std::num::NonZeroU64;
 
 use super::*;
 use crate::services::agent_protocol::TaskNotificationKind;
 
-/// Build an optional `serenity::MessageId` from a possibly-zero raw inflight id.
+/// Build an optional `serenity::MessageId` from a possibly-zero raw persisted id.
 ///
-/// `current_msg_id == 0` is a LEGITIMATE state: a TUI-direct / recovery turn
-/// (`runtime_kind = claude_tui`, `status_message_id = None`) that never anchored
-/// a Discord placeholder message. `serenity::MessageId::new(0)` PANICS
-/// ("Attempted to call MessageId::new with invalid (0) value"), so every
-/// recovery/relay path that derives a placeholder id from a possibly-zero
-/// inflight field must funnel through this helper and treat `None` as
-/// "no anchored placeholder" — skipping the placeholder-specific step while
-/// still performing watcher/session recovery — rather than panicking.
-pub(in crate::services::discord) fn optional_message_id(
+/// A zero message id is a legitimate sentinel for an unanchored TUI-direct or
+/// recovery turn. Callers must treat `None` as "skip the message-specific step"
+/// instead of constructing `MessageId::new(0)`, which panics. Because zero is an
+/// expected sentinel here (not an anomaly), the zero case is silent — unlike
+/// [`opt_channel_id`], where a zero channel id is never legitimate.
+pub(in crate::services::discord) fn opt_message_id(
     raw: u64,
 ) -> Option<poise::serenity_prelude::MessageId> {
-    if raw == 0 {
-        None
-    } else {
-        Some(poise::serenity_prelude::MessageId::new(raw))
+    NonZeroU64::new(raw).map(|raw| poise::serenity_prelude::MessageId::new(raw.get()))
+}
+
+/// Build an optional `serenity::ChannelId` from a persisted Discord channel id.
+///
+/// Stored recovery state must never construct `ChannelId::new(0)`: the invalid
+/// state is skipped and left available for a later diagnostic or repair.
+pub(in crate::services::discord) fn opt_channel_id(
+    raw: u64,
+) -> Option<poise::serenity_prelude::ChannelId> {
+    let Some(raw) = NonZeroU64::new(raw) else {
+        tracing::warn!("skipping Discord channel operation because persisted id is zero");
+        return None;
+    };
+    Some(poise::serenity_prelude::ChannelId::new(raw.get()))
+}
+
+pub(in crate::services::discord) use opt_message_id as optional_message_id;
+
+#[cfg(test)]
+mod discord_id_tests {
+    use super::{opt_channel_id, opt_message_id};
+    use poise::serenity_prelude::{ChannelId, MessageId};
+
+    #[test]
+    fn optional_id_helpers_return_none_for_zero_without_panicking() {
+        assert_eq!(opt_message_id(0), None);
+        assert_eq!(opt_message_id(42), Some(MessageId::new(42)));
+        assert_eq!(opt_channel_id(0), None);
+        assert_eq!(opt_channel_id(43), Some(ChannelId::new(43)));
     }
 }
 
@@ -42,6 +63,7 @@ fn mix_finalizer_hash(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthetic_finalizer_turn_id(
     provider: &str,
     channel_id: u64,
@@ -95,6 +117,9 @@ pub(in crate::services::discord) struct InflightTurnState {
     pub thread_title: Option<String>,
     pub request_owner_user_id: u64,
     pub user_msg_id: u64,
+    /// Queue-merge source identity for the durable retry budget and notice.
+    #[serde(default)]
+    pub busy_followup_retry_user_msg_id: u64,
     /// Nonzero identity used by the single-authority finalizer ledger. It is
     /// independent of Discord user-message anchoring: real user id wins, then a
     /// pinned injected prompt id, then a persisted synthetic id for id-0 turns.
@@ -125,6 +150,12 @@ pub(in crate::services::discord) struct InflightTurnState {
     pub tmux_session_name: Option<String>,
     pub output_path: Option<String>,
     pub input_fifo_path: Option<String>,
+    #[serde(default)]
+    pub claude_e_pid: Option<u32>,
+    #[serde(default)]
+    pub claude_e_process_starttime: Option<u128>,
+    #[serde(default)]
+    pub claude_e_macos_lstart_hash: Option<u128>,
     /// #2235: deserializing through `deserialize_runtime_kind_tolerant` so a
     /// future variant written by a newer binary collapses to `None` instead
     /// of failing the whole row's parse (which would otherwise lose the
@@ -361,16 +392,14 @@ pub(in crate::services::discord) struct InflightTurnState {
     /// live, progressing re-adopted turn (matching `user_msg_id`, not committed)
     /// still yields reclaim-reason `None`.
     ///
-    /// NOTE (#4370): this marker IS persisted on a DrainRestart-preserved row. The
-    /// BROAD identity-refresh save (`save_inflight_state_if_identity_unchanged`)
-    /// refuses any row still carrying `restart_mode`, which is precisely why the
-    /// marker is written through the NARROW single-field patch
+    /// NOTE (#4370/#4810): this marker is written through the NARROW adoption patch
     /// `mark_readopted_from_inflight_if_identity_unchanged`
-    /// (`inflight/save_store/identity_gate.rs`) instead: it re-reads under the
-    /// sidecar flock, pins the turn identity, flips only this additive bit, and
-    /// preserves `restart_mode`. Test `readopted_marker_lands_on_restart_preserved_row_and_never_resurrects`
-    /// pins that behavior. So the present-row (Path A) reclaim DOES cover
-    /// restart-preserved rows.
+    /// (`inflight/save_store/identity_gate.rs`), not the broad identity-refresh
+    /// save. The patch re-reads under the sidecar flock, pins the turn identity,
+    /// flips this additive bit, and atomically consumes any planned-restart marker
+    /// so replacement-process authority is durable before runtime handoff. Test
+    /// `readopted_marker_lands_on_restart_preserved_row_and_never_resurrects` pins
+    /// the restart-preserved adoption and no-resurrection behavior.
     ///
     /// The ROW-ABSENT reclaim (Path B) still does not consult this field — there is
     /// no row left to read — and uses the in-memory
@@ -740,6 +769,30 @@ mod turn_source_tests {
     }
 
     #[test]
+    fn set_watcher_owner_channel_id_with_zero_channel_id_skips_record_without_panicking() {
+        // A persisted channel_id == 0 sentinel must not reach ChannelId::new(0),
+        // which panics. The opt_channel_id guard skips the delivery-record write
+        // instead. Removing the guard makes this construction panic (#4608).
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            0,
+            None,
+            7,
+            8,
+            9,
+            "hello".to_string(),
+            None,
+            Some("AgentDesk-claude-adk".to_string()),
+            None,
+            None,
+            0,
+        );
+        let changed = state.set_watcher_owner_channel_id(123);
+        assert!(changed);
+        assert_eq!(state.watcher_owner_channel_id, Some(123));
+    }
+
+    #[test]
     fn watcher_owner_channel_id_defaults_absent_legacy_rows_to_none() {
         let state: InflightTurnState = serde_json::from_value(serde_json::json!({
             "version": 9,
@@ -874,6 +927,7 @@ mod turn_source_tests {
 }
 
 impl InflightTurnState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: ProviderKind,
         channel_id: u64,
@@ -890,7 +944,7 @@ impl InflightTurnState {
     ) -> Self {
         let now = now_string();
         let provider_name = provider.as_str().to_string();
-        let born_generation = super::super::runtime_store::load_generation();
+        let born_generation = super::super::runtime_store::process_generation();
         let finalizer_turn_id = if user_msg_id != 0 {
             user_msg_id
         } else {
@@ -920,6 +974,7 @@ impl InflightTurnState {
             thread_title: None,
             request_owner_user_id,
             user_msg_id,
+            busy_followup_retry_user_msg_id: user_msg_id,
             finalizer_turn_id,
             status_message_id: None,
             status_panel_generation: 0,
@@ -931,6 +986,9 @@ impl InflightTurnState {
             tmux_session_name,
             output_path,
             input_fifo_path,
+            claude_e_pid: None,
+            claude_e_process_starttime: None,
+            claude_e_macos_lstart_hash: None,
             runtime_kind,
             runtime_kind_unknown_on_disk: false,
             worktree_path: None,
@@ -1091,10 +1149,11 @@ impl InflightTurnState {
             ProviderKind::from_str(&self.provider),
             self.tmux_session_name.as_deref().filter(|name| !name.is_empty()),
         ) && let Some(owner_channel_id) = normalized
+            && let Some(self_channel_id) = opt_channel_id(self.channel_id)
             && let Err(error) =
                 crate::services::discord::outbound::delivery_record::record_watcher_owner_channel_context(
                     &provider,
-                    poise::serenity_prelude::ChannelId::new(self.channel_id),
+                    self_channel_id,
                     poise::serenity_prelude::ChannelId::new(owner_channel_id),
                     tmux_session_name,
                 )
@@ -1116,7 +1175,7 @@ impl InflightTurnState {
 
     pub fn set_restart_mode(&mut self, restart_mode: InflightRestartMode) {
         self.restart_mode = Some(restart_mode);
-        self.restart_generation = Some(super::super::runtime_store::load_generation());
+        self.restart_generation = Some(super::super::runtime_store::process_generation());
     }
 
     pub fn clear_restart_mode(&mut self) {

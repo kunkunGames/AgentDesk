@@ -21,8 +21,7 @@ pub(in crate::services::discord) async fn cmd_start(
         return Ok(());
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!("  [{ts}] ◀ [{user_name}] /start path={:?}", path);
+    log_command_received!(ctx.channel_id().get(), user_name, "/start", path = ?path);
 
     let path_str = path.as_deref().unwrap_or("").trim();
 
@@ -83,11 +82,12 @@ pub(in crate::services::discord) async fn cmd_start(
             let ch = ch_name.as_deref().unwrap_or("unknown");
             match create_git_worktree(&canonical_path, ch, &provider_str) {
                 Ok((wt_path, branch)) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] 🌿 Worktree conflict: {} already uses {}. Created worktree.",
-                        conflicting_channel,
-                        canonical_path
+                    log_info_event!(
+                        "discord_worktree_created",
+                        channel_id = ctx.channel_id().get(),
+                        conflicting_channel_id = conflicting_channel,
+                        path = %canonical_path,
+                        status = "created",
                     );
                     Some(WorktreeInfo {
                         original_path: canonical_path.clone(),
@@ -96,8 +96,12 @@ pub(in crate::services::discord) async fn cmd_start(
                     })
                 }
                 Err(e) => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!("  [{ts}] 🌿 Worktree creation skipped: {e}");
+                    log_info_event!(
+                        "discord_worktree_creation_skipped",
+                        channel_id = ctx.channel_id().get(),
+                        reason = %e,
+                        status = "skipped",
+                    );
                     None
                 }
             }
@@ -139,7 +143,7 @@ pub(in crate::services::discord) async fn cmd_start(
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
 
-                born_generation: runtime_store::load_generation(),
+                born_generation: runtime_store::process_generation(),
             });
         session.channel_id = Some(channel_id.get());
         session.channel_name = ch_name;
@@ -154,14 +158,22 @@ pub(in crate::services::discord) async fn cmd_start(
         let has_existing_session = session.session_id.is_some();
 
         if has_existing_session {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!("  [{ts}] ▶ Session restored: {effective_path}");
+            log_info_event!(
+                "discord_session_restored",
+                channel_id = channel_id.get(),
+                path = %effective_path,
+                status = "restored",
+            );
             response_lines.push(super::session_restored_response(&effective_path));
         } else {
             session.history.clear();
 
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!("  [{ts}] ▶ Session started: {effective_path}");
+            log_info_event!(
+                "discord_session_started",
+                channel_id = channel_id.get(),
+                path = %effective_path,
+                status = "started",
+            );
             response_lines.push(super::session_started_response(&effective_path));
         }
 
@@ -198,6 +210,134 @@ pub(in crate::services::discord) async fn cmd_start(
     Ok(())
 }
 
+/// Rebind this channel to a previous provider session (empty = auto-select).
+#[poise::command(slash_command, rename = "resume")]
+pub(in crate::services::discord) async fn cmd_resume(
+    ctx: Context<'_>,
+    #[description = "Provider session id to resume (empty = auto-select previous)"]
+    session_id: Option<String>,
+    #[description = "Worktree path for the resumed session (defaults to current)"] cwd: Option<
+        String,
+    >,
+) -> Result<(), Error> {
+    let user_id = ctx.author().id;
+    let user_name = &ctx.author().name;
+    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
+        return Ok(());
+    }
+    // Runtime-control tier — owner-only, same as /clear and /stop.
+    if !super::enforce_slash_command_policy(&ctx, "/resume").await? {
+        return Ok(());
+    }
+
+    log_command_received!(
+        ctx.channel_id().get(),
+        user_name,
+        "/resume",
+        provider_session_id = ?session_id,
+        cwd = ?cwd
+    );
+    // A transition may legitimately wait for an intake mailbox claim. Acknowledge
+    // the interaction before any database, forwarding, or bounded-lock work.
+    ctx.defer().await?;
+
+    let shared = &ctx.data().shared;
+    let provider = &ctx.data().provider;
+    let channel_id = ctx.channel_id();
+
+    let Some(session_key) =
+        super::super::adk_session::build_adk_session_key(shared, channel_id, provider, None).await
+    else {
+        ctx.say("이 채널의 session_key를 확인할 수 없어요. `/start`로 세션을 먼저 붙여주세요.")
+            .await?;
+        return Ok(());
+    };
+
+    let Some(pool) = shared.pg_pool.clone() else {
+        ctx.say("Error: postgres pool unavailable.").await?;
+        return Ok(());
+    };
+    let registry = shared.health_registry();
+
+    let opts = crate::services::session_resume::ResumePreviousOptions {
+        session_id: session_id.and_then(|s| {
+            let trimmed = s.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+        cwd: cwd.and_then(|c| {
+            let trimmed = c.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+    };
+
+    // S1: route through the same forwarding-aware dispatch the HTTP endpoint
+    // uses so a gateway node whose runtime does not own this channel delegates
+    // to the owner node (mirrors `/stop`'s remote-cancel forwarding) instead of
+    // mutating a session it does not run.
+    let forward_context =
+        crate::services::session_forwarding::ForwardCallerContext::from_live_globals(Some(
+            pool.clone(),
+        ));
+    let (_status, body) = crate::services::session_resume::dispatch_resume_previous(
+        &pool,
+        registry.as_deref(),
+        &forward_context,
+        None,
+        &session_key,
+        &opts,
+    )
+    .await;
+
+    if body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let auto = body
+            .get("auto_selected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mode = if auto {
+            "직전 세션 자동 선택"
+        } else {
+            "지정 세션"
+        };
+        let target_session_id = body
+            .get("target_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let target_cwd = body
+            .get("target_cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let mut lines = vec![
+            format!("↻ 세션 재바인딩 완료 ({mode})"),
+            format!("• session_id: `{target_session_id}`"),
+            format!("• cwd: `{target_cwd}`"),
+        ];
+        if let Some(prev) = body.get("previous_session_id").and_then(|v| v.as_str()) {
+            lines.push(format!("• 이전 session_id: `{prev}`"));
+        }
+        lines.push("다음 메시지부터 이 세션의 맥락으로 이어집니다.".to_string());
+        send_long_message_ctx(ctx, &lines.join("\n")).await?;
+        log_info_event!(
+            "discord_session_rebound",
+            channel_id = channel_id.get(),
+            provider = provider.as_str(),
+            session_key = %session_key,
+            provider_session_id = target_session_id,
+            path = target_cwd,
+            user_name = %user_name,
+            status = "completed",
+        );
+    } else {
+        let message = body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("세션 재바인딩에 실패했어요.")
+            .to_string();
+        ctx.say(format!("⚠ /resume 실패: {message}")).await?;
+    }
+
+    Ok(())
+}
+
 /// /pwd — Show current working directory
 #[poise::command(slash_command, rename = "pwd")]
 pub(in crate::services::discord) async fn cmd_pwd(ctx: Context<'_>) -> Result<(), Error> {
@@ -207,8 +347,7 @@ pub(in crate::services::discord) async fn cmd_pwd(ctx: Context<'_>) -> Result<()
         return Ok(());
     }
 
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!("  [{ts}] ◀ [{user_name}] /pwd");
+    log_command_received!(ctx.channel_id().get(), user_name, "/pwd");
 
     // Auto-restore session
     auto_restore_session(&ctx.data().shared, ctx.channel_id(), ctx.serenity_context()).await;

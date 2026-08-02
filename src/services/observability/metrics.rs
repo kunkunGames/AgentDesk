@@ -36,6 +36,22 @@ impl CounterKey {
     }
 }
 
+/// Closed reason categories for permanently unrecoverable relay emissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPermanentLossReason {
+    DriftStateTtlExpired,
+    DeadPane,
+}
+
+impl RelayPermanentLossReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DriftStateTtlExpired => "drift_state_ttl_expired",
+            Self::DeadPane => "dead_pane",
+        }
+    }
+}
+
 /// Atomic counters per `(channel_id, provider)`. All fields use `AtomicU64`.
 #[derive(Debug, Default)]
 pub struct AtomicCounters {
@@ -69,6 +85,27 @@ pub struct AtomicCounters {
     /// cleanly assigned across the three relay-launch paths, root cause #3). A
     /// phantom/unknown owner can make the bridge skip its own delivery.
     pub relay_owner_unknown: AtomicU64,
+    /// #4794: observed prompt-notification emissions that hit an authoritative
+    /// tmux-owner registry miss and were still pending when bounded three-state
+    /// probing definitively reported `DeadOrAbsent`. Poll misses are excluded;
+    /// `ProbeError` preserves the pending count; successful/already-effective
+    /// promotion drains it as delayed rather than lost. This is process-local and
+    /// cumulative per `(channel_id, provider)`.
+    pub relay_permanent_loss: AtomicU64,
+    /// #4794: subset of permanent loss caused by unresolved drift state TTL expiry.
+    pub relay_permanent_loss_drift_state_ttl_expired: AtomicU64,
+    /// #4794: subset of permanent loss confirmed by a dead/absent pane probe.
+    pub relay_permanent_loss_dead_pane: AtomicU64,
+    /// #4794: `/resume` channel transition critical sections that exceeded the
+    /// observation threshold and continued without cancellation.
+    pub resume_critical_section_overrun: AtomicU64,
+    /// #4913: canonical Discord identity writes rejected with a typed conflict.
+    pub session_identity_conflicts: AtomicU64,
+    pub session_identity_conflict_ambiguous_canonical: AtomicU64,
+    pub session_identity_conflict_ambiguous_legacy: AtomicU64,
+    pub session_identity_conflict_evidence_divergence: AtomicU64,
+    pub session_identity_conflict_locator_namespace: AtomicU64,
+    pub session_identity_conflict_ownership_mismatch: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -89,6 +126,32 @@ impl AtomicCounters {
                 .relay_uncommitted_inflight_cleared
                 .load(Ordering::Relaxed),
             relay_owner_unknown: self.relay_owner_unknown.load(Ordering::Relaxed),
+            relay_permanent_loss: self.relay_permanent_loss.load(Ordering::Relaxed),
+            relay_permanent_loss_drift_state_ttl_expired: self
+                .relay_permanent_loss_drift_state_ttl_expired
+                .load(Ordering::Relaxed),
+            relay_permanent_loss_dead_pane: self
+                .relay_permanent_loss_dead_pane
+                .load(Ordering::Relaxed),
+            resume_critical_section_overrun: self
+                .resume_critical_section_overrun
+                .load(Ordering::Relaxed),
+            session_identity_conflicts: self.session_identity_conflicts.load(Ordering::Relaxed),
+            session_identity_conflict_ambiguous_canonical: self
+                .session_identity_conflict_ambiguous_canonical
+                .load(Ordering::Relaxed),
+            session_identity_conflict_ambiguous_legacy: self
+                .session_identity_conflict_ambiguous_legacy
+                .load(Ordering::Relaxed),
+            session_identity_conflict_evidence_divergence: self
+                .session_identity_conflict_evidence_divergence
+                .load(Ordering::Relaxed),
+            session_identity_conflict_locator_namespace: self
+                .session_identity_conflict_locator_namespace
+                .load(Ordering::Relaxed),
+            session_identity_conflict_ownership_mismatch: self
+                .session_identity_conflict_ownership_mismatch
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -110,6 +173,19 @@ pub struct AtomicCountersSnapshot {
     pub relay_uncommitted_inflight_cleared: u64,
     /// #2838: see [`AtomicCounters::relay_owner_unknown`].
     pub relay_owner_unknown: u64,
+    /// #4794: confirmed lost observed-prompt emissions; see
+    /// [`AtomicCounters::relay_permanent_loss`] for exact inclusion rules.
+    pub relay_permanent_loss: u64,
+    pub relay_permanent_loss_drift_state_ttl_expired: u64,
+    pub relay_permanent_loss_dead_pane: u64,
+    pub resume_critical_section_overrun: u64,
+    /// #4913: see [`AtomicCounters::session_identity_conflicts`].
+    pub session_identity_conflicts: u64,
+    pub session_identity_conflict_ambiguous_canonical: u64,
+    pub session_identity_conflict_ambiguous_legacy: u64,
+    pub session_identity_conflict_evidence_divergence: u64,
+    pub session_identity_conflict_locator_namespace: u64,
+    pub session_identity_conflict_ownership_mismatch: u64,
 }
 
 /// One row emitted by `ObservabilityCounters::snapshot()`.
@@ -141,6 +217,20 @@ pub struct CounterSnapshotRow {
     /// #2838: turns that began relay with an Unknown owner kind. See
     /// [`AtomicCounters::relay_owner_unknown`].
     pub relay_owner_unknown: u64,
+    /// #4794: confirmed lost observed-prompt emissions; see
+    /// [`AtomicCounters::relay_permanent_loss`] for exact inclusion rules.
+    pub relay_permanent_loss: u64,
+    pub relay_permanent_loss_drift_state_ttl_expired: u64,
+    pub relay_permanent_loss_dead_pane: u64,
+    /// #4794: `/resume` transition critical sections observed beyond the threshold.
+    pub resume_critical_section_overrun: u64,
+    /// #4913: canonical identity writes rejected with a typed conflict.
+    pub session_identity_conflicts: u64,
+    pub session_identity_conflict_ambiguous_canonical: u64,
+    pub session_identity_conflict_ambiguous_legacy: u64,
+    pub session_identity_conflict_evidence_divergence: u64,
+    pub session_identity_conflict_locator_namespace: u64,
+    pub session_identity_conflict_ownership_mismatch: u64,
 }
 
 /// In-process registry of `(channel_id, provider) -> AtomicCounters`.
@@ -232,6 +322,63 @@ impl ObservabilityCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// #4794: add a confirmed count of permanently unrecoverable relay emissions.
+    pub fn record_relay_permanent_loss(
+        &self,
+        channel_id: u64,
+        provider: &str,
+        reason: RelayPermanentLossReason,
+        count: u64,
+    ) {
+        let slot = self.slot(channel_id, provider);
+        slot.relay_permanent_loss
+            .fetch_add(count, Ordering::Relaxed);
+        match reason {
+            RelayPermanentLossReason::DriftStateTtlExpired => {
+                &slot.relay_permanent_loss_drift_state_ttl_expired
+            }
+            RelayPermanentLossReason::DeadPane => &slot.relay_permanent_loss_dead_pane,
+        }
+        .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// #4794: a `/resume` transition remained in its non-cancellable critical
+    /// section beyond the observation threshold.
+    pub fn record_resume_critical_section_overrun(&self, channel_id: u64, provider: &str) {
+        self.slot(channel_id, provider)
+            .resume_critical_section_overrun
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_session_identity_conflict(
+        &self,
+        channel_id: u64,
+        provider: &str,
+        kind: crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind,
+    ) {
+        let slot = self.slot(channel_id, provider);
+        slot.session_identity_conflicts
+            .fetch_add(1, Ordering::Relaxed);
+        match kind {
+            crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind::AmbiguousCanonical => {
+                &slot.session_identity_conflict_ambiguous_canonical
+            }
+            crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind::AmbiguousLegacy => {
+                &slot.session_identity_conflict_ambiguous_legacy
+            }
+            crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind::EvidenceDivergence => {
+                &slot.session_identity_conflict_evidence_divergence
+            }
+            crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind::LocatorNamespace => {
+                &slot.session_identity_conflict_locator_namespace
+            }
+            crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind::OwnershipMismatch => {
+                &slot.session_identity_conflict_ownership_mismatch
+            }
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// #1085: record whether the turn entered with an existing provider session.
     /// `session_id_present == true` increments `session_reused`, else `session_new`.
     pub fn record_session_entry(&self, channel_id: u64, provider: &str, session_id_present: bool) {
@@ -279,6 +426,22 @@ impl ObservabilityCounters {
                     relay_terminal_ack_timeout: snap.relay_terminal_ack_timeout,
                     relay_uncommitted_inflight_cleared: snap.relay_uncommitted_inflight_cleared,
                     relay_owner_unknown: snap.relay_owner_unknown,
+                    relay_permanent_loss: snap.relay_permanent_loss,
+                    relay_permanent_loss_drift_state_ttl_expired: snap
+                        .relay_permanent_loss_drift_state_ttl_expired,
+                    relay_permanent_loss_dead_pane: snap.relay_permanent_loss_dead_pane,
+                    resume_critical_section_overrun: snap.resume_critical_section_overrun,
+                    session_identity_conflicts: snap.session_identity_conflicts,
+                    session_identity_conflict_ambiguous_canonical: snap
+                        .session_identity_conflict_ambiguous_canonical,
+                    session_identity_conflict_ambiguous_legacy: snap
+                        .session_identity_conflict_ambiguous_legacy,
+                    session_identity_conflict_evidence_divergence: snap
+                        .session_identity_conflict_evidence_divergence,
+                    session_identity_conflict_locator_namespace: snap
+                        .session_identity_conflict_locator_namespace,
+                    session_identity_conflict_ownership_mismatch: snap
+                        .session_identity_conflict_ownership_mismatch,
                 }
             })
             .collect();
@@ -331,6 +494,14 @@ pub fn record_session_entry(channel_id: u64, provider: &str, session_id_present:
     global().record_session_entry(channel_id, provider, session_id_present);
 }
 
+pub fn record_session_identity_conflict(
+    channel_id: u64,
+    provider: &str,
+    kind: crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind,
+) {
+    global().record_session_identity_conflict(channel_id, provider, kind);
+}
+
 /// #2838: convenience wrapper for `ObservabilityCounters::record_relay_terminal_ack_timeout`.
 pub fn record_relay_terminal_ack_timeout(channel_id: u64, provider: &str) {
     global().record_relay_terminal_ack_timeout(channel_id, provider);
@@ -353,6 +524,87 @@ pub fn record_relay_owner_unknown(channel_id: u64, provider: &str) {
     super::emit::emit_relay_root_cause_counter(provider, channel_id, "relay_owner_unknown");
 }
 
+/// #4794: record confirmed permanent relay loss as an additive emission count.
+pub fn record_relay_permanent_loss(
+    channel_id: u64,
+    provider: &str,
+    reason: RelayPermanentLossReason,
+    count: u64,
+) {
+    if count == 0 {
+        return;
+    }
+    global().record_relay_permanent_loss(channel_id, provider, reason, count);
+    tracing::error!(
+        channel_id,
+        provider,
+        permanent_loss_count = count,
+        permanent_loss_reason = reason.as_str(),
+        "relay emissions became permanently unrecoverable"
+    );
+}
+
+/// #4794: record a non-cancelling `/resume` critical-section overrun.
+pub fn record_resume_critical_section_overrun(channel_id: u64, provider: &str) {
+    global().record_resume_critical_section_overrun(channel_id, provider);
+}
+
+pub fn record_relay_circuit_activate_unknown() {
+    super::emit::emit_relay_root_cause_counter("unknown", 0, "relay_circuit_activate_unknown");
+}
+
 pub fn snapshot() -> Vec<CounterSnapshotRow> {
     global().snapshot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::dispatched_session_canonical_identity::SessionIdentityConflictKind;
+
+    #[test]
+    fn permanent_relay_loss_is_additive_and_exposed() {
+        let counters = ObservabilityCounters::new();
+        counters.record_relay_permanent_loss(
+            4794,
+            "Claude",
+            RelayPermanentLossReason::DriftStateTtlExpired,
+            9,
+        );
+        counters.record_relay_permanent_loss(4794, "claude", RelayPermanentLossReason::DeadPane, 2);
+
+        let rows = counters.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel_id, 4794);
+        assert_eq!(rows[0].provider, "claude");
+        assert_eq!(rows[0].relay_permanent_loss, 11);
+        assert_eq!(rows[0].relay_permanent_loss_drift_state_ttl_expired, 9);
+        assert_eq!(rows[0].relay_permanent_loss_dead_pane, 2);
+    }
+
+    #[test]
+    fn identity_conflict_snapshot_preserves_closed_categories() {
+        let counters = ObservabilityCounters::new();
+        counters.record_session_identity_conflict(
+            4913,
+            "Claude",
+            SessionIdentityConflictKind::LocatorNamespace,
+        );
+        counters.record_session_identity_conflict(
+            4913,
+            "claude",
+            SessionIdentityConflictKind::OwnershipMismatch,
+        );
+
+        let rows = counters.snapshot();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.provider, "claude");
+        assert_eq!(row.session_identity_conflicts, 2);
+        assert_eq!(row.session_identity_conflict_locator_namespace, 1);
+        assert_eq!(row.session_identity_conflict_ownership_mismatch, 1);
+        assert_eq!(row.session_identity_conflict_ambiguous_canonical, 0);
+        assert_eq!(row.session_identity_conflict_ambiguous_legacy, 0);
+        assert_eq!(row.session_identity_conflict_evidence_divergence, 0);
+    }
 }

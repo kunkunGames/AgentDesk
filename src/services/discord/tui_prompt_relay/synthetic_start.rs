@@ -232,6 +232,14 @@ pub(super) async fn claim_tui_direct_synthetic_turn(
         }
     }
 
+    // Capture the actor-owned episode identity after admission. If this call
+    // observed an already-active matching synthetic turn, the fresh local token
+    // was not admitted; the mailbox snapshot, not that unused token, is the
+    // authority for the nonce persisted below.
+    let active_turn_nonce = super::super::mailbox_snapshot(shared, channel_id)
+        .await
+        .active_turn_nonce;
+
     // #3146 Part 1: a TUI-driven turn is now active for this channel (we either
     // just started it via `mailbox_try_start_turn` or already own the matching
     // turn). Clear any stale `📦 … idle N분` recap card the same way the
@@ -281,7 +289,9 @@ pub(super) async fn claim_tui_direct_synthetic_turn(
         && existing.turn_source == TurnSource::ExternalInput
         && existing.user_msg_id == anchor_message_id.get()
     {
+        let expected = super::super::inflight::InflightTurnIdentity::from_state(&existing);
         let mut existing = existing;
+        existing.turn_nonce = active_turn_nonce.clone();
         existing.set_relay_owner_kind(relay_owner_kind);
         existing.session_key = lease.session_key.clone();
         existing.runtime_kind = lease.runtime_kind;
@@ -294,13 +304,19 @@ pub(super) async fn claim_tui_direct_synthetic_turn(
         // pinned so completion cleanup never reads a later injection's overwrite of
         // the shared prompt-anchor slot.
         existing.injected_prompt_message_id = Some(anchor_message_id.get());
-        if let Err(error) = super::super::inflight::save_inflight_state(&existing) {
+        let outcome =
+            super::super::inflight::save_inflight_state_if_identity_matches_allow_output_restamp(
+                &existing,
+                &expected,
+                "tui_direct_synthetic_refresh",
+            );
+        if !matches!(outcome, super::super::inflight::GuardedSaveOutcome::Saved) {
             tracing::warn!(
                 provider = %provider.as_str(),
                 channel_id = channel_id.get(),
                 tmux_session_name = %tmux_session_name,
-                error = %error,
-                "failed to refresh TUI-direct synthetic inflight ownership"
+                ?outcome,
+                "skipped TUI-direct synthetic inflight ownership refresh"
             );
             if mailbox_activation_occurred {
                 finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
@@ -336,27 +352,47 @@ pub(super) async fn claim_tui_direct_synthetic_turn(
         lease,
         relay_owner_kind,
     );
+    inflight_state.turn_nonce = active_turn_nonce;
     // #4002/#4082: lower-level safety. Normal wiring gates neutral continuation
     // records before this point; if a suppressing class reaches the raw claim API,
     // keep it relay-ownership-only so watcher completion Path B skips it.
     inflight_state.relay_ownership_only =
         classify_injected_prompt(prompt_text).suppresses_user_turn_lifecycle();
-    if let Err(error) = super::super::inflight::save_inflight_state(&inflight_state) {
-        tracing::warn!(
-            provider = %provider.as_str(),
-            channel_id = channel_id.get(),
-            tmux_session_name = %tmux_session_name,
-            error = %error,
-            "failed to save TUI-direct synthetic inflight"
-        );
-        if mailbox_activation_occurred {
-            finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
+    match super::super::inflight::save_inflight_state_if_absent(&inflight_state) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id = channel_id.get(),
+                tmux_session_name = %tmux_session_name,
+                "skipped TUI-direct synthetic inflight because a durable row already exists"
+            );
+            if mailbox_activation_occurred {
+                finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
+            }
+            return TuiDirectSyntheticTurnClaim {
+                relay_owner,
+                claimed: false,
+                turn_start_offset: start_offset,
+            };
         }
-        return TuiDirectSyntheticTurnClaim {
-            relay_owner,
-            claimed: false,
-            turn_start_offset: start_offset,
-        };
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id = channel_id.get(),
+                tmux_session_name = %tmux_session_name,
+                error = %error,
+                "failed to save TUI-direct synthetic inflight"
+            );
+            if mailbox_activation_occurred {
+                finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
+            }
+            return TuiDirectSyntheticTurnClaim {
+                relay_owner,
+                claimed: false,
+                turn_start_offset: start_offset,
+            };
+        }
     }
 
     if mailbox_activation_occurred {
@@ -388,27 +424,6 @@ mod tests {
     use crate::services::discord::mailbox_try_start_turn_kinded;
     use crate::services::turn_orchestrator::ActiveTurnKind;
     use ::serenity::model::id::{MessageId, UserId};
-
-    struct EnvGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn set_root(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
-            Self { previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-            }
-        }
-    }
 
     fn synthetic_owner() -> UserId {
         UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID)
@@ -477,11 +492,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn young_rowless_synthetic_owner_is_not_reclaimed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_200);
@@ -520,11 +532,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn aged_rowless_synthetic_owner_reclaims_and_finalizes_ledger() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_201);
@@ -588,11 +597,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn monitor_auto_turn_slot_is_not_reclaimed_even_when_aged() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_202);
@@ -635,11 +641,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_synthetic_owner_finalized_row_reclaims_for_new_turn() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_203);
@@ -683,11 +686,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_synthetic_owner_replaced_requires_same_tmux_session() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_204);
@@ -721,11 +721,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_synthetic_owner_live_inflight_still_skips_reclaim() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_018_260);
@@ -769,19 +766,17 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn claim_adopting_existing_mailbox_does_not_increment_global_active() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_019_230);
         let tmux = "AgentDesk-claude-4019-adopt";
         let anchor_id = MessageId::new(4_019_330);
-        let _token = seed_synthetic_mailbox_owner(&shared, channel_id, anchor_id).await;
+        let token = seed_synthetic_mailbox_owner(&shared, channel_id, anchor_id).await;
         shared.restart.global_active.store(0, Ordering::Relaxed);
-        let state = synthetic_state(channel_id, anchor_id, tmux, false);
+        let mut state = synthetic_state(channel_id, anchor_id, tmux, false);
+        state.turn_nonce = Some("stale-row-episode".to_string());
         inflight::save_inflight_state(&state).expect("save adopted synthetic inflight");
 
         let mut lease = ExternalInputRelayLease::unassigned(Some(channel_id.get()));
@@ -802,16 +797,17 @@ mod tests {
         );
         let snapshot = crate::services::discord::mailbox_snapshot(&shared, channel_id).await;
         assert_eq!(snapshot.active_user_message_id, Some(anchor_id));
+        assert_eq!(snapshot.active_turn_nonce.as_deref(), token.turn_nonce());
+        let persisted = inflight::load_inflight_state(&provider, channel_id.get())
+            .expect("adopted synthetic inflight must persist");
+        assert_eq!(persisted.turn_nonce.as_deref(), token.turn_nonce());
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn synthetic_finish_session_key_mismatch_preserves_newer_turn() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_019_231);
@@ -845,11 +841,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn synthetic_finish_routes_release_through_finalizer() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_019_232);
@@ -957,11 +950,8 @@ mod tests {
     // starved injection / task-notification turn win relay ownership.
     #[tokio::test(flavor = "current_thread")]
     async fn readopted_from_inflight_real_owner_committed_row_reclaims_for_starved_synthetic() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_050);
@@ -1018,11 +1008,8 @@ mod tests {
     // fix regressing into a live-turn thief.
     #[tokio::test(flavor = "current_thread")]
     async fn readopted_from_inflight_real_owner_live_turn_is_never_stolen() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_060);
@@ -1078,11 +1065,8 @@ mod tests {
     // enforces at the recovery site.
     #[tokio::test(flavor = "current_thread")]
     async fn readopted_from_inflight_id0_row_is_never_reclaimed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_070);
@@ -1125,11 +1109,8 @@ mod tests {
     // freshly-started real-user turn stays untouched.
     #[tokio::test(flavor = "current_thread")]
     async fn real_owner_without_readopted_marker_is_never_reclaimed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_070);
@@ -1173,11 +1154,8 @@ mod tests {
     // real-user turn — and `active_request_owner` would never transition.
     #[tokio::test(flavor = "current_thread")]
     async fn readopted_from_inflight_turn_yields_mailbox_to_injection_and_task_notification() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
 
@@ -1309,11 +1287,8 @@ mod tests {
     /// reclaim — the exact regression a direct-seed test would miss.
     #[tokio::test(flavor = "current_thread")]
     async fn path_b_absent_row_in_ledger_aged_reclaims_and_evicts() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_080);
@@ -1396,11 +1371,8 @@ mod tests {
     /// steal what might be a genuinely live turn.
     #[tokio::test(flavor = "current_thread")]
     async fn path_b_absent_row_not_in_ledger_is_never_reclaimed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_081);
@@ -1437,11 +1409,8 @@ mod tests {
     /// gate for the re-adopted class, exactly as for the #4018 synthetic class.
     #[tokio::test(flavor = "current_thread")]
     async fn path_b_absent_row_in_ledger_young_is_not_reclaimed() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_082);
@@ -1498,11 +1467,8 @@ mod tests {
     /// ledger entry can NEVER authorize stealing the live successor.
     #[tokio::test(flavor = "current_thread")]
     async fn path_b_absent_row_ledger_different_user_msg_id_is_never_stolen() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_083);
@@ -1559,11 +1525,8 @@ mod tests {
     /// have been stolen — this is the test that pins the enforced invariant.
     #[tokio::test(flavor = "current_thread")]
     async fn path_b_absent_row_ledger_live_not_finished_is_never_stolen() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_084);
@@ -1659,11 +1622,8 @@ mod tests {
             "the reclaim finalize context must not be a backstop-cleanup shape — that is the only shape that strips ⏳ / withholds ✅ on a Cancel (#4370 F3b)"
         );
 
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
-        let _env = EnvGuard::set_root(root.path());
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
         let provider = ProviderKind::Claude;
         let shared = crate::services::discord::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_370_090);
@@ -1682,9 +1642,9 @@ mod tests {
 
         // Observe the ACTUAL finalizer-scheduled reactions. In test builds
         // `schedule_reaction_cleanup` records synchronously into a global the
-        // recorder captures; this and the finalizer's own reaction tests all
-        // serialize on `shared_test_env_lock` (held above), so the recorder cannot
-        // race. An empty record set proves the reclaim scheduled NO reaction change
+        // recorder captures; this test's canonical root guard also holds the
+        // crate-wide shared test-environment lock, so the recorder cannot race.
+        // An empty record set proves the reclaim scheduled NO reaction change
         // and therefore cannot suppress the already-pending completion footer / ✅.
         crate::services::discord::turn_finalizer::cleanup::begin_reaction_cleanup_recording();
 
@@ -1966,6 +1926,10 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
                     prompt: record.prompt_text.clone(),
                     source_event_id: None,
                     observed_at: chrono::Utc::now(),
+                    external_input_lease_generation:
+                        crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+                    ssh_direct_observation_generation:
+                        crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
                 };
                 let spawned = maybe_spawn_claude_idle_response_tail(
                     shared.clone(),
@@ -2371,6 +2335,7 @@ pub(super) async fn finish_tui_direct_synthetic_turn_if_current(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_tui_direct_synthetic_inflight_state(
     provider: ProviderKind,
     channel_id: ChannelId,

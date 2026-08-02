@@ -15,12 +15,9 @@ use crate::config::{
 use crate::services::provider::ProviderKind;
 
 fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
-            return expanded.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn load_agentdesk_config_with_path() -> Option<(Config, std::path::PathBuf)> {
@@ -664,10 +661,6 @@ pub(super) fn resolve_workspace(
         .or_else(|| default_workspace(&agent.id))
 }
 
-// #3034: consumed by `settings::content::load_shared_prompt_for_profile`, the
-// profile-aware shared-prompt loader (unwired in prod but a real feature
-// surface). Keep the agentdesk_config resolver (and its fallback) live.
-#[allow(dead_code)]
 pub(super) fn load_shared_prompt_path() -> Option<String> {
     load_agentdesk_config()
         .and_then(|config| config.shared_prompt.as_deref().map(expand_tilde))

@@ -481,6 +481,7 @@ impl AgentChannels {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentChannel {
     Legacy(String),
     Detailed(AgentChannelConfig),
@@ -1030,6 +1031,21 @@ impl ClusterConfig {
 pub struct ClusterNodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_dispatches: Option<u32>,
+    /// Operator-owned exact origin used for authenticated session forwarding to
+    /// this node. Registry advertisements must match this value; they never
+    /// become a fallback trust root when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_forward_origin: Option<String>,
+    /// Permit RFC1918, unique-local, or Tailscale CGNAT addresses for this
+    /// operator-configured origin. Loopback, link-local, multicast, unspecified,
+    /// and metadata addresses remain prohibited.
+    #[serde(default)]
+    pub allow_private_forwarding: bool,
+    /// Permit cleartext HTTP only when every validated target address belongs to
+    /// an explicitly allowed private forwarding range. This is independent from
+    /// private-address consent and therefore requires both flags.
+    #[serde(default)]
+    pub allow_insecure_http_forwarding: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1103,12 +1119,18 @@ fn is_default_dispatch_routing_wake_interval_secs(value: &u64) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClusterIntakeRoutingConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "ClusterIntakeRoutingMode::is_default")]
     pub mode: ClusterIntakeRoutingMode,
+    /// Raw top-level Discord channel IDs opted into owner-authority planning.
+    /// A valid loaded config with an empty list is an explicit known-empty
+    /// opt-out scope; a config that failed to load is represented as unknown by
+    /// the effective routing snapshot instead of by this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_authority_channel_ids: Vec<String>,
     #[serde(default = "default_intake_forward_pre_claim_timeout_secs")]
     pub forward_pre_claim_timeout_secs: u64,
     #[serde(default = "default_intake_stale_claim_recovery_secs")]
@@ -1120,6 +1142,7 @@ impl Default for ClusterIntakeRoutingConfig {
         Self {
             enabled: false,
             mode: ClusterIntakeRoutingMode::default(),
+            owner_authority_channel_ids: Vec::new(),
             forward_pre_claim_timeout_secs: default_intake_forward_pre_claim_timeout_secs(),
             stale_claim_recovery_secs: default_intake_stale_claim_recovery_secs(),
         }
@@ -1261,6 +1284,9 @@ enabled: true
 nodes:
   mac-mini-release:
     max_concurrent_dispatches: 4
+    trusted_forward_origin: "http://mac-mini.tailnet.example:8791"
+    allow_private_forwarding: true
+    allow_insecure_http_forwarding: true
 blackout_windows:
   mac-mini-release:
     - start: "23:00"
@@ -1276,6 +1302,20 @@ dispatch_routing:
             config.nodes["mac-mini-release"].max_concurrent_dispatches,
             Some(4)
         );
+        assert_eq!(
+            config.nodes["mac-mini-release"]
+                .trusted_forward_origin
+                .as_deref(),
+            Some("http://mac-mini.tailnet.example:8791")
+        );
+        assert!(config.nodes["mac-mini-release"].allow_private_forwarding);
+        assert!(config.nodes["mac-mini-release"].allow_insecure_http_forwarding);
+        let defaults: ClusterConfig = serde_yaml::from_str(
+            "nodes:\n  worker-default:\n    trusted_forward_origin: https://worker.example:8791\n",
+        )
+        .expect("new forwarding flags preserve config compatibility");
+        assert!(!defaults.nodes["worker-default"].allow_private_forwarding);
+        assert!(!defaults.nodes["worker-default"].allow_insecure_http_forwarding);
         assert_eq!(
             config.blackout_windows["mac-mini-release"][0]
                 .reason
@@ -1299,6 +1339,12 @@ dispatch_routing:
             12
         );
         assert_eq!(default_config.intake_routing.stale_claim_recovery_secs, 60);
+        assert!(
+            default_config
+                .intake_routing
+                .owner_authority_channel_ids
+                .is_empty()
+        );
 
         let config: ClusterConfig = serde_yaml::from_str(
             r#"
@@ -1306,6 +1352,9 @@ enabled: true
 intake_routing:
   enabled: true
   mode: enforce
+  owner_authority_channel_ids:
+    - "123456789012345678"
+    - "223456789012345678"
   forward_pre_claim_timeout_secs: 13
   stale_claim_recovery_secs: 61
 "#,
@@ -1317,6 +1366,10 @@ intake_routing:
             config.intake_routing.mode,
             ClusterIntakeRoutingMode::Enforce
         );
+        assert_eq!(
+            config.intake_routing.owner_authority_channel_ids,
+            ["123456789012345678", "223456789012345678"]
+        );
         assert_eq!(config.intake_routing.forward_pre_claim_timeout_secs, 13);
         assert_eq!(config.intake_routing.stale_claim_recovery_secs, 61);
 
@@ -1327,6 +1380,14 @@ intake_routing:
 "#,
         );
         assert!(invalid.is_err());
+
+        let unknown_scope_key: Result<ClusterConfig, _> = serde_yaml::from_str(
+            r#"
+intake_routing:
+  owner_authority_channel_idz: ["123"]
+"#,
+        );
+        assert!(unknown_scope_key.is_err());
     }
 }
 
@@ -1506,6 +1567,13 @@ pub struct RuntimeSettingsConfig {
     pub context_compact_percent_codex: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compact_percent_claude: Option<u64>,
+    /// Minimum token occupancy at which context compaction may be requested.
+    ///
+    /// Unset uses the live consumer default (currently 300_000 tokens for
+    /// Claude). This is deliberately provider-neutral because other providers
+    /// can share the lower-bound policy without inheriting Claude's transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_compact_lower_bound_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub claude_gateway_proxy_enabled: bool,
     #[serde(
@@ -1666,6 +1734,7 @@ impl RuntimeSettingsConfig {
             && self.context_compact_percent.is_none()
             && self.context_compact_percent_codex.is_none()
             && self.context_compact_percent_claude.is_none()
+            && self.context_compact_lower_bound_tokens.is_none()
             && !self.claude_gateway_proxy_enabled
             && is_default_claude_gateway_proxy_url(&self.claude_gateway_proxy_url)
             && self.dispatch_poll_sec.is_none()

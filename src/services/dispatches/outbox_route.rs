@@ -37,8 +37,12 @@ impl DispatchFollowupConfig {
     pub(crate) fn from_runtime() -> Self {
         Self {
             discord_api_base: crate::services::dispatches::discord_delivery::discord_api_base_url(),
-            notify_bot_token: crate::credential::read_bot_token("notify"),
-            announce_bot_token: crate::credential::read_bot_token("announce"),
+            notify_bot_token: crate::credential::read_bot_token(
+                crate::services::discord::bot_role::UtilityBotRole::Notify.alias(),
+            ),
+            announce_bot_token: crate::credential::read_bot_token(
+                crate::services::discord::bot_role::UtilityBotRole::Announce.alias(),
+            ),
         }
     }
 }
@@ -1035,6 +1039,7 @@ fn minimal_dispatch_instruction_line(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dispatch_message(
     dispatch_id: &str,
     title: &str,

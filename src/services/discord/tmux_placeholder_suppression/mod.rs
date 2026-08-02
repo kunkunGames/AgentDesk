@@ -355,10 +355,11 @@ mod placeholder_suppression_tests {
     fn footer_status_block() -> String {
         let long_tail = "└ cargo test --lib tmux ".repeat(120);
         let panel = format!(
-            "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nTools\n└ cargo test --lib tmux\nSubagents\n└ review inspect\n{long_tail}"
+            "🟢 진행 중\n턴 트리거: https://discord.com/channels/1/2/3\n턴 시작 : 11-15 07:13:20 (<t:1700000000:R>)\n마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)\n\nTools\n└ cargo test --lib tmux\nSubagents\n└ review inspect\n{long_tail}"
         );
         let status_block = discord::single_message_panel::compose_footer_status_block("⠋", &panel);
-        assert!(status_block.starts_with("⠋ 진행 중 — Claude (<t:1700000000:R>)"));
+        assert!(status_block.starts_with("-# ⠋ 진행 중"));
+        assert!(status_block.contains("마지막 업데이트 : 11-15 07:18:20 (<t:1700000300:R>)"));
         assert!(status_block.contains("Tools"));
         assert!(status_block.contains("Subagents"));
         assert!(status_block.contains('…'));
@@ -374,7 +375,8 @@ mod placeholder_suppression_tests {
     }
 
     fn completion_footer_block() -> String {
-        "Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long background job ✓".to_string()
+        "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long background job ✓"
+            .to_string()
     }
 
     fn completion_footer_only_placeholder() -> String {
@@ -509,7 +511,7 @@ mod placeholder_suppression_tests {
             content,
             format!("visible assistant body\n\n{SUPPRESSED_INTERNAL_LABEL}")
         );
-        assert!(!content.contains("Context   📦"));
+        assert!(!content.contains("📦"));
         assert!(!content.contains("Subagents"));
     }
 

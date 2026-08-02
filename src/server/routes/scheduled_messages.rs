@@ -9,6 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -17,8 +18,12 @@ use sqlx::PgPool;
 use super::AppState;
 use crate::db::scheduled_messages as db;
 use crate::db::scheduled_messages::{
-    CancelOutcome, ListFilters, NewScheduledMessage, ScheduledMessagePatch, ScheduledMessageRow,
+    CancelOutcome, ListFilters, NewScheduledMessage, ScheduledMessageImageAttachment,
+    ScheduledMessagePatch, ScheduledMessageRow,
 };
+use crate::error::{AppError, AppResult, ErrorCode};
+
+mod snapshot_capture;
 
 #[cfg(test)]
 mod postgres_tests;
@@ -28,27 +33,37 @@ mod postgres_tests;
 const PAST_TOLERANCE_SECS: i64 = 60;
 
 /// Info-only scheduled pushes must not wake an agent that owns the target
-/// channel. `announce` is the authoritative agent-to-agent trigger bot, while
-/// `notify` is the canonical non-actionable delivery sink.
-const DEFAULT_SCHEDULED_MESSAGE_BOT: &str = "notify";
+/// channel, so they use the non-actionable utility-bot role.
+const DEFAULT_SCHEDULED_MESSAGE_BOT: &str =
+    crate::services::discord::bot_role::UtilityBotRole::Notify.alias();
 
-type ApiResponse = (StatusCode, Json<JsonValue>);
+const MAX_SCHEDULED_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> ApiResponse {
-    (status, Json(json!({"error": message.into()})))
+type ApiResponse = AppResult<(StatusCode, Json<JsonValue>)>;
+
+fn app_error(status: StatusCode, message: impl Into<String>) -> AppError {
+    let message = message.into();
+    match status {
+        StatusCode::BAD_REQUEST => AppError::bad_request(message),
+        StatusCode::NOT_FOUND => AppError::not_found(message),
+        StatusCode::CONFLICT => AppError::conflict(message),
+        StatusCode::INTERNAL_SERVER_ERROR => AppError::internal(message),
+        StatusCode::SERVICE_UNAVAILABLE => AppError::new(status, ErrorCode::Config, message),
+        _ => AppError::new(status, ErrorCode::Internal, message),
+    }
 }
 
-fn pool_or_unavailable(state: &AppState) -> Result<&PgPool, ApiResponse> {
+fn pool_or_unavailable(state: &AppState) -> Result<&PgPool, AppError> {
     state
         .pg_pool_ref()
-        .ok_or_else(|| error_response(StatusCode::SERVICE_UNAVAILABLE, "postgres pool unavailable"))
+        .ok_or_else(|| app_error(StatusCode::SERVICE_UNAVAILABLE, "postgres pool unavailable"))
 }
 
-fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, ApiResponse> {
+fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(value)
         .map(|parsed| parsed.with_timezone(&Utc))
         .map_err(|error| {
-            error_response(
+            app_error(
                 StatusCode::BAD_REQUEST,
                 format!("{field} must be an RFC3339 timestamp: {error}"),
             )
@@ -82,6 +97,82 @@ pub struct CreateScheduledMessageBody {
     pub source: Option<String>,
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
+    pub image_attachment: Option<ScheduledMessageImageAttachmentBody>,
+    /// #4658: 'fresh' (default) or 'snapshot'. Snapshot freezes the source
+    /// channel's conversation context at creation time.
+    pub context_strategy: Option<String>,
+    /// #4658: 'fail' (default, fail-closed) or 'fresh' (opt-in degrade).
+    pub on_context_failure: Option<String>,
+}
+
+/// JSON-safe upload form for one scheduled-message representative image.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledMessageImageAttachmentBody {
+    pub filename: String,
+    pub content_type: String,
+    pub data_base64: String,
+}
+
+fn validate_image_attachment(
+    body: &ScheduledMessageImageAttachmentBody,
+) -> Result<ScheduledMessageImageAttachment, AppError> {
+    let filename = body.filename.trim();
+    if filename.is_empty()
+        || filename.len() > 128
+        || filename.contains(['/', '\\'])
+        || filename.contains('\0')
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment.filename must be a plain filename up to 128 characters",
+        ));
+    }
+    let content_type = body.content_type.trim().to_ascii_lowercase();
+    if !matches!(
+        content_type.as_str(),
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+    ) {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment.contentType must be image/jpeg, image/png, image/webp, or image/gif",
+        ));
+    }
+    let data = BASE64_STANDARD
+        .decode(body.data_base64.trim())
+        .map_err(|_| {
+            app_error(
+                StatusCode::BAD_REQUEST,
+                "imageAttachment.dataBase64 must be valid standard base64",
+            )
+        })?;
+    if data.is_empty() || data.len() > MAX_SCHEDULED_IMAGE_BYTES {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment must contain between 1 byte and 8 MiB",
+        ));
+    }
+    if !image_signature_matches(&content_type, &data) {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment bytes do not match imageAttachment.contentType",
+        ));
+    }
+    Ok(ScheduledMessageImageAttachment {
+        filename: filename.to_string(),
+        content_type,
+        data,
+    })
+}
+
+fn image_signature_matches(content_type: &str, data: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
+        "image/webp" => data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP",
+        _ => false,
+    }
 }
 
 /// POST /api/scheduled-messages
@@ -89,21 +180,27 @@ pub async fn create_scheduled_message(
     State(state): State<AppState>,
     Json(body): Json<CreateScheduledMessageBody>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
+    let new = validate_create(
+        pool,
+        &body,
+        state.config.cluster.enabled,
+        state.config.cluster.lease_ttl_secs,
+    )
+    .await?;
 
-    let new = match validate_create(pool, &body).await {
-        Ok(new) => new,
-        Err(response) => return response,
-    };
+    // #4658: capture the immutable snapshot atomically with the definition
+    // insert. Success guarantees the snapshot row exists (FK + CHECK); an empty
+    // source channel fails closed with a 400 rather than degrading to fresh.
+    if new.context_strategy == db::CONTEXT_STRATEGY_SNAPSHOT {
+        return snapshot_capture::create_scheduled_message_with_snapshot(pool, new).await;
+    }
 
     match db::insert_scheduled_message_pg(pool, &new).await {
-        Ok(row) => (
+        Ok(row) => Ok((
             StatusCode::CREATED,
             Json(json!({"scheduledMessage": row.to_api_json()})),
-        ),
+        )),
         Err(error) if db::is_unique_violation(&error) => {
             let existing = match new.dedupe_key.as_deref() {
                 Some(key) => db::find_active_by_dedupe_key_pg(pool, key)
@@ -112,28 +209,30 @@ pub async fn create_scheduled_message(
                     .flatten(),
                 None => None,
             };
-            (
+            Ok((
                 StatusCode::CONFLICT,
                 Json(json!({
                     "error": "an active scheduled message with this dedupeKey already exists",
                     "scheduledMessage": existing.map(|row| row.to_api_json()),
                 })),
-            )
+            ))
         }
-        Err(error) => error_response(
+        Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("create scheduled message: {error}"),
-        ),
+        )),
     }
 }
 
 async fn validate_create(
     pool: &PgPool,
     body: &CreateScheduledMessageBody,
-) -> Result<NewScheduledMessage, ApiResponse> {
+    cluster_enabled: bool,
+    cluster_lease_ttl_secs: u64,
+) -> Result<NewScheduledMessage, AppError> {
     let content = body.content.trim();
     if content.is_empty() {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "content must not be empty",
         ));
@@ -145,7 +244,7 @@ async fn validate_create(
         .unwrap_or(db::KIND_PUSH)
         .to_string();
     if delivery_kind != db::KIND_PUSH && delivery_kind != db::KIND_AGENT {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "deliveryKind must be 'push' or 'agent'",
         ));
@@ -156,9 +255,48 @@ async fn validate_create(
         .unwrap_or("fail")
         .to_string();
     if on_agent_failure != "fail" && on_agent_failure != "push_raw" {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "onAgentFailure must be 'fail' or 'push_raw'",
+        ));
+    }
+
+    // #4658: context snapshot strategy. Snapshot is agent-only (push has no
+    // conversation context to freeze).
+    let context_strategy = body
+        .context_strategy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(db::CONTEXT_STRATEGY_FRESH)
+        .to_string();
+    if context_strategy != db::CONTEXT_STRATEGY_FRESH
+        && context_strategy != db::CONTEXT_STRATEGY_SNAPSHOT
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "contextStrategy must be 'fresh' or 'snapshot'",
+        ));
+    }
+    if context_strategy == db::CONTEXT_STRATEGY_SNAPSHOT && delivery_kind != db::KIND_AGENT {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "contextStrategy 'snapshot' is only valid for agent delivery",
+        ));
+    }
+    let on_context_failure = body
+        .on_context_failure
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(db::ON_CONTEXT_FAILURE_FAIL)
+        .to_string();
+    if on_context_failure != db::ON_CONTEXT_FAILURE_FAIL
+        && on_context_failure != db::ON_CONTEXT_FAILURE_FRESH
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "onContextFailure must be 'fail' or 'fresh'",
         ));
     }
 
@@ -183,13 +321,12 @@ async fn validate_create(
             // Recurring definitions self-correct: the pool's contract is "next
             // occurrence of the schedule", not the possibly-stale first slot.
             Some(schedule) => {
-                scheduled_at = crate::services::scheduling::next_due_after(
-                    schedule, &timezone, now,
-                )
-                .map_err(|error| error_response(StatusCode::BAD_REQUEST, format!("{error}")))?;
+                scheduled_at =
+                    crate::services::scheduling::next_due_after(schedule, &timezone, now)
+                        .map_err(|error| app_error(StatusCode::BAD_REQUEST, format!("{error}")))?;
             }
             None => {
-                return Err(error_response(
+                return Err(app_error(
                     StatusCode::BAD_REQUEST,
                     "scheduledAt is in the past and no schedule is set",
                 ));
@@ -199,12 +336,12 @@ async fn validate_create(
         // Validate grammar/timezone up front so the fire path never hits an
         // unparseable recurrence.
         crate::services::scheduling::next_due_after(schedule, &timezone, now)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, format!("{error}")))?;
+            .map_err(|error| app_error(StatusCode::BAD_REQUEST, format!("{error}")))?;
     }
 
     if let Some(expires_at) = expires_at {
         if expires_at <= scheduled_at {
-            return Err(error_response(
+            return Err(app_error(
                 StatusCode::BAD_REQUEST,
                 "expiresAt must be after scheduledAt",
             ));
@@ -240,6 +377,23 @@ async fn validate_create(
     )
     .await?;
 
+    let image_attachment = body
+        .image_attachment
+        .as_ref()
+        .map(validate_image_attachment)
+        .transpose()?;
+    if image_attachment.is_some() && delivery_kind != db::KIND_PUSH {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment is only valid for push delivery",
+        ));
+    }
+    validate_image_attachment_content_length(content, image_attachment.is_some())?;
+    if image_attachment.is_some() {
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
+            .await?;
+    }
+
     Ok(NewScheduledMessage {
         content: content.to_string(),
         title: body.title.clone().filter(|value| !value.trim().is_empty()),
@@ -266,7 +420,53 @@ async fn validate_create(
             .dedupe_key
             .clone()
             .filter(|value| !value.trim().is_empty()),
+        image_attachment,
+        context_strategy,
+        // Captured in the create transaction (snapshot strategy only); NULL here.
+        context_snapshot_id: None,
+        on_context_failure,
     })
+}
+
+fn validate_image_attachment_content_length(
+    content: &str,
+    has_image_attachment: bool,
+) -> Result<(), AppError> {
+    let hard_limit = crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS;
+    if has_image_attachment && content.chars().count() > hard_limit {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "content must not exceed {hard_limit} characters when imageAttachment is provided"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_image_attachment_rollout_ready(
+    pool: &PgPool,
+    cluster_enabled: bool,
+    lease_ttl_secs: u64,
+) -> Result<(), AppError> {
+    if !cluster_enabled {
+        return Ok(());
+    }
+    let ready = db::image_attachment_rollout_ready_pg(pool, lease_ttl_secs)
+        .await
+        .map_err(|error| {
+            app_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("verify scheduled image rollout readiness: {error}"),
+            )
+        })?;
+    if ready {
+        return Ok(());
+    }
+    Err(app_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "imageAttachment is temporarily unavailable while cluster workers upgrade",
+    ))
 }
 
 fn validate_agent_only_fields(
@@ -274,24 +474,24 @@ fn validate_agent_only_fields(
     agent_id: Option<&str>,
     agent_instruction: Option<&str>,
     on_agent_failure_explicit: bool,
-) -> Result<(), ApiResponse> {
+) -> Result<(), AppError> {
     if delivery_kind != db::KIND_PUSH {
         return Ok(());
     }
     if agent_id.is_some() {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "agentId is only valid for agent delivery",
         ));
     }
     if agent_instruction.is_some() {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "agentInstruction is only valid for agent delivery",
         ));
     }
     if on_agent_failure_explicit {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "onAgentFailure is only valid for agent delivery",
         ));
@@ -304,10 +504,10 @@ async fn validate_targeting(
     delivery_kind: &str,
     target_channel_id: Option<&str>,
     agent_id: Option<&str>,
-) -> Result<(), ApiResponse> {
+) -> Result<(), AppError> {
     if delivery_kind == db::KIND_PUSH {
         if target_channel_id.is_none() {
-            return Err(error_response(
+            return Err(app_error(
                 StatusCode::BAD_REQUEST,
                 "targetChannelId is required for push delivery",
             ));
@@ -316,7 +516,7 @@ async fn validate_targeting(
     }
 
     let Some(agent_id) = agent_id else {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             "agentId is required for agent delivery",
         ));
@@ -324,31 +524,31 @@ async fn validate_targeting(
     let bindings = crate::db::agents::load_agent_channel_bindings_pg(pool, agent_id)
         .await
         .map_err(|error| {
-            error_response(
+            app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("load agent bindings: {error}"),
             )
         })?;
     let Some(bindings) = bindings else {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' not found"),
         ));
     };
     let Some(primary_channel) = bindings.primary_channel() else {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' has no primary Discord channel"),
         ));
     };
     if resolve_channel_reference(&primary_channel).is_none() {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' has an invalid primary Discord channel"),
         ));
     }
     if bindings.resolved_primary_provider_kind().is_none() {
-        return Err(error_response(
+        return Err(app_error(
             StatusCode::BAD_REQUEST,
             format!("agent '{agent_id}' has no configured primary provider"),
         ));
@@ -363,14 +563,14 @@ fn resolve_channel_reference(value: &str) -> Option<u64> {
         .filter(|channel_id| *channel_id > 0)
 }
 
-fn normalize_target_channel_id(value: Option<String>) -> Result<Option<String>, ApiResponse> {
+fn normalize_target_channel_id(value: Option<String>) -> Result<Option<String>, AppError> {
     let Some(value) = value else {
         return Ok(None);
     };
     resolve_channel_reference(&value)
         .map(|channel_id| Some(channel_id.to_string()))
         .ok_or_else(|| {
-            error_response(
+            app_error(
                 StatusCode::BAD_REQUEST,
                 "targetChannelId must be a positive Discord channel id or known alias",
             )
@@ -397,10 +597,7 @@ pub async fn list_scheduled_messages(
     State(state): State<AppState>,
     Query(params): Query<ListScheduledMessagesQuery>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     let mut filters = ListFilters {
         status: params.status,
         delivery_kind: params.delivery_kind,
@@ -415,10 +612,7 @@ pub async fn list_scheduled_messages(
         ("before", &params.before, &mut filters.before),
     ] {
         if let Some(value) = source.as_deref() {
-            match parse_rfc3339(field, value) {
-                Ok(parsed) => *slot = Some(parsed),
-                Err(response) => return response,
-            }
+            *slot = Some(parse_rfc3339(field, value)?);
         }
     }
 
@@ -427,15 +621,15 @@ pub async fn list_scheduled_messages(
             let next_cursor = rows.last().map(|row| row.created_at.to_rfc3339());
             let messages: Vec<JsonValue> =
                 rows.iter().map(ScheduledMessageRow::to_api_json).collect();
-            (
+            Ok((
                 StatusCode::OK,
                 Json(json!({"scheduledMessages": messages, "nextCursor": next_cursor})),
-            )
+            ))
         }
-        Err(error) => error_response(
+        Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("list scheduled messages: {error}"),
-        ),
+        )),
     }
 }
 
@@ -444,36 +638,38 @@ pub async fn get_scheduled_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     let row = match db::get_scheduled_message_pg(pool, &id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "scheduled message not found"),
+        Ok(None) => {
+            return Err(app_error(
+                StatusCode::NOT_FOUND,
+                "scheduled message not found",
+            ));
+        }
         Err(error) => {
-            return error_response(
+            return Err(app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("load scheduled message: {error}"),
-            );
+            ));
         }
     };
     let deliveries = match db::list_deliveries_pg(pool, &id, 5, None).await {
         Ok(deliveries) => render_deliveries(pool, deliveries).await,
         Err(error) => {
-            return error_response(
+            return Err(app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("load deliveries: {error}"),
-            );
+            ));
         }
     };
-    (
+    Ok((
         StatusCode::OK,
         Json(json!({
             "scheduledMessage": row.to_api_json(),
             "recentDeliveries": deliveries,
         })),
-    )
+    ))
 }
 
 // ── Patch ───────────────────────────────────────────────────────────────────
@@ -487,54 +683,63 @@ pub async fn patch_scheduled_message(
     Path(id): Path<String>,
     Json(body): Json<JsonValue>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     let Some(body) = body.as_object() else {
-        return error_response(StatusCode::BAD_REQUEST, "body must be a JSON object");
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "body must be a JSON object",
+        ));
     };
 
     let existing = match db::get_scheduled_message_pg(pool, &id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "scheduled message not found"),
+        Ok(None) => {
+            return Err(app_error(
+                StatusCode::NOT_FOUND,
+                "scheduled message not found",
+            ));
+        }
         Err(error) => {
-            return error_response(
+            return Err(app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("load scheduled message: {error}"),
-            );
+            ));
         }
     };
     if existing.status != db::STATUS_SCHEDULED {
-        return error_response(
+        return Err(app_error(
             StatusCode::CONFLICT,
             format!(
                 "only scheduled messages can be edited (current status: {})",
                 existing.status
             ),
-        );
+        ));
     }
 
-    let patch = match build_patch(pool, body, &existing).await {
-        Ok(patch) => patch,
-        Err(response) => return response,
-    };
+    let patch = build_patch(
+        pool,
+        body,
+        &existing,
+        state.config.cluster.enabled,
+        state.config.cluster.lease_ttl_secs,
+    )
+    .await?;
 
     match db::update_scheduled_message_pg(pool, &id, &patch).await {
-        Ok(Some(row)) => (
+        Ok(Some(row)) => Ok((
             StatusCode::OK,
             Json(json!({"scheduledMessage": row.to_api_json()})),
-        ),
+        )),
         // The row left 'scheduled' between the read and the update (fired or
         // was canceled mid-request).
-        Ok(None) => error_response(
+        Ok(None) => Err(app_error(
             StatusCode::CONFLICT,
             "scheduled message is no longer editable",
-        ),
-        Err(error) => error_response(
+        )),
+        Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("save scheduled message: {error}"),
-        ),
+        )),
     }
 }
 
@@ -551,6 +756,25 @@ fn patch_string(
         }
         Some(_) => Err(format!("{key} must be a string or null")),
     }
+}
+
+fn patch_image_attachment(
+    body: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<Option<ScheduledMessageImageAttachment>>, AppError> {
+    let Some(value) = body.get("imageAttachment") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let parsed: ScheduledMessageImageAttachmentBody = serde_json::from_value(value.clone())
+        .map_err(|error| {
+            app_error(
+                StatusCode::BAD_REQUEST,
+                format!("imageAttachment must be an object or null: {error}"),
+            )
+        })?;
+    Ok(Some(Some(validate_image_attachment(&parsed)?)))
 }
 
 fn normalize_effective_scheduled_at(
@@ -581,13 +805,43 @@ fn normalize_effective_scheduled_at(
     Ok(scheduled_at)
 }
 
+/// #4658 F4: the source-binding fields a snapshot definition may NOT change via
+/// PATCH (they would silently retarget the frozen context). Returns the first
+/// offending key present in the patch body, or `None` when the patch is allowed.
+fn snapshot_patch_retarget_key(
+    context_strategy: &str,
+    body: &serde_json::Map<String, JsonValue>,
+) -> Option<&'static str> {
+    if context_strategy != db::CONTEXT_STRATEGY_SNAPSHOT {
+        return None;
+    }
+    ["targetChannelId", "agentId"]
+        .into_iter()
+        .find(|key| body.contains_key(*key))
+}
+
 async fn build_patch(
     pool: &PgPool,
     body: &serde_json::Map<String, JsonValue>,
     existing: &ScheduledMessageRow,
-) -> Result<ScheduledMessagePatch, ApiResponse> {
-    let bad_request = |message: String| error_response(StatusCode::BAD_REQUEST, message);
+    cluster_enabled: bool,
+    cluster_lease_ttl_secs: u64,
+) -> Result<ScheduledMessagePatch, AppError> {
+    let bad_request = |message: String| app_error(StatusCode::BAD_REQUEST, message);
     let mut patch = ScheduledMessagePatch::default();
+
+    // #4658 F4: a snapshot definition's frozen context is bound to the source
+    // channel/agent resolved at capture time. Reject re-targeting it (target
+    // channel or agent) without a re-capture — otherwise one channel's frozen
+    // context would be injected into another channel's turn (cross-channel
+    // bleed). Operators must cancel + recreate to re-capture.
+    if let Some(offending) = snapshot_patch_retarget_key(&existing.context_strategy, body) {
+        return Err(bad_request(format!(
+            "{offending} cannot be changed on a context_strategy='snapshot' reservation \
+             (its frozen context is bound to the source channel captured at creation); \
+             cancel and recreate to re-capture"
+        )));
+    }
 
     if let Some(content) = patch_string(body, "content").map_err(|e| bad_request(e))? {
         let content = content.ok_or_else(|| bad_request("content must not be null".to_string()))?;
@@ -630,6 +884,7 @@ async fn build_patch(
             None => None,
         });
     }
+    patch.image_attachment = patch_image_attachment(body)?;
 
     // Validate the effective (merged) definition with the create rules.
     let effective_kind = existing.delivery_kind.as_str();
@@ -658,6 +913,23 @@ async fn build_patch(
         effective_agent.as_deref(),
     )
     .await?;
+    if patch.image_attachment.as_ref().is_some_and(Option::is_some)
+        && effective_kind != db::KIND_PUSH
+    {
+        return Err(bad_request(
+            "imageAttachment is only valid for push delivery".to_string(),
+        ));
+    }
+    let effective_content = patch.content.as_deref().unwrap_or(&existing.content);
+    let effective_has_image_attachment = match &patch.image_attachment {
+        Some(image_attachment) => image_attachment.is_some(),
+        None => existing.image_data.is_some(),
+    };
+    validate_image_attachment_content_length(effective_content, effective_has_image_attachment)?;
+    if patch.image_attachment.as_ref().is_some_and(Option::is_some) {
+        ensure_image_attachment_rollout_ready(pool, cluster_enabled, cluster_lease_ttl_secs)
+            .await?;
+    }
 
     let mut effective_scheduled_at = patch.scheduled_at.unwrap_or(existing.scheduled_at);
     let effective_schedule = patch
@@ -699,21 +971,19 @@ pub async fn cancel_scheduled_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     match db::cancel_scheduled_message_pg(pool, &id).await {
-        Ok(CancelOutcome::NotFound) => {
-            error_response(StatusCode::NOT_FOUND, "scheduled message not found")
-        }
-        Ok(CancelOutcome::AlreadyTerminal(status)) => (
+        Ok(CancelOutcome::NotFound) => Err(app_error(
+            StatusCode::NOT_FOUND,
+            "scheduled message not found",
+        )),
+        Ok(CancelOutcome::AlreadyTerminal(status)) => Ok((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!("scheduled message already terminal (status: {status})"),
                 "status": status,
             })),
-        ),
+        )),
         Ok(CancelOutcome::Canceled {
             was_firing,
             handoff_started,
@@ -723,15 +993,15 @@ pub async fn cancel_scheduled_message(
             } else {
                 was_firing.then_some("in-flight delivery was canceled before handoff")
             };
-            (
+            Ok((
                 StatusCode::OK,
                 Json(json!({"canceled": true, "note": note})),
-            )
+            ))
         }
-        Err(error) => error_response(
+        Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cancel scheduled message: {error}"),
-        ),
+        )),
     }
 }
 
@@ -740,24 +1010,21 @@ pub async fn trigger_scheduled_message_now(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     if state.health_registry.is_none() {
         match db::get_scheduled_message_pg(pool, &id).await {
             Ok(Some(row)) if row.status == db::STATUS_SCHEDULED => {
-                return error_response(
+                return Err(app_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Discord runtime is unavailable for scheduled delivery",
-                );
+                ));
             }
             Ok(_) => {}
             Err(error) => {
-                return error_response(
+                return Err(app_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("load scheduled message: {error}"),
-                );
+                ));
             }
         }
     }
@@ -773,25 +1040,28 @@ pub async fn trigger_scheduled_message_now(
         Ok(None) => {
             // Missing, terminal, firing, or claimed by a concurrent worker.
             return match db::get_scheduled_message_pg(pool, &id).await {
-                Ok(Some(row)) => error_response(
+                Ok(Some(row)) => Err(app_error(
                     StatusCode::CONFLICT,
                     format!(
                         "scheduled message is not triggerable (status: {})",
                         row.status
                     ),
-                ),
-                Ok(None) => error_response(StatusCode::NOT_FOUND, "scheduled message not found"),
-                Err(error) => error_response(
+                )),
+                Ok(None) => Err(app_error(
+                    StatusCode::NOT_FOUND,
+                    "scheduled message not found",
+                )),
+                Err(error) => Err(app_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("load scheduled message: {error}"),
-                ),
+                )),
             };
         }
         Err(error) => {
-            return error_response(
+            return Err(app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("trigger scheduled message: {error}"),
-            );
+            ));
         }
     };
 
@@ -808,10 +1078,10 @@ pub async fn trigger_scheduled_message_now(
         .await;
     });
 
-    (
+    Ok((
         StatusCode::ACCEPTED,
         Json(json!({"delivery": {"id": delivery_id, "status": "running"}})),
-    )
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -826,36 +1096,35 @@ pub async fn list_scheduled_message_deliveries(
     Path(id): Path<String>,
     Query(params): Query<ListDeliveriesQuery>,
 ) -> ApiResponse {
-    let pool = match pool_or_unavailable(&state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
+    let pool = pool_or_unavailable(&state)?;
     let before = match params.before.as_deref() {
-        Some(value) => match parse_rfc3339("before", value) {
-            Ok(parsed) => Some(parsed),
-            Err(response) => return response,
-        },
+        Some(value) => Some(parse_rfc3339("before", value)?),
         None => None,
     };
     match db::get_scheduled_message_pg(pool, &id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "scheduled message not found"),
+        Ok(None) => {
+            return Err(app_error(
+                StatusCode::NOT_FOUND,
+                "scheduled message not found",
+            ));
+        }
         Err(error) => {
-            return error_response(
+            return Err(app_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("load scheduled message: {error}"),
-            );
+            ));
         }
     }
     match db::list_deliveries_pg(pool, &id, params.limit.unwrap_or(20), before).await {
         Ok(deliveries) => {
             let rendered = render_deliveries(pool, deliveries).await;
-            (StatusCode::OK, Json(json!({"deliveries": rendered})))
+            Ok((StatusCode::OK, Json(json!({"deliveries": rendered}))))
         }
-        Err(error) => error_response(
+        Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("list deliveries: {error}"),
-        ),
+        )),
     }
 }
 
@@ -904,6 +1173,39 @@ async fn render_deliveries(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    // #4658 F4: a snapshot definition cannot be re-targeted via PATCH (target
+    // channel / agent), else the frozen context bleeds into another channel's
+    // turn. Fresh definitions are unaffected. Mutation proof: make
+    // `snapshot_patch_retarget_key` always return None and the snapshot-reject
+    // assertions below fail.
+    #[test]
+    fn snapshot_patch_retarget_is_rejected_but_fresh_and_other_fields_pass() {
+        let with = |k: &str| {
+            let mut m = serde_json::Map::new();
+            m.insert(k.to_string(), json!("123456789"));
+            m
+        };
+        // Snapshot definition: retargeting keys are rejected.
+        assert_eq!(
+            snapshot_patch_retarget_key(db::CONTEXT_STRATEGY_SNAPSHOT, &with("targetChannelId")),
+            Some("targetChannelId")
+        );
+        assert_eq!(
+            snapshot_patch_retarget_key(db::CONTEXT_STRATEGY_SNAPSHOT, &with("agentId")),
+            Some("agentId")
+        );
+        // Non-retargeting fields (e.g. schedule) are allowed on a snapshot def.
+        assert_eq!(
+            snapshot_patch_retarget_key(db::CONTEXT_STRATEGY_SNAPSHOT, &with("schedule")),
+            None
+        );
+        // Fresh definitions may be retargeted freely.
+        assert_eq!(
+            snapshot_patch_retarget_key(db::CONTEXT_STRATEGY_FRESH, &with("targetChannelId")),
+            None
+        );
+    }
 
     #[test]
     fn target_channel_ids_are_normalized_and_invalid_values_rejected() {

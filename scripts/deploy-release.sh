@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- macOS: always run detached (decouple from the invoking shell/session) ---
+# On macOS the deploy restarts the release dcserver mid-run. When invoked from a
+# tmux/agent session's shell, that restart can perturb the caller and, worse,
+# tie the deploy's lifetime to a session that is itself being restarted. Re-exec
+# under nohup, detached from the controlling terminal and job table, so the
+# deploy always runs to completion independently of the caller. Opt out with
+# AGENTDESK_DEPLOY_NO_DETACH=1 (e.g. to stream logs in the foreground).
+if [[ "$(uname)" == "Darwin" \
+      && "${AGENTDESK_DEPLOY_DETACHED:-0}" != "1" \
+      && "${AGENTDESK_DEPLOY_NO_DETACH:-0}" != "1" ]]; then
+    _adk_deploy_log="${AGENTDESK_DEPLOY_LOG:-$HOME/.adk/release/logs/deploy-release.$$.log}"
+    mkdir -p "$(dirname "$_adk_deploy_log")" 2>/dev/null || true
+    AGENTDESK_DEPLOY_DETACHED=1 nohup "$0" "$@" >"$_adk_deploy_log" 2>&1 </dev/null &
+    _adk_deploy_pid=$!
+    disown "$_adk_deploy_pid" 2>/dev/null || true
+    echo "▸ [detach] macOS deploy re-launched detached (pid ${_adk_deploy_pid})"
+    echo "▸ [detach] log: ${_adk_deploy_log}"
+    exit 0
+fi
+
 # ENV (operator-overridable; defaults preserve current behavior):
 #   AGENTDESK_BUNDLE_ID         codesign --identifier value (default: com.itismyfield.agentdesk)
 #   AGENTDESK_DCSERVER_LABEL    release launchd plist Label / file basename.
@@ -115,6 +135,15 @@ STAGED_BINARY=""
 POLICIES_STAGED=""
 LAUNCHD_MIGRATED_STAGED=""
 RELEASE_ROOT_SCRIPTS_STAGED=""
+PG_TUNNEL_PREFLIGHT_PID=""
+PG_TUNNEL_PREFLIGHT_CONNINFO_DIR=""
+PG_TUNNEL_PREFLIGHT_PASSWORD_FILE=""
+PG_TUNNEL_ROLLBACK_ARMED=0
+PG_TUNNEL_ROLLBACK_DIR=""
+PG_TUNNEL_ROLLBACK_JOB_LOADED=0
+PG_TUNNEL_ROLLBACK_MANUAL_KIND="none"
+PG_TUNNEL_ROLLBACK_MANUAL_CONFIG=""
+PG_TUNNEL_ROLLBACK_WRAPPER_SOURCE=""
 DEPLOY_ALL_NODES="${AGENTDESK_DEPLOY_ALL_NODES:-0}"
 DEPLOY_PEERS_OVERRIDE=()
 DEPLOY_PEERS_FILE="${AGENTDESK_DEPLOY_PEERS_FILE:-$ADK_REL/config/deploy-peers.txt}"
@@ -299,6 +328,47 @@ _staged_deploy_binary_path() {
     mktemp "$ADK_REL/bin/agentdesk.deploy.XXXXXX"
 }
 
+# #4727: pure-shell fallback for `server.port` when python3 lacks PyYAML.
+# Non-interactive SSH (peer/mac-mini deploy) may resolve a system python3 without
+# PyYAML on PATH even though the interactive shell's homebrew python3 has it.
+# Parses the simple top-level `server:` mapping agentdesk.yaml uses:
+#   server:
+#     port: 8791
+# Emits the DIRECT-child `server.port` only — matching PyYAML's
+# `config['server']['port']` semantics: it locks onto the server block's
+# child-indent level (set by the block's first child) and accepts a `port:`
+# only at exactly that indent, so a deeper `server.tls.port` is never mis-picked.
+# The value must be a clean integer after stripping a trailing `# comment` and
+# one surrounding quote pair; any non-digit residue (e.g. `8791abc`, `"87-91"`)
+# is rejected → no output → caller fails closed. Range is checked by the caller.
+_extract_yaml_server_port_shell() {
+    local path="$1"
+    [ -f "$path" ] || return 1
+    awk -v sq="'" '
+        function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+        # Top-level key line (column 0, non-comment) delimits the server block.
+        /^[^[:space:]#]/ { in_server = ($0 ~ /^server:[[:space:]]*(#.*)?$/); child_indent = -1; next }
+        in_server {
+            if ($0 ~ /^[[:space:]]*$/) next          # blank line
+            if ($0 ~ /^[[:space:]]*#/) next          # comment line
+            match($0, /^ */); ind = RLENGTH          # leading-space count (YAML forbids tabs)
+            if (child_indent == -1) child_indent = ind   # first child fixes the direct-child level
+            if (ind != child_indent) next            # deeper (grandchild) or shallower — not server.port
+            if ($1 != "port:") next
+            v = $0
+            sub(/#.*/, "", v)                        # strip inline comment
+            sub(/^[[:space:]]*port:[[:space:]]*/, "", v)  # strip the key
+            v = trim(v)
+            # strip a single matching surrounding quote pair (double or single)
+            if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+            else if (length(v) >= 2 && substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq) v = substr(v, 2, length(v) - 2)
+            v = trim(v)
+            if (v ~ /^[0-9]+$/) print v              # clean integer only — else reject
+            exit                                     # exactly one server.port; valid or not, stop
+        }
+    ' "$path"
+}
+
 _resolve_release_server_port() {
     local fallback_port="${AGENTDESK_REL_PORT:-$ADK_DEFAULT_PORT}"
     local config_path=""
@@ -317,7 +387,8 @@ _resolve_release_server_port() {
         return 0
     fi
 
-    if configured_port=$(python3 - "$config_path" "$fallback_port" <<'PY'
+    if python3 -c 'import yaml' >/dev/null 2>&1; then
+        if configured_port=$(python3 - "$config_path" "$fallback_port" <<'PY'
 import sys
 
 import yaml
@@ -334,13 +405,29 @@ if not 1 <= port <= 65535:
     raise ValueError("server.port must be between 1 and 65535")
 print(port)
 PY
-    ); then
+        ); then
+            printf '%s\n' "$configured_port"
+            return 0
+        fi
+
+        echo "✗ Cannot resolve server.port from $config_path: invalid or unreadable configuration; aborting deploy" >&2
+        return 1
+    fi
+
+    # #4727: PyYAML-less python3 on the resolved PATH (typically a peer deploy over
+    # non-interactive SSH). Fall back to a pure-shell parse so the deploy no longer
+    # depends on which python3 is first on PATH.
+    if configured_port=$(_extract_yaml_server_port_shell "$config_path") \
+        && [ -n "$configured_port" ] \
+        && [ "$configured_port" -ge 1 ] 2>/dev/null \
+        && [ "$configured_port" -le 65535 ] 2>/dev/null; then
+        echo "▸ Resolved server.port=$configured_port from $config_path via shell fallback (python3 PyYAML unavailable)" >&2
         printf '%s\n' "$configured_port"
         return 0
     fi
 
-    echo "⚠ Could not resolve server.port from $config_path — using :$fallback_port" >&2
-    printf '%s\n' "$fallback_port"
+    echo "✗ Cannot resolve server.port from $config_path: python3 PyYAML unavailable and shell fallback could not read server.port; aborting deploy" >&2
+    return 1
 }
 
 _notify_channel() {
@@ -815,8 +902,158 @@ _rollback_release_binary() {
     fi
 }
 
+_cleanup_owned_pg_tunnel_preflight() {
+    local pid="${PG_TUNNEL_PREFLIGHT_PID:-}" attempts=0
+    if [ -n "$pid" ]; then
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 25 ]; do
+                sleep 0.2
+                attempts=$((attempts + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+        # Reap the child on every exit path, including an early SSH failure.
+        wait "$pid" 2>/dev/null || true
+    fi
+    PG_TUNNEL_PREFLIGHT_PID=""
+    [ -z "${PG_TUNNEL_PREFLIGHT_CONNINFO_DIR:-}" ] || rm -rf "$PG_TUNNEL_PREFLIGHT_CONNINFO_DIR" 2>/dev/null || true
+    [ -z "${PG_TUNNEL_PREFLIGHT_PASSWORD_FILE:-}" ] || rm -f "$PG_TUNNEL_PREFLIGHT_PASSWORD_FILE" 2>/dev/null || true
+    PG_TUNNEL_PREFLIGHT_CONNINFO_DIR=""
+    PG_TUNNEL_PREFLIGHT_PASSWORD_FILE=""
+}
+
+_reset_pg_tunnel_rollback_state() {
+    PG_TUNNEL_ROLLBACK_ARMED=0
+    PG_TUNNEL_ROLLBACK_DIR=""
+    PG_TUNNEL_ROLLBACK_JOB_LOADED=0
+    PG_TUNNEL_ROLLBACK_MANUAL_KIND="none"
+    PG_TUNNEL_ROLLBACK_MANUAL_CONFIG=""
+    PG_TUNNEL_ROLLBACK_WRAPPER_SOURCE=""
+}
+
+_pg_canonical_listener_absent() {
+    command -v lsof >/dev/null 2>&1 || return 1
+    ! lsof -nP -a -iTCP@127.0.0.1:15432 -sTCP:LISTEN >/dev/null 2>&1
+}
+
+_pg_wait_canonical_listener_absent() {
+    local attempt=0
+    while [ "$attempt" -lt 25 ]; do
+        _pg_canonical_listener_absent && return 0
+        sleep 0.2
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+_pg_report_rollback_recovery() {
+    local backup=${1:-unknown}
+    echo "⚠ PG tunnel rollback incomplete; recovery material retained at $backup" >&2
+    echo "  Manual recovery: clear the canonical :15432 listener, inspect state, then restore" >&2
+    echo "  the saved wrapper/plist and restart the prior launchd or manual tunnel." >&2
+}
+
+_rollback_pg_tunnel_migration() {
+    local domain="${PG_TUNNEL_LAUNCHD_DOMAIN:-}" bin="${PG_TUNNEL_BIN:-}"
+    local plist="${PG_TUNNEL_PLIST_PATH:-}" backup="${PG_TUNNEL_ROLLBACK_DIR:-}"
+    local restore_ok=1 readiness_ok=0
+    [ "${PG_TUNNEL_ROLLBACK_ARMED:-0}" = 1 ] || return 0
+    if [ -z "$domain" ] || [ -z "$bin" ] || [ -z "$plist" ] || [ -z "$backup" ]; then
+        echo "✗ PG tunnel rollback state is incomplete" >&2
+        _pg_report_rollback_recovery "${backup:-unknown}"
+        return 1
+    fi
+
+    echo "↩ Restoring previous PG tunnel state..." >&2
+    launchctl bootout "$domain/${PG_TUNNEL_LABEL:-com.agentdesk.pg-tunnel}" 2>/dev/null || true
+    if ! _pg_wait_canonical_listener_absent; then
+        echo "✗ New PG tunnel listener survived rollback bootout; refusing restore bind race" >&2
+        _pg_report_rollback_recovery "$backup"
+        return 1
+    fi
+    if [ -e "$backup/wrapper" ]; then
+        if ! install -m 0755 "$backup/wrapper" "$bin" 2>/dev/null; then
+            echo "✗ Failed to restore PG tunnel wrapper" >&2
+            restore_ok=0
+        fi
+    elif ! rm -f "$bin" 2>/dev/null; then
+        echo "✗ Failed to remove newly installed PG tunnel wrapper" >&2
+        restore_ok=0
+    fi
+    if [ -e "$backup/plist" ]; then
+        if ! cp -p "$backup/plist" "$plist.tmp" 2>/dev/null \
+          || ! mv -f "$plist.tmp" "$plist" 2>/dev/null; then
+            echo "✗ Failed to restore PG tunnel launchd plist" >&2
+            restore_ok=0
+        fi
+    elif ! rm -f "$plist" "$plist.tmp" 2>/dev/null; then
+        echo "✗ Failed to remove newly installed PG tunnel launchd plist" >&2
+        restore_ok=0
+    fi
+
+    if [ "$restore_ok" = 1 ]; then
+        if [ "${PG_TUNNEL_ROLLBACK_JOB_LOADED:-0}" = 1 ]; then
+            if [ ! -f "$plist" ] || ! launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
+                echo "✗ Failed to restart previous PG tunnel launchd job" >&2
+                restore_ok=0
+            fi
+        elif [ "${PG_TUNNEL_ROLLBACK_MANUAL_KIND:-none}" != none ]; then
+            if [ ! -x "${PG_TUNNEL_ROLLBACK_WRAPPER_SOURCE:-}" ] \
+              || [ ! -r "${PG_TUNNEL_ROLLBACK_MANUAL_CONFIG:-}" ] \
+              || ! "$PG_TUNNEL_ROLLBACK_WRAPPER_SOURCE" --restore-canonical \
+                    "$PG_TUNNEL_ROLLBACK_MANUAL_CONFIG" \
+                    "$PG_TUNNEL_ROLLBACK_MANUAL_KIND" >/dev/null 2>&1; then
+                echo "✗ Failed to restart previous manual PG tunnel" >&2
+                restore_ok=0
+            fi
+        fi
+    fi
+
+    if [ "$restore_ok" = 1 ]; then
+        if [ "${PG_TUNNEL_ROLLBACK_JOB_LOADED:-0}" = 1 ]; then
+            if _pg_sql_probe 15432 12; then
+                readiness_ok=1
+            else
+                echo "✗ Restored PG tunnel did not become SQL-ready on :15432 after launchd throttle window" >&2
+            fi
+            _cleanup_owned_pg_tunnel_preflight
+        elif [ "${PG_TUNNEL_ROLLBACK_MANUAL_KIND:-none}" != none ]; then
+            if _pg_sql_probe 15432; then
+                readiness_ok=1
+            else
+                echo "✗ Restored PG tunnel did not become SQL-ready on :15432" >&2
+            fi
+            _cleanup_owned_pg_tunnel_preflight
+        elif _pg_wait_canonical_listener_absent; then
+            readiness_ok=1
+        else
+            echo "✗ Restored no-tunnel state still has a listener on :15432" >&2
+        fi
+    fi
+    if [ "$restore_ok" = 1 ] && [ "$readiness_ok" = 1 ]; then
+        if rm -rf "$backup" 2>/dev/null; then
+            _reset_pg_tunnel_rollback_state
+            echo "✓ Previous PG tunnel state restored and verified" >&2
+            return 0
+        fi
+        echo "✗ Previous PG tunnel state is verified but rollback backup cleanup failed" >&2
+    fi
+    _pg_report_rollback_recovery "$backup"
+    return 1
+}
+
 _cleanup_on_exit() {
-    local status=$?
+    local status=${1:-$?}
+    trap - EXIT
+    trap '' INT TERM
+    _cleanup_owned_pg_tunnel_preflight
+    if [ "$status" -ne 0 ]; then
+        _rollback_pg_tunnel_migration || true
+        _cleanup_owned_pg_tunnel_preflight
+    fi
     # #3858: if the binary was promoted (ROLLBACK_ARMED) but the deploy never
     # reached DEPLOY_OK, restore the last-known-good binary and restart BEFORE the
     # staging cleanup below. This catches ANY non-zero exit after promotion — an
@@ -843,7 +1080,15 @@ _cleanup_on_exit() {
     _finalize_detached_helper "$status"
 }
 
+_handle_cleanup_signal() {
+    local status=$1
+    _cleanup_on_exit "$status"
+    exit "$status"
+}
+
 trap _cleanup_on_exit EXIT
+trap '_handle_cleanup_signal 130' INT
+trap '_handle_cleanup_signal 143' TERM
 
 _self_hosted_release_session() {
     [ "$DEPLOY_DETACHED_CHILD" != "1" ] || return 1
@@ -1406,18 +1651,19 @@ if [ -f "$REL_LAUNCHD_ENV_FILE" ]; then
     _apply_launchd_env_file_to_shell "$REL_LAUNCHD_ENV_FILE"
 fi
 
-echo "▸ Preflight PostgreSQL migration integrity via doctor..."
-DOCTOR_JSON_TMP=$(mktemp "${TMPDIR:-/tmp}/agentdesk-doctor.XXXXXX.json")
-set +e
-"$SOURCE_BINARY" doctor --json >"$DOCTOR_JSON_TMP" 2>/dev/null
-DOCTOR_RC=$?
-set -e
-if [ ! -s "$DOCTOR_JSON_TMP" ]; then
-    echo "✗ Doctor preflight did not return JSON output."
-    rm -f "$DOCTOR_JSON_TMP"
-    exit 1
-fi
-if ! python3 - "$DOCTOR_JSON_TMP" <<'PY'
+_doctor_postgres_preflight() {
+    local label=$1 doctor_json_tmp doctor_rc
+    doctor_json_tmp=$(mktemp "${TMPDIR:-/tmp}/agentdesk-doctor.XXXXXX.json") || return 1
+    set +e
+    "$SOURCE_BINARY" doctor --json >"$doctor_json_tmp" 2>/dev/null
+    doctor_rc=$?
+    set -e
+    if [ ! -s "$doctor_json_tmp" ]; then
+        echo "✗ ${label} did not return JSON output."
+        rm -f "$doctor_json_tmp"
+        return 1
+    fi
+    if ! python3 - "$doctor_json_tmp" <<'PY'
 import json
 import sys
 
@@ -1451,14 +1697,18 @@ else:
     print(f"✗ Doctor postgres preflight failed: status={status}, detail={detail}, actual={actual}")
 raise SystemExit(1)
 PY
-then
-    rm -f "$DOCTOR_JSON_TMP"
-    exit 1
-fi
-if [ "$DOCTOR_RC" -ne 0 ]; then
-    echo "⚠ doctor command returned non-zero ($DOCTOR_RC), but postgres preflight check passed."
-fi
-rm -f "$DOCTOR_JSON_TMP"
+    then
+        rm -f "$doctor_json_tmp"
+        return 1
+    fi
+    if [ "$doctor_rc" -ne 0 ]; then
+        echo "⚠ doctor command returned non-zero ($doctor_rc), but postgres preflight check passed."
+    fi
+    rm -f "$doctor_json_tmp"
+}
+
+echo "▸ Preflight PostgreSQL migration integrity via doctor..."
+_doctor_postgres_preflight "Doctor preflight"
 
 # Copy and sign the binary before stopping release. This keeps a missing
 # certificate or failed codesign from taking down a healthy dcserver.
@@ -1470,18 +1720,410 @@ xattr -d com.apple.provenance "$STAGED_BINARY" 2>/dev/null || true
 sign_binary_with_fallback "$STAGED_BINARY"
 _clean_release_build_cache_after_staging
 
-# #4381: a deploy restarts dcserver, so a short relay gap is EXPECTED here.
-# Touch the marker the out-of-band relay watchdog checks; while it is fresh
-# (deploy_quiet_secs) the watchdog logs instead of alerting.
-touch "$ADK_REL/logs/relay-watchdog.deploy-marker" 2>/dev/null || true
+# ── Fail-closed PostgreSQL tunnel migration (#4378) ───────────────────────────
+# Prove the new remote Unix-socket route on an alternate local port, then replace
+# and prove the canonical launchd route before dcserver is stopped. A missing
+# machine-local config is a node gate; a present but invalid or unusable config
+# aborts without disrupting dcserver.
+PG_TUNNEL_LABEL="com.agentdesk.pg-tunnel"
+PG_TUNNEL_PLIST_PATH="$HOME/Library/LaunchAgents/$PG_TUNNEL_LABEL.plist"
+PG_TUNNEL_BIN="$ADK_REL/bin/pg-tunnel.sh"
+PG_TUNNEL_CONFIG="$ADK_REL/config/pg-tunnel.env"
+PG_TUNNEL_LAUNCHD_DOMAIN="$(_launchd_domain)"
 
-# Stop release — wait for process to actually die (flock release)
-echo "▸ Stopping release..."
+_pg_xml_escape() {
+    local s=$1
+    s=${s//&/\&amp;}
+    s=${s//</\&lt;}
+    s=${s//>/\&gt;}
+    s=${s//\"/\&quot;}
+    s=${s//\'/\&apos;}
+    printf '%s' "$s"
+}
+
+_install_pg_tunnel_plist() {
+    local label_x bin_x config_x root_x
+    label_x=$(_pg_xml_escape "$PG_TUNNEL_LABEL") || return 1
+    bin_x=$(_pg_xml_escape "$PG_TUNNEL_BIN") || return 1
+    config_x=$(_pg_xml_escape "$PG_TUNNEL_CONFIG") || return 1
+    root_x=$(_pg_xml_escape "$ADK_REL") || return 1
+    mkdir -p "$HOME/Library/LaunchAgents" || return 1
+    cat > "$PG_TUNNEL_PLIST_PATH.tmp" <<PLIST_EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label_x</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$bin_x</string>
+    <string>$config_x</string>
+    <string>-N</string>
+    <string>-T</string>
+    <string>-o</string><string>BatchMode=yes</string>
+    <string>-o</string><string>ConnectTimeout=10</string>
+    <string>-o</string><string>ServerAliveInterval=15</string>
+    <string>-o</string><string>ServerAliveCountMax=3</string>
+    <string>-o</string><string>ExitOnForwardFailure=yes</string>
+    <string>-L</string><string>127.0.0.1:15432:/tmp/.s.PGSQL.5432</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$root_x/logs/pg-tunnel.launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$root_x/logs/pg-tunnel.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>AGENTDESK_ROOT_DIR</key><string>$root_x</string>
+  </dict>
+</dict>
+</plist>
+PLIST_EOF
+    mv -f "$PG_TUNNEL_PLIST_PATH.tmp" "$PG_TUNNEL_PLIST_PATH" || return 1
+}
+
+_pg_write_probe_conninfo() {
+    local local_port=$1 output_dir=$2 password_output=$3
+    local config_path="$ADK_REL/config/agentdesk.yaml"
+    command -v ruby >/dev/null 2>&1 || return 1
+    if [ -n "${DATABASE_URL:-}" ]; then
+        DATABASE_URL="$DATABASE_URL" ruby -ruri - "$local_port" "$output_dir" "$password_output" \
+            2>/dev/null <<'RUBY'
+port, output_dir, password_output = ARGV
+uri = URI.parse(ENV.fetch("DATABASE_URL"))
+raise "unsupported database URL scheme" unless %w[postgres postgresql].include?(uri.scheme)
+decode = ->(value) { URI::DEFAULT_PARSER.unescape(value.to_s) }
+host = uri.hostname.to_s
+user = decode.call(uri.user)
+name = decode.call(uri.path.to_s.sub(%r{\A/}, ""))
+password = decode.call(uri.password) if uri.password
+option_env = {
+  "application_name" => "PGAPPNAME",
+  "channel_binding" => "PGCHANNELBINDING",
+  "client_encoding" => "PGCLIENTENCODING",
+  "connect_timeout" => "PGCONNECT_TIMEOUT",
+  "fallback_application_name" => "PGAPPNAME",
+  "gssencmode" => "PGGSSENCMODE",
+  "krbsrvname" => "PGKRBSRVNAME",
+  "options" => "PGOPTIONS",
+  "require_auth" => "PGREQUIREAUTH",
+  "sslcert" => "PGSSLCERT",
+  "sslcrl" => "PGSSLCRL",
+  "sslcrldir" => "PGSSLCRLDIR",
+  "sslkey" => "PGSSLKEY",
+  "sslmode" => "PGSSLMODE",
+  "sslrootcert" => "PGSSLROOTCERT",
+  "ssl_max_protocol_version" => "PGSSLMAXPROTOCOLVERSION",
+  "ssl_min_protocol_version" => "PGSSLMINPROTOCOLVERSION",
+  "target_session_attrs" => "PGTARGETSESSIONATTRS"
+}
+fields = {}
+uri.query.to_s.split("&", -1).each do |pair|
+  next if pair.empty?
+  encoded_key, encoded_value = pair.split("=", 2)
+  key = decode.call(encoded_key)
+  value = decode.call(encoded_value)
+  case key
+  when "password"
+    password = value
+  when "user"
+    user = value
+  when "dbname"
+    name = value
+  when "host", "hostaddr", "port"
+    next
+  else
+    env_name = option_env[key]
+    fields[env_name] = value if env_name
+  end
+end
+raise "database host, user, or name missing" if host.empty? || user.empty? || name.empty?
+fields.merge!("PGHOST" => host, "PGHOSTADDR" => "127.0.0.1",
+              "PGPORT" => Integer(port, 10).to_s,
+              "PGUSER" => user, "PGDATABASE" => name)
+raise "NUL is not allowed in PostgreSQL settings" if fields.values.any? { |value| value.include?("\0") }
+fields.each do |env_name, value|
+  File.open(File.join(output_dir, env_name), File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |file|
+    file.write(value)
+  end
+end
+if password
+  raise "NUL is not allowed in PostgreSQL password" if password.include?("\0")
+  escape = lambda do |value|
+    value.to_s.gsub("\\") { "\\\\" }.gsub(":") { "\\:" }
+  end
+  File.open(password_output, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |file|
+    file.write([host, port, name, user, password].map { |value| escape.call(value) }.join(":") + "\n")
+  end
+end
+RUBY
+        return $?
+    fi
+    [ -r "$config_path" ] || return 1
+    ruby -ryaml - "$config_path" "$local_port" "$output_dir" "$password_output" \
+        2>/dev/null <<'RUBY'
+config_path, port, output_dir, password_output = ARGV
+config = YAML.safe_load(File.read(config_path), aliases: true) || {}
+db = config.fetch("database", {})
+raise "database disabled" unless db["enabled"] == true
+host = db.fetch("host").to_s
+user = db.fetch("user").to_s
+name = db.fetch("dbname").to_s
+raise "database host, user, or name missing" if host.empty? || user.empty? || name.empty?
+fields = { "PGHOST" => host, "PGHOSTADDR" => "127.0.0.1",
+           "PGPORT" => Integer(port, 10).to_s,
+           "PGUSER" => user, "PGDATABASE" => name }
+raise "NUL is not allowed in PostgreSQL settings" if fields.values.any? { |value| value.include?("\0") }
+fields.each do |env_name, value|
+  File.open(File.join(output_dir, env_name), File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |file|
+    file.write(value)
+  end
+end
+if db.key?("password") && !db["password"].nil?
+  password = db["password"].to_s
+  raise "NUL is not allowed in PostgreSQL password" if password.include?("\0")
+  escape = lambda do |value|
+    value.to_s.gsub("\\") { "\\\\" }.gsub(":") { "\\:" }
+  end
+  File.open(password_output, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |file|
+    file.write([host, port, name, user, password].map { |value| escape.call(value) }.join(":") + "\n")
+  end
+end
+RUBY
+}
+
+_pg_sql_probe() {
+    local local_port=$1 minimum_wait_secs=${2:-5} conninfo_dir password_file
+    local attempt=0 max_attempts name value connect_timeout_seen=0
+    local -a psql_env=(env -u DATABASE_URL)
+    local -a clear_names=(
+        PGAPPNAME PGCHANNELBINDING PGCLIENTENCODING PGCONNECT_TIMEOUT PGDATABASE
+        PGGSSENCMODE PGHOST PGHOSTADDR PGKEEPALIVES PGKEEPALIVESCOUNT
+        PGKEEPALIVESIDLE PGKEEPALIVESINTERVAL PGKRBSRVNAME PGLOADBALANCEHOSTS
+        PGOPTIONS PGPASSFILE PGPASSWORD PGPORT PGREQUIREAUTH PGSERVICE
+        PGSERVICEFILE PGSSLCERT PGSSLCRL PGSSLCRLDIR PGSSLKEY
+        PGSSLMAXPROTOCOLVERSION PGSSLMINPROTOCOLVERSION PGSSLMODE
+        PGSSLNEGOTIATION PGSSLROOTCERT PGTARGETSESSIONATTRS PGTCPUSER_TIMEOUT
+        PGUSER
+    )
+    local -a conninfo_names=(
+        PGAPPNAME PGCHANNELBINDING PGCLIENTENCODING PGCONNECT_TIMEOUT
+        PGGSSENCMODE PGHOST PGHOSTADDR PGKRBSRVNAME PGOPTIONS PGPORT
+        PGREQUIREAUTH PGSSLCERT PGSSLCRL PGSSLCRLDIR PGSSLKEY
+        PGSSLMAXPROTOCOLVERSION PGSSLMINPROTOCOLVERSION PGSSLMODE
+        PGSSLROOTCERT PGTARGETSESSIONATTRS PGUSER PGDATABASE
+    )
+    command -v psql >/dev/null 2>&1 || return 1
+    for name in "${clear_names[@]}"; do
+        psql_env+=(-u "$name")
+    done
+    conninfo_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentdesk-pg-probe.XXXXXX") || return 1
+    PG_TUNNEL_PREFLIGHT_CONNINFO_DIR="$conninfo_dir"
+    if ! password_file=$(mktemp "${TMPDIR:-/tmp}/agentdesk-pgpass.XXXXXX"); then
+        rm -rf "$conninfo_dir" 2>/dev/null || true
+        PG_TUNNEL_PREFLIGHT_CONNINFO_DIR=""
+        return 1
+    fi
+    PG_TUNNEL_PREFLIGHT_PASSWORD_FILE="$password_file"
+    chmod 700 "$conninfo_dir" || return 1
+    chmod 600 "$password_file" || return 1
+    _pg_write_probe_conninfo "$local_port" "$conninfo_dir" "$password_file" || return 1
+    for name in "${conninfo_names[@]}"; do
+        if [ -f "$conninfo_dir/$name" ]; then
+            value=$(<"$conninfo_dir/$name")
+            psql_env+=("$name=$value")
+            [ "$name" != PGCONNECT_TIMEOUT ] || connect_timeout_seen=1
+        fi
+    done
+    if [ "$connect_timeout_seen" = 0 ]; then
+        psql_env+=("PGCONNECT_TIMEOUT=5")
+    fi
+    if [ -s "$password_file" ]; then
+        psql_env+=("PGPASSFILE=$password_file")
+    else
+        psql_env+=("PGPASSFILE=/dev/null")
+    fi
+    max_attempts=$((minimum_wait_secs * 4))
+    [ "$max_attempts" -ge 20 ] || max_attempts=20
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        if "${psql_env[@]}" psql --no-psqlrc \
+          -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+            rm -rf "$conninfo_dir"
+            rm -f "$password_file"
+            PG_TUNNEL_PREFLIGHT_CONNINFO_DIR=""
+            PG_TUNNEL_PREFLIGHT_PASSWORD_FILE=""
+            return 0
+        fi
+        sleep 0.25
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+_migrate_pg_tunnel_before_release_stop() {
+    local probe_port wrapper_source="$REPO/scripts/pg_tunnel.sh"
+    [ -f "$PG_TUNNEL_CONFIG" ] || {
+        echo "▸ PG tunnel config absent: $PG_TUNNEL_CONFIG"
+        echo "  Supervisor NOT armed on this node (machine-local node gate)."
+        return 0
+    }
+    [ -x "$wrapper_source" ] || { echo "✗ PG tunnel wrapper missing: $wrapper_source"; return 1; }
+    "$wrapper_source" --check-config "$PG_TUNNEL_CONFIG" || {
+        echo "✗ PG tunnel config invalid: $PG_TUNNEL_CONFIG"
+        return 1
+    }
+
+    probe_port=$((20000 + ($$ % 20000)))
+    echo "▸ Proving remote PostgreSQL Unix-socket route on alternate port..."
+    "$wrapper_source" --probe-remote "$PG_TUNNEL_CONFIG" "$probe_port" \
+        >/dev/null 2>&1 &
+    PG_TUNNEL_PREFLIGHT_PID=$!
+    if ! _pg_sql_probe "$probe_port"; then
+        echo "✗ Remote PostgreSQL Unix-socket SQL probe failed"
+        _cleanup_owned_pg_tunnel_preflight
+        return 1
+    fi
+    _cleanup_owned_pg_tunnel_preflight
+
+    PG_TUNNEL_ROLLBACK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/agentdesk-pg-rollback.XXXXXX") || return 1
+    if [ -e "$PG_TUNNEL_BIN" ] \
+      && ! cp -p "$PG_TUNNEL_BIN" "$PG_TUNNEL_ROLLBACK_DIR/wrapper"; then
+        echo "✗ Failed to snapshot existing PG tunnel wrapper"
+        rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+        _reset_pg_tunnel_rollback_state
+        return 1
+    fi
+    if [ -e "$PG_TUNNEL_PLIST_PATH" ] \
+      && ! cp -p "$PG_TUNNEL_PLIST_PATH" "$PG_TUNNEL_ROLLBACK_DIR/plist"; then
+        echo "✗ Failed to snapshot existing PG tunnel launchd plist"
+        rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+        _reset_pg_tunnel_rollback_state
+        return 1
+    fi
+    if ! cp -p "$PG_TUNNEL_CONFIG" "$PG_TUNNEL_ROLLBACK_DIR/config"; then
+        echo "✗ Failed to snapshot PG tunnel machine config"
+        rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+        _reset_pg_tunnel_rollback_state
+        return 1
+    fi
+    PG_TUNNEL_ROLLBACK_WRAPPER_SOURCE="$wrapper_source"
+    PG_TUNNEL_ROLLBACK_MANUAL_CONFIG="$PG_TUNNEL_ROLLBACK_DIR/config"
+    PG_TUNNEL_ROLLBACK_JOB_LOADED=0
+    PG_TUNNEL_ROLLBACK_MANUAL_KIND="none"
+    if launchctl print "$PG_TUNNEL_LAUNCHD_DOMAIN/$PG_TUNNEL_LABEL" >/dev/null 2>&1; then
+        if [ ! -f "$PG_TUNNEL_ROLLBACK_DIR/wrapper" ] \
+          || [ ! -f "$PG_TUNNEL_ROLLBACK_DIR/plist" ]; then
+            echo "✗ Loaded PG tunnel job lacks restorable wrapper/plist snapshots"
+            rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+            _reset_pg_tunnel_rollback_state
+            return 1
+        fi
+        PG_TUNNEL_ROLLBACK_JOB_LOADED=1
+    else
+        if ! PG_TUNNEL_ROLLBACK_MANUAL_KIND=$(
+            "$wrapper_source" --canonical-kind 2>/dev/null
+        ); then
+            echo "✗ Failed to snapshot existing manual PG tunnel state"
+            rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+            _reset_pg_tunnel_rollback_state
+            return 1
+        fi
+        case "$PG_TUNNEL_ROLLBACK_MANUAL_KIND" in
+            none|tcp|unix) ;;
+            *)
+                echo "✗ Refusing unknown PG tunnel rollback kind"
+                rm -rf "$PG_TUNNEL_ROLLBACK_DIR" 2>/dev/null || true
+                _reset_pg_tunnel_rollback_state
+                return 1
+                ;;
+        esac
+    fi
+    PG_TUNNEL_ROLLBACK_ARMED=1
+    echo "▸ PG tunnel rollback armed; recovery material: $PG_TUNNEL_ROLLBACK_DIR"
+
+    install -m 0755 "$wrapper_source" "$PG_TUNNEL_BIN" || return 1
+    _install_pg_tunnel_plist || return 1
+    xattr -d com.apple.quarantine "$PG_TUNNEL_PLIST_PATH" 2>/dev/null || true
+    launchctl bootout "$PG_TUNNEL_LAUNCHD_DOMAIN/$PG_TUNNEL_LABEL" 2>/dev/null || true
+    if ! "$wrapper_source" --take-over-canonical; then
+        echo "✗ Failed to synchronously take over the canonical PG tunnel"
+        return 1
+    fi
+    if ! _pg_wait_canonical_listener_absent; then
+        echo "✗ Canonical PG tunnel listener survived synchronous takeover"
+        return 1
+    fi
+    if ! launchctl bootstrap "$PG_TUNNEL_LAUNCHD_DOMAIN" "$PG_TUNNEL_PLIST_PATH"; then
+        echo "✗ PG tunnel bootstrap failed"
+        return 1
+    fi
+    echo "▸ Proving canonical PostgreSQL tunnel readiness on :15432..."
+    if ! _pg_sql_probe 15432; then
+        echo "✗ Canonical PostgreSQL tunnel SQL readiness failed"
+        return 1
+    fi
+
+    rm -rf "$PG_TUNNEL_ROLLBACK_DIR" || return 1
+    _reset_pg_tunnel_rollback_state
+    echo "✓ PG tunnel migrated and SQL-ready before release stop"
+}
+
+_migrate_pg_tunnel_before_release_stop
+
 LOCK_FILE="$ADK_REL/runtime/dcserver.lock"
 OLD_PID=""
 if [ -f "$LOCK_FILE" ]; then
     OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
 fi
+
+# Apply the forward-only database boundary before requesting restart_pending.
+# The runtime may consume a persisted restart request and exit on its own, so no
+# drain marker or self-exit trigger may exist when candidate migration runs. The
+# tunnel migration above is a fail-closed, SQL-ready prerequisite; its EXIT trap
+# restores the previous tunnel state if that prerequisite itself fails.
+echo "▸ Applying release PostgreSQL migrations before restart drain..."
+if ! "$STAGED_BINARY" release-migrate-postgres; then
+    echo "✗ Release PostgreSQL migration failed before restart was requested; the existing runtime remains active."
+    exit 1
+fi
+
+# Migration 0100 is now a forward-only binary floor: once it commits, a pre-0100
+# binary cannot restart because SQLx rejects a database migration newer than its
+# embedded manifest. From this point onward failures must fail forward with the
+# staged 0100-aware binary; do not claim that the old runtime can be preserved.
+# Fence new relay admissions and let dcserver atomically persist each in-flight
+# delivery frontier before launchd is allowed to stop it. The runtime consumes
+# restart_pending only after queue/checkpoint state and DrainRestart markers are
+# durable; the replacement watcher then resumes from those committed offsets.
+AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS=1
+export AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS
+if ! request_restart_drain_mode_or_fail \
+    "release" "$PLIST_REL" "$REL_PORT" "$ADK_REL/runtime" "deploy-release"; then
+    exit 1
+fi
+RESTART_REQUEST_NONCE="${AGENTDESK_RESTART_REQUEST_NONCE:-}"
+if [ "${AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED:-0}" != "1" ]; then
+    if [ -z "$RESTART_REQUEST_NONCE" ]; then
+        echo "✗ [gate] release restart request nonce missing" >&2
+        clear_restart_drain_mode "$ADK_REL/runtime" || true
+        exit 1
+    fi
+    if ! wait_for_restart_persistence_or_fail \
+        "release" "$ADK_REL/runtime" "$RESTART_REQUEST_NONCE" 30; then
+        exit 1
+    fi
+fi
+
+# A planned restart no longer suppresses transcript gaps: the watchdog's durable
+# pre-restart authority must remain observable until Discord delivery catches up.
+# Remove a marker left by an older deploy so its quiet window cannot mask this
+# restart boundary after the runtime has proved its replay frontier durable.
+rm -f "$ADK_REL/logs/relay-watchdog.deploy-marker" 2>/dev/null || true
+rm -f "$ADK_REL/runtime/restart_persisted" 2>/dev/null || true
+
+# Stop release only after migration and the durable persistence acknowledgement.
+echo "▸ Stopping release..."
 LAUNCHD_DOMAIN="$(_launchd_domain)"
 launchctl bootout "$LAUNCHD_DOMAIN/$PLIST_REL" 2>/dev/null || true
 if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
@@ -2180,27 +2822,63 @@ _post_deploy_smoke_check_fail_closed_warn_rate() {
     fi
 }
 
-_post_deploy_smoke_check_relay_round_trip() {
-    local cluster_standby channel_id relay_output relay_log resolve_rc cell_busy cell_guard_rc
-    local config_path="$ADK_REL/config/agentdesk.yaml"
-    if [ -z "$POST_DEPLOY_SMOKE_HEALTH_BODY" ] || [ ! -s "$POST_DEPLOY_SMOKE_HEALTH_BODY" ]; then
-        _post_deploy_smoke_fail "relay E-1: /api/health body unavailable for standby gate" || true
+# #5026: resolve the `cluster_standby` flag as a *value*, never through `jq -e`.
+#
+# `jq -e` sets exit status 1 whenever the last output value is `false` or
+# `null`, and `false` is exactly the healthy non-standby value. The previous
+# `-e` spelling therefore reported "could not prove non-standby" on every
+# normal node even though it had extracted the flag correctly. Combined with
+# the deliberate skip on `cluster_standby=true`, no input value could ever
+# reach the round-trip below — the relay check was unreachable on every
+# deploy, which is why it never caught a relay regression.
+#
+# Echoes `true`/`false` on stdout and returns non-zero only when the flag is
+# genuinely unreadable (missing body, malformed JSON, non-boolean field).
+# jq stderr is left to the caller's redirect so evidence capture is unchanged.
+_post_deploy_smoke_resolve_cluster_standby() {
+    local health_body="$1" value
+    if [ -z "$health_body" ] || [ ! -s "$health_body" ]; then
         return 1
     fi
-    if ! cluster_standby=$(jq -er '
+    if ! value=$(jq -r '
         if (.cluster_standby | type) == "boolean" then
             .cluster_standby
         else
             error("cluster_standby is not boolean")
         end
-    ' "$POST_DEPLOY_SMOKE_HEALTH_BODY" 2>> "$POST_DEPLOY_SMOKE_EVIDENCE"); then
-        _post_deploy_smoke_fail "relay E-1: could not prove node is non-standby; round-trip skipped" || true
+    ' "$health_body"); then
+        return 1
+    fi
+    case "$value" in
+        true | false)
+            printf '%s\n' "$value"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_post_deploy_smoke_check_relay_round_trip() {
+    local cluster_standby channel_id relay_output relay_log resolve_rc cell_busy cell_guard_rc
+    local config_path="$ADK_REL/config/agentdesk.yaml"
+    if [ -z "$POST_DEPLOY_SMOKE_HEALTH_BODY" ] || [ ! -s "$POST_DEPLOY_SMOKE_HEALTH_BODY" ]; then
+        _post_deploy_smoke_fail "relay E-1 NOT VERIFIED: /api/health body unavailable for standby gate; round-trip did not run (smoke coverage gap, not a relay failure)" || true
+        return 1
+    fi
+    if ! cluster_standby=$(_post_deploy_smoke_resolve_cluster_standby \
+        "$POST_DEPLOY_SMOKE_HEALTH_BODY" 2>> "$POST_DEPLOY_SMOKE_EVIDENCE"); then
+        _post_deploy_smoke_fail "relay E-1 NOT VERIFIED: cluster_standby missing or non-boolean in /api/health; round-trip did not run (smoke coverage gap, not a relay failure)" || true
         return 1
     fi
     if [ "$cluster_standby" = "true" ]; then
         _post_deploy_smoke_note "relay E-1=skipped cluster_standby=true (no standby injection)" || return 1
         return 0
     fi
+    # Positive breadcrumb (#5026): the standby gate passed and the round-trip is
+    # actually executing. Absence of this line in a deploy log means the relay
+    # check did not run, which is what silently held for every prior deploy.
+    _post_deploy_smoke_note "relay E-1=round-trip proceeding cluster_standby=false" || return 1
 
     # Reuse the #3729 wrapper's config resolver: channel ids remain
     # machine-local agentdesk.yaml data and are never hard-coded here.
@@ -2460,6 +3138,10 @@ WATCHDOG_LABEL="com.agentdesk.relay-watchdog"
 WATCHDOG_PLIST_PATH="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
 WATCHDOG_BIN="$ADK_REL/bin/relay-watchdog.py"
 WATCHDOG_CONFIG="$ADK_REL/config/relay-watchdog.json"
+WATCHDOG_SCRIPT_CHANGED=1
+if [ -f "$WATCHDOG_BIN" ] && cmp -s "$REPO/scripts/relay_watchdog.py" "$WATCHDOG_BIN"; then
+    WATCHDOG_SCRIPT_CHANGED=0
+fi
 echo "▸ Installing out-of-band relay watchdog (#4381)..."
 if install -m 0755 "$REPO/scripts/relay_watchdog.py" "$WATCHDOG_BIN"; then
     if [ -f "$WATCHDOG_CONFIG" ]; then
@@ -2524,19 +3206,64 @@ PLIST_EOF
             echo "⚠ Relay watchdog requires python3 >= 3.10 (MIN_PYTHON in relay_watchdog.py);"
             echo "  resolved runner: $WATCHDOG_PYTHON — NOT armed (arming would KeepAlive-crash-loop)."
             echo "  Install a newer python3 (e.g. brew install python) and redeploy."
-        elif _install_relay_watchdog_plist; then
-            xattr -d com.apple.quarantine "$WATCHDOG_PLIST_PATH" 2>/dev/null || true
-            # bootout+bootstrap (not kickstart) so a script/plist change is picked up.
-            launchctl bootout "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" 2>/dev/null || true
-            if launchctl bootstrap "$LAUNCHD_DOMAIN" "$WATCHDOG_PLIST_PATH"; then
-                echo "✓ Relay watchdog armed ($WATCHDOG_LABEL)"
-            else
-                echo "⚠ Relay watchdog bootstrap FAILED — relay gaps will go unwatched"
-            fi
         else
-            rm -f "$WATCHDOG_PLIST_PATH.tmp" 2>/dev/null || true
-            echo "⚠ Relay watchdog plist write FAILED ($WATCHDOG_PLIST_PATH) — not armed"
-            echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
+            WATCHDOG_PLIST_BEFORE="$WATCHDOG_PLIST_PATH.deploy-prev.$$"
+            rm -f "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
+            if [ -f "$WATCHDOG_PLIST_PATH" ]; then
+                cp -p "$WATCHDOG_PLIST_PATH" "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
+            fi
+            if _install_relay_watchdog_plist; then
+                WATCHDOG_PLIST_CHANGED=1
+                if [ -f "$WATCHDOG_PLIST_BEFORE" ] \
+                  && cmp -s "$WATCHDOG_PLIST_BEFORE" "$WATCHDOG_PLIST_PATH"; then
+                    WATCHDOG_PLIST_CHANGED=0
+                fi
+                rm -f "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
+                xattr -d com.apple.quarantine "$WATCHDOG_PLIST_PATH" 2>/dev/null || true
+                _wd_loaded=0
+                if launchctl print "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" >/dev/null 2>&1; then
+                    _wd_loaded=1
+                fi
+                if [ "$WATCHDOG_SCRIPT_CHANGED" = "0" ] \
+                  && [ "$WATCHDOG_PLIST_CHANGED" = "0" ] \
+                  && [ "$_wd_loaded" = "1" ]; then
+                    echo "✓ Relay watchdog retained ($WATCHDOG_LABEL; durable authority uninterrupted)"
+                else
+                    # Restart only when deployment material changed or the job is absent.
+                    # The watermark lives in the atomic state file, so replacement loads
+                    # the same pre-restart transcript authority before its first tick.
+                    launchctl bootout "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" 2>/dev/null || true
+                    _wd_bootout_polls=0
+                    while launchctl print "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" >/dev/null 2>&1; do
+                        if [ "$_wd_bootout_polls" -ge 12 ]; then
+                            echo "⚠ Relay watchdog still unloading ~6s after bootout — bootstrapping anyway"
+                            break
+                        fi
+                        sleep 0.5
+                        _wd_bootout_polls=$((_wd_bootout_polls + 1))
+                    done
+                    _wd_armed=0
+                    for _wd_attempt in 1 2 3; do
+                        if launchctl bootstrap "$LAUNCHD_DOMAIN" "$WATCHDOG_PLIST_PATH"; then
+                            _wd_armed=1
+                            break
+                        fi
+                        if [ "$_wd_attempt" -lt 3 ]; then
+                            echo "⚠ Relay watchdog bootstrap attempt $_wd_attempt failed — retrying in 2s"
+                            sleep 2
+                        fi
+                    done
+                    if [ "$_wd_armed" = "1" ]; then
+                        echo "✓ Relay watchdog armed ($WATCHDOG_LABEL)"
+                    else
+                        echo "⚠ Relay watchdog bootstrap FAILED after 3 attempts — relay gaps will go unwatched"
+                    fi
+                fi
+            else
+                rm -f "$WATCHDOG_PLIST_PATH.tmp" "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
+                echo "⚠ Relay watchdog plist write FAILED ($WATCHDOG_PLIST_PATH) — not armed"
+                echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
+            fi
         fi
     else
         echo "⚠ Relay watchdog config missing: $WATCHDOG_CONFIG"
@@ -2546,101 +3273,6 @@ PLIST_EOF
     fi
 else
     echo "⚠ Relay watchdog staging FAILED (source: $REPO/scripts/relay_watchdog.py)"
-fi
-
-# ── Consumer-owned PostgreSQL SSH tunnel supervisor (#4378) ──────────────────
-# This is deliberately a separate launchd lifetime from dcserver: dcserver may
-# crash-loop while PG is absent (#4379), but the process that restores PG must
-# remain alive.  Like the relay watchdog above, this block is after DEPLOY_OK
-# and entirely fail-open so an ops-side install failure cannot turn a healthy,
-# health-confirmed binary deploy into a rollback or skip peer propagation.
-PG_TUNNEL_LABEL="com.agentdesk.pg-tunnel"
-PG_TUNNEL_PLIST_PATH="$HOME/Library/LaunchAgents/$PG_TUNNEL_LABEL.plist"
-PG_TUNNEL_BIN="$ADK_REL/bin/pg-tunnel.sh"
-PG_TUNNEL_CONFIG="$ADK_REL/config/pg-tunnel.env"
-echo "▸ Staging consumer-owned PG tunnel supervisor (#4378)..."
-if install -m 0755 "$REPO/scripts/pg_tunnel.sh" "$PG_TUNNEL_BIN"; then
-    # Machine-local config is the node-identity gate.  It is intentionally not
-    # shipped by the repo: mac-mini and future nodes must never arm a tunnel
-    # pointed back at themselves merely because cluster deploy propagated.
-    if [ -f "$PG_TUNNEL_CONFIG" ]; then
-        _pg_xml_escape() {
-            local s=$1
-            s=${s//&/\&amp;}
-            s=${s//</\&lt;}
-            s=${s//>/\&gt;}
-            s=${s//\"/\&quot;}
-            s=${s//\'/\&apos;}
-            printf '%s' "$s"
-        }
-        _install_pg_tunnel_plist() {
-            local label_x bin_x config_x root_x
-            label_x=$(_pg_xml_escape "$PG_TUNNEL_LABEL") || return 1
-            bin_x=$(_pg_xml_escape "$PG_TUNNEL_BIN") || return 1
-            config_x=$(_pg_xml_escape "$PG_TUNNEL_CONFIG") || return 1
-            root_x=$(_pg_xml_escape "$ADK_REL") || return 1
-            mkdir -p "$HOME/Library/LaunchAgents" || return 1
-            cat > "$PG_TUNNEL_PLIST_PATH.tmp" <<PLIST_EOF || return 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$label_x</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$bin_x</string>
-    <string>$config_x</string>
-    <string>-N</string>
-    <string>-T</string>
-    <string>-o</string><string>BatchMode=yes</string>
-    <string>-o</string><string>ConnectTimeout=10</string>
-    <string>-o</string><string>ServerAliveInterval=15</string>
-    <string>-o</string><string>ServerAliveCountMax=3</string>
-    <string>-o</string><string>ExitOnForwardFailure=yes</string>
-    <string>-L</string><string>127.0.0.1:15432:127.0.0.1:5432</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$root_x/logs/pg-tunnel.launchd.out.log</string>
-  <key>StandardErrorPath</key><string>$root_x/logs/pg-tunnel.launchd.err.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>AGENTDESK_ROOT_DIR</key><string>$root_x</string>
-  </dict>
-</dict>
-</plist>
-PLIST_EOF
-            # Atomic publish: launchd never observes a partially-written XML.
-            mv -f "$PG_TUNNEL_PLIST_PATH.tmp" "$PG_TUNNEL_PLIST_PATH" || return 1
-        }
-        if ! "$PG_TUNNEL_BIN" --check-config "$PG_TUNNEL_CONFIG"; then
-            echo "⚠ PG tunnel config invalid: $PG_TUNNEL_CONFIG — NOT armed"
-            echo "  Required: PG_TUNNEL_SSH_TARGET=mac-mini (or PG_TUNNEL_HOST alias)."
-        elif _install_pg_tunnel_plist; then
-            xattr -d com.apple.quarantine "$PG_TUNNEL_PLIST_PATH" 2>/dev/null || true
-            echo "⚠ PG tunnel deploy prerequisite: on mac-mini, bootout and remove BOTH"
-            echo "  reverse plists (com.agentdesk.macbook-pg-tunnel and"
-            echo "  com.agentdesk.macbook-memento-tunnel) before this job is activated."
-            # bootout+bootstrap (not kickstart): pick up both wrapper and plist.
-            launchctl bootout "$LAUNCHD_DOMAIN/$PG_TUNNEL_LABEL" 2>/dev/null || true
-            if launchctl bootstrap "$LAUNCHD_DOMAIN" "$PG_TUNNEL_PLIST_PATH"; then
-                echo "✓ PG tunnel supervisor armed ($PG_TUNNEL_LABEL)"
-            else
-                echo "⚠ PG tunnel bootstrap FAILED — dcserver PG path is unsupervised"
-            fi
-        else
-            rm -f "$PG_TUNNEL_PLIST_PATH.tmp" 2>/dev/null || true
-            echo "⚠ PG tunnel plist write FAILED ($PG_TUNNEL_PLIST_PATH) — not armed"
-            echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
-        fi
-    else
-        echo "▸ PG tunnel config absent: $PG_TUNNEL_CONFIG"
-        echo "  Supervisor NOT armed on this node (machine-local node gate)."
-    fi
-else
-    echo "⚠ PG tunnel staging FAILED (source: $REPO/scripts/pg_tunnel.sh)"
 fi
 
 _write_release_source_manifest

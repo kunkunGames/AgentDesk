@@ -116,15 +116,16 @@ jobs:
           brew install opus pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix opus)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-trusted-macos-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-trusted-macos-
+          # rust-cache derives the final key from OS/arch/toolchain and the
+          # dependency-only Cargo.lock/Cargo.toml hash. Keep target artifacts
+          # under sccache instead of duplicating multi-GB target directories.
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: false
 
       - name: cargo check
         run: cargo check --all-targets
@@ -138,9 +139,13 @@ jobs:
           cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
-          env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
+          env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres
+          env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres
+          # Health must precede relay_recovery so fail-fast reports both surfaces.
           python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
+          env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
+          env -u AGENTDESK_ROOT_DIR cargo test --lib _4888 -- --test-threads=1
           cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
 
       - name: Fresh user portable smoke
@@ -238,15 +243,8 @@ jobs:
           brew install opus pkg-config
           echo "PKG_CONFIG_PATH=$(brew --prefix opus)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Cache cargo registry & git
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-trusted-macos-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-trusted-macos-
+      # Do not attach GitHub cache actions to the persistent self-hosted path:
+      # local sccache is size-capped and runner cleanup owns disk pressure.
 
       # `nice -n 10` (lower scheduling priority) on the CPU-heavy cargo steps so
       # the co-located production Postgres preempts CI under contention (#3658,
@@ -263,9 +261,13 @@ jobs:
           nice -n 10 cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           nice -n 10 cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           nice -n 10 cargo test --all-targets stall_recovery -- --skip _pg --skip pg_ --skip postgres
-          nice -n 10 env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
+          nice -n 10 env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres
+          nice -n 10 env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres
+          # Health must precede relay_recovery so fail-fast reports both surfaces.
           nice -n 10 python3 scripts/ci-timeout.py 900 env -u AGENTDESK_ROOT_DIR cargo test --lib health -- --skip _pg --skip pg_ --skip postgres
+          nice -n 10 env -u AGENTDESK_ROOT_DIR cargo test --lib relay_recovery -- --skip _pg --skip pg_ --skip postgres
           nice -n 10 cargo test --all-targets routines -- --skip _pg --skip pg_ --skip postgres
+          nice -n 10 env -u AGENTDESK_ROOT_DIR cargo test --lib _4888 -- --test-threads=1
           nice -n 10 cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
 
       - name: Fresh user portable smoke

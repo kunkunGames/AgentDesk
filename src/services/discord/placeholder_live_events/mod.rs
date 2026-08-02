@@ -13,6 +13,7 @@ mod common;
 mod completion_footer;
 mod context_panel;
 mod freshness;
+mod panel_cache_invalidation;
 mod recent_events;
 mod session_banner_claim;
 mod session_panel;
@@ -40,6 +41,15 @@ use session_panel::SessionPanelSnapshot;
 #[cfg(test)]
 use status_panel::{CompletedKind, DerivedStatus};
 use status_panel::{StatusPanelState, render_status_panel};
+
+#[cfg(test)]
+pub(in crate::services::discord) fn rendered_activity_lines_for_panel_shape_tests()
+-> Vec<(String, bool)> {
+    DerivedStatus::panel_shape_test_variants()
+        .into_iter()
+        .map(|(status, terminal)| (freshness::render_activity_line(&status), terminal))
+        .collect()
+}
 pub(in crate::services::discord) use task_panel::TaskPanelInfo;
 use task_panel::{TaskPanelSnapshot, clean_task_panel_value};
 
@@ -49,7 +59,7 @@ use common::{
     STATUS_PANEL_WORKFLOW_LIMIT, STATUS_PANEL_WORKFLOW_PHASE_LIMIT,
 };
 #[cfg(test)]
-use status_panel::truncate_status_panel_sections;
+use status_panel::{format_and_truncate_status_panel_sections, truncate_status_panel_sections};
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
@@ -92,6 +102,7 @@ pub(in crate::services::discord) struct PlaceholderLiveEvents {
     // age here, so the rendered text stays byte-identical across heartbeat ticks
     // (no needless re-edit) while Discord shows the localized live age client-side.
     last_recent_event_unix: dashmap::DashMap<ChannelId, i64>,
+    panel_cache_invalidations: panel_cache_invalidation::PanelCacheInvalidations,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +118,7 @@ impl PlaceholderLiveEvents {
         self.status_by_channel.remove(&channel_id);
         self.last_recent_event_at.remove(&channel_id);
         self.last_recent_event_unix.remove(&channel_id); // #3812: drop the freshness anchor too.
+        self.panel_cache_invalidations.clear_channel(channel_id);
     }
 
     pub(in crate::services::discord) fn clear_channel_preserving_footer_residuals(
@@ -529,6 +541,7 @@ impl PlaceholderLiveEvents {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::services::discord) fn set_context_panel_usage(
         &self,
         channel_id: ChannelId,
@@ -650,6 +663,18 @@ impl PlaceholderLiveEvents {
     }
 }
 
+// Despite its historical name, this helper now recognizes only successful
+// background-Bash completions already represented by a matching footer slot.
+// Successful subagent/agent completions now take the card path (CardRequired),
+// SYMMETRIC with failure completions, per #4629 (user direction 2026-07-18):
+// previously only successes were footer-only-suppressed here, so success cards
+// went missing while failures posted. This does NOT keep a footer ✓ *alongside*
+// the card — once the card is confirmed, `claim_terminal_slot_for_card` evicts
+// the matching terminal footer marker (#4055) exactly as it does for failures.
+// The card, not the transient footer ✓, is the durable completion signal.
+// `event_key`/`terminal_delivery_fingerprint` dedup prevent repeat observations
+// from posting duplicate cards. Background Bash retains footer-only suppression
+// per #4097.
 fn task_notification_success_completion_visible_in_snapshot(
     snapshot: &StatusPanelState,
     events: &[StatusEvent],
@@ -661,16 +686,7 @@ fn task_notification_success_completion_visible_in_snapshot(
         } => snapshot.tasks.iter().any(|slot| {
             slot.background && slot.tool_use_id.as_deref() == Some(tool_use_id.as_str())
         }),
-        StatusEvent::SubagentEnd {
-            success: true,
-            tool_use_id: Some(tool_use_id),
-            ack_only: false,
-            ..
-        } => snapshot
-            .subagents
-            .iter()
-            .any(|slot| slot.tool_use_id.as_deref() == Some(tool_use_id.as_str())),
-        // Completion footers render Tasks/Subagents only. Suppressing Workflow
+        // Completion footers do not render Workflows. Suppressing Workflow
         // completion cards here would drop the only completion signal.
         StatusEvent::WorkflowEnd { .. } => false,
         _ => false,

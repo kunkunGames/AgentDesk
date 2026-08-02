@@ -15,13 +15,24 @@ struct CheckRunner<'a> {
 
 impl<'a> CheckRunner<'a> {
     fn run_version(&self) -> SmokeCheckStatus {
-        let mut command = Command::new(self.binary);
+        let mut command = if self.provider == "claude" {
+            crate::services::claude_command::ClaudeCommandBuilder::for_version_smoke(
+                self.binary,
+                self.canonical_path,
+            )
+            .into_command()
+        } else {
+            let mut command = Command::new(self.binary);
+            crate::services::platform::augment_exec_path(&mut command, self.canonical_path);
+            command
+        };
         command
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        crate::services::platform::augment_exec_path(&mut command, self.canonical_path);
-        configure_version_probe_command(&mut command, self.provider);
+        if self.provider != "claude" {
+            configure_version_probe_command(&mut command, self.provider);
+        }
 
         match run_command_status_with_timeout(command, SMOKE_TIMEOUT) {
             Ok(true) => SmokeCheckStatus::Ok,
@@ -59,11 +70,14 @@ impl<'a> CheckRunner<'a> {
 
 fn configure_version_probe_command(command: &mut Command, provider: &str) {
     if provider == "claude" {
-        // `--version` never routes models or spawns subagents, so probes always run
-        // native (Scrub), independent of gateway/config state. Turn launches use
-        // `resolve_for_launch` elsewhere.
-        crate::services::claude_gateway_proxy::ClaudeGatewayProxyEnv::Scrub
-            .apply_to_command(command);
+        // `--version` never routes models or spawns subagents, so probes always
+        // run native (Scrub). The gateway policy for this launch class lives in
+        // the single chokepoint authority (`VersionProbe => Scrub`); turn
+        // launches take the `Turn` intent there.
+        crate::services::claude_command::ClaudeLaunchEnv::resolve(
+            crate::services::claude_command::ClaudeLaunchIntent::VersionProbe,
+        )
+        .apply_to_command(command);
     }
 }
 

@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn scheduled_image_attachment_requires_matching_image_bytes() {
+    let png = ScheduledMessageImageAttachmentBody {
+        filename: "family-thumbnail.png".to_string(),
+        content_type: "image/png".to_string(),
+        data_base64: "iVBORw0KGgo=".to_string(),
+    };
+    let attachment = validate_image_attachment(&png).expect("valid PNG header");
+    assert_eq!(attachment.filename, "family-thumbnail.png");
+    assert_eq!(attachment.content_type, "image/png");
+    assert_eq!(attachment.data, b"\x89PNG\r\n\x1a\n");
+
+    let mismatched = ScheduledMessageImageAttachmentBody {
+        content_type: "image/jpeg".to_string(),
+        ..png
+    };
+    let error = validate_image_attachment(&mismatched).expect_err("MIME/header mismatch");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn scheduled_image_attachment_rejects_paths_and_non_image_mime_types() {
+    let path = ScheduledMessageImageAttachmentBody {
+        filename: "../thumbnail.png".to_string(),
+        content_type: "image/png".to_string(),
+        data_base64: "iVBORw0KGgo=".to_string(),
+    };
+    assert!(validate_image_attachment(&path).is_err());
+
+    let mime = ScheduledMessageImageAttachmentBody {
+        filename: "thumbnail.txt".to_string(),
+        content_type: "text/plain".to_string(),
+        data_base64: "aGVsbG8=".to_string(),
+    };
+    assert!(validate_image_attachment(&mime).is_err());
+}
+
+#[test]
+fn scheduled_image_attachment_rejects_oversized_discord_content() {
+    let content = "x".repeat(crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS + 1);
+    let error = validate_image_attachment_content_length(&content, true)
+        .expect_err("an image-bearing Discord message must fit one message");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error
+            .to_json_value()
+            .get("error")
+            .and_then(JsonValue::as_str),
+        Some("content must not exceed 2000 characters when imageAttachment is provided")
+    );
+    validate_image_attachment_content_length(&content, false)
+        .expect("text-only delivery retains existing long-content handling");
+}
+
+#[test]
 fn scheduled_message_bot_defaults_to_non_triggering_notify() {
     assert_eq!(scheduled_message_bot_or_default(None), "notify");
     assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
@@ -33,12 +87,12 @@ fn scheduled_push_rejects_agent_only_fields_but_allows_explicit_clears() {
             "onAgentFailure is only valid for agent delivery",
         ),
     ] {
-        let (status, Json(body)) =
+        let err =
             validate_agent_only_fields(db::KIND_PUSH, agent_id, instruction, explicit_failure)
                 .expect_err("push must reject agent-only values");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            body.get("error").and_then(JsonValue::as_str),
+            err.to_json_value().get("error").and_then(JsonValue::as_str),
             Some(expected_error)
         );
     }
@@ -78,9 +132,12 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
         source: Some("postgres_test".to_string()),
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
+        image_attachment: None,
+        context_strategy: None,
+        on_context_failure: None,
     };
 
-    let new = validate_create(&pool, &body)
+    let new = validate_create(&pool, &body, false, 1)
         .await
         .expect("validate explicit bot create");
     assert_eq!(new.bot, "notify");
@@ -117,14 +174,17 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
         source: Some("postgres_test".to_string()),
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
+        image_attachment: None,
+        context_strategy: None,
+        on_context_failure: None,
     };
 
-    let (status, Json(error)) = validate_create(&pool, &body)
+    let err = validate_create(&pool, &body, false, 1)
         .await
         .expect_err("push agentId must fail as a request error before INSERT");
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        error.get("error").and_then(JsonValue::as_str),
+        err.to_json_value().get("error").and_then(JsonValue::as_str),
         Some("agentId is only valid for agent delivery")
     );
     let stored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_messages")
@@ -163,6 +223,10 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
         },
     )
     .await
@@ -173,6 +237,8 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         &pool,
         metadata_body.as_object().expect("metadata patch object"),
         &existing,
+        false,
+        1,
     )
     .await
     .expect("metadata-only PATCH must not treat stored default fail as explicit input");
@@ -186,6 +252,8 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         &pool,
         clear_body.as_object().expect("agent clear patch object"),
         &existing,
+        false,
+        1,
     )
     .await
     .expect("explicit null clears leave no effective agent-only value");
@@ -206,16 +274,18 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             "onAgentFailure is only valid for agent delivery",
         ),
     ] {
-        let (status, Json(error)) = build_patch(
+        let err = build_patch(
             &pool,
             body.as_object().expect("invalid push patch object"),
             &existing,
+            false,
+            1,
         )
         .await
         .expect_err("push PATCH must reject effective agent-only values");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            error.get("error").and_then(JsonValue::as_str),
+            err.to_json_value().get("error").and_then(JsonValue::as_str),
             Some(expected_error)
         );
     }
@@ -241,7 +311,7 @@ async fn postgres_scheduled_message_explicit_target_still_requires_agent_primary
     .await
     .expect("seed agent without a primary channel");
 
-    let (status, Json(body)) = validate_targeting(
+    let err = validate_targeting(
         &pool,
         db::KIND_AGENT,
         Some("987654321"),
@@ -250,9 +320,9 @@ async fn postgres_scheduled_message_explicit_target_still_requires_agent_primary
     .await
     .expect_err("an explicit delivery target must not bypass the owner-channel requirement");
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        body.get("error").and_then(JsonValue::as_str),
+        err.to_json_value().get("error").and_then(JsonValue::as_str),
         Some("agent 'scheduled-agent-without-primary' has no primary Discord channel")
     );
 
@@ -278,7 +348,7 @@ async fn postgres_scheduled_message_rejects_invalid_agent_primary_channel() {
     .await
     .expect("seed agent with an invalid primary channel");
 
-    let (status, Json(body)) = validate_targeting(
+    let err = validate_targeting(
         &pool,
         db::KIND_AGENT,
         None,
@@ -287,9 +357,9 @@ async fn postgres_scheduled_message_rejects_invalid_agent_primary_channel() {
     .await
     .expect_err("an invalid owner channel must fail before fire time");
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        body.get("error").and_then(JsonValue::as_str),
+        err.to_json_value().get("error").and_then(JsonValue::as_str),
         Some("agent 'scheduled-agent-invalid-primary' has an invalid primary Discord channel")
     );
 

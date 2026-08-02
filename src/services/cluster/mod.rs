@@ -9,8 +9,11 @@
 //! Phase 3 will add the worker-side polling loop in a sibling submodule.
 
 pub(crate) mod capability_routing;
+pub(crate) mod intake_preflight;
 pub(crate) mod intake_router_hook;
 pub(crate) mod intake_routing;
+pub(crate) mod intake_routing_config;
+pub(crate) mod intake_routing_telemetry;
 pub(crate) mod intake_worker;
 pub(crate) mod intake_worker_capabilities;
 /// Worker-node registry + capability routing infrastructure. Relocated from

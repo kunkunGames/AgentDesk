@@ -2,6 +2,14 @@ use serde_json::Value;
 use sqlx::{PgPool, Row as SqlxRow};
 use thiserror::Error;
 
+// #4884: verdict inference lives in exactly one place. The aliases keep this
+// module's long-standing local names while the bodies moved to the canonical
+// reducer shared with the dispatch finalize path.
+use super::phase_gate_verdict::{
+    DEFAULT_PASS_VERDICT, diagnostic_verdict, pass_verdict_of, resolve_verdict,
+    verdict_matches as phase_gate_verdict_matches,
+};
+
 pub async fn current_batch_phase_pg(
     pool: &PgPool,
     run_id: &str,
@@ -545,14 +553,8 @@ async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
         return Ok(PhaseGateReconciliation::AlreadyFailed);
     }
 
-    let pass_verdict = if gate.pass_verdict.is_empty() {
-        "phase_gate_passed".to_string()
-    } else {
-        gate.pass_verdict.clone()
-    };
-
-    // Parse JSON once so we can reuse it for both explicit verdict extraction
-    // and checks-only inference.
+    // Parse JSON once so we can reuse it for expected-verdict selection,
+    // explicit verdict extraction, and checks-only inference.
     let result_value: Option<Value> = dispatch_result_json
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
@@ -561,31 +563,50 @@ async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
         .and_then(|raw| serde_json::from_str(raw).ok());
-    let mut verdict = result_value.as_ref().and_then(extract_explicit_verdict);
-    if verdict.is_none()
-        && let Some(result) = result_value.as_ref()
-    {
-        // #1980 + #699: legacy / checks-only results do not include an
-        // explicit verdict. Mirror the JS hook's inference so the durable
-        // Rust path does not spuriously fail those gates.
-        verdict = infer_phase_gate_pass_verdict(context_value.as_ref(), result);
-    }
+    let authoritative_context = authoritative_phase_gate_context_on_pg_tx(
+        tx,
+        &gate.run_id,
+        gate.phase,
+        context_value.as_ref(),
+    )
+    .await?;
+    // Each dispatch context is the authority for selecting a registry snapshot,
+    // but never for declaration contents. Legacy contexts are reconstructed only
+    // after the persisted entries for this run/phase prove NULL/blank kinds.
+    let pass_verdict = authoritative_context
+        .as_ref()
+        .and_then(|context| context.get("phase_gate"))
+        .map(pass_verdict_of)
+        .unwrap_or_else(|| DEFAULT_PASS_VERDICT.to_string());
+    // #1980 + #699: legacy / checks-only results do not carry an explicit
+    // verdict, so `resolve_verdict` falls back to checks inference — the same
+    // fallback the dispatch finalize path applies before persisting a result.
+    let verdict_resolution = result_value
+        .as_ref()
+        .map(|result| resolve_verdict(authoritative_context.as_ref(), result));
+    let verdict = verdict_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.verdict());
+    let diagnostic_verdict = result_value
+        .as_ref()
+        .zip(verdict_resolution.as_ref())
+        .and_then(|(result, resolution)| diagnostic_verdict(result, resolution));
 
     // Treat any non-`completed` terminal status (`failed`/`cancelled`) as a
     // gate failure regardless of verdict — the dispatch never produced a
     // verdict so we cannot pretend it passed.
     if dispatch_status != "completed"
         || !phase_gate_verdict_matches(
-            verdict.as_deref(),
+            verdict,
             &pass_verdict,
-            context_value.as_ref(),
+            authoritative_context.as_ref(),
             result_value.as_ref(),
         )
     {
         let failed_reason = compose_failed_reason(
             dispatch_status,
             dispatch_result_json,
-            verdict.as_deref(),
+            diagnostic_verdict.as_deref().or(verdict),
             &pass_verdict,
         );
         mark_phase_gate_row_failed_on_pg_tx(
@@ -593,7 +614,7 @@ async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
             &gate.run_id,
             gate.phase,
             dispatch_id,
-            verdict.as_deref(),
+            diagnostic_verdict.as_deref().or(verdict),
             &failed_reason,
         )
         .await?;
@@ -1209,153 +1230,6 @@ fn numeric_i64(value: &Value) -> Option<i64> {
     None
 }
 
-fn extract_explicit_verdict(result: &Value) -> Option<String> {
-    for key in ["verdict", "decision", "phase_gate_verdict"] {
-        if let Some(text) = result.get(key).and_then(Value::as_str) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Mirror of the JS `_inferPhaseGatePassVerdict` helper in
-/// `policies/auto-queue.js`. When a phase-gate dispatch result is missing an
-/// explicit `verdict` / `decision` / `phase_gate_verdict`, but reports check entries that all pass,
-/// fall back to the gate's `pass_verdict` (default `phase_gate_passed`). This
-/// keeps legacy / checks-only results from being reconciled as failures by
-/// the durable Rust path.
-///
-/// Refuses to infer if any check fails, if any declared check is missing, if
-/// no checks are reported, or if `result.verdict` / `result.decision` /
-/// `result.phase_gate_verdict` is
-/// already set to anything truthy (mirroring JS's `||` operator semantics —
-/// numbers, booleans, objects all count as explicit just like in JS).
-fn infer_phase_gate_pass_verdict(context: Option<&Value>, result: &Value) -> Option<String> {
-    if has_js_truthy_explicit_verdict(result) {
-        return None;
-    }
-    infer_phase_gate_pass_verdict_from_checks(context, result)
-}
-
-fn infer_phase_gate_pass_verdict_from_checks(
-    context: Option<&Value>,
-    result: &Value,
-) -> Option<String> {
-    let phase_gate = context?.get("phase_gate")?;
-    if !phase_gate.is_object() {
-        return None;
-    }
-    let checks = result.get("checks")?.as_object()?;
-    if checks.is_empty() {
-        return None;
-    }
-
-    if let Some(declared) = phase_gate.get("checks").and_then(Value::as_array) {
-        for required in declared {
-            let Some(name) = required.as_str() else {
-                continue;
-            };
-            let Some(entry) = checks.get(name) else {
-                return None;
-            };
-            if !js_check_entry_is_pass(entry) {
-                return None;
-            }
-        }
-    }
-
-    for entry in checks.values() {
-        if !js_check_entry_is_pass(entry) {
-            return None;
-        }
-    }
-
-    let pass_verdict = phase_gate
-        .get("pass_verdict")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "phase_gate_passed".to_string());
-    Some(pass_verdict)
-}
-
-fn phase_gate_verdict_matches(
-    actual_verdict: Option<&str>,
-    expected_verdict: &str,
-    context: Option<&Value>,
-    result: Option<&Value>,
-) -> bool {
-    let Some(actual_verdict) = actual_verdict
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    if actual_verdict == expected_verdict {
-        return true;
-    }
-    if !matches!(actual_verdict, "pass" | "passed") {
-        return false;
-    }
-    result
-        .and_then(|result| infer_phase_gate_pass_verdict_from_checks(context, result))
-        .as_deref()
-        == Some(expected_verdict)
-}
-
-/// JS-style truthiness check for `result.verdict || result.decision || result.phase_gate_verdict`.
-/// Mirrors the `||` short-circuit in `policies/auto-queue.js:47` so any
-/// non-falsy value (boolean true, non-zero number, non-empty string, any
-/// object/array) blocks inference.
-fn has_js_truthy_explicit_verdict(result: &Value) -> bool {
-    for key in ["verdict", "decision", "phase_gate_verdict"] {
-        if let Some(value) = result.get(key)
-            && is_js_truthy(value)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::String(s) => !s.is_empty(),
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0 && !f.is_nan()).unwrap_or(false),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
-/// Mirrors `entryIsPass` from `policies/auto-queue.js`. Notably, JS does NOT
-/// trim whitespace before comparing — only lowercases via `String(...)`. We
-/// match that exactly so a status like `" pass "` is rejected here and in JS.
-fn js_check_entry_is_pass(entry: &Value) -> bool {
-    // #2048 F12: mirror JS `entry.status || entry.result` truthiness. JS
-    // treats an empty string as falsy and falls through to `entry.result`;
-    // the previous Rust port short-circuited on `status` key presence even
-    // when its value was `""`, causing a Rust→JS verdict divergence. Now
-    // we ignore empty strings on the `status` side and fall back to
-    // `result` just like JS.
-    let raw = match entry {
-        Value::String(text) => Some(text.as_str()),
-        Value::Object(map) => map
-            .get("status")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .or_else(|| map.get("result").and_then(Value::as_str)),
-        _ => None,
-    };
-    raw.map(|status| {
-        let lower = status.to_ascii_lowercase();
-        lower == "pass" || lower == "passed"
-    })
-    .unwrap_or(false)
-}
-
 fn compose_failed_reason(
     dispatch_status: &str,
     dispatch_result_json: Option<&str>,
@@ -1412,6 +1286,43 @@ async fn load_phase_gate_row_for_dispatch_on_pg_tx(
         )
     })?;
     Ok(row.map(|status| PhaseGateRow { status }))
+}
+
+async fn phase_gate_run_phase_uses_legacy_default_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    phase: i64,
+) -> Result<bool, String> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(
+             BOOL_AND(NULLIF(BTRIM(phase_gate_kind, E' \t\n\r\\f\\v'), '') IS NULL),
+             FALSE
+         )
+         FROM auto_queue_entries
+         WHERE run_id = $1
+           AND COALESCE(batch_phase, 0) = $2",
+    )
+    .bind(run_id)
+    .bind(phase)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("load persisted phase-gate kind provenance for {run_id}/{phase}: {error}")
+    })
+}
+
+async fn authoritative_phase_gate_context_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    phase: i64,
+    context: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    let legacy_default =
+        phase_gate_run_phase_uses_legacy_default_on_pg_tx(tx, run_id, phase).await?;
+    Ok(super::phase_gate_verdict::authoritative_context(
+        context,
+        legacy_default,
+    ))
 }
 
 #[derive(Debug, Default)]
@@ -1487,6 +1398,9 @@ async fn load_sibling_phase_gate_dispatches_on_pg_tx(
                 })
             })
             .transpose()?;
+        let authoritative_context =
+            authoritative_phase_gate_context_on_pg_tx(tx, run_id, phase, context_value.as_ref())
+                .await?;
         match status.as_str() {
             "pending" | "dispatched" => {
                 summary.pending += 1;
@@ -1494,14 +1408,13 @@ async fn load_sibling_phase_gate_dispatches_on_pg_tx(
             }
             "completed" => {}
             _ => {
+                let resolution = result_value
+                    .as_ref()
+                    .map(|result| resolve_verdict(authoritative_context.as_ref(), result));
                 let verdict = result_value
                     .as_ref()
-                    .and_then(|v| {
-                        v.get("verdict")
-                            .or_else(|| v.get("decision"))
-                            .and_then(Value::as_str)
-                    })
-                    .map(str::to_string);
+                    .zip(resolution.as_ref())
+                    .and_then(|(result, resolution)| diagnostic_verdict(result, resolution));
                 let reason = result_value
                     .as_ref()
                     .and_then(|v| {
@@ -1522,25 +1435,28 @@ async fn load_sibling_phase_gate_dispatches_on_pg_tx(
             }
         }
 
-        let expected_verdict = context_value
+        let expected_verdict = authoritative_context
             .as_ref()
-            .and_then(|v| v.get("phase_gate"))
-            .and_then(|gate| gate.get("pass_verdict"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "phase_gate_passed".to_string());
-        let mut actual_verdict = result_value.as_ref().and_then(extract_explicit_verdict);
-        if actual_verdict.is_none()
-            && let Some(result) = result_value.as_ref()
-        {
-            // Mirror the JS hook's #699-round-2 inference for legacy sibling
-            // rows that completed before the server fix shipped.
-            actual_verdict = infer_phase_gate_pass_verdict(context_value.as_ref(), result);
-        }
+            .and_then(|value| value.get("phase_gate"))
+            .map(pass_verdict_of)
+            .unwrap_or_else(|| DEFAULT_PASS_VERDICT.to_string());
+        // Sibling rows go through the same explicit-or-inferred resolution as
+        // the primary dispatch so an aggregate gate decision cannot disagree
+        // with the per-dispatch one (#699 round 2, #4884).
+        let actual_resolution = result_value
+            .as_ref()
+            .map(|result| resolve_verdict(authoritative_context.as_ref(), result));
+        let actual_verdict = actual_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.verdict());
+        let diagnostic_verdict = result_value
+            .as_ref()
+            .zip(actual_resolution.as_ref())
+            .and_then(|(result, resolution)| diagnostic_verdict(result, resolution));
         if !phase_gate_verdict_matches(
-            actual_verdict.as_deref(),
+            actual_verdict,
             &expected_verdict,
-            context_value.as_ref(),
+            authoritative_context.as_ref(),
             result_value.as_ref(),
         ) {
             let reason = result_value
@@ -1554,12 +1470,15 @@ async fn load_sibling_phase_gate_dispatches_on_pg_tx(
                 .unwrap_or_else(|| {
                     format!(
                         "expected verdict {expected_verdict}, got {}",
-                        actual_verdict.as_deref().unwrap_or("none")
+                        diagnostic_verdict
+                            .as_deref()
+                            .or(actual_verdict)
+                            .unwrap_or("none")
                     )
                 });
             summary.failed_sibling = Some(FailedSibling {
                 dispatch_id,
-                verdict: actual_verdict,
+                verdict: diagnostic_verdict.or_else(|| actual_verdict.map(str::to_string)),
                 reason,
             });
             return Ok(summary);
@@ -1933,13 +1852,14 @@ mod current_batch_phase_pg_tests {
 mod reconcile_phase_gate_pg_tests {
     use super::{
         PhaseGateReconciliation, PhaseGateRepairOptions, PhaseGateStateWrite,
-        infer_phase_gate_pass_verdict, parse_phase_gate_context, phase_gate_verdict_matches,
+        parse_phase_gate_context, phase_gate_verdict_matches,
         reconcile_phase_gate_for_terminal_dispatch_on_pg_tx, repair_phase_gates_for_run_on_pg,
         save_phase_gate_state_on_pg,
     };
+    use crate::db::auto_queue::phase_gate_verdict::{VerdictResolution, resolve_verdict};
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use serde_json::json;
-    use sqlx::PgPool;
+    use sqlx::{PgPool, Row};
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
@@ -2037,16 +1957,37 @@ mod reconcile_phase_gate_pg_tests {
         .expect("gate status")
     }
 
+    async fn gate_failure_diagnostic(
+        pool: &PgPool,
+        run_id: &str,
+        phase: i64,
+    ) -> (Option<String>, Option<String>) {
+        let row = sqlx::query(
+            "SELECT verdict, failure_reason FROM auto_queue_phase_gates
+             WHERE run_id = $1 AND phase = $2 LIMIT 1",
+        )
+        .bind(run_id)
+        .bind(phase)
+        .fetch_one(pool)
+        .await
+        .expect("gate failure diagnostic"); // agentdesk-audit: allow-unwrap — test-only PG assertion in #[cfg(test)] module
+        (
+            row.try_get("verdict").expect("decode verdict"), // agentdesk-audit: allow-unwrap — test-only PG assertion in #[cfg(test)] module
+            row.try_get("failure_reason")
+                .expect("decode failure reason"), // agentdesk-audit: allow-unwrap — test-only PG assertion in #[cfg(test)] module
+        )
+    }
+
     fn gate_context() -> serde_json::Value {
-        json!({
-            "phase_gate": {
-                "run_id": "run-pg-test",
-                "batch_phase": 0,
-                "pass_verdict": "phase_gate_passed",
-                "next_phase": 1,
-                "final_phase": false,
-            }
-        })
+        let mut declaration = crate::phase_gate::resolve_declaration_value("pr-confirm")
+            .expect("pr-confirm declaration"); // agentdesk-audit: allow-unwrap — immutable built-in fixture in #[cfg(test)] module
+        let gate = declaration.as_object_mut().expect("declaration object"); // agentdesk-audit: allow-unwrap — registry declaration is always a JSON object
+
+        gate.insert("run_id".to_string(), json!("run-pg-test"));
+        gate.insert("batch_phase".to_string(), json!(0));
+        gate.insert("next_phase".to_string(), json!(1));
+        gate.insert("final_phase".to_string(), json!(false));
+        json!({"phase_gate": declaration})
     }
 
     #[test]
@@ -2084,7 +2025,10 @@ mod reconcile_phase_gate_pg_tests {
             }
         });
 
-        assert_eq!(infer_phase_gate_pass_verdict(Some(&context), &result), None);
+        assert_eq!(
+            resolve_verdict(Some(&context), &result),
+            VerdictResolution::Explicit("manual_hold".to_string())
+        );
         assert!(!phase_gate_verdict_matches(
             Some("manual_hold"),
             "phase_gate_passed",
@@ -2138,7 +2082,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-stale",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         assert!(matches!(outcome, PhaseGateReconciliation::StaleRow));
@@ -2188,7 +2132,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-pass",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2216,7 +2160,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-pass",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         match outcome {
@@ -2253,20 +2197,14 @@ mod reconcile_phase_gate_pg_tests {
         fixture(&pool).await;
 
         // No pending entries — drained run, ready to finalize.
-        let final_context = json!({
-            "phase_gate": {
-                "run_id": "run-pg-test",
-                "batch_phase": 0,
-                "pass_verdict": "phase_gate_passed",
-                "final_phase": true,
-            }
-        });
+        let mut final_context = gate_context();
+        final_context["phase_gate"]["final_phase"] = json!(true);
         insert_dispatch(
             &pool,
             "dsp-final",
             "completed",
             final_context.clone(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2290,7 +2228,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-final",
             "completed",
             final_context,
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         match outcome {
@@ -2376,6 +2314,227 @@ mod reconcile_phase_gate_pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_string_explicit_payload_is_redacted_in_failure_diagnostics() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+
+        let context = gate_context();
+        let result = json!({
+            "verdict": {"authorization": "Bearer secret"},
+            "checks": {"build_passed": {"status": "fail"}}
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-diagnostic",
+            "completed",
+            context.clone(),
+            Some(result.clone()),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "pending".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-diagnostic".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed gate state"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let outcome =
+            run_reconcile(&pool, "dsp-diagnostic", "completed", context, Some(result)).await;
+        let outcome_reason = match &outcome {
+            PhaseGateReconciliation::MarkedFailed { failed_reason, .. } => Some(failed_reason),
+            _ => None,
+        };
+        assert!(
+            outcome_reason.is_some_and(|reason| reason.contains("<non-string:object>")),
+            "outcome should retain only the verdict class: {outcome:?}"
+        );
+        assert!(
+            outcome_reason.is_some_and(|reason| {
+                !reason.contains("authorization") && !reason.contains("Bearer secret")
+            }),
+            "outcome must redact verdict keys and values: {outcome:?}"
+        );
+
+        let (verdict, reason) = gate_failure_diagnostic(&pool, "run-pg-test", 0).await;
+        assert_eq!(verdict.as_deref(), Some("<non-string:object>"));
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("<non-string:object>")),
+            "failure reason should retain only the verdict class: {reason:?}"
+        );
+        for forbidden in ["authorization", "Bearer secret"] {
+            assert!(
+                verdict
+                    .as_deref()
+                    .is_none_or(|verdict| !verdict.contains(forbidden)),
+                "persisted verdict leaked {forbidden}: {verdict:?}"
+            );
+            assert!(
+                reason
+                    .as_deref()
+                    .is_none_or(|reason| !reason.contains(forbidden)),
+                "persisted failure reason leaked {forbidden}: {reason:?}"
+            );
+        }
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_group_pass_verdict_uses_each_dispatch_context() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+
+        let context_a = gate_context();
+        let mut deploy = crate::phase_gate::resolve_declaration_value("deploy-gate")
+            .expect("deploy declaration"); // agentdesk-audit: allow-unwrap — immutable built-in fixture in #[cfg(test)] module
+        let deploy_gate = deploy.as_object_mut().expect("declaration object"); // agentdesk-audit: allow-unwrap — registry declaration is always a JSON object
+        deploy_gate.insert("run_id".to_string(), json!("run-pg-test"));
+        deploy_gate.insert("batch_phase".to_string(), json!(0));
+        deploy_gate.insert("next_phase".to_string(), json!(1));
+        deploy_gate.insert("final_phase".to_string(), json!(false));
+        let context_b = json!({"phase_gate": deploy});
+        for (id, context) in [
+            ("dsp-group-a", context_a.clone()),
+            ("dsp-group-b", context_b.clone()),
+        ] {
+            insert_dispatch(
+                &pool,
+                id,
+                "completed",
+                context.clone(),
+                Some(json!({
+                    "verdict": "phase_gate_passed",
+                    "checks": {
+                        "merge_verified": "pass",
+                        "issue_closed": "pass",
+                        "build_passed": "pass"
+                    }
+                })),
+            )
+            .await;
+        }
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "pending".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-group-a".into(), "dsp-group-b".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed mixed gate groups"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let outcome = run_reconcile(
+            &pool,
+            "dsp-group-a",
+            "completed",
+            context_a,
+            Some(json!({
+                "verdict": "phase_gate_passed",
+                "checks": {
+                    "merge_verified": "pass",
+                    "issue_closed": "pass",
+                    "build_passed": "pass"
+                }
+            })),
+        )
+        .await;
+        assert!(
+            matches!(outcome, PhaseGateReconciliation::MarkedFailed { .. }),
+            "the deploy sibling's authoritative unavailable context must not be replaced by the primary pr-confirm context: {outcome:?}"
+        );
+        assert_eq!(gate_status(&pool, "run-pg-test", 0).await, "failed");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noncompleted_sibling_redacts_non_string_verdict_payload() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+
+        let context = gate_context();
+        let passing = json!({
+            "verdict": "phase_gate_passed",
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            }
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-primary-private",
+            "completed",
+            context.clone(),
+            Some(passing.clone()),
+        )
+        .await;
+        insert_dispatch(
+            &pool,
+            "dsp-sibling-private",
+            "failed",
+            context.clone(),
+            Some(json!({"verdict": {"authorization": "Bearer secret"}})),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "pending".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-primary-private".into(), "dsp-sibling-private".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed sibling privacy gate"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let outcome = run_reconcile(
+            &pool,
+            "dsp-primary-private",
+            "completed",
+            context,
+            Some(passing),
+        )
+        .await;
+        let PhaseGateReconciliation::MarkedFailed { failed_reason, .. } = outcome else {
+            panic!("expected sibling failure"); // agentdesk-audit: allow-unwrap — test assertion for the required fail-closed outcome
+        };
+        assert!(!failed_reason.contains("authorization"));
+        assert!(!failed_reason.contains("Bearer secret"));
+        let (verdict, reason) = gate_failure_diagnostic(&pool, "run-pg-test", 0).await;
+        assert_eq!(verdict.as_deref(), Some("<non-string:object>"));
+        assert!(
+            reason.as_deref().is_none_or(
+                |text| !text.contains("authorization") && !text.contains("Bearer secret")
+            )
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn already_failed_gate_is_left_alone() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
@@ -2386,7 +2545,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-already",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2415,12 +2574,280 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-already",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         assert!(matches!(outcome, PhaseGateReconciliation::AlreadyFailed));
         assert_eq!(gate_status(&pool, "run-pg-test", 0).await, "failed");
         assert_eq!(run_status(&pool, "run-pg-test").await, "paused");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_null_kind_context_reconciles_and_repairs_from_registry() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-legacy-gate", 0).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-next-legacy", 1).await;
+
+        let legacy_context = json!({
+            "phase_gate": {
+                "run_id": "run-pg-test",
+                "batch_phase": 0,
+                "next_phase": 1,
+                "final_phase": false,
+                "pass_verdict": "attacker_override",
+                "checks": ["attacker_override"]
+            }
+        });
+        let passing = json!({
+            "verdict": "phase_gate_passed",
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            }
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-legacy-repair",
+            "completed",
+            legacy_context.clone(),
+            Some(passing.clone()),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                pass_verdict: "attacker_override".into(),
+                dispatch_ids: vec!["dsp-legacy-repair".into()],
+                next_phase: Some(1),
+                failure_reason: Some("pre-deploy strict reducer failure".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed legacy failed gate"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .expect("pause run"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let summary = repair_phase_gates_for_run_on_pg(
+            &pool,
+            "run-pg-test",
+            PhaseGateRepairOptions::default(),
+        )
+        .await
+        .expect("repair legacy gate"); // agentdesk-audit: allow-unwrap — test-only PG assertion in #[cfg(test)] module
+        assert_eq!(summary.cleared_gates, 1);
+        assert_eq!(summary.blocking_gates_remaining, 0);
+        assert_eq!(summary.run_status.as_deref(), Some("active"));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_context_with_nonblank_persisted_kind_remains_failed_closed() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        TestPostgresDb::emulate_pre_0100_deploy_gate_rows(&pool).await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-explicit-kind", 0).await;
+        sqlx::query(
+            "UPDATE auto_queue_entries SET phase_gate_kind = 'deploy-gate' WHERE id = 'entry-explicit-kind'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set explicit deploy kind"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let legacy_context = json!({
+            "phase_gate": {"run_id": "run-pg-test", "batch_phase": 0}
+        });
+        let passing = json!({
+            "verdict": "phase_gate_passed",
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            }
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-explicit-kind",
+            "completed",
+            legacy_context.clone(),
+            Some(passing.clone()),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "pending".into(),
+                dispatch_ids: vec!["dsp-explicit-kind".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed explicit-kind gate"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let outcome = run_reconcile(
+            &pool,
+            "dsp-explicit-kind",
+            "completed",
+            legacy_context,
+            Some(passing),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            PhaseGateReconciliation::MarkedFailed { .. }
+        ));
+        assert_eq!(gate_status(&pool, "run-pg-test", 0).await, "failed");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_ascii_control_whitespace_context_repairs_from_registry() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-whitespace-gate", 0).await;
+        sqlx::query(
+            "UPDATE auto_queue_entries SET phase_gate_kind = E' \\t\\n\\r'
+             WHERE id = 'entry-whitespace-gate'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set ASCII control whitespace kind"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+        seed_pending_entry(&pool, "run-pg-test", "entry-next-whitespace", 1).await;
+
+        let legacy_context = json!({
+            "phase_gate": {"run_id": "run-pg-test", "batch_phase": 0, "next_phase": 1}
+        });
+        let passing = json!({
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            }
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-whitespace-repair",
+            "completed",
+            legacy_context,
+            Some(passing),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                dispatch_ids: vec!["dsp-whitespace-repair".into()],
+                next_phase: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed whitespace failed gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .expect("pause whitespace run"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+
+        let summary = repair_phase_gates_for_run_on_pg(
+            &pool,
+            "run-pg-test",
+            PhaseGateRepairOptions::default(),
+        )
+        .await
+        .expect("repair whitespace gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
+        assert_eq!(summary.cleared_gates, 1);
+        assert_eq!(summary.blocking_gates_remaining, 0);
+        assert_eq!(summary.run_status.as_deref(), Some("active"));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_null_and_nonblank_legacy_context_remains_failed_closed_on_repair() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        TestPostgresDb::emulate_pre_0100_deploy_gate_rows(&pool).await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-mixed-null", 0).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-mixed-deploy", 0).await;
+        sqlx::query(
+            "UPDATE auto_queue_entries SET phase_gate_kind = 'deploy-gate'
+             WHERE id = 'entry-mixed-deploy'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set mixed explicit deploy kind"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+
+        let legacy_context = json!({
+            "phase_gate": {"run_id": "run-pg-test", "batch_phase": 0}
+        });
+        let passing = json!({
+            "verdict": "phase_gate_passed",
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            }
+        });
+        insert_dispatch(
+            &pool,
+            "dsp-mixed-repair",
+            "completed",
+            legacy_context,
+            Some(passing),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                dispatch_ids: vec!["dsp-mixed-repair".into()],
+                failure_reason: Some("mixed provenance".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed mixed failed gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .expect("pause mixed run"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
+
+        let summary = repair_phase_gates_for_run_on_pg(
+            &pool,
+            "run-pg-test",
+            PhaseGateRepairOptions::default(),
+        )
+        .await
+        .expect("repair mixed gate"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
+        assert_eq!(summary.cleared_gates, 0);
+        assert_eq!(summary.blocking_gates_remaining, 1);
+        assert_eq!(summary.run_status.as_deref(), Some("paused"));
+        assert_eq!(gate_status(&pool, "run-pg-test", 0).await, "failed");
 
         pool.close().await;
         pg_db.drop().await;
@@ -2438,7 +2865,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-repair-idempotent",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2565,7 +2992,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-repair-concurrent",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2659,7 +3086,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-repair-vs-patch",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(
@@ -2709,7 +3136,7 @@ mod reconcile_phase_gate_pg_tests {
                  SET result = CAST($1 AS jsonb), updated_at = NOW()
                  WHERE id = 'dsp-repair-vs-patch'",
             )
-            .bind(r#"{"verdict":"phase_gate_passed","note":"post-patch"}"#)
+            .bind(r#"{"verdict":"phase_gate_passed","note":"post-patch","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}}"#)
             .execute(&mut *tx)
             .await
             .expect("patch task_dispatches");
@@ -2756,7 +3183,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-pass-1",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         insert_dispatch(&pool, "dsp-pending-2", "dispatched", gate_context(), None).await;
@@ -2781,7 +3208,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-pass-1",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         match outcome {
@@ -2842,20 +3269,12 @@ mod reconcile_phase_gate_pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         fixture(&pool).await;
 
-        let context = json!({
-            "phase_gate": {
-                "run_id": "run-pg-test",
-                "batch_phase": 0,
-                "pass_verdict": "phase_gate_passed",
-                "next_phase": 1,
-                "final_phase": false,
-                "checks": ["lint", "tests"],
-            }
-        });
+        let context = gate_context();
         let result = json!({
             "checks": {
-                "lint": { "status": "pass" },
-                "tests": "passed",
+                "merge_verified": { "status": "pass" },
+                "issue_closed": "passed",
+                "build_passed": "pass",
             }
         });
 
@@ -2895,21 +3314,22 @@ mod reconcile_phase_gate_pg_tests {
         pg_db.drop().await;
     }
 
-    /// #1980 + codex v2 MED #5 parity: any truthy explicit `verdict`/`decision`
-    /// (including non-string values like numbers or booleans) must block
-    /// inference, matching JS's `||` operator semantics. The result here has
-    /// `verdict: 1` plus all-passing checks — JS would refuse to infer, so
-    /// Rust must too.
+    /// Preserve the pre-#4884 finalize contract: non-string explicit fields are
+    /// ignored and passing declared checks may still infer the pass verdict.
     #[test]
-    fn truthy_non_string_explicit_verdict_blocks_inference() {
-        let context = json!({"phase_gate": {"pass_verdict": "phase_gate_passed"}});
+    fn non_string_explicit_verdict_preserves_checks_inference() {
+        let context = gate_context();
         let result = json!({
             "verdict": 1,
-            "checks": { "tests": "pass" },
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": "pass"
+            },
         });
-        assert!(
-            infer_phase_gate_pass_verdict(Some(&context), &result).is_none(),
-            "truthy non-string verdict must block inference"
+        assert_eq!(
+            resolve_verdict(Some(&context), &result),
+            VerdictResolution::Inferred("phase_gate_passed".to_string())
         );
     }
 
@@ -2918,11 +3338,17 @@ mod reconcile_phase_gate_pg_tests {
     /// in JS).
     #[test]
     fn whitespace_padded_check_status_is_not_inferred_as_pass() {
-        let context =
-            json!({"phase_gate": {"pass_verdict": "phase_gate_passed", "checks": ["tests"]}});
-        let result = json!({"checks": {"tests": " pass "}});
-        assert!(
-            infer_phase_gate_pass_verdict(Some(&context), &result).is_none(),
+        let context = gate_context();
+        let result = json!({
+            "checks": {
+                "merge_verified": "pass",
+                "issue_closed": "pass",
+                "build_passed": " pass "
+            }
+        });
+        assert_eq!(
+            resolve_verdict(Some(&context), &result),
+            VerdictResolution::Missing,
             "whitespace-padded status must not be inferred (JS parity)"
         );
     }
@@ -2935,20 +3361,12 @@ mod reconcile_phase_gate_pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         fixture(&pool).await;
 
-        let context = json!({
-            "phase_gate": {
-                "run_id": "run-pg-test",
-                "batch_phase": 0,
-                "pass_verdict": "phase_gate_passed",
-                "next_phase": 1,
-                "final_phase": false,
-                "checks": ["lint", "tests"],
-            }
-        });
+        let context = gate_context();
         let result = json!({
             "checks": {
-                "lint": { "status": "pass" },
-                "tests": { "status": "fail" },
+                "merge_verified": { "status": "pass" },
+                "issue_closed": { "status": "pass" },
+                "build_passed": { "status": "fail" },
             }
         });
 
@@ -3009,7 +3427,7 @@ mod reconcile_phase_gate_pg_tests {
                 id,
                 "completed",
                 gate_context(),
-                Some(json!({"verdict":"phase_gate_passed"})),
+                Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
             )
             .await;
         }
@@ -3034,12 +3452,68 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-pass-b",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         assert!(
             matches!(outcome, PhaseGateReconciliation::Cleared { .. }),
             "all siblings passing should clear gate: got {outcome:?}"
+        );
+        assert_eq!(gate_count(&pool, "run-pg-test", 0).await, 0);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn primary_and_sibling_checks_only_evidence_use_same_reducer() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+
+        let context = gate_context();
+        let checks_only = json!({
+            "checks": {
+                "merge_verified": {"status": "pass"},
+                "issue_closed": {"status": "", "result": "passed"},
+                "build_passed": {"status": "pass"}
+            }
+        });
+        for id in ["dsp-reducer-primary", "dsp-reducer-sibling"] {
+            insert_dispatch(
+                &pool,
+                id,
+                "completed",
+                context.clone(),
+                Some(checks_only.clone()),
+            )
+            .await;
+        }
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "pending".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-reducer-primary".into(), "dsp-reducer-sibling".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed reducer path fixture"); // agentdesk-audit: allow-unwrap — test-only PG fixture in #[cfg(test)] module
+
+        let outcome = run_reconcile(
+            &pool,
+            "dsp-reducer-primary",
+            "completed",
+            context,
+            Some(checks_only),
+        )
+        .await;
+        assert!(
+            matches!(outcome, PhaseGateReconciliation::Cleared { .. }),
+            "primary and sibling checks-only rows must both infer the canonical verdict: {outcome:?}"
         );
         assert_eq!(gate_count(&pool, "run-pg-test", 0).await, 0);
 
@@ -3062,7 +3536,7 @@ mod reconcile_phase_gate_pg_tests {
             "dsp-status-only",
             "completed",
             gate_context(),
-            Some(json!({"verdict":"phase_gate_passed"})),
+            Some(json!({"verdict":"phase_gate_passed","checks":{"merge_verified":"pass","issue_closed":"pass","build_passed":"pass"}})),
         )
         .await;
         save_phase_gate_state_on_pg(

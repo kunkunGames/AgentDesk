@@ -7,6 +7,7 @@ use crate::db::session_agent_resolution::{
 use crate::db::session_status::{
     is_live_status, is_user_wait_status, normalize_incoming_session_status,
 };
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
@@ -18,11 +19,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+#[path = "dispatched_sessions/canonical_identity.rs"]
+mod canonical_identity;
+
 async fn hook_session_pg(
     state: &AppState,
     pool: &sqlx::PgPool,
     body: HookSessionBody,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let mut thread_channel_id = normalize_thread_channel_id(body.thread_channel_id.as_deref())
         .or_else(|| {
             body.name
@@ -56,6 +60,11 @@ async fn hook_session_pg(
     // and similar callers used to zero this column on every metadata update).
     let tokens = body.tokens.map(|t| t as i64);
     let active_dispatch_id = normalize_hook_active_dispatch_id(status, body.dispatch_id.as_deref());
+    let turn_start_nonce = body
+        .turn_start_nonce
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let dispatched_origin = body.dispatched_origin.unwrap_or(false);
     let instance_id = body
         .instance_id
         .as_deref()
@@ -64,45 +73,61 @@ async fn hook_session_pg(
         .or(state.cluster_instance_id.as_deref());
     let claude_session_id = body.claude_session_id.as_deref().filter(|s| !s.is_empty());
     let raw_provider_session_id = body.session_id.as_deref().filter(|s| !s.is_empty());
+    let identity = canonical_identity::parse_hook_identity(
+        &body.session_key,
+        provider,
+        body.identity_kind.as_deref(),
+        body.discord_token_hash.as_deref(),
+        body.channel_id.as_deref(),
+    )
+    .map_err(|error| {
+        AppError::bad_request(format!("invalid canonical session identity: {error:?}"))
+    })?;
 
     // #2045 Finding 7 (P2): the upsert helper now reports whether the row
     // was inserted in this transaction (`xmax = 0` RETURNING). The earlier
     // pattern of "SELECT exists, then upsert" raced under cluster hand-off
     // and could broadcast `dispatched_session_new` twice for the same
     // session_key — once per concurrent webhook.
-    let result = dispatched_sessions_db::upsert_hook_session_pg(
-        pool,
-        dispatched_sessions_db::HookSessionUpsert {
-            session_key: &body.session_key,
-            instance_id,
-            agent_id: agent_id.as_deref(),
-            provider,
-            status,
-            session_info: body.session_info.as_deref(),
-            model: body.model.as_deref(),
-            tokens,
-            cwd: body.cwd.as_deref(),
-            active_dispatch_id: active_dispatch_id.as_deref(),
-            thread_channel_id: thread_channel_id.as_deref(),
-            // #3207 (part 2) P0: persist the unique channel id so worktree reuse
-            // can require an exact channel match. Prefer the explicit channel id
-            // from the hook body; fall back to the resolved thread channel id so
-            // thread sessions (which set `thread_channel_id` but may omit
-            // `channel_id`) still scope correctly.
-            channel_id: body
-                .channel_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .or(thread_channel_id.as_deref()),
-            claude_session_id,
-            raw_provider_session_id,
-        },
-    )
-    .await;
+    let result =
+        crate::db::dispatched_session_canonical_identity::upsert_hook_session_with_identity_pg(
+            pool,
+            dispatched_sessions_db::HookSessionUpsert {
+                session_key: &body.session_key,
+                instance_id,
+                agent_id: agent_id.as_deref(),
+                provider,
+                status,
+                session_info: body.session_info.as_deref(),
+                model: body.model.as_deref(),
+                tokens,
+                cwd: body.cwd.as_deref(),
+                active_dispatch_id: active_dispatch_id.as_deref(),
+                thread_channel_id: thread_channel_id.as_deref(),
+                // #3207 (part 2) P0: persist the unique channel id so worktree reuse
+                // can require an exact channel match. Prefer the explicit channel id
+                // from the hook body; fall back to the resolved thread channel id so
+                // thread sessions (which set `thread_channel_id` but may omit
+                // `channel_id`) still scope correctly.
+                channel_id: body
+                    .channel_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or(thread_channel_id.as_deref()),
+                claude_session_id,
+                raw_provider_session_id,
+                turn_start_nonce,
+                dispatched_origin,
+            },
+            identity,
+        )
+        .await;
 
     match result {
-        Ok(is_new_session) => {
+        Ok(outcome) => {
+            let is_new_session = outcome.inserted;
+            let resolved_session_key = outcome.session_key;
             let dispatch_id = body.dispatch_id.clone();
 
             crate::kanban::fire_event_hooks_with_backends(
@@ -110,7 +135,7 @@ async fn hook_session_pg(
                 "on_session_status_change",
                 "OnSessionStatusChange",
                 json!({
-                    "session_key": body.session_key,
+                    "session_key": resolved_session_key,
                     "instance_id": instance_id,
                     "status": status,
                     "agent_id": agent_id,
@@ -125,7 +150,7 @@ async fn hook_session_pg(
                 spawn_auto_queue_activate_for_agent(state.clone(), aid.clone());
             }
 
-            match dispatched_sessions_db::load_session_event_payload_pg(pool, &body.session_key)
+            match dispatched_sessions_db::load_session_event_payload_pg(pool, &resolved_session_key)
                 .await
             {
                 Ok(Some(payload)) => {
@@ -139,7 +164,7 @@ async fn hook_session_pg(
                         crate::eventbus::emit_batched_event(
                             &state.batch_buffer,
                             "dispatched_session_update",
-                            &body.session_key,
+                            &resolved_session_key,
                             payload,
                         );
                     }
@@ -156,7 +181,7 @@ async fn hook_session_pg(
                 match dispatched_sessions_db::load_agent_status_payload_pg(
                     pool,
                     aid,
-                    &body.session_key,
+                    &resolved_session_key,
                 )
                 .await
                 {
@@ -178,12 +203,31 @@ async fn hook_session_pg(
                 }
             }
 
-            (StatusCode::OK, Json(json!({"ok": true})))
+            Ok((StatusCode::OK, Json(json!({"ok": true}))))
         }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error})),
-        ),
+        Err(error) => {
+            if let Some(kind) = error.conflict_kind() {
+                let channel_id = body
+                    .channel_id
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                crate::services::observability::metrics::record_session_identity_conflict(
+                    channel_id, provider, kind,
+                );
+                tracing::warn!(
+                    conflict_kind = kind.as_str(),
+                    provider,
+                    channel_id,
+                    "canonical session identity write rejected"
+                );
+            }
+            Err(
+                crate::db::dispatched_session_canonical_identity::hook_session_upsert_error_to_app_error(
+                    error,
+                ),
+            )
+        }
     }
 }
 
@@ -258,6 +302,18 @@ pub struct HookSessionBody {
     /// satisfy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// Explicit semantic owner kind. Omitted by old binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_kind: Option<String>,
+    /// Existing SHA-256-derived Discord bot namespace; never a raw token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_token_hash: Option<String>,
+    /// Durable turn-start identity. Present only for an authoritative new turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_start_nonce: Option<String>,
+    /// Whether the turn start was initiated by a dispatch. Paired with nonce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_origin: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -272,7 +328,7 @@ pub struct DeleteSessionQuery {
 pub async fn list_dispatched_sessions(
     State(state): State<AppState>,
     Query(params): Query<ListDispatchedSessionsQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let include_all = params.include_merged.as_deref() == Some("1");
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::list_dispatched_sessions_pg(pool, include_all).await {
@@ -296,79 +352,63 @@ pub async fn list_dispatched_sessions(
                     state.cluster_instance_id.as_deref(),
                     &worker_nodes,
                 );
-                (StatusCode::OK, Json(json!({"sessions": sessions})))
+                Ok((StatusCode::OK, Json(json!({"sessions": sessions}))))
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
+            Err(error) => Err(AppError::internal(error).with_code(ErrorCode::Database)),
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// POST /api/dispatched-sessions/webhook — upsert session from dcserver
 pub async fn hook_session(
     State(state): State<AppState>,
     Json(body): Json<HookSessionBody>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         return hook_session_pg(&state, pool, body).await;
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// DELETE /api/dispatched-sessions/cleanup — manual: delete disconnected sessions
 pub async fn cleanup_sessions(
     State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::cleanup_disconnected_sessions_pg(pool).await {
-            Ok(result) => (StatusCode::OK, Json(json!({"ok": true, "deleted": result}))),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            ),
+            Ok(result) => Ok((StatusCode::OK, Json(json!({"ok": true, "deleted": result})))),
+            Err(error) => {
+                Err(AppError::internal(format!("{error}")).with_code(ErrorCode::Database))
+            }
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// DELETE /api/dispatched-sessions/gc-threads — periodic: delete stale thread sessions
 pub async fn gc_thread_sessions(
     State(state): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         let deleted = dispatched_sessions_db::gc_stale_thread_sessions_pg(pool).await;
-        return (
+        return Ok((
             StatusCode::OK,
             Json(json!({"ok": true, "gc_threads": deleted.len()})),
-        );
+        ));
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// DELETE /api/dispatched-sessions/webhook — delete a session by session_key
 pub async fn delete_session(
     State(state): State<AppState>,
     Query(params): Query<DeleteSessionQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::delete_session_by_key_pg(pool, &params.session_key)
             .await
@@ -381,22 +421,18 @@ pub async fn delete_session(
                         json!({"id": session_id.to_string()}),
                     );
                 }
-                (
+                Ok((
                     StatusCode::OK,
                     Json(json!({"ok": true, "deleted": result.deleted})),
-                )
+                ))
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            ),
+            Err(error) => {
+                Err(AppError::internal(format!("{error}")).with_code(ErrorCode::Database))
+            }
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// GET /api/dispatched-sessions/claude-session-id?session_key=...
@@ -404,7 +440,7 @@ pub async fn delete_session(
 pub async fn get_claude_session_id(
     State(state): State<AppState>,
     Query(params): Query<DeleteSessionQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         let _ = dispatched_sessions_db::disconnect_stale_fixed_session_by_key_pg(
             pool,
@@ -423,40 +459,31 @@ pub async fn get_claude_session_id(
             Ok(Some(ids)) => {
                 let selected_session_id =
                     selected_provider_resume_selector_for_provider_recording_observation(
-                        pool,
-                        &params.session_key,
-                        provider,
-                        &ids,
+                        pool, provider, &ids,
                     )
                     .await;
-                (
+                Ok((
                     StatusCode::OK,
                     Json(json!({
                         "claude_session_id": ids.claude_session_id,
                         "session_id": selected_session_id,
                         "raw_provider_session_id": ids.raw_provider_session_id,
                     })),
-                )
+                ))
             }
-            Ok(None) => (
+            Ok(None) => Ok((
                 StatusCode::OK,
                 Json(json!({
                     "claude_session_id": null,
                     "session_id": null,
                     "raw_provider_session_id": null,
                 })),
-            ),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
+            )),
+            Err(error) => Err(AppError::internal(error).with_code(ErrorCode::Database)),
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// POST /api/dispatched-sessions/clear-stale-session-id
@@ -464,31 +491,24 @@ pub async fn get_claude_session_id(
 pub async fn clear_stale_session_id(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let Some(sid) = body
         .get("session_id")
         .and_then(|v| v.as_str())
         .or_else(|| body.get("claude_session_id").and_then(|v| v.as_str()))
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "session_id required"})),
-        );
+        return Err(AppError::bad_request("session_id required"));
     };
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::clear_stale_session_id_pg(pool, sid).await {
-            Ok(result) => (StatusCode::OK, Json(json!({"cleared": result}))),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            ),
+            Ok(result) => Ok((StatusCode::OK, Json(json!({"cleared": result})))),
+            Err(error) => {
+                Err(AppError::internal(format!("{error}")).with_code(ErrorCode::Database))
+            }
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// POST /api/dispatched-sessions/clear-session-id
@@ -497,27 +517,20 @@ pub async fn clear_stale_session_id(
 pub async fn clear_session_id_by_key(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let Some(key) = body.get("session_key").and_then(|v| v.as_str()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "session_key required"})),
-        );
+        return Err(AppError::bad_request("session_key required"));
     };
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::clear_session_id_by_key_pg(pool, key).await {
-            Ok(result) => (StatusCode::OK, Json(json!({"cleared": result}))),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            ),
+            Ok(result) => Ok((StatusCode::OK, Json(json!({"cleared": result})))),
+            Err(error) => {
+                Err(AppError::internal(format!("{error}")).with_code(ErrorCode::Database))
+            }
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 /// PATCH /api/dispatched-sessions/:id
@@ -525,7 +538,7 @@ pub async fn update_dispatched_session(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateDispatchedSessionBody>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(pool) = state.pg_pool_ref() {
         if body.status.is_none()
             && body.active_dispatch_id.is_none()
@@ -534,10 +547,7 @@ pub async fn update_dispatched_session(
             && body.cwd.is_none()
             && body.session_info.is_none()
         {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "no fields to update"})),
-            );
+            return Err(AppError::bad_request("no fields to update"));
         }
 
         let normalized_status = body
@@ -559,10 +569,7 @@ pub async fn update_dispatched_session(
         )
         .await
         {
-            Ok(0) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "session not found"})),
-            ),
+            Ok(0) => Err(AppError::not_found("session not found")),
             Ok(_) => {
                 match dispatched_sessions_db::load_session_update_payload_pg(pool, id).await {
                     Ok(Some(session)) => {
@@ -580,19 +587,13 @@ pub async fn update_dispatched_session(
                         error
                     ),
                 }
-                (StatusCode::OK, Json(json!({"ok": true})))
+                Ok((StatusCode::OK, Json(json!({"ok": true}))))
             }
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            ),
+            Err(error) => Err(AppError::internal(error).with_code(ErrorCode::Database)),
         };
     }
 
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "postgres pool unavailable"})),
-    )
+    Err(AppError::internal("postgres pool unavailable").with_code(ErrorCode::Database))
 }
 
 #[derive(Deserialize)]
@@ -675,9 +676,17 @@ async fn force_kill_session_impl_with_reason_and_forwarding(
             }
         };
 
+    let forward_context = crate::services::session_forwarding::ForwardCallerContext::from(state);
+    if let Err(response) = crate::services::session_forwarding::enforce_receiver_fence(
+        headers,
+        owner_instance_id.as_deref(),
+        forward_context.cluster_instance_id.as_deref(),
+    ) {
+        return response;
+    }
     if !crate::services::session_forwarding::is_forwarded_request(headers) {
         match crate::services::session_forwarding::resolve_forward_target(
-            state,
+            &forward_context,
             owner_instance_id.as_deref(),
             pool,
         )
@@ -686,7 +695,7 @@ async fn force_kill_session_impl_with_reason_and_forwarding(
             crate::services::session_forwarding::ForwardResolution::Local => {}
             crate::services::session_forwarding::ForwardResolution::Forward(target) => {
                 return crate::services::session_forwarding::forward_force_kill(
-                    state,
+                    &forward_context,
                     &target,
                     session_key,
                     retry,
@@ -935,9 +944,17 @@ pub async fn tmux_output(
         );
     };
 
+    let forward_context = crate::services::session_forwarding::ForwardCallerContext::from(&state);
+    if let Err(response) = crate::services::session_forwarding::enforce_receiver_fence(
+        &headers,
+        owner_instance_id.as_deref(),
+        forward_context.cluster_instance_id.as_deref(),
+    ) {
+        return response;
+    }
     if !crate::services::session_forwarding::is_forwarded_request(&headers) {
         match crate::services::session_forwarding::resolve_forward_target(
-            &state,
+            &forward_context,
             owner_instance_id.as_deref(),
             pool,
         )
@@ -946,7 +963,7 @@ pub async fn tmux_output(
             crate::services::session_forwarding::ForwardResolution::Local => {}
             crate::services::session_forwarding::ForwardResolution::Forward(target) => {
                 return crate::services::session_forwarding::forward_tmux_output(
-                    &state,
+                    &forward_context,
                     &target,
                     id,
                     effective_lines,
@@ -1155,7 +1172,6 @@ pub(crate) fn selected_provider_resume_selector_for_provider<'a>(
 
 pub(crate) async fn selected_provider_resume_selector_for_provider_recording_observation(
     pool: &sqlx::PgPool,
-    session_key: &str,
     provider_name: Option<&str>,
     ids: &dispatched_sessions_db::ProviderSessionIds,
 ) -> Option<String> {
@@ -1163,7 +1179,7 @@ pub(crate) async fn selected_provider_resume_selector_for_provider_recording_obs
         selected_provider_resume_selector_for_provider(provider_name, ids).map(str::to_string);
     record_raw_provider_transcript_len_watermark_if_observed(
         pool,
-        session_key,
+        &ids.resolved_session_key,
         provider_name,
         ids,
         None,
@@ -1485,9 +1501,17 @@ async fn kill_tmux_session_impl(
             }
         };
 
+    let forward_context = crate::services::session_forwarding::ForwardCallerContext::from(state);
+    if let Err(response) = crate::services::session_forwarding::enforce_receiver_fence(
+        headers,
+        owner_instance_id.as_deref(),
+        forward_context.cluster_instance_id.as_deref(),
+    ) {
+        return response;
+    }
     if !crate::services::session_forwarding::is_forwarded_request(headers) {
         match crate::services::session_forwarding::resolve_forward_target(
-            state,
+            &forward_context,
             owner_instance_id.as_deref(),
             pool,
         )
@@ -1496,7 +1520,7 @@ async fn kill_tmux_session_impl(
             crate::services::session_forwarding::ForwardResolution::Local => {}
             crate::services::session_forwarding::ForwardResolution::Forward(target) => {
                 return crate::services::session_forwarding::forward_kill_tmux(
-                    state,
+                    &forward_context,
                     &target,
                     session_key,
                     reason,
@@ -1644,7 +1668,7 @@ async fn kill_tmux_session_impl(
             let resumable = provider_resume_selector_is_effective(effective_provider_name, &ids);
             record_raw_provider_transcript_len_watermark_if_observed(
                 pool,
-                session_key,
+                &ids.resolved_session_key,
                 effective_provider_name,
                 &ids,
                 None,
@@ -1831,6 +1855,7 @@ mod kill_tmux_resume_tests {
         raw_provider_transcript_growth_proven: bool,
     ) -> ProviderSessionIds {
         ProviderSessionIds {
+            resolved_session_key: "test-session".to_string(),
             claude_session_id: claude_session_id.map(str::to_string),
             raw_provider_session_id: raw_provider_session_id.map(str::to_string),
             cwd: cwd.map(|path| path.display().to_string()),

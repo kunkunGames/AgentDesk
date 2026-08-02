@@ -5,6 +5,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
 
+use crate::services::discord::bot_role::UtilityBotRole;
 use crate::services::discord::health::{HealthRegistry, resolve_bot_http};
 use crate::services::discord::outbound::delivery::{deliver_outbound, first_raw_message_id};
 use crate::services::discord::outbound::message::{OutboundOperation, OutboundTarget};
@@ -246,7 +247,7 @@ impl RoutineDiscordLogger {
         } else if let Some(target) = self.health_target.as_deref() {
             self.log_to_target(
                 target,
-                "notify",
+                UtilityBotRole::Notify.alias(),
                 "routine_recovery_resumed",
                 &format!(
                     "routine:{}:run:{}:recovery",
@@ -326,6 +327,7 @@ impl RoutineDiscordLogger {
         RoutineDiscordLogStatus::skipped()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn log_to_routine_target(
         &self,
         store: Option<&RoutineStore>,
@@ -404,6 +406,7 @@ impl RoutineDiscordLogger {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn log_run_section(
         &self,
         store: &RoutineStore,
@@ -482,7 +485,7 @@ impl RoutineDiscordLogger {
                         return Err(error);
                     }
                 },
-                None => "notify".to_string(),
+                None => UtilityBotRole::Notify.alias().to_string(),
             };
             return Ok(Some(RoutineLogTarget { target, bot }));
         }
@@ -553,7 +556,7 @@ impl RoutineDiscordLogger {
             .strip_prefix("channel:")
             .unwrap_or(target.target.as_str());
         let token = crate::credential::read_bot_token(&target.bot)
-            .or_else(|| crate::credential::read_bot_token("notify"))
+            .or_else(|| crate::credential::read_bot_token(UtilityBotRole::Notify.alias()))
             .ok_or_else(|| {
                 format!(
                     "routine run Discord summary bot token not configured for {}",
@@ -737,6 +740,7 @@ impl RoutineDiscordLogger {
                 source: "routine-runtime",
                 reason_code: Some(reason_code),
                 session_key: Some(session_key),
+                attachment: None,
             },
         )
         .await
@@ -770,6 +774,7 @@ impl RoutineDiscordLogger {
                 source: "routine-runtime",
                 reason_code: Some(reason_code),
                 session_key: Some(session_key),
+                attachment: None,
             },
             dedupe_ttl_secs,
         )
@@ -923,7 +928,7 @@ async fn resolve_routine_thread_http(
 ) -> Result<RoutineThreadHttp> {
     let mut errors = Vec::new();
     let mut tried = Vec::new();
-    for bot in [provider_name, agent_id, "notify"] {
+    for bot in [provider_name, agent_id, UtilityBotRole::Notify.alias()] {
         if bot.trim().is_empty() || tried.contains(&bot) {
             continue;
         }
@@ -1105,7 +1110,7 @@ async fn resolve_available_log_bot(
 
 fn routine_log_bot_candidates(provider_bot: Option<&str>, agent_id: Option<&str>) -> Vec<String> {
     let mut candidates = Vec::new();
-    for bot in [provider_bot, agent_id, Some("notify")]
+    for bot in [provider_bot, agent_id, Some(UtilityBotRole::Notify.alias())]
         .into_iter()
         .flatten()
     {
@@ -1719,6 +1724,56 @@ mod tests {
         assert!(message.contains("action: \"complete\""));
         assert!(message.contains("status: \"failed\""));
         assert!(message.contains("error: boom"));
+    }
+
+    #[test]
+    fn run_outcome_message_redacts_secret_but_keeps_diagnostic_class() {
+        let routine = RoutineRecord {
+            id: "routine-123456789".to_string(),
+            agent_id: None,
+            fallback_agent_id: None,
+            max_retries: 0,
+            script_ref: "secret.js".to_string(),
+            name: "Secret Routine".to_string(),
+            status: "enabled".to_string(),
+            execution_strategy: "fresh".to_string(),
+            schedule: None,
+            next_due_at: None,
+            last_run_at: None,
+            last_result: None,
+            checkpoint: None,
+            discord_thread_id: None,
+            timeout_secs: None,
+            in_flight_run_id: None,
+            pause_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let diagnostic = "routine script secret.js tick(ctx) failed: api_key=sk-live-secret";
+        let outcome = RoutineRunOutcome {
+            run_id: "run-123456789".to_string(),
+            routine_id: routine.id.clone(),
+            script_ref: routine.script_ref.clone(),
+            action: "error".to_string(),
+            status: "failed".to_string(),
+            result_json: Some(json!({
+                "error": crate::services::routines::loader::ROUTINE_TICK_ERROR_PUBLIC_REASON,
+                "diagnostic_class": crate::services::routines::loader::ROUTINE_TICK_ERROR_PUBLIC_REASON,
+            })),
+            error: Some(
+                crate::services::routines::loader::ROUTINE_TICK_ERROR_PUBLIC_REASON.to_string(),
+            ),
+            fresh_context_guaranteed: false,
+        };
+
+        let message = run_outcome_message(&routine, &outcome);
+        let api_json = serde_json::to_string(&outcome).unwrap();
+        assert!(message.contains("routine_tick_exception"), "{message}");
+        assert!(api_json.contains("routine_tick_exception"), "{api_json}");
+        assert!(!message.contains("sk-live-secret"), "{message}");
+        assert!(!api_json.contains("sk-live-secret"), "{api_json}");
+        assert!(!message.contains(diagnostic), "{message}");
+        assert!(!api_json.contains(diagnostic), "{api_json}");
     }
 
     #[test]

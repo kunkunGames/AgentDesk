@@ -6,8 +6,9 @@ repository is already clippy-clean.
 ## Entrypoints
 
 - `just check`: local/CI aggregate for `just fmt-check`, staged clippy,
-  `cargo check --workspace --all-features --all-targets`, and the existing
-  non-Postgres test subset.
+  `cargo check --workspace --all-features --all-targets`, the existing
+  non-Postgres test subset, and the targeted `ClaudeBinary` compile-fail
+  doctest guard.
 - `just test-postgres`: existing PostgreSQL test lane for CI jobs with a
   Postgres service.
 - `just lint-strict`: target end state, `cargo clippy --workspace --all-targets
@@ -32,7 +33,12 @@ production-only, test-aware, or repo-wide before adding hard gates.
 ## Non-Postgres Test Scope
 
 `just test-non-pg` preserves the targeted non-Postgres subset already used by
-CI. A broader sweep was attempted with:
+CI on `main`: `ci-main.yml` runs it through `just check`, while the nightly
+macOS and Windows lanes run their broader non-Postgres sweeps. The required PR
+`check_fast` lane runs policy tests plus `just cargo-check` only, so this
+longer subset does not remain on the PR critical path.
+
+A broader sweep was attempted with:
 
 `cargo test --workspace --all-features --all-targets -- --skip _pg --skip pg_ --skip postgres --test-threads=1`
 

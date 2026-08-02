@@ -48,6 +48,16 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
         for (var li = 0; li < inflights.length; li++) {
           var inf = inflights[li];
           if (!inf.started_at) continue;
+          // Persistent routine sessions are intentionally reusable and may stay idle
+          // without accumulating progress, so elapsed time is not a hang signal.
+          var routineTmux = /^AgentDesk-[^-]+-routine-/.test(inf.tmux_session_name || "");
+          if (routineTmux) {
+            var routineRows = agentdesk.db.query(
+              "SELECT execution_strategy FROM routines WHERE discord_thread_id = ? LIMIT 1",
+              [inf.channel_id]
+            );
+            if (routineRows.length > 0 && routineRows[0].execution_strategy === "persistent") continue;
+          }
           // Stale inflight check: skip cleanup here — let InflightCleanupGuard handle it.
           // Previous approach (checking working sessions) caused false positives because
           // DB session status can lag behind actual tmux state.
@@ -58,10 +68,10 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
           if (currentThreshold < ALERT_INTERVAL_MINUTES) continue; // under 30min, skip
           // Check if we already alerted at this tier
           var tierKey = "long_turn_tier:" + inf.provider + ":" + inf.channel_id;
-          var lastTier = agentdesk.db.query("SELECT value FROM kv_meta WHERE key = ?", [tierKey]);
+          var lastTier = agentdesk.kv.get(tierKey);
           var lastAlertedThreshold = -1;
-          if (lastTier.length > 0) {
-            var rawLastTier = parseInt(lastTier[0].value, 10);
+          if (lastTier) {
+            var rawLastTier = parseInt(lastTier, 10);
             if (!isNaN(rawLastTier)) {
               // Backward compatibility for pre-30-minute cadence values:
               // old tier index 0/1/2 meant 30/60/120 minutes.
@@ -76,8 +86,8 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
           var recentProgress = updatedAgeMin !== null && updatedAgeMin <= WATCHDOG_EXTENSION_RECENT_PROGRESS_MINUTES;
           var extensionLine = "";
           var extensionKey = "long_turn_watchdog_extension:" + inf.provider + ":" + inf.channel_id;
-          var lastExtensionRows = agentdesk.db.query("SELECT value FROM kv_meta WHERE key = ?", [extensionKey]);
-          var lastExtensionAt = lastExtensionRows.length > 0 ? parseInt(lastExtensionRows[0].value, 10) : 0;
+          var lastExtensionVal = agentdesk.kv.get(extensionKey);
+          var lastExtensionAt = lastExtensionVal ? parseInt(lastExtensionVal, 10) : 0;
           var nowMs = Date.now();
           var extensionCooldownElapsed = !lastExtensionAt ||
             (nowMs - lastExtensionAt) >= WATCHDOG_EXTENSION_COOLDOWN_MINUTES * 60 * 1000;
@@ -86,10 +96,7 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
               var extendResp = requestTurnWatchdogExtension(inf.channel_id, WATCHDOG_EXTENSION_MINUTES);
               if (extendResp.ok) {
                 extensionLine = "\nwatchdog: +" + WATCHDOG_EXTENSION_MINUTES + "분 연장 요청 완료";
-                agentdesk.db.execute(
-                  "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
-                  [extensionKey, "" + nowMs]
-                );
+                agentdesk.kv.set(extensionKey, "" + nowMs);
                 agentdesk.log.info("[long-turn] " + (inf.channel_name || inf.channel_id) +
                   " — recent inflight progress; extended watchdog +" + WATCHDOG_EXTENSION_MINUTES + "min");
               } else {
@@ -137,10 +144,7 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
             "provider: " + (inf.provider || "?") +
             extensionLine
           );
-          agentdesk.db.execute(
-            "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
-            [tierKey, "" + currentThreshold]
-          );
+          agentdesk.kv.set(tierKey, "" + currentThreshold);
           agentdesk.log.warn("[long-turn] " + (inf.channel_name || inf.channel_id) + " — " + Math.round(elapsedMin) + "min (" + currentThreshold + "min threshold)");
         }
         // Pre-compute active inflight keys for O(1) lookups
@@ -153,25 +157,33 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
 
         // Clean up tier keys for inflights that no longer exist
         var tierKeys = agentdesk.db.query("SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'");
+        var tierKeysToDelete = [];
         for (var tk = 0; tk < tierKeys.length; tk++) {
           var parts = tierKeys[tk].key.split(":");
           var tkProvider = parts[1];
           var tkChannel = parts[2];
           if (!activeInflightSet[tkProvider + ":" + tkChannel]) {
-            agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [tierKeys[tk].key]);
+            tierKeysToDelete.push(tierKeys[tk].key);
           }
+        }
+        if (tierKeysToDelete.length > 0) {
+          agentdesk.kv.deleteMany(tierKeysToDelete);
         }
         // Also clean up old cooldown keys
         agentdesk.db.execute("DELETE FROM kv_meta WHERE key LIKE 'long_turn_alert:%'");
 
         var extensionKeys = agentdesk.db.query("SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'");
+        var extensionKeysToDelete = [];
         for (var ek = 0; ek < extensionKeys.length; ek++) {
           var eParts = extensionKeys[ek].key.split(":");
           var eProvider = eParts[1];
           var eChannel = eParts[2];
           if (!activeInflightSet[eProvider + ":" + eChannel]) {
-            agentdesk.db.execute("DELETE FROM kv_meta WHERE key = ?", [extensionKeys[ek].key]);
+            extensionKeysToDelete.push(extensionKeys[ek].key);
           }
+        }
+        if (extensionKeysToDelete.length > 0) {
+          agentdesk.kv.deleteMany(extensionKeysToDelete);
         }
       } catch(de) {
         agentdesk.log.warn("[long-turn] inflight scan error: " + de);

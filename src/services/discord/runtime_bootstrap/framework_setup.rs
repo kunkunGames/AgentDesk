@@ -62,14 +62,9 @@ pub(super) async fn run_bot_framework_setup(
 
     let shared_for_tmux = shared_for_migrate.clone();
 
-    // Background: poll for deferred restart marker when idle
-    super::spawns::run_bot_spawn_deferred_restart_poller(&shared_for_tmux, &provider_for_setup);
-
-    // (Phase 5.1 of intake-node-routing — issue #2007: the
-    // intake_worker poll loop is now spawned in `run_bot()`
-    // before the gateway lease check, so cluster-standby
-    // nodes also drain their share of `intake_outbox`. No
-    // worker bootstrap belongs here anymore.)
+    // (Phase 5.1 of intake-node-routing — issue #2007: `run_bot()` starts the
+    // intake worker only after the lease result authorizes a registered gateway
+    // or standby runtime. No worker bootstrap belongs here.)
 
     // Background: hot-reload skills on file changes (30s polling)
     // Scans home-level AND all active project-level skill directories.
@@ -136,13 +131,10 @@ pub(super) async fn run_bot_framework_setup(
         provider_for_setup.clone(),
     );
 
-    // #3412 startup reclaim sweep: a restart drops the in-memory single-message
-    // panel registry, orphaning any panel the previous generation was still
-    // animating (frozen Tasks/footer spinner). This one-shot per-channel sweep
-    // finds those prior-generation messages (inflight anchor ids + a bounded
-    // recent-message read) and applies a single finalize edit that strips the
-    // animated footer and appends `⏹ (재시작으로 중단됨)`. Current-generation live
-    // panels carry a post-boot timestamp and are never touched.
+    // #3412/#4342 startup reclaim: independent bounded passes finalize prior-
+    // generation frozen panels after the boot settle window and later delete
+    // current-bot `...` placeholders left unlinked by a POST-before-persist
+    // crash. Both passes reload durable protections and fail closed on identity.
     super::startup_reclaim::spawn_startup_reclaim_sweep(
         ctx.http.clone(),
         shared_clone.clone(),
@@ -220,11 +212,13 @@ pub(super) async fn run_bot_framework_setup(
 pub(super) fn run_bot_build_slash_commands() -> Vec<poise::Command<Data, Error>> {
     let mut slash_commands = vec![
         commands::cmd_start(),
+        commands::cmd_resume(),
         commands::cmd_pwd(),
         commands::cmd_status(),
         commands::cmd_inflight(),
         commands::cmd_clear(),
         commands::cmd_stop(),
+        commands::cmd_cancel_queued(),
         commands::cmd_down(),
         commands::cmd_shell(),
         commands::cmd_skill(),
@@ -237,7 +231,6 @@ pub(super) fn run_bot_build_slash_commands() -> Vec<poise::Command<Data, Error>>
         commands::cmd_goals(),
         commands::cmd_effort(),
         commands::cmd_compact(),
-        commands::cmd_steer(),
         commands::cmd_cost(),
         commands::cmd_context(),
         commands::cmd_adk(),
@@ -325,18 +318,8 @@ async fn audit_or_prune_global_slash_commands(
 }
 
 #[cfg(test)]
-mod steer_registration_tests {
+mod slash_command_registration_tests {
     use super::*;
-
-    #[test]
-    fn steer_command_is_registered() {
-        assert!(
-            run_bot_build_slash_commands()
-                .iter()
-                .any(|command| command.name == "steer"),
-            "/steer must be present in the slash command registration vec"
-        );
-    }
 
     #[test]
     fn node_command_is_registered() {
