@@ -1277,6 +1277,7 @@ mod tests {
             image_filename: None,
             image_content_type: None,
             image_data: None,
+            image_size_bytes: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
