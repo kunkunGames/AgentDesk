@@ -114,7 +114,9 @@ pub(super) struct SummaryRuleDef {
 // ─── Tilde expansion ────────────────────────────────────────────────────────
 
 fn expand_tilde(path: &str) -> String {
-    crate::utils::format::expand_tilde_path(path).to_string_lossy().into_owned()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ─── Loading ────────────────────────────────────────────────────────────────

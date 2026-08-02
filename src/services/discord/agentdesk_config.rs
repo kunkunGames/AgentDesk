@@ -15,7 +15,9 @@ use crate::config::{
 use crate::services::provider::ProviderKind;
 
 fn expand_tilde(path: &str) -> String {
-    crate::utils::format::expand_tilde_path(path).to_string_lossy().into_owned()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn load_agentdesk_config_with_path() -> Option<(Config, std::path::PathBuf)> {

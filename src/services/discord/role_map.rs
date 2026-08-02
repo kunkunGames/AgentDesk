@@ -12,7 +12,9 @@ use crate::services::provider::ProviderKind;
 
 /// Expand `~` or `~/` prefix to the user's home directory.
 fn expand_tilde(path: &str) -> String {
-    crate::utils::format::expand_tilde_path(path).to_string_lossy().into_owned()
+    crate::utils::format::expand_tilde_path(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn load_role_map_json() -> Option<serde_json::Value> {
