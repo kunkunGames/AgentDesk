@@ -1662,6 +1662,10 @@
     1000+ production lines). (`dispatches/thread_reuse.rs` dropped below the
     giant threshold in #3037 after its Postgres/Discord-API thread-map helpers
     were relocated to `services/dispatches/discord_delivery/thread_reuse.rs`.)
+  - `src/server/routes/scheduled_messages.rs` (giant route surface): request
+    validation, patch semantics, response shaping, and cluster rollout gates
+    share one scheduled-message API contract. Keep behavior changes covered by
+    route and PostgreSQL tests; split only by an explicit API contract boundary.
 - active_callsite_coverage: retired DB compatibility history is tracked in
   `known-legacy.md`.
 - invariants:
@@ -1788,6 +1792,10 @@
   - `src/db/intake_outbox.rs` is the intake-node-routing claim/transition/sweep
     surface; its production LoC is now below the giant-file threshold once the
     `#[cfg(test)] mod` PG coverage is excluded (bugfix only).
+  - `src/db/scheduled_messages.rs` (giant persistence surface): row conversion,
+    durable lease transitions, attachment metadata, and worker-capability reads
+    share one SQL projection contract. Preserve the projection invariants and
+    PostgreSQL coverage; split only by an explicit persistence contract boundary.
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
 - invariants: production reads/writes go through `pg_pool_ref()`; retired DB
