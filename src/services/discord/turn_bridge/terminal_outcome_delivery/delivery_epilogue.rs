@@ -57,6 +57,7 @@ pub(super) struct DeliveryEpilogueState<'a> {
     pub(super) terminal_full_replay_cleanup_msg_ids: &'a mut Vec<MessageId>,
     pub(super) bridge_should_emit_completion: &'a mut bool,
     pub(super) status_panel_terminal_committed: &'a mut bool,
+    pub(super) busy_requeue_outcome: &'a mut Option<followup_requeue::FollowupRequeueOutcome>,
 }
 
 #[rustfmt::skip]
@@ -101,6 +102,7 @@ pub(super) async fn handle_delivery_epilogue(
         &mut *state.terminal_full_replay_cleanup_msg_ids;
     let mut bridge_should_emit_completion = *state.bridge_should_emit_completion;
     let mut status_panel_terminal_committed = *state.status_panel_terminal_committed;
+    let busy_requeue_outcome = &mut *state.busy_requeue_outcome;
 
     match message {
         DeliveryEpilogueMessage::PostCommit => {
@@ -109,21 +111,20 @@ pub(super) async fn handle_delivery_epilogue(
             inflight_state.response_sent_offset = response_sent_offset;
             inflight_state.terminal_delivery_committed = true;
             inflight_state.full_response = full_response.clone();
-            match crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
-                &inflight_state,
-                "turn_bridge::terminal_delivery_committed_mirror@5536",
-            ) {
-                crate::services::discord::inflight::GuardedSaveOutcome::IoError => {
-                    tracing::warn!(
-                        provider = %provider.as_str(),
-                        channel_id = channel_id.get(),
-                        "turn bridge failed to mirror committed terminal delivery before cleanup"
-                    );
-                }
-                crate::services::discord::inflight::GuardedSaveOutcome::Saved
-                | crate::services::discord::inflight::GuardedSaveOutcome::Missing
-                | crate::services::discord::inflight::GuardedSaveOutcome::IdentityMismatch => {}
-            }
+            let mirror_outcome =
+                crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
+                    &mut *inflight_state,
+                    "turn_bridge::terminal_delivery_committed_mirror@5536",
+                );
+            crate::services::discord::inflight::terminal_delivery_evidence_loss::warn_for_bridge_terminal_mirror_outcome(
+                mirror_outcome,
+                crate::services::discord::inflight::terminal_delivery_evidence_loss::BridgeEvidenceLossContext {
+                    provider: &provider,
+                    channel_id,
+                    current_msg_id,
+                    response_sent_offset,
+                },
+            );
             for frozen_msg_id in terminal_full_replay_cleanup_msg_ids.drain(..) {
                 // #5413/#3607: current_msg_id is the terminal answer and is
                 // already excluded here, so no terminal-anchor guard is
@@ -323,21 +324,19 @@ pub(super) async fn handle_delivery_epilogue(
                         "TUI transport error was already delivered; skipping quiescence gate so inflight cleanup can complete"
                     );
                 }
-                // Skip only when the busy path already requeued; legacy must still requeue (#4610).
-                if claude_tui_followup_pre_submit_requeue_candidate
-                    && !claude_tui_busy_requeue_pending
-                {
-                    let _ = followup_requeue::requeue_claude_tui_followup_pre_submit_timeout(
-                        &shared_owned,
-                        &provider,
-                        channel_id,
-                        &inflight_state,
-                        dispatch_id.as_deref(),
-                        adk_session_key.as_deref(),
-                        turn_id.as_str(),
-                    )
-                    .await;
-                }
+                followup_requeue::requeue_if_needed(
+                    busy_requeue_outcome,
+                    claude_tui_followup_pre_submit_requeue_candidate,
+                    claude_tui_busy_requeue_pending,
+                    &shared_owned,
+                    &provider,
+                    channel_id,
+                    &inflight_state,
+                    dispatch_id.as_deref(),
+                    adk_session_key.as_deref(),
+                    turn_id.as_str(),
+                )
+                .await;
                 super::super::super::tmux::TuiCompletionGateOutcome::NotGated
             };
 

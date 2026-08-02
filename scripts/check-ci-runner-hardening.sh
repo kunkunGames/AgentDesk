@@ -60,7 +60,43 @@ unless document["concurrency"] == expected_concurrency
   exit 1
 end
 
+trigger = document[true] || document["on"]
+trigger_events = case trigger
+when Hash
+  trigger.keys.map(&:to_s)
+when Array
+  trigger.map(&:to_s)
+when String
+  [trigger]
+else
+  []
+end
+unless trigger_events == ["pull_request"]
+  warn "#{path}: required PR contexts must be triggered only by pull_request"
+  exit 1
+end
+
 targets = {
+  # The independent explicit step-inventory layer was removed. What remains
+  # splits into two mechanisms of very different strength, and conflating them
+  # has produced a wrong claim in this comment five rounds running.
+  #
+  #   1. The whole-job semantic hash only *detects* structural change. Re-pinning
+  #      it in the same diff accepts anything. Measured on test_fast: adding an
+  #      unregistered step, deleting "Start PostgreSQL service", and swapping two
+  #      cache steps each fail against the stale pin (rc=1) and pass after a
+  #      re-pin (rc=0), with no expected-step edit needed. Treat the hash as a
+  #      review trigger, not a guarantee.
+  #   2. The hash is compared in exactly one place. Every other assertion in
+  #      this file is independent of it and survives a re-pin.
+  #
+  # This comment does not enumerate what mechanism 2 covers. Five rounds of
+  # trying produced an incomplete or wrong list every time. To find out whether
+  # a specific tamper is caught, apply it, re-pin the hash, and run this
+  # script -- that answer does not go stale.
+  #
+  # This registry does not discover new jobs automatically, and there is no
+  # invocation-floor replacement in the selection-evidence verifier.
   "check_fast_cross_os" => {
     "label" => "cross-OS job",
     "name" => 'Fast check + non-PG tests (${{ matrix.os }})',
@@ -73,7 +109,6 @@ targets = {
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
-        "continue_on_error" => nil,
         "timeout_minutes" => nil,
       },
     },
@@ -84,13 +119,87 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.pg_db == 'true'",
     "runs_on" => "ubuntu-latest",
-    # #4747 (opt.3) re-pins after making PR cache access restore-only.
-    "job_sha256" => "038d897af037869047a114d10640751c62f0a7350d3748320bbabb171fadeeff",
+    # #4979 S2 re-pins after adding the AGENTDESK_REQUIRE_PG=1 job env so a PG
+    # connection failure in this PG-backed lane hard-fails instead of
+    # soft-skipping green; the command inventory itself is unchanged.
+    # #5040 re-pins after adding the telemetry-only intake authority regressions
+    # to this existing toolchain-provisioned lane whose mirror is required.
+    # #5025 and #4985 retain their production bridge and footer-marker coverage
+    # in the same job block, so the pin covers the merged command inventory.
+    "job_sha256" => "0995b8496416accb68d636a3d115508298b457d035be9dc48e07b9fac6e2a51b",
     "cargo_steps" => {
+      "Observe curated lane selections" => {
+        "commands" => [
+          "set -o pipefail",
+          "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-test-fast.log\"",
+        ],
+        "timeout_minutes" => 20,
+        "continue_on_error" => nil,
+      },
+      "Require observer summary" => {
+        "commands" => [
+          "set -euo pipefail",
+          "python3 scripts/check_test_target_integrity.py --verify-selection-evidence \"$RUNNER_TEMP/selection-evidence-test-fast.log\"",
+        ],
+        "timeout_minutes" => 1,
+        "if_condition" => "always()",
+        "continue_on_error" => nil,
+      },
+      "Footer-only marker regressions" => {
+        "commands" => [
+          "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
+          "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
+        ],
+        "timeout_minutes" => 10,
+      },
+      "Trusted session forwarding tests" => {
+        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
+        "timeout_minutes" => 10,
+      },
+      "Telemetry-only intake authority regressions" => {
+        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres"],
+        "timeout_minutes" => 10,
+      },
+      "Terminal delivery evidence regressions" => {
+        "commands" => [
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn",
+        ],
+        "timeout_minutes" => 10,
+      },
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
-        "continue_on_error" => nil,
         "timeout_minutes" => 20,
+      },
+    },
+  },
+  "high-risk-recovery" => {
+    "label" => "High-risk recovery job",
+    "name" => "High-risk recovery",
+    "needs" => "changes",
+    "if" => "needs.changes.outputs.high_risk_recovery == 'true'",
+    "runs_on" => "ubuntu-latest",
+    "job_sha256" => "9c3587d8664bdd63769c3306c016f241e851649a68a7c6a52b11e243c438df3d",
+    "require_debug_env" => false,
+    "cargo_steps" => {
+      "Observe curated lane selections" => {
+        "commands" => [
+          "set -o pipefail",
+          "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-high-risk.log\"",
+        ],
+        "timeout_minutes" => 20,
+        "continue_on_error" => nil,
+      },
+      "Require observer summary" => {
+        "commands" => [
+          "set -euo pipefail",
+          "python3 scripts/check_test_target_integrity.py --verify-selection-evidence \"$RUNNER_TEMP/selection-evidence-high-risk.log\"",
+        ],
+        "timeout_minutes" => 1,
+        "if_condition" => "always()",
+        "continue_on_error" => nil,
       },
     },
   },
@@ -124,7 +233,9 @@ targets.each do |job_id, spec|
   }.each do |field, expected|
     errors << "#{label} must retain exact #{field}" unless job[field] == expected
   end
-  errors << "#{label} must not be allowed to continue on error" unless job["continue-on-error"].nil?
+  if job["continue-on-error"]
+    errors << "#{label} must not be allowed to continue on error"
+  end
   if job_id == "check_fast_cross_os"
     strategy = job["strategy"]
     unless strategy.is_a?(Hash)
@@ -135,12 +246,13 @@ targets.each do |job_id, spec|
     end
   end
 
-  env = job["env"]
-  keys.each do |key|
-    unless env.is_a?(Hash) && env[key] == "0"
-      errors << "#{label} must set job-level #{key} to the string \"0\""
+  unless spec["require_debug_env"] == false
+    env = job["env"]
+    keys.each do |key|
+      unless env.is_a?(Hash) && env[key] == "0"
+        errors << "#{label} must set job-level #{key} to the string \"0\""
+      end
     end
-
   end
 
   expected_steps = spec.fetch("cargo_steps")
@@ -161,8 +273,11 @@ targets.each do |job_id, spec|
       unless step["shell"] == "bash"
         errors << "#{label} #{name.inspect} must use explicit bash"
       end
-      errors << "#{label} #{name.inspect} must not be conditionally skipped" unless step["if"].nil?
-      unless step["continue-on-error"] == step_spec.fetch("continue_on_error")
+      unless step["if"] == step_spec.fetch("if_condition", nil)
+        errors << "#{label} #{name.inspect} must retain exact if policy"
+      end
+      if step_spec.key?("continue_on_error") &&
+         step["continue-on-error"] != step_spec.fetch("continue_on_error")
         errors << "#{label} #{name.inspect} must retain exact continue-on-error policy"
       end
       unless step["timeout-minutes"] == step_spec.fetch("timeout_minutes")
@@ -180,9 +295,6 @@ targets.each do |job_id, spec|
       forbidden.each do |key|
         errors << "#{label} step #{index + 1} must not set #{key}" if step_env.is_a?(Hash) && step_env.key?(key)
         errors << "#{label} step #{index + 1} must not mutate #{key} at runtime" if run.is_a?(String) && run.include?(key)
-      end
-      if run.is_a?(String) && run.match?(/(^|[[:space:]])cargo[[:space:]]|(^|[[:space:]])just[[:space:]]+test-postgres/)
-        errors << "#{label} step #{index + 1} adds an unprotected cargo/test boundary"
       end
     end
   end
@@ -202,6 +314,92 @@ RUBY
 trusted_workflow=".github/workflows/ci-macos-trusted.yml"
 pr_workflow=".github/workflows/ci-pr.yml"
 
+workflow_files() {
+  find .github/workflows -maxdepth 1 -type f \
+    \( -name '*.yml' -o -name '*.yaml' \) -print0
+}
+
+validate_workflow_entries() {
+  while IFS= read -r -d '' workflow; do
+    error "$workflow must not be a symlink; workflow hardening requires regular files"
+  done < <(find .github/workflows -type l -print0)
+}
+
+validate_required_context_uniqueness() {
+  if ! command -v ruby >/dev/null 2>&1; then
+    error "ruby is required to validate required workflow contexts structurally"
+    return
+  fi
+
+  while IFS= read -r -d '' workflow; do
+    if ! ruby - "$workflow" "$pr_workflow" <<'RUBY'
+require "yaml"
+
+path, pr_path = ARGV
+begin
+  # Workflow aliases are intentionally unsupported. Rejecting them keeps every
+  # audited job definition local and explicit instead of expanding YAML graphs.
+  document = YAML.safe_load(File.read(path), aliases: false, filename: path)
+rescue StandardError => error
+  warn "#{path}: cannot parse YAML: #{error.message}"
+  exit 1
+end
+jobs = document.is_a?(Hash) ? document["jobs"] : nil
+unless jobs.is_a?(Hash)
+  warn "#{path}: jobs must be a YAML mapping"
+  exit 1
+end
+required_context = "Script checks"
+required_context_jobs = []
+unsafe_dynamic_name_jobs = []
+jobs.each do |job_id, job|
+  next unless job.is_a?(Hash)
+
+  name = job["name"]
+  required_context_jobs << job_id.to_s if name.to_s.strip == required_context
+  next unless name.is_a?(String) && name.include?("${{")
+
+  # Do not evaluate Actions expressions. Permit exactly one matrix substitution
+  # whose static prefix/suffix make the required context impossible to render.
+  expression_shape_valid = name.scan("${{").length == 1 && name.scan("}}").length == 1
+  matrix_name = if expression_shape_valid
+    /\A([^{}]*)\$\{\{\s*matrix\.[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}([^{}]*)\z/.match(name)
+  end
+  can_render_required = if matrix_name
+    static_fragments = [matrix_name[1], matrix_name[2]]
+    static_fragments.any? { |fragment| fragment.include?(required_context) } ||
+      (required_context.start_with?(matrix_name[1]) && required_context.end_with?(matrix_name[2]))
+  else
+    true
+  end
+  unsafe_dynamic_name_jobs << job_id.to_s if can_render_required
+end
+if path == pr_path
+  scripts = jobs["scripts"]
+  unless scripts.is_a?(Hash) && scripts["name"] == required_context
+    warn "#{path}: required Script checks context must be the exact literal name of jobs.scripts"
+    exit 1
+  end
+  unexpected_required = required_context_jobs - ["scripts"]
+  if unexpected_required.any?
+    warn "#{path}: required Script checks context must belong only to jobs.scripts"
+    exit 1
+  end
+elsif required_context_jobs.any?
+  warn "#{path}: must not publish required Script checks context (jobs: #{required_context_jobs.join(', ')})"
+  exit 1
+end
+if unsafe_dynamic_name_jobs.any?
+  warn "#{path}: dynamic job names must not be able to publish required Script checks context (jobs: #{unsafe_dynamic_name_jobs.join(', ')})"
+  exit 1
+end
+RUBY
+    then
+      error "$workflow violates required Script checks context uniqueness"
+    fi
+  done < <(workflow_files)
+}
+
 if [ ! -f "$trusted_workflow" ]; then
   error "missing $trusted_workflow"
 fi
@@ -209,9 +407,9 @@ if [ ! -f "$pr_workflow" ]; then
   error "missing $pr_workflow"
 fi
 
-for workflow in .github/workflows/*.yml; do
-  [ -f "$workflow" ] || continue
+validate_workflow_entries
 
+while IFS= read -r -d '' workflow; do
   if grep -Eq '^[[:space:]]+pull_request(_target)?:' "$workflow"; then
     if grep -Eq 'MACOS_RUNNER|self-hosted' "$workflow"; then
       error "$workflow is pull_request-triggered and must not reference self-hosted macOS routing"
@@ -225,7 +423,9 @@ for workflow in .github/workflows/*.yml; do
   if grep -q 'RUSTC_WRAPPER=' "$workflow" && ! grep -q 'SCCACHE_GHA_ENABLED=' "$workflow"; then
     error "$workflow clears RUSTC_WRAPPER but not SCCACHE_GHA_ENABLED"
   fi
-done
+done < <(workflow_files)
+
+validate_required_context_uniqueness
 
 if [ -f "$trusted_workflow" ]; then
   if grep -Eq '^[[:space:]]+pull_request(_target)?:' "$trusted_workflow"; then

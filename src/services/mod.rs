@@ -122,6 +122,7 @@ pub mod settings;
 pub mod shell_guard;
 pub mod slo;
 pub(crate) mod stale_turn_reconciler;
+pub(crate) mod task_completion_v1;
 // #3034: 1 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during termination_audit dead-code cleanup.
 pub(crate) mod terminal_status_formatting;
@@ -138,6 +139,9 @@ pub mod tool_output_guard;
 pub(crate) mod tui_prompt_control;
 #[allow(dead_code)]
 pub(crate) mod tui_prompt_dedupe;
+// #4754 Slice 1 removes the automatic intake call site; retain this helper
+// module for the subsequent manual-steering slice without dead-code noise.
+#[allow(dead_code)]
 pub(crate) mod tui_steering;
 pub(crate) mod tui_turn_state;
 pub mod turn_cancel_finalizer;

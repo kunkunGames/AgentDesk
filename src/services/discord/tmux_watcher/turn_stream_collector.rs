@@ -38,6 +38,7 @@ pub(super) struct TurnStreamCollectorIo {
     pub(super) data: Vec<u8>,
     pub(super) data_start_offset: u64,
     pub(super) epoch_snapshot: u64,
+    pub(super) source_authority: WatcherSourceAuthority,
 }
 
 pub(super) struct TurnParseState<'a> {
@@ -98,6 +99,7 @@ pub(super) struct ActiveReadState {
 
 pub(super) struct CollectedTurnStream {
     pub(super) turn_data_start_offset: u64,
+    pub(super) source_authority: WatcherSourceAuthority,
     pub(super) split_trailing_turn_follows: bool,
     pub(super) state: StreamLineState,
     pub(super) restored_response_seed: String,
@@ -130,10 +132,6 @@ pub(super) struct CollectedTurnStream {
     pub(super) terminal_kind: Option<WatcherTerminalKind>,
     pub(super) terminal_evidence_offset: Option<u64>,
     pub(super) is_prompt_too_long: bool,
-    pub(super) is_auth_error: bool,
-    pub(super) auth_error_message: Option<String>,
-    pub(super) is_provider_overloaded: bool,
-    pub(super) provider_overload_message: Option<String>,
     pub(super) stale_resume_detected: bool,
     pub(super) task_notification_kind: Option<TaskNotificationKind>,
     pub(super) task_notification_context:
@@ -172,6 +170,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
     let data = io.data;
     let data_start_offset = io.data_start_offset;
     let epoch_snapshot = io.epoch_snapshot;
+    let source_authority = io.source_authority;
     let utf8_decoder = &mut *parser.utf8_decoder;
     let watcher_turn_identity = (*parser.watcher_turn_identity).clone();
     let producer_registry = (*relay.producer_registry).clone();
@@ -469,6 +468,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
             &producer_registry,
             &mut cached_relay_producer,
             fence,
+            source_authority.generation_mtime_ns,
         ),
         None => forward_chunk_to_supervisor_relay_for_turn(
             &tmux_session_name,
@@ -476,6 +476,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
             &producer_registry,
             &mut cached_relay_producer,
             turn_identity_for_panel.as_ref(),
+            source_authority.generation_mtime_ns,
         ),
     };
     let supervisor_turn_state = apply_initial_supervisor_relay_forward(
@@ -504,10 +505,6 @@ pub(super) async fn collect_turn_stream_until_terminal(
         None
     };
     let mut is_prompt_too_long = initial_outcome.is_prompt_too_long;
-    let mut is_auth_error = initial_outcome.is_auth_error;
-    let mut auth_error_message = initial_outcome.auth_error_message;
-    let mut is_provider_overloaded = initial_outcome.is_provider_overloaded;
-    let mut provider_overload_message = initial_outcome.provider_overload_message;
     let mut stale_resume_detected = initial_outcome.stale_resume_detected;
     let mut auto_compaction_lifecycle_attempted = false;
     let mut task_notification_kind = stream_seed.task_notification_kind;
@@ -744,6 +741,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
                             &producer_registry,
                             &mut cached_relay_producer,
                             fence,
+                            source_authority.generation_mtime_ns,
                         ),
                         None => forward_chunk_to_supervisor_relay_for_turn(
                             &tmux_session_name,
@@ -751,6 +749,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
                             &producer_registry,
                             &mut cached_relay_producer,
                             turn_identity_for_panel.as_ref(),
+                            source_authority.generation_mtime_ns,
                         ),
                     };
                     apply_streaming_supervisor_relay_forward(
@@ -795,12 +794,6 @@ pub(super) async fn collect_turn_stream_until_terminal(
                             .or(terminal_evidence_offset);
                     }
                     is_prompt_too_long = is_prompt_too_long || outcome.is_prompt_too_long;
-                    is_auth_error = is_auth_error || outcome.is_auth_error;
-                    if auth_error_message.is_none() {
-                        auth_error_message = outcome.auth_error_message;
-                    }
-                    is_provider_overloaded =
-                        is_provider_overloaded || outcome.is_provider_overloaded;
                     stale_resume_detected = stale_resume_detected || outcome.stale_resume_detected;
                     if let Some(kind) = outcome.task_notification_kind {
                         task_notification_kind =
@@ -848,9 +841,6 @@ pub(super) async fn collect_turn_stream_until_terminal(
                                 hint
                             );
                         }
-                    }
-                    if provider_overload_message.is_none() {
-                        provider_overload_message = outcome.provider_overload_message;
                     }
                     if outcome.auto_compacted && !auto_compaction_lifecycle_attempted {
                         auto_compaction_lifecycle_attempted =
@@ -1115,6 +1105,7 @@ pub(super) async fn collect_turn_stream_until_terminal(
     commit_collect_state!();
     return CollectOutcome::Fallthrough(CollectedTurnStream {
         turn_data_start_offset,
+        source_authority,
         split_trailing_turn_follows,
         state,
         restored_response_seed,
@@ -1146,10 +1137,6 @@ pub(super) async fn collect_turn_stream_until_terminal(
         terminal_kind,
         terminal_evidence_offset,
         is_prompt_too_long,
-        is_auth_error,
-        auth_error_message,
-        is_provider_overloaded,
-        provider_overload_message,
         stale_resume_detected,
         task_notification_kind,
         task_notification_context,

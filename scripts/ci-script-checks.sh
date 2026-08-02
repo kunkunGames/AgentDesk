@@ -68,6 +68,9 @@ echo "=== Policy DB capability manifest guard (#3734) ==="
 echo "=== Merge automation policy tests (#4250) ==="
 node --test policies/__tests__/merge-automation.test.js
 
+echo "=== Timeout shadow aggregation gate tests (#3950) ==="
+node --test scripts/__tests__/timeout-shadow-gate.test.mjs
+
 echo "=== Daily log-digest routine tests (#4263) ==="
 node --test policies/__tests__/daily-log-digest.test.js
 "$PYTHON" -m unittest tests.test_daily_log_digest
@@ -111,19 +114,39 @@ echo "=== CI timeout wrapper tests (#4413) ==="
 echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
+echo "=== TUI relay assertion unit tests (#5065) ==="
+"$PYTHON" -m unittest scripts.e2e.tui_relay.test_assertions
+
 echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
 "$PYTHON" -m unittest tests.test_fast_check_ci_wiring
 
-echo "=== Rust test-lane coverage ratchet (#4846) ==="
-"$PYTHON" scripts/check_test_lane_coverage.py
+echo "=== Rust test-lane coverage ratchet (#4846/#4910) ==="
+if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
+  echo "ERROR: TEST_LANE_BASELINE_REF must name an immutable comparison snapshot" >&2
+  exit 1
+fi
+"$PYTHON" scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"
 "$PYTHON" -m unittest tests.test_test_lane_coverage
+
+echo "=== Test-target integrity gate (#5003, warn-only rollout) ==="
+# cargo exits 0 on zero filter matches, so a curated lane with the wrong
+# --lib/--bin/--test flag can run 0 tests while its required check stays
+# green. Warn-only until the known offenders are repaired (separate slice);
+# flip to --enforce afterwards. The unittest run below is the gate's own
+# mutation proof (bad fixture must fail, fixed fixture must pass).
+"$PYTHON" scripts/check_test_target_integrity.py
+"$PYTHON" -m unittest tests.test_check_test_target_integrity
+
+echo "=== PostgreSQL test-lane membership gate (#4979, enforced) ==="
+"$PYTHON" scripts/check_pg_test_lane_membership.py --baseline-ref "$TEST_LANE_BASELINE_REF"
+"$PYTHON" -m unittest tests.test_check_pg_test_lane_membership
 
 echo "=== Scheduled-message PG path-filter wiring contract ==="
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js verify.sh; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js verify.sh prs.json scratch.json scratchpad.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -153,7 +176,7 @@ for scratch_file in scratch.py scratchpad.py scratch.js scratchpad.js; do
     FAIL=1
   fi
 done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js; do
+for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js scratch[._-]*.json scratchpad[._-]*.json test_scratch[._-]*.json test_*.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -171,13 +194,8 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
-if grep -rn 'env!("HOME")' --include='*.rs' \
-  --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
-else
-  echo "OK: No env!(\"HOME\") found"
-fi
+echo "=== Checking hardcoded home paths (hard gate; see #100) ==="
+"$PYTHON" scripts/check-portable-paths.py --rust-env-home-only
 
 echo "=== Path integrity check ==="
 FAIL=0

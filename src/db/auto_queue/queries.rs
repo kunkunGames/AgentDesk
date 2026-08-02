@@ -185,7 +185,12 @@ pub async fn get_status_entry_pg(
                 CASE WHEN td.updated_at IS NOT NULL
                     THEN EXTRACT(EPOCH FROM td.updated_at)::BIGINT * 1000
                 END AS dispatch_updated_at,
-                COALESCE(live_sessions.live_session_count, 0)::BIGINT AS live_session_count,
+                (
+                    SELECT COUNT(*)::BIGINT
+                    FROM sessions s
+                    WHERE s.active_dispatch_id = e.dispatch_id
+                      AND COALESCE(s.status, '') NOT IN ('disconnected', 'aborted', 'completed', 'failed', 'cancelled')
+                ) AS live_session_count,
                 e.priority_rank::BIGINT AS priority_rank,
                 e.reason,
                 e.status,
@@ -215,13 +220,6 @@ pub async fn get_status_entry_pg(
          LEFT JOIN kanban_cards kc ON e.kanban_card_id = kc.id
          LEFT JOIN card_review_state crs ON e.kanban_card_id = crs.card_id
          LEFT JOIN task_dispatches td ON td.id = e.dispatch_id
-         LEFT JOIN (
-             SELECT active_dispatch_id, COUNT(*)::BIGINT AS live_session_count
-             FROM sessions
-             WHERE COALESCE(status, '') NOT IN ('disconnected', 'aborted', 'completed', 'failed', 'cancelled')
-               AND active_dispatch_id IS NOT NULL
-             GROUP BY active_dispatch_id
-         ) live_sessions ON live_sessions.active_dispatch_id = e.dispatch_id
          WHERE e.id = $1",
     )
     .bind(entry_id)
@@ -467,6 +465,35 @@ pub async fn count_cards_by_status_pg(
     .bind(agent_id.filter(|value| !value.is_empty()))
     .fetch_one(pool)
     .await
+}
+
+pub async fn count_cards_by_status_grouped_pg(
+    pool: &PgPool,
+    repo: Option<&str>,
+    agent_id: Option<&str>,
+    statuses: &[String],
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT status, COUNT(*)::BIGINT as count
+         FROM kanban_cards
+         WHERE status = ANY($1::TEXT[])
+           AND ($2::TEXT IS NULL OR repo_id = $2)
+           AND ($3::TEXT IS NULL OR assigned_agent_id = $3)
+         GROUP BY status",
+    )
+    .bind(statuses)
+    .bind(repo.filter(|value| !value.is_empty()))
+    .bind(agent_id.filter(|value| !value.is_empty()))
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let status: String = sqlx::Row::try_get(&row, "status")?;
+        let count: i64 = sqlx::Row::try_get(&row, "count")?;
+        map.insert(status, count);
+    }
+    Ok(map)
 }
 
 fn auto_queue_run_record_from_pg_row(
