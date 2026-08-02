@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useId } from "react";
 import { X, Plus, Trash2, UserPlus, UserMinus, Settings2 } from "lucide-react";
 import type { Office, Agent } from "../types";
 import AgentAvatar from "./AgentAvatar";
@@ -51,6 +51,9 @@ export default function OfficeManagerModal({
     (ko: string, en: string) => (isKo ? ko : en),
     [isKo],
   );
+  const descriptionId = useId();
+  const iconLabelId = useId();
+  const colorLabelId = useId();
 
   const openCreate = () => {
     setEditOffice(null);
@@ -279,14 +282,14 @@ export default function OfficeManagerModal({
                   </div>
                   <div>
                     <label
-                      htmlFor="office-description"
+                      htmlFor={descriptionId}
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("설명", "Description")}
                     </label>
                     <textarea
-                      id="office-description"
+                      id={descriptionId}
                       value={draft.description}
                       onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))}
                       className="w-full px-3 py-2 rounded-lg text-sm resize-none"
@@ -308,13 +311,13 @@ export default function OfficeManagerModal({
                 <div className="space-y-4">
                   <div>
                     <div
-                      id="office-icon-label"
+                      id={iconLabelId}
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("아이콘", "Icon")}
                     </div>
-                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby="office-icon-label">
+                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby={iconLabelId}>
                       {OFFICE_ICONS.map((ic, idx) => (
                         <button
                           key={ic}
@@ -364,13 +367,13 @@ export default function OfficeManagerModal({
                   </div>
                   <div>
                     <div
-                      id="office-color-label"
+                      id={colorLabelId}
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("색상", "Color")}
                     </div>
-                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby="office-color-label">
+                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby={colorLabelId}>
                       {OFFICE_COLORS.map((c, idx) => (
                         <button
                           key={c}
