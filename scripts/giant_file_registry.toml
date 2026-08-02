@@ -618,6 +618,18 @@ decompose_issue = "#4710"
 # registry doc and rejects ghost registrations.
 
 [[entry]]
+file = "src/db/scheduled_messages.rs"
+owner = "scheduled-messages"
+decision = "keep"
+keep_reason = "Scheduled-message row conversion, durable lease transitions, attachment metadata, and worker capability reads share one SQL projection contract; retain the cohesive persistence boundary until a scoped extraction is planned."
+
+[[entry]]
+file = "src/server/routes/scheduled_messages.rs"
+owner = "scheduled-messages"
+decision = "keep"
+keep_reason = "Scheduled-message API validation, patch semantics, rollout gates, and response shaping share one request contract; retain the cohesive route boundary until a scoped extraction is planned."
+
+[[entry]]
 # Standby JSONL relay has completion draining, terminal response selection, and
 # identity-guarded delivery in one module; split its polling and delivery paths
 # without changing durable cursor or result-first semantics.

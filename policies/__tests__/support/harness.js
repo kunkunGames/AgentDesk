@@ -161,7 +161,8 @@ function createAgentdeskMock(options) {
     escalations: [],
     manualInterventions: [],
     flushedEscalations: 0,
-    kv: new Map()
+    kv: new Map(),
+    kvDeleteManyCalls: []
   };
 
   const dbQuery = settings.dbQuery || (() => []);
@@ -430,6 +431,14 @@ function createAgentdeskMock(options) {
       },
       delete(key) {
         state.kv.delete(key);
+      },
+      deleteMany(keys) {
+        const copiedKeys = clone(keys || []);
+        state.kvDeleteManyCalls.push(copiedKeys);
+        for (const key of copiedKeys) {
+          state.kv.delete(key);
+        }
+        return { ok: true, deleted: copiedKeys.length };
       }
     },
     autoQueue: {

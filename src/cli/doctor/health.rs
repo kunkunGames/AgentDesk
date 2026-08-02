@@ -222,7 +222,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres/SQLite availability and server logs".to_string(),
+            next_step: "check PostgreSQL availability and agentdesk dcserver logs".to_string(),
         },
         // #4515 PR2: worker-local recovery circuit reasons.
         ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
@@ -306,7 +306,7 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 
 #[cfg(test)]
 mod health_classification_tests {
-    use super::super::contract::{FixSafety, Severity};
+    use super::super::contract::{FixSafety, SecurityExposure, Severity};
     use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
 
     #[test]
@@ -410,8 +410,16 @@ mod health_classification_tests {
         assert_eq!(provider_standby.severity, Severity::Warning);
         assert_eq!(provider_standby.fix_safety, FixSafety::ReadOnly);
         assert_eq!(
+            provider_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
             provider_standby.summary,
             "provider codex is in gateway standby mode"
+        );
+        assert_eq!(
+            provider_standby.next_step,
+            "verify primary gateway node is healthy"
         );
         assert_ne!(provider_standby.summary, provider_standby.raw);
 
@@ -420,9 +428,31 @@ mod health_classification_tests {
         assert_eq!(cluster_standby.severity, Severity::Warning);
         assert_eq!(cluster_standby.fix_safety, FixSafety::ReadOnly);
         assert_eq!(
+            cluster_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
             cluster_standby.summary,
             "cluster is in standby mode without a gateway connection"
         );
+        assert_eq!(
+            cluster_standby.next_step,
+            "verify cluster configuration and gateway node health"
+        );
         assert_ne!(cluster_standby.summary, cluster_standby.raw);
+    }
+
+    #[test]
+    fn db_unavailable_reason_is_actionable() {
+        let reason = classify_degraded_reason("db_unavailable");
+
+        assert_eq!(reason.subsystem, "postgres");
+        assert_eq!(reason.severity, Severity::Error);
+        assert_eq!(reason.fix_safety, FixSafety::NotFixable);
+        assert_eq!(reason.summary, "database is unavailable");
+        assert_eq!(
+            reason.next_step,
+            "check PostgreSQL availability and agentdesk dcserver logs"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{delete, get, patch, post},
 };
 
@@ -7,7 +8,7 @@ use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
     e2e_control, health_api, idle_recap, maintenance, message_outbox, messages, monitoring,
     pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
-    routines, scheduled_messages, skills_api, termination_events,
+    scheduled_messages, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -241,43 +242,19 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 get(prompt_manifest_retention::get_retention_status),
             )
             .route(
-                "/routines",
-                get(routines::list_routines).post(routines::attach_routine),
-            )
-            .route("/routines/metrics", get(routines::routine_metrics))
-            .route(
-                "/routines/runs/search",
-                get(routines::search_routine_run_results),
-            )
-            .route(
-                "/routines/{id}",
-                get(routines::get_routine)
-                    .patch(routines::patch_routine)
-                    .delete(routines::delete_routine),
-            )
-            .route("/routines/{id}/runs", get(routines::list_routine_runs))
-            .route("/routines/{id}/pause", post(routines::pause_routine))
-            .route("/routines/{id}/resume", post(routines::resume_routine))
-            .route("/routines/{id}/detach", post(routines::detach_routine))
-            .route("/routines/{id}/run-now", post(routines::run_routine_now))
-            .route(
-                "/routines/{id}/session/reset",
-                post(routines::reset_routine_session),
-            )
-            .route(
-                "/routines/{id}/session/kill",
-                post(routines::kill_routine_session),
-            )
-            .route(
                 "/scheduled-messages",
                 get(scheduled_messages::list_scheduled_messages)
-                    .post(scheduled_messages::create_scheduled_message),
+                    .post(scheduled_messages::create_scheduled_message)
+                    // The optional 8 MiB image is base64-encoded in JSON.
+                    // Keep this limit local to the upload-capable endpoint.
+                    .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
             )
             .route(
                 "/scheduled-messages/{id}",
                 get(scheduled_messages::get_scheduled_message)
                     .patch(scheduled_messages::patch_scheduled_message)
-                    .delete(scheduled_messages::cancel_scheduled_message),
+                    .delete(scheduled_messages::cancel_scheduled_message)
+                    .layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
             )
             .route(
                 "/scheduled-messages/{id}/trigger-now",
