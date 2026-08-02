@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-15 (against `main` @ `9594a4d94`).
+> Last refreshed: 2026-07-31 (PR #5048 stale-route recovery changes).
 >
 > Last refreshed: 2026-07-05 (#4089 — `worker_registry.rs` exposes the local RateLimitSync leader-worker active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: leader election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-leader switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the leader loop.)
 >
@@ -446,6 +446,13 @@
   before merging.
 
 ### Audited touches
+- 2026-07-30 — #5014 / PR #5020 destructive cancel commit: the inflight
+  sidecar flock, watcher cancel `AtomicBool`, and registry identity CAS remain
+  **worker-local** authority. The primitive adds no PostgreSQL lease, distributed
+  epoch, leader check, remote-owner RPC, durable cancel intent, worker placement,
+  or cross-node fencing; another node can independently verify the same channel
+  row. Gateway lease containment narrows that deployment condition but does not
+  turn the host-local commit into cluster authority.
 - 2026-07-26 — #4898 untrusted deploy-gate containment: PostgreSQL migration
   0100 adds a validated cluster-wide `CHECK` constraint that rejects normalized
   `deploy-gate` provenance. The `ALTER TABLE` lock serializes concurrent legacy
@@ -895,6 +902,15 @@
   safe without local execution; queued items are front-requeued before marker
   teardown. Worker execution remains instance-local and is the one intentional
   admission bypass after an outbox claim. No new lease or migration.
+
+- #5040 owner-authority admission fence correction: `owner_authority_channel_ids`
+  now distinguishes `opted_in`, `not_opted_in`, and `unknown` at the admission
+  boundary. A `pending` predecessor is eligible for local recovery only when
+  its row age exceeds `forward_pre_claim_timeout_secs`, the owner is live-local,
+  and the channel is explicitly unlisted; the row is atomically retired under
+  the channel advisory lock before local execution. Unknown config and
+  `claimed`/`accepted`/`spawned` routes remain fenced. Foreign-owner routing,
+  worker claim, lease, migration, and gateway ownership remain unchanged.
 
 - #3630 frontier mirror for cancel/stop + prompt_too_long terminal arms:
   turn_bridge now mirrors only Delivered+committed terminal-replace lease ranges

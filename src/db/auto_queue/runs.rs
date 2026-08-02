@@ -48,6 +48,7 @@ async fn queue_run_completion_notify_on_pg(
                 source: "system",
                 reason_code: None,
                 session_key: None,
+                attachment: None,
             },
         )
         .await

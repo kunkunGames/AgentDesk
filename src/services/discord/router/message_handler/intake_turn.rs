@@ -14,7 +14,6 @@ mod placeholder_handoff;
 pub(super) mod race_loss;
 mod runtime_transition;
 mod stale_dispatch_guard;
-mod steering_hook;
 mod turn_watchdog;
 mod voice_intake;
 mod worker_entry;
@@ -63,7 +62,7 @@ pub(super) async fn handle_text_message(
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
     preserve_on_cancel: bool,
-    queued_drain: bool,
+    _queued_drain: bool,
     preloaded_uploads: Vec<String>,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<(), Error> {
@@ -1813,69 +1812,15 @@ pub(super) async fn handle_text_message(
     )
     .await;
 
-    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, mut inflight_offset) = {
-        #[cfg(unix)]
-        {
-            if remote_profile.is_none()
-                && provider.uses_managed_tmux_backend()
-                && claude::is_tmux_available()
-            {
-                if let Some(ref tmux_name) = tmux_session_name {
-                    let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
-                    let session_exists =
-                        crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
-                    let last_offset = std::fs::metadata(&output_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    (
-                        Some(tmux_name.clone()),
-                        Some(output_path),
-                        Some(input_fifo_path),
-                        if session_exists { last_offset } else { 0 },
-                    )
-                } else {
-                    (None, None, None, 0)
-                }
-            } else {
-                (None, None, None, 0)
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            (None, None, None, 0u64)
-        }
-    };
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, mut inflight_offset) =
+        prelaunch_inflight_runtime_seed(
+            &provider,
+            remote_profile.is_none(),
+            tmux_session_name.as_deref(),
+            prelaunch_runtime_kind,
+        );
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
-    #[cfg(unix)]
-    if let Some(result) =
-        steering_hook::maybe_handle_intake_steering(steering_hook::IntakeSteeringContext {
-            http,
-            shared,
-            token,
-            channel_id,
-            user_msg_id,
-            placeholder_msg_id,
-            provider: &provider,
-            provider_label,
-            tmux_session_name: tmux_session_name.as_deref(),
-            current_path: &current_path,
-            session_id: session_id.as_deref(),
-            user_text,
-            cancel_token: &cancel_token,
-            intake_latency: &intake_latency,
-            foreground: matches!(turn_kind, TurnKind::Foreground),
-            local: remote_profile.is_none(),
-            wait_for_completion,
-            queued_drain,
-            has_dispatch: dispatch_id.is_some() || dispatch_id_for_thread.is_some(),
-            is_voice_announcement,
-            has_pending_uploads: !pending_uploads.is_empty(),
-        })
-        .await
-    {
-        return result;
-    }
     #[cfg(unix)]
     let mut recapture_offset_after_busy_wait = false;
     // #2416: compute claude_tui busy-followup diagnostic with a wait+retry step.
@@ -2212,7 +2157,7 @@ pub(super) async fn handle_text_message(
     }
 
     let (logical_channel_id, thread_id, thread_title) =
-        if let Some((parent_id, _parent_name)) = final_thread_parent {
+        if let Some((parent_id, _parent_name)) = final_thread_parent.as_ref() {
             let (live_thread_title, _) =
                 super::super::super::resolve_channel_category(http, cache, channel_id).await;
             (parent_id.get(), Some(channel_id.get()), live_thread_title)
@@ -2304,6 +2249,7 @@ pub(super) async fn handle_text_message(
         watcher_output_path,
         inflight_offset,
         "turn_start_message",
+        final_thread_parent.map(|(parent_channel_id, _)| parent_channel_id),
         &mut inflight_state,
     );
 

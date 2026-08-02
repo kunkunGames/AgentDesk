@@ -22,6 +22,7 @@ BUSY_RETRY_4888_TEST_COMMAND = (
 # update this test deliberately. The duplication is a drift-prevention gate, not an
 # attempt to derive the expected coverage from the justfile under test.
 EXPECTED_TEST_NON_PG_COMMANDS = (
+    "cargo test --lib engine::ops::cards_ops::parse_json_value_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::docs::inventory::endpoints::part_0 -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::task_completion_v1::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib source_registry -- --skip _pg --skip pg_ --skip postgres",
@@ -31,15 +32,22 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib server::routes::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres",
+    (
+        "cargo test --lib services::discord::tmux::placeholder_suppression::evidence::tests"
+        " -- --skip _pg --skip pg_ --skip postgres"
+    ),
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::watcher_lifecycle::tests::tests::turn_starts_reuse_healthy_runtime_path_incumbent_after_handoff -- --exact",
     "cargo test --lib server::claude_oauth_usage_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib tui_task_card::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::message_outbox::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::dispatches::outbox_claiming::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::dispatches::discord_delivery::guard::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib discord_thread_create -- --test-threads=1",
     "cargo test --lib reaction_control::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib intake_queue_transaction::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib pending_reaction_failure_adapter_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib intake_dispatch_invariant_queued_entrypoints_promote_markers -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib attachment -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib mailbox_reaction_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_marker::tests -- --skip _pg --skip pg_ --skip postgres",
@@ -50,6 +58,7 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib services::tmux_common::sentinel_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::turn_bridge::followup_requeue::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::busy_followup_retry::tests -- --skip _pg --skip pg_ --skip postgres",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::destructive_commit::tests -- --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::bridge_entry_guard_tests -- --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::bridge_entry::tests -- --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::claude_e_stamp::tests -- --test-threads=1",
@@ -75,6 +84,8 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib canonical_identity::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib session_canonical_identity::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::observability::metrics::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::observability::turn_lifecycle::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::observability::recovery_audit::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib cli::args::tests::legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract",
     "cargo test --all-targets transition -- --skip _pg --skip pg_ --skip postgres --test-threads=1",
     "cargo test --all-targets auto_queue -- --skip _pg --skip pg_ --skip postgres",
@@ -195,6 +206,86 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(test_job.count("- name: Trusted session forwarding tests"), 1)
         self.assertEqual(test_job.count(command), 1)
         self.assertNotIn(command, job_block(workflow, "scripts"))
+
+    def test_telemetry_only_intake_regressions_run_in_required_lane(self) -> None:
+        workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        changes = job_block(workflow, "changes")
+        test_job = job_block(workflow, "test_fast")
+        mirror = job_block(workflow, "fast_targeted_tests_required_context")
+        command = (
+            "env -u AGENTDESK_ROOT_DIR cargo test --lib "
+            "services::discord::router::intake_dispatch::tests::telemetry_only_unopted "
+            "-- --skip _pg --skip pg_ --skip postgres"
+        )
+
+        self.assertEqual(test_job.count("- name: Telemetry-only intake authority regressions"), 1)
+        self.assertEqual(test_job.count(command), 1)
+        self.assertIn("- 'src/services/discord/router/intake_dispatch.rs'", changes)
+        self.assertIn("- 'src/services/discord/router/intake_dispatch/**'", changes)
+        self.assertIn("- test_fast", mirror)
+        self.assertIn("FILTER_NAME: pg_db", mirror)
+        self.assertIn("UPSTREAM_JOB_NAME: test_fast", mirror)
+
+    def test_terminal_delivery_evidence_regressions_flow_through_registered_required_context(self) -> None:
+        workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        changes_job = job_block(workflow, "changes")
+        test_job = job_block(workflow, "test_fast")
+        mirror_job = job_block(workflow, "fast_targeted_tests_required_context")
+        registered_required_contexts = {
+            "Lint",
+            "Script checks",
+            "Fast check (ubuntu-latest)",
+            "High-risk recovery",
+            "Dashboard (Node 22)",
+            "Fast targeted tests (ubuntu-latest)",
+        }
+
+        self.assertNotIn("terminal_delivery_evidence_tests:", workflow)
+        self.assertNotIn("terminal_delivery_evidence_required_context:", workflow)
+        for path in (
+            "src/services/discord/inflight.rs",
+            "src/services/discord/inflight/**",
+            "src/services/discord/tmux_watcher.rs",
+            "src/services/discord/tmux_watcher/**",
+            "src/services/discord/turn_bridge/terminal_outcome_delivery.rs",
+            "src/services/discord/turn_bridge/terminal_outcome_delivery/**",
+        ):
+            self.assertIn(f"- '{path}'", changes_job)
+        for command in (
+            "cargo test --lib inflight::terminal_delivery_evidence_loss::tests",
+            "cargo test --lib services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests",
+            "cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row",
+            "cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn",
+        ):
+            self.assertIn(command, test_job)
+        self.assertIn("name: Fast targeted tests (ubuntu-latest)", mirror_job)
+        self.assertIn("Fast targeted tests (ubuntu-latest)", registered_required_contexts)
+        self.assertIn("- test_fast", mirror_job)
+        self.assertIn("FILTER_NAME: pg_db", mirror_job)
+        self.assertIn("FILTER_OUTPUT: ${{ needs.changes.outputs.pg_db }}", mirror_job)
+        self.assertIn("UPSTREAM_JOB_NAME: test_fast", mirror_job)
+        self.assertIn("UPSTREAM_RESULT: ${{ needs.test_fast.result }}", mirror_job)
+
+    def test_footer_marker_regressions_run_in_required_test_fast_lane(self) -> None:
+        workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        test_job = job_block(workflow, "test_fast")
+        self.assertEqual(test_job.count("- name: Footer-only marker regressions"), 1)
+        for command in (
+            "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
+            "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
+        ):
+            self.assertEqual(test_job.count(command), 1)
+
+        changes = job_block(workflow, "changes")
+        for path in (
+            # Glob, not a file list: a per-file enumeration silently excludes
+            # modules added later (see the matching comment in ci-pr.yml).
+            "src/services/discord/task_notification_delivery/**",
+            "src/services/discord/tmux.rs",
+            "src/services/discord/tmux_watcher/discrete_trigger_marker.rs",
+            "src/services/discord/tui_prompt_relay/task_notification_prompt.rs",
+        ):
+            self.assertIn(f"- '{path}'", changes)
 
     def test_pr_cross_os_lane_is_compile_only(self) -> None:
         job = job_block(PR_WORKFLOW.read_text(encoding="utf-8"), "check_fast_cross_os")

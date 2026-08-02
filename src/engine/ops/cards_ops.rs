@@ -446,3 +446,33 @@ fn json_result(result: anyhow::Result<Value>) -> String {
         Err(err) => json!({ "error": err.to_string() }).to_string(),
     }
 }
+
+#[cfg(test)]
+mod parse_json_value_tests {
+    use super::parse_json_value;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn parse_json_value_returns_null_on_malformed_json() {
+        let raw = Some(r#"{"metadata": "broken""#.to_string());
+        let result = parse_json_value(raw, "metadata");
+        assert_eq!(
+            result,
+            Value::Null,
+            "malformed JSON should fall back to null"
+        );
+    }
+
+    #[test]
+    fn parse_json_value_returns_parsed_value_on_valid_json() {
+        let raw = Some(r#"{"metadata": "valid"}"#.to_string());
+        let result = parse_json_value(raw, "metadata");
+        assert_eq!(result, json!({"metadata": "valid"}));
+    }
+
+    #[test]
+    fn parse_json_value_returns_null_on_none() {
+        let result = parse_json_value(None, "metadata");
+        assert_eq!(result, Value::Null);
+    }
+}

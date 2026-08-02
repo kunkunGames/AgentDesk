@@ -10,6 +10,22 @@
 >
 > Last refreshed: 2026-07-21 (against #4706 acceptance repair: structural lint allow baseline, giant-registry issue validation, and production-count sync).
 >
+> Last refreshed: 2026-07-30 (#4984 S1 records unintended cross-channel tmux
+> watcher claims through the existing WARN-level `invariant_violation` event
+> surface. Every cross-channel claim persists either an intended follow-up or an
+> unintended-claim classification; intake and headless paths use live Discord
+> parent context, while handoff and recovery paths derive parent candidates from
+> persisted inflight identity. Claim, session-name, and delivery behavior remain
+> unchanged).
+>
+> Last refreshed: 2026-07-29 (#4911/#4961 Phase A R9 — `tmux.rs` gains the
+> generation-scoped `advance_watcher_confirmed_end_for_generation` used only by the
+> guarded watcher/sink delivery funnel. The watcher surface's offset authority is
+> unchanged in shape: raw monotonic-CAS advances remain for non-lease-governed
+> committed paths, while lease-governed terminal deliveries capture their source
+> identity before transport and advance only under the frontier mutation guard.
+> No new coordinate field, no migration-sensitive surface added).
+>
 > PR #3456 dcserver-robustness: frozen giant-surface entries were reviewed after
 > the reconcile row-allocation churn reduction and the OpenCode warm-server
 > reuse/cancel recovery; no new logic added to either giant file, and the line
@@ -232,7 +248,7 @@
     output policy, recovery marker, and test clusters moved verbatim into
     sub-1000-LoC `watchers/lifecycle/*.rs` modules. The root remains the
     canonical facade and preserves all prior call paths through re-exports.
-  - `src/services/discord/tmux.rs` (frozen giant surface; #4895 removes untyped auth/overload terminal variants and authority-bearing outcome fields; parser diagnostics now use a fixed redacted category while generic error results remain `HardResult`; test-only #4277 re-exports
+  - `src/services/discord/tmux.rs` (frozen giant surface; current generated inventory: 1677 production LoC; #4895 removes untyped auth/overload terminal variants and authority-bearing outcome fields; parser diagnostics now use a fixed redacted category while generic error results remain `HardResult`; test-only #4277 re-exports
     the watcher delivery-lease key helper so session-sink production-entry tests
     prove bidirectional contention on the same idle JSONL range; -9 from the #4804
     Windows-compile hotfix moving `footer_background_marker_session_key` into
@@ -334,7 +350,7 @@
     late-frame fresh row B is rejected; -576 from #3841 extracting placeholder
     suppression helpers to `tmux_placeholder_suppression/`;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (frozen giant surface; #4895 removes the obsolete auth/overload prose-authority fields from the thin collector→exit wiring; untyped prose now remains a bounded diagnostic and cannot reach provider-clear/tmux-kill/retry execution; #4799 adds thin suppressed-terminal wiring only: footer-owned background completions enqueue one semantic-event-keyed lifecycle marker, while card-owned subagents are deliberately excluded to prevent a duplicate card+marker surface; #4229 S4
+  - `src/services/discord/tmux_watcher.rs` (frozen giant surface; #4229 W7b S-A moved the terminal token update and disabled auto-compact tail verbatim to the non-giant `tmux_watcher/terminal_token_update.rs` child module, ratcheting the root down after behavior-preserving decompose; #4895 removes the obsolete auth/overload prose-authority fields from the thin collector→exit wiring; untyped prose now remains a bounded diagnostic and cannot reach provider-clear/tmux-kill/retry execution; #4799 adds thin suppressed-terminal wiring only: footer-owned background completions enqueue one semantic-event-keyed lifecycle marker, while card-owned subagents are deliberately excluded to prevent a duplicate card+marker surface; #4229 S4
     moved the turn stream collector (seed restore/first parse-forward/monitor
     auto-turn claim/active read-parse loop) verbatim to
     `src/services/discord/tmux_watcher/turn_stream_collector.rs` (frozen giant surface), ratcheting
@@ -1646,6 +1662,10 @@
     1000+ production lines). (`dispatches/thread_reuse.rs` dropped below the
     giant threshold in #3037 after its Postgres/Discord-API thread-map helpers
     were relocated to `services/dispatches/discord_delivery/thread_reuse.rs`.)
+  - `src/server/routes/scheduled_messages.rs` (giant route surface): request
+    validation, patch semantics, response shaping, and cluster rollout gates
+    share one scheduled-message API contract. Keep behavior changes covered by
+    route and PostgreSQL tests; split only by an explicit API contract boundary.
 - active_callsite_coverage: retired DB compatibility history is tracked in
   `known-legacy.md`.
 - invariants:
@@ -1772,6 +1792,10 @@
   - `src/db/intake_outbox.rs` is the intake-node-routing claim/transition/sweep
     surface; its production LoC is now below the giant-file threshold once the
     `#[cfg(test)] mod` PG coverage is excluded (bugfix only).
+  - `src/db/scheduled_messages.rs` (giant persistence surface): row conversion,
+    durable lease transitions, attachment metadata, and worker-capability reads
+    share one SQL projection contract. Preserve the projection invariants and
+    PostgreSQL coverage; split only by an explicit persistence contract boundary.
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
 - invariants: production reads/writes go through `pg_pool_ref()`; retired DB
