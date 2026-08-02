@@ -18,7 +18,7 @@ pub(super) fn register_agent_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -
             if let Some(pool) = pg_get.as_ref() {
                 return agent_get_raw_pg(pool, &agent_id);
             }
-            json!({ "error": "sqlite backend is unavailable" }).to_string()
+            json!({ "error": "postgres backend is required for agents.get" }).to_string()
         })?,
     )?;
 
