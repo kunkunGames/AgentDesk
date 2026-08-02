@@ -145,11 +145,8 @@ export default function AgentFormModal({
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
             <div
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
-              role="spinbutton"
-              aria-label={tr("스프라이트 번호", "Sprite number")}
-              aria-valuenow={spriteNum || 0}
-              aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              role="group"
+              aria-label={tr("스프라이트 선택", "Sprite selection")}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
