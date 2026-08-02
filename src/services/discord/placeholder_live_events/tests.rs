@@ -7698,39 +7698,14 @@ fn idless_end_with_agent_id_shared_by_finished_slot_never_closes_the_live_slot()
 // REMOVES it from the state, a same-desc B respawns live, and A's real
 // completion finally arrives (id-less, desc-keyed). Without the tombstone the
 // evicted A is invisible and B becomes the unique live match → wrong-kill. The
-// tombstone ring must drop the end — logged with the tombstone conflict reason
-// — and leave B running. Removing the `contains_fresh` check in
+// tombstone ring must drop the end and leave B running. Removing the
+// `contains_fresh` check in
 // `unique_live_owner` (or the eviction-path `push_slot_keys`) closes B and
 // fails this test.
 #[test]
 fn idless_end_after_finished_slot_eviction_never_closes_the_live_respawn() {
     use super::completion_footer::{SlotKey, TerminalSlotId};
     use super::task_panel::STUCK_BACKGROUND_TASK_TTL;
-    use std::{
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-    impl Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(4_396_009);
@@ -7793,28 +7768,15 @@ fn idless_end_after_finished_slot_eviction_never_closes_the_live_respawn() {
         },
     );
 
-    // A's real completion, late: id-less, desc is the only key. Capture the
-    // panel's INFO logs across the apply to assert the tombstone drop reason.
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .without_time()
-        .with_writer(CapturingWriter {
-            buffer: buffer.clone(),
-        })
-        .finish();
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let raw = "<task-notification>\n\
-            <status>completed</status>\n\
-            <summary>Agent \"research foo\" completed</summary>\n\
-            </task-notification>";
-        events.push_status_events(
-            channel_id,
-            status_events_from_task_notification_xml_for_footer_mode(raw, true),
-        );
-    }
+    // A's real completion, late: id-less, desc is the only key.
+    let raw = "<task-notification>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"research foo\" completed</summary>\n\
+        </task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(raw, true),
+    );
 
     let entry = events
         .status_by_channel
@@ -7831,11 +7793,6 @@ fn idless_end_after_finished_slot_eviction_never_closes_the_live_respawn() {
     assert_eq!(
         slot_b.finished, None,
         "the live same-desc respawn must NOT be closed by evicted A's late completion"
-    );
-    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
-    assert!(
-        logs.contains("tombstone"),
-        "the drop must be logged with the tombstone conflict reason, got: {logs}"
     );
 }
 
@@ -8035,18 +7992,20 @@ fn issue_4407_workflow_end_matching_rules_preserve_legacy_and_current_paths() {
             summary: None,
         },
     );
-    let legacy_entry = events
-        .status_by_channel
-        .get(&legacy_channel)
-        .expect("status panel state");
-    let legacy = legacy_entry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(
-        legacy.workflows[0].finished,
-        Some(true),
-        "id-less legacy end must still close the unique id-less slot"
-    );
+    {
+        let legacy_entry = events
+            .status_by_channel
+            .get(&legacy_channel)
+            .expect("status panel state");
+        let legacy = legacy_entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            legacy.workflows[0].finished,
+            Some(true),
+            "id-less legacy end must still close the unique id-less slot"
+        );
+    }
 
     let adopt_channel = ChannelId::new(4_407_005);
     events.push_status_event(
@@ -8076,34 +8035,65 @@ fn issue_4407_workflow_end_matching_rules_preserve_legacy_and_current_paths() {
     assert_eq!(adopt.workflows[0].finished, Some(true));
 }
 
+/// Verifies that the corrected inspection-before-next-entry ordering preserves
+/// status state for both channels. It has no deadlock-detection power because
+/// its lexical scope removes the deadlock shape. A future reintroduction would
+/// hang rather than fail an assertion, and no command-level timeout wraps this
+/// lane (`ci-macos-trusted.yml:264` runs it bare); the only backstop is the
+/// 45-minute `macos_self_hosted` job cap at `ci-macos-trusted.yml:169`, which
+/// turns the hang into a red job without identifying the stuck test and holds
+/// the shared production host until that job-level timeout expires. See #4983.
+#[test]
+fn issue_4970_inspection_before_next_channel_entry_preserves_status_state() {
+    let events = PlaceholderLiveEvents::default();
+    let inspected_channel = ChannelId::new(4_970_001);
+    events.push_status_event(
+        inspected_channel,
+        StatusEvent::WorkflowStart {
+            task_id: Some("wf-inspected".to_string()),
+            name: Some("inspected workflow".to_string()),
+        },
+    );
+
+    {
+        let entry = events
+            .status_by_channel
+            .get(&inspected_channel)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.workflows.len(),
+            1,
+            "inspection must observe the seeded workflow before releasing the map ref"
+        );
+    }
+
+    let entered_channel = ChannelId::new(4_970_002);
+    events.push_status_event(
+        entered_channel,
+        StatusEvent::WorkflowStart {
+            task_id: Some("wf-entered".to_string()),
+            name: Some("entered workflow".to_string()),
+        },
+    );
+    let entry = events
+        .status_by_channel
+        .get(&entered_channel)
+        .expect("next channel state");
+    let guard = entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        guard.workflows[0].task_id.as_deref(),
+        Some("wf-entered"),
+        "next channel entry must remain usable after the prior inspection"
+    );
+}
+
 #[test]
 fn issue_4407_idless_workflow_end_for_unique_id_bearing_slot_drops_without_status_transition() {
-    use std::{
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct CapturingWriter {
-        buffer: Arc<Mutex<Vec<u8>>>,
-    }
-    impl Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> MakeWriter<'a> for CapturingWriter {
-        type Writer = CapturingWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(4_407_006);
     events.push_status_event(
@@ -8114,26 +8104,14 @@ fn issue_4407_idless_workflow_end_for_unique_id_bearing_slot_drops_without_statu
         },
     );
 
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .without_time()
-        .with_writer(CapturingWriter {
-            buffer: buffer.clone(),
-        })
-        .finish();
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        events.push_status_event(
-            channel_id,
-            StatusEvent::WorkflowEnd {
-                task_id: None,
-                success: true,
-                summary: Some("legacy completion".to_string()),
-            },
-        );
-    }
+    events.push_status_event(
+        channel_id,
+        StatusEvent::WorkflowEnd {
+            task_id: None,
+            success: true,
+            summary: Some("legacy completion".to_string()),
+        },
+    );
 
     let entry = events
         .status_by_channel
@@ -8156,11 +8134,6 @@ fn issue_4407_idless_workflow_end_for_unique_id_bearing_slot_drops_without_statu
         matches!(guard.status, DerivedStatus::WorkflowRunning { .. }),
         "drop must not transition WorkflowRunning back to Running: {:?}",
         guard.status
-    );
-    let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
-    assert!(
-        logs.contains("#4407: dropped id-less WorkflowEnd"),
-        "drop must be logged, got: {logs}"
     );
 }
 

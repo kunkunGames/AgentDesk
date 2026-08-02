@@ -199,6 +199,8 @@ export function Step3AgentSelection({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <input
             type="text"
+            autoComplete="off"
+            spellCheck="false"
             aria-label={tr("에이전트 이름", "Agent name")}
             placeholder={tr("에이전트 이름", "Agent name")}
             value={customName}
@@ -208,6 +210,8 @@ export function Step3AgentSelection({
           />
           <input
             type="text"
+            autoComplete="off"
+            spellCheck="false"
             aria-label={tr("한줄 설명", "Brief description")}
             placeholder={tr("한줄 설명", "Brief description")}
             value={customDesc}
@@ -219,6 +223,8 @@ export function Step3AgentSelection({
         <div className="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2">
           <input
             type="text"
+            autoComplete="off"
+            spellCheck="false"
             aria-label={tr("영문 이름 (선택)", "English name (optional)")}
             placeholder={tr("영문 이름 (선택)", "English name (optional)")}
             value={customNameEn}
@@ -228,6 +234,8 @@ export function Step3AgentSelection({
           />
           <input
             type="text"
+            autoComplete="off"
+            spellCheck="false"
             aria-label={tr("영문 설명 (선택)", "English description (optional)")}
             placeholder={tr("영문 설명 (선택)", "English description (optional)")}
             value={customDescEn}

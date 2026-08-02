@@ -36,7 +36,6 @@ db::dispatches::delivery_events::tests
 db::dispatches::metadata::tests
 db::dispatches::outbox::delivery::tests
 db::idempotency::tests
-db::intake_outbox::migration_tests
 db::prompt_manifests::tests
 db::relay_dead_letter::tests
 db::session_agent_resolution::tests
@@ -90,7 +89,6 @@ server::multinode_regression::tests
 server::outbox_actionable_delivery::tests
 server::policy_tick_schedule_tests
 server::rate_limit_header_tests
-server::resource_locks::tests
 server::routes::agents::tmux_relay_adoption_state_tests
 server::routes::audit_explicit_auth_routes_tests
 server::routes::auth::tests
@@ -112,7 +110,6 @@ server::routes::reviews::recovery_commit_validation_tests
 server::routes::scheduled_messages::tests
 server::routes::voice_config::tests
 server::startup_preflight::tests
-server::task_dispatch_claims::tests
 server::test_phase_runs::tests
 server::worker_recovery::tests
 server::worker_registry::leader_takeover_tests
@@ -159,7 +156,6 @@ services::claude_tui::hosting::followup_support::busy_followup_notice_tests
 services::claude_tui::hosting::followup_support::claude_tui_prompt_buffer_tests
 services::claude_tui::hosting::warm_followup::followup_wait_error_requeue_tests
 services::claude_tui::input::active_turn_wait_extension_tests
-services::claude_tui::input::tests
 services::claude_tui::memento_feedback::tests
 services::claude_tui::prompt_readiness::tests
 services::claude_tui::session::tests
@@ -228,7 +224,6 @@ services::discord::followup_retry_requeue_tests
 services::discord::footer_view_reconciler::tests
 services::discord::gateway::answer_flush_gate_tests
 services::discord::gateway::outbound_messages::classified_post_tests
-services::discord::gateway::tests
 services::discord::gateway_voice_queue::tests
 services::discord::global_active_counter_tests
 services::discord::hard_ceiling_tests
@@ -280,7 +275,6 @@ services::discord::placeholder_cleanup::permanent_failure_tests
 services::discord::placeholder_cleanup::terminal_anchor_guard_tests
 services::discord::placeholder_controller::edit_retry_tests
 services::discord::placeholder_controller::live_events_tests
-services::discord::placeholder_sweeper::abandon_guard::tests
 services::discord::placeholder_sweeper::is_message_still_placeholder_tests
 services::discord::placeholder_sweeper::panel_shape::tests
 services::discord::placeholder_sweeper::probe_classification_tests
@@ -319,7 +313,6 @@ services::discord::recovery_engine::restore_inflight::tests
 services::discord::recovery_engine::routing_orphan::tests
 services::discord::recovery_engine::runtime::delivered_inflight_reregister_tests
 services::discord::recovery_engine::runtime::readopted_ledger_record_gate_tests
-services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests
 services::discord::recovery_engine::terminal_text_idempotency::tests
 services::discord::recovery_engine::terminal_watcher::restart_report_tests
 services::discord::recovery_engine::terminal_watcher::tests
@@ -353,7 +346,6 @@ services::discord::router::message_handler::intake_turn::feedback_reminder_take_
 services::discord::router::message_handler::intake_turn::queue_pending_reaction_clear_tests
 services::discord::router::message_handler::intake_turn::race_loss::race_loss_requeue_tests
 services::discord::router::message_handler::intake_turn::recovery_context_take_order_tests
-services::discord::router::message_handler::intake_turn::steering_hook::tests
 services::discord::router::message_handler::intake_turn::tui_busy_pre_submit_queue_reaction_tests
 services::discord::router::message_handler::intake_turn::turn_start_dispatch_guard_preservation_tests
 services::discord::router::message_handler::latency_spans::tests
@@ -398,7 +390,6 @@ services::discord::startup_reclaim::tests
 services::discord::status_panel_orphan_store::tests
 services::discord::streaming_finalizer::tests
 services::discord::task_supervisor::tests
-services::discord::terminal_ui_obligation::tests
 services::discord::tmux::active_bridge_turn_guard_tests
 services::discord::tmux::buffer_offset_tests
 services::discord::tmux::lifecycle_stage_pause_matrix_tests
@@ -439,7 +430,6 @@ services::discord::tmux::tui_completion_gate_tests
 services::discord::tmux::watcher_lifecycle::claude_restore::claude_tui_transcript_fallback_tests
 services::discord::tmux::watcher_lifecycle::codex_restore::codex_direct_resume_args_tests
 services::discord::tmux::watcher_lifecycle::output_policy::post_terminal_output_tests
-services::discord::tmux::watcher_lifecycle::restore_tests::restored_session_cwd_channel_isolation_tests
 services::discord::tmux::watcher_lifecycle::tests::tests
 services::discord::tmux::watcher_placeholder_status_tests
 services::discord::tmux::watcher_stream_progress_tests
@@ -466,7 +456,6 @@ services::discord::turn_bridge::completion_guard::tests
 services::discord::turn_bridge::completion_postlude::channel_writeback::tests
 services::discord::turn_bridge::context_window::tests
 services::discord::turn_bridge::finalize_epilogue::tests
-services::discord::turn_bridge::followup_requeue::tests
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests
 services::discord::turn_bridge::memory_lifecycle::background_memory_task_tests
 services::discord::turn_bridge::output_lifecycle::tests
@@ -535,10 +524,8 @@ services::discord_config_audit::voice_alias_precheck_tests
 services::dispatch_gate::tests
 services::dispatch_watchdog::tests
 services::dispatched_sessions::kill_tmux_resume_tests
-services::dispatches::discord_delivery::guard::tests
 services::dispatches::discord_delivery::orchestration::slot_routing_pure_tests
 services::dispatches::discord_delivery::transport::tests
-services::dispatches::outbox_claiming::tests
 services::dispatches::outbox_route::tests
 services::dispatches::result_header::tests
 services::dispatches::routing_constraint::tests
@@ -558,16 +545,13 @@ services::maintenance::jobs::db_retention::tests
 services::maintenance::jobs::target_sweep::tests
 services::maintenance::jobs::tmp_pipeline_sweep::tests
 services::maintenance::jobs::voice_cache_sweep::tests
-services::maintenance::jobs::worktree_orphan_sweep::active_dispatch_worktree_keep_set_tests
 services::maintenance::jobs::worktree_orphan_sweep::blocking_directory_walk_tests
 services::maintenance::jobs::worktree_orphan_sweep::deploy_worktree_protection_tests
 services::maintenance::jobs::worktree_orphan_sweep::fresh_provision_toctou_tests
 services::maintenance::jobs::worktree_orphan_sweep::git_pointer_fallback_tests
-services::maintenance::jobs::worktree_orphan_sweep::keep_set_query_failure_fail_closed_tests
 services::maintenance::jobs::worktree_orphan_sweep::managed_root_recursion_tests
 services::maintenance::jobs::worktree_orphan_sweep::naming_whitelist_tests
 services::maintenance::jobs::worktree_orphan_sweep::phantom_sweep_decision_tests
-services::maintenance::jobs::worktree_orphan_sweep::resumable_keep_set_query_tests
 services::maintenance::jobs::worktree_orphan_sweep::resumable_keep_set_tests
 services::mcp_config::review_slim_tests
 services::memory::local::tests
@@ -583,15 +567,12 @@ services::message_outbox_recovery_tests
 services::observability::cancellation_observability_tests
 services::observability::emit::tests
 services::observability::queries::alert_authority_tests
-services::observability::recovery_audit::tests
 services::observability::relay_signal_alert::tests
-services::observability::turn_lifecycle::tests
 services::onboarding::canonical_status_tests
 services::onboarding::credential_token_permission_tests
 services::opencode::tests
 services::operator_connectors::tests
 services::pane_readiness::tests
-services::pipeline_override::tests
 services::pipeline_routes::tests
 services::platform::binary_resolver::tests
 services::platform::tmux::availability::availability_cache_tests
@@ -632,7 +613,6 @@ services::stale_turn_reconciler::tests
 services::tmux_common::channel_binding_tests
 services::tmux_common::mcp_auth_required_tests
 services::tmux_common::selector_overlay_tests
-services::tmux_common::sentinel_tests
 services::tmux_diagnostics::tests
 services::tmux_wrapper::marker_one_hop_tests
 services::tmux_wrapper::stderr_redaction_tests

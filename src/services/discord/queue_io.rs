@@ -139,6 +139,14 @@ pub(super) fn schedule_race_loss_requeue_post_enqueue_idle_recheck(
     channel_id: ChannelId,
 ) {
     super::task_supervisor::spawn_observed("race_loss_requeue_idle_recheck", async move {
+        // A race-loss recheck is an edge-trigger, not competing transition
+        // authority. Waiting here coalesces the one recheck behind the current
+        // transition instead of dequeue/requeue spinning while it is held.
+        let transition_guard = shared
+            .session_transition_lock(channel_id)
+            .lock_owned()
+            .await;
+
         let snapshot = super::mailbox_snapshot(&shared, channel_id).await;
         if !race_loss_requeue_snapshot_has_idle_kickable_backlog(
             &shared, &provider, channel_id, &snapshot,
@@ -153,6 +161,7 @@ pub(super) fn schedule_race_loss_requeue_post_enqueue_idle_recheck(
             return;
         }
 
+        drop(transition_guard);
         let outcome = kick_idle_queue_channel_if_context_available(
             &shared,
             &provider,
@@ -208,11 +217,16 @@ fn idle_queue_backstop_backlog_units(
     channel_id: ChannelId,
     snapshot: &ChannelMailboxSnapshot,
 ) -> usize {
-    if idle_queue_snapshot_has_raw_rearm_backlog(shared, provider, channel_id, snapshot) {
-        snapshot.intervention_queue.len().max(1)
-    } else {
-        0
+    if !idle_queue_snapshot_has_raw_rearm_backlog(shared, provider, channel_id, snapshot) {
+        return 0;
     }
+    if matches!(
+        super::automatic_queue_progression(shared, provider, channel_id, snapshot),
+        AutomaticQueueProgression::BlockedByCappedRetries
+    ) {
+        return 0;
+    }
+    snapshot.intervention_queue.len().max(1)
 }
 
 fn idle_queue_snapshot_has_raw_rearm_backlog(
@@ -494,8 +508,12 @@ async fn run_single_slow_idle_queue_backstop(
     provider: &ProviderKind,
     channel_id: ChannelId,
     reason: &'static str,
+    wake: &tokio::sync::Notify,
 ) -> Option<IdleQueueBackstopRearm> {
-    tokio::time::sleep(DEFERRED_IDLE_QUEUE_BACKSTOP_DELAY).await;
+    let timed_out = tokio::select! {
+        _ = tokio::time::sleep(DEFERRED_IDLE_QUEUE_BACKSTOP_DELAY) => true,
+        _ = wake.notified() => false,
+    };
     let snapshot = super::mailbox_snapshot(shared.as_ref(), channel_id).await;
     let backlog_units =
         idle_queue_backstop_backlog_units(shared.as_ref(), provider, channel_id, &snapshot);
@@ -503,13 +521,15 @@ async fn run_single_slow_idle_queue_backstop(
         return None;
     }
 
-    emit_idle_queue_backstop_warn(
-        provider,
-        Some(channel_id),
-        reason,
-        backlog_units,
-        "channel_backstop",
-    );
+    if timed_out {
+        emit_idle_queue_backstop_warn(
+            provider,
+            Some(channel_id),
+            reason,
+            backlog_units,
+            "channel_backstop",
+        );
+    }
     let _outcome =
         kick_idle_queue_channel_if_context_available(shared, provider, channel_id, reason).await;
 
@@ -542,7 +562,7 @@ fn schedule_single_slow_idle_queue_backstop(
     reason: &'static str,
     backlog_units: usize,
 ) -> bool {
-    match shared.restart.deferred_hook_channels.entry(channel_id) {
+    let wake = match shared.restart.deferred_hook_channels.entry(channel_id) {
         dashmap::mapref::entry::Entry::Occupied(_) => {
             tracing::debug!(
                 provider = provider.as_str(),
@@ -554,7 +574,9 @@ fn schedule_single_slow_idle_queue_backstop(
             return false;
         }
         dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Arc::new(tokio::sync::Notify::new()));
+            let wake = Arc::new(tokio::sync::Notify::new());
+            entry.insert(wake.clone());
+            wake
         }
     };
     shared
@@ -568,7 +590,8 @@ fn schedule_single_slow_idle_queue_backstop(
             active: true,
         };
         let rearm =
-            run_single_slow_idle_queue_backstop(&shared, &provider, channel_id, reason).await;
+            run_single_slow_idle_queue_backstop(&shared, &provider, channel_id, reason, &wake)
+                .await;
         backlog_guard.release();
         if let Some(rearm) = rearm {
             schedule_single_slow_idle_queue_backstop(
@@ -624,11 +647,20 @@ pub(in crate::services::discord) fn spawn_turn_completion_idle_queue_listener(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    if !event.queue_is_eligible() {
+                        tracing::debug!(
+                            target: "agentdesk::discord::turn_completion_events",
+                            provider = provider.as_str(),
+                            channel_id = event.channel_id.get(),
+                            "mailbox release observed before terminal projection settled; queue kick withheld"
+                        );
+                        continue;
+                    }
                     tracing::debug!(
                         target: "agentdesk::discord::turn_completion_events",
                         provider = provider.as_str(),
                         channel_id = event.channel_id.get(),
-                        "turn completion event received; kicking idle queue channel"
+                        "queue-eligible completion event received; kicking idle queue channel"
                     );
                     let outcome = kick_idle_queue_channel_if_context_available(
                         &shared,
@@ -694,12 +726,12 @@ pub(in crate::services::discord) fn spawn_turn_completion_idle_queue_listener(
 }
 
 #[cfg(test)]
-fn idle_queue_backstop_fires_for_tests() -> usize {
+pub(in crate::services::discord) fn idle_queue_backstop_fires_for_tests() -> usize {
     IDLE_QUEUE_BACKSTOP_FIRES_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
-fn idle_queue_backstop_delay_for_tests() -> std::time::Duration {
+pub(in crate::services::discord) fn idle_queue_backstop_delay_for_tests() -> std::time::Duration {
     DEFERRED_IDLE_QUEUE_BACKSTOP_DELAY
 }
 
@@ -710,7 +742,7 @@ fn schedule_deferred_idle_queue_kickoff_inner(
     reason: &'static str,
     profile: DeferredIdleQueueKickoffProfile,
 ) {
-    match shared.restart.deferred_hook_channels.entry(channel_id) {
+    let wake = match shared.restart.deferred_hook_channels.entry(channel_id) {
         dashmap::mapref::entry::Entry::Occupied(entry) => {
             if profile.wakes_existing_task() {
                 entry.get().notify_one();
@@ -726,7 +758,9 @@ fn schedule_deferred_idle_queue_kickoff_inner(
             return;
         }
         dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(Arc::new(tokio::sync::Notify::new()));
+            let wake = Arc::new(tokio::sync::Notify::new());
+            entry.insert(wake.clone());
+            wake
         }
     };
     shared
@@ -744,7 +778,10 @@ fn schedule_deferred_idle_queue_kickoff_inner(
 
         let initial_presleep = profile.initial_presleep();
         if !initial_presleep.is_zero() {
-            tokio::time::sleep(initial_presleep).await;
+            tokio::select! {
+                _ = tokio::time::sleep(initial_presleep) => {}
+                _ = wake.notified() => {}
+            }
         }
 
         let _ =
@@ -752,7 +789,8 @@ fn schedule_deferred_idle_queue_kickoff_inner(
                 .await;
 
         let rearm =
-            run_single_slow_idle_queue_backstop(&shared, &provider, channel_id, reason).await;
+            run_single_slow_idle_queue_backstop(&shared, &provider, channel_id, reason, &wake)
+                .await;
         backlog_guard.release();
         if let Some(rearm) = rearm {
             schedule_single_slow_idle_queue_backstop(
@@ -1079,6 +1117,161 @@ mod presleep_tests {
                 .deferred_hook_channels
                 .contains_key(&channel_id),
             "the armed backstop is channel-scoped and coalescible"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn capped_retry_is_parked_while_unrelated_backlog_progresses_and_backstop_disarms_4893() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let tmp = tempfile::tempdir().expect("temp runtime root");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let shared = make_shared_data_for_tests();
+        drop(_lock);
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_893_310);
+        let capped_id = MessageId::new(4_893_311);
+        let eligible_id = MessageId::new(4_893_312);
+        let notice_id = MessageId::new(4_893_313);
+        super::super::busy_followup_retry_store::bind_notice_if_absent(
+            &provider,
+            channel_id.get(),
+            capped_id.get(),
+            notice_id.get(),
+        )
+        .expect("bind capped retry");
+        for _ in 0..super::super::busy_followup_retry_store::MAX_BUSY_RETRY_COUNT {
+            super::super::busy_followup_retry_store::record_busy_retry(
+                &provider,
+                channel_id.get(),
+                capped_id.get(),
+                notice_id.get(),
+            )
+            .expect("record capped retry");
+        }
+        shared
+            .mailbox(channel_id)
+            .replace_queue(
+                vec![
+                    user_intervention(capped_id.get(), "capped A"),
+                    user_intervention(eligible_id.get(), "unrelated B"),
+                ],
+                queue_persistence_context(&shared, &provider, channel_id),
+            )
+            .await;
+
+        let kick_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_calls = kick_calls.clone();
+        let hook_dispatched = dispatched.clone();
+        let _hook = set_idle_queue_kick_hook_for_tests(Arc::new(
+            move |shared, provider, channel, _reason| {
+                let hook_calls = hook_calls.clone();
+                let hook_dispatched = hook_dispatched.clone();
+                Box::pin(async move {
+                    if channel != channel_id {
+                        return None;
+                    }
+                    hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let taken = super::super::mailbox_take_next_automatic_intervention(
+                        &shared, &provider, channel,
+                    )
+                    .await;
+                    if let Some(intervention) = taken.intervention.as_ref() {
+                        hook_dispatched
+                            .lock()
+                            .expect("dispatch observations")
+                            .push(intervention.message_id);
+                        super::super::mailbox_abandon_unclaimed_dispatch_after_success(
+                            &shared,
+                            &provider,
+                            channel,
+                            intervention.message_id,
+                            taken
+                                .dispatch_lease
+                                .as_ref()
+                                .expect("automatic dequeue lease")
+                                .clone(),
+                        )
+                        .await;
+                    }
+                    Some(IdleQueueKickoffChannelOutcome {
+                        started: taken.intervention.is_some(),
+                    })
+                })
+            },
+        ));
+
+        assert!(
+            arm_slow_idle_queue_backstop_if_queue_nonempty(
+                &shared,
+                &provider,
+                channel_id,
+                "prearmed-before-terminal-disposition",
+            )
+            .await,
+            "mailbox release can pre-arm the slow backstop before cap settlement"
+        );
+        let direct =
+            super::super::mailbox_take_next_automatic_intervention(&shared, &provider, channel_id)
+                .await;
+        assert_eq!(
+            direct.intervention.as_ref().map(|item| item.message_id),
+            Some(eligible_id),
+            "stale epilogue progression must skip capped A and select unrelated B"
+        );
+        super::super::mailbox_abandon_unclaimed_dispatch_after_success(
+            &shared,
+            &provider,
+            channel_id,
+            eligible_id,
+            direct
+                .dispatch_lease
+                .as_ref()
+                .expect("direct automatic dequeue lease")
+                .clone(),
+        )
+        .await;
+
+        tokio::time::advance(idle_queue_backstop_delay_for_tests()).await;
+        yield_backstop_tasks().await;
+        let snapshot = mailbox_snapshot(&shared, channel_id).await;
+        assert_eq!(
+            snapshot
+                .intervention_queue
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>(),
+            vec![capped_id],
+            "capped A remains available for explicit operator recovery"
+        );
+        assert_eq!(
+            kick_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the prearmed backstop must become a cap-aware no-op"
+        );
+        assert!(
+            dispatched.lock().expect("dispatch observations").is_empty(),
+            "the prearmed backstop must never redispatch capped A"
+        );
+        assert_eq!(
+            shared
+                .restart
+                .deferred_hook_backlog
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the capped-only queue must not rearm the backstop"
+        );
+
+        let manual =
+            super::super::mailbox_take_next_soft_intervention(&shared, &provider, channel_id).await;
+        assert_eq!(
+            manual.intervention.as_ref().map(|item| item.message_id),
+            Some(capped_id),
+            "explicit/manual dequeue retains recovery authority"
         );
     }
 
@@ -1490,8 +1683,13 @@ mod presleep_tests {
                         )
                         .await;
                         assert!(requeue.enqueued, "race-loss path requeues the message");
-                        mailbox_abandon_pending_dispatch(&shared, &provider, channel, requeued_msg)
-                            .await;
+                        let _ = mailbox_abandon_pending_dispatch(
+                            &shared,
+                            &provider,
+                            channel,
+                            requeued_msg,
+                        )
+                        .await;
                         schedule_race_loss_requeue_post_enqueue_idle_recheck(
                             shared.clone(),
                             provider.clone(),
@@ -1667,6 +1865,82 @@ mod presleep_tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn race_loss_recheck_waits_for_transition_before_kickoff_4794() {
+        let tmp = tempfile::tempdir().expect("temp runtime root");
+        let _env = crate::config::set_agentdesk_root_for_test(tmp.path());
+
+        let shared = make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(4_794_210);
+        let queued_msg = MessageId::new(4_794_211);
+        shared
+            .mailbox(channel_id)
+            .replace_queue(
+                vec![user_intervention(
+                    queued_msg.get(),
+                    "queued during transition",
+                )],
+                queue_persistence_context(&shared, &provider, channel_id),
+            )
+            .await;
+
+        let transition_guard = shared
+            .session_transition_lock(channel_id)
+            .lock_owned()
+            .await;
+        let kick_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = kick_calls.clone();
+        let _hook = set_idle_queue_kick_hook_for_tests(Arc::new(
+            move |shared, provider, channel, reason| {
+                let hook_calls = hook_calls.clone();
+                Box::pin(async move {
+                    if channel != channel_id {
+                        return None;
+                    }
+                    assert_eq!(reason, "race_loss_requeue_idle_recheck");
+                    hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let taken = super::super::mailbox_take_next_automatic_intervention(
+                        &shared, &provider, channel,
+                    )
+                    .await;
+                    Some(IdleQueueKickoffChannelOutcome {
+                        started: taken.intervention.is_some(),
+                    })
+                })
+            },
+        ));
+
+        schedule_race_loss_requeue_post_enqueue_idle_recheck(
+            shared.clone(),
+            provider.clone(),
+            channel_id,
+        );
+        yield_backstop_tasks().await;
+        assert_eq!(
+            kick_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the production kickoff seam must not run while transition is held"
+        );
+        assert_eq!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .intervention_queue
+                .first()
+                .map(|item| item.message_id),
+            Some(queued_msg),
+            "waiting recheck must leave the queued head untouched"
+        );
+
+        drop(transition_guard);
+        yield_backstop_tasks().await;
+        assert_eq!(
+            kick_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one coalesced recheck runs after transition release"
+        );
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn race_loss_requeue_idle_recheck_kicks_after_missed_completion_4078() {
@@ -1758,7 +2032,7 @@ mod presleep_tests {
         ))
         .await;
         assert!(requeue.enqueued, "race-loss requeue lands durably");
-        mailbox_abandon_pending_dispatch(&shared, &provider, channel_id, queued_msg).await;
+        let _ = mailbox_abandon_pending_dispatch(&shared, &provider, channel_id, queued_msg).await;
         schedule_race_loss_requeue_post_enqueue_idle_recheck(
             shared.clone(),
             provider.clone(),
