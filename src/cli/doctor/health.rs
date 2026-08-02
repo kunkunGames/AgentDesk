@@ -60,6 +60,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("provider {provider} is disconnected"),
             next_step: format!("check {provider} Discord token, gateway status, and dcserver logs"),
         },
+        ["provider", provider, "gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "provider_runtime",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("provider {provider} is in gateway standby mode"),
+            next_step: "verify primary gateway node is healthy".to_string(),
+        },
         ["provider", provider, "restart_pending"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_runtime",
@@ -170,6 +179,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: "no providers are currently registered".to_string(),
             next_step: "register a provider via the dashboard or check agentdesk.yaml".to_string(),
         },
+        ["gateway_standby"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: "cluster is in standby mode without a gateway connection".to_string(),
+            next_step: "verify cluster configuration and gateway node health".to_string(),
+        },
         ["startup_doctor_failed", count] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "startup_doctor",
@@ -275,6 +293,8 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
                     "raw": reason.raw,
                     "subsystem": reason.subsystem,
                     "severity": reason.severity.as_str(),
+                    "fix_safety": reason.fix_safety.as_str(),
+                    "summary": reason.summary,
                     "next_step": reason.next_step,
                 })
             })
@@ -288,8 +308,10 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 
 #[cfg(test)]
 mod health_classification_tests {
-    use super::super::contract::{FixSafety, Severity};
-    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
+    use serde_json::json;
+
+    use super::super::contract::{FixSafety, SecurityExposure, Severity};
+    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason, reasons_evidence};
 
     #[test]
     fn startup_doctor_reasons_point_to_latest_report_endpoint() {
@@ -386,6 +408,45 @@ mod health_classification_tests {
     }
 
     #[test]
+    fn gateway_standby_reason_codes_classify() {
+        let provider_standby = classify_degraded_reason("provider:codex:gateway_standby");
+        assert_eq!(provider_standby.subsystem, "provider_runtime");
+        assert_eq!(provider_standby.severity, Severity::Warning);
+        assert_eq!(provider_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            provider_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
+            provider_standby.summary,
+            "provider codex is in gateway standby mode"
+        );
+        assert_eq!(
+            provider_standby.next_step,
+            "verify primary gateway node is healthy"
+        );
+        assert_ne!(provider_standby.summary, provider_standby.raw);
+
+        let cluster_standby = classify_degraded_reason("gateway_standby");
+        assert_eq!(cluster_standby.subsystem, "health");
+        assert_eq!(cluster_standby.severity, Severity::Warning);
+        assert_eq!(cluster_standby.fix_safety, FixSafety::ReadOnly);
+        assert_eq!(
+            cluster_standby.security_exposure,
+            SecurityExposure::OperationalMetadata
+        );
+        assert_eq!(
+            cluster_standby.summary,
+            "cluster is in standby mode without a gateway connection"
+        );
+        assert_eq!(
+            cluster_standby.next_step,
+            "verify cluster configuration and gateway node health"
+        );
+        assert_ne!(cluster_standby.summary, cluster_standby.raw);
+    }
+
+    #[test]
     fn db_unavailable_reason_is_actionable() {
         let reason = classify_degraded_reason("db_unavailable");
 
@@ -396,6 +457,24 @@ mod health_classification_tests {
         assert_eq!(
             reason.next_step,
             "check PostgreSQL availability and agentdesk dcserver logs"
+        );
+    }
+
+    #[test]
+    fn reasons_evidence_json_shape_contract() {
+        let reason = classify_degraded_reason("db_unavailable");
+        assert_eq!(
+            reasons_evidence(&[reason]),
+            json!({
+                "degraded_reasons": [{
+                    "raw": "db_unavailable",
+                    "subsystem": "postgres",
+                    "severity": "error",
+                    "fix_safety": "not_fixable",
+                    "summary": "database is unavailable",
+                    "next_step": "check PostgreSQL availability and agentdesk dcserver logs",
+                }]
+            })
         );
     }
 }

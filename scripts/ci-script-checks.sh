@@ -120,6 +120,9 @@ echo "=== TUI relay assertion unit tests (#5065) ==="
 echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
 "$PYTHON" -m unittest tests.test_fast_check_ci_wiring
 
+echo "=== Dashboard verification security-gate contracts ==="
+"$PYTHON" -m unittest tests.test_verify_dashboard
+
 echo "=== Rust test-lane coverage ratchet (#4846/#4910) ==="
 if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
   echo "ERROR: TEST_LANE_BASELINE_REF must name an immutable comparison snapshot" >&2
