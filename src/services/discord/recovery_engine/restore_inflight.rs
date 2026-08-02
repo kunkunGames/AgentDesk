@@ -67,8 +67,7 @@ pub(in crate::services::discord) async fn finish_recovered_turn_mailbox(
 
 #[cfg(unix)]
 fn tmux_pane_pid(tmux_session_name: &str) -> Option<u32> {
-    let mut cmd = Command::new("tmux");
-    binary_resolver::apply_runtime_path(&mut cmd);
+    let mut cmd = crate::services::platform::tmux::command();
     let output = cmd
         .args([
             "display-message",

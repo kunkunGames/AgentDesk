@@ -1338,11 +1338,11 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::services::platform::tmux::command()
             .args(["kill-session", "-t", tmux_session])
             .status();
         assert!(
-            std::process::Command::new("tmux")
+            crate::services::platform::tmux::command()
                 .args(["new-session", "-d", "-s", tmux_session])
                 .status()
                 .expect("start tmux fixture")
@@ -1468,7 +1468,7 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::services::platform::tmux::command()
             .args(["kill-session", "-t", tmux_session])
             .status();
     }
