@@ -600,6 +600,17 @@
   the entire fleet together. The migration-specific CI gate is activated only
   when the migration 0093 SQL file is in the changed-file set, so unrelated PRs
   and the pre-0093 main branch are not gated by this boundary.
+- Migration 0104 scheduled-image delivery uses a database-enforced consumer
+  floor in addition to the worker heartbeat capability gate. Every node still
+  marked `online` must advertise `scheduled_messages.image_attachments_v1`
+  before the API accepts an image. More importantly, PostgreSQL triggers reject
+  image-bearing `scheduled_messages -> firing` and `message_outbox -> processing`
+  claims unless the transaction declares
+  `agentdesk.scheduled_image_consumer_v1=enabled`. Pre-0104 processes cannot
+  make that declaration, so a stale process resuming or registering after the
+  creation check remains fail-closed. Migration 0104 is forward-only after it
+  commits; rollback requires a forward fix or a pre-0104 database restore with
+  the entire fleet rolled back together.
 - #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
   Discord gateway/runtime**. Queue acceptance and retry requeue states are
   rendered only by the existing persisted `turn_view_reconciler` identity;

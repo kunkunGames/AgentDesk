@@ -136,17 +136,17 @@ async fn postgres_scheduled_image_rollout_rejects_legacy_online_workers() {
     .await;
     sqlx::query(
         "INSERT INTO worker_nodes (instance_id, status, capabilities, last_heartbeat_at) \
-         VALUES ('legacy-worker', 'online', $1, NOW())",
+         VALUES ('legacy-worker', 'online', $1, NOW() - INTERVAL '1 day')",
     )
     .bind(serde_json::json!({}))
     .execute(&pool)
     .await
     .expect("seed legacy online worker");
     assert!(
-        !image_attachment_rollout_ready_pg(&pool, 60)
+        !image_attachment_rollout_ready_pg(&pool)
             .await
             .expect("query rollout gate"),
-        "a live worker without the feature advertisement blocks new image reservations"
+        "a stale-but-online worker without the feature advertisement blocks new image reservations"
     );
 
     sqlx::query("UPDATE worker_nodes SET capabilities = $1 WHERE instance_id = 'legacy-worker'")
@@ -157,10 +157,128 @@ async fn postgres_scheduled_image_rollout_rejects_legacy_online_workers() {
         .await
         .expect("mark worker image-capable");
     assert!(
-        image_attachment_rollout_ready_pg(&pool, 60)
+        image_attachment_rollout_ready_pg(&pool)
             .await
             .expect("query rollout gate after upgrade")
     );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_image_consumer_floor_fences_legacy_claims() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_image_consumer_floor",
+        "scheduled image durable consumer capability floor",
+    )
+    .await;
+    let message = insert_scheduled_message_pg(
+        &pool,
+        &NewScheduledMessage {
+            content: "image consumer floor".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::seconds(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+            image_attachment: Some(ScheduledMessageImageAttachment {
+                filename: "thumbnail.png".to_string(),
+                content_type: "image/png".to_string(),
+                data: b"\x89PNG\r\n\x1a\nconsumer-floor".to_vec(),
+            }),
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
+        },
+    )
+    .await
+    .expect("insert image-bearing scheduled definition");
+
+    let scheduled_error =
+        sqlx::query("UPDATE scheduled_messages SET status = 'firing' WHERE id = $1")
+            .bind(&message.id)
+            .execute(&pool)
+            .await
+            .expect_err("a legacy scheduled-message consumer must be fenced");
+    assert_eq!(
+        scheduled_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    let claimed = claim_due_fires_pg(&pool, "v1-worker", true, 1, 30, Utc::now())
+        .await
+        .expect("v1 scheduled-message consumer declares its transaction capability");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].message.id, message.id);
+
+    let outbox_id =
+        crate::services::message_outbox::enqueue_outbox_pg_returning_id_with_persistent_dedupe(
+            &pool,
+            crate::services::message_outbox::OutboxMessage {
+                target: "channel:123456789",
+                content: "image outbox floor",
+                bot: "notify",
+                source: "scheduled_message",
+                reason_code: Some("scheduled_message:v1:consumer-floor:slot"),
+                session_key: None,
+                attachment: Some(crate::services::message_outbox::OutboxAttachment {
+                    filename: "thumbnail.png",
+                    content_type: "image/png",
+                    data: b"\x89PNG\r\n\x1a\n",
+                }),
+            },
+        )
+        .await
+        .expect("seed image-bearing outbox row");
+    let outbox_error = sqlx::query(
+        "UPDATE message_outbox
+         SET status = 'processing', claim_owner = 'legacy-worker', claimed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(outbox_id)
+    .execute(&pool)
+    .await
+    .expect_err("a legacy message-outbox consumer must be fenced");
+    assert_eq!(
+        outbox_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin v1 outbox claim transaction");
+    declare_image_attachment_consumer_v1_tx(&mut tx)
+        .await
+        .expect("declare v1 outbox consumer capability");
+    let claimed_rows = sqlx::query(
+        "UPDATE message_outbox
+         SET status = 'processing', claim_owner = 'v1-worker', claimed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(outbox_id)
+    .execute(&mut *tx)
+    .await
+    .expect("v1 outbox consumer may claim image rows")
+    .rows_affected();
+    tx.commit().await.expect("commit v1 outbox claim");
+    assert_eq!(claimed_rows, 1);
 
     pool.close().await;
     pg_db.drop().await;

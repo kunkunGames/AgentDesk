@@ -49,7 +49,7 @@ recurring 자동화 전반은 `routines`의 영역이다. 이 테이블은 "이 
 
 Postgres 전용 (messages 라우트와 동일하게 pg pool 필수). 마이그레이션:
 `migrations/postgres/0082_scheduled_messages.sql`부터
-`0103_scheduled_message_image_attachments.sql`까지
+`0104_scheduled_image_consumer_floor.sql`까지
 사용한다 (`0079`~`0081`은 최신 upstream 계열이 선점). 라이브에 적용된 0082와
 이어지는 0083의 원문은 immutable하게 유지하고, recurrence anchor 컬럼과 최종
 non-null invariant는 0084/0085에서 additive하게 적용한다. 0086은 agent launch의
@@ -151,8 +151,21 @@ push 예약은 선택적으로 대표 이미지 한 장을 함께 보낼 수 있
 
 - 허용 MIME: `image/jpeg`, `image/png`, `image/webp`, `image/gif`
 - 최대 크기: 8 MiB, MIME과 실제 파일 시그니처가 일치해야 함
+- Serenity가 multipart MIME을 파일명에서 정하므로 확장자도 MIME과 일치해야 한다.
+  JPEG는 `.jpg`/`.jpeg`, 나머지는 각각 `.png`/`.webp`/`.gif`를 허용한다.
 - `imageAttachment`는 `deliveryKind: "push"`에서만 허용된다. agent 답변은
   agent가 생성하는 본문이므로 예약 파일을 별도로 끼워 넣지 않는다.
+- 활성 반복 예약(`status='scheduled'`)은 다음 발화를 위해 이미지를 유지한다.
+  일회성/반복 여부와 관계없이 터미널 정의는 7일 후 payload만 비우며,
+  `updated_at`은 생명주기 시각이므로 payload GC가 갱신하지 않는다. 영구 outbox
+  dedupe sentinel도 7일 뒤 첨부 payload만 비우고 dedupe identity는 보존한다.
+
+클러스터 생성 gate는 heartbeat 시각으로 노드를 누락하지 않고 `online`으로 남은
+모든 worker capability를 확인한다. 별도로 0104의 PostgreSQL trigger는 이미지
+정의가 `firing`으로, 이미지 outbox row가 `processing`으로 바뀌기 전에 동일
+transaction의 `agentdesk.scheduled_image_consumer_v1=enabled` 선언을 요구한다.
+따라서 생성 gate 이후 구버전 process가 등록되거나 stale process가 재개되어도
+이미지 전달을 claim하지 못한다.
 
 ### `scheduled_message_deliveries` — 발화 이력 (routine_runs 패턴)
 
@@ -483,14 +496,15 @@ agent를 호출하지 않더라도 agent-bound 대상 채널의 수신 에이전
 
 | 파일 | 내용 |
 |---|---|
-| `migrations/postgres/0082_scheduled_messages.sql` ~ `0103_scheduled_message_image_attachments.sql` | 예약 정의/영속 outbox의 이미지 첨부와 재시도 안전 전송을 포함한 스키마 |
+| `migrations/postgres/0082_scheduled_messages.sql` ~ `0104_scheduled_image_consumer_floor.sql` | 예약 정의/영속 outbox의 이미지 첨부와 재시도 안전 전송을 포함한 스키마 |
 | `src/db/scheduled_messages.rs`, `src/db/scheduled_messages/{agent,outbox}.rs` | CRUD + due-claim + delivery/agent-poll/outbox 조회 쿼리 |
 | `src/server/routes/scheduled_messages.rs` | 위 7개 핸들러 |
 | `src/server/routes/mod.rs`, `domains/ops.rs` | 라우트 등록 (protected ops 도메인) |
 | `src/server/routes/docs/inventory/endpoints/part_09.rs` | API docs 인벤토리 항목 (coverage 가드 필수) |
 | `src/services/scheduled_messages.rs`, `src/services/scheduled_messages/{evidence,timing}.rs` | `scheduled_message_loop` 워커 (fire/감시/복구) + 완료 evidence + 반복/retry timing 정책 |
 | `src/server/worker_registry.rs` | 워커 등록 항목 추가 (`ScheduledMessages`, leader-only) |
-| `src/server/outbox_gc.rs`, `src/services/maintenance/jobs/db_retention.rs` | 영구 slot dedupe sentinel을 GC/retention에서 보존 |
+| `src/services/message_outbox.rs`, `src/services/maintenance/jobs/db_retention.rs` | 영구 slot dedupe identity를 보존하고 전송 완료 첨부 payload를 기간 제한 |
+| `src/services/discord/outbound/image_attachment.rs` | Discord MIME/파일 확장자 공용 계약 |
 | `src/services/scheduling.rs` | routines와 scheduled messages 양쪽이 의존하는 공용 스케줄 문법 + slot-anchor 계산 |
 | `src/services/discord/outbound/source_registry.rs` | `scheduled_message`를 LoopbackInternal source로 등록 |
 

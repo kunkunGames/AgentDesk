@@ -57,9 +57,11 @@ pub(super) async fn send_resolved_manual_message_with_client<C: ManualOutboundCl
         &channel_id_raw.to_string(),
         content,
         bot,
-        summary,
-        delivery_id,
-        attachment,
+        ManualDeliveryOptions {
+            summary,
+            delivery_id,
+            attachment,
+        },
     )
     .await;
     match send_result {
@@ -184,6 +186,13 @@ pub(crate) struct ManualOutboundAttachment {
     pub(crate) filename: String,
     pub(crate) content_type: String,
     pub(crate) data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ManualDeliveryOptions<'a> {
+    summary: Option<&'a str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'a>>,
+    attachment: Option<&'a ManualOutboundAttachment>,
 }
 
 pub(super) fn is_reserved_voice_correlation_namespace(
@@ -331,9 +340,9 @@ impl ManualOutboundClient for SerenityManualOutboundClient {
                     format!("invalid discord channel id {target_channel}: {error}"),
                 )
             })?;
-        // Discord determines the preview from the file bytes/name. Keep the
-        // validated MIME for durable audit and future transports even though
-        // Serenity's CreateAttachment does not expose a MIME override.
+        // Serenity derives the multipart MIME from this validated filename;
+        // `deliver_manual_notification_with_attachment` rejects any mismatch
+        // with the durable content type before the send reaches this client.
         let file = CreateAttachment::bytes(attachment.data.clone(), attachment.filename.clone());
         channel_id
             .send_message(
@@ -351,6 +360,7 @@ impl ManualOutboundClient for SerenityManualOutboundClient {
     }
 }
 
+#[cfg(test)]
 async fn deliver_manual_notification<C: ManualOutboundClient>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -366,9 +376,11 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
         channel_id,
         content,
         bot,
-        summary,
-        delivery_id,
-        None,
+        ManualDeliveryOptions {
+            summary,
+            delivery_id,
+            ..ManualDeliveryOptions::default()
+        },
     )
     .await
 }
@@ -379,10 +391,23 @@ async fn deliver_manual_notification_with_attachment<C: ManualOutboundClient>(
     channel_id: &str,
     content: &str,
     bot: &str,
-    summary: Option<&str>,
-    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
-    attachment: Option<&ManualOutboundAttachment>,
+    options: ManualDeliveryOptions<'_>,
 ) -> ManualDeliveryOutcome {
+    let ManualDeliveryOptions {
+        summary,
+        delivery_id,
+        attachment,
+    } = options;
+    if let Some(attachment) = attachment
+        && let Err(error) = super::image_attachment::validate_filename_content_type(
+            &attachment.filename,
+            &attachment.content_type,
+        )
+    {
+        return ManualDeliveryOutcome::Failed {
+            detail: format!("invalid Discord image attachment: {error}"),
+        };
+    }
     // Issue #2363: the manual dedupe key must include the resolved target
     // channel AND the sending `bot` identity. Voice announce delivery ids
     // encode (guild, voice_channel, utterance, generation) in
@@ -801,12 +826,14 @@ mod manual_v3_delivery_tests {
         assert_eq!(manual_delivery_log_emoji("provider"), "📨");
     }
 
+    type RecordedBinaryAttachment = (String, String, String, Vec<u8>);
+
     #[derive(Clone, Default)]
     struct MockManualOutboundClient {
         posts: Arc<Mutex<Vec<String>>>,
         post_targets: Arc<Mutex<Vec<String>>>,
         dm_resolutions: Arc<Mutex<Vec<String>>>,
-        binary_attachments: Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>,
+        binary_attachments: Arc<Mutex<Vec<RecordedBinaryAttachment>>>,
     }
 
     impl DiscordOutboundClient for MockManualOutboundClient {
@@ -883,9 +910,11 @@ mod manual_v3_delivery_tests {
             "123",
             "scheduled update",
             "notify",
-            None,
-            Some(delivery_id),
-            Some(&attachment),
+            ManualDeliveryOptions {
+                delivery_id: Some(delivery_id),
+                attachment: Some(&attachment),
+                ..ManualDeliveryOptions::default()
+            },
         )
         .await;
         let retry = deliver_manual_notification_with_attachment(
@@ -894,9 +923,11 @@ mod manual_v3_delivery_tests {
             "123",
             "scheduled update",
             "notify",
-            None,
-            Some(delivery_id),
-            Some(&attachment),
+            ManualDeliveryOptions {
+                delivery_id: Some(delivery_id),
+                attachment: Some(&attachment),
+                ..ManualDeliveryOptions::default()
+            },
         )
         .await;
 
@@ -908,6 +939,60 @@ mod manual_v3_delivery_tests {
                 ..
             }
         ));
+        assert_eq!(client.binary_attachments.lock().unwrap().len(), 1); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+    }
+
+    #[tokio::test]
+    async fn manual_notification_rejects_mime_filename_mismatch_before_dedup_reservation() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "scheduled:filename-contract",
+            semantic_event_id: "scheduled:filename-contract:slot",
+        };
+        let invalid = ManualOutboundAttachment {
+            filename: "thumbnail.jpg".to_string(),
+            content_type: "image/png".to_string(),
+            data: b"\x89PNG\r\n\x1a\nthumbnail".to_vec(),
+        };
+        let rejected = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            "scheduled update",
+            "notify",
+            ManualDeliveryOptions {
+                delivery_id: Some(delivery_id),
+                attachment: Some(&invalid),
+                ..ManualDeliveryOptions::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            ManualDeliveryOutcome::Failed { ref detail }
+                if detail.contains("filename extension")
+        ));
+        assert!(client.binary_attachments.lock().unwrap().is_empty()); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
+
+        let valid = ManualOutboundAttachment {
+            filename: "thumbnail.png".to_string(),
+            ..invalid
+        };
+        let delivered = deliver_manual_notification_with_attachment(
+            &client,
+            &dedup,
+            "123",
+            "scheduled update",
+            "notify",
+            ManualDeliveryOptions {
+                delivery_id: Some(delivery_id),
+                attachment: Some(&valid),
+                ..ManualDeliveryOptions::default()
+            },
+        )
+        .await;
+        assert!(matches!(delivered, ManualDeliveryOutcome::Sent { .. }));
         assert_eq!(client.binary_attachments.lock().unwrap().len(), 1); // agentdesk-audit: allow-unwrap — test mock mutex is local and poisoned only on test failure
     }
 
@@ -926,9 +1011,10 @@ mod manual_v3_delivery_tests {
             "123",
             &"x".repeat(DISCORD_HARD_LIMIT_CHARS + 1),
             "notify",
-            None,
-            None,
-            Some(&attachment),
+            ManualDeliveryOptions {
+                attachment: Some(&attachment),
+                ..ManualDeliveryOptions::default()
+            },
         )
         .await;
 

@@ -2882,6 +2882,21 @@ async fn claim_pending_message_outbox_batch_pg(
     pool: &PgPool,
     claim_owner: &str,
 ) -> Vec<PendingMessageOutboxRow> {
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::warn!("[outbox-pg] failed to begin message_outbox claim: {error}");
+            return Vec::new();
+        }
+    };
+    if let Err(error) =
+        crate::db::scheduled_messages::declare_image_attachment_consumer_v1_tx(&mut tx).await
+    {
+        tracing::warn!(
+            "[outbox-pg] failed to declare image attachment consumer capability: {error}"
+        );
+        return Vec::new();
+    }
     let rows = match sqlx::query(
         "WITH claimed AS (
             SELECT id
@@ -2917,7 +2932,7 @@ async fn claim_pending_message_outbox_batch_pg(
     )
     .bind(MESSAGE_OUTBOX_CLAIM_STALE_SECS)
     .bind(claim_owner)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     {
         Ok(rows) => rows,
@@ -2926,6 +2941,10 @@ async fn claim_pending_message_outbox_batch_pg(
             return Vec::new();
         }
     };
+    if let Err(error) = tx.commit().await {
+        tracing::warn!("[outbox-pg] failed to commit message_outbox claim: {error}");
+        return Vec::new();
+    }
 
     let mut claimed = rows
         .into_iter()
@@ -3151,11 +3170,12 @@ async fn message_outbox_loop(pg_pool: Arc<PgPool>, health_registry: Option<Arc<H
 
         if std::time::Instant::now() >= next_gc_at {
             match crate::services::message_outbox::gc_stale_outbox_rows(pg_pool.as_ref()).await {
-                Ok((held, failed, sent)) if held + failed + sent > 0 => {
+                Ok(report) if report.total_mutations() > 0 => {
                     tracing::info!(
-                        held_pruned = held,
-                        failed_pruned = failed,
-                        sent_pruned = sent,
+                        held_pruned = report.held_deleted,
+                        failed_pruned = report.failed_deleted,
+                        sent_pruned = report.sent_deleted,
+                        attachment_payloads_cleared = report.attachment_payloads_cleared,
                         "[outbox] gc swept stale message_outbox rows"
                     );
                 }

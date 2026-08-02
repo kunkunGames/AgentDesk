@@ -9,6 +9,13 @@ use crate::services::{
 
 pub(crate) const LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS: i64 = 5 * 60;
 pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
+pub(crate) const PERSISTENT_ATTACHMENT_RETENTION_DAYS: i32 = 7;
+const EXPIRED_PERSISTENT_ATTACHMENT_PREDICATE: &str = "status = 'sent'
+    AND sent_at IS NOT NULL
+    AND sent_at < NOW() - ($1::INT || ' days')::INTERVAL
+    AND dedupe_key IS NOT NULL
+    AND dedupe_expires_at IS NULL
+    AND attachment_data IS NOT NULL";
 /// Actionable operational alerts are delivered by the announce bot first so
 /// the channel's resident AgentDesk role receives a real intake turn.  The
 /// outbox worker falls back to the notify bot only when that primary delivery
@@ -856,6 +863,56 @@ pub(crate) async fn cancel_staged_outbox_pg(pool: &PgPool, id: i64) -> Result<bo
     )
 }
 
+/// Mutation counts from one outbox garbage-collection pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OutboxGcReport {
+    pub(crate) held_deleted: u64,
+    pub(crate) failed_deleted: u64,
+    pub(crate) sent_deleted: u64,
+    pub(crate) attachment_payloads_cleared: u64,
+}
+
+impl OutboxGcReport {
+    pub(crate) fn total_mutations(self) -> u64 {
+        self.held_deleted
+            + self.failed_deleted
+            + self.sent_deleted
+            + self.attachment_payloads_cleared
+    }
+}
+
+pub(crate) async fn count_expired_persistent_attachment_payloads_pg(
+    pool: &PgPool,
+) -> Result<i64, sqlx::Error> {
+    let sql = format!(
+        "SELECT COUNT(*)::BIGINT FROM message_outbox
+         WHERE {EXPIRED_PERSISTENT_ATTACHMENT_PREDICATE}"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(PERSISTENT_ATTACHMENT_RETENTION_DAYS)
+        .fetch_one(pool)
+        .await
+}
+
+/// Reclaim binary payloads after the retry/audit window while retaining the
+/// permanent dedupe row and key that make a fire slot exactly-once.
+pub(crate) async fn clear_expired_persistent_attachment_payloads_pg(
+    pool: &PgPool,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "UPDATE message_outbox
+         SET attachment_filename = NULL,
+             attachment_content_type = NULL,
+             attachment_data = NULL
+         WHERE {EXPIRED_PERSISTENT_ATTACHMENT_PREDICATE}"
+    );
+    Ok(sqlx::query(&sql)
+        .bind(PERSISTENT_ATTACHMENT_RETENTION_DAYS)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
 /// Prune terminal outbox history and expired worker-invisible staging rows.
 ///
 /// A process can die after PostgreSQL commits a `held` row but before the
@@ -864,7 +921,8 @@ pub(crate) async fn cancel_staged_outbox_pg(pool: &PgPool, id: i64) -> Result<bo
 /// them: a sidecar that does retain the id treats a missing row as a signal to
 /// reopen and stage a fresh alert. Bounding them here prevents permanent
 /// housekeeping leaks without activating or otherwise exposing stale alerts.
-pub(crate) async fn gc_stale_outbox_rows(pool: &PgPool) -> Result<(u64, u64, u64), sqlx::Error> {
+pub(crate) async fn gc_stale_outbox_rows(pool: &PgPool) -> Result<OutboxGcReport, sqlx::Error> {
+    let attachment_payloads_cleared = clear_expired_persistent_attachment_payloads_pg(pool).await?;
     let held = sqlx::query(
         "DELETE FROM message_outbox
           WHERE status = 'held'
@@ -893,7 +951,12 @@ pub(crate) async fn gc_stale_outbox_rows(pool: &PgPool) -> Result<(u64, u64, u64
     .execute(pool)
     .await?
     .rows_affected();
-    Ok((held, failed, sent))
+    Ok(OutboxGcReport {
+        held_deleted: held,
+        failed_deleted: failed,
+        sent_deleted: sent,
+        attachment_payloads_cleared,
+    })
 }
 
 pub(crate) async fn enqueue_outbox_pg(
@@ -1288,8 +1351,14 @@ mod postgres_held_gc_tests {
         .await
         .expect("stage live held row");
 
-        let (held, failed, sent) = gc_stale_outbox_rows(&pool).await.expect("run outbox gc");
-        assert_eq!((held, failed, sent), (1, 0, 0));
+        let report = gc_stale_outbox_rows(&pool).await.expect("run outbox gc");
+        assert_eq!(
+            report,
+            OutboxGcReport {
+                held_deleted: 1,
+                ..OutboxGcReport::default()
+            }
+        );
         assert!(
             !sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM message_outbox WHERE id=$1)",
@@ -1331,7 +1400,11 @@ mod postgres_held_gc_tests {
                 source: "scheduled_message",
                 reason_code: Some("scheduled_message:v1:gc-test:slot"),
                 session_key: None,
-                attachment: None,
+                attachment: Some(OutboxAttachment {
+                    filename: "thumbnail.png",
+                    content_type: "image/png",
+                    data: b"\x89PNG\r\n\x1a\nthumbnail",
+                }),
             },
         )
         .await
@@ -1363,9 +1436,15 @@ mod postgres_held_gc_tests {
         .await
         .expect("age sent outbox rows");
 
-        let (held_pruned, failed_pruned, sent_pruned) =
-            gc_stale_outbox_rows(&pool).await.expect("run outbox gc");
-        assert_eq!((held_pruned, failed_pruned, sent_pruned), (0, 0, 1));
+        let report = gc_stale_outbox_rows(&pool).await.expect("run outbox gc");
+        assert_eq!(
+            report,
+            OutboxGcReport {
+                sent_deleted: 1,
+                attachment_payloads_cleared: 1,
+                ..OutboxGcReport::default()
+            }
+        );
 
         let remaining: Vec<String> =
             sqlx::query_scalar("SELECT content FROM message_outbox ORDER BY content")
@@ -1373,6 +1452,16 @@ mod postgres_held_gc_tests {
                 .await
                 .expect("read GC survivors");
         assert_eq!(remaining, vec!["persistent"]);
+        let persistent_payload: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT attachment_data FROM message_outbox WHERE id = $1")
+                .bind(persistent_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read persistent sentinel payload");
+        assert_eq!(
+            persistent_payload, None,
+            "GC must retain only dedupe identity"
+        );
     }
 }
 

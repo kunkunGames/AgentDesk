@@ -13,6 +13,7 @@ fn scheduled_image_attachment_requires_matching_image_bytes() {
     assert_eq!(attachment.data, b"\x89PNG\r\n\x1a\n");
 
     let mismatched = ScheduledMessageImageAttachmentBody {
+        filename: "family-thumbnail.jpg".to_string(),
         content_type: "image/jpeg".to_string(),
         ..png
     };
@@ -28,6 +29,13 @@ fn scheduled_image_attachment_rejects_paths_and_non_image_mime_types() {
         data_base64: "iVBORw0KGgo=".to_string(),
     };
     assert!(validate_image_attachment(&path).is_err());
+
+    let extension_mismatch = ScheduledMessageImageAttachmentBody {
+        filename: "thumbnail.jpg".to_string(),
+        content_type: "image/png".to_string(),
+        data_base64: "iVBORw0KGgo=".to_string(),
+    };
+    assert!(validate_image_attachment(&extension_mismatch).is_err());
 
     let mime = ScheduledMessageImageAttachmentBody {
         filename: "thumbnail.txt".to_string(),
@@ -137,7 +145,7 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
         on_context_failure: None,
     };
 
-    let new = validate_create(&pool, &body, false, 1)
+    let new = validate_create(&pool, &body, false)
         .await
         .expect("validate explicit bot create");
     assert_eq!(new.bot, "notify");
@@ -179,7 +187,7 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
         on_context_failure: None,
     };
 
-    let err = validate_create(&pool, &body, false, 1)
+    let err = validate_create(&pool, &body, false)
         .await
         .expect_err("push agentId must fail as a request error before INSERT");
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -238,7 +246,6 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         metadata_body.as_object().expect("metadata patch object"),
         &existing,
         false,
-        1,
     )
     .await
     .expect("metadata-only PATCH must not treat stored default fail as explicit input");
@@ -253,7 +260,6 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         clear_body.as_object().expect("agent clear patch object"),
         &existing,
         false,
-        1,
     )
     .await
     .expect("explicit null clears leave no effective agent-only value");
@@ -279,7 +285,6 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             body.as_object().expect("invalid push patch object"),
             &existing,
             false,
-            1,
         )
         .await
         .expect_err("push PATCH must reject effective agent-only values");
