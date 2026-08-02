@@ -293,6 +293,8 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
                     "raw": reason.raw,
                     "subsystem": reason.subsystem,
                     "severity": reason.severity.as_str(),
+                    "fix_safety": reason.fix_safety.as_str(),
+                    "summary": reason.summary,
                     "next_step": reason.next_step,
                 })
             })
@@ -306,8 +308,10 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 
 #[cfg(test)]
 mod health_classification_tests {
+    use serde_json::json;
+
     use super::super::contract::{FixSafety, SecurityExposure, Severity};
-    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
+    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason, reasons_evidence};
 
     #[test]
     fn startup_doctor_reasons_point_to_latest_report_endpoint() {
@@ -453,6 +457,24 @@ mod health_classification_tests {
         assert_eq!(
             reason.next_step,
             "check PostgreSQL availability and agentdesk dcserver logs"
+        );
+    }
+
+    #[test]
+    fn reasons_evidence_json_shape_contract() {
+        let reason = classify_degraded_reason("db_unavailable");
+        assert_eq!(
+            reasons_evidence(&[reason]),
+            json!({
+                "degraded_reasons": [{
+                    "raw": "db_unavailable",
+                    "subsystem": "postgres",
+                    "severity": "error",
+                    "fix_safety": "not_fixable",
+                    "summary": "database is unavailable",
+                    "next_step": "check PostgreSQL availability and agentdesk dcserver logs",
+                }]
+            })
         );
     }
 }
