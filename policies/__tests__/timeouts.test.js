@@ -931,8 +931,7 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /장시간 턴/);
   assert.match(state.deadlockAlerts[0].message, /90분 단계/);
-  assert.match(state.executions[0].sql, /INSERT OR REPLACE INTO kv_meta/);
-  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "90"]);
+  assert.equal(state.kv.get("long_turn_tier:codex:channel-1"), "90");
 });
 
 test("timeouts long turn monitor module skips persistent routine keep-alive sessions", () => {
@@ -970,10 +969,7 @@ test("timeouts long turn monitor module skips persistent routine keep-alive sess
   policy._section_L();
 
   assert.equal(state.deadlockAlerts.length, 0);
-  assert.equal(
-    state.executions.filter((execution) => /INSERT OR REPLACE INTO kv_meta/.test(execution.sql)).length,
-    0
-  );
+  assert.equal(state.kv.size, 0);
   assert.equal(
     state.logs.warn.filter((line) => line.includes("inflight scan error")).length,
     0,
@@ -1111,7 +1107,7 @@ test("timeouts long turn monitor module uses configured alert interval", () => {
 
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /80분 단계/);
-  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "80"]);
+  assert.equal(state.kv.get("long_turn_tier:codex:channel-1"), "80");
 });
 
 test("timeouts workspace branch guard module recovers wt branches", () => {
