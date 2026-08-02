@@ -21,7 +21,7 @@ pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> J
                 if let Some(pool) = pg_set.as_ref() {
                     return kv_set_raw_pg(pool, &key, &value, ttl_seconds);
                 }
-                r#"{"error":"sqlite backend is unavailable"}"#.to_string()
+                r#"{"error":"postgres backend is required for kv.set"}"#.to_string()
             },
         )?,
     )?;
@@ -46,7 +46,7 @@ pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> J
             if let Some(pool) = pg_del.as_ref() {
                 return kv_delete_raw_pg(pool, &key);
             }
-            r#"{"error":"sqlite backend is unavailable"}"#.to_string()
+            r#"{"error":"postgres backend is required for kv.delete"}"#.to_string()
         })?,
     )?;
 

@@ -13,7 +13,7 @@ pub(super) fn register_queue_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -
             if let Some(pool) = pg_status.as_ref() {
                 return queue_status_raw_pg(pool);
             }
-            json!({ "error": "sqlite backend is unavailable" }).to_string()
+            json!({ "error": "postgres backend is required for queue.status" }).to_string()
         })?,
     )?;
 

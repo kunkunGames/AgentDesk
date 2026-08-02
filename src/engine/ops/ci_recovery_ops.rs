@@ -143,7 +143,7 @@ fn set_blocked_reason_raw(pg_pool: Option<&PgPool>, card_id: &str, reason: Optio
     if let Some(pool) = pg_pool {
         return set_blocked_reason_pg(pool, card_id, reason);
     }
-    json!({ "error": "sqlite backend is unavailable" }).to_string()
+    json!({ "error": "postgres backend is required for ciRecovery.setBlockedReason" }).to_string()
 }
 
 fn set_blocked_reason_pg(pool: &PgPool, card_id: &str, reason: Option<&str>) -> String {
@@ -176,7 +176,7 @@ fn get_card_status_raw(pg_pool: Option<&PgPool>, card_id: &str) -> String {
     if let Some(pool) = pg_pool {
         return get_card_status_pg(pool, card_id);
     }
-    json!({ "error": "sqlite backend is unavailable" }).to_string()
+    json!({ "error": "postgres backend is required for ciRecovery.getCardStatus" }).to_string()
 }
 
 fn get_card_status_pg(pool: &PgPool, card_id: &str) -> String {
@@ -208,7 +208,7 @@ fn get_card_lifecycle_raw(pg_pool: Option<&PgPool>, card_id: &str) -> String {
     if let Some(pool) = pg_pool {
         return get_card_lifecycle_pg(pool, card_id);
     }
-    json!({ "error": "sqlite backend is unavailable" }).to_string()
+    json!({ "error": "postgres backend is required for ciRecovery.getCardLifecycle" }).to_string()
 }
 
 fn get_card_lifecycle_pg(pool: &PgPool, card_id: &str) -> String {
@@ -261,7 +261,7 @@ fn get_rework_card_info_raw(pg_pool: Option<&PgPool>, card_id: &str) -> String {
     if let Some(pool) = pg_pool {
         return get_rework_card_info_pg(pool, card_id);
     }
-    json!({ "error": "sqlite backend is unavailable" }).to_string()
+    json!({ "error": "postgres backend is required for ciRecovery.getReworkCardInfo" }).to_string()
 }
 
 fn get_rework_card_info_pg(pool: &PgPool, card_id: &str) -> String {
@@ -312,7 +312,7 @@ fn list_waiting_for_ci_raw(pg_pool: Option<&PgPool>) -> String {
     if let Some(pool) = pg_pool {
         return list_waiting_for_ci_pg(pool);
     }
-    json!({ "error": "sqlite backend is unavailable" }).to_string()
+    json!({ "error": "postgres backend is required for ciRecovery.listWaitingForCi" }).to_string()
 }
 
 fn list_waiting_for_ci_pg(pool: &PgPool) -> String {
