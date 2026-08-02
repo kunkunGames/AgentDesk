@@ -272,6 +272,28 @@ def main():
         if not has_non_empty_body_field(body, ["risk and rollback notes", "rollback notes", "rollback"]):
             print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
 
+        # In AgentDesk, PR hygiene and merge-readiness are strictly validated by scripts/analyze_prs.py.
+        # It enforces that PR titles matching jules/<agent_name>/* branches explicitly start with
+        # the corresponding AgentName: prefix.
+        head_ref_name = pr.get('headRefName', '')
+        if head_ref_name.startswith('jules/'):
+            parts = head_ref_name.split('/')
+            if len(parts) >= 3:
+                agent_slug = parts[1].lower()
+                overrides = {
+                    "cartographer-lite": "Cartographer-Lite:",
+                    "onboardingsmith": "OnboardingSmith:",
+                    "domainkeeper": "DomainKeeper:",
+                    "api-routemaster": "ApiRoutemaster:",
+                }
+                if agent_slug in overrides:
+                    expected_prefix = overrides[agent_slug]
+                else:
+                    expected_prefix = "".join(p.capitalize() for p in agent_slug.split("-")) + ":"
+
+                if not title.startswith(expected_prefix):
+                    print(f"  [!] INVALID TITLE PREFIX: Branch '{head_ref_name}' requires PR title to start with '{expected_prefix}'. Found: '{title}'.")
+
         # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
         is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
 
