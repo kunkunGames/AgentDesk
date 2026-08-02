@@ -204,7 +204,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres/SQLite availability and server logs".to_string(),
+            next_step: "check PostgreSQL connection, agentdesk.yaml configuration, and dcserver logs".to_string(),
         },
         // #4515 PR2: worker-local recovery circuit reasons.
         ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
