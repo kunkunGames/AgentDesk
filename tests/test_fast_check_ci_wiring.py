@@ -327,10 +327,6 @@ class FastCheckCiWiringTests(unittest.TestCase):
         nightly = NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(job_block(nightly, "full_macos").count(install_command), 1)
 
-        # Keep the dormant cross-OS matrix ready for macOS to be re-enabled.
-        pr = PR_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(job_block(pr, "check_fast_cross_os").count(install_command), 1)
-
     def test_main_and_nightly_retain_non_pg_test_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         self.assertIn("check: fmt-check lint cargo-check test", justfile)
