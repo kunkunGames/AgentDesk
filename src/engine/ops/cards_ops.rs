@@ -448,15 +448,19 @@ fn json_result(result: anyhow::Result<Value>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+mod parse_json_value_tests {
+    use super::parse_json_value;
+    use serde_json::{Value, json};
 
     #[test]
     fn parse_json_value_returns_null_on_malformed_json() {
         let raw = Some(r#"{"metadata": "broken""#.to_string());
         let result = parse_json_value(raw, "metadata");
-        assert_eq!(result, Value::Null, "malformed json should fallback to Null");
+        assert_eq!(
+            result,
+            Value::Null,
+            "malformed JSON should fall back to null"
+        );
     }
 
     #[test]
