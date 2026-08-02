@@ -19,7 +19,8 @@ use super::health::HealthRegistry;
 use super::inflight::{InflightTurnState, RelayOwnerKind, TurnSource};
 use super::outbound::delivery_record as dr;
 use super::outbound::turn_output_controller as toc;
-use super::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
+#[cfg(test)]
+use super::placeholder_controller::PlaceholderLifecycle;
 use super::replace_outcome_policy::edit_fail_fallback_disposition;
 #[cfg(test)]
 use crate::services::agent_protocol::TaskNotificationKind;
@@ -30,8 +31,17 @@ use crate::services::cluster::watcher_supervisor::{SupervisorConfig, run_watcher
 use crate::services::provider::ProviderKind;
 use tracing::Instrument;
 
+#[cfg(test)]
+pub(in crate::services::discord) const PURE_SUBAGENT_ZERO_DELIVERY_PAYLOAD: &str = concat!(
+    "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"sub-1\",\"task_type\":\"local_agent\"}\n",
+    "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"sub-1\",\"status\":\"completed\",\"summary\":\"Subagent finished\"}\n",
+    "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n"
+);
+
+mod delivery_frontier;
 mod delivery_outcome_classify;
 mod idle_jsonl;
+mod short_controller;
 // #3960: orphaned `SessionBoundRelay` TUI-direct reclaim (producer-liveness TOCTOU).
 mod orphan_reclaim;
 mod relay_format;
@@ -568,6 +578,7 @@ impl SessionBoundDiscordRelaySink {
             dr::commit_ordered_jsonl_range(
                 provider,
                 ChannelId::new(channel_id),
+                session_name,
                 (start, end),
                 frame_generation,
             ),
@@ -748,142 +759,12 @@ impl SessionBoundDiscordRelaySink {
     /// `CommitOnFallback`, identity-gated advance (FRESH post-POST reload): confirmed POST →
     /// `Delivered`, ambiguous → `Err(Transient)` (I2); `Replace { Active }` → `post_send_finalize`
     /// no-op. `gateway` seam (review-fix Medium-1): live = real gateway, test fakes it.
-    #[allow(clippy::too_many_arguments)]
     async fn deliver_short_replace_via_controller<G: super::gateway::TurnGateway + ?Sized>(
         &self,
         gateway: &G,
-        shared: &Arc<super::SharedData>,
-        provider: &ProviderKind,
-        channel: ChannelId,
-        channel_id: u64,
-        msg_id: MessageId,
-        relay_text: &str,
-        delivered_fingerprint_body: &str,
-        delivery: &SessionRelayDelivery,
-        trace: &SessionRelayTraceContext,
-        start: u64,
-        end: u64,
+        ctx: short_controller::SinkShortReplaceCtx<'_>,
     ) -> Result<SessionRelayDeliveryOutcome, RelaySinkError> {
-        let sink_turn = super::turn_finalizer::TurnKey::new(
-            channel,
-            delivery.frame_turn_user_msg_id,
-            shared.restart.current_generation,
-        );
-        let sink_lease_key = delivery_lease_key_for_frame(
-            channel,
-            shared.restart.current_generation,
-            delivery,
-            Some(start),
-        );
-        let cell = shared.delivery_lease(channel);
-        // Self-heal (`SinkDeliveryLeaseGuard::acquire`): reclaim an EXPIRED prior holder before acquire (a stale dead lease must not force a markerless POST).
-        cell.reclaim_if_expired(super::lease_now_ms());
-        let heartbeat = SinkPostHeartbeat { cell: cell.clone() };
-        // Identity-gated advance: INLINE before any post-send await (I1), SAME FRESH-reload gate as `advance_after_confirmed_post` (`true`→`Delivered`, `false`→`NotDelivered`).
-        let advance = |_range: (u64, u64)| -> bool {
-            let fresh = super::inflight::load_inflight_state(provider, channel_id);
-            self.advance_offset_for_confirmed_delegated_terminal(
-                shared,
-                provider,
-                channel_id,
-                &delivery.session_name,
-                delivery,
-                fresh.as_ref(),
-            )
-        };
-        let outcome = toc::deliver_turn_output(
-            gateway,
-            toc::TurnOutputCtx {
-                turn: sink_turn,
-                lease_key: Some(sink_lease_key),
-                owner: RelayOwnerKind::SessionBoundRelay,
-                holder: super::LeaseHolder::Sink,
-                lease: &*cell,
-                channel_id: channel,
-                placeholder_controller: &shared.ui.placeholder_controller,
-                placeholder: toc::PlaceholderSlot::Active {
-                    message_id: msg_id,
-                    key: PlaceholderKey {
-                        provider: provider.clone(),
-                        channel_id: channel,
-                        message_id: msg_id,
-                    },
-                },
-                body: relay_text,
-                send_range: (start, end),
-                // `Replace { Active }` → non-terminal → `post_send_finalize` no-ops (no
-                // placeholder transition), matching the legacy edit-in-place.
-                plan: toc::OutputPlan::Replace {
-                    lifecycle: PlaceholderLifecycle::Active,
-                },
-                edit_fail_policy: toc::EditFailPlaceholderPolicy::PreserveAlways,
-                fallback_commit_policy: toc::FallbackCommitPolicy::CommitOnFallback,
-                acquire_failure_mode: toc::AcquireFailureMode::Transient,
-                advance: Some(&advance),
-                heartbeat: Some(&heartbeat),
-            },
-        )
-        .await;
-
-        // #3089 B1: shadow-mirror durable delivered frontier — flag-gated, observe-only, Delivered-only (I2), OFF=no-op.
-        // #3610 PR-1: anchor msg = `msg_id` (current_msg_id — true terminal anchor, not status_message_id). PR-1b: anchor channel = `channel` (same-channel path).
-        dr::shadow_mirror_same_channel_frontier_with_body(
-            shared,
-            provider,
-            channel,
-            (start, end),
-            dr::outcome_is_shadow_delivered(&outcome),
-            msg_id.get(),
-            delivered_fingerprint_body,
-        );
-
-        match outcome {
-            // Confirmed POST (edit OR #2757 fallback): controller already ran advance + commit;
-            // BOTH map to sink-local `Delivered` (POST landed; lease outcome only steers the watcher). Emit legacy side-effects.
-            toc::DeliveryOutcome::Delivered { .. } | toc::DeliveryOutcome::NotDelivered { .. } => {
-                self.delivered_total.fetch_add(1, Ordering::AcqRel);
-                tracing::info!(
-                    provider = provider.as_str(),
-                    channel_id,
-                    message = msg_id.get(),
-                    tmux_session = %delivery.session_name,
-                    turn_id = trace.turn_id().unwrap_or(""),
-                    dispatch_id = trace.dispatch_id().unwrap_or(""),
-                    session_key = trace.session_key().unwrap_or(""),
-                    relay_owner = trace.relay_owner(),
-                    runtime_kind = trace.runtime_kind(),
-                    chars = relay_text.chars().count(),
-                    "session-bound relay sink delivered terminal response via placeholder edit (controller #3089 A2b)"
-                );
-                crate::services::observability::emit_relay_delivery(
-                    provider.as_str(),
-                    channel_id,
-                    trace.dispatch_id(),
-                    trace.session_key(),
-                    trace.turn_id(),
-                    Some(msg_id.get()),
-                    "session_relay_sink",
-                    "edit",
-                    None,
-                    None,
-                    true,
-                    Some("placeholder edit (controller)"),
-                );
-                Ok(SessionRelayDeliveryOutcome::Delivered)
-            }
-            toc::DeliveryOutcome::FreshDelivered {
-                committed_to,
-                persistence_recorded,
-            } => Ok(SessionRelayDeliveryOutcome::FreshDelivered {
-                committed_to,
-                persistence_recorded,
-            }),
-            non_delivery @ (toc::DeliveryOutcome::Transient { .. }
-            | toc::DeliveryOutcome::Unknown { .. }
-            | toc::DeliveryOutcome::Skipped) => Err(
-                delivery_outcome_classify::short_replace_non_delivery_error(&non_delivery),
-            ),
-        }
+        short_controller::deliver_short_replace_via_controller(gateway, ctx).await
     }
 
     async fn deliver_response(
@@ -992,19 +873,33 @@ impl SessionBoundDiscordRelaySink {
             && matches!(route, SessionBoundTerminalDeliveryRoute::PlaceholderEdit(_))
             && !session_bound_should_send_new_chunks_for_placeholder(&relay_text);
         let (lease_range, lease_fallback_start) = sink_delivery_lease_coordinate(&delivery);
+        let sink_lease_key = delivery_lease_key_for_frame(
+            channel,
+            shared.restart.current_generation,
+            &delivery,
+            lease_fallback_start,
+        );
+        let sink_delivery_authority = delivery_frontier::capture_sink_delivery_authority(
+            &shared,
+            channel,
+            &delivery,
+            &sink_lease_key,
+            lease_range,
+        );
+        let sink_delivery_ctx = delivery_frontier::SinkDeliveryCtx {
+            shared: &shared,
+            provider: &provider,
+            channel,
+            delivery: &delivery,
+            authority: sink_delivery_authority,
+        };
         let sink_lease_guard = if cutover_short_replace {
             None
         } else {
-            let sink_lease_key = delivery_lease_key_for_frame(
-                channel,
-                shared.restart.current_generation,
-                &delivery,
-                lease_fallback_start,
-            );
             let cell = shared.delivery_lease(channel);
             let Some(guard) = SinkDeliveryLeaseGuard::acquire(
                 &cell,
-                sink_lease_key,
+                sink_lease_key.clone(),
                 lease_range.0,
                 lease_range.1,
             ) else {
@@ -1110,22 +1005,26 @@ impl SessionBoundDiscordRelaySink {
                 return self
                     .deliver_short_replace_via_controller(
                         &gateway,
-                        &shared,
-                        &provider,
-                        channel,
-                        channel_id,
-                        msg_id,
-                        &relay_text,
-                        &raw_response_text,
-                        &delivery,
-                        &trace,
-                        start,
-                        end,
+                        short_controller::SinkShortReplaceCtx {
+                            shared: &shared,
+                            provider: &provider,
+                            channel,
+                            channel_id,
+                            msg_id,
+                            relay_text: &relay_text,
+                            delivered_fingerprint_body: &raw_response_text,
+                            delivery: &delivery,
+                            sink_lease_key,
+                            sink_delivery_authority,
+                            trace: &trace,
+                            range: (start, end),
+                            delivered_total: &self.delivered_total,
+                        },
                     )
                     .await;
             }
             if session_bound_should_send_new_chunks_for_placeholder(&relay_text) {
-                formatting::send_long_message_raw_with_rollback(
+                let message_ids = formatting::send_long_message_raw_with_rollback(
                     &http,
                     channel,
                     msg_id,
@@ -1163,28 +1062,23 @@ impl SessionBoundDiscordRelaySink {
                     true,
                     Some("long response sent as ordered chunks"),
                 );
-                // #3041 P1-4 (§4-④): external_input lease released by the RAII guard
-                // on exit. #3041 P1-3 (Part a, B1, codex issue 3): couple the confirmed
-                // POST to the advance, re-checking the gate against fresh-reloaded inflight.
-                self.advance_after_confirmed_post(
-                    &shared,
-                    &provider,
-                    channel_id,
-                    &delivery.session_name,
-                    &delivery,
+                let proof = delivery_frontier::finish_sink_delivery(
+                    sink_delivery_ctx,
+                    message_ids.last().map(|message_id| message_id.get()),
+                    &raw_response_text,
                     sink_lease_guard.as_ref(),
+                    "src/services/discord/session_relay_sink.rs:sink_long_chunks_advance",
                 );
-                return Ok(SessionRelayDeliveryOutcome::Delivered);
+                return Ok(SessionRelayDeliveryOutcome::from_proof(proof));
             }
+            let mut last_chunk_anchor = None;
             match formatting::replace_long_message_raw_with_outcome(
                 &http,
                 channel,
                 msg_id,
                 &relay_text,
                 &shared,
-                // #3805 P1: the session-bound relay sink does not append a
-                // completion footer, so the last-chunk anchor is unused here.
-                &mut None,
+                &mut last_chunk_anchor,
             )
             .await
             {
@@ -1217,20 +1111,24 @@ impl SessionBoundDiscordRelaySink {
                         true,
                         Some("placeholder edit"),
                     );
-                    // #3041 P1-4 (§4-④) lease released by RAII guard. #3041 P1-3 (Part a,
-                    // B1, codex issue 3): commit fence — post-POST fresh re-check before advance.
-                    self.advance_after_confirmed_post(
-                        &shared,
-                        &provider,
-                        channel_id,
-                        &delivery.session_name,
-                        &delivery,
+                    let anchor = formatting::watcher_completion_footer_anchor(
+                        last_chunk_anchor.as_ref(),
+                        msg_id,
+                        &relay_text,
+                    )
+                    .0;
+                    let proof = delivery_frontier::finish_sink_delivery(
+                        sink_delivery_ctx,
+                        Some(anchor.get()),
+                        &raw_response_text,
                         sink_lease_guard.as_ref(),
+                        "src/services/discord/session_relay_sink.rs:sink_legacy_short_edit_advance",
                     );
-                    Ok(SessionRelayDeliveryOutcome::Delivered)
+                    Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
-                    edit_error, ..
+                    edit_error,
+                    replacement_anchor,
                 }) => {
                     // #2757 (A0 #3089): never delete msg_id — it is the bridge's
                     // current_msg_id, possibly holding streamed content a transient edit
@@ -1266,18 +1164,14 @@ impl SessionBoundDiscordRelaySink {
                         true,
                         Some("fallback after edit failure"),
                     );
-                    // #3041 P1-4 (§4-④) lease released by RAII guard. #3041 P1-3 (Part a,
-                    // B1, codex issue 3): the fallback POST delivered → advance too, after
-                    // a post-POST fresh re-check.
-                    self.advance_after_confirmed_post(
-                        &shared,
-                        &provider,
-                        channel_id,
-                        &delivery.session_name,
-                        &delivery,
+                    let proof = delivery_frontier::finish_sink_delivery(
+                        sink_delivery_ctx,
+                        replacement_anchor.map(|anchor| anchor.get()),
+                        &raw_response_text,
                         sink_lease_guard.as_ref(),
+                        "src/services/discord/session_relay_sink.rs:sink_legacy_short_fallback_advance",
                     );
-                    Ok(SessionRelayDeliveryOutcome::Delivered)
+                    Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }
                 Ok(ReplaceLongMessageOutcome::PartialContinuationFailure { error, .. }) => {
                     Err(RelaySinkError::Transient(
@@ -1309,6 +1203,7 @@ impl SessionBoundDiscordRelaySink {
                 task_response_claim,
                 &trace,
                 sink_lease_guard.as_ref(),
+                sink_delivery_ctx,
             )
             .await
         }
@@ -1325,12 +1220,24 @@ impl SessionBoundDiscordRelaySink {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionRelayDeliveryOutcome {
     Delivered,
+    LandedStale,
+    LandedUnrecorded,
     FreshDelivered {
         committed_to: Option<u64>,
         persistence_recorded: bool,
     },
     SentButUncommitted,
     NotDelivered,
+}
+
+impl SessionRelayDeliveryOutcome {
+    fn from_proof(result: delivery_frontier::SinkDeliveryProofResult) -> Self {
+        match result {
+            delivery_frontier::SinkDeliveryProofResult::Persisted => Self::Delivered,
+            delivery_frontier::SinkDeliveryProofResult::LandedStale => Self::LandedStale,
+            delivery_frontier::SinkDeliveryProofResult::LandedUnrecorded => Self::LandedUnrecorded,
+        }
+    }
 }
 
 #[async_trait]
@@ -1343,6 +1250,11 @@ impl RelaySink for SessionBoundDiscordRelaySink {
         // handled by the per-sequence ACK. The fence still ONLY gates the OFFSET ADVANCE
         // (inline in `deliver_response`) — outcome and advance are decoupled.
         let deliveries = self.ingest_frame(frame);
+        let fenced_terminal_without_delivery = deliveries.is_empty()
+            && matches!(
+                (frame.turn_start_offset, frame.terminal_consumed_end),
+                (Some(start), Some(end)) if end > start
+            );
         let mut terminal_delivered = false;
         let mut terminal_fresh_delivered = None;
         let mut terminal_not_delivered = false;
@@ -1351,6 +1263,15 @@ impl RelaySink for SessionBoundDiscordRelaySink {
                 Ok(SessionRelayDeliveryOutcome::Delivered) => {
                     // #3041 P1-3 (B1 CLOSED): the offset advance is owned INLINE by
                     // `deliver_response` — see `advance_after_confirmed_post`.
+                    terminal_delivered = true;
+                }
+                Ok(
+                    SessionRelayDeliveryOutcome::LandedStale
+                    | SessionRelayDeliveryOutcome::LandedUnrecorded,
+                ) => {
+                    // Transport landed, but the captured source authority was
+                    // stale or its proof could not be durably recorded. Never
+                    // retry this POST into the replacement incarnation.
                     terminal_delivered = true;
                 }
                 Ok(SessionRelayDeliveryOutcome::FreshDelivered {
@@ -1370,7 +1291,10 @@ impl RelaySink for SessionBoundDiscordRelaySink {
         }
         // #3041 P1-3 R5: surface the outcome on THIS frame's sequence (the watcher
         // resolves its own terminal ACK on its exact seq, so a co-chunked tail can't
-        // satisfy another turn's ACK); no result-bearing delivery → `FrameAccepted`.
+        // satisfy another turn's ACK). A valid terminal commit fence proves this exact
+        // sequence needs a terminal resolution even when parser visibility policy emits
+        // no delivery; resolve it as NotDelivered so the watcher reconciles immediately.
+        // An unfenced frame with no result-bearing delivery remains `FrameAccepted`.
         // #3041 P1-5: NO `TerminalUnknown` (the sink always KNOWS its result).
         if terminal_delivered {
             Ok(RelaySinkOutcome::TerminalDelivered)
@@ -1379,7 +1303,7 @@ impl RelaySink for SessionBoundDiscordRelaySink {
                 committed_to,
                 persistence_recorded,
             })
-        } else if terminal_not_delivered {
+        } else if terminal_not_delivered || fenced_terminal_without_delivery {
             Ok(RelaySinkOutcome::TerminalNotDelivered)
         } else {
             Ok(RelaySinkOutcome::FrameAccepted)
@@ -3250,6 +3174,7 @@ mod tests {
         outcome: super::super::formatting::ReplaceLongMessageOutcome,
         ok: bool,
         replace_calls: std::sync::atomic::AtomicUsize,
+        on_replace: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl super::super::gateway::TurnGateway for ShortReplaceFakeGateway {
@@ -3265,6 +3190,9 @@ mod tests {
             Box::pin(async move {
                 self.replace_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(on_replace) = &self.on_replace {
+                    on_replace();
+                }
                 if self.ok {
                     Ok(self.outcome.clone())
                 } else {
@@ -3359,6 +3287,7 @@ mod tests {
             outcome,
             ok,
             replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: None,
         };
         let hb = NoopHeartbeat;
         let advance = |_r: (u64, u64)| -> bool { advance_returns };
@@ -3503,8 +3432,13 @@ mod tests {
         // A real ordered [start,end) so the cut-over guard-skip applies and the
         // controller acquires the SINGLE lease.
         let (start, end) = (0u64, 256u64);
-        let delivery =
+        let generation_path =
+            crate::services::tmux_common::session_temp_path(session, "generation");
+        std::fs::create_dir_all(std::path::Path::new(&generation_path).parent().unwrap()).unwrap();
+        std::fs::write(&generation_path, b"1").unwrap();
+        let mut delivery =
             delivery_with_fence_offset(session, Some(end), 0, "2026-06-04T00:00:00Z", Some(0));
+        delivery.relay_generation_mtime_ns = Some(dr::current_generation_mtime_ns(session));
 
         // ---- MATCH: the on-disk inflight identity matches the frame ----------
         // The fresh-reload identity gate inside the production `advance` closure
@@ -3525,22 +3459,35 @@ mod tests {
             outcome: super::super::formatting::ReplaceLongMessageOutcome::EditedOriginal,
             ok: true,
             replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: None,
         };
         let trace = SessionRelayTraceContext::default();
+        let lease_key = delivery_lease_key_for_frame(channel, 0, &delivery, Some(start));
+        let authority = delivery_frontier::capture_sink_delivery_authority(
+            &shared,
+            channel,
+            &delivery,
+            &lease_key,
+            (start, end),
+        );
         let outcome = rt
             .block_on(sink.deliver_short_replace_via_controller(
                 &gateway,
-                &shared,
-                &provider,
-                channel,
-                channel.get(),
-                MessageId::new(99),
-                "answer",
-                "answer",
-                &delivery,
-                &trace,
-                start,
-                end,
+                short_controller::SinkShortReplaceCtx {
+                    shared: &shared,
+                    provider: &provider,
+                    channel: channel,
+                    channel_id: channel.get(),
+                    msg_id: MessageId::new(99),
+                    relay_text: "answer",
+                    delivered_fingerprint_body: "answer",
+                    delivery: &delivery,
+                    sink_lease_key: lease_key,
+                    sink_delivery_authority: authority,
+                    trace: &trace,
+                    range: (start, end),
+                    delivered_total: &sink.delivered_total,
+                },
             ))
             .expect("matching-identity cut-over delivery is Ok");
         assert!(
@@ -3582,27 +3529,40 @@ mod tests {
             outcome: super::super::formatting::ReplaceLongMessageOutcome::EditedOriginal,
             ok: true,
             replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: None,
         };
+        let lease_key2 = delivery_lease_key_for_frame(channel, 0, &delivery, Some(start));
+        let authority2 = delivery_frontier::capture_sink_delivery_authority(
+            &shared2,
+            channel,
+            &delivery,
+            &lease_key2,
+            (start, end),
+        );
         let outcome2 = rt
             .block_on(sink2.deliver_short_replace_via_controller(
                 &gateway2,
-                &shared2,
-                &provider,
-                channel,
-                channel.get(),
-                MessageId::new(99),
-                "answer",
-                "answer",
-                &delivery,
-                &trace,
-                start,
-                end,
+                short_controller::SinkShortReplaceCtx {
+                    shared: &shared2,
+                    provider: &provider,
+                    channel: channel,
+                    channel_id: channel.get(),
+                    msg_id: MessageId::new(99),
+                    relay_text: "answer",
+                    delivered_fingerprint_body: "answer",
+                    delivery: &delivery,
+                    sink_lease_key: lease_key2,
+                    sink_delivery_authority: authority2,
+                    trace: &trace,
+                    range: (start, end),
+                    delivered_total: &sink.delivered_total,
+                },
             ))
             .expect("mismatched-identity cut-over delivery is still Ok (POST landed)");
         // The POST landed (sink-local Delivered maps both lease outcomes), but the
         // committed offset must NOT advance — the gate refused. The decisive
         // mutation-sensitive assertion is the offset, not the sink-local outcome.
-        assert!(matches!(outcome2, SessionRelayDeliveryOutcome::Delivered));
+        assert!(matches!(outcome2, SessionRelayDeliveryOutcome::LandedStale));
         assert_eq!(
             shared2.committed_relay_offset(channel),
             0,
@@ -3616,6 +3576,293 @@ mod tests {
             1,
             "the mismatched run still POSTs once under its held lease; only the advance differs"
         );
+    }
+
+    #[test]
+    fn sink_short_controller_post_reset_is_landed_stale_without_replacement_poison_4911() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let provider = ProviderKind::Claude;
+        let channel = ChannelId::new(8_041_491_1);
+        let session = "AgentDesk-claude-sink-short-4911";
+        let generation_path =
+            crate::services::tmux_common::session_temp_path(session, "generation");
+        std::fs::create_dir_all(std::path::Path::new(&generation_path).parent().unwrap()).unwrap();
+        std::fs::write(&generation_path, b"source-a").unwrap();
+        let generation = dr::current_generation_mtime_ns(session);
+        let (start, end) = (0, 256);
+        let old_user_msg_id = 8_041_491_100;
+        let replacement_user_msg_id = 8_041_491_200;
+        let mut delivery = delivery_with_fence_offset(
+            session,
+            Some(end),
+            old_user_msg_id,
+            "2026-07-29T00:00:00Z",
+            Some(start),
+        );
+        delivery.channel_id = channel.get();
+        delivery.relay_generation_mtime_ns = Some(generation);
+        let matching = inflight_with_identity_offset(
+            channel.get(),
+            session,
+            old_user_msg_id,
+            "2026-07-29T00:00:00Z",
+            Some(start),
+        );
+        super::super::inflight::save_inflight_state(&matching).unwrap();
+
+        let shared = super::super::make_shared_data_for_tests();
+        let coord = shared.tmux_relay_coord(channel);
+        coord.confirmed_end_offset.store(300, Ordering::Release);
+        coord
+            .confirmed_end_generation_mtime_ns
+            .store(generation, Ordering::Release);
+        let lease_key = delivery_lease_key_for_frame(channel, 0, &delivery, Some(start));
+        let authority = delivery_frontier::capture_sink_delivery_authority(
+            &shared,
+            channel,
+            &delivery,
+            &lease_key,
+            (start, end),
+        );
+        let reset_shared = Arc::clone(&shared);
+        let callback_provider = provider.clone();
+        let gateway = ShortReplaceFakeGateway {
+            outcome: ReplaceLongMessageOutcome::EditedOriginal,
+            ok: true,
+            replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: Some(Arc::new(move || {
+                let replacement = inflight_with_identity_offset(
+                    channel.get(),
+                    session,
+                    replacement_user_msg_id,
+                    "2026-07-29T00:00:01Z",
+                    Some(4_096),
+                );
+                super::super::inflight::save_inflight_state(&replacement).unwrap();
+                assert!(
+                    reset_shared
+                        .tmux_relay_coord(channel)
+                        .reset_confirmed_frontier(300, 17)
+                );
+                dr::write_delivered_frontier(
+                    &callback_provider,
+                    channel.get(),
+                    session,
+                    dr::DeliveredCommit {
+                        range: (0, 17),
+                        generation_mtime_ns: generation,
+                        attempts: 1,
+                        panel_msg_id: Some(8_041_491_999),
+                        panel_channel_id: Some(channel.get()),
+                    },
+                )
+                .unwrap();
+                dr::record_delivered_content_fingerprint(
+                    &callback_provider,
+                    channel,
+                    session,
+                    "replacement body",
+                );
+                super::super::outbound::completed_turn_ledger::append_completed_turn(
+                    &callback_provider,
+                    channel.get(),
+                    replacement_user_msg_id,
+                );
+            })),
+        };
+        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
+        let outcome = rt
+            .block_on(sink.deliver_short_replace_via_controller(
+                &gateway,
+                short_controller::SinkShortReplaceCtx {
+                    shared: &shared,
+                    provider: &provider,
+                    channel: channel,
+                    channel_id: channel.get(),
+                    msg_id: MessageId::new(99),
+                    relay_text: "old body",
+                    delivered_fingerprint_body: "old body",
+                    delivery: &delivery,
+                    sink_lease_key: lease_key,
+                    sink_delivery_authority: authority,
+                    trace: &SessionRelayTraceContext::default(),
+                    range: (start, end),
+                    delivered_total: &sink.delivered_total,
+                },
+            ))
+            .unwrap();
+        assert_eq!(outcome, SessionRelayDeliveryOutcome::LandedStale);
+        assert_eq!(coord.confirmed_end_offset.load(Ordering::Acquire), 17);
+        let record = dr::read_record(&provider, channel.get()).unwrap();
+        assert_eq!(record.delivered_frontier.unwrap().range, (0, 17));
+        assert_eq!(record.recent_delivered_contents.len(), 1);
+        assert!(dr::recent_delivered_content_matches(
+            &provider,
+            channel,
+            session,
+            "replacement body"
+        ));
+        assert!(!dr::recent_delivered_content_matches(
+            &provider, channel, session, "old body"
+        ));
+        let settled = super::super::outbound::completed_turn_ledger::settled_user_msg_ids(
+            &provider,
+            channel.get(),
+        );
+        assert_eq!(settled, HashSet::from([replacement_user_msg_id]));
+        assert!(matches!(
+            shared.delivery_lease(channel).read(),
+            super::super::LeaseSnapshot::Unleased
+        ));
+    }
+
+    #[test]
+    fn sink_long_and_legacy_short_post_reset_keep_replacement_authority_4911() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (index, path_name, context) in [
+                (
+                    1_u64,
+                    "sink long",
+                    "src/services/discord/session_relay_sink.rs:sink_long_chunks_advance",
+                ),
+                (
+                    2_u64,
+                    "sink legacy short",
+                    "src/services/discord/session_relay_sink.rs:sink_legacy_short_edit_advance",
+                ),
+            ] {
+                let provider = ProviderKind::Claude;
+                let channel = ChannelId::new(8_041_492_000 + index);
+                let session = format!("AgentDesk-claude-{path_name}-4911");
+                let generation_path =
+                    crate::services::tmux_common::session_temp_path(&session, "generation");
+                std::fs::create_dir_all(std::path::Path::new(&generation_path).parent().unwrap())
+                    .unwrap();
+                std::fs::write(&generation_path, b"same-generation").unwrap();
+                let generation = dr::current_generation_mtime_ns(&session);
+                let old_user_msg_id = 8_041_492_100 + index;
+                let replacement_user_msg_id = 8_041_492_200 + index;
+                let mut delivery = delivery_with_fence_offset(
+                    &session,
+                    Some(256),
+                    old_user_msg_id,
+                    "2026-07-29T01:00:00Z",
+                    Some(0),
+                );
+                delivery.channel_id = channel.get();
+                delivery.relay_generation_mtime_ns = Some(generation);
+                let matching = inflight_with_identity_offset(
+                    channel.get(),
+                    &session,
+                    old_user_msg_id,
+                    "2026-07-29T01:00:00Z",
+                    Some(0),
+                );
+                super::super::inflight::save_inflight_state(&matching).unwrap();
+                let shared = super::super::make_shared_data_for_tests();
+                let coord = shared.tmux_relay_coord(channel);
+                coord.confirmed_end_offset.store(300, Ordering::Release);
+                coord
+                    .confirmed_end_generation_mtime_ns
+                    .store(generation, Ordering::Release);
+                let lease_key = delivery_lease_key_for_frame(channel, 0, &delivery, Some(0));
+                let authority = delivery_frontier::capture_sink_delivery_authority(
+                    &shared,
+                    channel,
+                    &delivery,
+                    &lease_key,
+                    (0, 256),
+                );
+                let cell = shared.delivery_lease(channel);
+                let lease_guard = SinkDeliveryLeaseGuard::acquire(&cell, lease_key, 0, 256)
+                    .expect("production sink lease");
+
+                // Deterministic slow-POST race: transport has landed, then the
+                // same-name replacement resets and installs its own proof before
+                // the production post-send frontier helper runs.
+                let replacement = inflight_with_identity_offset(
+                    channel.get(),
+                    &session,
+                    replacement_user_msg_id,
+                    "2026-07-29T01:00:01Z",
+                    Some(4_096),
+                );
+                super::super::inflight::save_inflight_state(&replacement).unwrap();
+                assert!(coord.reset_confirmed_frontier(300, 17));
+                dr::write_delivered_frontier(
+                    &provider,
+                    channel.get(),
+                    &session,
+                    dr::DeliveredCommit {
+                        range: (0, 17),
+                        generation_mtime_ns: generation,
+                        attempts: 1,
+                        panel_msg_id: Some(8_041_492_900 + index),
+                        panel_channel_id: Some(channel.get()),
+                    },
+                )
+                .unwrap();
+                dr::record_delivered_content_fingerprint(
+                    &provider,
+                    channel,
+                    &session,
+                    "replacement body",
+                );
+                super::super::outbound::completed_turn_ledger::append_completed_turn(
+                    &provider,
+                    channel.get(),
+                    replacement_user_msg_id,
+                );
+
+                let result = delivery_frontier::finish_sink_delivery(
+                    delivery_frontier::SinkDeliveryCtx {
+                        shared: &shared,
+                        provider: &provider,
+                        channel,
+                        delivery: &delivery,
+                        authority,
+                    },
+                    Some(8_041_492_800 + index),
+                    "old landed body",
+                    Some(&lease_guard),
+                    context,
+                );
+                assert_eq!(
+                    result,
+                    delivery_frontier::SinkDeliveryProofResult::LandedStale
+                );
+                drop(lease_guard);
+                assert_eq!(coord.confirmed_end_offset.load(Ordering::Acquire), 17);
+                let record = dr::read_record(&provider, channel.get()).unwrap();
+                assert_eq!(record.delivered_frontier.unwrap().range, (0, 17));
+                assert_eq!(record.recent_delivered_contents.len(), 1);
+                assert!(!dr::recent_delivered_content_matches(
+                    &provider,
+                    channel,
+                    &session,
+                    "old landed body"
+                ));
+                assert_eq!(
+                    super::super::outbound::completed_turn_ledger::settled_user_msg_ids(
+                        &provider,
+                        channel.get(),
+                    ),
+                    HashSet::from([replacement_user_msg_id])
+                );
+                assert!(matches!(cell.read(), super::super::LeaseSnapshot::Unleased));
+            }
+        });
     }
 
     // #4081 round-4: the session-bound short-replace controller sends formatted
@@ -3636,6 +3883,7 @@ mod tests {
         let channel = ChannelId::new(8_041_4081);
         let session = "AgentDesk-claude-session-sink-raw-4081";
         let raw_body = "# heading\nbody line\n".to_string();
+        let user_msg_id = 8_041_4080;
         let relay_text = formatting::format_for_discord_with_provider(&raw_body, &provider);
         assert_ne!(
             raw_body, relay_text,
@@ -3655,7 +3903,9 @@ mod tests {
             "session sink status-panel formatting must also use the preserved raw body"
         );
         assert!(
-            module_src.contains("&relay_text,\n                        &raw_response_text,"),
+            module_src.contains(
+                "relay_text: &relay_text,\n                            delivered_fingerprint_body: &raw_response_text,"
+            ),
             "session sink production cut-over call must thread the raw pre-format body into the fingerprint slot"
         );
 
@@ -3666,16 +3916,22 @@ mod tests {
 
         let start = 0;
         let end = raw_body.len() as u64;
-        let mut delivery =
-            delivery_with_fence_offset(session, Some(end), 0, "2026-07-04T00:00:00Z", Some(start));
+        let mut delivery = delivery_with_fence_offset(
+            session,
+            Some(end),
+            user_msg_id,
+            "2026-07-04T00:00:00Z",
+            Some(start),
+        );
         delivery.provider = provider.clone();
         delivery.channel_id = channel.get();
         delivery.response_text = raw_body.clone();
+        delivery.relay_generation_mtime_ns = Some(dr::current_generation_mtime_ns(session));
 
         let matching = inflight_with_identity_offset(
             channel.get(),
             session,
-            0,
+            user_msg_id,
             "2026-07-04T00:00:00Z",
             Some(start),
         );
@@ -3687,23 +3943,36 @@ mod tests {
             outcome: super::super::formatting::ReplaceLongMessageOutcome::EditedOriginal,
             ok: true,
             replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: None,
         };
         let trace = SessionRelayTraceContext::default();
+        let lease_key = delivery_lease_key_for_frame(channel, 0, &delivery, Some(start));
+        let authority = delivery_frontier::capture_sink_delivery_authority(
+            &shared,
+            channel,
+            &delivery,
+            &lease_key,
+            (start, end),
+        );
 
         let outcome = rt
             .block_on(sink.deliver_short_replace_via_controller(
                 &gateway,
-                &shared,
-                &provider,
-                channel,
-                channel.get(),
-                MessageId::new(99),
-                &relay_text,
-                &raw_body,
-                &delivery,
-                &trace,
-                start,
-                end,
+                short_controller::SinkShortReplaceCtx {
+                    shared: &shared,
+                    provider: &provider,
+                    channel: channel,
+                    channel_id: channel.get(),
+                    msg_id: MessageId::new(99),
+                    relay_text: &relay_text,
+                    delivered_fingerprint_body: &raw_body,
+                    delivery: &delivery,
+                    sink_lease_key: lease_key,
+                    sink_delivery_authority: authority,
+                    trace: &trace,
+                    range: (start, end),
+                    delivered_total: &sink.delivered_total,
+                },
             ))
             .expect("raw-fingerprint cut-over delivery is Ok");
         assert!(matches!(outcome, SessionRelayDeliveryOutcome::Delivered));
@@ -3714,6 +3983,14 @@ mod tests {
         assert!(
             !dr::recent_delivered_content_matches(&provider, channel, session, &relay_text),
             "formatted Discord relay text must not satisfy the raw-body refusal lookup"
+        );
+        assert!(
+            super::super::outbound::completed_turn_ledger::settled_user_msg_ids(
+                &provider,
+                channel.get(),
+            )
+            .contains(&user_msg_id),
+            "sink controller must settle the lease-pinned nonzero inbound id"
         );
     }
 
@@ -3756,6 +4033,7 @@ mod tests {
             outcome: super::super::formatting::ReplaceLongMessageOutcome::EditedOriginal,
             ok: true,
             replace_calls: std::sync::atomic::AtomicUsize::new(0),
+            on_replace: None,
         };
         let hb = NoopHeartbeat;
         let advance = |_r: (u64, u64)| -> bool { true };
@@ -4347,6 +4625,47 @@ mod tests {
         assert_eq!(deliveries[0].frame_turn_start_offset, Some(0));
     }
 
+    #[test]
+    fn parser_never_binds_buffered_old_generation_bytes_to_new_incarnation_4911() {
+        let binding = matched("4911");
+        let mut parser = SessionRelayParser::default();
+        let assistant = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old generation answer\"}]}}\n";
+        let mut old_frame = frame(&binding, assistant, 1);
+        old_frame.relay_generation_mtime_ns = Some(101);
+        assert!(parser.ingest_frame(&old_frame).is_empty());
+
+        let result = "{\"type\":\"result\",\"result\":\"new generation result\"}\n";
+        let mut replacement_terminal =
+            terminal_frame(&binding, result, 2, 512, 77, "2026-07-29T00:00:00Z");
+        replacement_terminal.relay_generation_mtime_ns = Some(202);
+        let boundary_deliveries = parser.ingest_frame(&replacement_terminal);
+        assert!(boundary_deliveries.iter().all(|delivery| {
+            delivery.response_text != "old generation answer"
+                && delivery.relay_generation_mtime_ns == Some(202)
+        }));
+
+        let mut replacement_assistant = frame(
+            &binding,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"replacement answer\"}]}}\n",
+            3,
+        );
+        replacement_assistant.relay_generation_mtime_ns = Some(202);
+        assert!(parser.ingest_frame(&replacement_assistant).is_empty());
+        let mut replacement_result = terminal_frame(
+            &binding,
+            "{\"type\":\"result\",\"result\":\"replacement answer\"}\n",
+            4,
+            640,
+            88,
+            "2026-07-29T00:00:01Z",
+        );
+        replacement_result.relay_generation_mtime_ns = Some(202);
+        let deliveries = parser.ingest_frame(&replacement_result);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].response_text, "replacement answer");
+        assert_eq!(deliveries[0].relay_generation_mtime_ns, Some(202));
+    }
+
     // #3041 P1-3 (codex P1-3 issue 1 — multi-turn-chunk close): after the watcher
     // SPLITS a `result(A) + bytes(B)` physical chunk, the sink's parser receives
     // turn A's bytes on a TERMINAL frame (A's fence) and turn B's bytes on a
@@ -4529,14 +4848,9 @@ mod tests {
         let binding = matched("42");
         let mut parser = SessionRelayParser::default();
 
-        let pure_subagent = concat!(
-            "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"sub-1\",\"task_type\":\"local_agent\"}\n",
-            "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"sub-1\",\"status\":\"completed\",\"summary\":\"Subagent finished\"}\n",
-            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n"
-        );
         assert!(
             parser
-                .ingest_frame(&frame(&binding, pure_subagent, 1))
+                .ingest_frame(&frame(&binding, PURE_SUBAGENT_ZERO_DELIVERY_PAYLOAD, 1,))
                 .is_empty()
         );
 

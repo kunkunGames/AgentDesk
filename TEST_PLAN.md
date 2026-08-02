@@ -1,22 +1,25 @@
 # AgentDesk Test Plan & Queue Hygiene Guidelines
 
 ## Queue Hygiene & Merge-Readiness
-- **Duplicate Checks:** Before starting work, check open PRs for duplicates. If your generated inventory refresh or PR overlaps with existing open PRs, stop and report a no-change overlap.
+- **Duplicate Checks:** Before starting work, check open PRs for duplicates. If your generated inventory refresh or PR overlaps with existing open PRs, stop and report a no-change overlap. When checking for overlapping open PRs, if the `gh` CLI is unavailable, query the live GitHub Pulls API (e.g., via `curl -s https://api.github.com/repos/<owner>/<repo>/pulls?state=open`) to ensure no duplicate work is performed.
 - **Strict No-Change Verification:** A "no-change" report MUST have exactly zero changed files. Verify using `gh pr view --json files`. If a PR claims "no change" but modifies files (e.g. migrations, routines), it is unsafe. If an empty no-change PR is unavoidably created, its body must explicitly list the exact overlapping PR numbers and branches.
 - **Stale Branch Cleanup:** Treat low-signal or stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place. A no-change result should NOT become a PR unless it explicitly changes a queue-hygiene artifact.
 - **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`, `patch.diff`, `prs.json`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
 
 ## Execution Plan Guidelines
 - **Dedicated Verification Step:** Plans for code changes must name the relevant test, lint, build, or generated-drift commands before final review and push. Keep the commands proportional to the changed surface; docs-only work may use focused document and diff checks.
-- **Pre-Commit Step:** Execution plans must use the exact required string for the pre-commit step: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.' without any extra formatting or text.
+- **Groundedness Rule:** Base all steps, tool calls, and reports solely on confirmed facts and exact tool outputs, avoiding assumptions about truncated data or unverified branch names.
+- **Completeness Rule:** When modifying Rust code, the testing step must explicitly state: 'Run `cargo check --all-targets` and the narrowest relevant `cargo test` target to verify the Rust changes'.
+- **Specificity Rule:** When formulating a no-change report, do not create a separate narrative step to 'formulate' the report. Incorporate the report details directly into the final submission step using the `done` tool.
+- **Pre-Commit Rule:** Create a separate, distinct step immediately before the final submission step to 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.' rather than embedding it as a sub-bullet.
 - **Finalization Step:** Describe finalization in environment-neutral terms and include a final diff/status review. Execution plans involving PR submission must avoid vague instructions like 'an appropriate description'. Instead, explicitly require drafting the PR body to include all mandatory sections (What changed, Why, WorkFingerprint, duplicate/overlap check, verification commands/results, skipped checks, risk, and rollback notes).
-- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. When deciding to stop and produce a no-change report, ensure the repository is left completely untouched. Clean up all temporary scratch files (e.g., plan.md, python/bash scripts, prs.json) to avoid accidentally generating a patch containing them. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies.
+- **No-Change Handling:** When no repository files changed, stop and report the result without creating an empty commit or PR. When deciding to stop and produce a no-change report, ensure the repository is left completely untouched. Clean up all temporary scratch files (e.g., plan.md, python/bash scripts, prs.json) to avoid accidentally generating a patch containing them. Only an external workflow that explicitly requires a no-change trace may use the existing Strict No-Change Verification exception, and the PR body must state why the exception applies. When producing a no-change report, incorporate the justification for the no-change report directly into the finalization report summary instead of generating separate conversational plan steps for it.
 
 ## PR Body Requirements
 Every PR must include:
 - What changed
 - Why
-- WorkFingerprint (Agent, Boundary, Primary files, Queue hygiene invariant, Related PRs/issues, Non-overlapping reason)
+- WorkFingerprint (Agent, Boundary, Primary files, Public API impact, Docs impact, Queue hygiene invariant, Related PRs/issues, Non-overlapping reason)
 - Duplicate/overlap check
 - Verification commands and results
 - Skipped checks and reasons
