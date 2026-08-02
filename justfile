@@ -30,6 +30,8 @@ test-active-usage-4631:
 test-non-pg:
     # cards_ops JSON decoding must remain fail-soft for persisted malformed payloads.
     cargo test --lib engine::ops::cards_ops::parse_json_value_tests -- --skip _pg --skip pg_ --skip postgres
+    # Typed KV bulk deletion must keep its array-bound payload contract covered.
+    cargo test --lib engine::ops::kv_ops::tests -- --skip _pg --skip pg_ --skip postgres
     # #4878: keep the generated queue docs on the canonical thread-group contract.
     cargo test --lib server::routes::docs::inventory::endpoints::part_0 -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::task_completion_v1::tests -- --skip _pg --skip pg_ --skip postgres

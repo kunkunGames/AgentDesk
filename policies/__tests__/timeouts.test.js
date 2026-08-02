@@ -1049,6 +1049,50 @@ test("timeouts long turn monitor module skips synthetic reattach placeholders", 
   assert.equal(bulkAlertDeletes.length, 1);
 });
 
+test("timeouts long turn monitor batches stale KV cleanup through the typed facade", () => {
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    inflights: [
+      {
+        provider: "codex",
+        channel_id: "active-channel",
+        started_at: null
+      }
+    ],
+    dbQuery: createSqlRouter([
+      {
+        match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'",
+        result: [
+          { key: "long_turn_tier:codex:active-channel" },
+          { key: "long_turn_tier:codex:stale-channel-1" },
+          { key: "long_turn_tier:claude:stale-channel-2" }
+        ]
+      },
+      {
+        match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'",
+        result: [
+          { key: "long_turn_watchdog_extension:codex:active-channel" },
+          { key: "long_turn_watchdog_extension:codex:stale-channel-1" }
+        ]
+      }
+    ])
+  });
+
+  policy._section_L();
+
+  assert.deepEqual(state.kvDeleteManyCalls, [
+    [
+      "long_turn_tier:codex:stale-channel-1",
+      "long_turn_tier:claude:stale-channel-2"
+    ],
+    ["long_turn_watchdog_extension:codex:stale-channel-1"]
+  ]);
+  assert.equal(
+    state.executions.some((execution) => /WHERE key IN \(/.test(execution.sql)),
+    false,
+    "policy cleanup must not bypass the typed KV facade with scalar placeholders"
+  );
+});
+
 test("timeouts long turn monitor module skips repeated 30-minute threshold", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     inflights: [
