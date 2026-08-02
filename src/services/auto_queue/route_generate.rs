@@ -1,5 +1,9 @@
 use super::*;
 
+fn unresolved_external_dependency_label(issue_number: i64, status: Option<&str>) -> Option<String> {
+    (status != Some("done")).then(|| format!("#{issue_number}:{}", status.unwrap_or("missing")))
+}
+
 /// POST /api/queue/generate
 ///
 /// Creates a queue run from ready cards, ordered by priority.
@@ -344,7 +348,9 @@ pub async fn generate(
                 continue;
             }
 
-            if !dependency_status_cache.contains_key(dep_num) {
+            let unresolved_dependency = if let Some(status) = dependency_status_cache.get(dep_num) {
+                unresolved_external_dependency_label(*dep_num, status.as_deref())
+            } else {
                 let status = sqlx::query_scalar::<_, String>(
                     "SELECT status
                          FROM kanban_cards
@@ -357,15 +363,14 @@ pub async fn generate(
                 .await
                 .ok()
                 .flatten();
+                let unresolved_dependency =
+                    unresolved_external_dependency_label(*dep_num, status.as_deref());
                 dependency_status_cache.insert(*dep_num, status);
-            }
-            let dep_status = dependency_status_cache.get(dep_num).unwrap();
+                unresolved_dependency
+            };
 
-            if dep_status.as_deref() != Some("done") {
-                unresolved_external_dependencies.push(format!(
-                    "#{dep_num}:{}",
-                    dep_status.as_deref().unwrap_or("missing")
-                ));
+            if let Some(unresolved_dependency) = unresolved_dependency {
+                unresolved_external_dependencies.push(unresolved_dependency);
             }
         }
 
@@ -729,6 +734,19 @@ pub(crate) async fn active_dispatch_id_for_card_pg(
 #[cfg(test)]
 mod deploy_gate_request_rejection_tests {
     use super::*;
+
+    #[test]
+    fn dependency_label_preserves_done_pending_and_missing_semantics() {
+        assert_eq!(unresolved_external_dependency_label(41, Some("done")), None);
+        assert_eq!(
+            unresolved_external_dependency_label(42, Some("in_progress")),
+            Some("#42:in_progress".to_string())
+        );
+        assert_eq!(
+            unresolved_external_dependency_label(43, None),
+            Some("#43:missing".to_string())
+        );
+    }
 
     fn body(kind: &str) -> GenerateBody {
         GenerateBody {
