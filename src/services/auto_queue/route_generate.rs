@@ -270,19 +270,28 @@ pub async fn generate(
     if cards.is_empty() {
         let mut counts_map = serde_json::Map::new();
         if let Some(pipeline) = crate::pipeline::try_get() {
-            for pipeline_state in &pipeline.states {
-                if !pipeline_state.terminal {
-                    let c = state
-                        .auto_queue_service()
-                        .count_cards_by_status_with_pg(
-                            pool,
-                            body.repo.as_deref(),
-                            body.agent_id.as_deref(),
-                            &pipeline_state.id,
-                        )
-                        .await
-                        .unwrap_or(0);
-                    counts_map.insert(pipeline_state.id.clone(), serde_json::json!(c));
+            let statuses: Vec<String> = pipeline
+                .states
+                .iter()
+                .filter(|s| !s.terminal)
+                .map(|s| s.id.clone())
+                .collect();
+
+            if !statuses.is_empty() {
+                let grouped = state
+                    .auto_queue_service()
+                    .count_cards_by_status_grouped_with_pg(
+                        pool,
+                        body.repo.as_deref(),
+                        body.agent_id.as_deref(),
+                        &statuses,
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                for status in statuses {
+                    let count = grouped.get(&status).copied().unwrap_or(0);
+                    counts_map.insert(status, serde_json::json!(count));
                 }
             }
         }

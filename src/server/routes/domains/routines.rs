@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    routing::{delete, get, patch, post},
+    routing::{get, post},
 };
 
 use super::super::{ApiRouter, AppState, protected_api_domain, routines};
