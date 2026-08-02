@@ -326,7 +326,7 @@ def main():
                 print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
-        if "no-change" in title.lower():
+        if "no-change" in title.lower() or "no change" in title.lower():
             if not has_no_change_verification_ack(body):
                 print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
             if files_data.get("files") is not None:
