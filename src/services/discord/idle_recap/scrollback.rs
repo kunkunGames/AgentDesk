@@ -21,7 +21,7 @@ pub(crate) struct RecapComposerOutput {
 pub(crate) async fn capture_tmux_scrollback(session_name: &str) -> Option<String> {
     let session = session_name.to_string();
     task::spawn_blocking(move || {
-        crate::services::platform::tmux::command()
+        crate::services::platform::tmux::tmux_command()
             .args([
                 "capture-pane",
                 "-p",
