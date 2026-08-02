@@ -545,7 +545,8 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         )
     };
 
-    let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, early_thread_parent);
+    let fast_mode_channel_id =
+        effective_fast_mode_channel_id(channel_id, early_thread_parent.clone());
     super::super::super::commands::reset_provider_session_if_pending(
         &ctx.http,
         shared,
@@ -1108,38 +1109,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     )
     .await;
 
-    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) = {
-        #[cfg(unix)]
-        {
-            if remote_profile.is_none()
-                && provider.uses_managed_tmux_backend()
-                && claude::is_tmux_available()
-            {
-                if let Some(ref tmux_name) = tmux_session_name {
-                    let (output_path, input_fifo_path) = tmux_runtime_paths(tmux_name);
-                    let session_exists =
-                        crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_name);
-                    let last_offset = std::fs::metadata(&output_path)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    (
-                        Some(tmux_name.clone()),
-                        Some(output_path),
-                        Some(input_fifo_path),
-                        if session_exists { last_offset } else { 0 },
-                    )
-                } else {
-                    (None, None, None, 0)
-                }
-            } else {
-                (None, None, None, 0)
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            (None, None, None, 0u64)
-        }
-    };
+    let (inflight_tmux_name, inflight_output_path, inflight_input_fifo, inflight_offset) =
+        prelaunch_inflight_runtime_seed(
+            &provider,
+            remote_profile.is_none(),
+            tmux_session_name.as_deref(),
+            prelaunch_runtime_kind,
+        );
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
 
@@ -1194,6 +1170,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         watcher_output_path,
         inflight_offset,
         "turn_start_headless",
+        early_thread_parent.map(|(parent_channel_id, _)| parent_channel_id),
         &mut inflight_state,
     );
     let (tx, rx) = mpsc::channel();

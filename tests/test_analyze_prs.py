@@ -7,9 +7,11 @@ from scripts.analyze_prs import (
     has_no_change_verification_ack,
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
+    has_mergeability_status_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
+    _is_top_level_field_label,
 )
 
 
@@ -68,6 +70,11 @@ Update analyzer hygiene checks.
         body = "- **Agent:** Codex"
 
         self.assertTrue(has_non_empty_body_field(body, ["agent"]))
+
+    def test_empty_bold_sublabel_is_not_parent_field_content(self):
+        body = "- **Risk**:\n  - **Impact**:"
+
+        self.assertFalse(has_non_empty_body_field(body, ["risk", "risk assessment"]))
 
     def test_skipped_checks_and_reasons_label_allows_none(self):
         body = "- Skipped checks and reasons: none"
@@ -145,6 +152,21 @@ class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
 
         self.assertTrue(has_duplicate_guard_ack(body))
 
+    def test_checked_template_duplicate_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **Duplicate PR guard**: I have checked for overlapping open PRs."
+
+        self.assertTrue(has_duplicate_guard_ack(body))
+
+    def test_bare_checked_template_duplicate_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **Duplicate PR guard**:"
+
+        self.assertTrue(has_duplicate_guard_ack(body))
+
+    def test_unchecked_template_duplicate_guard_with_colon_outside_is_not_ack(self):
+        body = "- [ ] **Duplicate PR guard**: I have checked for overlapping open PRs."
+
+        self.assertFalse(has_duplicate_guard_ack(body))
+
     def test_filled_duplicate_overlap_field_is_acknowledgement(self):
         body = (
             "- duplicate/overlap check: compared against sibling upstream-pr "
@@ -170,6 +192,11 @@ class PrAnalyzerNoChangeVerificationGuardTests(unittest.TestCase):
 
         self.assertTrue(has_no_change_verification_ack(body))
 
+    def test_bare_checked_template_no_change_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **No-change verification**:"
+
+        self.assertTrue(has_no_change_verification_ack(body))
+
     def test_filled_no_change_field_is_acknowledgement(self):
         body = "- no-change verification: checked using gh pr view --json files"
 
@@ -184,6 +211,11 @@ class PrAnalyzerStaleBranchCleanupGuardTests(unittest.TestCase):
 
     def test_checked_template_stale_branch_guard_is_acknowledgement(self):
         body = "- [x] **Stale branch cleanup:** I am not salvaging a stale broad branch in-place."
+
+        self.assertTrue(has_stale_branch_cleanup_ack(body))
+
+    def test_bare_checked_template_stale_branch_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **Stale branch cleanup**:"
 
         self.assertTrue(has_stale_branch_cleanup_ack(body))
 
@@ -204,10 +236,32 @@ class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
 
+    def test_bare_checked_template_scratch_file_guard_accepts_colon_outside_bold(self):
+        body = "- [x] **Scratch file cleanup**:"
+
+        self.assertTrue(has_scratch_file_cleanup_ack(body))
+
     def test_filled_scratch_file_field_is_acknowledgement(self):
         body = "- scratch file cleanup: ran git diff --check and git status."
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
+
+
+class PrAnalyzerMergeabilityStatusGuardTests(unittest.TestCase):
+    def test_unchecked_template_mergeability_status_guard_is_not_acknowledgement(self):
+        body = "- [ ] **Mergeability status:** I am not claiming merge-ready from partial check status."
+
+        self.assertFalse(has_mergeability_status_ack(body))
+
+    def test_checked_template_mergeability_status_guard_is_acknowledgement(self):
+        body = "- [X] **Mergeability status:** I am not claiming merge-ready from partial check status."
+
+        self.assertTrue(has_mergeability_status_ack(body))
+
+    def test_filled_mergeability_status_field_is_acknowledgement(self):
+        body = "- mergeability status: tests pass."
+
+        self.assertTrue(has_mergeability_status_ack(body))
 
 
 class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
@@ -256,6 +310,15 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
         body = """
 - Duplicate/overlap check:
   - #1234 on branch codex/same-scope covers this no-change PR.
+"""
+
+        self.assertTrue(has_overlap_reference(body))
+
+    def test_overlap_reference_preserves_bold_detail_fields(self):
+        body = """
+- Duplicate/overlap check:
+- **PR**: #1234
+- **Branch**: feature/foo
 """
 
         self.assertTrue(has_overlap_reference(body))
@@ -386,6 +449,8 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
         self.assertTrue(is_scratch_file_path("scratch.rs"))
         self.assertTrue(is_scratch_file_path("test_scratch.rs"))
         self.assertTrue(is_scratch_file_path("sql_test.rs"))
+        self.assertTrue(is_scratch_file_path("patch.diff"))
+        self.assertTrue(is_scratch_file_path("changes.patch"))
 
     def test_checked_in_scripts_and_migrations_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
@@ -408,6 +473,13 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("scratch[._-]*.sh", script)
         self.assertIn("scratchpad[._-]*.sh", script)
 
+    def test_ci_guard_includes_root_diff_patch_globs(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("*.diff", script)
+        self.assertIn("*.patch", script)
+        self.assertIn("patch.diff", script)
+
     def test_ci_guard_includes_analyzer_md_txt_rs_scratch_globs(self):
         script = Path("scripts/ci-script-checks.sh").read_text()
 
@@ -425,6 +497,25 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("test.js", script)
         self.assertIn("scratch[._-]*.js", script)
         self.assertIn("test_*.js", script)
+
+class PrAnalyzerRegexTests(unittest.TestCase):
+    def test_bold_label_before_colon(self):
+        body = "- **Agent**: Steward"
+        self.assertTrue(has_non_empty_body_field(body, ["agent"]))
+
+    def test_bold_label_after_colon(self):
+        body = "- **Agent:** Steward"
+        self.assertTrue(has_non_empty_body_field(body, ["agent"]))
+
+    def test_bold_label_in_field_check(self):
+        body = "- **Agent**: Steward"
+        self.assertTrue(_is_top_level_field_label(body))
+
+    def test_bold_label_in_field_check_after_colon(self):
+        body = "- **Agent:** Steward"
+        self.assertTrue(_is_top_level_field_label(body))
+
+
 
 if __name__ == "__main__":
     unittest.main()

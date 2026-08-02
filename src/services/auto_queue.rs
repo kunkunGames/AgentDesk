@@ -553,6 +553,22 @@ impl AutoQueueService {
             })
     }
 
+    pub async fn count_cards_by_status_grouped_with_pg(
+        &self,
+        pool: &PgPool,
+        repo: Option<&str>,
+        agent_id: Option<&str>,
+        statuses: &[String],
+    ) -> ServiceResult<std::collections::HashMap<String, i64>> {
+        auto_queue::count_cards_by_status_grouped_pg(pool, repo, agent_id, statuses)
+            .await
+            .map_err(|error| {
+                ServiceError::internal(format!("count grouped cards: {error}"))
+                    .with_code(ErrorCode::Database)
+                    .with_operation("count_cards_by_status_grouped_with_pg")
+            })
+    }
+
     pub async fn run_view_with_pg(
         &self,
         pool: &PgPool,
