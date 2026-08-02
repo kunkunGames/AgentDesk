@@ -469,6 +469,35 @@ pub async fn count_cards_by_status_pg(
     .await
 }
 
+pub async fn count_cards_by_status_grouped_pg(
+    pool: &PgPool,
+    repo: Option<&str>,
+    agent_id: Option<&str>,
+    statuses: &[String],
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT status, COUNT(*)::BIGINT as count
+         FROM kanban_cards
+         WHERE status = ANY($1::TEXT[])
+           AND ($2::TEXT IS NULL OR repo_id = $2)
+           AND ($3::TEXT IS NULL OR assigned_agent_id = $3)
+         GROUP BY status",
+    )
+    .bind(statuses)
+    .bind(repo.filter(|value| !value.is_empty()))
+    .bind(agent_id.filter(|value| !value.is_empty()))
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let status: String = sqlx::Row::try_get(&row, "status")?;
+        let count: i64 = sqlx::Row::try_get(&row, "count")?;
+        map.insert(status, count);
+    }
+    Ok(map)
+}
+
 fn auto_queue_run_record_from_pg_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<AutoQueueRunRecord, sqlx::Error> {
