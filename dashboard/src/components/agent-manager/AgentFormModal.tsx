@@ -146,10 +146,10 @@ export default function AgentFormModal({
             <div
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
               role="spinbutton"
-              aria-label={tr("스프라이트 번호", "Sprite Number")}
+              aria-label={tr("스프라이트 번호", "Sprite number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected Sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -174,7 +174,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   tabIndex={-1}
-                  aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-label={tr("다음 스프라이트", "Next sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -195,7 +195,7 @@ export default function AgentFormModal({
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected Sprite preview: ${spriteNum}` })}
+                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
                       aria-current="true"
@@ -217,7 +217,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   tabIndex={-1}
-                  aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-label={tr("이전 스프라이트", "Previous sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
