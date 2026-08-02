@@ -857,6 +857,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn destructive_finalize_records_only_mailbox_edge_for_strict_plan_4888() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
