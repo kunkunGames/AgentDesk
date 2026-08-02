@@ -1,13 +1,16 @@
 <!-- Keep title concise (≤70 chars). Use the body for details. -->
 
-## Summary
-<!-- 1–3 bullets: what changed and why. -->
+## What changed
+<!-- 1–3 bullets: exactly what files/behaviors were modified. -->
 
-## Test plan
-<!-- Bulleted checklist: how to verify the change. -->
+## Why
+<!-- The reason for the change. -->
+
+## Verification
+<!-- Verification commands and results (e.g. `cargo test`, `./scripts/verify-dashboard.sh`). -->
 
 ## Queue Hygiene & Merge-Readiness checklist
-- [ ] **Duplicate PR guard:** I have checked for overlapping open PRs before creating this PR (especially for generated refresh work). If overlap is found, I have ended the run with a no-change report rather than opening an empty PR.
+- [ ] **Duplicate PR guard:** I have checked for overlapping open PRs (e.g. using `gh pr list --state open --limit 100`) before creating this PR. If an overlapping PR exists, I have stopped and produced a no-change report rather than opening a duplicate PR.
 - [ ] **No-change verification:** If this PR claims no change, I have verified it modifies zero files using `gh pr view --json files`. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. (If an unavoidable no-change PR is opened, its body lists the exact overlapping PR numbers and branches).
 - [ ] **Stale branch cleanup:** I am not salvaging a stale broad branch in-place. Instead, I am closing stale branches and recreating clean branches from main.
 - [ ] **Scratch file cleanup:** I have run `git status` or a changed-file audit to ensure no ad-hoc scratch files (e.g. `plan.md`, `pr-body.md`, `patch.diff`, `prs.json`) or unrelated test scripts (e.g. `.sh`, `.sql`) are included in this PR.
