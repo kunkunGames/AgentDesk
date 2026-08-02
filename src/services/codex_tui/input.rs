@@ -2209,7 +2209,7 @@ mod tests {
         let token = Arc::new(CancelToken::new());
         let cancel_token = token.clone();
         let cancel_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(150));
             cancel_token.cancelled.store(true, Ordering::Relaxed);
         });
         let mut executor = RecordingExecutor::default();
