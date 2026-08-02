@@ -38,7 +38,10 @@ def _strip_html_comments(value):
 
 def _meaningful_field_value(value, *, allow_none=False):
     normalized = _strip_html_comments(value).strip().strip("-–—").strip()
-    if re.match(r"(?i)^[a-z0-9 /_-]+\s*:\s*$", normalized):
+    if re.match(
+        r"(?i)^(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\*\*)?\s*$",
+        normalized,
+    ):
         return False
     placeholders = {"n/a", "todo", "tbd", "na"}
     if not allow_none:
@@ -51,7 +54,11 @@ def _is_markdown_heading(line):
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
         return False
-    return re.match(r"^(?:[-*]\s*)?(?:\*\*)?[a-z0-9 /_-]+\s*:(?:\*\*)?(?:\s.*)?$", line.strip(), re.I)
+    return re.match(
+        r"^(?:[-*]\s*)?(?:\[[ xX]\]\s*)?(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\*\*)?(?:\s.*)?$",
+        line.strip(),
+        re.I,
+    )
 
 def _meaningful_branch_ref(value):
     normalized = value.strip().strip("`").strip(".,;:)]}")
@@ -60,7 +67,7 @@ def _meaningful_branch_ref(value):
 def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_labels=True):
     for label in labels:
         pattern = re.compile(
-            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|(?:\*\*)?[ \t]*)$"
+            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:\[[xX]\][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?(?:[ \t]*:(?:\*\*)?[ \t]*(.*)|[ \t]*)$"
         )
         for match in pattern.finditer(body):
             if _meaningful_field_value(match.group(1) or "", allow_none=allow_none):
@@ -88,51 +95,52 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
                 break
     return False
 
-def has_duplicate_guard_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:duplicate pr guard|duplicate-pr guard|duplicate/overlap check|overlap check):\*\*", body):
-        return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "duplicate pr guard",
-            "duplicate-pr guard",
-            "duplicate/overlap check",
-            "overlap check",
-        ],
+def _has_checked_template_ack(body, labels):
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    return bool(
+        re.search(
+            rf"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:{label_pattern})(?::\*\*|\*\*[ \t]*:)",
+            body,
+        )
     )
+
+def has_duplicate_guard_ack(body):
+    labels = [
+        "duplicate pr guard",
+        "duplicate-pr guard",
+        "duplicate/overlap check",
+        "overlap check",
+    ]
+    if _has_checked_template_ack(body, labels):
+        return True
+    return has_non_empty_body_field(body, labels)
 
 def has_no_change_verification_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:no-change verification|no change verification):\*\*", body):
+    labels = [
+        "no-change verification",
+        "no change verification",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "no-change verification",
-            "no change verification",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_stale_branch_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:stale branch cleanup|stale-branch cleanup):\*\*", body):
+    labels = [
+        "stale branch cleanup",
+        "stale-branch cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "stale branch cleanup",
-            "stale-branch cleanup",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_scratch_file_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:scratch file cleanup|scratch-file cleanup):\*\*", body):
+    labels = [
+        "scratch file cleanup",
+        "scratch-file cleanup",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "scratch file cleanup",
-            "scratch-file cleanup",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_mergeability_status_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*mergeability status:\*\*", body):
@@ -150,7 +158,9 @@ def has_overlap_reference(body):
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicates?|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
     negated_overlap_context = re.compile(r"(?i)\b(?:non[- ]?overlapp?ing|non[- ]?overlap|not overlapping|not overlap|does not overlap|no overlapping|no overlap)\b")
     branch_ref = re.compile(r"(?i)\b(?:branch(?:es)?|head(?:\s+ref)?|ref)\b\s*[:=-]?\s*`?([A-Za-z0-9][A-Za-z0-9._/-]*)`?")
-    overlap_detail_field = re.compile(r"(?i)^(?:[-*]\s*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)\s*:")
+    overlap_detail_field = re.compile(
+        r"(?i)^(?:[-*]\s*)?(?:\*\*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)(?:\*\*)?\s*:(?:\*\*)?"
+    )
     in_overlap_block = False
     block_has_pr = False
     block_has_branch = False
@@ -179,7 +189,7 @@ def has_overlap_reference(body):
         block_has_pr = block_has_pr or bool(pr_ref.search(stripped))
         block_has_branch = block_has_branch or any(
             _meaningful_branch_ref(match.group(1))
-            for match in branch_ref.finditer(stripped)
+            for match in branch_ref.finditer(stripped.replace("**", ""))
         )
         if block_has_pr and block_has_branch:
             return True
