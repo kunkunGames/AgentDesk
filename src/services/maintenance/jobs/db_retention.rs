@@ -758,6 +758,7 @@ mod tests {
                 source: "scheduled_message",
                 reason_code: Some("scheduled_message:v1:retention-test:slot"),
                 session_key: None,
+                attachment: None,
             },
         )
         .await
@@ -771,6 +772,7 @@ mod tests {
                 source: "system",
                 reason_code: None,
                 session_key: None,
+                attachment: None,
             },
             0,
         )
@@ -786,6 +788,7 @@ mod tests {
                 source: "system",
                 reason_code: Some("retention-test-ttl"),
                 session_key: None,
+                attachment: None,
             },
             60,
         )

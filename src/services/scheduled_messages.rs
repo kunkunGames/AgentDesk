@@ -34,7 +34,8 @@ use crate::services::discord::health::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 use crate::services::message_outbox::{
-    OutboxEnqueueError, OutboxMessage, enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
+    OutboxAttachment, OutboxEnqueueError, OutboxMessage,
+    enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
 };
 
 const CLAIM_BATCH: i64 = 10;
@@ -204,6 +205,18 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
             source: OUTBOX_SOURCE,
             reason_code: Some(&reason_code),
             session_key: None,
+            attachment: match (
+                message.image_filename.as_deref(),
+                message.image_content_type.as_deref(),
+                message.image_data.as_deref(),
+            ) {
+                (Some(filename), Some(content_type), Some(data)) => Some(OutboxAttachment {
+                    filename,
+                    content_type,
+                    data,
+                }),
+                _ => None,
+            },
         },
         now,
     )
@@ -643,6 +656,7 @@ async fn enqueue_raw_fallback_on_tx(
             source: OUTBOX_SOURCE,
             reason_code: Some(&reason_code),
             session_key: None,
+            attachment: None,
         },
     )
     .await
@@ -1260,6 +1274,9 @@ mod tests {
             source: "api".to_string(),
             created_by: None,
             dedupe_key: None,
+            image_filename: None,
+            image_content_type: None,
+            image_data: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),

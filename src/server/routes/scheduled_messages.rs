@@ -9,6 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -17,7 +18,8 @@ use sqlx::PgPool;
 use super::AppState;
 use crate::db::scheduled_messages as db;
 use crate::db::scheduled_messages::{
-    CancelOutcome, ListFilters, NewScheduledMessage, ScheduledMessagePatch, ScheduledMessageRow,
+    CancelOutcome, ListFilters, NewScheduledMessage, ScheduledMessageImageAttachment,
+    ScheduledMessagePatch, ScheduledMessageRow,
 };
 use crate::error::{AppError, AppResult, ErrorCode};
 
@@ -34,6 +36,8 @@ const PAST_TOLERANCE_SECS: i64 = 60;
 /// channel, so they use the non-actionable utility-bot role.
 const DEFAULT_SCHEDULED_MESSAGE_BOT: &str =
     crate::services::discord::bot_role::UtilityBotRole::Notify.alias();
+
+const MAX_SCHEDULED_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 type ApiResponse = AppResult<(StatusCode, Json<JsonValue>)>;
 
@@ -93,11 +97,82 @@ pub struct CreateScheduledMessageBody {
     pub source: Option<String>,
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
+    pub image_attachment: Option<ScheduledMessageImageAttachmentBody>,
     /// #4658: 'fresh' (default) or 'snapshot'. Snapshot freezes the source
     /// channel's conversation context at creation time.
     pub context_strategy: Option<String>,
     /// #4658: 'fail' (default, fail-closed) or 'fresh' (opt-in degrade).
     pub on_context_failure: Option<String>,
+}
+
+/// JSON-safe upload form for one scheduled-message representative image.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledMessageImageAttachmentBody {
+    pub filename: String,
+    pub content_type: String,
+    pub data_base64: String,
+}
+
+fn validate_image_attachment(
+    body: &ScheduledMessageImageAttachmentBody,
+) -> Result<ScheduledMessageImageAttachment, AppError> {
+    let filename = body.filename.trim();
+    if filename.is_empty()
+        || filename.len() > 128
+        || filename.contains(['/', '\\'])
+        || filename.contains('\0')
+    {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment.filename must be a plain filename up to 128 characters",
+        ));
+    }
+    let content_type = body.content_type.trim().to_ascii_lowercase();
+    if !matches!(
+        content_type.as_str(),
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+    ) {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment.contentType must be image/jpeg, image/png, image/webp, or image/gif",
+        ));
+    }
+    let data = BASE64_STANDARD
+        .decode(body.data_base64.trim())
+        .map_err(|_| {
+            app_error(
+                StatusCode::BAD_REQUEST,
+                "imageAttachment.dataBase64 must be valid standard base64",
+            )
+        })?;
+    if data.is_empty() || data.len() > MAX_SCHEDULED_IMAGE_BYTES {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment must contain between 1 byte and 8 MiB",
+        ));
+    }
+    if !image_signature_matches(&content_type, &data) {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment bytes do not match imageAttachment.contentType",
+        ));
+    }
+    Ok(ScheduledMessageImageAttachment {
+        filename: filename.to_string(),
+        content_type,
+        data,
+    })
+}
+
+fn image_signature_matches(content_type: &str, data: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"),
+        "image/webp" => data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP",
+        _ => false,
+    }
 }
 
 /// POST /api/scheduled-messages
@@ -294,6 +369,18 @@ async fn validate_create(
     )
     .await?;
 
+    let image_attachment = body
+        .image_attachment
+        .as_ref()
+        .map(validate_image_attachment)
+        .transpose()?;
+    if image_attachment.is_some() && delivery_kind != db::KIND_PUSH {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "imageAttachment is only valid for push delivery",
+        ));
+    }
+
     Ok(NewScheduledMessage {
         content: content.to_string(),
         title: body.title.clone().filter(|value| !value.trim().is_empty()),
@@ -320,6 +407,7 @@ async fn validate_create(
             .dedupe_key
             .clone()
             .filter(|value| !value.trim().is_empty()),
+        image_attachment,
         context_strategy,
         // Captured in the create transaction (snapshot strategy only); NULL here.
         context_snapshot_id: None,
@@ -609,6 +697,25 @@ fn patch_string(
     }
 }
 
+fn patch_image_attachment(
+    body: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<Option<ScheduledMessageImageAttachment>>, AppError> {
+    let Some(value) = body.get("imageAttachment") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let parsed: ScheduledMessageImageAttachmentBody = serde_json::from_value(value.clone())
+        .map_err(|error| {
+            app_error(
+                StatusCode::BAD_REQUEST,
+                format!("imageAttachment must be an object or null: {error}"),
+            )
+        })?;
+    Ok(Some(Some(validate_image_attachment(&parsed)?)))
+}
+
 fn normalize_effective_scheduled_at(
     scheduled_at: DateTime<Utc>,
     schedule: Option<&str>,
@@ -714,6 +821,7 @@ async fn build_patch(
             None => None,
         });
     }
+    patch.image_attachment = patch_image_attachment(body)?;
 
     // Validate the effective (merged) definition with the create rules.
     let effective_kind = existing.delivery_kind.as_str();
@@ -742,6 +850,13 @@ async fn build_patch(
         effective_agent.as_deref(),
     )
     .await?;
+    if patch.image_attachment.as_ref().is_some_and(Option::is_some)
+        && effective_kind != db::KIND_PUSH
+    {
+        return Err(bad_request(
+            "imageAttachment is only valid for push delivery".to_string(),
+        ));
+    }
 
     let mut effective_scheduled_at = patch.scheduled_at.unwrap_or(existing.scheduled_at);
     let effective_schedule = patch

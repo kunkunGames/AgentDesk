@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn scheduled_image_attachment_requires_matching_image_bytes() {
+    let png = ScheduledMessageImageAttachmentBody {
+        filename: "family-thumbnail.png".to_string(),
+        content_type: "image/png".to_string(),
+        data_base64: "iVBORw0KGgo=".to_string(),
+    };
+    let attachment = validate_image_attachment(&png).expect("valid PNG header");
+    assert_eq!(attachment.filename, "family-thumbnail.png");
+    assert_eq!(attachment.content_type, "image/png");
+    assert_eq!(attachment.data, b"\x89PNG\r\n\x1a\n");
+
+    let mismatched = ScheduledMessageImageAttachmentBody {
+        content_type: "image/jpeg".to_string(),
+        ..png
+    };
+    let error = validate_image_attachment(&mismatched).expect_err("MIME/header mismatch");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn scheduled_image_attachment_rejects_paths_and_non_image_mime_types() {
+    let path = ScheduledMessageImageAttachmentBody {
+        filename: "../thumbnail.png".to_string(),
+        content_type: "image/png".to_string(),
+        data_base64: "iVBORw0KGgo=".to_string(),
+    };
+    assert!(validate_image_attachment(&path).is_err());
+
+    let mime = ScheduledMessageImageAttachmentBody {
+        filename: "thumbnail.txt".to_string(),
+        content_type: "text/plain".to_string(),
+        data_base64: "aGVsbG8=".to_string(),
+    };
+    assert!(validate_image_attachment(&mime).is_err());
+}
+
+#[test]
 fn scheduled_message_bot_defaults_to_non_triggering_notify() {
     assert_eq!(scheduled_message_bot_or_default(None), "notify");
     assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
@@ -78,6 +115,7 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
         source: Some("postgres_test".to_string()),
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
+        image_attachment: None,
         context_strategy: None,
         on_context_failure: None,
     };
@@ -119,6 +157,7 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
         source: Some("postgres_test".to_string()),
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
+        image_attachment: None,
         context_strategy: None,
         on_context_failure: None,
     };
@@ -167,6 +206,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             source: "postgres_test".to_string(),
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
+            image_attachment: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
