@@ -19,7 +19,7 @@
 Every PR must include:
 - What changed
 - Why
-- WorkFingerprint (Agent, Boundary, Primary files, Queue hygiene invariant, Related PRs/issues, Non-overlapping reason)
+- WorkFingerprint (Agent, Boundary, Primary files, Public API impact, Docs impact, Queue hygiene invariant, Related PRs/issues, Non-overlapping reason)
 - Duplicate/overlap check
 - Verification commands and results
 - Skipped checks and reasons
