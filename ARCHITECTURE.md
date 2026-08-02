@@ -1061,6 +1061,7 @@ src/
 │   │   ├── catch_up.rs
 │   │   ├── compact_turn_authority.rs
 │   │   ├── completion_footer_metadata.rs
+│   │   ├── delivery_lease_cell.rs
 │   │   ├── delivery_lease_key.rs
 │   │   ├── destructive_cancel_capture.rs
 │   │   ├── destructive_cancel_gate.rs
@@ -1105,6 +1106,8 @@ src/
 │   │   ├── reaction_lifecycle.rs
 │   │   ├── readopted_mailbox_ledger.rs
 │   │   ├── recovery_engine.rs
+│   │   ├── relay_coord.rs
+│   │   ├── relay_coord_tests.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
 │   │   ├── relay_recovery.rs
@@ -1162,6 +1165,8 @@ src/
 │   │   ├── tmux_restart_handoff.rs
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
+│   │   ├── tmux_watcher_registry.rs
+│   │   ├── tmux_watcher_registry_restore_tests.rs
 │   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
 │   │   ├── tui_task_card.rs
