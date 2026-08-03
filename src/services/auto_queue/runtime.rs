@@ -125,10 +125,8 @@ pub async fn clear_slot_sessions_pg(
     if thread_channel_ids.is_empty() {
         return Ok(0);
     }
-    let thread_channel_ids_str: Vec<String> = thread_channel_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect();
+    let thread_channel_ids_str: Vec<String> =
+        thread_channel_ids.iter().map(|id| id.to_string()).collect();
 
     let result = sqlx::query(
         "UPDATE sessions
