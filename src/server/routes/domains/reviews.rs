@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{ApiRouter, AppState, protected_api_domain, review_verdict, reviews};
 
-// Category: reviews
+// Category: kanban
 
 pub(crate) fn router(state: AppState) -> ApiRouter {
     protected_api_domain(
