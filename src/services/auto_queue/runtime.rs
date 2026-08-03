@@ -122,29 +122,34 @@ pub async fn clear_slot_sessions_pg(
     pool: &PgPool,
     thread_channel_ids: &[u64],
 ) -> Result<usize, String> {
-    let mut cleared_sessions = 0usize;
-    for thread_channel_id in thread_channel_ids {
-        let result = sqlx::query(
-            "UPDATE sessions
-             SET status = 'idle',
-                 active_dispatch_id = NULL,
-                 session_info = $1,
-                 claude_session_id = NULL,
-                 tokens = 0,
-                 last_heartbeat = NOW()
-             WHERE thread_channel_id = $2
-               AND status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working', 'idle')",
-        )
-        .bind("Slot thread reset")
-        .bind(thread_channel_id.to_string())
-        .execute(pool)
-        .await
-        .map_err(|error| {
-            format!("clear postgres slot sessions for {thread_channel_id}: {error}")
-        })?;
-        cleared_sessions += result.rows_affected() as usize;
+    if thread_channel_ids.is_empty() {
+        return Ok(0);
     }
-    Ok(cleared_sessions)
+    let thread_channel_ids_str: Vec<String> = thread_channel_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+
+    let result = sqlx::query(
+        "UPDATE sessions
+         SET status = 'idle',
+             active_dispatch_id = NULL,
+             session_info = $1,
+             claude_session_id = NULL,
+             tokens = 0,
+             last_heartbeat = NOW()
+         WHERE thread_channel_id = ANY($2)
+           AND status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working', 'idle')",
+    )
+    .bind("Slot thread reset")
+    .bind(&thread_channel_ids_str)
+    .execute(pool)
+    .await
+    .map_err(|error| {
+        format!("clear postgres slot sessions for {thread_channel_ids_str:?}: {error}")
+    })?;
+
+    Ok(result.rows_affected() as usize)
 }
 
 pub async fn clear_slot_threads_for_slot_pg(
