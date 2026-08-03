@@ -35,4 +35,5 @@
 - Rollback notes:
 - Queue hygiene invariant:
 - Related PRs/issues checked:
+- Duplicate/overlap check:
 - Why this is non-overlapping:
