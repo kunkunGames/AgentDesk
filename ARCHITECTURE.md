@@ -777,6 +777,7 @@ src/
 │   │   │   ├── relay_format.rs
 │   │   │   ├── short_controller.rs
 │   │   │   ├── task_notification_context.rs
+│   │   │   ├── terminal_handoff.rs
 │   │   │   └── turn_parser.rs
 │   │   ├── session_runtime/
 │   │   │   ├── channel_routing.rs
