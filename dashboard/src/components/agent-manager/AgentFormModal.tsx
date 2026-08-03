@@ -149,7 +149,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -195,20 +195,15 @@ export default function AgentFormModal({
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt={t({ ko: `선택된 스프라이트 미리보기: ${spriteNum}`, en: `Selected sprite preview: ${spriteNum}` })}
+                      alt=""
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
-                      aria-current="true"
+                      aria-hidden="true"
                     />
                   ) : (
                     <span
                       className="text-2xl"
-                      role="img"
-                      aria-current="true"
-                      aria-label={t({
-                        ko: `선택된 아이콘 미리보기: ${formValues.avatar_emoji || "🤖"}`,
-                        en: `Selected icon preview: ${formValues.avatar_emoji || "🤖"}`,
-                      })}
+                      aria-hidden="true"
                     >
                       {formValues.avatar_emoji || "🤖"}
                     </span>
