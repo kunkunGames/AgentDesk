@@ -12,7 +12,7 @@ static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // first header line is empty (`Authorization:\r\n token`). An ordinary
     // unindented next line is NOT consumed; a value-less header is NOT matched.
     Regex::new(
-        r"(?i)\b(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
+        r"(?i)\b((?:authorization|cookie|set-cookie)[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
     )
     .unwrap()
 });
@@ -206,6 +206,21 @@ mod tests {
         assert!(!redacted.contains("sk-live"));
         assert!(!redacted.contains("gh-priv-key-secret"));
         assert!(!redacted.contains("pk-secret"));
+    }
+
+    #[test]
+    fn redact_known_secrets_masks_cookies() {
+        let redacted = redact_known_secrets(
+            "Cookie: session=12345; HttpOnly\nSet-Cookie: token=abcdef; Secure\nset-cookie: other=999\nplain line",
+        );
+
+        assert!(redacted.contains("Cookie: ***"));
+        assert!(redacted.contains("Set-Cookie: ***"));
+        assert!(redacted.contains("set-cookie: ***"));
+        assert!(!redacted.contains("session=12345"));
+        assert!(!redacted.contains("token=abcdef"));
+        assert!(!redacted.contains("other=999"));
+        assert!(redacted.contains("plain line"));
     }
 
     #[test]
