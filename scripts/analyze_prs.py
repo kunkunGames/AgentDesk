@@ -225,6 +225,19 @@ def is_scratch_file_path(path):
         or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", path)
     )
 
+def is_generated_inventory_path(path):
+    # Regenerated wholesale by scripts/generate_inventory_docs.py. A PR whose
+    # entire diff is these files carries no reviewable intent, so the analyzer
+    # asks for a no-change report instead. (They ARE tracked in git — two are
+    # also listed in .gitignore, which has no effect once a file is tracked.)
+    generated_inventory_files = {
+        "docs/generated/module-inventory.md",
+        "docs/generated/giant-file-registry.md",
+        "docs/generated/route-inventory.md",
+        "docs/generated/worker-inventory.md",
+    }
+    return path in generated_inventory_files
+
 def main():
     repo = _detect_repo()
     print("Fetching PRs...")
@@ -336,28 +349,22 @@ def main():
         # Scratch file detection
         if files_data.get("files") is not None:
             scratch_files = []
-            untracked_drift_files = []
-            tracked_files = []
+            generated_inventory_files = []
+            other_files = []
             for f in files_data["files"]:
                 path = f.get("path", "")
                 if is_scratch_file_path(path):
                     scratch_files.append(path)
-
-                if path in {
-                    "docs/generated/module-inventory.md",
-                    "docs/generated/giant-file-registry.md",
-                    "docs/generated/route-inventory.md",
-                    "docs/generated/worker-inventory.md"
-                }:
-                    untracked_drift_files.append(path)
+                if is_generated_inventory_path(path):
+                    generated_inventory_files.append(path)
                 else:
-                    tracked_files.append(path)
+                    other_files.append(path)
 
             if scratch_files:
                 print(f"  [!] SCRATCH FILE DETECTED: PR includes scratch files like pr-body.md, plan.md, or test scripts ({', '.join(scratch_files)}).")
 
-            if untracked_drift_files and not tracked_files:
-                print(f"  [!] NO TRACKED DRIFT: PR modifies solely deliberately untracked generated files ({', '.join(untracked_drift_files)}). This constitutes 'no tracked drift' and requires a no-change report instead of a PR.")
+            if generated_inventory_files and not other_files:
+                print(f"  [!] GENERATED INVENTORY DRIFT ONLY: PR's entire diff is regenerated inventory docs ({', '.join(generated_inventory_files)}). Re-run scripts/generate_inventory_docs.py on main and file a no-change report instead of a PR.")
 
         if is_stale:
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")

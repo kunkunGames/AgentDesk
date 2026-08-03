@@ -10,6 +10,7 @@ from scripts.analyze_prs import (
     has_mergeability_status_ack,
     has_overlap_reference,
     has_template_summary,
+    is_generated_inventory_path,
     is_scratch_file_path,
     _is_top_level_field_label,
 )
@@ -455,6 +456,20 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_checked_in_scripts_and_migrations_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
         self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
+
+
+class PrAnalyzerGeneratedInventoryPathTests(unittest.TestCase):
+    def test_generated_inventory_docs_are_flagged(self):
+        self.assertTrue(is_generated_inventory_path("docs/generated/module-inventory.md"))
+        self.assertTrue(is_generated_inventory_path("docs/generated/giant-file-registry.md"))
+        self.assertTrue(is_generated_inventory_path("docs/generated/route-inventory.md"))
+        self.assertTrue(is_generated_inventory_path("docs/generated/worker-inventory.md"))
+
+    def test_curated_docs_and_source_are_not_generated_inventory(self):
+        self.assertFalse(is_generated_inventory_path("docs/generated/README.md"))
+        self.assertFalse(is_generated_inventory_path("docs/generated/pg-audit-checklist.md"))
+        self.assertFalse(is_generated_inventory_path("src/dispatch/dispatch_status.rs"))
+        self.assertFalse(is_generated_inventory_path(""))
 
 
 class CiScriptScratchGuardTests(unittest.TestCase):
