@@ -45,7 +45,7 @@ describe("EmojiPicker", () => {
     const button = target.querySelector("button");
     expect(button).not.toBeNull();
     expect(button?.getAttribute("aria-expanded")).toBe("false");
-    expect(button?.getAttribute("aria-label")).toBe("Selected emoji: 🤖, change emoji");
+    expect(button?.getAttribute("aria-label")).toBe("Selected Emoji: 🤖, change Emoji");
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
   });
 
