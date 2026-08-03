@@ -262,7 +262,7 @@ where
 }
 
 async fn dispatch_exists_pg(pool: &PgPool, dispatch_id: &str) -> Result<bool> {
-    sqlx::query_scalar::<_, bool>("SELECT COUNT(*) > 0 FROM task_dispatches WHERE id = $1")
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM task_dispatches WHERE id = $1)")
         .bind(dispatch_id)
         .fetch_one(pool)
         .await
