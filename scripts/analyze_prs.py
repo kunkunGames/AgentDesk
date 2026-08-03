@@ -336,12 +336,28 @@ def main():
         # Scratch file detection
         if files_data.get("files") is not None:
             scratch_files = []
+            untracked_drift_files = []
+            tracked_files = []
             for f in files_data["files"]:
                 path = f.get("path", "")
                 if is_scratch_file_path(path):
                     scratch_files.append(path)
+
+                if path in {
+                    "docs/generated/module-inventory.md",
+                    "docs/generated/giant-file-registry.md",
+                    "docs/generated/route-inventory.md",
+                    "docs/generated/worker-inventory.md"
+                }:
+                    untracked_drift_files.append(path)
+                else:
+                    tracked_files.append(path)
+
             if scratch_files:
                 print(f"  [!] SCRATCH FILE DETECTED: PR includes scratch files like pr-body.md, plan.md, or test scripts ({', '.join(scratch_files)}).")
+
+            if untracked_drift_files and not tracked_files:
+                print(f"  [!] NO TRACKED DRIFT: PR modifies solely deliberately untracked generated files ({', '.join(untracked_drift_files)}). This constitutes 'no tracked drift' and requires a no-change report instead of a PR.")
 
         if is_stale:
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
