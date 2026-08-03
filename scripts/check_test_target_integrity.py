@@ -8,12 +8,12 @@ cross-checks each workflow `cargo test` command's `--lib`/`--bin`/`--test`
 selection against where the filtered module is declared (module tree walked
 from Cargo.toml target roots, following `#[path = "..."]` redirections; no
 compilation). A filtered command whose selected target declares no modules at
-all is always flagged. Default mode is warn-only
-(rc=0) until the known offenders are repaired; `--enforce` makes violations
-fatal, and opt-in `--run-list-check` additionally runs
-`cargo test ... -- --list` (compiles) to flag lanes selecting 0 tests.
-Legitimately-empty lanes (platform `#[cfg]`) are excused via
-scripts/test_target_integrity_allowlist.txt (normalized command per line).
+all is always flagged. Default mode is warn-only (rc=0) for local runs unless
+`--enforce` is passed (making violations fatal), but CI enforces it.
+Opt-in `--run-list-check` additionally runs `cargo test ... -- --list`
+(compiles) to flag lanes selecting 0 tests. Legitimately-empty lanes
+(platform `#[cfg]`) are excused via scripts/test_target_integrity_allowlist.txt
+(normalized command per line).
 """
 
 from __future__ import annotations
@@ -562,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         prefix = "ERROR" if args.enforce else "::warning::"
         print(f"{prefix} {violation.render()}")
     if violations:
-        mode = "enforced" if args.enforce else "warn-only rollout (#5003)"
+        mode = "enforced" if args.enforce else "warn-only (local run)"
         print(f"test-target integrity: {len(violations)} violation(s) [{mode}]")
         return 1 if args.enforce else 0
     print("test-target integrity check passed")
