@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{ApiRouter, AppState, onboarding, protected_api_domain};
 
-// Category: admin
+// Category: onboarding
 
 pub(crate) fn router(state: AppState) -> ApiRouter {
     protected_api_domain(
