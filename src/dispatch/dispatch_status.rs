@@ -1126,7 +1126,7 @@ pub fn finalize_dispatch_with_backends(
         }
         None => json!({ "completion_source": completion_source }),
     };
-    complete_dispatch_inner_with_backends(engine, dispatch_id, &result)
+    complete_dispatch_inner_with_backends(engine, dispatch_id, result)
 }
 
 pub fn set_dispatch_status_with_backends(
@@ -1272,7 +1272,7 @@ pub fn load_dispatch_row_with_backends(
 fn complete_dispatch_inner_with_backends(
     engine: &PolicyEngine,
     dispatch_id: &str,
-    result: &serde_json::Value,
+    result: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let dispatch_span =
         crate::logging::dispatch_span("complete_dispatch", Some(dispatch_id), None, None);
@@ -1283,7 +1283,7 @@ fn complete_dispatch_inner_with_backends(
         ));
     };
     let dispatch_id_owned = dispatch_id.to_string();
-    let input_result = result.clone();
+    let input_result = result;
     let (
         dispatch,
         kanban_card_id,
