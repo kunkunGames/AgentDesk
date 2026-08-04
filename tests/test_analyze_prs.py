@@ -8,6 +8,7 @@ from scripts.analyze_prs import (
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
     has_mergeability_status_ack,
+    has_verification_grounding_ack,
     has_overlap_reference,
     has_template_summary,
     is_generated_inventory_path,
@@ -263,6 +264,23 @@ class PrAnalyzerMergeabilityStatusGuardTests(unittest.TestCase):
         body = "- mergeability status: tests pass."
 
         self.assertTrue(has_mergeability_status_ack(body))
+
+
+class PrAnalyzerVerificationGroundingGuardTests(unittest.TestCase):
+    def test_unchecked_template_verification_grounding_guard_is_not_acknowledgement(self):
+        body = "- [ ] **Verification Grounding:** I am not claiming PostgreSQL, Discord, tmux, provider runtime, browser, or CI verification unless it was actually executed."
+
+        self.assertFalse(has_verification_grounding_ack(body))
+
+    def test_checked_template_verification_grounding_guard_is_acknowledgement(self):
+        body = "- [X] **Verification Grounding:** I am not claiming PostgreSQL, Discord, tmux, provider runtime, browser, or CI verification unless it was actually executed."
+
+        self.assertTrue(has_verification_grounding_ack(body))
+
+    def test_filled_verification_grounding_field_is_acknowledgement(self):
+        body = "- verification grounding: verified locally."
+
+        self.assertTrue(has_verification_grounding_ack(body))
 
 
 class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
