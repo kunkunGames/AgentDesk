@@ -28,7 +28,10 @@ def canonical_yaml(value)
   case value
   when Hash
     value.keys.sort_by(&:to_s).each_with_object({}) do |key, canonical|
-      canonical[key.to_s] = canonical_yaml(value[key])
+      item = value[key]
+      next if key.to_s == "continue-on-error" && (item.nil? || item == false)
+
+      canonical[key.to_s] = canonical_yaml(item)
     end
   when Array
     value.map { |item| canonical_yaml(item) }
@@ -73,6 +76,54 @@ else
 end
 unless trigger_events == ["pull_request"]
   warn "#{path}: required PR contexts must be triggered only by pull_request"
+  exit 1
+end
+
+# The required Script checks job is intentionally high-churn: concurrent lanes
+# regularly add gates to its step inventory. Protect only the job and aggregate
+# step fields that can silently disable the required context, rather than
+# whole-job hashing that would force unrelated hash re-pins for every new check.
+script_checks_job = jobs["scripts"]
+unless script_checks_job.is_a?(Hash)
+  warn "#{path}: Script checks job (scripts) must be a YAML mapping"
+  exit 1
+end
+if script_checks_job.key?("if")
+  warn "#{path}: Script checks job must not define a job-level if condition"
+  exit 1
+end
+if script_checks_job["continue-on-error"]
+  warn "#{path}: Script checks job must not be allowed to continue on error"
+  exit 1
+end
+script_checks_needs = script_checks_job["needs"]
+unless script_checks_needs == "changes" || script_checks_needs == ["changes"]
+  warn "#{path}: Script checks job must retain exact needs: changes"
+  exit 1
+end
+script_check_steps = Array(script_checks_job["steps"]).select do |step|
+  step.is_a?(Hash) && step["name"] == "Run script checks"
+end
+unless script_check_steps.length == 1
+  warn "#{path}: Script checks job must retain exactly one \"Run script checks\" step"
+  exit 1
+end
+script_check_step = script_check_steps.fetch(0)
+if script_check_step.key?("if")
+  warn "#{path}: Script checks job \"Run script checks\" step must not define if"
+  exit 1
+end
+if script_check_step["continue-on-error"]
+  warn "#{path}: Script checks job \"Run script checks\" step must not continue on error"
+  exit 1
+end
+script_check_commands = if script_check_step["run"].is_a?(String)
+  script_check_step["run"].lines.map(&:strip).reject(&:empty?)
+else
+  []
+end
+unless script_check_commands == ["./scripts/ci-script-checks.sh"]
+  warn "#{path}: Script checks job \"Run script checks\" step must run exactly ./scripts/ci-script-checks.sh"
   exit 1
 end
 
@@ -134,7 +185,6 @@ targets = {
           "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-test-fast.log\"",
         ],
         "timeout_minutes" => 20,
-        "continue_on_error" => nil,
       },
       "Require observer summary" => {
         "commands" => [
@@ -143,7 +193,6 @@ targets = {
         ],
         "timeout_minutes" => 1,
         "if_condition" => "always()",
-        "continue_on_error" => nil,
       },
       "Footer-only marker regressions" => {
         "commands" => [
@@ -175,6 +224,34 @@ targets = {
       },
     },
   },
+  "relay-authority-contract" => {
+    "label" => "relay-authority contract job",
+    "name" => "relay-authority-contract",
+    "needs" => nil,
+    "if" => nil,
+    "runs_on" => "ubuntu-latest",
+    # #5071 registers this unconditional candidate in the existing semantic
+    # hardening registry so order-independent job keys cannot disable it silently.
+    "job_sha256" => "20faba743fc3c5007680dba1c5b78938d6a82922c9ef879cbe45c043c1a2ee95",
+    "cargo_steps" => {
+      "Verify named relay-authority targets and selection floors" => {
+        "commands" => ["python3 scripts/check_relay_authority_contract.py"],
+        "timeout_minutes" => 30,
+      },
+      "Run named relay-authority contract targets" => {
+        "commands" => [
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1",
+        ],
+        "timeout_minutes" => 30,
+      },
+      "Require relay-authority mutations to be killed" => {
+        "commands" => ["bash scripts/run_relay_authority_mutations.sh"],
+        "timeout_minutes" => 30,
+      },
+    },
+  },
   "high-risk-recovery" => {
     "label" => "High-risk recovery job",
     "name" => "High-risk recovery",
@@ -190,7 +267,6 @@ targets = {
           "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-high-risk.log\"",
         ],
         "timeout_minutes" => 20,
-        "continue_on_error" => nil,
       },
       "Require observer summary" => {
         "commands" => [
@@ -199,7 +275,6 @@ targets = {
         ],
         "timeout_minutes" => 1,
         "if_condition" => "always()",
-        "continue_on_error" => nil,
       },
     },
   },
@@ -276,8 +351,9 @@ targets.each do |job_id, spec|
       unless step["if"] == step_spec.fetch("if_condition", nil)
         errors << "#{label} #{name.inspect} must retain exact if policy"
       end
-      if step_spec.key?("continue_on_error") &&
-         step["continue-on-error"] != step_spec.fetch("continue_on_error")
+      actual_continue_on_error = step["continue-on-error"] || nil
+      expected_continue_on_error = step_spec.fetch("continue_on_error", nil) || nil
+      unless actual_continue_on_error == expected_continue_on_error
         errors << "#{label} #{name.inspect} must retain exact continue-on-error policy"
       end
       unless step["timeout-minutes"] == step_spec.fetch("timeout_minutes")

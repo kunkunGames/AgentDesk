@@ -111,11 +111,18 @@ echo "=== PR infrastructure failure rerun classifier (#4392) ==="
 echo "=== CI timeout wrapper tests (#4413) ==="
 "$PYTHON" -m unittest tests.test_ci_timeout
 
+echo "=== Relay-authority fixed mutation gate (#5071) ==="
+"$PYTHON" -m unittest tests.test_relay_authority_mutations
+
 echo "=== Relay recovery targeted-lane wiring contract (#4423) ==="
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
 echo "=== TUI relay assertion unit tests (#5065) ==="
 "$PYTHON" -m unittest scripts.e2e.tui_relay.test_assertions
+
+echo "=== Relay-authority named-target floor contract (#5071) ==="
+"$PYTHON" scripts/check_relay_authority_contract.py --check-manifest
+"$PYTHON" -m unittest tests.test_check_relay_authority_contract
 
 echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
 "$PYTHON" -m unittest tests.test_fast_check_ci_wiring
