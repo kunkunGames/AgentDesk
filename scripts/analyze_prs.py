@@ -153,6 +153,17 @@ def has_mergeability_status_ack(body):
         ],
     )
 
+def has_verification_grounding_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*verification grounding:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "verification grounding",
+            "verification-grounding",
+        ],
+    )
+
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicates?|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
@@ -295,6 +306,8 @@ def main():
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_mergeability_status_ack(body):
             print("  [!] MISSING MERGEABILITY STATUS CHECK: PR body lacks a completed mergeability status acknowledgement.")
+        if not has_verification_grounding_ack(body):
+            print("  [!] MISSING VERIFICATION GROUNDING CHECK: PR body lacks a completed verification grounding acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
         if not has_non_empty_body_field(
