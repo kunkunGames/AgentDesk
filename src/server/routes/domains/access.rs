@@ -2,7 +2,7 @@ use axum::{Router, routing::get};
 
 use super::super::{ApiRouter, auth, health_api, public_api_domain};
 
-// Category: ops and integrations
+// Category: access
 
 pub(crate) fn router() -> ApiRouter {
     public_api_domain(
