@@ -79,10 +79,24 @@ function _dispatchableTargets(cfg) {
     targets.push("requested");
   }
 
+  var gatedOut = {};
+  var gatedIn = {};
+  if (cfg.transitions) {
+    for (var i = 0; i < cfg.transitions.length; i++) {
+      var t = cfg.transitions[i];
+      if (t.type === "gated") {
+        gatedOut[t.from] = true;
+        gatedIn[t.to] = true;
+      }
+    }
+  }
+
   for (var i = 0; i < cfg.states.length; i++) {
     var s = cfg.states[i];
     if (s.terminal) continue;
-    if (!_isDispatchableState(s.id, cfg)) continue;
+    var hasGatedOut = gatedOut[s.id] || false;
+    var hasGatedIn = gatedIn[s.id] || false;
+    if (!(hasGatedOut && !hasGatedIn)) continue;
     if (targets.indexOf(s.id) === -1) targets.push(s.id);
   }
   return targets;
