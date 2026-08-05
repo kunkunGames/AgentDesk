@@ -134,9 +134,8 @@ use self::tool_markdown::convert_markdown_tables;
 pub(super) use self::tool_markdown::{
     ALL_TOOLS, BUILTIN_SKILLS, canonical_tool_name, escape_for_code_fence,
     extract_skill_description, filter_codex_tool_logs, format_for_discord_with_provider,
-    format_for_discord_with_status_panel, format_tool_input, is_command_tool_name,
-    normalize_empty_lines, risk_badge, shorten_path, strip_codex_tool_log_lines, tool_info,
-    truncate_str,
+    format_for_discord_with_status_panel, format_tool_input, normalize_empty_lines, risk_badge,
+    shorten_path, strip_codex_tool_log_lines, tool_info, truncate_str,
 };
 pub(crate) use self::tool_markdown::{normalize_allowed_tools, redact_sensitive_for_placeholder};
 
@@ -167,7 +166,6 @@ pub(super) use self::delivery::{
 pub(in crate::services::discord) use self::delivery::{
     long_message_reply_builders, send_long_message_raw_with_reference,
     send_long_message_raw_with_reference_returning_message_ids, send_long_message_reply_ctx,
-    send_single_message_returning_receipt,
 };
 
 #[cfg(test)]

@@ -38,8 +38,7 @@ Current typed facade entrypoints:
 | `agentdesk.timeouts` | `cleanupDeadlockCountersForInactiveSessions()` | Deletes `deadlock_check:*` markers whose sessions are no longer active. |
 | `agentdesk.timeouts` | `cleanupDeadlockHistoryBefore(cutoff_ms)` | Deletes old `deadlock_history:*` markers by timestamp suffix. |
 | `agentdesk.dispatch` | `create(...)` | Existing typed command, retained as-is. |
-| `agentdesk.kv` | `get/set/delete(...)` | Typed exact-key KV facade, preferred over `kv_meta` SQL. |
-| `agentdesk.kv` | `deleteMany(keys)` | Deletes exact keys with one PostgreSQL `TEXT[]` bind and returns `{ ok, deleted }`. |
+| `agentdesk.kv` | `get/set/delete(...)` | Existing typed KV facade, preferred over `kv_meta` SQL. |
 
 ## Return Shape Conventions
 
@@ -63,7 +62,7 @@ Other scalar columns keep the same shape as `query`; the difference is limited t
 - Prefer `agentdesk.cards.assign(...)` and `agentdesk.cards.setPriority(...)` over direct `UPDATE kanban_cards`.
 - Prefer `agentdesk.review.entryContext(...)` and `agentdesk.review.recordEntry(...)` for review round planning over ad hoc `task_dispatches`/`kanban_cards.review_round` SQL.
 - Prefer `agentdesk.timeouts.*` for active-monitor stale-session scans, session idle transitions, deadlock cleanup, dispatch-type lookups, and termination audits.
-- Prefer `agentdesk.kv.*` over `kv_meta` SQL; use `deleteMany(keys)` for exact-key batches instead of scalar delete loops.
+- Prefer `agentdesk.kv.*` over `kv_meta` SQL.
 - Keep `agentdesk.db.*` for gaps, debugging, or transitional policy code only.
 
 ## First Migration Slice

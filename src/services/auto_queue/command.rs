@@ -140,24 +140,11 @@ pub(super) async fn update_run_with_pg(
     run_id: &str,
     body: &UpdateRunBody,
     pool: &sqlx::PgPool,
-) -> Result<(usize, Option<bool>), String> {
+) -> Result<usize, String> {
     let mut changed = 0usize;
-    let mut status_changed = None;
 
     if let Some(ref status) = body.status {
-        let result = if status == "active" {
-            sqlx::query(
-                "UPDATE auto_queue_runs
-                 SET status = 'active',
-                     completed_at = NULL
-                 WHERE id = $1
-                   AND status = 'pending'",
-            )
-            .bind(run_id)
-            .execute(pool)
-            .await
-            .map_err(|error| format!("start pending postgres auto_queue_run {run_id}: {error}"))?
-        } else if status == "completed" {
+        let result = if status == "completed" {
             sqlx::query(
                 "UPDATE auto_queue_runs
                  SET status = $1,
@@ -186,12 +173,7 @@ pub(super) async fn update_run_with_pg(
                 format!("update postgres auto_queue_runs status for {run_id}: {error}")
             })?
         };
-        let status_rows = result.rows_affected() as usize;
-        status_changed = Some(status_rows > 0);
-        changed += status_rows;
-        if status == "active" && status_rows == 0 {
-            return Ok((changed, status_changed));
-        }
+        changed += result.rows_affected() as usize;
     }
 
     if let Some(ref deploy_phases) = body.deploy_phases {
@@ -228,7 +210,7 @@ pub(super) async fn update_run_with_pg(
         changed += result.rows_affected() as usize;
     }
 
-    Ok((changed, status_changed))
+    Ok(changed)
 }
 
 pub(super) async fn reorder_with_pg(body: &ReorderBody, pool: &sqlx::PgPool) -> Result<(), String> {

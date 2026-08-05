@@ -55,15 +55,6 @@ fn catch_up_source_generation(
     }
 }
 
-fn catch_up_intervention_text(text: &str, author_is_bot: bool) -> String {
-    if author_is_bot {
-        return text.to_string();
-    }
-    let (without_operational_alert_origin, _) =
-        super::dispatch_policy::strip_operational_alert_origin(text);
-    without_operational_alert_origin.trim().to_string()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::services) struct CatchUpRetryState {
     checkpoint: u64,
@@ -1196,7 +1187,6 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
 
         for msg in &messages {
             let text = msg.content.trim().to_string();
-            let intervention_text = catch_up_intervention_text(&text, msg.author.bot);
             let msg_ts = msg.id.created_at();
             let age_reference = catch_up_message_age_reference_time(
                 chrono::Utc::now(),
@@ -1210,7 +1200,7 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                 author_is_bot: msg.author.bot,
                 is_processable_kind: router::should_process_turn_message(msg.kind),
                 age_secs,
-                trimmed_text: intervention_text.clone(),
+                trimmed_text: text.clone(),
             };
             let outcome = match classify_catch_up_message_with_utility_resolution(
                 &view,
@@ -1323,7 +1313,7 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                     source_message_ids: vec![msg.id],
                     source_message_queued_generations: vec![source_generation],
                     source_text_segments: Vec::new(),
-                    text: intervention_text.clone(),
+                    text: text.clone(),
                     mode: InterventionMode::Soft,
                     created_at: catch_up_intervention_created_at(
                         scan_wall_time,
@@ -1333,9 +1323,9 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                     reply_context: None,
                     has_reply_boundary: msg.message_reference.is_some(),
                     merge_consecutive: !msg.author.bot
-                        && !intervention_text.starts_with('!')
-                        && !intervention_text.starts_with('/')
-                        && !intervention_text.starts_with("DISPATCH:"),
+                        && !text.starts_with('!')
+                        && !text.starts_with('/')
+                        && !text.starts_with("DISPATCH:"),
                     pending_uploads: Vec::new(),
                     voice_announcement: None,
                 },
@@ -1575,7 +1565,6 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                 continue;
             }
             let text = msg.content.trim();
-            let intervention_text = catch_up_intervention_text(text, msg.author.bot);
             if text.is_empty() {
                 stats.skipped += 1;
                 continue;
@@ -1610,7 +1599,7 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                 author_is_bot: msg.author.bot,
                 is_processable_kind: true,
                 age_secs: msg_age.num_seconds(),
-                trimmed_text: intervention_text.clone(),
+                trimmed_text: text.to_string(),
             };
             let author_is_authorized = {
                 let settings = shared.settings.read().await;
@@ -1701,7 +1690,7 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                     source_message_ids: vec![msg.id],
                     source_message_queued_generations: vec![source_generation],
                     source_text_segments: Vec::new(),
-                    text: intervention_text.clone(),
+                    text: text.to_string(),
                     mode: InterventionMode::Soft,
                     created_at: catch_up_intervention_created_at(
                         scan_wall_time,
@@ -1711,9 +1700,9 @@ async fn run_catch_up_sweep<A: CatchUpDiscordApi + ?Sized>(deps: CatchUpDeps<'_,
                     reply_context: None,
                     has_reply_boundary: msg.message_reference.is_some(),
                     merge_consecutive: !msg.author.bot
-                        && !intervention_text.starts_with('!')
-                        && !intervention_text.starts_with('/')
-                        && !intervention_text.starts_with("DISPATCH:"),
+                        && !text.starts_with('!')
+                        && !text.starts_with('/')
+                        && !text.starts_with("DISPATCH:"),
                     pending_uploads: Vec::new(),
                     voice_announcement: None,
                 },

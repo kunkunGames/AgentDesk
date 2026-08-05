@@ -13,14 +13,6 @@ import {
 
 type Tr = (ko: string, en: string) => string;
 
-const TOKEN_INPUT_SEMANTICS = {
-  autoCapitalize: "none",
-  autoComplete: "new-password",
-  autoCorrect: "off",
-  "data-1p-ignore": "true",
-  spellCheck: false,
-} as const;
-
 interface Step1BotConnectionProps {
   actionRow: string;
   announceBotInfo: BotInfo | null;
@@ -179,8 +171,10 @@ export function Step1BotConnection({
             </div>
             <input
               type="password"
-              {...TOKEN_INPUT_SEMANTICS}
-              aria-label={tr(`실행 봇 ${i + 1} 토큰`, `Command bot ${i + 1} token`)}
+              autoComplete="new-password"
+              spellCheck="false"
+              data-1p-ignore
+              aria-label={tr("명령어 봇 토큰", "Command bot token")}
               placeholder={tr("봇 토큰 붙여넣기", "Paste bot token")}
               value={bot.token}
               onChange={(event) => {
@@ -250,7 +244,9 @@ export function Step1BotConnection({
         </div>
         <input
           type="password"
-          {...TOKEN_INPUT_SEMANTICS}
+          autoComplete="new-password"
+          spellCheck="false"
+          data-1p-ignore
           aria-label={tr("통신 봇 토큰", "Communication bot token")}
           placeholder={tr("통신 봇 토큰 붙여넣기", "Paste communication bot token")}
           value={announceToken}
@@ -305,8 +301,10 @@ export function Step1BotConnection({
         </div>
         <input
           type="password"
-          {...TOKEN_INPUT_SEMANTICS}
-          aria-label={tr("알림 봇 토큰 (선택)", "Notification bot token (optional)")}
+          autoComplete="new-password"
+          spellCheck="false"
+          data-1p-ignore
+          aria-label={tr("알림 봇 토큰", "Notification bot token")}
           placeholder={tr("알림 봇 토큰 (선택)", "Notification bot token (optional)")}
           value={notifyToken}
           onChange={(event) => setNotifyToken(event.target.value)}

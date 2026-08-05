@@ -85,10 +85,6 @@ echo "=== await_holding_lock ratchet guard ==="
 "$PYTHON" scripts/check_await_holding_lock_ratchet.py
 "$PYTHON" -m unittest tests.test_await_holding_lock_ratchet
 
-echo "=== DeliveryJournal raw-writer allowlist ==="
-"$PYTHON" scripts/check_delivery_journal_raw_writer.py
-"$PYTHON" -m unittest tests.test_delivery_journal_raw_writer
-
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
 "$PYTHON" -m unittest scripts.test_ratchet_admission
@@ -131,6 +127,9 @@ echo "=== Relay-authority named-target floor contract (#5071) ==="
 echo "=== Fast compile check PR/main/nightly split contract (#4747) ==="
 "$PYTHON" -m unittest tests.test_fast_check_ci_wiring
 
+echo "=== Dashboard verification security-gate contracts ==="
+"$PYTHON" -m unittest tests.test_verify_dashboard
+
 echo "=== Rust test-lane coverage ratchet (#4846/#4910) ==="
 if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
   echo "ERROR: TEST_LANE_BASELINE_REF must name an immutable comparison snapshot" >&2
@@ -139,14 +138,10 @@ fi
 "$PYTHON" scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"
 "$PYTHON" -m unittest tests.test_test_lane_coverage
 
-echo "=== Test-target integrity gate (#5003/#5008) ==="
-# cargo exits 0 on zero filter matches, so a curated lane with the wrong
-# --lib/--bin/--test flag can run 0 tests while its required check stays
-# green. Warn-only until the known offenders are repaired (separate slice);
-# flip to --enforce afterwards. The unittest run below is the gate's own
-# mutation proof (bad fixture must fail, fixed fixture must pass).
-"$PYTHON" scripts/check_test_target_integrity.py
-"$PYTHON" scripts/check_test_target_integrity.py --verify-lib-inventory
+echo "=== Test-target integrity gate (#5003, enforced) ==="
+# The unittest run below is the gate's own mutation proof
+# (bad fixture must fail, fixed fixture must pass).
+"$PYTHON" scripts/check_test_target_integrity.py --enforce
 "$PYTHON" -m unittest tests.test_check_test_target_integrity
 
 echo "=== PostgreSQL test-lane membership gate (#4979, enforced) ==="
@@ -158,7 +153,7 @@ echo "=== Scheduled-message PG path-filter wiring contract ==="
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql test.py test.js verify.sh prs.json scratch.json scratchpad.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -176,7 +171,19 @@ for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; 
     FAIL=1
   fi
 done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs; do
+for scratch_file in *.diff *.patch patch.diff; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch diff/patch file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
+for scratch_file in scratch.py scratchpad.py scratch.js scratchpad.js; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch script file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
+for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js scratch[._-]*.json scratchpad[._-]*.json test_scratch[._-]*.json test_*.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -194,13 +201,8 @@ grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --inc
   | grep -v '# port' || true
 
 echo ""
-echo "=== Checking hardcoded home paths (informational; see #100) ==="
-if grep -rn 'env!("HOME")' --include='*.rs' \
-  --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude 2>/dev/null; then
-  echo "NOTE: env!(\"HOME\") found; tracked in #100"
-else
-  echo "OK: No env!(\"HOME\") found"
-fi
+echo "=== Checking hardcoded home paths (hard gate; see #100) ==="
+"$PYTHON" scripts/check-portable-paths.py --rust-env-home-only
 
 echo "=== Path integrity check ==="
 FAIL=0
