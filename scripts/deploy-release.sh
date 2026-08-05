@@ -43,11 +43,7 @@ fi
 #   AGENTDESK_DEPLOY_ALLOW_DIRTY=1     allow deploying with local changes.
 #   AGENTDESK_DEPLOY_SKIP_FRESHNESS=1  skip both source-identity and remote
 #                                      freshness gates for an intentional
-#                                      offline/emergency deploy. In this mode,
-#                                      dashboard dependencies are reused only
-#                                      when their installed lock exactly matches
-#                                      package-lock.json; no npm network access
-#                                      or destructive clean install is attempted.
+#                                      offline/emergency deploy.
 #   AGENTDESK_DEPLOY_FAST=1            opt into the release-fast Cargo profile
 #                                      for lower-latency dev-loop deploys.
 # Resource-contention pre-flight (#4255 — runs on every node before the build):
@@ -474,20 +470,23 @@ _ensure_dashboard_dependencies() {
     local dashboard_dir="$REPO/dashboard"
     [ -d "$dashboard_dir" ] || return 0
 
-    bash "$SCRIPT_DIR/check-dashboard-toolchain.sh" "$REPO"
-    if [ "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" = "1" ]; then
-        echo "▸ Offline/emergency deploy: validating cached dashboard dependencies..."
-        if node "$SCRIPT_DIR/check-dashboard-install-state.mjs" "$dashboard_dir"; then
-            echo "✓ Reusing dashboard dependencies that exactly match package-lock.json"
-            return 0
-        fi
-        echo "✗ Offline/emergency deploy cannot prove cached dashboard dependencies match package-lock.json" >&2
-        echo "  Existing node_modules was preserved. Run npm ci while online, then retry." >&2
-        return 1
+    if ! command -v node >/dev/null 2>&1; then
+        echo "✗ node is required to build dashboard before deploy"
+        exit 1
     fi
-    echo "▸ Installing dashboard dependencies from package-lock.json..."
-    bash "$SCRIPT_DIR/install-dashboard-dependencies.sh" "$dashboard_dir"
-    node "$SCRIPT_DIR/check-dashboard-install-state.mjs" "$dashboard_dir"
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "✗ npm is required to build dashboard before deploy"
+        exit 1
+    fi
+    if [ ! -f "$dashboard_dir/package-lock.json" ]; then
+        echo "✗ dashboard/package-lock.json missing — cannot install deterministic dashboard dependencies"
+        exit 1
+    fi
+
+    if [ ! -x "$dashboard_dir/node_modules/.bin/tsc" ]; then
+        echo "▸ Installing dashboard dependencies (npm ci)..."
+        (cd "$dashboard_dir" && npm ci --no-audit --no-fund)
+    fi
 }
 
 _resolve_default_release_binary() {
@@ -876,11 +875,6 @@ _rollback_release_binary() {
     echo "↩ Rolling back release binary to previous good version..."
     domain="$(_launchd_domain)" || domain="gui/$(id -u 2>/dev/null)"
     # Stop the crash-looping new process before swapping the binary back.
-    # NOTE: bootstrap may not spawn process (runs=0) despite rc=0 (#5151 root cause).
-    # Release rollback has tmux fallback (line 897) + health check (line 899); if bootstrap
-    # succeeds but process doesn't spawn, tmux fallback will restart via SSH.
-    # Observed issue (#5151): explicit kickstart required after bootstrap. Scope: PG tunnel
-    # only for now; release rollback suitable for future unification if measured necessary.
     launchctl bootout "$domain/$plist" 2>/dev/null || true
     tmux kill-session -t "${AGENTDESK_RELEASE_TMUX_SESSION:-AgentDesk-dcserver-release-manual}" 2>/dev/null || true
     # The bad binary is never locked (uchg is deferred to the success path), so
@@ -1002,13 +996,7 @@ _rollback_pg_tunnel_migration() {
 
     if [ "$restore_ok" = 1 ]; then
         if [ "${PG_TUNNEL_ROLLBACK_JOB_LOADED:-0}" = 1 ]; then
-            # #5151: bootstrap only loads the plist; it does not guarantee that launchd
-            # spawns the process (observed rc=0 with runs=0 despite RunAtLoad/KeepAlive).
-            # The explicit kickstart is what actually brings the tunnel back, so rollback
-            # must treat a kickstart failure as a restore failure too.
-            if [ ! -f "$plist" ] \
-              || ! launchctl bootstrap "$domain" "$plist" 2>/dev/null \
-              || ! launchctl kickstart -k "$domain/${PG_TUNNEL_LABEL:-com.agentdesk.pg-tunnel}" 2>/dev/null; then
+            if [ ! -f "$plist" ] || ! launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
                 echo "✗ Failed to restart previous PG tunnel launchd job" >&2
                 restore_ok=0
             fi
@@ -2070,17 +2058,8 @@ _migrate_pg_tunnel_before_release_stop() {
         echo "✗ PG tunnel bootstrap failed"
         return 1
     fi
-    # #5151: bootstrap loads the plist but does not guarantee that launchd spawns the
-    # process — measured rc=0 with runs=0 even though RunAtLoad=true and KeepAlive=true.
-    # The explicit kickstart is what actually starts it (runs 0→1, SQL-ready in 0.25s).
-    # Deliberately placed after the single bootout above: adding a second bootout here
-    # would re-stop the job the wrapper just claimed as canonical.
-    if ! launchctl kickstart -k "$PG_TUNNEL_LAUNCHD_DOMAIN/$PG_TUNNEL_LABEL"; then
-        echo "✗ PG tunnel kickstart failed"
-        return 1
-    fi
     echo "▸ Proving canonical PostgreSQL tunnel readiness on :15432..."
-    if ! _pg_sql_probe 15432 12; then
+    if ! _pg_sql_probe 15432; then
         echo "✗ Canonical PostgreSQL tunnel SQL readiness failed"
         return 1
     fi
@@ -3253,10 +3232,6 @@ PLIST_EOF
                     # Restart only when deployment material changed or the job is absent.
                     # The watermark lives in the atomic state file, so replacement loads
                     # the same pre-restart transcript authority before its first tick.
-                    # NOTE: This block implements the same bootout/poll/bootstrap pattern as
-                    # the PG tunnel sites. Currently runs=2 (healthy), i.e. measured as not
-                    # requiring an explicit kickstart (unlike PG tunnel #5151). Scope: excluded
-                    # from this PR; unification is a follow-up gated on measurement (#5151).
                     launchctl bootout "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" 2>/dev/null || true
                     _wd_bootout_polls=0
                     while launchctl print "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" >/dev/null 2>&1; do
