@@ -15,7 +15,7 @@ type Tr = (ko: string, en: string) => string;
 
 const TOKEN_INPUT_SEMANTICS = {
   autoCapitalize: "none",
-  autoComplete: "new-password",
+  autoComplete: "off",
   autoCorrect: "off",
   "data-1p-ignore": "true",
   spellCheck: false,
