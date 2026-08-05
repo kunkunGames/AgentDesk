@@ -127,6 +127,51 @@ unless script_check_commands == ["./scripts/ci-script-checks.sh"]
   exit 1
 end
 
+# The aggregate job is intentionally excluded from the high-churn cargo-job
+# `targets` hash below, but its inventory verifier has a hard prerequisite:
+# cargo must be available before ci-script-checks.sh starts. Pin the setup shape
+# here so removing the toolchain/cache silently cannot recreate D2.
+script_steps = Array(script_checks_job["steps"])
+setup_specs = {
+  "Install Rust toolchain for lib inventory" => {
+    "uses" => "dtolnay/rust-toolchain@master",
+    "toolchain" => "1.94.1",
+  },
+  "Setup sccache for lib inventory" => {
+    "uses" => "mozilla-actions/sccache-action@v0.0.10",
+  },
+  "Cache Cargo dependencies for lib inventory" => {
+    "uses" => "Swatinem/rust-cache@v2",
+    "cache-targets" => false,
+    "cache-bin" => false,
+    "shared-key" => "cargo-dependencies-v2",
+  },
+}
+setup_specs.each do |name, spec|
+  matches = script_steps.select { |step| step.is_a?(Hash) && step["name"] == name }
+  unless matches.length == 1
+    warn "#{path}: Script checks must retain exactly one #{name.inspect} step"
+    exit 1
+  end
+  step = matches.fetch(0)
+  expected_uses = spec.fetch("uses")
+  unless step["uses"] == expected_uses
+    warn "#{path}: Script checks #{name.inspect} must use #{expected_uses}"
+    exit 1
+  end
+  if spec.key?("toolchain") && step.dig("with", "toolchain") != spec["toolchain"]
+    warn "#{path}: Script checks #{name.inspect} must pin Rust 1.94.1"
+    exit 1
+  end
+  spec.each do |key, expected|
+    next if key == "uses" || key == "toolchain"
+    unless step.dig("with", key) == expected
+      warn "#{path}: Script checks #{name.inspect} must retain #{key}=#{expected.inspect}"
+      exit 1
+    end
+  end
+end
+
 targets = {
   # The independent explicit step-inventory layer was removed. What remains
   # splits into two mechanisms of very different strength, and conflating them
@@ -258,7 +303,9 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.high_risk_recovery == 'true'",
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "9c3587d8664bdd63769c3306c016f241e851649a68a7c6a52b11e243c438df3d",
+    # #5034 re-pins after adding the attachment-delivery and catch-up
+    # operational-alert targets to the path-filtered required high-risk lane.
+    "job_sha256" => "29c7a0c33753933e50c446f073da942bebd0c53881460260562cd9cabaef9c44",
     "require_debug_env" => false,
     "cargo_steps" => {
       "Observe curated lane selections" => {

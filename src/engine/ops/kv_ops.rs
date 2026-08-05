@@ -6,7 +6,7 @@ use sqlx::PgPool;
 // agentdesk.kv.set(key, value, ttlSeconds) — set with optional TTL
 // agentdesk.kv.get(key) → value or null (filters expired)
 // agentdesk.kv.delete(key) — delete a key
-// agentdesk.kv.deleteMany(keys) — delete keys with one array-bound query
+// agentdesk.kv.deleteMany(keys) — delete exact keys with one array-bound query
 
 pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
@@ -22,7 +22,7 @@ pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> J
                 if let Some(pool) = pg_set.as_ref() {
                     return kv_set_raw_pg(pool, &key, &value, ttl_seconds);
                 }
-                r#"{"error":"postgres backend is required for kv.set"}"#.to_string()
+                r#"{"error":"sqlite backend is unavailable"}"#.to_string()
             },
         )?,
     )?;
@@ -47,12 +47,12 @@ pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> J
             if let Some(pool) = pg_del.as_ref() {
                 return kv_delete_raw_pg(pool, &key);
             }
-            r#"{"error":"postgres backend is required for kv.delete"}"#.to_string()
+            r#"{"error":"sqlite backend is unavailable"}"#.to_string()
         })?,
     )?;
 
-    // PostgreSQL receives one TEXT[] bind parameter, so this remains bounded
-    // even when the key count exceeds its scalar bind-parameter limit.
+    // PostgreSQL receives one TEXT[] bind parameter, so the number of keys
+    // cannot exhaust the scalar bind-parameter limit.
     let pg_delete_many = pg_pool.clone();
     kv_obj.set(
         "__deleteManyRaw",
@@ -248,7 +248,7 @@ fn kv_delete_many_raw_pg(pool: &PgPool, keys_json: &str) -> String {
                 .rows_affected();
             Ok(serde_json::json!({ "ok": true, "deleted": deleted }).to_string())
         },
-        |error| format!(r#"{{"error":"{error}"}}"#),
+        |error| serde_json::json!({ "error": error }).to_string(),
     ) {
         Ok(result) => result,
         Err(raw) => crate::engine::ops::ensure_js_error_json(raw),

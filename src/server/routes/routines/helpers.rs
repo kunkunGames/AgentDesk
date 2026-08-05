@@ -172,6 +172,7 @@ pub(super) fn validate_run_status_filter(status: &str) -> AppResult<()> {
     }
 }
 
+/// Applies the public routine-run paging policy before store-level clamping.
 pub(super) fn normalize_routine_run_limit(limit: Option<i64>) -> i64 {
     const DEFAULT_LIMIT: i64 = 20;
 
@@ -327,6 +328,7 @@ mod tests {
     #[test]
     fn routine_run_limit_has_explicit_default_and_bounds() {
         assert_eq!(normalize_routine_run_limit(None), 20);
+        assert_eq!(normalize_routine_run_limit(Some(i64::MIN)), 1);
         assert_eq!(normalize_routine_run_limit(Some(-1)), 1);
         assert_eq!(normalize_routine_run_limit(Some(0)), 1);
         assert_eq!(normalize_routine_run_limit(Some(1)), 1);

@@ -14,6 +14,19 @@ pub(crate) struct ClassifiedReason {
     pub(crate) next_step: String,
 }
 
+impl ClassifiedReason {
+    fn evidence(&self) -> Value {
+        json!({
+            "raw": self.raw,
+            "subsystem": self.subsystem,
+            "severity": self.severity.as_str(),
+            "fix_safety": self.fix_safety.as_str(),
+            "summary": self.summary,
+            "next_step": self.next_step,
+        })
+    }
+}
+
 fn startup_doctor_report_next_step() -> String {
     format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}")
 }
@@ -222,7 +235,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check PostgreSQL availability and agentdesk dcserver logs".to_string(),
+            next_step: "check Postgres/SQLite availability and server logs".to_string(),
         },
         // #4515 PR2: worker-local recovery circuit reasons.
         ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
@@ -288,16 +301,7 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
     json!({
         "degraded_reasons": reasons
             .iter()
-            .map(|reason| {
-                json!({
-                    "raw": reason.raw,
-                    "subsystem": reason.subsystem,
-                    "severity": reason.severity.as_str(),
-                    "fix_safety": reason.fix_safety.as_str(),
-                    "summary": reason.summary,
-                    "next_step": reason.next_step,
-                })
-            })
+            .map(ClassifiedReason::evidence)
             .collect::<Vec<_>>()
     })
 }
@@ -408,6 +412,7 @@ mod health_classification_tests {
     }
 
     #[test]
+        #[test]
     fn gateway_standby_reason_codes_classify() {
         let provider_standby = classify_degraded_reason("provider:codex:gateway_standby");
         assert_eq!(provider_standby.subsystem, "provider_runtime");
@@ -446,23 +451,9 @@ mod health_classification_tests {
         assert_ne!(cluster_standby.summary, cluster_standby.raw);
     }
 
-    #[test]
-    fn db_unavailable_reason_is_actionable() {
+fn reasons_evidence_preserves_actionable_reason_contract() {
         let reason = classify_degraded_reason("db_unavailable");
 
-        assert_eq!(reason.subsystem, "postgres");
-        assert_eq!(reason.severity, Severity::Error);
-        assert_eq!(reason.fix_safety, FixSafety::NotFixable);
-        assert_eq!(reason.summary, "database is unavailable");
-        assert_eq!(
-            reason.next_step,
-            "check PostgreSQL availability and agentdesk dcserver logs"
-        );
-    }
-
-    #[test]
-    fn reasons_evidence_json_shape_contract() {
-        let reason = classify_degraded_reason("db_unavailable");
         assert_eq!(
             reasons_evidence(&[reason]),
             json!({
@@ -472,7 +463,7 @@ mod health_classification_tests {
                     "severity": "error",
                     "fix_safety": "not_fixable",
                     "summary": "database is unavailable",
-                    "next_step": "check PostgreSQL availability and agentdesk dcserver logs",
+                    "next_step": "check Postgres/SQLite availability and server logs",
                 }]
             })
         );

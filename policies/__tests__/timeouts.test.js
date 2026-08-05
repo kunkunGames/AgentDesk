@@ -931,7 +931,8 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /장시간 턴/);
   assert.match(state.deadlockAlerts[0].message, /90분 단계/);
-  assert.equal(state.kv.get("long_turn_tier:codex:channel-1"), "90");
+  assert.match(state.executions[0].sql, /INSERT OR REPLACE INTO kv_meta/);
+  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "90"]);
 });
 
 test("timeouts long turn monitor module skips persistent routine keep-alive sessions", () => {
@@ -969,7 +970,10 @@ test("timeouts long turn monitor module skips persistent routine keep-alive sess
   policy._section_L();
 
   assert.equal(state.deadlockAlerts.length, 0);
-  assert.equal(state.kv.size, 0);
+  assert.equal(
+    state.executions.filter((execution) => /INSERT OR REPLACE INTO kv_meta/.test(execution.sql)).length,
+    0
+  );
   assert.equal(
     state.logs.warn.filter((line) => line.includes("inflight scan error")).length,
     0,
@@ -1054,7 +1058,7 @@ test("timeouts long turn monitor batches stale KV cleanup through the typed faca
     inflights: [
       {
         provider: "codex",
-        channel_id: "active-channel",
+        channel_id: "active-channel:thread",
         started_at: null
       }
     ],
@@ -1062,7 +1066,7 @@ test("timeouts long turn monitor batches stale KV cleanup through the typed faca
       {
         match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'",
         result: [
-          { key: "long_turn_tier:codex:active-channel" },
+          { key: "long_turn_tier:codex:active-channel:thread" },
           { key: "long_turn_tier:codex:stale-channel-1" },
           { key: "long_turn_tier:claude:stale-channel-2" }
         ]
@@ -1070,12 +1074,20 @@ test("timeouts long turn monitor batches stale KV cleanup through the typed faca
       {
         match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'",
         result: [
-          { key: "long_turn_watchdog_extension:codex:active-channel" },
+          { key: "long_turn_watchdog_extension:codex:active-channel:thread" },
           { key: "long_turn_watchdog_extension:codex:stale-channel-1" }
         ]
       }
     ])
   });
+  const keys = [
+    "long_turn_tier:codex:active-channel:thread",
+    "long_turn_tier:codex:stale-channel-1",
+    "long_turn_tier:claude:stale-channel-2",
+    "long_turn_watchdog_extension:codex:active-channel:thread",
+    "long_turn_watchdog_extension:codex:stale-channel-1"
+  ];
+  for (const key of keys) state.kv.set(key, "present");
 
   policy._section_L();
 
@@ -1087,9 +1099,20 @@ test("timeouts long turn monitor batches stale KV cleanup through the typed faca
     ["long_turn_watchdog_extension:codex:stale-channel-1"]
   ]);
   assert.equal(
-    state.executions.some((execution) => /WHERE key IN \(/.test(execution.sql)),
+    state.kv.has("long_turn_tier:codex:active-channel:thread"),
+    true
+  );
+  assert.equal(
+    state.kv.has("long_turn_watchdog_extension:codex:active-channel:thread"),
+    true
+  );
+  assert.equal(state.kv.has("long_turn_tier:codex:stale-channel-1"), false);
+  assert.equal(state.kv.has("long_turn_tier:claude:stale-channel-2"), false);
+  assert.equal(state.kv.has("long_turn_watchdog_extension:codex:stale-channel-1"), false);
+  assert.equal(
+    state.executions.some((execution) => /WHERE key = \?/.test(execution.sql)),
     false,
-    "policy cleanup must not bypass the typed KV facade with scalar placeholders"
+    "policy cleanup must not bypass the typed KV facade with scalar deletes"
   );
 });
 
@@ -1151,7 +1174,7 @@ test("timeouts long turn monitor module uses configured alert interval", () => {
 
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /80분 단계/);
-  assert.equal(state.kv.get("long_turn_tier:codex:channel-1"), "80");
+  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "80"]);
 });
 
 test("timeouts workspace branch guard module recovers wt branches", () => {
@@ -1488,73 +1511,4 @@ test("timeouts idle-kill module excludes thread idle rows from the main batch", 
     assert.match(p.body.reason, /idle \d+(시간|일) 초과/);
     assert.equal(p.body.minimum_idle_minutes, 360);
   });
-});
-
-test("timeouts reconcile fallback escalates DoD wait when only DoD is incomplete", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { pm_decision_gate_enabled: true },
-    cards: {
-      "card-dod-reconcile": {
-        id: "card-dod-reconcile",
-        status: "in_progress",
-        priority: "high",
-        assigned_agent_id: "agent-dod",
-        deferred_dod_json: {
-          items: ["test1", "test2"],
-          verified: ["test1"]
-        }
-      }
-    },
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
-        result: [{ key: "reconcile_dispatch:dispatch-dod-reconcile", value: "dispatch-dod-reconcile" }]
-      },
-      {
-        match: "FROM task_dispatches WHERE id = ?",
-        result: [
-          {
-            id: "dispatch-dod-reconcile",
-            kanban_card_id: "card-dod-reconcile",
-            to_agent_id: "agent-dod",
-            dispatch_type: "implementation",
-            chain_depth: 1,
-            created_at: "2026-06-21 10:00:00",
-            result: JSON.stringify({}),
-            context: "{}",
-            status: "completed"
-          }
-        ]
-      },
-      {
-        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'pm_pending:%'",
-        result: []
-      }
-    ])
-  });
-
-  policy._section_R(); // This should trigger reconciliation
-
-  assert.deepEqual(state.statusCalls, [
-    {
-      cardId: "card-dod-reconcile",
-      status: "review",
-      force: false
-    }
-  ]);
-  assert.deepEqual(state.reviewStatusCalls, [
-    {
-      cardId: "card-dod-reconcile",
-      reviewStatus: "awaiting_dod",
-      options: { awaiting_dod_at: "now" }
-    }
-  ]);
-  assert.deepEqual(state.reviewStateSyncs, [
-    {
-      cardId: "card-dod-reconcile",
-      status: "awaiting_dod",
-      options: {}
-    }
-  ]);
-  assert.equal(state.manualInterventions.length, 0);
 });

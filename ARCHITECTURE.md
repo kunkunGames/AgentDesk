@@ -271,6 +271,7 @@ src/
 │   │   ├── analytics.rs
 │   │   ├── auth.rs
 │   │   ├── auto_queue.rs
+│   │   ├── auto_queue_lifecycle_pg_tests.rs
 │   │   ├── automation_candidates.rs
 │   │   ├── claude_accounts_api.rs
 │   │   ├── cluster.rs
@@ -359,6 +360,8 @@ src/
 │   │   ├── patterns.rs
 │   │   └── storage.rs
 │   ├── auto_queue/
+│   │   ├── runtime/
+│   │   │   └── clear_slot_sessions_pg_tests.rs
 │   │   ├── activate_command.rs
 │   │   ├── activate_preflight.rs
 │   │   ├── activate_route.rs
@@ -369,6 +372,7 @@ src/
 │   │   ├── dispatch_command.rs
 │   │   ├── dispatch_query.rs
 │   │   ├── fsm.rs
+│   │   ├── lifecycle_routes.rs
 │   │   ├── order_routes.rs
 │   │   ├── phase_gate.rs
 │   │   ├── phase_gate_catalog.rs
@@ -770,11 +774,14 @@ src/
 │   │   │   ├── startup_doctor.rs
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
+│   │   │   ├── journal/
+│   │   │   │   └── pg_store.rs
 │   │   │   ├── delivery_commit.rs
 │   │   │   ├── delivery_frontier.rs
 │   │   │   ├── delivery_orchestration_tests.rs
 │   │   │   ├── delivery_outcome_classify.rs
 │   │   │   ├── idle_jsonl.rs
+│   │   │   ├── journal.rs
 │   │   │   ├── orphan_reclaim.rs
 │   │   │   ├── relay_format.rs
 │   │   │   ├── short_controller.rs

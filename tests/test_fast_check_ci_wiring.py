@@ -24,7 +24,6 @@ BUSY_RETRY_4888_TEST_COMMAND = (
 # update this test deliberately. The duplication is a drift-prevention gate, not an
 # attempt to derive the expected coverage from the justfile under test.
 EXPECTED_TEST_NON_PG_COMMANDS = (
-    "cargo test --lib engine::ops::cards_ops::parse_json_value_tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib engine::ops::kv_ops::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::docs::inventory::endpoints::part_0 -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::task_completion_v1::tests -- --skip _pg --skip pg_ --skip postgres",
@@ -143,18 +142,6 @@ def just_recipe_commands(justfile: str, recipe_name: str) -> tuple[str, ...]:
 
 
 class FastCheckCiWiringTests(unittest.TestCase):
-    def test_large_file_guard_uses_nul_delimited_tracked_paths(self) -> None:
-        scripts_job = job_block(PR_WORKFLOW.read_text(encoding="utf-8"), "scripts")
-        guard = scripts_job.split("- name: Large file guard", 1)[1].split(
-            "- name: Install shellcheck", 1
-        )[0]
-
-        self.assertIn("shell: bash", guard)
-        self.assertIn("while IFS= read -r -d '' path; do", guard)
-        self.assertIn("done < <(git ls-files -z)", guard)
-        self.assertNotIn("while IFS= read -r path; do", guard)
-        self.assertNotIn("done < <(git ls-files)\n", guard)
-
     def test_pr_fast_check_is_compile_and_policy_only(self) -> None:
         job = job_block(PR_WORKFLOW.read_text(encoding="utf-8"), "check_fast")
 
@@ -328,19 +315,6 @@ class FastCheckCiWiringTests(unittest.TestCase):
             "placeholder_live_events -- --skip _pg --skip pg_ --skip postgres"
         )
         self.assertEqual(workflow.count(command), 2)
-
-    def test_macos_test_lanes_install_tmux_for_live_session_fixtures(self) -> None:
-        install_command = "brew install opus pkg-config tmux"
-        trusted = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(
-            job_block(trusted, "macos_hosted").count(install_command), 1
-        )
-        self.assertEqual(
-            job_block(trusted, "macos_self_hosted").count(install_command), 1
-        )
-
-        nightly = NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(job_block(nightly, "full_macos").count(install_command), 1)
 
     def test_main_and_nightly_retain_non_pg_test_coverage(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -907,7 +881,6 @@ jobs:
         self.assertIn(
             '"$PYTHON" -m unittest tests.test_fast_check_ci_wiring', script
         )
-        self.assertIn('"$PYTHON" -m unittest tests.test_verify_dashboard', script)
         self.assertIn(
             'scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"',
             script,

@@ -433,12 +433,19 @@ function createAgentdeskMock(options) {
         state.kv.delete(key);
       },
       deleteMany(keys) {
-        const copiedKeys = clone(keys || []);
-        state.kvDeleteManyCalls.push(copiedKeys);
-        for (const key of copiedKeys) {
-          state.kv.delete(key);
+        if (!Array.isArray(keys)) {
+          throw new TypeError("kv.deleteMany expects an array of keys");
         }
-        return { ok: true, deleted: copiedKeys.length };
+        if (keys.some((key) => typeof key !== "string")) {
+          throw new TypeError("kv.deleteMany expects every key to be a string");
+        }
+        const copiedKeys = clone(keys);
+        state.kvDeleteManyCalls.push(copiedKeys);
+        let deleted = 0;
+        for (const key of copiedKeys) {
+          if (state.kv.delete(key)) deleted += 1;
+        }
+        return { ok: true, deleted };
       }
     },
     autoQueue: {

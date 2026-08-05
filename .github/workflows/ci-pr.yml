@@ -69,7 +69,11 @@ jobs:
         with:
           filters: |
             dashboard:
+              - '.nvmrc'
               - 'dashboard/**'
+              - 'scripts/check-dashboard-install-state.mjs'
+              - 'scripts/check-dashboard-toolchain.sh'
+              - 'scripts/install-dashboard-dependencies.sh'
               - 'scripts/verify-dashboard.sh'
             high_risk_recovery:
               - '.github/workflows/**'
@@ -88,6 +92,7 @@ jobs:
               - 'src/server/routes/auto_queue.rs'
               - 'src/server/routes/dispatched_sessions.rs'
               - 'src/server/routes/dispatches/**'
+              - 'src/server/outbox_actionable_delivery.rs'
               - 'src/server/routes/message_outbox.rs'
               - 'src/server/routes/scheduled_messages.rs'
               - 'src/server/worker_registry.rs'
@@ -116,6 +121,7 @@ jobs:
               - 'src/kanban/**'
               - 'src/reconcile.rs'
               - 'src/server/routes/auto_queue.rs'
+              - 'src/server/routes/auto_queue_lifecycle_pg_tests.rs'
               - 'src/server/routes/dispatched_sessions.rs'
               - 'src/server/routes/dispatches/**'
               - 'src/server/routes/message_outbox.rs'
@@ -763,6 +769,21 @@ jobs:
           cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
           cargo test --lib services::discord::terminal_ui_obligation::tests -- --test-threads=1
 
+      # #5034: watchdog/operational alerts are notifications, not queued turns;
+      # run the sender-policy, attachment-delivery, catch-up, outbox-delivery,
+      # watchdog, and intake-boundary regressions in the same path-filtered
+      # required lane as the production change.
+      - name: Operational alert intake admission regressions
+        run: |
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::dispatch_policy::allowed_turn_sender_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::formatting::delivery::attachment_delivery_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::catch_up::classification_order_tests::catch_up_human_visible_marker_recovers_and_strips_but_bot_marker_is_rejected -- --exact --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_gate::gate::tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib server::outbox_actionable_delivery::tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::message_handler::watchdog::timeout_notice_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::message_outbox::dedupe_key_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_gate::live_intake_preserve_wiring_tests::one_admission_guard_precedes_all_soft_intervention_entrypoints -- --exact --test-threads=1
+
       # #5003: this production-path E2E previously ran only in main's broad
       # non-PG lane, so test-only fixes could merge without executing it on PRs.
       - name: Local model durable queue wake regression
@@ -890,6 +911,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # --verify-lib-inventory invokes `cargo test --lib -- --list`, so this
+      # required aggregate job must provision the same pinned toolchain and
+      # cache used by the other Rust lanes before running ci-script-checks.sh.
+      - name: Install Rust toolchain for lib inventory
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+
+      - name: Setup sccache for lib inventory
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache Cargo dependencies for lib inventory
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Python for script checks
         uses: actions/setup-python@v5
