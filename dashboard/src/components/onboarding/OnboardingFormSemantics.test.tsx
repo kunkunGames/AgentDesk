@@ -69,7 +69,7 @@ describe("onboarding form semantics", () => {
       "Notification bot token (optional)",
     ]);
     for (const input of tokenInputs) {
-      expect(input.getAttribute("autocomplete")).toBe("new-password");
+      expect(input.getAttribute("autocomplete")).toBe("off");
       expect(input.getAttribute("autocapitalize")).toBe("none");
       expect(input.getAttribute("autocorrect")).toBe("off");
       expect(input.getAttribute("spellcheck")).toBe("false");
