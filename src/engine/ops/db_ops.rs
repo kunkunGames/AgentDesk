@@ -590,7 +590,11 @@ fn previous_sql_word(sql: &str, before: usize) -> Option<&str> {
     }
 
     let mut start = end;
-    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'.') {
+    while start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || bytes[start - 1] == b'_'
+            || bytes[start - 1] == b'.')
+    {
         start -= 1;
     }
 
@@ -623,9 +627,7 @@ fn translate_sqlite_rowid(sql: &str) -> String {
                 }
                 if bytes[idx] == b'"' {
                     if let Some((raw, ident, next_idx)) = scan_double_quoted_identifier(sql, idx) {
-                        if ident.eq_ignore_ascii_case("rowid")
-                            && !is_identifier_alias(sql, idx)
-                        {
+                        if ident.eq_ignore_ascii_case("rowid") && !is_identifier_alias(sql, idx) {
                             result.push_str("ctid");
                         } else {
                             result.push_str(raw);
