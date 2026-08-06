@@ -513,8 +513,73 @@ fn scan_double_quoted_identifier(sql: &str, start: usize) -> Option<(&str, Strin
     None
 }
 
-fn is_quoted_identifier_alias(sql: &str, quote_start: usize) -> bool {
-    previous_sql_word(sql, quote_start).is_some_and(|word| word.eq_ignore_ascii_case("as"))
+fn is_identifier_alias(sql: &str, identifier_start: usize) -> bool {
+    let word = match previous_sql_word(sql, identifier_start) {
+        Some(w) => w,
+        None => return false,
+    };
+
+    if word.eq_ignore_ascii_case("as") {
+        return true;
+    }
+
+    if word.ends_with('.') {
+        return false;
+    }
+
+    let is_keyword = word.eq_ignore_ascii_case("select")
+        || word.eq_ignore_ascii_case("from")
+        || word.eq_ignore_ascii_case("where")
+        || word.eq_ignore_ascii_case("and")
+        || word.eq_ignore_ascii_case("or")
+        || word.eq_ignore_ascii_case("on")
+        || word.eq_ignore_ascii_case("set")
+        || word.eq_ignore_ascii_case("by")
+        || word.eq_ignore_ascii_case("having")
+        || word.eq_ignore_ascii_case("group")
+        || word.eq_ignore_ascii_case("order")
+        || word.eq_ignore_ascii_case("limit")
+        || word.eq_ignore_ascii_case("offset")
+        || word.eq_ignore_ascii_case("returning")
+        || word.eq_ignore_ascii_case("into")
+        || word.eq_ignore_ascii_case("values")
+        || word.eq_ignore_ascii_case("in")
+        || word.eq_ignore_ascii_case("not")
+        || word.eq_ignore_ascii_case("is")
+        || word.eq_ignore_ascii_case("null")
+        || word.eq_ignore_ascii_case("when")
+        || word.eq_ignore_ascii_case("then")
+        || word.eq_ignore_ascii_case("else")
+        || word.eq_ignore_ascii_case("end")
+        || word.eq_ignore_ascii_case("like")
+        || word.eq_ignore_ascii_case("ilike")
+        || word.eq_ignore_ascii_case("between")
+        || word.eq_ignore_ascii_case("asc")
+        || word.eq_ignore_ascii_case("desc")
+        || word.eq_ignore_ascii_case("outer")
+        || word.eq_ignore_ascii_case("inner")
+        || word.eq_ignore_ascii_case("join")
+        || word.eq_ignore_ascii_case("left")
+        || word.eq_ignore_ascii_case("right")
+        || word.eq_ignore_ascii_case("full")
+        || word.eq_ignore_ascii_case("cross")
+        || word.eq_ignore_ascii_case("natural")
+        || word.eq_ignore_ascii_case("using")
+        || word.eq_ignore_ascii_case("union")
+        || word.eq_ignore_ascii_case("intersect")
+        || word.eq_ignore_ascii_case("except")
+        || word.eq_ignore_ascii_case("exists")
+        || word.eq_ignore_ascii_case("any")
+        || word.eq_ignore_ascii_case("all")
+        || word.eq_ignore_ascii_case("some")
+        || word.eq_ignore_ascii_case("cast")
+        || word.eq_ignore_ascii_case("extract")
+        || word.eq_ignore_ascii_case("substring")
+        || word.eq_ignore_ascii_case("trim")
+        || word.eq_ignore_ascii_case("case")
+        || word.eq_ignore_ascii_case("distinct");
+
+    !is_keyword
 }
 
 fn previous_sql_word(sql: &str, before: usize) -> Option<&str> {
@@ -525,7 +590,7 @@ fn previous_sql_word(sql: &str, before: usize) -> Option<&str> {
     }
 
     let mut start = end;
-    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'.') {
         start -= 1;
     }
 
@@ -559,7 +624,7 @@ fn translate_sqlite_rowid(sql: &str) -> String {
                 if bytes[idx] == b'"' {
                     if let Some((raw, ident, next_idx)) = scan_double_quoted_identifier(sql, idx) {
                         if ident.eq_ignore_ascii_case("rowid")
-                            && !is_quoted_identifier_alias(sql, idx)
+                            && !is_identifier_alias(sql, idx)
                         {
                             result.push_str("ctid");
                         } else {
@@ -603,7 +668,7 @@ fn translate_sqlite_rowid(sql: &str) -> String {
 
                     let token = &sql[start..idx];
                     if token.eq_ignore_ascii_case("rowid") {
-                        if !is_quoted_identifier_alias(sql, start) {
+                        if !is_identifier_alias(sql, start) {
                             result.push_str("ctid");
                         } else {
                             result.push_str(token);
@@ -1505,7 +1570,7 @@ mod tests {
 
     #[test]
     fn test_translate_sqlite_rowid_aliases() {
-        // Unquoted aliases
+        // Unquoted aliases with AS
         assert_eq!(
             translate_sqlite_rowid("SELECT rowid AS rowid FROM t"),
             "SELECT ctid AS rowid FROM t"
@@ -1519,10 +1584,28 @@ mod tests {
             "SELECT t.ctid AS rowid FROM t"
         );
 
+        // Unquoted aliases without AS
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid rowid FROM t"),
+            "SELECT ctid rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT t.rowid rowid FROM t"),
+            "SELECT t.ctid rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT a rowid FROM t"),
+            "SELECT a rowid FROM t"
+        );
+
         // Quoted aliases
         assert_eq!(
             translate_sqlite_rowid("SELECT rowid AS \"rowid\" FROM t"),
             "SELECT ctid AS \"rowid\" FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT rowid \"rowid\" FROM t"),
+            "SELECT ctid \"rowid\" FROM t"
         );
 
         // No aliases
@@ -1533,6 +1616,10 @@ mod tests {
         assert_eq!(
             translate_sqlite_rowid("SELECT rowid, my_rowid FROM t"),
             "SELECT ctid, my_rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT a, rowid FROM t"),
+            "SELECT a, ctid FROM t"
         );
     }
 
