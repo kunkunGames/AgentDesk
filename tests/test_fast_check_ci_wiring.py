@@ -36,6 +36,10 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres",
     (
+        "cargo test --lib services::discord::recovery_known_ids::recovery_known_message_ids_tests"
+        " -- --skip _pg --skip pg_ --skip postgres"
+    ),
+    (
         "cargo test --lib services::discord::tmux::placeholder_suppression::evidence::tests"
         " -- --skip _pg --skip pg_ --skip postgres"
     ),
@@ -53,7 +57,10 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib attachment -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib mailbox_reaction_tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::zombie_foreground_release::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_marker::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::placeholder_controller::queued_card_gate::tests"
+    " -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib queue_status_presentation::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib status_panel_singleton_store -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib busy_followup_retry_store -- --skip _pg --skip pg_ --skip postgres",
@@ -78,6 +85,7 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_finalizer::cleanup::tests::late_already_finalized_cleanup_releases_mailbox_and_rearms_once_4906 -- --exact --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_finalizer::cleanup::tests::mailbox_release_backstop_coalesces_duplicate_arms_and_eventually_fires_4906 -- --exact --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::placeholder_reclaim::redrive_reclaim_e2e_tests::live_tmux_redrive_reclaim_cycle_terminates_4299 -- --exact --test-threads=1",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::terminal_relay_plan::soft_terminal_direct_send_authority_tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests -- --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres",

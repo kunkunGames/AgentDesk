@@ -617,6 +617,10 @@ src/
 │   │   │   ├── source_registry.rs
 │   │   │   ├── transport.rs
 │   │   │   └── turn_output_controller.rs
+│   │   ├── placeholder_controller/
+│   │   │   ├── queued_card_gate/
+│   │   │   │   └── tests.rs
+│   │   │   └── queued_card_gate.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── status_panel/
 │   │   │   │   ├── completed_kind.rs
@@ -716,6 +720,7 @@ src/
 │   │   │   │   │   ├── race_loss/
 │   │   │   │   │   │   ├── mailbox_reaction.rs
 │   │   │   │   │   │   ├── mailbox_reaction_tests.rs
+│   │   │   │   │   │   ├── queued_intake_cause.rs
 │   │   │   │   │   │   └── requeue_tests.rs
 │   │   │   │   │   ├── adk_thread.rs
 │   │   │   │   │   ├── claim_bootstrap.rs
@@ -775,7 +780,8 @@ src/
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
 │   │   │   ├── journal/
-│   │   │   │   └── pg_store.rs
+│   │   │   │   ├── pg_store.rs
+│   │   │   │   └── watcher.rs
 │   │   │   ├── delivery_commit.rs
 │   │   │   ├── delivery_frontier.rs
 │   │   │   ├── delivery_orchestration_tests.rs
@@ -827,6 +833,8 @@ src/
 │   │   ├── tmux_watcher/
 │   │   │   ├── streaming_status_tick/
 │   │   │   │   └── types.rs
+│   │   │   ├── turn_identity/
+│   │   │   │   └── soft_terminal_authority.rs
 │   │   │   ├── commit_decisions.rs
 │   │   │   ├── committed_placeholder_cleanup.rs
 │   │   │   ├── completion_gate.rs
@@ -868,6 +876,7 @@ src/
 │   │   │   ├── terminal_readiness.rs
 │   │   │   ├── terminal_readiness_tests.rs
 │   │   │   ├── terminal_relay_plan.rs
+│   │   │   ├── terminal_relay_plan_tests.rs
 │   │   │   ├── terminal_send.rs
 │   │   │   ├── terminal_token_update.rs
 │   │   │   ├── tests.rs
@@ -1118,6 +1127,7 @@ src/
 │   │   ├── reaction_lifecycle.rs
 │   │   ├── readopted_mailbox_ledger.rs
 │   │   ├── recovery_engine.rs
+│   │   ├── recovery_known_ids.rs
 │   │   ├── relay_coord.rs
 │   │   ├── relay_coord_tests.rs
 │   │   ├── relay_health.rs
@@ -1193,7 +1203,8 @@ src/
 │   │   ├── voice_id_sequences.rs
 │   │   ├── voice_lifecycle.rs
 │   │   ├── voice_routing.rs
-│   │   └── voice_sensitivity.rs
+│   │   ├── voice_sensitivity.rs
+│   │   └── zombie_foreground_release.rs
 │   ├── dispatched_sessions/
 │   │   └── canonical_identity.rs
 │   ├── dispatches/
@@ -1234,7 +1245,6 @@ src/
 │   ├── memory/
 │   │   ├── local.rs
 │   │   ├── memento.rs
-│   │   ├── memento_instructions_cache.rs
 │   │   ├── memento_throttle.rs
 │   │   ├── mod.rs
 │   │   └── runtime_state.rs
@@ -1556,6 +1566,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/services/discord/session_runtime.rs` | Session bootstrap, path/worktree resolution, per-channel session state. |
 | `src/services/discord/tmux.rs` / `tmux_reaper.rs` | tmux watcher lifecycle, stale session cleanup, reaping. |
 | `src/services/discord/recovery_engine.rs` | Restart-time inflight turn recovery. |
+| `src/services/discord/placeholder_controller/queued_card_gate.rs` | #5035: sole enforcement point for destroying a channel's queued `📬` card. Evaluates contract G (G1 ∧ G2) under the channel persist lock over the whole mailbox queue and hands out a `QueuedCardTeardown` token no other module can construct. |
 | `src/services/discord/gateway.rs` / `discord_io.rs` / `queue_io.rs` | Discord gateway bridge and outbound/inbound message plumbing. |
 | `src/services/discord/commands/` | Slash command handlers for session, config, diagnostics, meetings, models, receipts, skills. |
 | `src/services/discord/agentdesk_config.rs` / `config_audit.rs` | YAML/DB/legacy config source-of-truth handling and audits. |

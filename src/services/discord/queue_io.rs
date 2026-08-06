@@ -33,7 +33,7 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
-type IdleQueueKickHookForTests = std::sync::Arc<
+pub(in crate::services::discord) type IdleQueueKickHookForTests = std::sync::Arc<
     dyn Fn(
             Arc<SharedData>,
             ProviderKind,
@@ -50,7 +50,7 @@ static IDLE_QUEUE_KICK_HOOK_FOR_TESTS: std::sync::Mutex<Option<IdleQueueKickHook
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-struct IdleQueueKickHookResetForTests;
+pub(in crate::services::discord) struct IdleQueueKickHookResetForTests;
 
 #[cfg(test)]
 impl Drop for IdleQueueKickHookResetForTests {
@@ -62,7 +62,7 @@ impl Drop for IdleQueueKickHookResetForTests {
 }
 
 #[cfg(test)]
-fn set_idle_queue_kick_hook_for_tests(
+pub(in crate::services::discord) fn set_idle_queue_kick_hook_for_tests(
     hook: IdleQueueKickHookForTests,
 ) -> IdleQueueKickHookResetForTests {
     *IDLE_QUEUE_KICK_HOOK_FOR_TESTS
@@ -140,12 +140,38 @@ pub(super) fn schedule_race_loss_requeue_post_enqueue_idle_recheck(
 ) {
     super::task_supervisor::spawn_observed("race_loss_requeue_idle_recheck", async move {
         // A race-loss recheck is an edge-trigger, not competing transition
-        // authority. Waiting here coalesces the one recheck behind the current
-        // transition instead of dequeue/requeue spinning while it is held.
-        let transition_guard = shared
-            .session_transition_lock(channel_id)
-            .lock_owned()
+        // authority — so it must not park in the transition lock's waiter queue.
+        //
+        // #5170 B: `tokio::sync::Mutex` hands a released permit straight to the
+        // head of its waiter queue and only returns it to the free-permit
+        // counter once that queue is empty, while `try_lock_owned()` consults
+        // the free-permit counter alone. One blocking waiter parked here
+        // therefore makes every non-blocking acquirer fail for as long as this
+        // task waits — including intake
+        // (`turn_start::try_intake_runtime_transition_after_redirect`) and the
+        // kickoff dequeue gate (`idle_queue_take_next_soft_if_ready`). #4794's
+        // `lock_owned().await` was meant to coalesce this recheck behind the
+        // live transition; instead it starved the very kickoff it was about to
+        // perform, and each starved intake requeued and spawned another waiter
+        // here. Not owning the transition means not owning an edge: defer to
+        // the slow fail-open backstop, the same treatment the finalize epilogue
+        // transition fence already gives a transition-owned channel.
+        let Ok(transition_guard) = shared.session_transition_lock(channel_id).try_lock_owned()
+        else {
+            tracing::debug!(
+                provider = provider.as_str(),
+                channel_id = channel_id.get(),
+                "Deferred drain: session transition owns channel; race-loss requeue recheck defers to the slow backstop"
+            );
+            arm_slow_idle_queue_backstop_if_queue_nonempty(
+                &shared,
+                &provider,
+                channel_id,
+                "race_loss_requeue_transition_busy",
+            )
             .await;
+            return;
+        };
 
         let snapshot = super::mailbox_snapshot(&shared, channel_id).await;
         if !race_loss_requeue_snapshot_has_idle_kickable_backlog(
@@ -1122,14 +1148,17 @@ mod presleep_tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn capped_retry_is_parked_while_unrelated_backlog_progresses_and_backstop_disarms_4893() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let tmp = tempfile::tempdir().expect("temp runtime root");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        // #5181: this test reads and writes `busy_followup_retry_store`, whose
+        // root is re-resolved from the process-global `AGENTDESK_ROOT_DIR` on
+        // EVERY call. Releasing the shared test env lock right after
+        // `make_shared_data_for_tests()` (as this test used to) left the rest of
+        // the body racing any sibling that repoints that variable at its own
+        // tempdir: the capped-retry records then become invisible, capped A is
+        // selected instead of parked, and this test fails ONLY under parallel
+        // execution. Hold the lock for the whole body via
+        // `scoped_runtime_root()`, like every other test in this module.
+        let _root = scoped_runtime_root();
         let shared = make_shared_data_for_tests();
-        drop(_lock);
 
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(4_893_310);
@@ -1865,8 +1894,16 @@ mod presleep_tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn race_loss_recheck_waits_for_transition_before_kickoff_4794() {
+    /// #4794 fenced the recheck's kickoff behind the session transition; #5170
+    /// keeps that fence but replaces the blocking wait that implemented it. The
+    /// two properties #4794 actually protected — no kickoff seam while the
+    /// transition is held, and an untouched queue head — are asserted below
+    /// verbatim. What changes is the mechanism (`try_lock_owned` + slow
+    /// backstop instead of `lock_owned().await`) and therefore the release
+    /// behaviour: the recheck no longer parks a waiter that would intercept the
+    /// released permit ahead of every `try_lock_owned()` acquirer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn race_loss_recheck_fences_on_transition_without_parking_a_waiter_5170() {
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::set_agentdesk_root_for_test(tmp.path());
 
@@ -1898,7 +1935,7 @@ mod presleep_tests {
                     if channel != channel_id {
                         return None;
                     }
-                    assert_eq!(reason, "race_loss_requeue_idle_recheck");
+                    assert_eq!(reason, "race_loss_requeue_transition_busy");
                     hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let taken = super::super::mailbox_take_next_automatic_intervention(
                         &shared, &provider, channel,
@@ -1929,15 +1966,56 @@ mod presleep_tests {
                 .first()
                 .map(|item| item.message_id),
             Some(queued_msg),
-            "waiting recheck must leave the queued head untouched"
+            "fenced recheck must leave the queued head untouched"
+        );
+        // #5170: the recheck must not have parked a blocking waiter. Releasing
+        // a `tokio::sync::Mutex` assigns the permit to the head of the waiter
+        // queue inside `drop` itself, and returns it to the free-permit counter
+        // only when that queue is empty — so this `try_lock_owned()`, taken
+        // before any scheduling point, observes the handoff deterministically.
+        // It is the exact acquisition shape intake and the kickoff dequeue gate
+        // both use.
+        drop(transition_guard);
+        let reacquired = shared.session_transition_lock(channel_id).try_lock_owned();
+        assert!(
+            reacquired.is_ok(),
+            "a released transition must be reacquirable by a non-blocking acquirer; a parked recheck waiter would have intercepted the permit"
+        );
+        drop(reacquired);
+
+        yield_backstop_tasks().await;
+        assert_eq!(
+            kick_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the fenced recheck owns no edge and must not resume a kickoff on release"
+        );
+        // Over-suppression guard: declining the transition must hand the
+        // channel to the slow fail-open net, not drop it.
+        assert!(
+            shared
+                .restart
+                .deferred_hook_channels
+                .contains_key(&channel_id),
+            "a transition-fenced recheck must arm the slow backstop so the backlog still has an owner"
         );
 
-        drop(transition_guard);
+        // The slow backstop is the only owner left, and it does drain.
+        tokio::time::advance(
+            DEFERRED_IDLE_QUEUE_BACKSTOP_DELAY + std::time::Duration::from_secs(1),
+        )
+        .await;
         yield_backstop_tasks().await;
         assert_eq!(
             kick_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "exactly one coalesced recheck runs after transition release"
+            "the slow backstop must drain the backlog the fenced recheck declined"
+        );
+        assert!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .intervention_queue
+                .is_empty(),
+            "the backstop kick must consume the queued head"
         );
     }
 
@@ -2287,11 +2365,18 @@ mod presleep_tests {
     }
 
     /// #4270 pin — sustained-busy convergence over the PRODUCTION defer
-    /// sequence (`take_next_soft` promote → `mailbox_requeue_intervention_front`
-    /// + slow-backstop arm, exactly what the `dispatch_queued_turn` promote gate
-    /// runs): repeated cycles converge to a SINGLE queue entry and a SINGLE
-    /// coalesced slow backstop (no accumulation / oscillation), and never fire a
-    /// fast kick.
+    /// sequence (`take_next_soft` promote → `mailbox_restore_dequeued_head`
+    /// with the promote's own dispatch lease + slow-backstop arm, exactly what
+    /// the `dispatch_queued_turn` promote gate runs — see
+    /// `router::intake_dispatch::queued`'s deferred-admission arm): repeated
+    /// cycles converge to a SINGLE queue entry and a SINGLE coalesced slow
+    /// backstop (no accumulation / oscillation), and never fire a fast kick.
+    ///
+    /// #5181/#4797 note: the front-restore is lease-AUTHORIZED. Since #4811 the
+    /// lease-less `mailbox_requeue_intervention_front` is refused with
+    /// `SourceIdPendingOrActive` once the promote has reserved
+    /// `pending_user_dispatch`, so threading the promote's lease through is what
+    /// makes the defer preserve the follow-up instead of dropping it.
     #[tokio::test(flavor = "current_thread")]
     async fn promote_defer_requeue_converges_no_oscillation_across_cycles_4270() {
         let _root = scoped_runtime_root();
@@ -2331,7 +2416,23 @@ mod presleep_tests {
             let intervention = taken
                 .intervention
                 .unwrap_or_else(|| panic!("cycle {cycle}: the follow-up must still be promotable"));
-            mailbox_requeue_intervention_front(&shared, &provider, channel_id, intervention).await;
+            let dispatch_lease = taken.dispatch_lease.unwrap_or_else(|| {
+                panic!("cycle {cycle}: the soft promote must hand back its dispatch lease")
+            });
+            let restored = mailbox_restore_dequeued_head(
+                &shared,
+                &provider,
+                channel_id,
+                intervention,
+                dispatch_lease,
+            )
+            .await;
+            assert!(
+                restored.enqueued,
+                "cycle {cycle}: the lease-authorized dequeued-head restore must preserve the \
+                 follow-up (refusal={:?})",
+                restored.refusal_reason
+            );
             arm_slow_idle_queue_backstop_if_queue_nonempty(
                 &shared,
                 &provider,
@@ -2484,7 +2585,23 @@ mod presleep_tests {
             .take_next_soft(queue_persistence_context(&shared, &provider, channel_id))
             .await;
         let intervention = taken.intervention.expect("promote once");
-        mailbox_requeue_intervention_front(&shared, &provider, channel_id, intervention).await;
+        let dispatch_lease = taken
+            .dispatch_lease
+            .expect("the soft promote must hand back its dispatch lease");
+        let restored = mailbox_restore_dequeued_head(
+            &shared,
+            &provider,
+            channel_id,
+            intervention,
+            dispatch_lease,
+        )
+        .await;
+        assert!(
+            restored.enqueued,
+            "the promote gate's lease-authorized restore must re-preserve the follow-up \
+             (refusal={:?})",
+            restored.refusal_reason
+        );
 
         // Watcher-idle drain: the TUI reached Idle, so the drain soft-takes and
         // claims. It must start exactly once and leave the queue empty.

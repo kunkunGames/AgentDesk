@@ -1,5 +1,45 @@
 # Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436 / #1457)
 
+> Last refreshed: 2026-08-06 (#5071 T1 S3b — the five **no-transport** watcher
+> frontier advances now record themselves. Silent-turn suppression, cancel-tombstone
+> suppression, fresh ready-for-input idle, post-terminal-without-inflight suppression
+> and the dead-tmux tail drain each advance the frontier with no POST, no attempt and
+> no receipt, so each emits `O`+`S` only and is never counted as Delivered. The
+> post-terminal arm re-enters with the same range on every poll pass, so its
+> observation shares the one-shot range test that already keeps its warning from
+> repeating. The non-lease committed-path advance in `tmux_watcher.rs` is deliberately
+> NOT one of these — its session-bound-delegation case really POSTed and the sink
+> family already journals it; a comment there records why. No delivery behaviour
+> changes, so the coverage rows below are unchanged.)
+
+> Last refreshed: 2026-08-06 (#5071 T1 S3a — the **watcher terminal family** joined the
+> shadow journal. The watcher's own leased direct send opens an obligation before
+> transport and settles it from the guarded delivery result, so only a `Persisted`
+> durable record yields `T`+`C` while a proof-less advance settles as `Unknown`. The
+> placeholderless fresh-send arm gained
+> `send_long_message_raw_with_reference_rollback_returning_receipts`, and the cutover
+> deferred-replace receipt variant gained its first production consumer, so those arms
+> carry Discord's returned channel. The controller/gateway long-chunk path still reports
+> message ids only, so it yields no receipt and the journal leaves that obligation open
+> rather than synthesising one. `JournalObserver` moved from a sink field to one
+> process-wide instance so both families serialise onto a single actor. No v3 producer or
+> direct-send callsite is added and no delivery behaviour changes, so the coverage rows
+> below are unchanged.)
+
+> Last refreshed: 2026-08-06 (#5071 T1 S2 — the raw `formatting` transports gained
+> receipt-preserving parallel entry points
+> (`send_long_message_raw_with_rollback_returning_receipts`,
+> `replace_long_message_raw_{deferred,with_outcome}_returning_receipt`). Two of the
+> four sink-direct receipt kinds — **long-chunk and edit** — now carry the channel
+> Discord answered with rather than the channel that was requested, so the
+> journal's `channel_mismatch` classification stays reachable on those paths. The
+> other two — **referenced and split** — are unchanged: that work is D1, deferred
+> to S6 with contract C7, so `formatting/delivery.rs` is byte-identical to its
+> pre-slice state and the multi-chunk arm of `task_notification_context.rs` still
+> returns no receipt. The legacy names and return types are unchanged thin
+> wrappers, and no v3 producer or direct-send callsite is added, so the coverage
+> rows below are unchanged).
+
 > Last refreshed: 2026-08-04 (#5071 T1 S1 r2 — `DiscordTransportReceipt` preserves requested/returned channel IDs and message ID for the shadow journal; outbound delivery callsite coverage remains unchanged).
 
 > Last refreshed: 2026-07-24 (#4508 review follow-up — watcher anchored short-replace now uses an edit-only deferred transport boundary in both controller and retained legacy paths. On edit failure, the range owner keeps the same delivery lease and suppresses fallback POST only after a locked, stable pre-edit-path/generation + EOF-bounded durable-frontier recheck; any rotate, marker, metadata, or frontier uncertainty remains fail-open. Already-committed reconciliation reuses delivered-anchor-aware guarded placeholder cleanup and drops local/orphan tracking only after cleanup commits. This changes A4 replacement authority and lifecycle parity, but adds no v3 producer or direct-send callsite; the coverage rows below are unchanged).

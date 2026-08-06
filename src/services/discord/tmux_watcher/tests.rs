@@ -2939,7 +2939,7 @@ fn placeholderless_rollback_sender_cleans_prefix_before_rewind_4154() {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .push((id, content.to_string()));
-                    Some(Ok(id))
+                    Some(Ok((seen_channel, id)))
                 },
             ),
             Box::new(move |seen_channel, message_id| {
@@ -5649,8 +5649,12 @@ mod watcher_short_replace_controller {
 }
 
 // #3089 A0 — characterization of the watcher terminal-fallback
-// should-send-new-chunks predicate (design §5 A0 item 1). Its gate is
-// `session_bound_fallback_uses_full_body && text.len() > DISCORD_MSG_LIMIT`.
+// should-send-new-chunks predicate (design §5 A0 item 1). Its gate is now
+// `session_bound_fallback_uses_full_body && needs_multiple_messages(text)`,
+// i.e. a CHARACTER count — it read `text.len() > DISCORD_MSG_LIMIT` (UTF-8
+// BYTES) until the byte/character fix, which tripped Korean bodies at ~667
+// characters. The assertions below still use an ASCII fixture, where the two
+// agree.
 // (The #2757 watcher edit-fail delete policy — the other watcher A0 datum —
 // is already pinned above by
 // `fallback_edit_failure_never_deletes_original_without_placeholder_probe`;

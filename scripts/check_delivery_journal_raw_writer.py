@@ -26,12 +26,49 @@ FAMILY_REGISTRY = (
     ("pipe stream epoch", "src/services/discord/tmux_watcher/turn_stream_collector.rs", "collect_turn_stream_until_terminal"),
 )
 # Cheap lexical text match, not Rust parsing: each complete anchor file, including
-# tests, is scanned with only the suffix after // on that line removed.
+# tests, is scanned with only the suffix after // on that line removed. The scan
+# deliberately stays file-wide: lexical brace balancing cannot honestly bound a
+# Rust fn body when strings and macros may contain braces.
 # Strings, block comments (/* */ and /** */), raw strings, macros, and test-area
 # text count; line comments (including /// and //! doc comments) do not. The
 # result is a monotonic baseline signal, not proof of instrumentation.
-JOURNAL_FACADE_CALL = re.compile(r"\bself\.journal\.(?:begin_fresh|finish_fresh)\s*\(")
-UNINSTRUMENTED_FAMILY_BASELINE = 5
+#
+# #5071 T1 S2 extension of that declaration. `uninstrumented families: 4/6`
+# means "four anchor files contain no facade token". It does NOT mean:
+#   - that the two matched families instrument any delivery at runtime — one
+#     token anywhere in the file, including inside `#[cfg(test)] mod tests` or
+#     a string literal, flips a family to instrumented;
+#   - that the call sits on a reachable branch, is reached once, or is reached
+#     at all;
+#   - that a finish/settle exists for every begin. Deleting one of the sink's
+#     three `journal::settle(..)` call sites still leaves THIS gate green, and
+#     no RUNTIME test dies either: `begin_fresh` returns None without PG +
+#     Shadow, so there is nothing to observe. CI does still catch that one
+#     edit, but only through a source-contract text count -- see
+#     `test_source_contract_sink_direct_success_arms_settle_each_terminal_arm`
+#     in tests/test_delivery_journal_raw_writer.py, run by
+#     scripts/ci-script-checks.sh. A settle that is genuinely lost (moved out
+#     of the anchor file, or dropped in a way the count still accepts)
+#     self-reports later, as an `Unknown` classification in shadow data.
+# What the gate does buy is monotonicity: a family cannot silently regress to
+# uninstrumented. Whether the instrumentation is CORRECT is proven only by the
+# Rust runtime tests T1-T8 and their mutations M1-M7 (see the SOURCE-CONTRACT
+# block in tests/test_delivery_journal_raw_writer.py for the index).
+#
+# #5071 T1 S3a extension. The watcher terminal family cannot spell the sink's
+# facade: `tmux_output_watcher_with_restore` is a free function with no `self`,
+# so it reaches the journal through the `journal::watcher` facade instead. The
+# pattern below is therefore an alternation of two EXACT call shapes, not a
+# loosened one — each alternative names its own module path and function, and
+# neither matches a bare `journal`, a bare `watcher`, or an arbitrary method.
+# Everything the S2 block says about what a match does NOT prove applies
+# unchanged to the new alternative: one token anywhere in the anchor file,
+# including a string literal or a test module, flips the family.
+JOURNAL_FACADE_CALL = re.compile(
+    r"\bself\.journal\.(?:begin_fresh|finish_fresh)\s*\("
+    r"|\bjournal_watcher::(?:begin_watcher_terminal|settle_watcher_terminal|settle_without_transport)\s*\("
+)
+UNINSTRUMENTED_FAMILY_BASELINE = 3
 
 
 def call_sites(root: Path) -> tuple[Counter[str], int]:
@@ -74,7 +111,7 @@ def check(root: Path) -> tuple[bool, str]:
     if found != ALLOWLIST:
         return False, f"raw writer allowlist mismatch: expected={dict(ALLOWLIST)} actual={dict(found)} (scanned Rust files: {scanned_files})"
     uninstrumented = [name for name, instrumented in families if not instrumented]
-    summary = f"uninstrumented families: {len(uninstrumented)}/{len(families)} (lexical baseline signal; whole anchor file; only // suffix excluded; not proof; {', '.join(uninstrumented) or 'none'})"
+    summary = f"uninstrumented families: {len(uninstrumented)}/{len(families)} (lexical baseline signal; whole anchor file including tests; only // suffix excluded; not proof; {', '.join(uninstrumented) or 'none'})"
     if len(uninstrumented) > UNINSTRUMENTED_FAMILY_BASELINE:
         return False, f"{summary}; exceeds baseline {UNINSTRUMENTED_FAMILY_BASELINE}: {', '.join(uninstrumented)}"
     if len(uninstrumented) < UNINSTRUMENTED_FAMILY_BASELINE:

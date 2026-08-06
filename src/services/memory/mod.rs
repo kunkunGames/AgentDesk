@@ -1,6 +1,5 @@
 mod local;
 mod memento;
-mod memento_instructions_cache;
 mod memento_throttle;
 mod runtime_state;
 
@@ -20,17 +19,9 @@ pub(crate) use memento::{
     MementoBackend, MementoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agent_id,
     resolve_memento_workspace, sanitize_memento_workspace_segment,
 };
-pub(crate) use memento_instructions_cache::{
-    InstructionsDelta, instructions_cache_stats, record_instructions,
-};
 pub(crate) use memento_throttle::{
-    ForgetRatioAlarmDecision, RecallSizeBucket, memento_call_metrics_snapshot,
-    note_memento_forget_call, note_memento_recall_call, note_memento_tool_feedback_trigger,
-    note_recall_context_size,
+    memento_call_metrics_snapshot, note_memento_tool_feedback_trigger,
 };
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use memento_throttle::{ForgetRatioSnapshot, observe_memento_forget_recall};
 pub(crate) use runtime_state::{backend_is_active, backend_state, refresh_backend_health};
 
 pub(crate) const UNBOUND_MEMORY_ROLE_ID: &str = "__unbound_role__";
@@ -55,21 +46,12 @@ impl TokenUsage {
 }
 
 /// Controls how much memento payload the backend should fetch and emit.
-///
-/// #1083: Memento recall throttling — by default a turn no longer auto-injects
-/// the full memento `context` payload. The first turn of a fresh session
-/// requests `IdentityOnly` (lightweight identity + working session) while
-/// trigger-based turns request `Full`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RecallMode {
     /// Full memento context payload — identity, working memory, ranked
-    /// memories, anchors, etc. Reserved for trigger-driven turns.
+    /// memories, anchors, etc.
     #[default]
     Full,
-    /// Lightweight identity-only payload. Used on default session-start turns
-    /// so the model still knows who it is talking to without paying the full
-    /// context cost.
-    IdentityOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -157,14 +139,6 @@ pub(crate) trait MemoryBackend: Send + Sync {
             }
         })
     }
-}
-
-pub(crate) fn build_memory_backend(
-    role_binding: Option<&RoleBinding>,
-) -> (ResolvedMemorySettings, Box<dyn MemoryBackend + Send + Sync>) {
-    let settings = crate::services::discord::settings::memory_settings_for_binding(role_binding);
-    let backend = build_resolved_memory_backend(&settings);
-    (settings, backend)
 }
 
 pub(crate) fn build_resolved_memory_backend(

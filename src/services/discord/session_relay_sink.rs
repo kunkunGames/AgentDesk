@@ -41,7 +41,7 @@ mod delivery_commit;
 mod delivery_frontier;
 mod delivery_outcome_classify;
 mod idle_jsonl;
-mod journal;
+pub(in crate::services::discord) mod journal;
 mod short_controller;
 // #3960: orphaned `SessionBoundRelay` TUI-direct reclaim (producer-liveness TOCTOU).
 mod orphan_reclaim;
@@ -403,7 +403,7 @@ struct SinkPostHeartbeatGuard {
 impl toc::PostHeartbeatGuard for SinkPostHeartbeatGuard {}
 
 fn session_bound_should_send_new_chunks_for_placeholder(response_text: &str) -> bool {
-    response_text.len() > super::DISCORD_MSG_LIMIT
+    super::formatting::needs_multiple_messages(response_text)
 }
 
 /// Pick the one ordered coordinate used by every terminal sink path. Strict
@@ -512,7 +512,9 @@ pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
     frames_total: AtomicU64,
     delivered_total: AtomicU64,
     by_session: Mutex<HashMap<String, SessionRelayParser>>,
-    journal: journal::JournalObserver,
+    // #5071 T1 S3a: borrowed from the process-wide observer rather than owned, so
+    // the sink direct family and the watcher family serialise onto one actor.
+    journal: &'static journal::JournalObserver,
     #[cfg(test)]
     lease_test_probe: Option<Arc<SinkLeaseTestProbe>>,
     #[cfg(test)]
@@ -532,7 +534,7 @@ impl SessionBoundDiscordRelaySink {
             frames_total: AtomicU64::new(0),
             delivered_total: AtomicU64::new(0),
             by_session: Mutex::new(HashMap::new()),
-            journal: journal::JournalObserver::default(),
+            journal: journal::process_observer(),
             #[cfg(test)]
             lease_test_probe: None,
             #[cfg(test)]
@@ -971,23 +973,23 @@ impl SessionBoundDiscordRelaySink {
                 )
                 .await;
             }
-            if session_bound_should_send_new_chunks_for_placeholder(&relay_text) {
-                let message_ids = if let Some(gateway) = gateway {
-                    gateway
-                        .send_long_message_with_rollback(channel, msg_id, &relay_text)
-                        .await
-                        .map_err(RelaySinkError::Transient)?
+            let mut direct_journal_attempt =
+                if journal::journals_sink_direct(&route, cutover_short_replace) {
+                    self.journal.begin_fresh(&shared, &delivery)
                 } else {
-                    formatting::send_long_message_raw_with_rollback(
+                    None
+                };
+            if session_bound_should_send_new_chunks_for_placeholder(&relay_text) {
+                let (message_ids, chunk_anchor_receipt) =
+                    journal::send_long_chunks_with_anchor_receipt(
+                        gateway,
                         &http,
                         channel,
                         msg_id,
                         &relay_text,
                         &shared,
                     )
-                    .await
-                    .map_err(|error| RelaySinkError::Transient(error.to_string()))?
-                };
+                    .await?;
                 if let Some(gateway) = gateway {
                     let _ = gateway.delete_message(channel, msg_id).await;
                 } else {
@@ -1028,24 +1030,32 @@ impl SessionBoundDiscordRelaySink {
                     sink_lease_guard.as_ref(),
                     "src/services/discord/session_relay_sink.rs:sink_long_chunks_advance",
                 );
+                journal::settle(
+                    self.journal,
+                    &mut direct_journal_attempt,
+                    chunk_anchor_receipt,
+                    proof,
+                );
                 return Ok(SessionRelayDeliveryOutcome::from_proof(proof));
             }
             #[cfg(test)]
             let mut last_chunk_anchor = self.test_replace_anchor.clone();
             #[cfg(not(test))]
             let mut last_chunk_anchor = None;
+            let mut edit_anchor_receipt = None;
             let replace_outcome = if let Some(gateway) = gateway {
                 gateway
                     .replace_message_with_outcome(channel, msg_id, &relay_text)
                     .await
             } else {
-                formatting::replace_long_message_raw_with_outcome(
+                formatting::replace_long_message_raw_with_outcome_returning_receipt(
                     &http,
                     channel,
                     msg_id,
                     &relay_text,
                     &shared,
                     &mut last_chunk_anchor,
+                    &mut edit_anchor_receipt,
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -1093,6 +1103,12 @@ impl SessionBoundDiscordRelaySink {
                         sink_lease_guard.as_ref(),
                         "src/services/discord/session_relay_sink.rs:sink_legacy_short_edit_advance",
                     );
+                    journal::settle(
+                        self.journal,
+                        &mut direct_journal_attempt,
+                        edit_anchor_receipt.take(),
+                        proof,
+                    );
                     Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
@@ -1139,6 +1155,12 @@ impl SessionBoundDiscordRelaySink {
                         &raw_response_text,
                         sink_lease_guard.as_ref(),
                         "src/services/discord/session_relay_sink.rs:sink_legacy_short_fallback_advance",
+                    );
+                    journal::settle(
+                        self.journal,
+                        &mut direct_journal_attempt,
+                        edit_anchor_receipt.take(),
+                        proof,
                     );
                     Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }
@@ -1783,6 +1805,21 @@ mod tests {
         assert!(session_bound_should_send_new_chunks_for_placeholder(&body));
         assert!(!session_bound_should_send_new_chunks_for_placeholder(
             "[E2E:E15:BEGIN]\nE15-LINE-150\n[E2E:E15:END]"
+        ));
+    }
+
+    /// Twin of the standby-relay guard: a Korean answer that fits in one
+    /// Discord message must not be routed down the multi-chunk path just
+    /// because its UTF-8 byte length exceeds the character limit.
+    #[test]
+    fn korean_answer_under_the_character_limit_stays_one_message() {
+        let body = "한".repeat(900);
+        assert!(body.len() > super::super::DISCORD_MSG_LIMIT);
+        assert!(!session_bound_should_send_new_chunks_for_placeholder(&body));
+
+        let overflowing = "한".repeat(2100);
+        assert!(session_bound_should_send_new_chunks_for_placeholder(
+            &overflowing
         ));
     }
 

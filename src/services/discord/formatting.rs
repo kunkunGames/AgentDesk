@@ -41,8 +41,11 @@ pub(in crate::services::discord) mod long_send_rollback;
 mod rollback_journal;
 
 use self::long_send_rollback::delete_rollback_channel_message;
+pub(in crate::services::discord) use self::long_send_rollback::message_ids_from_receipts;
 pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_reference_rollback;
+pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_reference_rollback_returning_receipts;
 pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_rollback;
+pub(in crate::services::discord) use self::long_send_rollback::send_long_message_raw_with_rollback_returning_receipts;
 #[cfg(test)]
 use self::rollback_journal::{
     REPLACE_CONTINUATION_ROLLBACKS, force_next_replace_continuation_rollback_remove_failure,
@@ -60,6 +63,10 @@ use self::rollback_journal::{
 pub(in crate::services::discord) mod rollback_transport_test_hook {
     use super::*;
 
+    // #5071 T1 S2: the hook yields (returned channel, message id) rather than a
+    // bare id so tests can reproduce a Discord response that lands in a channel
+    // other than the requested one. Collapsing the pair here would hide the
+    // very `channel_mismatch` the delivery journal is meant to observe.
     type SendHook = Box<
         dyn Fn(
                 ChannelId,
@@ -67,7 +74,7 @@ pub(in crate::services::discord) mod rollback_transport_test_hook {
                 Option<(ChannelId, MessageId)>,
                 Option<&str>,
                 bool,
-            ) -> Option<Result<MessageId, String>>
+            ) -> Option<Result<(ChannelId, MessageId), String>>
             + Send
             + Sync,
     >;
@@ -101,7 +108,7 @@ pub(in crate::services::discord) mod rollback_transport_test_hook {
         reference: Option<(ChannelId, MessageId)>,
         nonce: Option<&str>,
         enforce_nonce: bool,
-    ) -> Option<Result<MessageId, Error>> {
+    ) -> Option<Result<(ChannelId, MessageId), Error>> {
         SEND_HOOK
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -121,6 +128,50 @@ pub(in crate::services::discord) mod rollback_transport_test_hook {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .and_then(|hook| hook(channel_id, message_id).map(|result| result.map_err(Into::into)))
+    }
+}
+
+/// #5071 T1 S2: PATCH interception for `replace_long_message`'s chunk-0 edit.
+/// Separate from [`rollback_transport_test_hook`] so installing one never
+/// changes which requests the other intercepts. Yields `(returned channel,
+/// message id)` so a channel mismatch is expressible.
+#[cfg(test)]
+pub(in crate::services::discord) mod chunk_transport_test_hook {
+    use super::*;
+
+    type ChunkEditHook = Box<
+        dyn Fn(ChannelId, MessageId, &str) -> Option<Result<(ChannelId, MessageId), String>>
+            + Send
+            + Sync,
+    >;
+
+    static EDIT_HOOK: LazyLock<Mutex<Option<ChunkEditHook>>> = LazyLock::new(|| Mutex::new(None));
+
+    pub(in crate::services::discord) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *EDIT_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+
+    pub(in crate::services::discord) fn install(edit: ChunkEditHook) -> Guard {
+        *EDIT_HOOK.lock().unwrap_or_else(|error| error.into_inner()) = Some(edit);
+        Guard
+    }
+
+    pub(super) fn edit(
+        channel_id: ChannelId,
+        message_id: MessageId,
+        content: &str,
+    ) -> Option<Result<(ChannelId, MessageId), Error>> {
+        EDIT_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|hook| {
+                hook(channel_id, message_id, content).map(|result| result.map_err(Into::into))
+            })
     }
 }
 
@@ -161,7 +212,8 @@ mod delivery;
 
 use self::delivery::send_channel_message_with_optional_reference;
 pub(super) use self::delivery::{
-    build_long_message_attachment, send_long_message_ctx, send_long_message_raw, split_message,
+    build_long_message_attachment, needs_multiple_messages, send_long_message_ctx,
+    send_long_message_raw, split_message,
 };
 #[allow(unused_imports)]
 pub(in crate::services::discord) use self::delivery::{
@@ -179,11 +231,16 @@ mod replace_long_message;
 
 #[cfg(test)]
 pub(in crate::services::discord) use self::replace_long_message::ReplaceLastChunkAnchor;
+// #5071 T1 S3a: the deferred receipt variant gained a production consumer — the
+// watcher's cutover short-replace arm, which needs the tail-continuation receipt
+// its `_with_outcome_` sibling does not surface.
+pub(in crate::services::discord) use self::replace_long_message::replace_long_message_raw_deferred_returning_receipt;
 pub(in crate::services::discord) use self::replace_long_message::{
     DeferredReplaceLongMessageOutcome, ReplaceLongMessageOutcome,
     cleanup_replace_continuations_after_failure, replace_long_message_outcome_to_result,
     replace_long_message_raw, replace_long_message_raw_deferred,
-    replace_long_message_raw_with_outcome, watcher_completion_footer_anchor,
+    replace_long_message_raw_with_outcome, replace_long_message_raw_with_outcome_returning_receipt,
+    watcher_completion_footer_anchor,
 };
 
 #[cfg(test)]

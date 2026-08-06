@@ -305,7 +305,12 @@ targets = {
     "runs_on" => "ubuntu-latest",
     # #5034 re-pins after adding the attachment-delivery and catch-up
     # operational-alert targets to the path-filtered required high-risk lane.
-    "job_sha256" => "29c7a0c33753933e50c446f073da942bebd0c53881460260562cd9cabaef9c44",
+    # #5170 re-pins after wiring the transition-busy requeue oracles, which the
+    # lib inventory manifest counted while no curated filter executed them.
+    # #5181 re-pins after widening that lane from the two named #5170 oracles to
+    # the whole `services::discord::queue_io::` module, now that the module's
+    # pre-existing #4270/#4893 failures are fixed rather than filtered around.
+    "job_sha256" => "6bf1e4fea9bf977a711f462b6992ac27452faf2ffaf5fea36fd964aaa6354936",
     "require_debug_env" => false,
     "cargo_steps" => {
       "Observe curated lane selections" => {
