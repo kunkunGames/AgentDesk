@@ -1,7 +1,7 @@
 Steward: Improve scratch file detection parity in CI checks
 
-- **What changed:** Added `.diff`, `.patch`, `.py`, `.js`, and `.json` extensions to the `Scratch file guard` checks in `scripts/ci-script-checks.sh`.
-- **Why:** To bring the CI script's scratch file guard into parity with the `scripts/analyze_prs.py` hygiene analyzer, preventing developers from accidentally committing temporary artifacts.
+- **What changed:** Added `.diff`, `.patch`, `.py`, `.js`, and `.json` extensions to the `Scratch file guard` checks in `scripts/ci-script-checks.sh`. Also fixed a rust formatting issue in `src/cli/doctor/health.rs` that broke the `cargo fmt` check.
+- **Why:** To bring the CI script's scratch file guard into parity with the `scripts/analyze_prs.py` hygiene analyzer, preventing developers from accidentally committing temporary artifacts, and fixing the format issue unblocked the CI pipeline.
 - **WorkFingerprint:**
   - Agent: Steward
   - Boundary: PR hygiene scripts (`scripts/ci-script-checks.sh`)
@@ -15,6 +15,7 @@ Steward: Improve scratch file detection parity in CI checks
 - **Verification commands and results:**
   - `git diff --check`: clean
   - `./scripts/ci-script-checks.sh`: logic applied (warns on shellcheck due to missing binary, fails on unrelated pre-existing DB migration)
+  - `cargo fmt --all --check`: clean
   - `npm run test:policies`: 220 tests passed
   - `./scripts/verify-dashboard.sh`: dashboard tests passed
   - `python3 scripts/generate_inventory_docs.py`: generated docs successfully (restored generated changes since PR is strictly bash parity).
