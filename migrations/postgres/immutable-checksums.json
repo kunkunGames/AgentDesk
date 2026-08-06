@@ -539,7 +539,7 @@
     {
       "path": "migrations/postgres/0105_delivery_journal.sql",
       "sha256": "a8b316673f275edc3636bc2cd1b94ca4ba6ef28e870e229c674022d7a4623b7c",
-      "version": 105
+      "version": 103
     }
   ],
   "version": 1
