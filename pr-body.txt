@@ -1,0 +1,33 @@
+**What changed:**
+Added `-gm` as a mapped suffix for Gemini in `dashboard/src/components/agent-manager/setupWizardHelpers.ts` to fully mirror the backend configurations. Also updated the documentation string describing `detectProviderSuffix`.
+
+**Why:**
+This ensures the dashboard and backend `provider_suffix_default_map` are fully aligned. The backend `src/config.rs` accepted `-gm` for `gemini`, while the dashboard wizard mapping lacked `-gm`.
+
+**WorkFingerprint:**
+- Agent: OnboardingSmith
+- Category Boundary: dashboard/src/**OnboardingWizard** & onboarding setup flows
+- Primary Files: dashboard/src/components/agent-manager/setupWizardHelpers.ts
+- Invariant Protected: Keep dashboard and API behavior aligned when onboarding states or fields change.
+- Public API Impact: None
+- Docs Impact: Minor docstring update in `setupWizardHelpers.ts`
+- Verification Plan: `./scripts/verify-dashboard.sh` and cargo checks
+- Related PRs/Issues: None
+
+**Duplicate/Overlap Check:**
+Ran `gh pr list --state open` & `git branch -r` and verified there are no overlapping branches or PRs modifying onboarding provider mappings.
+
+**Verification Commands and Results:**
+- `git diff --check`: Clean.
+- `./scripts/verify-dashboard.sh`: Passed successfully. (Dashboard built without warnings and Vitest passed 50 files, 315 tests).
+- `cargo check --lib`: Compiled without new issues. (All targets timed out/errored locally, skipped tests because no rust code was modified)
+- `npm run test:policies`: 220 tests passed successfully.
+
+**Skipped Checks with Reasons:**
+- `cargo check --all-targets`: Errored out/timed out internally in this environment. Resorted to `cargo check --lib` as fallback even though no Rust files were modified.
+
+**Risk:**
+Low. Adds an extra mapping entry directly mirroring an existing backend capability, avoiding runtime crashes.
+
+**Rollback Notes:**
+Revert the commit adding the mapping in `setupWizardHelpers.ts`.
