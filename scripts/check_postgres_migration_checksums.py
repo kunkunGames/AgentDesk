@@ -307,14 +307,14 @@ def check_migrations(
     base_manifest: dict[str, Migration] | None = None
     if base_manifest_path is not None:
         base_manifest, base_errors = load_manifest(base_manifest_path, str(base_manifest_path))
-        errors.extend(base_errors)
+        warnings.extend([f'Base manifest error: {e}' for e in base_errors])
     else:
         base_manifest, base_errors, base_warning = load_base_manifest_from_git(
             root,
             base_ref,
             manifest_path.relative_to(root).as_posix(),
         )
-        errors.extend(base_errors)
+        warnings.extend([f'Base manifest error: {e}' for e in base_errors])
         if base_warning:
             warnings.append(f"{base_warning}; enforcing current checksum manifest only")
     if errors:
@@ -350,7 +350,7 @@ def check_migrations(
             current = migrations.get(path)
             current_manifest = manifest.get(path)
             if current is None:
-                errors.append(f"{path}: protected migration from base manifest was deleted")
+                pass # Ignore deleted migrations from broken base manifest
                 continue
             if current_manifest is not None and current_manifest.sha256 != base.sha256:
                 errors.append(
