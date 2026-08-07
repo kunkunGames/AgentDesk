@@ -51,6 +51,7 @@ dispatch::dispatch_summary::tests
 dispatch::test_support
 engine::intent::tests
 engine::loader::tests
+engine::ops::cards_ops::parse_json_value_tests
 engine::ops::config_ops::tests
 engine::ops::db_ops::tests
 engine::ops::exec_ops::bridge_deadline_tests
