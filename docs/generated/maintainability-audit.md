@@ -16,7 +16,7 @@ Baseline no-regression gates are **enabled** for 3 checks: `parent_test_residue`
 |---|---:|:--:|:--:|
 | `giant_files` | 0 | YES | no |
 | `giant_file_ratchet` | 0 | YES | no |
-| `parent_test_residue` | 5 | no | YES |
+| `parent_test_residue` | 4 | no | YES |
 | `namespace_size_caps` | 0 | YES | no |
 | `route_srp_violations` | 10 | no | YES |
 | `service_server_backflow` | 0 | no | YES |
@@ -47,11 +47,10 @@ Decomposition parents whose inline test LoC exceeds 3x their production LoC (fil
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/services/discord/inflight.rs` |  | 5205 test LoC vs 608 prod LoC (ratio 8.56x > 3x, 5813 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/inflight/save_store.rs` |  | 730 test LoC vs 241 prod LoC (ratio 3.03x > 3x, 971 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/inflight.rs` |  | 5283 test LoC vs 654 prod LoC (ratio 8.08x > 3x, 5937 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 146 prod LoC (ratio 3.08x > 3x, 596 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 1048 prod LoC (ratio 3.81x > 3x, 5040 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 428 test LoC vs 87 prod LoC (ratio 4.92x > 3x, 515 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/turn_finalizer.rs` |  | 3990 test LoC vs 1029 prod LoC (ratio 3.88x > 3x, 5019 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 428 test LoC vs 88 prod LoC (ratio 4.86x > 3x, 516 raw); migrate the stranded tests with the decomposed production code |
 
 ## Namespace size caps (`namespace_size_caps`)
 
@@ -65,16 +64,16 @@ Files under src/server/routes/ that mix raw SQL, json!() shaping, and crate::ser
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (25), json!() (56), and crate::services calls (5) |
+| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (25), json!() (20), and crate::services calls (5) |
 | warn | `src/server/routes/agents_setup.rs` |  | route file mixes SQL (7), json!() (12), and crate::services calls (2) |
 | warn | `src/server/routes/cron_api.rs` |  | route file mixes SQL (2), json!() (12), and crate::services calls (1) |
-| warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (24), and crate::services calls (3) |
-| warn | `src/server/routes/github.rs` |  | route file mixes SQL (6), json!() (44), and crate::services calls (1) |
-| warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (17), json!() (18), and crate::services calls (7) |
-| warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (12), and crate::services calls (6) |
-| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (15), and crate::services calls (3) |
+| warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (12), and crate::services calls (6) |
+| warn | `src/server/routes/github.rs` |  | route file mixes SQL (6), json!() (29), and crate::services calls (1) |
+| warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (17), json!() (10), and crate::services calls (7) |
+| warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (2), and crate::services calls (6) |
+| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (12), and crate::services calls (4) |
 | warn | `src/server/routes/review_verdict/verdict_route.rs` |  | route file mixes SQL (5), json!() (20), and crate::services calls (5) |
-| warn | `src/server/routes/stats.rs` |  | route file mixes SQL (32), json!() (10), and crate::services calls (2) |
+| warn | `src/server/routes/stats.rs` |  | route file mixes SQL (32), json!() (8), and crate::services calls (2) |
 
 ## Service/server backflow (`service_server_backflow`)
 
