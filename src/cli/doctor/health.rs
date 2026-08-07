@@ -412,7 +412,7 @@ mod health_classification_tests {
     }
 
     #[test]
-        #[test]
+    #[test]
     fn gateway_standby_reason_codes_classify() {
         let provider_standby = classify_degraded_reason("provider:codex:gateway_standby");
         assert_eq!(provider_standby.subsystem, "provider_runtime");
@@ -451,7 +451,7 @@ mod health_classification_tests {
         assert_ne!(cluster_standby.summary, cluster_standby.raw);
     }
 
-fn reasons_evidence_preserves_actionable_reason_contract() {
+    fn reasons_evidence_preserves_actionable_reason_contract() {
         let reason = classify_degraded_reason("db_unavailable");
 
         assert_eq!(
