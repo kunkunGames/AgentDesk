@@ -3236,7 +3236,6 @@ fn check_service_manager() -> Check {
                 dcserver::current_launchd_domain().unwrap_or_else(|| "gui/$(id -u)".to_string())
             ),
             format!("tmux has-session -t ={fallback_session}:"),
-            "agentdesk doctor --fix".to_string(),
         ])
     }
 }
@@ -3636,12 +3635,12 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "systemd --user — agentdesk-dcserver enabled but inactive",
-            "check the status with `systemctl --user status agentdesk-dcserver` or try restarting with `agentdesk doctor --fix`.",
+            "check the status with `systemctl --user status agentdesk-dcserver` or try restarting with `agentdesk doctor --fix --allow-restart`.",
         )
         .with_expected_actual("systemd user service active", "systemd user service enabled but inactive")
         .with_next_steps(vec![
             "systemctl --user status agentdesk-dcserver".to_string(),
-            "agentdesk doctor --fix".to_string(),
+            "agentdesk doctor --fix --allow-restart".to_string(),
         ])
     } else {
         Check::warn(
@@ -3679,12 +3678,12 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "Windows service — AgentDeskDcserver installed but not running",
-            "check the status with `sc query AgentDeskDcserver` or try restarting with `agentdesk doctor --fix`.",
+            "check the status with `sc query AgentDeskDcserver` or try restarting with `agentdesk doctor --fix --allow-restart`.",
         )
         .with_expected_actual("Windows service running", "Windows service installed but not running")
         .with_next_steps(vec![
             "sc query AgentDeskDcserver".to_string(),
-            "agentdesk doctor --fix".to_string(),
+            "agentdesk doctor --fix --allow-restart".to_string(),
         ])
     } else {
         Check::warn(
