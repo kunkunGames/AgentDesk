@@ -243,7 +243,7 @@ echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invar
 # drift gate: generation updates snapshots, then CI rejects changes to tracked
 # source-of-truth docs instead of comparing the generated workspace to itself.
 "$PYTHON" scripts/generate_inventory_docs.py
-git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
+git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md docs/generated/module-inventory.md docs/generated/giant-file-registry.md
 
 echo "=== Inventory prod/test split regression tests (#4394) ==="
 "$PYTHON" -m unittest tests.test_inventory_giant_split
