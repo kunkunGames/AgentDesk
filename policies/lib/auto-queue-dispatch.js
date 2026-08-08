@@ -79,8 +79,8 @@ function _dispatchableTargets(cfg) {
     targets.push("requested");
   }
 
-  var gatedOut = {};
-  var gatedIn = {};
+  var gatedOut = Object.create(null);
+  var gatedIn = Object.create(null);
   if (cfg.transitions) {
     for (var i = 0; i < cfg.transitions.length; i++) {
       var t = cfg.transitions[i];
@@ -94,8 +94,8 @@ function _dispatchableTargets(cfg) {
   for (var i = 0; i < cfg.states.length; i++) {
     var s = cfg.states[i];
     if (s.terminal) continue;
-    var hasGatedOut = gatedOut[s.id] || false;
-    var hasGatedIn = gatedIn[s.id] || false;
+    var hasGatedOut = Object.prototype.hasOwnProperty.call(gatedOut, s.id);
+    var hasGatedIn = Object.prototype.hasOwnProperty.call(gatedIn, s.id);
     if (!(hasGatedOut && !hasGatedIn)) continue;
     if (targets.indexOf(s.id) === -1) targets.push(s.id);
   }
