@@ -1,6 +1,7 @@
-scripts/** text eol=lf
+*.sh text eol=lf
 .githooks/** text eol=lf
 .github/workflows/*.yml text eol=lf
+migrations/postgres/*.sql text eol=lf
 
 # Custom merge driver for tracked generated inventory docs (#4724 slice B).
 # These two files are generated wholesale; line-count churn makes concurrent PRs

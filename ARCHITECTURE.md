@@ -322,6 +322,7 @@ src/
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
 │   ├── dashboard_provision.rs
+│   ├── database_fixture_invariant_tests.rs
 │   ├── issue_specs.rs
 │   ├── mod.rs
 │   ├── multinode_regression.rs
@@ -366,6 +367,8 @@ src/
 │   │   ├── activate_preflight.rs
 │   │   ├── activate_route.rs
 │   │   ├── cancel_run.rs
+│   │   ├── cleanup_tasks.rs
+│   │   ├── cleanup_tasks_pg_tests.rs
 │   │   ├── command.rs
 │   │   ├── control_routes.rs
 │   │   ├── dispatch_assignment_command.rs
@@ -520,6 +523,7 @@ src/
 │   │   ├── health/
 │   │   │   ├── recovery/
 │   │   │   │   ├── leak_recovery_ledger.rs
+│   │   │   │   ├── self_watchdog.rs
 │   │   │   │   ├── stall_alert.rs
 │   │   │   │   └── watchdog_decisions.rs
 │   │   │   ├── stall_liveness/
@@ -539,6 +543,7 @@ src/
 │   │   │   ├── snapshot.rs
 │   │   │   ├── stall_liveness.rs
 │   │   │   ├── stall_verdict.rs
+│   │   │   ├── transcript_binding_stall.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── idle_recap/
 │   │   │   ├── card.rs
@@ -687,7 +692,8 @@ src/
 │   │   │   ├── terminal_text_idempotency.rs
 │   │   │   ├── terminal_watcher.rs
 │   │   │   ├── tmux_probe.rs
-│   │   │   └── two_message_panel.rs
+│   │   │   ├── two_message_panel.rs
+│   │   │   └── unix_journal.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── controller_cutover.rs
 │   │   │   ├── mod.rs
@@ -780,7 +786,9 @@ src/
 │   │   │   └── voice.rs
 │   │   ├── session_relay_sink/
 │   │   │   ├── journal/
+│   │   │   │   ├── controller.rs
 │   │   │   │   ├── pg_store.rs
+│   │   │   │   ├── recovery.rs
 │   │   │   │   └── watcher.rs
 │   │   │   ├── delivery_commit.rs
 │   │   │   ├── delivery_frontier.rs
@@ -914,6 +922,7 @@ src/
 │   │   │   ├── observed_prompt_decision.rs
 │   │   │   ├── rehydration.rs
 │   │   │   ├── relay_ownership.rs
+│   │   │   ├── session_rotation_settle.rs
 │   │   │   ├── synthetic_orphan_reclaim.rs
 │   │   │   ├── synthetic_start.rs
 │   │   │   ├── synthetic_start_wiring.rs
@@ -954,6 +963,8 @@ src/
 │   │   │   │   └── types.rs
 │   │   │   ├── stream_tick/
 │   │   │   │   └── guarded_persist.rs
+│   │   │   ├── terminal_controller_cutover/
+│   │   │   │   └── unix_journal.rs
 │   │   │   ├── terminal_outcome_delivery/
 │   │   │   │   ├── empty_response_recovery/
 │   │   │   │   │   ├── guidance.rs
@@ -1020,6 +1031,9 @@ src/
 │   │   │   ├── watcher_handoff.rs
 │   │   │   └── watcher_orphan_cleanup.rs
 │   │   ├── turn_finalizer/
+│   │   │   ├── finalize/
+│   │   │   │   └── tests/
+│   │   │   │       └── residue_tests.rs
 │   │   │   ├── actor_state.rs
 │   │   │   ├── cleanup.rs
 │   │   │   ├── completion_admission.rs
@@ -1028,6 +1042,7 @@ src/
 │   │   │   ├── delivery_lease.rs
 │   │   │   ├── finalize.rs
 │   │   │   ├── finalize_context.rs
+│   │   │   ├── guarded_finish_residue.rs
 │   │   │   ├── reconcile.rs
 │   │   │   └── watcher_backstop.rs
 │   │   ├── turn_view_reconciler/
@@ -1341,6 +1356,7 @@ src/
 │   │   ├── extract.rs
 │   │   ├── observation.rs
 │   │   ├── runtime_binding.rs
+│   │   ├── session_rotation.rs
 │   │   ├── state.rs
 │   │   ├── synthetic_prompt.rs
 │   │   └── tests.rs
@@ -1382,6 +1398,7 @@ src/
 │   ├── escalation_settings.rs
 │   ├── gemini.rs
 │   ├── github_issue_creation.rs
+│   ├── hang_forensics.rs
 │   ├── health_active_session_audit.rs
 │   ├── health_diagnostics.rs
 │   ├── issue_announcements.rs

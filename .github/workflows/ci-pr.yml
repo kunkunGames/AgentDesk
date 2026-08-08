@@ -77,6 +77,27 @@ jobs:
               - 'scripts/verify-dashboard.sh'
             high_risk_recovery:
               - '.github/workflows/**'
+              # #5147: this lane owns the self-watchdog's kill-time forensics,
+              # and one of those tests asserts on `[profile.release]` -- it is
+              # what stops `strip = true` (which erased the Mach-O symbol table
+              # and stalled #4756/#4770/#5147) from coming back. A guard whose
+              # own subject cannot trigger it is the #5185 defect, so the files
+              # under guard are listed here alongside the tests.
+              #
+              # NO-OP, stated so nobody reads this filter as narrow: the
+              # `'!src/services/discord/placeholder_live_events/**'` line below
+              # already makes `high_risk_recovery` effectively always true.
+              # dorny/paths-filter@v3 is NOT GitHub's native `paths:` -- it
+              # compiles every pattern into its own picomatch matcher and ORs
+              # them (`matchers.some(...)`), so a leading `!` is just another
+              # positive matcher for "anything that is not this", and it matches
+              # nearly every changed file. The patterns #5147 adds here and
+              # below therefore change nothing about what runs; they are kept
+              # as a statement of which files this lane is meant to guard, and
+              # they become load-bearing the moment that `!` line is fixed.
+              # Fixing it is a separate change: narrowing the filter would
+              # silently stop running whatever has been relying on it.
+              - 'Cargo.toml'
               - 'policies/auto-queue.js'
               - 'policies/kanban-rules.js'
               - 'policies/timeouts.js'
@@ -103,6 +124,13 @@ jobs:
               - 'src/services/discord/outbound/source_registry.rs'
               - 'src/services/discord/**'
               - '!src/services/discord/placeholder_live_events/**'
+              # #5147: the forensics module, the health-path DB awaits it
+              # brackets, and the boot site that starts the self-watchdog (and
+              # with it the runtime beacon). Inert today -- see the `!` note
+              # above.
+              - 'src/cli/dcserver.rs'
+              - 'src/services/hang_forensics.rs'
+              - 'src/services/health_diagnostics.rs'
               - 'src/services/message_outbox.rs'
               - 'src/services/message_outbox_recovery.rs'
               - 'src/services/message_outbox_recovery_support.rs'
@@ -640,8 +668,9 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
-          cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres
-          cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres
+          source scripts/ci/non-pg-test-filter.sh
+          cargo test --lib task_notification -- "${NON_PG_SKIP_ARGS[@]}"
+          cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- "${NON_PG_SKIP_ARGS[@]}"
 
       - name: Trusted session forwarding tests
         timeout-minutes: 10
@@ -650,7 +679,9 @@ jobs:
           BASH_ENV: /dev/null
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
-        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres
+        run: |
+          source scripts/ci/non-pg-test-filter.sh
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- "${NON_PG_SKIP_ARGS[@]}"
 
       # #5040: `intake_dispatch::tests` predates the lane-coverage ratchet and is
       # baselined debt. Select the telemetry-only admission regressions explicitly
@@ -662,7 +693,9 @@ jobs:
           BASH_ENV: /dev/null
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
-        run: env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres
+        run: |
+          source scripts/ci/non-pg-test-filter.sh
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- "${NON_PG_SKIP_ARGS[@]}"
 
       # #5025: this job is mirrored by the branch-protected
       # `Fast targeted tests (ubuntu-latest)` context above. Keep the router test
@@ -768,6 +801,15 @@ jobs:
           cargo test --lib services::discord::health::relay_dead_reattach::tests -- --test-threads=1
           cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
           cargo test --lib services::discord::terminal_ui_obligation::tests -- --test-threads=1
+          # #5147: the self-watchdog's kill-time forensics. Belongs in the
+          # high-risk recovery lane because these tests are what stop the
+          # watchdog from silently regressing to a bare pass/fail probe — the
+          # exact blind spot that stalled #4756, #4770 and #5147.
+          cargo test --lib services::hang_forensics::tests -- --test-threads=1
+          # The other half of the same guard: that every Postgres await on the
+          # public /api/health path is still bracketed, so a kill line cannot
+          # report db_in_flight=0 while the handler is stuck inside one.
+          cargo test --lib services::health_diagnostics::tests -- --test-threads=1
 
       # #5034: watchdog/operational alerts are notifications, not queued turns;
       # run the sender-policy, attachment-delivery, catch-up, outbox-delivery,
@@ -835,6 +877,290 @@ jobs:
           FILTER_OUTPUT: ${{ needs.changes.outputs.high_risk_recovery }}
           UPSTREAM_JOB_NAME: high-risk-recovery
           UPSTREAM_RESULT: ${{ needs.high-risk-recovery.result }}
+        run: ./scripts/required-check-mirror.sh
+
+  # #5185: measured on b6b551627, the curated PR lanes select 971 of 7538
+  # library tests (12.9%), and every curated lane is path-filtered. The one
+  # job that EXECUTES library tests unconditionally is
+  # `relay-authority-contract`: it carries no `if:` and no `needs:`, and this
+  # workflow has no `paths:` trigger filter, so it runs on every PR. (The
+  # `scripts` job is unconditional too, but its Rust step is
+  # `cargo test --lib -- --list`, which compiles and enumerates without
+  # running anything.) That is the real floor a PR missing `pg_db`,
+  # `high_risk_recovery` and the relay-authority path filters used to land on:
+  # 171 library tests -- 123 under `services::discord::session_relay_sink`,
+  # 43 under `services::discord::relay_recovery::tests`, 5 under
+  # `services::discord::tui_prompt_relay::local_model_queue_wake_e2e` -- i.e.
+  # 2.3% of the harness, all of it relay-authority surface.
+  #
+  # Whole-harness-minus-filter plus 15 replays: `rust_or_policy` selects 7,025 tests, of which
+  # 8 are `#[ignore]`d, so 7,017 execute. Those three figures are derived
+  # from `scripts/lib_test_inventory_manifest.txt` at THIS commit. The newest
+  # figures a real run of this lane has REPORTED are at `6c2c43634`, 14 commits
+  # before `fb2357a66`: `expected=6971 ignored=8 executed=6963`. The Linux
+  # `derive_expected_selection` difference between those SHAs with skips `_pg`, `pg_` and `postgres` is 54 added and none removed, under
+  # `server::routes::health_api::tests` (4),
+  # `server::worker_registry::leader_takeover_tests` (1) and
+  # `services::health_diagnostics::tests` (4), `services::hang_forensics::tests` (30),
+  # `services::discord::recovery_engine::terminal_text_idempotency::tests` (5),
+  # `services::discord::session_relay_sink::journal::controller::controller_terminal_semantics_tests` (5) and
+  # `services::discord::session_relay_sink::journal::recovery::recovery_terminal_semantics_tests` (5). They
+  # track the manifest, so a later PR that adds or removes a library test dates
+  # them; what enforces the set is `run_test_lane.py`, which recomputes it every
+  # run and names the difference. Read these as orientation, not as a gate.
+  # Measured wall time for the libtest run itself on an M4 Pro: 262-274 s
+  # across five sweeps (an earlier
+  # revision of this comment claimed "~1 min", which was never measured);
+  # a two-core `ubuntu-latest` runner is slower still, which is what the
+  # 45-minute step timeout is sized for. darwin derives 7,028 / 7,020 from the
+  # same manifest because four macOS-only tests are `#[cfg]`-absent on Linux
+  # while one Linux-only test is present; the wrapper resolves that through
+  # `--platform`, which defaults to the host, so the runner derives the Linux
+  # figures and a local reproduction on a Mac derives the darwin ones.
+  #
+  # THIS JOB NEEDS POSTGRESQL, even though its filters are named for excluding
+  # it. The canonical non-PG filter is a substring filter over test
+  # ids, and PostgreSQL dependence is a property of a test *body*. The two do
+  # not coincide: `scripts/pg_test_lane_manifest.txt` classifies 477 library
+  # tests as PG-dependent and 55 of them carry none of those three substrings
+  # in their id, so this lane selects those 55. That residual was 61 until
+  # #5218 renamed `server::multinode_regression::tests` (5 ids) and the
+  # Postgres half of `server::issue_specs::tests` (1 id) into `_pg_` modules,
+  # which handed those 6 to the id-filtered `test_fast` lane; the count moves
+  # again whenever a module gains or loses a lane token.
+  #
+  # The two counts move independently, and #5142 is the worked example: it took
+  # the PG-dependent total from 460 to 477 while leaving the residual at 55 --
+  # the same 55 ids, not merely the same count. Its 17 new PG-dependent tests
+  # all live in `services::auto_queue::cleanup_tasks::cleanup_tasks_pg_tests`
+  # and every id ends in `_pg`, so the substring filter removes all of them and
+  # this lane's selection is unchanged by them. Growth in the PG total is
+  # therefore not evidence that this lane's PG obligation grew; only a test
+  # whose id lacks all three tokens can change that.
+  #
+  # The three measurements below were taken against the 61-id set, before that
+  # rename. They are kept rather than rerun because what they establish is
+  # FIXTURE BEHAVIOUR -- a property of each test body, which the rename did not
+  # touch. Measured with the fixture base pointed at a closed port, those ids
+  # do not degrade to a skip -- `TestPostgresDb::create()` panics through
+  # `.expect(...)` and the soft-skip variants stall on connect retries for
+  # minutes each. Against a live server the 61 were measured
+  # `61 passed; 0 failed` in 24.8 s, in parallel, with
+  # `AGENTDESK_REQUIRE_PG=1` -- on ONE development machine, server version
+  # unrecorded. Both numbers are conditional on that host, and neither is a
+  # property of this lane:
+  #   * `0 failed` is not a guarantee. A review on another machine measured
+  #     60 passed / 1 failed, the loser being the `multinode_regression`
+  #     dispatch/reclaim test that `scripts/known_test_failures.txt` carries as
+  #     `flaky` -- an intra-test race that reproduces under `--exact` on an idle
+  #     machine. That worked example no longer describes THIS lane: #5218 moved
+  #     that id into `test_fast`, and its ledger entry now prints here as
+  #     `ledger-note: ... selected no test in lane non-pg-sweep`. Measured at
+  #     this commit, no `lane=non-pg-sweep` ledger entry matches any of the 55,
+  #     so a failure among them is reported `unexpected` and turns this lane red
+  #     instead of being held green by the ledger.
+  #   * 24.8 s is not a budget. `POSTGRES_TEST_LIFECYCLE_LOCK`
+  #     (`src/db/postgres.rs`) serialises every fixture database create/drop
+  #     process-globally, so the elapsed time is whatever one
+  #     create+migrate+drop costs on the host; a two-core `ubuntu-latest`
+  #     runner is expected to be far slower, and that is not a regression.
+  # What is host-independent is the direction, and that is all this evidence is
+  # asked to carry: with a live server the 55 run and are adjudicated on the
+  # change. With a closed port they still run -- one review measured `57 FAILED
+  # / 4 ok` in 915.72 s, against the 61-id set of the time. What that red
+  # reports can be listed, and the list is short: which of the two fixture
+  # behaviours each id takes -- `create()`
+  # panicking through `.expect(...)`, or a soft-skip variant burning its
+  # connect-retry budget -- and that the port was closed. Which of the two a
+  # given id does is a property of the test, not of the diff. What it does not
+  # report is whether the assertions past the fixture call hold, and those are
+  # where a change is normally adjudicated.
+  #
+  # It does not follow that such a run says nothing about a change, and an
+  # earlier revision of this comment claimed exactly that. The lines before the
+  # fixture call are diffable, and that branch diffed them: three of the 55 live
+  # in `src/services/session_resume.rs`, which that branch edited, and
+  # `resume_production_path_clears_stale_binding_and_rebinds_runtime` there now
+  # takes its `TEST_LOCK` with `unwrap_or_else(|poison| poison.into_inner())`
+  # before its own `TestPostgresDb::create()` call. A closed port is
+  # what makes that `create()` panic, and that panic is what poisons the lock
+  # the edit exists to survive -- so against a closed port the fixture, not the
+  # assertion, decides what that edit is worth. State the harm that way: the
+  # lane does not go unrun, it goes red slowly, and it answers a narrower
+  # question than the pull request asked.
+  #
+  # So the service below is not defensive: without it
+  # this required context can never be green, and with it ids that no PR lane
+  # ran at all start running on every Rust PR against a real database. The
+  # count, measured rather than asserted: `[rule1]` of
+  # `scripts/pg_test_lane_baseline.txt` held 56 such ids at 31465b184, the last
+  # commit before this lane emptied it, and 55 of the 55 residual ids above are
+  # among those 56. The 56th is
+  # `server::issue_specs::tests::upsert_issue_spec_persists_parsed_contract`,
+  # which #5218 renamed into `issue_specs_pg_tests` and thereby handed to
+  # `test_fast`; it is still run by a PR lane, which is why `[rule1]` stays
+  # empty rather than regaining an entry.
+  #
+  # `scripts/check_pg_test_lane_membership.py` `[rule5]` is what keeps the
+  # SELECTION honest -- the selection, and nothing beyond it. What the rule
+  # actually decides is whether a job's YAML text references the PostgreSQL
+  # service start script at all; a `cargo test` job whose text does not
+  # reference it fails rule5, naming every PG-dependent id that job selects.
+  # Being a substring test over job text, it does not evaluate `if:`
+  # conditions, does not tell a live step from a commented-out one, and cannot
+  # know whether the container came up. `docs/ci/release-gates.md` records the
+  # same limit in its required-context procedure -- rule5 inspects the
+  # selection set, not whether the service really started -- which is why that
+  # procedure ALSO makes you confirm, in a real main run, that this job's
+  # service step exists and succeeded. Within those limits the rule carries no
+  # baseline tolerance, so deleting the service step below turns this into a
+  # red script check rather than a red sweep discovered by every PR author at
+  # once.
+  #
+  # Residual risk, recorded rather than closed because it is low-probability
+  # and has no cheap guard: a container that FAILS TO START is already safe --
+  # the start step polls `pg_isready` for its budget and fast-fails the job. A
+  # container that starts and then DIES mid-sweep is not. Every PG-dependent
+  # test still to run then burns its connect-retry budget (a review measured
+  # ~45 s per test against a closed port) before failing, which on a two-core
+  # runner adds far more than the 45-minute step timeout has left. That
+  # surfaces as a TIMEOUT red with no named failure -- not as the clean,
+  # id-naming red this lane is built to produce -- so read a timeout here as
+  # "check the service", not as "the sweep got slower".
+  #
+  # Boundaries and why they are here rather than wider:
+  #   * `--lib` only. `full_non_pg` in ci-main.yml documents that an
+  #     `--all-targets` non-PG sweep panics in ~169 SQLite-fixture tests that
+  #     still await the #1238 PostgreSQL migration; pulling them in would force
+  #     either a huge isolation ledger or a re-narrowed filter.
+  #   * The id-filtered PostgreSQL suite keeps its existing home in `test_fast`
+  #     / `just test-postgres`: that lane runs it `--test-threads=1` under its
+  #     own container. This lane provisions its own container for the 55
+  #     residual ids only; the two jobs run on separate runners and share
+  #     nothing.
+  #   * `DATABASE_URL` is deliberately NOT exported here even though `test_fast`
+  #     and `high-risk-recovery` export it. Those lanes select hundreds of tests;
+  #     this one selects 7,025 and executes 7,017, and the fixture helpers read
+  #     `POSTGRES_TEST_DATABASE_URL_BASE`/`PG*`, not `DATABASE_URL` -- the 55
+  #     pass without it. Exporting a production connection string across the
+  #     whole harness is a blast radius that was not measured, so it is not
+  #     claimed.
+  #   * Parallel, NOT `--test-threads=1`: serialising would hide the shared
+  #     process-global state this sweep exposes instead of recording it.
+  #
+  # `scripts/run_test_lane.py` is what makes the green meaningful. It derives
+  # the exact id set this lane must run and fails -- naming every id on either
+  # side of the difference -- when the run reports a different one, and it
+  # fails on any failure that is not carried in
+  # `scripts/known_test_failures.txt` with a tracking issue and a reason.
+  # There is deliberately no execution-count floor; the step comment below
+  # records the two measured evasions that cleared one.
+  library_sweep:
+    name: Library test sweep
+    needs: changes
+    if: needs.changes.outputs.rust_or_policy == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
+      # Fixture-side PostgreSQL wiring, matching `test_fast` /
+      # `high-risk-recovery` minus `DATABASE_URL` (see the job comment).
+      POSTGRES_TEST_DATABASE_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
+      POSTGRES_TEST_ADMIN_DB: postgres
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      # #4979 S2 contract, and rule4 of check_pg_test_lane_membership.py: any
+      # job that starts the service must also hard-fail on an unreachable
+      # database instead of soft-skipping to green. rule4 does not ENFORCE
+      # that. A newly appearing rule4 debt entry prints as `WARN` and the check
+      # still exits 0 -- only a *stale* baseline entry is `FAIL` -- so deleting
+      # this line turns no gate red; it quietly returns the PG-dependent tests
+      # this lane selects to soft-skip green. Treat rule4 as a ledger, and this
+      # line as load-bearing on its own.
+      AGENTDESK_REQUIRE_PG: "1"
+      # Match the other test lanes: assertions and panic text are preserved,
+      # only native debug symbols are dropped to cut link memory (#4245).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start PostgreSQL service
+        run: ./scripts/ci/postgres-service.sh start
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # See `check_fast` for rationale: `target/` excluded to protect the
+      # sccache GHA cache quota.
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          cache-bin: false
+          shared-key: cargo-dependencies-v2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # There is no execution-count floor here, deliberately. A floor is a
+      # scalar summary of a set, and both measured evasions cleared one: a
+      # 402-test narrowing of a single module and a 213-test module disable
+      # each stayed above a floor of 6500 and reported a green lane. The
+      # adjudicator instead derives the exact id set this lane must run from
+      # scripts/lib_test_inventory_manifest.txt minus the --skip patterns
+      # declared below, and names every id on either side of the difference --
+      # the same set-comparison convention #5144 moved the inventory pin onto.
+      #
+      # --skip is declared to the adjudicator as well as to libtest, and the
+      # two must match: a lane that told the adjudicator about a narrower
+      # selection than it executed would shrink its own expectation to fit.
+      #
+      # --max-summaries 2 because `non_wait_relay_parent_subprocess_entry`
+      # re-executes the test binary and its child libtest writes a second
+      # "test result:" line to the inherited stdout. Any further nesting is an
+      # error: child output is otherwise counted as if this run had produced it.
+      - name: Library sweep (selection-set gated)
+        timeout-minutes: 45
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          source scripts/ci/non-pg-test-filter.sh
+          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 2 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
+          run_non_pg_filter_false_positives
+
+      - name: Stop PostgreSQL service
+        if: always()
+        run: ./scripts/ci/postgres-service.sh stop
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+  library_sweep_required_context:
+    name: Library test sweep (ubuntu-latest)
+    needs:
+      - changes
+      - library_sweep
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror library sweep result across path-filter skips
+        env:
+          CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
+          FILTER_NAME: rust_or_policy
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy }}
+          UPSTREAM_JOB_NAME: library_sweep
+          UPSTREAM_RESULT: ${{ needs.library_sweep.result }}
         run: ./scripts/required-check-mirror.sh
 
   lint:

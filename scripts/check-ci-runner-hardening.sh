@@ -222,7 +222,10 @@ targets = {
     # to this existing toolchain-provisioned lane whose mirror is required.
     # #5025 and #4985 retain their production bridge and footer-marker coverage
     # in the same job block, so the pin covers the merged command inventory.
-    "job_sha256" => "0995b8496416accb68d636a3d115508298b457d035be9dc48e07b9fac6e2a51b",
+    # #5230 re-pins after replacing repeated PostgreSQL skip literals with the
+    # shared non-pg-test-filter source; job names, conditions, and timeouts are
+    # unchanged, and the exact commands below pin each source/use pair.
+    "job_sha256" => "1e10a6a98f3e9a9b1f89001ccc260f6759a36238bb4c36dda0d08f10fe17e406",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -241,17 +244,24 @@ targets = {
       },
       "Footer-only marker regressions" => {
         "commands" => [
-          "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
-          "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
+          "source scripts/ci/non-pg-test-filter.sh",
+          'cargo test --lib task_notification -- "${NON_PG_SKIP_ARGS[@]}"',
+          'cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- "${NON_PG_SKIP_ARGS[@]}"',
         ],
         "timeout_minutes" => 10,
       },
       "Trusted session forwarding tests" => {
-        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"],
+        "commands" => [
+          "source scripts/ci/non-pg-test-filter.sh",
+          'env -u AGENTDESK_ROOT_DIR cargo test --lib services::session_forwarding -- "${NON_PG_SKIP_ARGS[@]}"',
+        ],
         "timeout_minutes" => 10,
       },
       "Telemetry-only intake authority regressions" => {
-        "commands" => ["env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- --skip _pg --skip pg_ --skip postgres"],
+        "commands" => [
+          "source scripts/ci/non-pg-test-filter.sh",
+          'env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- "${NON_PG_SKIP_ARGS[@]}"',
+        ],
         "timeout_minutes" => 10,
       },
       "Terminal delivery evidence regressions" => {
@@ -266,6 +276,38 @@ targets = {
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
         "timeout_minutes" => 20,
+      },
+    },
+  },
+  # #5185: the PR-side whole-library sweep. Registering it here pins its step
+  # inventory, so removing the adjudicator and leaving a bare `cargo test --lib`
+  # -- which exits 0 on a zero-match filter -- is a diff that fails this script
+  # rather than one that quietly restores the false green the job exists to
+  # close. Read the two-layer caveat above before treating the hash as a
+  # guarantee: it detects change, it does not prevent it.
+  "library_sweep" => {
+    "label" => "PR library sweep job",
+    "name" => "Library test sweep",
+    "needs" => "changes",
+    "if" => "needs.changes.outputs.rust_or_policy == 'true'",
+    "runs_on" => "ubuntu-latest",
+    # #5185 re-pins after giving this lane the PostgreSQL service its own
+    # selection requires: the canonical filters are substring matches over
+    # ids, and 55 PG-dependent tests carry none of those substrings, so the
+    # job selected a database it never provisioned.
+    # The re-pin is a review trigger only; the property is enforced without a
+    # hash by `[rule5]` in scripts/check_pg_test_lane_membership.py.
+    # #5230 re-pins after sourcing the shared filter and replaying its 15
+    # source-verified non-PG false positives after the adjudicated sweep.
+    "job_sha256" => "1e8147f0eb1a23e3b49336953e8c0cd5d1214e94dd3d517444d4e35f1ef98ed8",
+    "cargo_steps" => {
+      "Library sweep (selection-set gated)" => {
+        "commands" => [
+          "source scripts/ci/non-pg-test-filter.sh",
+          'python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 2 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"',
+          "run_non_pg_filter_false_positives",
+        ],
+        "timeout_minutes" => 45,
       },
     },
   },
@@ -310,7 +352,11 @@ targets = {
     # #5181 re-pins after widening that lane from the two named #5170 oracles to
     # the whole `services::discord::queue_io::` module, now that the module's
     # pre-existing #4270/#4893 failures are fixed rather than filtered around.
-    "job_sha256" => "6bf1e4fea9bf977a711f462b6992ac27452faf2ffaf5fea36fd964aaa6354936",
+    # #5147 re-pins after adding the hang-forensics and health-diagnostics
+    # test steps to this lane. Steps were only added -- none removed,
+    # reordered or given a relaxed env -- and the value is recomputed from
+    # the workflow with this script's own canonical_yaml, never copied.
+    "job_sha256" => "131ff4835b5b0811ceeb28a2a1b11efbf0d9f1dc6bf7ad87ab62da8d1dcd02bf",
     "require_debug_env" => false,
     "cargo_steps" => {
       "Observe curated lane selections" => {

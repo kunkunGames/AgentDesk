@@ -1,5 +1,50 @@
 # Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436 / #1457)
 
+> Last refreshed: 2026-08-08 (against #5071 T1 S5b).
+>
+> — **on unix**, the recovery / fresh-send / orphan family joined the shadow
+> journal, at the anchor S5a corrected. Its three confirmed-delivery entry points
+> (the leased no-anchor fresh send, the anchored-replace edit-failure fallback,
+> and the same fallback through the turn-output controller) open one obligation
+> immediately before `RecoveryDeliveryContext::record_durable_frontier`, and that
+> funnel returns its own verdict so the obligation settles `C` only when the
+> durable write returned `Ok`; every refusal it already had — no tmux session
+> name, no current generation marker, write error, anchor bind not persisted —
+> settles `U` naming itself. Two ceilings are declared rather than papered over:
+> the obligation opens AFTER transport, because two of the three entry points only
+> learn that they advance the frontier from the edit transport's own answer, so a
+> recovery delivery lost mid-POST leaves no trace; and it emits no `T`, because no
+> receipt is observable on this path and synthesising one from the anchor message
+> id would make `requested == returned` structurally true. The journal stays
+> shadow-only with nothing reading it back, and the recovery path's bypass of the
+> `shadow_mirror_delivered_frontier` funnel is deliberately still there — S5b
+> measures that bypass, T1 S7 closes it. Off unix this family is uninstrumented:
+> the journal is `#[cfg(unix)]` while `recovery_engine` / `recovery_paths` /
+> `outbound` are not, so the family reaches it through one `cfg` door whose
+> non-unix half is an uninhabited enum. The uninstrumented baseline moves 2 -> 1;
+> the one family still uninstrumented is `pipe stream epoch`, whose own anchor is
+> the open question S5a raised. No delivery behaviour changes, so the coverage
+> rows below are unchanged.
+
+> Last refreshed: 2026-08-08 (#5071 T1 S5a — the shadow journal's **family map**
+> was corrected; no family gained instrumentation and the uninstrumented baseline
+> stays 2. The recovery / fresh-send / orphan family was anchored on
+> `tmux_reaper.rs::reap_fresh_routine_orphan`, a file that writes no delivery at
+> all — no durable frontier write, no completed-turn ledger append, no transport,
+> no journal — and matched the family only by the words "fresh" and "orphan" in a
+> symbol name. The anchor now names
+> `recovery_engine/terminal_text_idempotency.rs::record_successful_fresh_send`,
+> the entry point of the one funnel that holds all three of this family's durable
+> writes. A new rule test requires EVERY family anchor to show delivery work in
+> its own file, so the next mis-anchor fails rather than being measured; the audit
+> behind it found one more anchor with no delivery work, `pipe stream epoch`
+> (`tmux_watcher/turn_stream_collector.rs`), which is carried as a single named
+> exemption pinned to stay empty rather than being silently accepted or fixed out
+> of scope. `fresh_send.rs`'s durable write stays out of the map because
+> `OutputPlan::SendFresh` has no production constructor, pinned so the S1r-2~5
+> owner cutovers must answer it. No Rust changes, no delivery behaviour changes,
+> so the coverage rows below are unchanged.)
+
 > Last refreshed: 2026-08-06 (#5071 T1 S3b — the five **no-transport** watcher
 > frontier advances now record themselves. Silent-turn suppression, cancel-tombstone
 > suppression, fresh ready-for-input idle, post-terminal-without-inflight suppression
@@ -679,3 +724,5 @@ changing runtime behavior.
 > Last refreshed: 2026-07-24 (#4533 — the optional manual-delivery transcript record explicitly opts out of the interactive `/clear` turn-start fence because it is a synthetic post-delivery pair, not an in-flight user turn. No delivery verb, transport, dedup identity, target grammar, or callsite coverage changed.)
 
 > Last refreshed: 2026-07-29 (#4911/#4961 Phase A R9 — `outbound/delivery_record.rs` gains `WatcherDeliveryRecordAuthority` (frontier token + lease-time reset incarnation + source generation + pinned nonzero ledger user_msg_id) threaded into `record_watcher_terminal_delivery` → `shadow_mirror_delivered_frontier_inner`. Watcher and session-sink terminal deliveries now capture that immutable source identity BEFORE transport and re-verify it inside the frontier mutation guard, so a POST that landed after its source generation/incarnation was replaced advances nothing and records no fingerprint/ledger side effect (reported as `LandedStale`); a landed POST whose durable record write fails is reported as `LandedUnrecorded` instead of a silent `Delivered`. No new delivery verb, transport, target grammar, or dedup identity: the production callsite coverage map is unchanged — the same callsites now route their advance/record/fingerprint epilogue through the single guarded funnel instead of independent ambient writes.)
+
+> Last refreshed: 2026-08-07 (#5185 — `outbound/send_gate.rs` changes only inside `#[cfg(test)] mod send_source_tests`: two acquisitions of `config::shared_test_env_lock()` recover a poisoned guard with `unwrap_or_else(|poison| poison.into_inner())` instead of propagating the `PoisonError`. The widened PR library sweep measured one real failure reporting itself as eleven because every later acquirer of that mutex died on the poison; recovering at the acquisition site removes the cascade. No production code, delivery verb, transport, dedup identity, target grammar, or callsite coverage change — the callsite coverage map is unchanged. Recorded here because the `src/services/discord/outbound/**` touch rule is path-based and cannot see that the change is test-only.)

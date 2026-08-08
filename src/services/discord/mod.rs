@@ -2615,7 +2615,7 @@ mod followup_retry_requeue_tests {
     fn pre_submit_requeue_preserves_context_and_returns_enqueue_outcome() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .expect("shared env lock poisoned");
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let _guard = EnvGuard {
             previous: std::env::var(AGENTDESK_ROOT_DIR_ENV).ok(),
@@ -2677,7 +2677,7 @@ mod followup_retry_requeue_tests {
     fn pre_submit_requeue_of_marked_followup_reconstructs_marked_intervention() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .expect("shared env lock poisoned");
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let _guard = EnvGuard {
             previous: std::env::var(AGENTDESK_ROOT_DIR_ENV).ok(),
@@ -2718,7 +2718,7 @@ mod followup_retry_requeue_tests {
     fn inflight_retry_restores_earlier_message_without_reversing_fifo_4797() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .expect("shared env lock poisoned");
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let _guard = EnvGuard {
             previous: std::env::var(AGENTDESK_ROOT_DIR_ENV).ok(),
@@ -2987,11 +2987,8 @@ async fn kickoff_idle_queue_channel(
     let fresh_snapshot = mailbox_snapshot(shared, channel_id).await;
     if !idle_queue_channel_has_kickable_backlog(shared, provider, channel_id, &fresh_snapshot).await
     {
-        tracing::info!(
-            channel_id = channel_id.get(),
-            provider = provider.as_str(),
-            "KICKOFF: skipped queued turn after fresh mailbox/TUI guard"
-        );
+        turn_finalizer::handle_idle_queue_guard_skip(shared, provider, channel_id, &fresh_snapshot)
+            .await;
         return IdleQueueKickoffChannelOutcome::default();
     }
 

@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from scripts.analyze_prs import (
     has_duplicate_guard_ack,
@@ -14,6 +15,10 @@ from scripts.analyze_prs import (
     is_generated_inventory_path,
     is_scratch_file_path,
     _is_top_level_field_label,
+)
+from scripts.check_root_scratch_files import (
+    find_root_scratch_files,
+    main as check_root_scratch_files,
 )
 
 
@@ -491,45 +496,39 @@ class PrAnalyzerGeneratedInventoryPathTests(unittest.TestCase):
 
 
 class CiScriptScratchGuardTests(unittest.TestCase):
-    def test_ci_guard_includes_root_sql_scratch_files(self):
+    def test_ci_guard_uses_canonical_analyzer_policy(self):
         script = Path("scripts/ci-script-checks.sh").read_text()
 
-        self.assertIn("test.sql", script)
-        self.assertIn("scratch[._-]*.sql", script)
+        self.assertIn('"$PYTHON" -m scripts.check_root_scratch_files', script)
+        self.assertNotIn("for scratch_file in", script)
 
-    def test_ci_guard_includes_root_shell_scratch_globs(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
+    def test_root_guard_reuses_all_canonical_scratch_types(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            scratch_names = {
+                "patch.diff",
+                "changes.patch",
+                "test.py",
+                "scratch-tool.js",
+                "test_payload.json",
+                "scratch.sql",
+                "test_cli.rs",
+            }
+            for name in scratch_names | {"README.md"}:
+                (root / name).write_text("fixture\n", encoding="utf-8")
 
-        self.assertIn("scratch.sh", script)
-        self.assertIn("verify.sh", script)
-        self.assertIn("scratchpad.sh", script)
-        self.assertIn("scratch[._-]*.sh", script)
-        self.assertIn("scratchpad[._-]*.sh", script)
+            self.assertEqual(
+                {path.name for path in find_root_scratch_files(root)}, scratch_names
+            )
+            self.assertEqual(check_root_scratch_files(root), 1)
 
-    def test_ci_guard_includes_root_diff_patch_globs(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
+    def test_root_guard_accepts_a_clean_root(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("fixture\n", encoding="utf-8")
 
-        self.assertIn("*.diff", script)
-        self.assertIn("*.patch", script)
-        self.assertIn("patch.diff", script)
-
-    def test_ci_guard_includes_analyzer_md_txt_rs_scratch_globs(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
-
-        self.assertIn("scratch[._-]*.md", script)
-        self.assertIn("scratchpad[._-]*.txt", script)
-        self.assertIn("test_scratch[._-]*.rs", script)
-        self.assertIn("test_*.rs", script)
-
-    def test_ci_guard_includes_py_js_scratch_globs(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
-
-        self.assertIn("test.py", script)
-        self.assertIn("scratch[._-]*.py", script)
-        self.assertIn("test_*.py", script)
-        self.assertIn("test.js", script)
-        self.assertIn("scratch[._-]*.js", script)
-        self.assertIn("test_*.js", script)
+            self.assertEqual(find_root_scratch_files(root), [])
+            self.assertEqual(check_root_scratch_files(root), 0)
 
 class PrAnalyzerRegexTests(unittest.TestCase):
     def test_bold_label_before_colon(self):

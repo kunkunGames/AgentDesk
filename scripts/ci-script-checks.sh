@@ -89,6 +89,17 @@ echo "=== DeliveryJournal raw-writer allowlist ==="
 "$PYTHON" scripts/check_delivery_journal_raw_writer.py
 "$PYTHON" -m unittest tests.test_delivery_journal_raw_writer
 
+echo "=== Durable frontier writer per-file call-site allowlist (#5071) ==="
+# Built for #5071 T1 S7, which changes the recovery path's durable behaviour.
+# Nothing in the repo pinned WHERE these writer symbols are called from, so this
+# fixes an exact per-file count for each of them over all of src/ before that
+# behaviour moves. It changes no production behaviour itself. Lexical scan: it
+# does not see `use .. as` aliases, renamed re-exports, or name-constructing
+# macros -- the script's docstring declares those holes and the unittest module
+# measures each one.
+"$PYTHON" scripts/check_durable_frontier_writer_call_sites.py
+"$PYTHON" -m unittest tests.test_durable_frontier_writer_call_sites
+
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
 "$PYTHON" -m unittest scripts.test_ratchet_admission
@@ -105,11 +116,19 @@ echo "=== Inflight blind-save ratchet guard (#4259) ==="
 # #4511 post-deploy smoke WARN post-restart scoping
 bash tests/test_deploy_smoke_warn_scope_4511.sh
 
+echo "=== Cluster deploy peer verdict + terminal marker contract (#5189) ==="
+bash tests/test_cluster_deploy_peer_verdict_5189.sh
+
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
 "$PYTHON" -m unittest tests.test_discord_thread_create_ci_wiring
 
-echo "=== PR infrastructure failure rerun classifier (#4392) ==="
+echo "=== PR infrastructure failure rerun classifier (#4392/#5207) ==="
+# The self-test also enforces the #5207 sibling-regex sync contract: the
+# classifier's INFRA_TERMINATION_REGEX must stay byte-identical to
+# log_has_infra_termination in scripts/main-ci-triage.sh, and drift fails here.
+# tests/test_infra_failure_classifier_5207.sh (tests/*.sh loop below) carries
+# the discriminating matrix and proves drift detection actually discriminates.
 ./scripts/ci/infra-failure-rerun.sh --self-test
 
 echo "=== CI timeout wrapper tests (#4413) ==="
@@ -153,38 +172,19 @@ echo "=== PostgreSQL test-lane membership gate (#4979, enforced) ==="
 "$PYTHON" scripts/check_pg_test_lane_membership.py --baseline-ref "$TEST_LANE_BASELINE_REF"
 "$PYTHON" -m unittest tests.test_check_pg_test_lane_membership
 
+echo "=== Process-global Mutex<()> poison-recovery gate (#5185) ==="
+# The rule this enforces was documented in src/config.rs and recurred anyway:
+# one real failure reported itself as 11, was repaired at one mutex, and then a
+# different process-global Mutex<()> turned one real failure into 68 (67 of 73
+# panics were PoisonError). A rule that only exists as prose is #5003.
+"$PYTHON" scripts/check_test_mutex_poison_recovery.py
+"$PYTHON" -m unittest tests.test_check_test_mutex_poison_recovery
+
 echo "=== Scheduled-message PG path-filter wiring contract ==="
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
 
 echo "=== Scratch file guard ==="
-FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in scratch.sql scratchpad.sql scratch[._-]*.sql scratchpad[._-]*.sql test_scratch[._-]*.sql; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch SQL file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch shell file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
-if [ "$FAIL" -ne 0 ]; then
-  exit "$FAIL"
-fi
+"$PYTHON" -m scripts.check_root_scratch_files
 
 echo "=== Check hardcoded port/path drift ==="
 grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \

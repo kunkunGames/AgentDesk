@@ -252,7 +252,9 @@ where
             ..
         } => {
             if let Some(context) = recovery_context {
-                context.record_successful_fresh_send(anchor, body);
+                context.record_successful_fresh_send_after_controller_edit_fallback(
+                    shared, anchor, body,
+                );
             } else {
                 tracing::warn!(
                     channel_id = channel_id.get(),
@@ -605,6 +607,7 @@ mod tests {
         inflight::save_inflight_state(&state).expect("save inflight");
         let shared = make_shared_data_for_tests();
         let context = RecoveryDeliveryContext::from_state(
+            &shared,
             &provider,
             &state,
             Some((128, 256)),

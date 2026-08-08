@@ -7,6 +7,7 @@ use super::provider_probe::{self, ProviderHealthSnapshot};
 use super::redaction;
 use super::session_enrichment::SessionEnrichment;
 use super::stall_verdict;
+use super::transcript_binding_stall::{self, resolve_bound_selector};
 use super::{BotTokenReloadScopes, HealthRegistry, bot_token_reload_scopes};
 use crate::services::discord;
 use crate::services::discord::SharedData;
@@ -111,6 +112,10 @@ pub struct WatcherStateSnapshot {
     /// advances a watermark) is intentionally never consulted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_session_id: Option<String>,
+    /// #5188 (R5/R6): `"none"`, or why a delivery binding is pointed at a
+    /// transcript that stopped growing. See
+    /// [`super::transcript_binding_stall::TranscriptBindingStall`].
+    pub transcript_binding_stall: &'static str,
     /// #3126: `true` when the in-flight row records a turn whose terminal
     /// assistant response has already been committed
     /// (`InflightTurnState::terminal_delivery_committed`). A row with this set
@@ -208,39 +213,6 @@ fn ownerless_external_input_inflight_is_idle(
     inflight: Option<&discord::inflight::InflightTurnState>,
 ) -> bool {
     inflight.is_some_and(discord::inflight::ownerless_external_input_inflight_is_stale)
-}
-
-/// #4408 phase-2 (I1): resolve the transcript path / provider session the relay
-/// tail is bound to, surfaced on `watcher-state` so the out-of-band watchdog can
-/// compare the server's asserted selector (B) against its own growth-aware
-/// transcript pick (F).
-///
-/// Precedence is per field: a live inflight row's persisted `output_path` /
-/// `session_id` win because they are the authoritative binding; when the inflight
-/// row is absent — or leaves a field blank — we fall back to the in-memory tmux
-/// runtime binding's `relay_output_path` / `session_id`. Both inputs come from
-/// sync single-shot lookups that never straddle an await (so no
-/// `await_holding_lock` allow is introduced), and the side-effecting
-/// claude-session-id GET path is intentionally NOT consulted. A field is `None`
-/// when neither source knows it, so serialization omits it and the watchdog fails
-/// closed instead of alarming on an unknown bind.
-fn resolve_bound_selector(
-    inflight_output_path: Option<&str>,
-    inflight_session_id: Option<&str>,
-    binding: Option<&crate::services::tui_prompt_dedupe::TuiRuntimeBinding>,
-) -> (Option<String>, Option<String>) {
-    fn non_blank(value: Option<&str>) -> Option<String> {
-        value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    }
-
-    let bound_output_path = non_blank(inflight_output_path)
-        .or_else(|| non_blank(binding.map(|binding| binding.relay_output_path())));
-    let bound_session_id = non_blank(inflight_session_id)
-        .or_else(|| non_blank(binding.and_then(|binding| binding.session_id.as_deref())));
-    (bound_output_path, bound_session_id)
 }
 
 fn relay_active_turn_from_inflight(
@@ -640,6 +612,15 @@ async fn watcher_state_snapshot_for_shared(
             .and_then(|state| state.session_id.as_deref()),
         tmux_runtime_binding.as_ref(),
     );
+    let transcript_binding_stall = transcript_binding_stall::resolve_transcript_binding_stall(
+        provider_name,
+        authoritative_tmux_session.as_deref(),
+        bound_output_path.as_deref(),
+        bound_session_id.as_deref(),
+        session.attached,
+        tmux_session_alive,
+        session.inflight_state_present,
+    );
     Some(WatcherStateSnapshot {
         provider: provider_name.to_string(),
         attached: session.attached,
@@ -663,6 +644,7 @@ async fn watcher_state_snapshot_for_shared(
         mailbox_active_turn_nonce: mailbox_snapshot.active_turn_nonce.clone(),
         bound_output_path,
         bound_session_id,
+        transcript_binding_stall: transcript_binding_stall.as_str(),
         inflight_terminal_delivery_committed: session.inflight_terminal_delivery_committed(),
         inflight_identity: session
             .inflight
@@ -819,11 +801,10 @@ async fn build_health_snapshot_with_options(
                     recovery_started: snapshot.recovery_started_at.is_some(),
                     active_request_owner: snapshot.active_request_owner.map(|id| id.get()),
                     active_user_message_id: mailbox_active_user_msg_id,
-                    agent_turn_status: if mailbox_has_cancel_token {
-                        "active"
-                    } else {
-                        "idle"
-                    },
+                    agent_turn_status: super::mailbox::mailbox_agent_turn_status(
+                        mailbox_has_cancel_token,
+                        super::mailbox::residual_occupancy(&entry.shared, channel, &snapshot),
+                    ),
                     watcher_attached: session.watcher_attached,
                     inflight_state_present: session.inflight_state_present,
                     tmux_present,
@@ -1275,5 +1256,63 @@ mod tests {
             crate::services::discord::ChannelMailboxRegistry::global_handle(channel).is_none(),
             "health snapshot construction must remain peek-only for absent channels"
         );
+    }
+
+    #[test]
+    fn health_detail_marks_same_episode_guarded_finish_occupancy_residual() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("temp runtime root");
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("health detail test runtime")
+            .block_on(async {
+                let registry = HealthRegistry::new();
+                let shared = crate::services::discord::make_shared_data_for_tests();
+                registry
+                    .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+                    .await;
+                let channel =
+                    ChannelId::new(NEXT_ABSENT_MAILBOX_CHANNEL.fetch_add(1, Ordering::Relaxed));
+                let active_user_msg_id = 5_068_301;
+                let token = Arc::new(CancelToken::new());
+                let nonce = token.turn_nonce().expect("fresh token nonce").to_string();
+                assert!(
+                    crate::services::discord::mailbox_try_start_turn(
+                        &shared,
+                        channel,
+                        token,
+                        UserId::new(7),
+                        MessageId::new(active_user_msg_id),
+                    )
+                    .await
+                );
+                shared.turn_finalizer.guarded_finish_residues().insert(
+                    channel,
+                    crate::services::discord::turn_finalizer::GuardedFinishResidue {
+                        expected_user_msg_id: 5_068_300,
+                        active_user_msg_id,
+                        generation: 0,
+                        provider: ProviderKind::Claude,
+                        terminal_turn_nonce: Some(nonce.clone()),
+                        active_turn_nonce: Some(nonce),
+                        observed_before: std::time::Instant::now(),
+                        allow_completion_cleanup: true,
+                        drain_voice: true,
+                        terminal_was_cancel: false,
+                    },
+                );
+
+                let json = serde_json::to_value(build_health_snapshot(&registry).await)
+                    .expect("serialize residual mailbox health");
+                assert_eq!(json["mailboxes"][0]["agent_turn_status"], "residual");
+                assert_eq!(
+                    json["mailboxes"][0]["active_user_message_id"],
+                    active_user_msg_id
+                );
+            });
     }
 }

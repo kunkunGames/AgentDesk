@@ -117,6 +117,33 @@ class PostgresMigrationChecksumGuardTest(unittest.TestCase):
         self.assertIn(sha256(self.original), result.stderr)
         self.assertIn(sha256(self.changed), result.stderr)
 
+    def test_rejects_duplicate_simple_migration_versions(self):
+        duplicate = self.migrations_dir / "0001_duplicate.sql"
+        duplicate.write_bytes(b"CREATE TABLE duplicate_example (id BIGINT PRIMARY KEY);\n")
+
+        result = self.run_guard()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate PostgreSQL migration version 0001", result.stderr)
+        self.assertIn("0001_duplicate.sql", result.stderr)
+        self.assertIn("0001_initial_schema.sql", result.stderr)
+
+    def test_allows_matching_up_down_migration_pair(self):
+        up = self.migrations_dir / "0001_initial_schema.up.sql"
+        down = self.migrations_dir / "0001_initial_schema.down.sql"
+        self.migration.rename(up)
+        down.write_bytes(b"DROP TABLE example;\n")
+
+        migrations = self.guard.find_migrations(self.root)
+
+        self.assertEqual(
+            set(migrations),
+            {
+                "migrations/postgres/0001_initial_schema.down.sql",
+                "migrations/postgres/0001_initial_schema.up.sql",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

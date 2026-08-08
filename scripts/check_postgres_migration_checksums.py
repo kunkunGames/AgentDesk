@@ -82,6 +82,7 @@ def validate_migration_relpath(path: str) -> str | None:
 def find_migrations(root: Path) -> dict[str, Migration]:
     migrations_dir = root / "migrations" / "postgres"
     migrations: dict[str, Migration] = {}
+    paths_by_version: dict[int, list[str]] = {}
     if not migrations_dir.is_dir():
         raise ValueError(f"missing migrations directory: {migrations_dir}")
     for path in sorted(migrations_dir.iterdir()):
@@ -91,11 +92,39 @@ def find_migrations(root: Path) -> dict[str, Migration]:
         if not match:
             continue
         rel_path = path.relative_to(root).as_posix()
+        version = int(match.group("version"))
         migrations[rel_path] = Migration(
             path=rel_path,
-            version=int(match.group("version")),
+            version=version,
             sha256=sha256_file(path),
         )
+        paths_by_version.setdefault(version, []).append(rel_path)
+
+    for version, paths in sorted(paths_by_version.items()):
+        if len(paths) == 1:
+            continue
+
+        reversible_parts: list[tuple[str, str]] = []
+        for rel_path in paths:
+            match = re.match(
+                r"^(?P<stem>[0-9]{4}_.+)\.(?P<direction>up|down)\.sql$",
+                Path(rel_path).name,
+            )
+            if match:
+                reversible_parts.append((match.group("stem"), match.group("direction")))
+
+        is_reversible_pair = (
+            len(paths) == 2
+            and len(reversible_parts) == 2
+            and len({stem for stem, _ in reversible_parts}) == 1
+            and {direction for _, direction in reversible_parts} == {"up", "down"}
+        )
+        if not is_reversible_pair:
+            joined_paths = ", ".join(sorted(paths))
+            raise ValueError(
+                f"duplicate PostgreSQL migration version {version:04d}: {joined_paths}; "
+                "only one migration or a matching .up.sql/.down.sql pair is allowed"
+            )
     return migrations
 
 
