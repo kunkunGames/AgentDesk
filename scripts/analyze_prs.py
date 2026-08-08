@@ -296,6 +296,8 @@ def main():
             print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
         if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"]):
             print("  [!] MISSING RELATED PRS: PR body lacks the required 'Related PRs/issues checked' field.")
+        if not has_non_empty_body_field(body, ["duplicate/overlap check"]):
+            print("  [!] MISSING DUPLICATE OVERLAP CHECK FIELD: PR body lacks the required 'Duplicate/overlap check' field.")
         if not has_non_empty_body_field(body, ["why this is non-overlapping", "non-overlapping reason"]):
             print("  [!] MISSING NON-OVERLAPPING REASON: PR body lacks the required 'Why this is non-overlapping' field.")
         if not has_duplicate_guard_ack(body):
