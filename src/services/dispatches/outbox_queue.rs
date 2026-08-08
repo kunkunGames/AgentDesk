@@ -197,7 +197,9 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
     {
         check_dispatch_outbox_retry_count_in_bounds(id, &dispatch_id, retry_count);
         if action == "notify" {
-            let suppress_delivery = match dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id).await {
+            let suppress_delivery = match dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id)
+                .await
+            {
                 Ok(suppressed) => suppressed,
                 Err(error) => {
                     tracing::warn!(

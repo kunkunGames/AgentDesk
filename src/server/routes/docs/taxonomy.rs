@@ -40,7 +40,7 @@ pub(super) fn canonical_category(category: &str) -> &'static str {
         "routines" => "routines",
         "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats" | "v1"
         | "provider-cli" | "claude-accounts" => "ops",
-        "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
+        "discord" | "github" | "github-dashboard" | "kakao" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
         | "skills" => "admin",
         _ => "ops",
@@ -87,7 +87,7 @@ pub(super) fn category_to_group(category: &str) -> &'static str {
         // agents — agents, agent-setup, agent-quality, roles
         "agents" => "agents",
         // integrations — discord, github, meetings, provider, mcp
-        "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
+        "discord" | "github" | "github-dashboard" | "kakao" | "meetings" => "integrations",
         // automation — auto-queue, policies, scheduler, cron, maintenance
         "auto-queue" | "automation-candidates" | "queue" | "cron" | "policies" | "routines" => {
             "automation"
@@ -188,6 +188,9 @@ pub(super) fn category_description(category: &str) -> &'static str {
         "health" => "Health and liveness endpoints.",
         "internal" => "Internal-only thread reuse helpers used by the runtime.",
         "kanban-repos" => "Kanban repository settings and ownership metadata.",
+        "kakao" => {
+            "Kakao OAuth connection, message-eligible friends, and manual friend-share operations."
+        }
         "meetings" => "Round-table meeting lifecycle and issue generation.",
         "memory" => {
             "Memory fragment CRUD (recall/remember/forget) with auto-selected memento-or-local backend."

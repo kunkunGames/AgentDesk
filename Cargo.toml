@@ -75,7 +75,7 @@ json5 = "0.4"
 futures = "0.3"
 ureq = { version = "2", features = ["json"] }
 url = "2"
-uuid = { version = "1", features = ["v4", "v5"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 chrono-tz = "0.10"
 notify = "7"
@@ -98,12 +98,15 @@ icu_properties = "=2.1.2"
 # From RCC — crypto/encoding
 base64 = "0.22"
 blake3 = "1"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 # From RCC — concurrency
 dashmap = "6"
 
 # From RCC — HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 
 # From RCC — crypto
 sha2 = "0.10"

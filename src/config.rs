@@ -27,6 +27,8 @@ pub struct Config {
     pub meeting: Option<MeetingSettings>,
     #[serde(default)]
     pub github: GitHubConfig,
+    #[serde(default, skip_serializing_if = "IntegrationsConfig::is_default")]
+    pub integrations: IntegrationsConfig,
     #[serde(default)]
     pub policies: PoliciesConfig,
     #[serde(default)]
@@ -67,12 +69,51 @@ pub struct Config {
     /// swapped in; a parse/validation failure keeps the running config. Infra
     /// fields (`server` bind/port/auth, `database`, `data.dir`, `cluster`,
     /// Discord/provider/agent launch and voice runtimes, MCP child processes and
-    /// credential watcher, `memory`, GitHub sync cadence, prompt retention, and
-    /// the config watcher flag itself) are NOT hot-swapped — a change to those is
-    /// applied to the shared snapshot but logged as restart-required, since live
-    /// subsystems bound them at boot.
+    /// credential watcher, `memory`, external `integrations`, GitHub sync cadence,
+    /// prompt retention, and the config watcher flag itself) are NOT hot-swapped —
+    /// a change to those is applied to the shared snapshot but logged as
+    /// restart-required, since live subsystems bound them at boot.
     #[serde(default = "default_true")]
     pub config_hot_reload: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct IntegrationsConfig {
+    #[serde(skip_serializing_if = "KakaoFriendShareConfig::is_default")]
+    pub kakao_friend_share: KakaoFriendShareConfig,
+}
+
+impl IntegrationsConfig {
+    pub fn is_default(&self) -> bool {
+        self.kakao_friend_share.is_default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct KakaoFriendShareConfig {
+    pub enabled: bool,
+    pub redirect_uri: String,
+    pub landing_url: String,
+    pub send_limit_per_hour: u32,
+}
+
+impl KakaoFriendShareConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Default for KakaoFriendShareConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redirect_uri: "http://127.0.0.1:8791/api/kakao/oauth/callback".to_string(),
+            landing_url: "http://127.0.0.1:8791/".to_string(),
+            send_limit_per_hour: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2754,6 +2795,7 @@ impl Default for Config {
             agents: Vec::new(),
             meeting: None,
             github: GitHubConfig::default(),
+            integrations: IntegrationsConfig::default(),
             policies: PoliciesConfig::default(),
             data: DataConfig::default(),
             database: DatabaseConfig::default(),
@@ -2839,7 +2881,49 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    validate_escalation_schedule(&config.escalation.schedule)
+    validate_escalation_schedule(&config.escalation.schedule)?;
+    validate_kakao_friend_share_config(&config.integrations.kakao_friend_share)
+}
+
+fn validate_kakao_friend_share_config(config: &KakaoFriendShareConfig) -> Result<()> {
+    if !(1..=1_000).contains(&config.send_limit_per_hour) {
+        bail!("integrations.kakao_friend_share.send_limit_per_hour must be between 1 and 1000");
+    }
+    validate_external_http_url(
+        "integrations.kakao_friend_share.redirect_uri",
+        &config.redirect_uri,
+    )?;
+    validate_external_http_url(
+        "integrations.kakao_friend_share.landing_url",
+        &config.landing_url,
+    )
+}
+
+fn validate_external_http_url(field: &str, raw: &str) -> Result<()> {
+    let parsed =
+        url::Url::parse(raw).with_context(|| format!("{field} must be an absolute URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("{field} must use http or https");
+    }
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("{field} must have a host and no credentials or fragment");
+    }
+    if parsed.scheme() == "http" {
+        let is_loopback = match parsed.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(host)) => host.is_loopback(),
+            Some(url::Host::Ipv6(host)) => host.is_loopback(),
+            None => false,
+        };
+        if !is_loopback {
+            bail!("{field} must use https unless the host is loopback");
+        }
+    }
+    Ok(())
 }
 
 fn validate_escalation_schedule(schedule: &EscalationScheduleConfig) -> Result<()> {
@@ -2883,6 +2967,19 @@ fn register_config_secrets(config: &Config) {
             crate::utils::redact::register_known_secret(&value);
         }
     }
+    if config.integrations.kakao_friend_share.enabled {
+        for env_name in [
+            "KAKAO_REST_API_KEY",
+            "KAKAO_CLIENT_SECRET",
+            "AGENTDESK_OAUTH_TOKEN_KEY_V1",
+        ] {
+            if let Ok(value) = std::env::var(env_name)
+                && !value.is_empty()
+            {
+                crate::utils::redact::register_known_secret(&value);
+            }
+        }
+    }
 }
 
 fn config_contains_file_secrets(config: &Config) -> bool {
@@ -2915,6 +3012,42 @@ pub fn save_to_path(path: &Path, config: &Config) -> Result<()> {
             .with_context(|| format!("Failed to write config {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kakao_friend_share_config_tests {
+    use super::*;
+
+    #[test]
+    fn kakao_friend_share_defaults_to_disabled_and_safe_local_urls() {
+        let config = KakaoFriendShareConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.send_limit_per_hour, 30);
+        assert!(validate_kakao_friend_share_config(&config).is_ok());
+    }
+
+    #[test]
+    fn kakao_friend_share_rejects_credentials_fragments_and_non_http_urls() {
+        for invalid in [
+            "https://user@example.com/callback",
+            "https://example.com/callback#fragment",
+            "http://example.com/callback",
+            "file:///tmp/callback",
+        ] {
+            let mut config = KakaoFriendShareConfig::default();
+            config.redirect_uri = invalid.to_string();
+            assert!(validate_kakao_friend_share_config(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn kakao_friend_share_rejects_unbounded_send_limits() {
+        let mut config = KakaoFriendShareConfig::default();
+        config.send_limit_per_hour = 0;
+        assert!(validate_kakao_friend_share_config(&config).is_err());
+        config.send_limit_per_hour = 1_001;
+        assert!(validate_kakao_friend_share_config(&config).is_err());
+    }
 }
 
 #[cfg(test)]

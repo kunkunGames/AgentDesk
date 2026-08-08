@@ -545,6 +545,11 @@
       "path": "migrations/postgres/0106_auto_queue_run_cleanup_tasks.sql",
       "sha256": "658c3e35c36fcaa06f868810b264882524f1a11a1acb4181c6ded003475115d8",
       "version": 106
+    },
+    {
+      "path": "migrations/postgres/0107_kakao_friend_share.sql",
+      "sha256": "179b8896d8ff4cfa66307c71a4420d9c942a9256b7d58f2b4360e85f3b736bcd",
+      "version": 107
     }
   ],
   "version": 1

@@ -2,6 +2,18 @@ server:
   port: 8791
   host: "0.0.0.0"
 
+# Optional external integrations are disabled by default. Credentials remain in
+# environment variables and are never written to this file. Kakao friend share
+# additionally requires KAKAO_REST_API_KEY, KAKAO_CLIENT_SECRET, and a base64
+# 32-byte AGENTDESK_OAUTH_TOKEN_KEY_V1 value.
+integrations:
+  kakao_friend_share:
+    enabled: false
+    # HTTP is accepted only for loopback development; remote URLs must use HTTPS.
+    redirect_uri: "http://127.0.0.1:8791/api/kakao/oauth/callback"
+    landing_url: "http://127.0.0.1:8791/"
+    send_limit_per_hour: 30
+
 cluster:
   enabled: false
   # Optional operator-owned settings per node. Keys match worker `instance_id`

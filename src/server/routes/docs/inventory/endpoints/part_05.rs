@@ -495,14 +495,17 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                         "name": "Obsidian skill root",
                         "state": "missing_config",
                         "optional": true,
+                        "kind": "filesystem",
                         "env_var": "AGENTDESK_OBSIDIAN_SKILL_ROOT",
+                        "env_vars": ["AGENTDESK_OBSIDIAN_SKILL_ROOT"],
                         "source": "/Users/user/ObsidianVault/RemoteVault/99_Skills",
                         "reason": "missing_config",
                         "detail": "state=missing_config source=/Users/user/ObsidianVault/RemoteVault/99_Skills reason=missing_config",
                         "setup_actions": [
                             "Set AGENTDESK_OBSIDIAN_SKILL_ROOT to an existing skill directory containing at least one <skill>/SKILL.md, or run scripts/operator-init-portable.py --with-obsidian-stubs before syncing real skills."
                         ],
-                        "capabilities": ["obsidian_skill_root"]
+                        "capabilities": ["obsidian_skill_root"],
+                        "actions": []
                     }
                 ],
                 "summary": {

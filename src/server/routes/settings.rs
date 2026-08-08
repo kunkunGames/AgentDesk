@@ -70,11 +70,15 @@ pub async fn get_runtime_config(
 }
 
 /// GET /api/settings/operator-connectors
-pub async fn get_operator_connectors() -> AppResult<(StatusCode, Json<Value>)> {
-    Ok(settings_json_response(
-        StatusCode::OK,
-        OptionalConnectorsResponse::current(),
-    ))
+pub async fn get_operator_connectors(
+    State(state): State<AppState>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    let response = OptionalConnectorsResponse::current_with_kakao(
+        state.pg_pool_ref(),
+        &state.config.integrations.kakao_friend_share,
+    )
+    .await;
+    Ok(settings_json_response(StatusCode::OK, response))
 }
 
 /// PUT /api/settings/runtime-config applies a metadata-less update or explicit replacement.

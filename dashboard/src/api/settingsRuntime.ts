@@ -110,12 +110,22 @@ export interface OperatorConnectorStatus {
   name: string;
   state: OperatorConnectorState;
   optional: boolean;
+  kind: "filesystem" | "oauth" | string;
   env_var: string;
+  env_vars: string[];
   source: string | null;
   reason: string | null;
   detail: string;
   setup_actions: string[];
   capabilities: string[];
+  connection?: {
+    state: string;
+    reason: string | null;
+    scopes: string[];
+    access_expires_at: string | null;
+    landing_url: string | null;
+  };
+  actions: string[];
 }
 
 export interface OperatorConnectorsResponse {
@@ -135,6 +145,77 @@ export interface OperatorConnectorsResponse {
 
 export async function getOperatorConnectors(): Promise<OperatorConnectorsResponse> {
   return request("/api/settings/operator-connectors");
+}
+
+export interface KakaoOAuthStartResponse {
+  authorize_url: string;
+  expires_in_seconds: number;
+}
+
+export interface KakaoFriendView {
+  uuid: string;
+  display_name: string;
+}
+
+export interface KakaoFriendsPage {
+  friends: KakaoFriendView[];
+  total_count: number;
+  offset: number;
+  limit: number;
+  next_offset: number | null;
+}
+
+export type KakaoSendStatus = "success" | "partial_success" | "failed" | "unknown";
+
+export interface KakaoSendResult {
+  request_id: string;
+  status: KakaoSendStatus;
+  requested_count: number;
+  successful_count: number;
+  failed_count: number;
+  replayed: boolean;
+  delivery_may_have_occurred: boolean;
+  automatic_retry_allowed: false;
+}
+
+export async function startKakaoOAuth(): Promise<KakaoOAuthStartResponse> {
+  return request("/api/kakao/oauth/start", {
+    method: "POST",
+    maxRetries: 0,
+  });
+}
+
+export async function disconnectKakao(): Promise<{
+  ok: boolean;
+  connector_id: string;
+  connection_state: string;
+  remote_unlinked: boolean;
+}> {
+  return request("/api/kakao/connection", {
+    method: "DELETE",
+    maxRetries: 0,
+  });
+}
+
+export async function getKakaoFriends(offset = 0, limit = 20): Promise<KakaoFriendsPage> {
+  return request(`/api/kakao/friends?offset=${offset}&limit=${limit}`);
+}
+
+export async function sendKakaoFriendMessage(
+  idempotencyKey: string,
+  receiverUuids: string[],
+  text: string,
+): Promise<KakaoSendResult> {
+  return request("/api/kakao/messages/send", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify({
+      receiver_uuids: receiverUuids,
+      text,
+      confirmed: true,
+    }),
+    maxRetries: 0,
+  });
 }
 
 export async function getEscalationSettings(): Promise<EscalationSettingsResponse> {

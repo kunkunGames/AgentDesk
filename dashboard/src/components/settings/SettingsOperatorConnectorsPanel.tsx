@@ -2,6 +2,7 @@ import { AlertTriangle, CheckCircle2, CircleSlash, RefreshCw } from "lucide-reac
 import type { CSSProperties } from "react";
 import type { OperatorConnectorStatus, OperatorConnectorsResponse } from "../../api";
 import { SurfaceEmptyState as SettingsEmptyState } from "../common/SurfacePrimitives";
+import { KakaoFriendShareControls } from "./KakaoFriendShareControls";
 
 interface SettingsOperatorConnectorsPanelProps {
   connectors: OperatorConnectorsResponse | null;
@@ -74,7 +75,14 @@ export function SettingsOperatorConnectorsPanel({
       ) : (
         <div className="grid gap-3">
           {rows.map((connector) => (
-            <ConnectorRow key={connector.id} connector={connector} tr={tr} />
+            <ConnectorRow
+              key={connector.id}
+              connector={connector}
+              onReload={onReload}
+              secondaryActionClass={secondaryActionClass}
+              secondaryActionStyle={secondaryActionStyle}
+              tr={tr}
+            />
           ))}
         </div>
       )}
@@ -109,9 +117,15 @@ function SummaryPill({
 
 function ConnectorRow({
   connector,
+  onReload,
+  secondaryActionClass,
+  secondaryActionStyle,
   tr,
 }: {
   connector: OperatorConnectorStatus;
+  onReload: () => void;
+  secondaryActionClass: string;
+  secondaryActionStyle: CSSProperties;
   tr: (ko: string, en: string) => string;
 }) {
   const state = normalizedState(connector.state);
@@ -150,8 +164,13 @@ function ConnectorRow({
       </div>
 
       <div className="mt-3 grid gap-2 text-[12px] leading-5" style={{ color: "var(--th-text-muted)" }}>
-        <FieldLine label={tr("환경변수", "Env var")} value={connector.env_var} />
-        <FieldLine label={tr("경로", "Path")} value={connector.source ?? tr("미확인", "Unavailable")} />
+        <FieldLine
+          label={tr("환경변수", "Env vars")}
+          value={(connector.env_vars?.length ? connector.env_vars : [connector.env_var]).filter(Boolean).join(", ")}
+        />
+        {connector.kind === "filesystem" ? (
+          <FieldLine label={tr("경로", "Path")} value={connector.source ?? tr("미확인", "Unavailable")} />
+        ) : null}
         {connector.reason ? <FieldLine label={tr("사유", "Reason")} value={connector.reason} /> : null}
       </div>
 
@@ -171,6 +190,16 @@ function ConnectorRow({
             ))}
           </ul>
         </div>
+      ) : null}
+
+      {connector.id === "kakao_friend_share" && connector.kind === "oauth" ? (
+        <KakaoFriendShareControls
+          connector={connector}
+          onReload={onReload}
+          secondaryActionClass={secondaryActionClass}
+          secondaryActionStyle={secondaryActionStyle}
+          tr={tr}
+        />
       ) : null}
     </div>
   );

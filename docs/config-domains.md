@@ -12,7 +12,13 @@ This document is the operator-side index for the three domains. The precedence a
 | **dashboard** (company settings) | The dashboard UI and any caller that owns the merged company-settings JSON document | `kv_meta['settings']` | n/a — this surface IS the override | Full-replace contract. No YAML baseline. Hidden keys (e.g. `roomThemes`) survive only if callers re-merge them. |
 | **bot-settings** | Discord bot bindings, agent roster, channel→agent routing, default per-bot behavior | `agentdesk.yaml` (`discord:`, `agents[].channels`) | None at runtime; defaults are read-only metadata derived from the YAML | Legacy `bot_settings.json` and `role_map.json` are migration inputs only. The dashboard "bot defaults" view is read-only over this YAML. |
 
-A surface that doesn't fit one of the three domains (escalation override, onboarding/secrets) is a separate, dedicated store — see the surface matrix in `adr-settings-precedence.md`.
+A surface that doesn't fit one of the three domains (external integrations, escalation override, onboarding/secrets) is a separate, dedicated store — see the surface matrix in `adr-settings-precedence.md`.
+
+### Dedicated daemon integration configuration
+
+External provider integrations are YAML-only daemon configuration, not dashboard company settings and not `kv_meta['runtime-config']`. Their canonical home is `agentdesk.yaml` under `integrations:`; they are restart-required and default disabled. Secret values stay in fixed environment variables, while runtime OAuth state and encrypted tokens live in dedicated Postgres tables. The Settings connector panel is a status/action projection over that configuration and database state, not a second writable configuration owner.
+
+The first concrete block is `integrations.kakao_friend_share`. Its non-secret fields (`enabled`, exact OAuth `redirect_uri`, fixed recipient `landing_url`, and DB-backed `send_limit_per_hour`) are YAML-owned. `KAKAO_REST_API_KEY`, `KAKAO_CLIENT_SECRET`, and `AGENTDESK_OAUTH_TOKEN_KEY_V1` are environment-owned and must never be copied into YAML, company settings, runtime overrides, or connector JSON.
 
 ## Domain 1 — `runtime-config`
 
@@ -85,6 +91,7 @@ For the runtime side, the relevant modules are:
 - `src/services/discord_config_audit.rs` — bot-settings ingestion and YAML validation.
 - `src/services/settings.rs` — runtime-config + dashboard surface plumbing.
 - `src/services/mcp_config.rs` — MCP server declarations (a separate sub-vector under `agentdesk.yaml` documented in `source-of-truth.md`).
+- `src/services/kakao.rs` and `src/services/oauth_connection.rs` — optional Kakao integration execution and encrypted OAuth state.
 - `src/runtime_layout/paths.rs` — canonical paths used by all three domains.
 
 ## Related Documents
