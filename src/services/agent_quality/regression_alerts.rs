@@ -177,7 +177,7 @@ where
 /// Legitimately-absent optional columns are *not* affected: a SQL `NULL`
 /// decoded into an `Option<T>` target is `Ok(None)` at the sqlx layer and never
 /// reaches the `ColumnDecode` arm, so the existing `None` / `0` defaults for
-/// genuinely-missing data are preserved for the success path. We also fallback for ColumnNotFound.
+/// genuinely-missing data are preserved for the success path.
 fn decode_with_fallback<T: Default, F>(column: &str, decode: F) -> Result<T>
 where
     F: FnOnce() -> std::result::Result<T, sqlx::Error>,
@@ -191,13 +191,6 @@ where
                 "[quality] column decode error surfaced (fail-closed; not suppressing regression)"
             );
             Err(anyhow!("decode {}: {}", column, e))
-        }
-        Err(sqlx::Error::ColumnNotFound(_)) => {
-            tracing::debug!(
-                column = column,
-                "[quality] column not found, falling back to default for legacy payload"
-            );
-            Ok(T::default())
         }
         Err(e) => Err(anyhow!("decode {}: {}", column, e)),
     }
@@ -752,11 +745,14 @@ mod explicit_decode_fallback_tests {
     }
 
     #[test]
-    fn falls_back_on_column_not_found() {
+    fn fails_closed_on_other_errors() {
         let result: Result<f64, anyhow::Error> = decode_with_fallback("some_column", || {
             Err(sqlx::Error::ColumnNotFound("missing".to_string()))
         });
 
-        assert_eq!(result.unwrap(), 0.0);
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("decode some_column"));
+        assert!(error.contains("missing"));
     }
 }
