@@ -272,10 +272,7 @@ impl PromptKey {
 mod extract;
 mod observation;
 mod runtime_binding;
-mod session_rotation;
 mod state;
-
-pub(crate) use session_rotation::*;
 
 pub use extract::*;
 use extract::{

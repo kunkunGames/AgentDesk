@@ -8,16 +8,14 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-08-06 (against #5071 T1 S3b).
->
-> — the dead-tmux tail drain in `tmux.rs`
-> (`drain_missing_inflight_dead_tmux_tail_to_eof`) now records itself in
+> Last refreshed: 2026-08-06 (#5071 T1 S3b — the dead-tmux tail drain in
+> `tmux.rs` (`drain_missing_inflight_dead_tmux_tail_to_eof`) now records itself in
 > the delivery journal. That arm advances the relay frontier to EOF so it cannot
 > strand behind a dead wrapper, but nothing is posted, so it emits `O`+`S` only —
 > no attempt and no receipt — and is never counted as Delivered. Shadow
 > instrumentation only: the drain's trigger conditions, offset authority and
 > delivery behavior are unchanged, and no new coordinate field or
-> migration-sensitive surface is added.
+> migration-sensitive surface is added).
 >
 > Last refreshed: 2026-07-21 (against #4706 acceptance repair: structural lint allow baseline, giant-registry issue validation, and production-count sync).
 >
@@ -1701,18 +1699,6 @@ time for diagnostics; neither is a stored approval value.
   `src/services/auto_queue/cancel_run.rs` (frozen giant surface) is the canonical
   auto-queue cancellation and run-stop command surface; split before adding
   non-bugfix behavior.
-  `src/services/auto_queue/cleanup_tasks.rs` (frozen giant surface, #5142) is the
-  canonical run-cleanup transactional outbox: `enqueue_run_cleanup_task_on_tx`
-  writes the task in the same transaction that commits the cancel/end state
-  change, `drain_run_cleanup_task_pg` only deletes a row once every step
-  succeeded, and `replay_pending_run_cleanup_tasks_pg` resumes the backlog after
-  a restart. Enqueue, claim/drain, replay, attempt-cap dead-lettering, and the
-  backlog gauge are one durable row-lifecycle contract over
-  `auto_queue_run_cleanup_tasks`; the at-most-once emit invariant is only
-  checkable while they sit together, so this surface is registered
-  `decision = "keep"` in `scripts/giant_file_registry.toml` rather than carrying
-  a shrink deadline. Split only behind a scoped issue that moves the invariant
-  and its enforcement together.
 - legacy_modules: none; retired route fallback history is documented in
   `known-legacy.md`.
 - do_not_edit_without_migration_plan (giant-file routes):

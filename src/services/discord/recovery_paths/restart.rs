@@ -575,7 +575,6 @@ pub(in crate::services::discord) async fn try_recover_anchor_repost(
     };
     let recovery_context =
         super::super::recovery_engine::RecoveryDeliveryContext::send_new_after_gone_anchor(
-            shared,
             provider,
             state,
             anchor_channel_id,

@@ -211,32 +211,6 @@ class LaneFilterTests(unittest.TestCase):
                 (coverage.LaneFilter(("retained_tests",), ()),),
             )
 
-    def test_discovers_shared_non_pg_filter_without_treating_variable_as_positive(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / ".github/workflows").mkdir(parents=True)
-            (root / "scripts/ci").mkdir(parents=True)
-            (root / coverage.NON_PG_FILTER_REL).write_text(
-                (REPO_ROOT / coverage.NON_PG_FILTER_REL).read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            (root / "justfile").write_text(
-                "test-non-pg:\n    cargo test --lib retained_tests\n",
-                encoding="utf-8",
-            )
-            (root / ".github/workflows/ci-pr.yml").write_text(
-                'run: cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"\n',
-                encoding="utf-8",
-            )
-
-            args = coverage.load_non_pg_skip_args(root)
-            lanes = coverage.discover_lane_filters(root)
-
-            self.assertIn(
-                coverage.LaneFilter((), tuple(args[1::2])),
-                lanes,
-            )
-
     def test_module_filter_covers_nested_module(self) -> None:
         modules = {"service::tests", "other::tests"}
         lanes = (coverage.LaneFilter(("service",), ()),)
@@ -402,21 +376,15 @@ class RatchetTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(stderr, "")
 
-    def test_repository_inventory_uses_logical_footer_path(self) -> None:
-        # This asserted the same property against the debt baseline until
-        # #5185's library sweep covered the footer module and removed its
-        # entry. Anchoring on the inventory instead states the real contract --
-        # `#[path]` aliases resolve to logical module paths -- and keeps
-        # holding as the baseline shrinks toward empty, which is the direction
-        # the ratchet exists to force.
-        inventory = coverage.discover_test_inventory(REPO_ROOT)
+    def test_repository_baseline_contains_logical_footer_path(self) -> None:
+        baseline = coverage.load_baseline(REPO_ROOT / coverage.BASELINE_REL)
         self.assertIn(
             "services::discord::tmux::tmux_watcher::single_message_footer::tests",
-            inventory,
+            baseline,
         )
         self.assertNotIn(
             "services::discord::tmux_watcher::single_message_footer::tests",
-            inventory,
+            baseline,
         )
 
     def test_candidate_merge_first_parent_composes_parallel_removals(self) -> None:

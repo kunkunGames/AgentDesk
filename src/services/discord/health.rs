@@ -22,7 +22,7 @@ use crate::services::provider::ProviderKind;
 //     send-to-agent/outbound dispatch, re-exported here for compatibility
 mod headless_turn;
 pub(in crate::services::discord) mod liveness_authority;
-pub(in crate::services::discord) mod mailbox;
+mod mailbox;
 mod provider_probe;
 #[path = "health/rebind_request.rs"]
 mod rebind_request;
@@ -36,8 +36,6 @@ mod session_enrichment;
 mod snapshot;
 mod stall_liveness;
 mod stall_verdict;
-// #5188 (R5/R6): a delivery binding pointed at a transcript Claude abandoned.
-mod transcript_binding_stall;
 mod watcher_respawn;
 
 // `HeadlessAgentTurnReservation` has no external referent today (callers
@@ -63,11 +61,6 @@ pub use headless_turn::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 pub use mailbox::purge_idle_channel_mailbox_registry_entry;
-// #5147: re-exported as a module (not as loose constants) so a consumer reads
-// `self_watchdog::TCP_TIMEOUT` — a name that says which timeout — rather than a
-// bare `TCP_TIMEOUT` at the health root.
-#[allow(unused_imports)]
-pub(crate) use recovery::self_watchdog;
 #[allow(unused_imports)]
 pub use recovery::{
     HardStopRuntimeResult, IdleTmuxStaleTurnRepairResult, PendingQueueSnapshot,

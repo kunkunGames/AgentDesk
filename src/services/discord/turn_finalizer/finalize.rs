@@ -26,17 +26,6 @@ pub(super) async fn do_finalize(
     shared: &Arc<SharedData>,
 ) -> FinalizeOutcome {
     let channel_id = key.channel_id;
-    // Capture the terminal episode before any caller-owned/in-function inflight
-    // clear can erase it. Watcher submitters provide the pre-clear snapshot;
-    // other paths may still have the matching row on disk here.
-    let terminal_turn_nonce = submit_snapshot
-        .filter(|snapshot| snapshot.user_msg_id == key.user_msg_id)
-        .and_then(|snapshot| snapshot.turn_nonce.clone())
-        .or_else(|| {
-            crate::services::discord::inflight::load_inflight_state(&provider, channel_id.get())
-                .filter(|state| state.effective_finalizer_turn_id() == key.user_msg_id)
-                .and_then(|state| state.turn_nonce)
-        });
 
     // #3866: test-only injection point — fire a panic INSIDE the finalize
     // side-effect surface, AFTER the caller (`handle_terminal` /
@@ -166,30 +155,10 @@ pub(super) async fn do_finalize(
     // release and counter decrement. (An id-0 orphan keeps today's behaviour.)
     let guarded_finish_missed = key.user_msg_id != 0 && finish.removed_token.is_none();
     if guarded_finish_missed {
-        let active_snapshot = crate::services::discord::mailbox_snapshot(shared, channel_id).await;
-        let active_user_message_id = active_snapshot.active_user_message_id.map(|id| id.get());
-        let residue_recorded = if let Some(active_user_msg_id) = active_user_message_id
-            && active_snapshot.cancel_token.is_some()
-        {
-            shared.turn_finalizer.guarded_finish_residues().insert(
-                channel_id,
-                GuardedFinishResidue {
-                    expected_user_msg_id: key.user_msg_id,
-                    active_user_msg_id,
-                    generation: key.generation,
-                    provider: provider.clone(),
-                    terminal_turn_nonce: terminal_turn_nonce.clone(),
-                    active_turn_nonce: active_snapshot.active_turn_nonce.clone(),
-                    observed_before: std::time::Instant::now(),
-                    allow_completion_cleanup: ctx.allow_completion_cleanup,
-                    drain_voice: ctx.drain_voice,
-                    terminal_was_cancel: matches!(event, TerminalEvent::Cancel),
-                },
-            );
-            true
-        } else {
-            false
-        };
+        let active_user_message_id = crate::services::discord::mailbox_snapshot(shared, channel_id)
+            .await
+            .active_user_message_id
+            .map(|id| id.get());
         if ctx.is_backstop_reconcile_path() {
             tracing::debug!(
                 provider = %provider.as_str(),
@@ -197,7 +166,6 @@ pub(super) async fn do_finalize(
                 expected_user_msg_id = key.user_msg_id,
                 active_user_message_id = active_user_message_id.unwrap_or(0),
                 generation = key.generation,
-                residue_recorded,
                 expected_idempotent = true,
                 "TurnFinalizer identity-guarded mailbox release skipped; active mailbox owner did not match finalizer turn identity"
             );
@@ -208,7 +176,6 @@ pub(super) async fn do_finalize(
                 expected_user_msg_id = key.user_msg_id,
                 active_user_message_id = active_user_message_id.unwrap_or(0),
                 generation = key.generation,
-                residue_recorded,
                 expected_idempotent = false,
                 "TurnFinalizer identity-guarded mailbox release skipped; active mailbox owner did not match finalizer turn identity"
             );
@@ -355,7 +322,7 @@ mod tests {
     async fn identity_guard_mismatch_does_not_release_wrong_owner_and_logs() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
         let _env = EnvGuard::set_root(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -429,7 +396,7 @@ mod tests {
     async fn finalize_chokepoint_publishes_mailbox_release_completion_event() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
         let _env = EnvGuard::set_root(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -486,7 +453,7 @@ mod tests {
     async fn thread_finalize_removes_parent_mapping_and_schedules_parent_kickoff() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
         let _env = EnvGuard::set_root(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -532,7 +499,7 @@ mod tests {
     async fn guarded_miss_preserves_parent_mapping_and_skips_parent_kickoff() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
         let _env = EnvGuard::set_root(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -589,7 +556,7 @@ mod tests {
     async fn non_thread_finalize_schedules_no_parent_kickoff() {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .expect("shared env lock poisoned");
         let root = tempfile::tempdir().expect("runtime root");
         let _env = EnvGuard::set_root(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -624,6 +591,4 @@ mod tests {
             "no removed thread-parent mapping means no parent kick"
         );
     }
-
-    mod residue_tests;
 }

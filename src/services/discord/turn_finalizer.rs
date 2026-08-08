@@ -42,7 +42,6 @@ pub(in crate::services::discord) mod completion_signal;
 mod delivery_lease;
 mod finalize;
 mod finalize_context;
-mod guarded_finish_residue;
 mod reconcile;
 mod watcher_backstop;
 
@@ -60,8 +59,6 @@ use self::completion_admission_actor::{
 pub(in crate::services::discord) use self::completion_signal::{
     CompletionSignal, completion_signal_from_transcript,
 };
-pub(in crate::services::discord) use self::guarded_finish_residue::GuardedFinishResidue;
-pub(in crate::services::discord) use self::guarded_finish_residue::handle_idle_queue_guard_skip;
 // #3479 r9: dormant delivery-lease handlers extracted to the child module; the
 // actor-loop call sites below reference them unqualified, byte-identical.
 #[allow(unused_imports)] // handlers are `#[cfg(unix)]`-conditional + dormant.
@@ -291,7 +288,6 @@ pub(in crate::services::discord) enum FinalizeOutcome {
 /// submit-or-await wrappers.
 pub(in crate::services::discord) struct TurnFinalizer {
     tx: mpsc::UnboundedSender<FinalizeMsg>,
-    guarded_finish_residues: guarded_finish_residue::GuardedFinishResidues,
 }
 
 impl TurnFinalizer {
@@ -307,10 +303,7 @@ impl TurnFinalizer {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(actor_loop(rx));
         }
-        Arc::new(Self {
-            tx,
-            guarded_finish_residues: Default::default(),
-        })
+        Arc::new(Self { tx })
     }
 
     /// #3018 — register a turn so the ledger knows it exists before any

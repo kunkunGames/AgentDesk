@@ -565,15 +565,6 @@ pub(crate) fn adopt_claude_continuation_session(
     {
         // Subsequent hooks still carry the launch-time query UUID. Do not reset
         // the already-adopted continuation cursor to zero on every event.
-        //
-        // #5188 (P1-A): but DO refresh the adopted-session authority. This is
-        // the branch every hook after the first one takes, so leaving it out
-        // made the authority a write-once fact tied to a single instant instead
-        // of a standing statement about what this pane is running now.
-        super::session_rotation::record_hook_adopted_claude_session_id(
-            &tmux_session_name,
-            payload_session_id,
-        );
         state.tmux_by_provider_session.insert(
             PromptKey::new("claude", payload_session_id),
             TimedValue {
@@ -592,24 +583,6 @@ pub(crate) fn adopt_claude_continuation_session(
     }
 
     let binding = state.runtime_by_tmux.get_mut(&tmux_session_name)?;
-    // #5188 (R1/R2): record the rotation BEFORE the fields are overwritten. The
-    // pre-rotation transcript and cursor are the only evidence of what may still
-    // be owed to Discord, and the adopted session id is what stops the
-    // launch-script rehydration pass from reverting this binding to the frozen
-    // file. Without this, adoption stayed a purely local mutation: the log said
-    // "adopted" while delivery kept reading a transcript that never grew again.
-    super::session_rotation::record_claude_session_rotation(
-        super::session_rotation::ClaudeSessionRotation {
-            tmux_session_name: tmux_session_name.clone(),
-            old_session_id: binding.value.session_id.clone(),
-            old_output_path: binding.value.output_path.clone(),
-            old_last_offset: binding.value.relay_last_offset(),
-            new_session_id: payload_session_id.to_string(),
-            new_output_path: new_output_path.clone(),
-            observed_drain_frontier: 0,
-            polls_without_drain_progress: 0,
-        },
-    );
     binding.value.output_path = new_output_path.clone();
     binding.value.relay_output_path = None;
     binding.value.session_id = Some(payload_session_id.to_string());

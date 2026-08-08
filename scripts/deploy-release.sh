@@ -741,22 +741,6 @@ _assert_release_binary_runtime_surface() {
     rm -f "$surface_dump"
 }
 
-_emit_terminal_deploy_marker() {
-    # EVERY deploy run must end its transcript on exactly one machine-greppable
-    # terminal line. Success is printed by the main body (`═══ Deploy Complete ═══`);
-    # this is its failure counterpart.
-    #
-    # #5189: this echo used to live inside _finalize_detached_helper, i.e. behind
-    # `DEPLOY_DETACHED_CHILD = 1` AND a non-empty report channel. An ssh-driven
-    # cluster peer leg satisfies neither, so a peer that refused promotion ended its
-    # transcript with NO terminal marker at all — leaving any log-based verdict with
-    # nothing to match and the operator with nothing to grep. The marker is the
-    # contract; the Discord notification below is the optional extra.
-    local status="${1:-0}"
-    [ "$status" -ne 0 ] || return 0
-    echo "═══ DEPLOY FAILED (exit=${status}) ═══"
-}
-
 _finalize_detached_helper() {
     local status="${1:-0}"
     [ "$DEPLOY_DETACHED_CHILD" = "1" ] || return 0
@@ -766,6 +750,10 @@ _finalize_detached_helper() {
     if [ "$status" -eq 0 ]; then
         content="✅ release deploy complete"
     else
+        # Emit a deterministic failure marker into the helper log so an operator
+        # tailing the log can poll for a single regex covering both outcomes
+        # (success: `═══ Deploy Complete ═══`, failure: this line).
+        echo "═══ DEPLOY FAILED (exit=${status}) ═══"
         content="❌ release deploy failed (exit ${status})
 log: ${DEPLOY_LOG_PATH:-n/a}"
         local summary
@@ -1101,7 +1089,6 @@ _cleanup_on_exit() {
     if [ -n "${DEPLOY_MKDIR_LOCK_DIR:-}" ] && [ -d "$DEPLOY_MKDIR_LOCK_DIR" ]; then
         rm -rf "$DEPLOY_MKDIR_LOCK_DIR" 2>/dev/null || true
     fi
-    _emit_terminal_deploy_marker "$status"
     _finalize_detached_helper "$status"
 }
 
@@ -1392,14 +1379,9 @@ EOF
     echo "    Poll the helper log in this turn until one terminal line appears:"
     echo "      success: ═══ Deploy Complete ═══"
     echo "      failure: ═══ DEPLOY FAILED (exit=N) ═══"
-    echo "    With --all-nodes these are printed only AFTER every peer leg has finished,"
-    echo "    so the wait below covers the cluster verdict too (#5189)."
     echo ""
     echo "    One-shot wait command (polling loop — self-terminates after match):"
-    # `^`-anchored: `grep -qm1` stops at the FIRST match, so a line that merely quotes
-    # a marker (the per-peer ✓ lines do) would end the wait early and be reported as
-    # the verdict. Terminal markers are emitted at column 0 (#5189).
-    echo "      LOG=$log_path; until [ -f \"\$LOG\" ] && grep -qm1 -E '^═══ Deploy Complete ═══|^═══ DEPLOY FAILED' \"\$LOG\"; do sleep 3; done; grep -E '^═══ Deploy Complete ═══|^═══ DEPLOY FAILED' \"\$LOG\" | tail -1"
+    echo "      LOG=$log_path; until [ -f \"\$LOG\" ] && grep -qm1 -E '═══ Deploy Complete ═══|═══ DEPLOY FAILED' \"\$LOG\"; do sleep 3; done; grep -E '═══ Deploy Complete ═══|═══ DEPLOY FAILED' \"\$LOG\" | tail -1"
     echo ""
     echo "    ⚠ DO NOT use 'tail -F | grep -m1' — grep -m1 exits on match but tail -F stays alive"
     echo "      on inotify wait, leaving the bash task hung past helper completion."
@@ -2137,15 +2119,6 @@ fi
 # durable; the replacement watcher then resumes from those committed offsets.
 AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS=1
 export AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS
-# #5245: this deploy has always written its restart request to "$ADK_REL/runtime"
-# while the process that must observe it watches "$ADK_REL" — crate::
-# agentdesk_runtime_root() (src/config.rs) returns $AGENTDESK_ROOT_DIR verbatim,
-# and no Rust code reads "$ROOT/runtime/restart_*". At deploy time the observer
-# is always the OLD binary, so the mirror is what reaches an unupgraded node.
-# Stated, not derived: this is the same $ADK_REL the call below appends
-# "/runtime" to — `dirname` of the argument would be a different claim.
-AGENTDESK_RESTART_MARKER_MIRROR_ROOT="$ADK_REL"
-export AGENTDESK_RESTART_MARKER_MIRROR_ROOT
 if ! request_restart_drain_mode_or_fail \
     "release" "$PLIST_REL" "$REL_PORT" "$ADK_REL/runtime" "deploy-release"; then
     exit 1
@@ -2539,67 +2512,6 @@ fi
 # to roll back with no .prev, and a hiccup in a non-critical step (lock, manifest)
 # must never tear down a healthy, health-confirmed binary.
 DEPLOY_OK=1
-# #5147: ship the .dSYM next to the promoted binary. `sample` (which the
-# self-watchdog runs to capture hang dumps) and `atos` look for
-# `<binary>.dSYM` in the binary's own directory before falling back to
-# Spotlight, and /Users/…/.adk/release/bin is not somewhere we want to rely on
-# Spotlight indexing. With it in place a hang dump resolves to file:line;
-# without it the dump still resolves to function names from the binary's own
-# symbol table (see `[profile.release] strip = "debuginfo"`), so this whole
-# step is an upgrade, never a dependency.
-#
-# Placed AFTER DEPLOY_OK on purpose: if the deploy rolls back to .prev we must
-# not have replaced the dSYM of the binary that is actually serving. Entirely
-# fail-open — a missing or unwritable dSYM must never fail a health-confirmed
-# deploy. dSYMs are matched by Mach-O UUID, so a stale one is ignored rather
-# than believed.
-#
-# COST, stated because it is the largest thing this change adds and it is not
-# the +18.4 MiB the binary grew: the bundle measures **276 MB**, and this is a
-# full `cp -RL` of it on EVERY deploy (no hardlinking, no rsync delta — the
-# .old/.tmp dance below needs a real directory it can move). Steady state is
-# also 276 MB resident under bin/, plus a second transient copy during the
-# window between `cp` and the `mv` that replaces the incumbent, i.e. ~552 MB
-# peak. Worth it against three stalled investigations, but not free, and not
-# something to add a second copy of without re-reading this.
-_ship_release_dsym() {
-    src_dsym="$SOURCE_BINARY.dSYM"
-    [ -d "$src_dsym" ] || return 0
-    dest_dsym="$REL_BINARY.dSYM"
-    rm -rf "$dest_dsym.tmp" "$dest_dsym.old" 2>/dev/null || true
-    # -L, not plain -R: cargo emits target/release/agentdesk.dSYM as a SYMLINK
-    # into deps/agentdesk-<hash>.dSYM, and BSD cp -R would copy the dangling
-    # link instead of the bundle. Verified on this build:
-    #   agentdesk.dSYM -> deps/agentdesk-c6adbbf07c76db60.dSYM
-    cp -RL "$src_dsym" "$dest_dsym.tmp" || return 0
-    # Move the incumbent aside rather than deleting it, and put it BACK if the
-    # swap-in fails. The previous order (`mv old` then `rm -rf old`
-    # unconditionally) destroyed both copies whenever the second `mv` failed --
-    # leaving a promoted binary with no symbols at all, which is worse than the
-    # stale-but-UUID-mismatched dSYM it replaced.
-    if [ -d "$dest_dsym" ]; then
-        mv -f "$dest_dsym" "$dest_dsym.old" 2>/dev/null || true
-    fi
-    if mv -f "$dest_dsym.tmp" "$dest_dsym" 2>/dev/null; then
-        rm -rf "$dest_dsym.old" 2>/dev/null || true
-    elif [ -d "$dest_dsym.old" ]; then
-        mv -f "$dest_dsym.old" "$dest_dsym" 2>/dev/null || true
-        rm -rf "$dest_dsym.tmp" 2>/dev/null || true
-    fi
-    return 0
-}
-# `|| true` pins the fail-open contract in the code rather than in the caller's
-# shape. The body already ends in `return 0`, so this is currently redundant --
-# that is the point: under `set -e` a future edit that lets a non-zero status
-# escape would otherwise abort the script AFTER DEPLOY_OK, skipping the chflags
-# re-lock and the .prev cleanup below.
-_ship_release_dsym || true
-if [ -d "$REL_BINARY.dSYM" ]; then
-    echo "▸ Shipped debug symbols: $REL_BINARY.dSYM"
-else
-    echo "⚠ No .dSYM alongside $SOURCE_BINARY — hang dumps will show function"
-    echo "  names but no file:line. Check [profile.release] split-debuginfo."
-fi
 # Lock it against unsigned overwrites (deferred from promotion) and drop the
 # now-unneeded rollback backup. chflags is best-effort: failing to re-lock a
 # healthy serving binary must not fail the deploy.
@@ -3436,18 +3348,8 @@ fi
 
 _write_release_source_manifest
 
-# #5189: the terminal marker is the LAST line this run prints, on every path.
-# It used to be echoed HERE, before the cluster stage, and the polling command this
-# script hands the operator (see _spawn_detached_helper) stops at the FIRST match —
-# `grep -qm1` — so it locked onto this line and reported "Deploy Complete" while
-# peers were still unjudged. That is #5189's own defect on a second path. The window
-# is seconds today and grows to the 10-25 minutes a peer leg takes once peers deploy
-# in the ssh foreground.
-# Ordering is the fix, not a smarter regex: while peers are being deployed this
-# transcript carries NO terminal marker, which is the truth — there is no verdict
-# yet. A refused peer exits non-zero and the EXIT trap prints DEPLOY FAILED instead.
+echo "═══ Deploy Complete ═══"
+
 if [ "$DEPLOY_ALL_NODES" = "1" ]; then
     _deploy_to_all_peers "$@"
 fi
-
-echo "═══ Deploy Complete ═══"

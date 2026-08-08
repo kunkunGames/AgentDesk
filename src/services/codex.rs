@@ -3716,9 +3716,7 @@ mod remote_dispatch_gate_tests {
     ) -> Result<(), String> {
         // Lock so the AGENTDESK_CODEX_REMOTE_TMUX env mutation and the
         // provider_hosting runtime cell can't race with other tests.
-        let _guard = GATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = GATE_TEST_LOCK.lock().unwrap();
 
         // Default gate: OFF. This mirrors fresh-bootstrap state.
         crate::services::provider_hosting::install_provider_hosting_config(

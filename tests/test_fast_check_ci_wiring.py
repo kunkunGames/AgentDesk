@@ -110,10 +110,6 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib services::discord::model_catalog -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::commands::model_ui::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::runtime_bootstrap::shutdown::lifecycle_tests -- --skip _pg --skip pg_ --skip postgres",
-    # #5188: Claude session-rotation (`/clear`) delivery-propagation contracts.
-    "cargo test --lib services::discord::tui_prompt_relay::session_rotation_settle::tests -- --skip _pg --skip pg_ --skip postgres",
-    "cargo test --lib services::discord::tui_prompt_relay::injected_prompt_policy::session_resetting_lifecycle_tests -- --skip _pg --skip pg_ --skip postgres",
-    "cargo test --lib services::tui_prompt_dedupe::session_rotation::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --doc ClaudeBinary",
 )
@@ -216,10 +212,9 @@ class FastCheckCiWiringTests(unittest.TestCase):
         )
         command = (
             "env -u AGENTDESK_ROOT_DIR cargo test --lib "
-            'services::session_forwarding -- "${NON_PG_SKIP_ARGS[@]}"'
+            "services::session_forwarding -- --skip _pg --skip pg_ --skip postgres"
         )
         self.assertEqual(test_job.count("- name: Trusted session forwarding tests"), 1)
-        self.assertIn("source scripts/ci/non-pg-test-filter.sh", test_job)
         self.assertEqual(test_job.count(command), 1)
         self.assertNotIn(command, job_block(workflow, "scripts"))
 
@@ -231,7 +226,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         command = (
             "env -u AGENTDESK_ROOT_DIR cargo test --lib "
             "services::discord::router::intake_dispatch::tests::telemetry_only_unopted "
-            '-- "${NON_PG_SKIP_ARGS[@]}"'
+            "-- --skip _pg --skip pg_ --skip postgres"
         )
 
         self.assertEqual(test_job.count("- name: Telemetry-only intake authority regressions"), 1)
@@ -287,8 +282,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
         test_job = job_block(workflow, "test_fast")
         self.assertEqual(test_job.count("- name: Footer-only marker regressions"), 1)
         for command in (
-            'cargo test --lib task_notification -- "${NON_PG_SKIP_ARGS[@]}"',
-            'cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- "${NON_PG_SKIP_ARGS[@]}"',
+            "cargo test --lib task_notification -- --skip _pg --skip pg_ --skip postgres",
+            "cargo test --lib services::discord::tmux::tmux_watcher::discrete_trigger_marker::tests -- --skip _pg --skip pg_ --skip postgres",
         ):
             self.assertEqual(test_job.count(command), 1)
 
@@ -346,21 +341,12 @@ class FastCheckCiWiringTests(unittest.TestCase):
             with self.subTest(job=job_name):
                 job = job_block(nightly, job_name)
                 self.assertIn("- name: cargo test (non-PG)", job)
-                self.assertIn("source scripts/ci/non-pg-test-filter.sh", job)
                 self.assertIn(
-                    'cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}"', job
+                    "cargo test --all-targets -- --skip _pg_ --skip postgres_", job
                 )
-                self.assertIn("run_non_pg_filter_false_positives", job)
         self.assertIn(
             "cargo test --lib discord_thread_create -- --test-threads=1",
             job_block(nightly, "full_windows"),
-        )
-        postgres = job_block(nightly, "postgres_full")
-        self.assertIn("source scripts/ci/non-pg-test-filter.sh", postgres)
-        self.assertIn(
-            'cargo test --all-targets -- "${PG_INCLUDE_ARGS[@]}" '
-            "--nocapture --test-threads=1",
-            postgres,
         )
 
     def test_relay_authority_contract_job_uses_pinned_recipe(self) -> None:
