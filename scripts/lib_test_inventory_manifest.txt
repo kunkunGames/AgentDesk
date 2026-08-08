@@ -111,6 +111,7 @@ cli::discord_thread_create::tests::windows_lock_uses_global_current_sid_named_mu
 cli::discord_thread_create_lock::unix_identity_tests::locked_handle_rejects_replaced_path_inode
 cli::discord_thread_create_lock::windows::tests::wait_status_accepts_normal_and_abandoned_but_reports_errors
 cli::doctor::health::health_classification_tests::disk_low_free_bytes_reason_formats_bytes
+cli::doctor::health::health_classification_tests::gateway_standby_reason_codes_classify
 cli::doctor::health::health_classification_tests::global_active_counter_reason_is_actionable
 cli::doctor::health::health_classification_tests::opencode_warm_server_reason_codes_classify_without_serve_overlap
 cli::doctor::health::health_classification_tests::reasons_evidence_preserves_actionable_reason_contract
@@ -456,6 +457,7 @@ db::scheduled_messages::postgres_tests::postgres_cancel_reports_committed_agent_
 db::scheduled_messages::postgres_tests::postgres_definition_patch_clears_runtime_defer_gate
 db::scheduled_messages::postgres_tests::postgres_expired_started_turn_is_adopted_instead_of_rearmed
 db::scheduled_messages::postgres_tests::postgres_launch_commit_without_runtime_ack_is_adopted_fail_closed
+db::scheduled_messages::postgres_tests::postgres_list_scheduled_messages_keeps_image_blobs_out_of_memory
 db::scheduled_messages::postgres_tests::postgres_old_writer_rearm_after_new_intent_recovery_stays_ambiguous
 db::scheduled_messages::postgres_tests::postgres_reclaimed_snapshot_accepts_terminal_status
 db::scheduled_messages::postgres_tests::postgres_reclaimed_snapshot_rejects_nonterminal_status
@@ -463,6 +465,9 @@ db::scheduled_messages::postgres_tests::postgres_rolling_old_writer_turn_is_adop
 db::scheduled_messages::postgres_tests::postgres_running_agent_poll_rotates_before_renewed_rows
 db::scheduled_messages::postgres_tests::postgres_runtime_absence_blocks_push_claims_too
 db::scheduled_messages::postgres_tests::postgres_runtime_deferred_backlog_does_not_starve_ready_rows_past_batch
+db::scheduled_messages::postgres_tests::postgres_scheduled_image_consumer_floor_fences_legacy_claims
+db::scheduled_messages::postgres_tests::postgres_scheduled_image_floor_preflight_requires_upgraded_drained_fleet
+db::scheduled_messages::postgres_tests::postgres_scheduled_image_rollout_rejects_legacy_online_workers
 db::scheduled_messages::postgres_tests::postgres_scheduled_message_backoff_does_not_block_other_due_rows
 db::scheduled_messages::postgres_tests::postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_fields
 db::scheduled_messages::postgres_tests::postgres_scheduled_message_retry_waits_until_next_attempt_at
@@ -554,6 +559,9 @@ engine::loader::tests::load_single_policy_tolerates_wrong_type_optional_metadata
 engine::loader::tests::load_single_policy_with_deadline_interrupts_runaway_policy
 engine::loader::tests::policy_trust_findings_flag_writable_policy_and_symlink
 engine::loader::tests::test_compute_policy_version
+engine::ops::cards_ops::parse_json_value_tests::parse_json_value_returns_null_on_malformed_json
+engine::ops::cards_ops::parse_json_value_tests::parse_json_value_returns_null_on_none
+engine::ops::cards_ops::parse_json_value_tests::parse_json_value_returns_parsed_value_on_valid_json
 engine::ops::config_ops::tests::config_get_raw_keeps_scalar_string_semantics_and_precedence
 engine::ops::config_ops::tests::config_get_raw_never_exposes_the_reserved_runtime_blob_key
 engine::ops::config_ops::tests::config_get_raw_preserves_runtime_blob_json_types
@@ -576,6 +584,7 @@ engine::ops::db_ops::tests::prepare_policy_sql_for_pg_rewrites_insert_or_replace
 engine::ops::db_ops::tests::prepare_policy_sql_for_pg_rewrites_quoted_rowid_expressions
 engine::ops::db_ops::tests::prepare_policy_sql_for_pg_rewrites_rowid_tokens
 engine::ops::db_ops::tests::prepare_policy_sql_for_pg_skips_dollar_quoted_literals_for_rowid
+engine::ops::db_ops::tests::test_translate_sqlite_rowid_aliases
 engine::ops::exec_ops::bridge_deadline_tests::clamp_is_noop_without_armed_deadline
 engine::ops::exec_ops::bridge_deadline_tests::clamp_returns_error_after_deadline_elapses
 engine::ops::exec_ops::bridge_deadline_tests::clamp_shortens_to_remaining_budget_when_armed
@@ -950,8 +959,12 @@ server::routes::scheduled_messages::postgres_tests::postgres_scheduled_message_e
 server::routes::scheduled_messages::postgres_tests::postgres_scheduled_message_rejects_invalid_agent_primary_channel
 server::routes::scheduled_messages::postgres_tests::postgres_scheduled_push_patch_distinguishes_values_from_null_clears
 server::routes::scheduled_messages::postgres_tests::postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert
+server::routes::scheduled_messages::postgres_tests::scheduled_image_attachment_rejects_oversized_discord_content
+server::routes::scheduled_messages::postgres_tests::scheduled_image_attachment_rejects_paths_and_non_image_mime_types
+server::routes::scheduled_messages::postgres_tests::scheduled_image_attachment_requires_matching_image_bytes
 server::routes::scheduled_messages::postgres_tests::scheduled_message_bot_defaults_to_non_triggering_notify
 server::routes::scheduled_messages::postgres_tests::scheduled_push_rejects_agent_only_fields_but_allows_explicit_clears
+server::routes::scheduled_messages::tests::new_image_attachment_uploads_reject_mime_filename_mismatch
 server::routes::scheduled_messages::tests::patch_realigns_stale_recurring_time
 server::routes::scheduled_messages::tests::patch_rejects_stale_effective_one_shot_time
 server::routes::scheduled_messages::tests::snapshot_patch_retarget_is_rejected_but_fresh_and_other_fields_pass
@@ -991,7 +1004,7 @@ server::worker_recovery::tests::stable_run_resets_backoff
 server::worker_registry::leader_takeover_tests::policy_tick_thread_captures_the_process_health_registry
 server::worker_registry::leader_takeover_tests::supervisor_respawns_worker_after_lease_takeover
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_column_decode_error
-services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_other_errors
+services::agent_quality::regression_alerts::explicit_decode_fallback_tests::falls_back_on_column_not_found
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::metric_thresholds_preserve_retired_authority_policy
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::preserves_none_for_legitimately_absent_optional_column
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::quality_channel_target_normalizes_without_implicit_fallback
@@ -1660,6 +1673,7 @@ services::cluster::intake_worker_capabilities::tests::non_preserving_request_all
 services::cluster::intake_worker_capabilities::tests::preserving_request_rejects_malformed_or_wrong_features
 services::cluster::intake_worker_capabilities::tests::preserving_request_requires_versioned_feature
 services::cluster::intake_worker_capabilities::tests::runtime_capability_advertises_preservation_protocol
+services::cluster::intake_worker_capabilities::tests::runtime_capability_advertises_scheduled_image_attachment_protocol
 services::cluster::node_registry::tests::auto_node_leadership_requires_configured_gateway_token
 services::cluster::node_registry::tests::capability_match_accepts_labels_providers_and_healthy_mcp
 services::cluster::node_registry::tests::capability_match_reports_exclusion_reasons
@@ -3042,9 +3056,15 @@ services::discord::outbound::delivery_record::tests::watcher_long_chunk_same_cha
 services::discord::outbound::delivery_record::tests::watcher_owner_context_preserves_frontier_and_resolves_current_generation_3751
 services::discord::outbound::delivery_record::tests::watcher_owner_context_rejects_stale_or_wrong_session_3751
 services::discord::outbound::delivery_record::tests::watcher_owner_context_survives_delivery_record_rewrite_3751
+services::discord::outbound::image_attachment::tests::accepts_canonical_and_jpeg_alias_extensions_case_insensitively
+services::discord::outbound::image_attachment::tests::normalizes_legacy_filenames_without_changing_valid_names
+services::discord::outbound::image_attachment::tests::rejects_missing_mismatched_and_unsupported_extensions
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::api_send_rejects_user_supplied_voice_delivery_id_namespace
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::manual_delivery_log_emoji_preserves_legacy_mapping
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve
+services::discord::outbound::manual_delivery::manual_v3_delivery_tests::manual_image_attachment_normalizes_legacy_filename_without_poisoning_dedup
+services::discord::outbound::manual_delivery::manual_v3_delivery_tests::manual_notification_posts_a_binary_attachment_once_with_delivery_identity
+services::discord::outbound::manual_delivery::manual_v3_delivery_tests::manual_notification_rejects_an_oversized_body_with_an_image_attachment
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::synthetic_routine_pair_is_complete_and_message_id_deterministic
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::synthetic_routine_pair_uses_non_empty_default_label
 services::discord::outbound::manual_delivery::manual_v3_delivery_tests::voice_announce_cross_guild_isolation_prevents_dedupe_collision
@@ -6320,6 +6340,7 @@ services::long_turn_watchdog::tests::alert_message_contains_actionable_context
 services::long_turn_watchdog::tests::cluster_threshold_triggers_at_three
 services::long_turn_watchdog::tests::dedupe_identity_is_stable_and_content_independent
 services::long_turn_watchdog::tests::fallback_channel_is_adk_cc_when_unconfigured
+services::maintenance::jobs::db_retention::tests::db_retention_clears_all_aged_terminal_image_attachments_without_reaging_pg_test
 services::maintenance::jobs::db_retention::tests::db_retention_context_snapshot_pg_reference_gate
 services::maintenance::jobs::db_retention::tests::db_retention_context_snapshot_terminal_reclaim
 services::maintenance::jobs::db_retention::tests::db_retention_keeps_skill_usage_rows_with_null_used_at
@@ -6847,6 +6868,7 @@ services::routines::store::tests::close_does_not_invent_unverified_fresh_context
 services::routines::store::tests::close_preserves_verified_fresh_context_evidence_from_locked_row
 services::routines::store::tests::close_run_pause_reason_is_set_only_when_pausing
 services::routines::store::tests::confirmation_can_merge_evidence_after_terminal_close_for_matching_turn
+services::routines::store::tests::json_count_clamps_to_range_and_prioritizes_keys
 services::routines::store::tests::pause_reason_constants_have_correct_values
 services::routines::store::tests::pause_reason_failure_is_the_only_auto_resume_eligible_value
 services::routines::store::tests::precomputed_memento_digest_observation_respects_category_override
@@ -6892,6 +6914,7 @@ services::scheduled_messages::postgres_tests::postgres_resume_anchor_compat_migr
 services::scheduled_messages::postgres_tests::postgres_runtime_absence_defers_terminal_agent_fallback_polling
 services::scheduled_messages::postgres_tests::postgres_scheduled_message_default_notify_reaches_push_outbox
 services::scheduled_messages::postgres_tests::postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_definitions
+services::scheduled_messages::postgres_tests::postgres_scheduled_push_handoff_copies_image_attachment_to_outbox
 services::scheduled_messages::postgres_tests::postgres_transcript_event_probe_tolerates_unknown_or_legacy_json
 services::scheduled_messages::postgres_tests::postgres_trigger_now_retry_preserves_recurring_anchor
 services::scheduled_messages::tests::agent_prompt_includes_instruction_and_content
@@ -7448,6 +7471,7 @@ utils::redact::tests::private_key_colon_json_and_quoted_values_are_masked
 utils::redact::tests::quoted_cookie_header_arguments_preserve_delimiters_and_following_command
 utils::redact::tests::redact_known_secrets_masks_bare_pem_block_without_assignment
 utils::redact::tests::redact_known_secrets_masks_bearer_bot_and_assignments
+utils::redact::tests::redact_known_secrets_masks_cookies
 utils::redact::tests::redact_known_secrets_masks_multiline_pem_private_key_block
 utils::redact::tests::register_secret_or_dsn_also_masks_dsn_password
 utils::redact::tests::registered_secret_is_redacted_from_plain_errors
