@@ -12,7 +12,7 @@ static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // first header line is empty (`Authorization:\r\n token`). An ordinary
     // unindented next line is NOT consumed; a value-less header is NOT matched.
     Regex::new(
-        r"(?i)\b((?:authorization|cookie|set-cookie)[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
+        r"(?i)\b(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+/-]*[ \t]+)?)(?:[^\r\n]+(?:\r?\n[ \t]+[^\r\n]+)*|(?:\r?\n[ \t]+[^\r\n]+)+)",
     )
     .unwrap()
 });
