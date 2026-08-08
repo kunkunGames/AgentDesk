@@ -149,6 +149,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
+              aria-valuemax={20}
               aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 이모지: ${formValues.avatar_emoji || "🤖"}`, en: `Selected emoji: ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
