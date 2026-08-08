@@ -197,9 +197,18 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
     {
         check_dispatch_outbox_retry_count_in_bounds(id, &dispatch_id, retry_count);
         if action == "notify" {
-            let suppress_delivery = dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id)
-                .await
-                .unwrap_or(false);
+            let suppress_delivery = match dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id).await {
+                Ok(suppressed) => suppressed,
+                Err(error) => {
+                    tracing::warn!(
+                        outbox_id = id,
+                        dispatch_id = %dispatch_id,
+                        %error,
+                        "[dispatch-outbox] failed to check if delivery is suppressed, assuming false"
+                    );
+                    false
+                }
+            };
             if suppress_delivery {
                 let delivery_result = generic_outbox_delivery_result(
                     &dispatch_id,
@@ -285,7 +294,14 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                 )
                 .await;
                 if done.is_ok() && action == "notify" {
-                    mark_dispatch_dispatched_pg(pool, &dispatch_id).await.ok();
+                    if let Err(error) = mark_dispatch_dispatched_pg(pool, &dispatch_id).await {
+                        tracing::error!(
+                            outbox_id = id,
+                            dispatch_id = %dispatch_id,
+                            %error,
+                            "[dispatch-outbox] post-notify dispatch bookkeeping failed after status may already be dispatched (non-atomic helper)"
+                        );
+                    }
                 }
             }
             Err(err) => {
