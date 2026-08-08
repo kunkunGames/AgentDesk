@@ -67,7 +67,7 @@ Each row is a (vector × action × job) tuple. If a vector is not in this table,
 Job source locations under `src/services/maintenance/jobs/`:
 `target_sweep.rs`, `worktree_orphan_sweep.rs`, `hang_dump_cleanup.rs`,
 `db_retention.rs`.
-Also `src/server/maintenance/mod.rs` and `src/db/prompt_manifests/retention.rs` for `prompt_manifest_retention` (status API in `src/server/routes/prompt_manifest_retention.rs`).
+The `prompt_manifest_retention` job is registered directly in `src/server/maintenance/mod.rs` (it calls `src/db/prompt_manifests/retention.rs`; status API in `src/server/routes/prompt_manifest_retention.rs`).
 
 Config knobs (all live in `Config::default_runtime()` per job):
 
