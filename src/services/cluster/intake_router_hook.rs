@@ -822,7 +822,7 @@ async fn route_to_instance(
                 tracing::info!(
                     channel_id = ctx.channel_id,
                     user_msg_id = ctx.user_msg_id,
-                    "[intake_router] duplicate Discord message (node override) — existing row already covers it; skipping local execution"
+                    "[intake_router] duplicate Discord message — existing row already covers it; skipping local execution"
                 );
                 IntakeRouterDecision::SkippedDuplicate { resolved_owner }
             }
