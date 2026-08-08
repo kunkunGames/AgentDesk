@@ -540,14 +540,9 @@ var autoQueue = {
     var activeRuns = agentdesk.db.query(
       "SELECT r.id " +
       "FROM auto_queue_runs r " +
-      "JOIN LATERAL (" +
-      "  SELECT e.updated_at " +
-      "  FROM auto_queue_entries e " +
-      "  WHERE e.run_id = r.id AND e.status = 'pending' " +
-      "  ORDER BY e.updated_at ASC LIMIT 1" +
-      ") oldest_pending ON TRUE " +
       "WHERE r.status = 'active' " +
-      "ORDER BY oldest_pending.updated_at ASC LIMIT 50",
+      "AND EXISTS (SELECT 1 FROM auto_queue_entries e WHERE e.run_id = r.id AND e.status = 'pending') " +
+      "ORDER BY (SELECT min(e.updated_at) FROM auto_queue_entries e WHERE e.run_id = r.id AND e.status = 'pending') ASC LIMIT 50",
       []
     );
 
