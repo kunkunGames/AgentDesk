@@ -513,92 +513,164 @@ fn scan_double_quoted_identifier(sql: &str, start: usize) -> Option<(&str, Strin
     None
 }
 
+/// True when `identifier_start` is an alias for a completed select-list expression.
+///
+/// Handles `AS alias`, implicit `expr alias`, and aliases after punctuation-
+/// terminated expressions (`count(*) rowid`, `"value" "rowid"`). Skips comments
+/// when inspecting the preceding token so `ORDER BY -- x\n rowid` still maps to
+/// `ctid`.
 fn is_identifier_alias(sql: &str, identifier_start: usize) -> bool {
-    let word = match previous_sql_word(sql, identifier_start) {
-        Some(w) => w,
-        None => return false,
-    };
-
-    if word.eq_ignore_ascii_case("as") {
-        return true;
+    match previous_sql_token(sql, identifier_start) {
+        Some(SqlPrecedingToken::As) => true,
+        Some(SqlPrecedingToken::ClauseKeyword) => false,
+        // Completed expressions: identifiers, value keywords (NULL/END/TRUE/…),
+        // or punctuation that closes an expression (')', quoted id, etc.).
+        Some(SqlPrecedingToken::ExpressionComplete) => true,
+        None => false,
     }
-
-    if word.ends_with('.') {
-        return false;
-    }
-
-    let is_keyword = word.eq_ignore_ascii_case("select")
-        || word.eq_ignore_ascii_case("from")
-        || word.eq_ignore_ascii_case("where")
-        || word.eq_ignore_ascii_case("and")
-        || word.eq_ignore_ascii_case("or")
-        || word.eq_ignore_ascii_case("on")
-        || word.eq_ignore_ascii_case("set")
-        || word.eq_ignore_ascii_case("by")
-        || word.eq_ignore_ascii_case("having")
-        || word.eq_ignore_ascii_case("group")
-        || word.eq_ignore_ascii_case("order")
-        || word.eq_ignore_ascii_case("limit")
-        || word.eq_ignore_ascii_case("offset")
-        || word.eq_ignore_ascii_case("returning")
-        || word.eq_ignore_ascii_case("into")
-        || word.eq_ignore_ascii_case("values")
-        || word.eq_ignore_ascii_case("in")
-        || word.eq_ignore_ascii_case("not")
-        || word.eq_ignore_ascii_case("is")
-        || word.eq_ignore_ascii_case("null")
-        || word.eq_ignore_ascii_case("when")
-        || word.eq_ignore_ascii_case("then")
-        || word.eq_ignore_ascii_case("else")
-        || word.eq_ignore_ascii_case("end")
-        || word.eq_ignore_ascii_case("like")
-        || word.eq_ignore_ascii_case("ilike")
-        || word.eq_ignore_ascii_case("between")
-        || word.eq_ignore_ascii_case("asc")
-        || word.eq_ignore_ascii_case("desc")
-        || word.eq_ignore_ascii_case("outer")
-        || word.eq_ignore_ascii_case("inner")
-        || word.eq_ignore_ascii_case("join")
-        || word.eq_ignore_ascii_case("left")
-        || word.eq_ignore_ascii_case("right")
-        || word.eq_ignore_ascii_case("full")
-        || word.eq_ignore_ascii_case("cross")
-        || word.eq_ignore_ascii_case("natural")
-        || word.eq_ignore_ascii_case("using")
-        || word.eq_ignore_ascii_case("union")
-        || word.eq_ignore_ascii_case("intersect")
-        || word.eq_ignore_ascii_case("except")
-        || word.eq_ignore_ascii_case("exists")
-        || word.eq_ignore_ascii_case("any")
-        || word.eq_ignore_ascii_case("all")
-        || word.eq_ignore_ascii_case("some")
-        || word.eq_ignore_ascii_case("cast")
-        || word.eq_ignore_ascii_case("extract")
-        || word.eq_ignore_ascii_case("substring")
-        || word.eq_ignore_ascii_case("trim")
-        || word.eq_ignore_ascii_case("case")
-        || word.eq_ignore_ascii_case("distinct");
-
-    !is_keyword
 }
 
-fn previous_sql_word(sql: &str, before: usize) -> Option<&str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlPrecedingToken {
+    As,
+    ClauseKeyword,
+    ExpressionComplete,
+}
+
+fn previous_sql_token(sql: &str, before: usize) -> Option<SqlPrecedingToken> {
+    let end = skip_ws_and_comments_backward(sql, before.min(sql.len()))?;
     let bytes = sql.as_bytes();
-    let mut end = before.min(bytes.len());
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
+    let last = bytes[end - 1];
+
+    // Expression completed by punctuation: count(*) alias, "col" alias, 'x' alias.
+    if matches!(last, b')' | b']' | b'"' | b'\'' | b'`') {
+        return Some(SqlPrecedingToken::ExpressionComplete);
+    }
+
+    if !(last.is_ascii_alphanumeric() || last == b'_') {
+        return None;
     }
 
     let mut start = end;
-    while start > 0
-        && (bytes[start - 1].is_ascii_alphanumeric()
-            || bytes[start - 1] == b'_'
-            || bytes[start - 1] == b'.')
-    {
-        start -= 1;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    // Qualified name ending in '.' is not a completed standalone expression token
+    // for alias purposes (the identifier continues after the dot in the scanner).
+    if start > 0 && bytes[start - 1] == b'.' {
+        return Some(SqlPrecedingToken::ClauseKeyword);
     }
 
-    (start < end).then_some(&sql[start..end])
+    let word = &sql[start..end];
+    if word.eq_ignore_ascii_case("as") {
+        return Some(SqlPrecedingToken::As);
+    }
+    if is_sql_clause_keyword(word) {
+        return Some(SqlPrecedingToken::ClauseKeyword);
+    }
+    // Includes value-completing keywords (NULL, END, TRUE, FALSE) and identifiers.
+    Some(SqlPrecedingToken::ExpressionComplete)
+}
+
+/// Walk backward over whitespace and SQL comments; return end index of the
+/// preceding non-comment, non-whitespace region (exclusive).
+fn skip_ws_and_comments_backward(sql: &str, mut end: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    loop {
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return None;
+        }
+
+        // Block comment closer `*/`
+        if end >= 2 && bytes[end - 2] == b'*' && bytes[end - 1] == b'/' {
+            if let Some(open) = sql[..end - 2].rfind("/*") {
+                end = open;
+                continue;
+            }
+            return None;
+        }
+
+        // Line comment: if current line contains `--`, skip to before it.
+        let line_start = sql[..end].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if let Some(rel) = sql[line_start..end].find("--") {
+            end = line_start + rel;
+            continue;
+        }
+
+        return Some(end);
+    }
+}
+
+fn is_sql_clause_keyword(word: &str) -> bool {
+    // Keywords that introduce / bind a following expression (not complete a
+    // select-list expression that can take an implicit alias).
+    // Intentionally excludes NULL/TRUE/FALSE/END which complete expressions.
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "select"
+            | "from"
+            | "where"
+            | "and"
+            | "or"
+            | "on"
+            | "set"
+            | "by"
+            | "having"
+            | "group"
+            | "order"
+            | "limit"
+            | "offset"
+            | "returning"
+            | "into"
+            | "values"
+            | "in"
+            | "not"
+            | "is"
+            | "when"
+            | "then"
+            | "else"
+            | "like"
+            | "ilike"
+            | "between"
+            | "asc"
+            | "desc"
+            | "outer"
+            | "inner"
+            | "join"
+            | "left"
+            | "right"
+            | "full"
+            | "cross"
+            | "natural"
+            | "using"
+            | "union"
+            | "intersect"
+            | "except"
+            | "exists"
+            | "any"
+            | "all"
+            | "some"
+            | "cast"
+            | "extract"
+            | "substring"
+            | "trim"
+            | "case"
+            | "distinct"
+            | "over"
+            | "partition"
+            | "window"
+            | "filter"
+            | "with"
+            | "as" // handled separately but safe
+    )
 }
 
 fn translate_sqlite_rowid(sql: &str) -> String {
@@ -1622,6 +1694,32 @@ mod tests {
         assert_eq!(
             translate_sqlite_rowid("SELECT a, rowid FROM t"),
             "SELECT a, ctid FROM t"
+        );
+
+        // Alias after punctuation-terminated expression
+        assert_eq!(
+            translate_sqlite_rowid("SELECT count(*) rowid FROM t"),
+            "SELECT count(*) rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT \"value\" \"rowid\" FROM t"),
+            "SELECT \"value\" \"rowid\" FROM t"
+        );
+
+        // Value-completing keywords may take an implicit alias
+        assert_eq!(
+            translate_sqlite_rowid("SELECT NULL rowid FROM t"),
+            "SELECT NULL rowid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT CASE WHEN x THEN 1 END rowid FROM t"),
+            "SELECT CASE WHEN x THEN 1 END rowid FROM t"
+        );
+
+        // Line comments must not poison alias detection for real rowid refs
+        assert_eq!(
+            translate_sqlite_rowid("ORDER BY -- stable\n rowid DESC"),
+            "ORDER BY -- stable\n ctid DESC"
         );
     }
 
