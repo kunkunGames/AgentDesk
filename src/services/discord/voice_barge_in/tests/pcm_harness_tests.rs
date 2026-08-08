@@ -340,7 +340,7 @@ async fn voice_pcm_harness_unattended_e2e() {
 
 #[cfg(not(unix))]
 #[test]
-fn voice_pcm_harness_unattended_e2e() {
+fn voice_pcm_harness_unattended_e2e_non_unix() {
     eprintln!("voice PCM harness uses local POSIX command shims and is skipped on non-Unix");
 }
 
