@@ -149,7 +149,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuemax={20}
+              aria-valuemax={40}
               aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 이모지: ${formValues.avatar_emoji || "🤖"}`, en: `Selected emoji: ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
@@ -158,11 +158,11 @@ export default function AgentFormModal({
                 }
                 if (e.key === "ArrowUp") {
                   e.preventDefault();
-                  const next = Math.max(1, spriteNum || 0) + 1;
+                  const next = Math.min(40, Math.max(1, spriteNum || 0) + 1);
                   setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                 } else if (e.key === "ArrowDown") {
                   e.preventDefault();
-                  const next = Math.max(1, (spriteNum || 1) - 1);
+                  const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
                   setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                 }
               }}
@@ -183,7 +183,7 @@ export default function AgentFormModal({
                     background: "color-mix(in srgb, var(--th-bg-surface) 92%, transparent)",
                   }}
                   onClick={() => {
-                    const next = Math.max(1, spriteNum || 0) + 1;
+                    const next = Math.min(40, Math.max(1, spriteNum || 0) + 1);
                     setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                   }}
                 >
@@ -221,7 +221,7 @@ export default function AgentFormModal({
                     background: "color-mix(in srgb, var(--th-bg-surface) 92%, transparent)",
                   }}
                   onClick={() => {
-                    const next = Math.max(1, (spriteNum || 1) - 1);
+                    const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
                     setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                   }}
                 >
