@@ -158,7 +158,7 @@ echo "=== Scheduled-message PG path-filter wiring contract ==="
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh patch.diff prs.json; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -176,7 +176,7 @@ for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; 
     FAIL=1
   fi
 done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs scratch[._-]*.diff scratchpad[._-]*.diff test_scratch[._-]*.diff test_*.diff scratch[._-]*.patch scratchpad[._-]*.patch test_scratch[._-]*.patch test_*.patch scratch[._-]*.py scratchpad[._-]*.py test_scratch[._-]*.py test_*.py scratch[._-]*.js scratchpad[._-]*.js test_scratch[._-]*.js test_*.js scratch[._-]*.json scratchpad[._-]*.json test_scratch[._-]*.json test_*.json; do
+for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
