@@ -14,6 +14,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 mod agent;
+mod external_delivery;
 mod outbox;
 mod writes;
 pub use agent::{
@@ -22,6 +23,8 @@ pub use agent::{
     record_delivery_agent_turn_intent_pg, recover_expired_leases_pg,
     release_agent_delivery_to_poller_pg,
 };
+use external_delivery::declare_external_delivery_consumer_v1_tx;
+pub use external_delivery::external_delivery_rollout_ready_pg;
 pub use outbox::outbox_statuses_for_deliveries_pg;
 pub use writes::{insert_scheduled_message_pg, insert_scheduled_message_tx};
 
@@ -47,7 +50,9 @@ const DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, de
      source, created_by, dedupe_key, image_filename, image_content_type, image_data, \
      octet_length(image_data) AS image_size_bytes, \
      context_strategy, context_snapshot_id, \
-     on_context_failure, created_at, updated_at";
+     on_context_failure, external_delivery_plan_id, external_delivery_plan_ciphertext, \
+     external_delivery_plan_nonce, external_delivery_plan_key_version, \
+     external_delivery_summary, external_delivery_plan_scrubbed_at, created_at, updated_at";
 
 // The list endpoint only exposes attachment metadata. Do not select image_data
 // there: a valid page can otherwise retain up to 1.6 GiB of decoded blobs.
@@ -57,7 +62,11 @@ const LIST_DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bo
      source, created_by, dedupe_key, image_filename, image_content_type, \
      NULL::BYTEA AS image_data, octet_length(image_data) AS image_size_bytes, \
      context_strategy, context_snapshot_id, \
-     on_context_failure, created_at, updated_at";
+     on_context_failure, external_delivery_plan_id, \
+     NULL::BYTEA AS external_delivery_plan_ciphertext, \
+     NULL::BYTEA AS external_delivery_plan_nonce, \
+     NULL::SMALLINT AS external_delivery_plan_key_version, \
+     external_delivery_summary, external_delivery_plan_scrubbed_at, created_at, updated_at";
 
 pub const CONTEXT_STRATEGY_FRESH: &str = "fresh";
 pub const CONTEXT_STRATEGY_SNAPSHOT: &str = "snapshot";
@@ -100,6 +109,15 @@ pub struct ScheduledMessageRow {
     /// #4658: 'fail' (default, fail-closed) or 'fresh' (opt-in degrade) when the
     /// snapshot cannot be validated at fire time.
     pub on_context_failure: String,
+    /// Encrypted provider target plan. Full-row reads use these fields for the
+    /// fire handoff; list reads intentionally replace the secret bytes with
+    /// NULL and retain only the safe summary.
+    pub external_delivery_plan_id: Option<Uuid>,
+    pub external_delivery_plan_ciphertext: Option<Vec<u8>>,
+    pub external_delivery_plan_nonce: Option<Vec<u8>>,
+    pub external_delivery_plan_key_version: Option<i16>,
+    pub external_delivery_summary: Option<JsonValue>,
+    pub external_delivery_plan_scrubbed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -132,6 +150,7 @@ impl ScheduledMessageRow {
             "contextStrategy": self.context_strategy,
             "contextSnapshotId": self.context_snapshot_id,
             "onContextFailure": self.on_context_failure,
+            "providerTargets": self.external_delivery_summary.clone().unwrap_or_else(|| json!({})),
             "createdAt": self.created_at.to_rfc3339(),
             "updatedAt": self.updated_at.to_rfc3339(),
         })
@@ -163,6 +182,18 @@ pub struct ScheduledMessageImageAttachment {
     pub filename: String,
     pub content_type: String,
     pub data: Vec<u8>,
+}
+
+/// Encrypted provider-target plan stored on an active scheduled definition.
+/// The JSON summary must contain counts/capabilities only and is safe for API
+/// responses; recipient identifiers exist only inside `ciphertext`.
+#[derive(Debug, Clone)]
+pub struct EncryptedExternalDeliveryPlan {
+    pub id: Uuid,
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub key_version: i16,
+    pub summary: JsonValue,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -232,6 +263,7 @@ pub struct NewScheduledMessage {
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
     pub image_attachment: Option<ScheduledMessageImageAttachment>,
+    pub external_delivery_plan: Option<EncryptedExternalDeliveryPlan>,
     /// #4658: 'fresh' (default) or 'snapshot'. Defaulted by the route.
     pub context_strategy: String,
     /// Snapshot id captured before insert (snapshot strategy only). NULL for fresh.
@@ -254,6 +286,7 @@ pub struct ScheduledMessagePatch {
     pub timezone: Option<String>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub image_attachment: Option<Option<ScheduledMessageImageAttachment>>,
+    pub external_delivery_plan: Option<Option<EncryptedExternalDeliveryPlan>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -439,6 +472,24 @@ pub async fn update_scheduled_message_pg(
             .push(", image_content_type = ")
             .push_bind(content_type);
         builder.push(", image_data = ").push_bind(data);
+    }
+    if let Some(plan) = &patch.external_delivery_plan {
+        builder
+            .push(", external_delivery_plan_id = ")
+            .push_bind(plan.as_ref().map(|plan| plan.id));
+        builder
+            .push(", external_delivery_plan_ciphertext = ")
+            .push_bind(plan.as_ref().map(|plan| plan.ciphertext.as_slice()));
+        builder
+            .push(", external_delivery_plan_nonce = ")
+            .push_bind(plan.as_ref().map(|plan| plan.nonce.as_slice()));
+        builder
+            .push(", external_delivery_plan_key_version = ")
+            .push_bind(plan.as_ref().map(|plan| plan.key_version));
+        builder
+            .push(", external_delivery_summary = ")
+            .push_bind(plan.as_ref().map(|plan| &plan.summary));
+        builder.push(", external_delivery_plan_scrubbed_at = NULL");
     }
     builder
         .push(" WHERE id = ")
@@ -632,6 +683,7 @@ async fn arm_delivery_slot_tx(
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
     declare_image_attachment_consumer_v1_tx(tx).await?;
+    declare_external_delivery_consumer_v1_tx(tx).await?;
     let delivery_id = format!("smdel_{}", Uuid::new_v4());
     let claim_token = format!("smclaim_{}", Uuid::new_v4());
     let armed = sqlx::query(

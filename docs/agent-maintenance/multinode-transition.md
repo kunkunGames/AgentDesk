@@ -655,6 +655,15 @@
   their mixed batches intentionally fail closed at the database boundary.
   Migration 0104 is forward-only after it commits; rollback requires a forward
   fix or a pre-0104 database restore with the entire fleet rolled back together.
+- Scheduled external-provider fan-out migration 0108 uses the same stop-and-drain
+  boundary. Before applying it, stop the fleet, verify no old worker remains
+  `online`, and restart only binaries advertising
+  `scheduled_messages.external_delivery_consumer_v1=true`. Provider-targeted
+  claims must declare
+  `agentdesk.scheduled_external_delivery_consumer_v1=enabled`; PostgreSQL rejects
+  a restarted pre-0108 worker before it can silently deliver Discord without the
+  Kakao sibling obligation. New provider-target create/PATCH also fails 503 while
+  any online node lacks the capability.
 - #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
   Discord gateway/runtime**. Queue acceptance and retry requeue states are
   rendered only by the existing persisted `turn_view_reconciler` identity;

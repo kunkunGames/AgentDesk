@@ -66,6 +66,7 @@ async fn insert_agent_message(
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -111,6 +112,7 @@ async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -126,6 +128,29 @@ async fn claim_one(pool: &PgPool, owner: &str) -> ClaimedFire {
         .expect("claim due scheduled message");
     assert_eq!(claimed.len(), 1, "exactly one definition should be due");
     claimed.pop().expect("claimed scheduled-message fire")
+}
+
+fn external_share_for_fire(
+    fire: &ClaimedFire,
+    source_key: &str,
+    requested_count: i16,
+) -> crate::services::external_share_outbox::NewExternalShareOutbox {
+    crate::services::external_share_outbox::NewExternalShareOutbox {
+        id: uuid::Uuid::new_v4(),
+        provider: crate::services::oauth_connection::KAKAO_PROVIDER.to_string(),
+        channel_id: external_delivery::KAKAO_CHANNEL_ID.to_string(),
+        account_key: crate::services::oauth_connection::PRIMARY_ACCOUNT_KEY.to_string(),
+        source: external_delivery::OUTBOX_SOURCE.to_string(),
+        source_key: source_key.to_string(),
+        scheduled_delivery_id: fire.delivery_id.clone(),
+        requested_count,
+        encrypted_payload: crate::services::oauth_connection::EncryptedValue {
+            ciphertext: b"encrypted-provider-payload".to_vec(),
+            nonce: vec![3_u8; 24],
+            key_version: 1,
+        },
+        deliver_before: None,
+    }
 }
 
 async fn record_confirmed_agent_turn(pool: &PgPool, fire: &ClaimedFire, turn_id: &str) {
@@ -284,6 +309,7 @@ async fn postgres_scheduled_push_handoff_copies_image_attachment_to_outbox() {
                 content_type: "image/png".to_string(),
                 data: image_data.clone(),
             }),
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -310,6 +336,203 @@ async fn postgres_scheduled_push_handoff_copies_image_attachment_to_outbox() {
     assert_eq!(attachment.0.as_deref(), Some("thumbnail.png"));
     assert_eq!(attachment.1.as_deref(), Some("image/png"));
     assert_eq!(attachment.2, Some(image_data));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_push_atomically_hands_off_discord_and_kakao_outboxes() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_provider_fanout",
+        "scheduled push atomic Discord and Kakao handoff",
+    )
+    .await;
+    let message = insert_due_push_message(&pool).await;
+    let fire = claim_one(&pool, "provider-fanout-worker").await;
+    let target = "channel:123456789";
+    let source_key = format!(
+        "scheduled_message:v1:{}:{}",
+        message.id,
+        fire.fire_scheduled_at.timestamp_micros()
+    );
+    let external = external_share_for_fire(&fire, &source_key, 2);
+    let handed_off = commit_push_handoff(
+        &pool,
+        &fire,
+        OutboxMessage {
+            target,
+            content: &message.content,
+            bot: &message.bot,
+            source: OUTBOX_SOURCE,
+            reason_code: Some(&source_key),
+            session_key: None,
+            attachment: None,
+        },
+        Some(&external),
+        Utc::now(),
+    )
+    .await
+    .expect("commit dual-provider handoff");
+    assert!(handed_off);
+
+    let discord_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM message_outbox WHERE source = $1 AND reason_code = $2",
+    )
+    .bind(OUTBOX_SOURCE)
+    .bind(&source_key)
+    .fetch_one(&pool)
+    .await
+    .expect("count Discord outbox handoff");
+    let kakao_row: (i64, String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT COUNT(*) OVER (), status, payload_ciphertext
+         FROM external_share_outbox
+         WHERE source = $1 AND source_key = $2",
+    )
+    .bind(external_delivery::OUTBOX_SOURCE)
+    .bind(&source_key)
+    .fetch_one(&pool)
+    .await
+    .expect("load Kakao outbox handoff");
+    assert_eq!(discord_count, 1);
+    assert_eq!(kakao_row.0, 1);
+    assert_eq!(kakao_row.1, "pending");
+    assert!(kakao_row.2.is_some(), "pending payload stays encrypted");
+
+    let duplicate = commit_push_handoff(
+        &pool,
+        &fire,
+        OutboxMessage {
+            target,
+            content: &message.content,
+            bot: &message.bot,
+            source: OUTBOX_SOURCE,
+            reason_code: Some(&source_key),
+            session_key: None,
+            attachment: None,
+        },
+        Some(&external),
+        Utc::now(),
+    )
+    .await
+    .expect("repeat completed handoff is a fenced no-op");
+    assert!(!duplicate);
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM message_outbox WHERE source = $1 AND reason_code = $2),
+            (SELECT COUNT(*) FROM external_share_outbox WHERE source = $3 AND source_key = $2)",
+    )
+    .bind(OUTBOX_SOURCE)
+    .bind(&source_key)
+    .bind(external_delivery::OUTBOX_SOURCE)
+    .fetch_one(&pool)
+    .await
+    .expect("count deduplicated provider handoffs");
+    assert_eq!(counts, (1, 1));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_push_rolls_back_discord_when_provider_handoff_fails() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_provider_atomic_rollback",
+        "scheduled push provider handoff rollback",
+    )
+    .await;
+    let message = insert_due_push_message(&pool).await;
+    let fire = claim_one(&pool, "provider-rollback-worker").await;
+    let source_key = format!(
+        "scheduled_message:v1:{}:{}",
+        message.id,
+        fire.fire_scheduled_at.timestamp_micros()
+    );
+    let invalid_external = external_share_for_fire(&fire, &source_key, 0);
+
+    commit_push_handoff(
+        &pool,
+        &fire,
+        OutboxMessage {
+            target: "channel:123456789",
+            content: &message.content,
+            bot: &message.bot,
+            source: OUTBOX_SOURCE,
+            reason_code: Some(&source_key),
+            session_key: None,
+            attachment: None,
+        },
+        Some(&invalid_external),
+        Utc::now(),
+    )
+    .await
+    .expect_err("an invalid provider handoff aborts the whole push transaction");
+
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM message_outbox WHERE source = $1 AND reason_code = $2),
+            (SELECT COUNT(*) FROM external_share_outbox WHERE source = $3 AND source_key = $2)",
+    )
+    .bind(OUTBOX_SOURCE)
+    .bind(&source_key)
+    .bind(external_delivery::OUTBOX_SOURCE)
+    .fetch_one(&pool)
+    .await
+    .expect("count rolled-back provider handoffs");
+    assert_eq!(counts, (0, 0));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_push_cancellation_wins_before_all_provider_handoffs() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_provider_cancel",
+        "scheduled push cancellation fences every provider handoff",
+    )
+    .await;
+    let message = insert_due_push_message(&pool).await;
+    let fire = claim_one(&pool, "provider-cancel-worker").await;
+    db::cancel_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("cancel claimed provider fan-out");
+    let source_key = format!(
+        "scheduled_message:v1:{}:{}",
+        message.id,
+        fire.fire_scheduled_at.timestamp_micros()
+    );
+    let external = external_share_for_fire(&fire, &source_key, 1);
+    let handed_off = commit_push_handoff(
+        &pool,
+        &fire,
+        OutboxMessage {
+            target: "channel:123456789",
+            content: &message.content,
+            bot: &message.bot,
+            source: OUTBOX_SOURCE,
+            reason_code: Some(&source_key),
+            session_key: None,
+            attachment: None,
+        },
+        Some(&external),
+        Utc::now(),
+    )
+    .await
+    .expect("canceled handoff check");
+    assert!(!handed_off);
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM message_outbox WHERE source = $1 AND reason_code = $2),
+            (SELECT COUNT(*) FROM external_share_outbox WHERE source = $3 AND source_key = $2)",
+    )
+    .bind(OUTBOX_SOURCE)
+    .bind(&source_key)
+    .bind(external_delivery::OUTBOX_SOURCE)
+    .fetch_one(&pool)
+    .await
+    .expect("count canceled provider handoffs");
+    assert_eq!(counts, (0, 0));
 
     pool.close().await;
     pg_db.drop().await;
@@ -505,6 +728,7 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -591,6 +815,7 @@ async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_an
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -758,6 +983,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),

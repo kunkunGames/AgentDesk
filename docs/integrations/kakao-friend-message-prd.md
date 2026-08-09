@@ -39,8 +39,9 @@ v1은 AgentDesk 결과나 카드를 외부에 공개하지 않는다. 고정 랜
 | 첫 사용자 표면 | Settings의 connector 인접 `테스트로 공유`만 | 실제 가치 검증 전에 전역 버튼과 결과 화면을 오염시키지 않음 |
 | 콘텐츠 | 텍스트 + 서버 고정 랜딩 링크 | 공개 artifact·권한·만료 링크 범위를 분리 |
 | 전송 보장 | 영속 `external_share_operations` fence 기반 at-most-once | Kakao POST가 비멱등이어도 crash 후 자동 재전송하지 않음 |
+| 예약 fan-out | 명시적으로 확인된 `push` 예약만 Discord + Kakao 동시 handoff | 기존 fire-slot/Discord outbox를 재사용하고 provider별 최종 전달·재시도 상태는 분리 |
 | 기존 idempotency | fingerprint helper만 재사용 가능; claim/TTL 재claim은 사용 금지 | 현재 계약은 replay-safe mutation 전용 |
-| 기존 delivery journal | 개념만 참고; 테이블·writer 재사용 금지 | `0105_delivery_journal`은 Discord 전용 hot surface와 제약을 가짐 |
+| 기존 delivery journal | 개념만 참고; 테이블·writer 재사용 금지 | `0105_delivery_journal`은 Discord 전용 hot surface와 제약을 가짐. 예약 fan-out은 별도 `external_share_outbox`를 사용 |
 | connector | 기존 Settings connector 표면을 DB-aware로 확장 | 새 Integrations 탭 없이 상태 원천을 하나로 유지 |
 | 채널 추상화 | v1에는 범용 `ExternalShareChannel` trait 없음 | 구현체 하나로 잘못된 공통 계약을 선고정하지 않음 |
 | 다중 노드 | DB unique fence와 refresh lease로 안전하게 처리 | process-local guard를 운영 보장으로 오인하지 않음 |
@@ -138,7 +139,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 메시지 템플릿 DSL
 - 다중 Kakao account UI
 - 장기 감사/분석 이벤트 파이프라인
-- Discord outbox 또는 delivery journal 변경
+- Discord transport/retry 또는 delivery journal 변경 (`message_outbox` enqueue 계약은 그대로 재사용)
 - 친구 thumbnail proxy/cache
 
 ---
@@ -156,11 +157,14 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 7. `success`, `partial_success`, `failed`, `unknown` 결과
 8. 동일 `Idempotency-Key` replay와 payload mismatch 방지
 9. 다중 노드에서 동일 operation 중복 POST 방지
+10. 명시적으로 확인된 push 예약에서 Discord와 Kakao 전달 의도를 같은 DB transaction으로 handoff
+11. 활성 예약 target과 건별 Kakao payload 암호화, 터미널 전환 시 ciphertext 즉시 scrub
+12. Kakao target이 남아 있는 예약의 본문·발송 시각·반복·시간대·만료 변경 시 명시적 확인 갱신
 
 ### 3.2 v1 제외
 
 - AgentDesk 결과/카드의 공개 공유
-- 자동·예약·이벤트 기반 메시지
+- 이벤트 기반·암묵적 background 메시지와 Kakao-only 예약. 단, 명시적 `providerTargets.kakaoFriendShare.confirmed=true`를 포함한 push 예약 fan-out은 포함
 - 알림톡, 전화번호 발송, 전체 친구 발송
 - feed/list/commerce 등 추가 Kakao 템플릿
 - 친구 검색 인덱스, 즐겨찾기 동기화, thumbnail 저장
@@ -168,7 +172,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 원격 Kakao unlink; v1 disconnect는 AgentDesk 로컬 자격증명 삭제
 - 두 번째 외부 채널
 - `ExternalShareChannel` trait/registry
-- Discord `message_outbox`, `outbound/*`, `delivery_journal_events`
+- Discord `outbound/*`, `delivery_journal_events` 변경. 예약 오케스트레이터의 기존 `message_outbox` enqueue 호출은 재사용
 
 ### 3.3 향후 결과 공유가 필요할 때
 
@@ -235,7 +239,10 @@ operator connectors ─────────────┤
                                  ├─ oauth_connection (repository, vault, refresh lease)
                                  └─ external_share (operation store)
 
-FORBIDDEN: kakao/external_share → Discord outbox/outbound/delivery journal
+scheduled_messages ── atomic handoff ─┬─ message_outbox (Discord)
+                                     └─ external_share_outbox ── kakao
+
+FORBIDDEN: kakao/external_share/oauth_connection → Discord outbox/outbound/delivery journal
 ```
 
 ### 5.1 모듈 책임
@@ -245,6 +252,8 @@ FORBIDDEN: kakao/external_share → Discord outbox/outbound/delivery journal
 | `oauth_connection` | provider-keyed session/account 저장, AEAD vault, refresh lease | Kakao 친구·메시지 JSON |
 | `kakao` | OAuth endpoint/scope, 친구·메시지 DTO와 오류 분류 | UI, Discord, operation retention |
 | `external_share` | confirmed command, at-most-once operation, 결과 집계 | authorize URL, provider raw DTO |
+| `external_share_outbox` | 암호화 payload claim/lease, provider별 재시도와 안전한 결과 projection | 예약 계산, Discord transport, raw PII 로그 |
+| `scheduled_messages` | fire-slot dedupe와 Discord + external outbox 원자적 handoff | provider POST와 provider별 재시도 |
 | `operator_connectors` | config + DB connection 상태의 canonical projection | token 복호화 결과 원문 |
 | routes | 인증 경계, 입력/출력, AppError 변환 | retry 정책과 SQL 상태 전이 |
 
@@ -261,7 +270,8 @@ FORBIDDEN: kakao/external_share → Discord outbox/outbound/delivery journal
 | `AppError`와 기존 ErrorCode | 재사용 | envelope와 공통 오류 어휘 유지 |
 | `utils::redact`, config secret 비직렬화 | 재사용 | secret 노출 방지 |
 | reqwest rustls stack | 재사용 | 별도 HTTP/TLS stack 불필요 |
-| Discord outbox/rate/delivery | 사용 금지 | 자동 전달과 재시도 의미가 다름 |
+| Discord `message_outbox` enqueue | 예약 오케스트레이터에서 재사용 | 같은 fire transaction으로 Discord obligation을 만들되 Kakao retry/status는 공유하지 않음 |
+| Discord rate/delivery journal | **재사용 금지** | provider별 quota와 비멱등 POST 의미가 다름 |
 
 ### 5.3 최소 신규 자산
 
@@ -298,7 +308,9 @@ FORBIDDEN: kakao/external_share → Discord outbox/outbound/delivery journal
 
 ### 6.3 개인정보
 
-- 친구 UUID는 friends/send request·response에서만 허용한다.
+- 친구 UUID는 friends/send request·response 또는 활성 예약/outbox의 AEAD ciphertext 안에서만 허용한다. plaintext DB column에는 저장하지 않는다.
+- 활성 반복 예약의 provider target은 `AGENTDESK_OAUTH_TOKEN_KEY_V1` vault로 암호화하고 plan UUID를 AAD에 결합한다. 일회성/취소/실패/만료 terminal 정의는 safe count summary만 남기고 ciphertext를 즉시 scrub한다.
+- fire별 external outbox payload도 별도 outbox UUID AAD로 암호화하며 success/partial_success/failed/unknown terminal 전환과 같은 UPDATE에서 ciphertext를 제거한다.
 - UUID, nickname, token, authorization code, state를 로그·metric label·AppError context에 넣지 않는다.
 - operation table에는 raw UUID와 message text를 저장하지 않는다. request fingerprint, recipient count, 안전한 결과만 저장한다.
 - thumbnail은 v1 응답에 포함하지 않는다.
@@ -411,10 +423,11 @@ AGENTDESK_OAUTH_TOKEN_KEY_V1
 |---|---|
 | 정확성 | 같은 operation은 provider POST 최대 1회 |
 | 보안 | token AEAD, state hash, secret 비직렬화, 고정 callback, redirect 비활성화 |
-| 개인정보 | UUID·nickname·text 영속/로그 최소화 |
+| 개인정보 | UUID·nickname·text 영속/로그 최소화. 예약 본문은 기존 `scheduled_messages.content` 한 곳만 authoritative plaintext로 유지하고 Kakao target/payload 복제본은 암호화 |
 | 가용성 | provider 장애를 Discord/AgentDesk core runtime 장애로 승격하지 않음 |
 | 관측성 | PII 없는 상태·latency·outcome aggregate만 |
 | 확장성 | provider DTO와 application command 분리; 두 번째 구현 전 trait 금지 |
+| 예약 전달 | Discord와 external obligation은 원자적으로 생성; 실제 transport 결과와 retry budget은 provider별 독립 |
 | 유지보수 | route/migration/inventory/config 문서를 변경 PR과 원자적으로 갱신 |
 
 ---
@@ -430,6 +443,8 @@ AGENTDESK_OAUTH_TOKEN_KEY_V1
 | connector API가 filesystem 가정에 묶임 | optional field + typed kind/action으로 한 번에 일반화 |
 | 결과 공유로 범위가 팽창 | v1 약속을 text + fixed landing으로 고정 |
 | 추상화가 실제 채널 차이를 가림 | Kakao concrete service로 시작, 두 번째 구현 때 추출 |
+| Discord 성공 후 Kakao 실패 | handoff는 함께 커밋하되 `providerDeliveries`에서 독립 상태를 노출; Discord 재전송으로 보상하지 않음 |
+| target/payload 개인정보 잔존 | active 정의와 pending outbox만 AEAD 보관, terminal trigger/update에서 ciphertext scrub |
 | operation table 증가 | v1은 저빈도·비식별 tombstone 유지; pilot 후 별도 retention 결정 |
 | 외부 공식 사실의 변경 | 확인 날짜가 있는 Evidence Ledger를 구현 gate로 사용 |
 
@@ -473,3 +488,4 @@ AGENTDESK_OAUTH_TOKEN_KEY_V1
 | 2026-08-09 | wire/idempotency/connectors 상세화 |
 | 2026-08-09 | **응집도·재활용·확장성·ROI 안전성 개정**: text-only Settings MVP, Gate 0, durable at-most-once operation fence, DB-aware connector projection, concrete Kakao service, pilot 승격 기준으로 재설계. 기존 idempotency TTL 재claim과 Discord delivery journal 재사용을 금지하고, 외부 미검증 사실을 blocking evidence로 격하. |
 | 2026-08-09 | **구현 동기화**: oauth2-rs 5.0.0과 Kakao 공식 REST 계약을 확인하고, 미확인 PKCE를 제거했다. 기본 비활성화 OAuth/vault/friends/send 수직 슬라이스와 inline Settings composer를 반영하고, 콘솔·실계정·landing URL 검증을 rollout gate로 분리했다. |
+| 2026-08-09 | **예약 fan-out 후속 설계**: 기존 scheduled-message fire-slot과 Discord `message_outbox` handoff를 재사용해, 명시적으로 확인된 push 예약만 Discord + Kakao로 확장했다. 암호화 provider plan/outbox, 동일 transaction handoff, provider별 lease/retry/status, terminal scrub을 추가하고 Kakao 도메인의 Discord 의존 금지는 유지했다. |

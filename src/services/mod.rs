@@ -39,6 +39,7 @@ pub mod dispatches;
 pub mod dispatches_followup;
 pub mod escalation_settings;
 pub mod external_share;
+pub mod external_share_outbox;
 pub mod gemini;
 pub mod git;
 pub mod github_issue_creation;

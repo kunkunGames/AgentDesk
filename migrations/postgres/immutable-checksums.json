@@ -550,6 +550,11 @@
       "path": "migrations/postgres/0107_kakao_friend_share.sql",
       "sha256": "179b8896d8ff4cfa66307c71a4420d9c942a9256b7d58f2b4360e85f3b736bcd",
       "version": 107
+    },
+    {
+      "path": "migrations/postgres/0108_scheduled_external_share_outbox.sql",
+      "sha256": "13521e19395ef0832b0c14ec1d9b62221a60f79b79bf6a7bc617204768a51305",
+      "version": 108
     }
   ],
   "version": 1

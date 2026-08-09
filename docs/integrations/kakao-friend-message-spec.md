@@ -50,7 +50,9 @@ external_evidence_status: "official-contracts-verified-live-account-pending"
 9. disconnect는 **AgentDesk 로컬 account row 삭제**다. Kakao 원격 unlink라고 표현하지 않는다.
 10. route status, ErrorCode, callback redirect, `unknown` 의미를 선택지 없이 고정한다.
 11. route/migration/config 변경은 inventory, immutable checksum, taxonomy 문서를 같은 PR에서 갱신한다.
-12. Kakao REST 공식 wire 계약과 oauth2-rs 5.0.0 소스는 확인됐다. 공식 문서에서 확인되지 않은 PKCE는 v1에 넣지 않으며, 콘솔·실계정·제품 수요 evidence가 완료되기 전에는 기능을 활성화하지 않는다.
+12. 후속 예약 기능은 `deliveryKind='push'`와 명시적 `providerTargets.kakaoFriendShare.confirmed=true`에서만 Discord + Kakao fan-out을 허용한다. Discord와 Kakao obligation은 같은 transaction으로 만들되 transport 상태와 retry는 공유하지 않는다.
+13. 예약 recipient target과 건별 Kakao payload는 vault로 암호화하고 각각 plan/outbox UUID를 AAD에 결합한다. terminal row에는 count summary만 남긴다.
+14. Kakao REST 공식 wire 계약과 oauth2-rs 5.0.0 소스는 확인됐다. 공식 문서에서 확인되지 않은 PKCE는 v1에 넣지 않으며, 콘솔·실계정·제품 수요 evidence가 완료되기 전에는 기능을 활성화하지 않는다.
 
 ---
 
@@ -197,6 +199,11 @@ operator_connectors
 
 external_share
   └─ sqlx + sha2 (no Kakao/Discord dependency)
+
+scheduled_messages
+  ├─ message_outbox (existing Discord handoff)
+  └─ external_share_outbox
+       └─ kakao (stable outbox-derived Idempotency-Key)
 ```
 
 Forbidden dependency edges:
@@ -232,7 +239,7 @@ kakao/external_share/oauth_connection
 | `idempotency::claim` and expiry reclaim | Kakao POST is not replay-safe |
 | `idempotency::release_unclaimed` after a send fence | deleting the fence could allow duplicate POST |
 | `delivery_journal_events` and its raw writer | Discord-specific schema, ownership, hot surface |
-| Discord outbox/retry/rate paths | automatic delivery semantics are incompatible |
+| Discord `message_outbox` transport/retry/rate paths | Kakao transport와 quota에는 재사용 금지. 단, 예약 오케스트레이터는 기존 Discord enqueue primitive를 sibling obligation으로 그대로 사용 |
 | `kv_meta['settings']` | company settings is not daemon integration config |
 | process-local mutex/rate map as correctness authority | cluster mode exists |
 | provider ID branches throughout the generic row | common fields/actions stay generic; one Kakao composer owns provider-specific UX |
@@ -798,7 +805,7 @@ Unknown response `200`:
 }
 ```
 
-`request_id` is the server-generated operation UUID, not the raw Idempotency-Key. Replay reconstructs the safe count-only terminal body with `replayed=true`; the server stores no message preview, raw text, recipient UUID, or raw key.
+`request_id` is the server-generated operation UUID, not the raw Idempotency-Key. Replay reconstructs the safe count-only terminal body with `replayed=true`; the manual-send operation store contains no message preview, raw text, recipient UUID, or raw key. Scheduled fan-out keeps the existing `scheduled_messages.content` as the single authoritative Discord reservation payload, but adds no provider-specific plaintext text copy: recipient targets and pending provider snapshots remain AEAD ciphertext.
 
 ### 10.6 Exact protected-route errors
 
@@ -975,15 +982,19 @@ If recurring operational demand later justifies provider metrics, labels MUST re
 
 The current implementation adds only a warning for failure to persist a terminal operation state, keyed by the server-generated operation ID. It does not log the provider response, request fingerprint, recipients, or message.
 
-### 14.3 Forbidden persistence
+### 14.3 Persistence boundaries
+
+The manual Settings send path and all provider-specific/OAuth/operation stores forbid:
 
 - friends list/cache
-- raw UUID arrays
+- plaintext UUID arrays
 - nickname or thumbnail
-- message text
+- message text or preview
 - authorization query
 - token response JSON
 - provider raw failure body
+
+A confirmed scheduled fan-out keeps the pre-existing `scheduled_messages.content` because it is the authoritative Discord reservation payload. It MUST NOT add another plaintext Kakao text copy. Active recipient targets and per-fire provider snapshots are allowed only inside UUID-bound AEAD ciphertext; terminal definition/outbox rows scrub that ciphertext and retain count-only summaries.
 
 The browser keeps friend data only while the inline Settings composer is open and clears friends, selections, and message text when it closes. It does not copy the list to local storage, session storage, query caches, or server persistence.
 
@@ -1028,12 +1039,12 @@ There is no global toolbar or result-card entry in v1.
 
 - [REQ-001] v1 is Settings-only manual text + fixed landing URL; it is not result/card sharing.
 - [REQ-002] Official wire evidence MUST precede provider code. Console feasibility, live E2E, recurring demand, and landing safety MUST pass before the default-disabled feature is activated for rollout.
-- [REQ-003] No automatic, scheduled, event-driven, or background Kakao send.
+- [REQ-003] Kakao send is manual by default. The only automatic path is an operator-confirmed `push` scheduled-message fan-out with encrypted targets. A PATCH that materially changes retained Kakao content or timing MUST renew that confirmation; event-driven, implicit background, Kakao-only, and `agent` fan-out are forbidden.
 - [REQ-004] Kakao/external_share/oauth modules MUST NOT depend on Discord outbox/outbound/delivery journal/turn bridge.
 - [REQ-005] v1 has no public share artifact, recipient authorization, or result deep link.
 - [REQ-006] v1 uses a concrete Kakao service; no channel trait/registry until a second implementation exists.
 - [REQ-007] Every send uses `external_share_operations` as a durable at-most-once fence.
-- [REQ-008] Send MUST NOT use idempotency claim/reclaim/release semantics or Discord delivery journal writers.
+- [REQ-008] Kakao send MUST NOT use generic idempotency claim/reclaim/release semantics, Discord transport retry, or Discord delivery journal writers. Scheduled orchestration MAY reuse the existing Discord outbox enqueue primitive as an independent sibling handoff.
 - [REQ-009] A `dispatching` or terminal operation is never automatically re-dispatched.
 - [REQ-010] A validated 8..=128 byte safe-ASCII `Idempotency-Key` plus canonical fingerprint controls replay and mismatch; the dashboard generates UUIDs.
 - [REQ-011] Send outcome is exactly success/partial_success/failed/unknown with the fixed meaning in this Spec.
@@ -1057,6 +1068,10 @@ There is no global toolbar or result-card entry in v1.
 - [REQ-029] Missing Postgres or connector configuration fails the optional feature closed without blocking core AgentDesk.
 - [REQ-030] Product entrypoints beyond Settings require the PRD pilot promotion gate.
 - [REQ-031] Every new Kakao Dashboard endpoint validates its response with a zod parser before caching or rendering; inferred types and runtime schemas have one owner.
+- [REQ-032] A scheduled push with Kakao targets MUST create its Discord `message_outbox` row and encrypted `external_share_outbox` row in the same transaction after re-checking the active parent/delivery claim. Failure to enqueue either obligation MUST roll back both.
+- [REQ-033] Scheduled Kakao outbox dispatch MUST derive a stable valid `Idempotency-Key` from the durable outbox UUID. A crash after provider dispatch replays the existing external operation and MUST NOT issue another POST.
+- [REQ-034] Active scheduled targets and pending/processing outbox payloads MUST be AEAD encrypted. Terminal scheduled definitions and terminal outbox rows retain only PII-free summaries and MUST scrub ciphertext.
+- [REQ-035] Scheduled provider outcomes are exposed as `providerDeliveries`; Discord success never causes Kakao compensation by re-sending Discord, and Kakao failure never rewinds an already committed Discord handoff.
 
 ---
 
@@ -1091,13 +1106,21 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 - [TSK-B-005] **LOCAL-IMPLEMENTED** — add the Settings inline composer, unknown/duplicate-risk UX, typed connector actions, and zod-validated Kakao response boundaries.
 - [TSK-B-006] **ROLLOUT-BLOCKED** — add PostgreSQL crash/multi-node/privacy integration coverage and live-provider fixtures before activation.
 
+### D — Scheduled Discord + Kakao fan-out workstream
+
+- [TSK-D-001] **LOCAL-IMPLEMENTED** — add optional push-only `providerTargets.kakaoFriendShare` create/PATCH contract with explicit confirmation and shared Kakao validation.
+- [TSK-D-002] **LOCAL-IMPLEMENTED** — encrypt active scheduled targets and per-fire payload snapshots with UUID-bound AAD; expose count-only summaries.
+- [TSK-D-003] **LOCAL-IMPLEMENTED** — atomically enqueue the existing Discord `message_outbox` row and provider-neutral `external_share_outbox` row under the existing parent/delivery locks.
+- [TSK-D-004] **LOCAL-IMPLEMENTED** — add leader-only lease/CAS external outbox worker, bounded safe pre-dispatch retries, stable outbox-derived Kakao idempotency, and PII-free status projection.
+- [TSK-D-005] **LOCAL-VERIFIED** — focused PostgreSQL coverage proves dual handoff, cancellation fencing, fire-slot dedupe, stale lease reclaim, list redaction, and terminal ciphertext scrubbing.
+
 ### Merge and rollout boundaries
 
 - PR merge requires formatting, focused Rust tests, dashboard build, migration checksum, and generated inventory checks to pass.
 - The feature remains disabled by default and missing optional configuration cannot block AgentDesk core startup.
 - Rollout additionally requires G0-002, G0-003, G0-005, TSK-B-006, and a real external HTTPS landing URL.
 - One operation must never produce a second provider POST automatically; a sticky `unknown` is safer than duplicate delivery.
-- No Kakao/external-share module may import or write Discord outbox, outbound, delivery-journal, or turn-bridge surfaces.
+- No Kakao/external-share/oauth module may import or write Discord outbox, outbound, delivery-journal, or turn-bridge surfaces. The higher-level scheduled-message orchestrator owns the two sibling outbox handoffs.
 
 ### Pilot and conditional PR-C
 
@@ -1153,7 +1176,7 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 - [TEST-029] Only fixture-proven no-side-effect provider rejection maps to failed.
 - [TEST-030] Full and partial provider fixtures map counts/indexes/internal codes correctly.
 - [TEST-031] confirmed=false, duplicate/0/6 recipients, empty/201-char text, and client link/template fields are rejected before fence.
-- [TEST-032] DB/log/metrics/AppError/browser persistence fixtures contain no raw UUID, nickname, text, token, or provider body.
+- [TEST-032] OAuth/account/external-operation/log/metrics/AppError/browser persistence fixtures contain no raw UUID, nickname, token, or provider body; manual-send text is not persisted. Scheduled fan-out retains only the pre-existing authoritative `scheduled_messages.content`, while provider-specific target/payload copies remain ciphertext.
 - [TEST-033] DB-backed hourly cap is not exceeded under concurrent nodes; replay does not consume a new slot.
 - [TEST-034] No Kakao/external_share source imports or writes Discord outbox/outbound/delivery journal paths.
 
@@ -1166,6 +1189,12 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 - [TEST-039] Migration immutable checksum validation passes in every migration-changing PR.
 - [TEST-040] Pilot aggregate derives counts without raw recipient/text fields or a new audit table.
 - [TEST-041] Dashboard API tests accept valid OAuth/disconnect/friends/send payloads and reject malformed URLs, remote-unlink claims, friend pages, operation IDs, counts, statuses, and retry flags before UI/cache use.
+- [TEST-042] Scheduled create/PATCH rejects agent/Kakao combinations, missing confirmation, invalid recipient sets, content outside 1..=200, and content/timing changes that retain a Kakao target without renewed confirmation before persistence.
+- [TEST-043] Active scheduled provider targets are ciphertext-only in full rows, omitted from list-row memory, and represented by count-only API summaries.
+- [TEST-044] One fire transaction creates exactly one Discord outbox and one external outbox; cancellation, a stale claim, or either outbox insert failure commits neither.
+- [TEST-045] Reprocessing a fire slot or stale external outbox lease never creates another obligation or provider POST; the stable outbox-derived key replays the operation fence.
+- [TEST-046] Terminal scheduled definitions and external outbox rows retain safe summaries while plan/payload ciphertext, nonce, and key version are cleared.
+- [TEST-047] Delivery responses expose independent Discord and provider states without UUID, nickname, text, token, or raw provider body.
 
 ---
 
@@ -1175,12 +1204,12 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 |---|---|---|
 | REQ-001 | TSK-B-005 | TEST-036 |
 | REQ-002 | TSK-G0-001, TSK-G0-002, TSK-G0-003, TSK-G0-005, TSK-G0-006 | TEST-001, TEST-002, TEST-003; EVIDENCE-G0-001, EVIDENCE-G0-002, EVIDENCE-G0-003, EVIDENCE-G0-004, EVIDENCE-G0-005, EVIDENCE-G0-006, EVIDENCE-G0-007, EVIDENCE-G0-008, EVIDENCE-G0-009, EVIDENCE-G0-010 |
-| REQ-003 | TSK-B-003, TSK-B-005 | TEST-024, TEST-034, TEST-036 |
-| REQ-004 | TSK-B-003, TSK-B-006 | TEST-034 |
+| REQ-003 | TSK-B-003, TSK-B-005, TSK-D-001 | TEST-024, TEST-034, TEST-036, TEST-042 |
+| REQ-004 | TSK-B-003, TSK-B-006, TSK-D-003 | TEST-034, TEST-044 |
 | REQ-005 | TSK-B-005, TSK-C-002 | TEST-035, TEST-036 |
 | REQ-006 | TSK-B-003, TSK-C-003 | TEST-034 |
 | REQ-007 | TSK-B-001, TSK-B-003 | TEST-021, TEST-025, TEST-026, TEST-027 |
-| REQ-008 | TSK-B-001, TSK-B-006 | TEST-025, TEST-026, TEST-034 |
+| REQ-008 | TSK-B-001, TSK-B-006, TSK-D-003 | TEST-025, TEST-026, TEST-034, TEST-044 |
 | REQ-009 | TSK-B-001, TSK-B-003, TSK-B-005 | TEST-022, TEST-024, TEST-025, TEST-026, TEST-027, TEST-037 |
 | REQ-010 | TSK-B-001, TSK-B-004 | TEST-021, TEST-022, TEST-023, TEST-024 |
 | REQ-011 | TSK-B-002, TSK-B-003 | TEST-024, TEST-028, TEST-029, TEST-030 |
@@ -1193,7 +1222,7 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 | REQ-018 | TSK-A-005 | TEST-015, TEST-017, TEST-018 |
 | REQ-019 | TSK-A-001 | TEST-019 |
 | REQ-020 | TSK-A-004, TSK-B-004 | TEST-035 |
-| REQ-021 | TSK-A-002, TSK-B-002, TSK-B-003, TSK-B-005 | TEST-007, TEST-017, TEST-032 |
+| REQ-021 | TSK-A-002, TSK-B-002, TSK-B-003, TSK-B-005, TSK-D-002, TSK-D-004 | TEST-007, TEST-017, TEST-032, TEST-043, TEST-046, TEST-047 |
 | REQ-022 | TSK-B-003, TSK-B-004, TSK-B-005 | TEST-031, TEST-036 |
 | REQ-023 | TSK-A-001, TSK-B-002, TSK-B-005 | TEST-031, TEST-035, TEST-036 |
 | REQ-024 | TSK-B-001, TSK-B-003 | TEST-021, TEST-033 |
@@ -1204,6 +1233,10 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 | REQ-029 | TSK-A-001, TSK-A-005, TSK-B-003 | TEST-016, TEST-019, TEST-020 |
 | REQ-030 | TSK-PILOT-001, TSK-PILOT-002, TSK-C-001, TSK-C-002 | TEST-003, TEST-040 |
 | REQ-031 | TSK-B-005 | TEST-035, TEST-041 |
+| REQ-032 | TSK-D-001, TSK-D-003 | TEST-042, TEST-044 |
+| REQ-033 | TSK-D-004 | TEST-045 |
+| REQ-034 | TSK-D-002, TSK-D-004 | TEST-043, TEST-046 |
+| REQ-035 | TSK-D-003, TSK-D-004 | TEST-044, TEST-047 |
 
 All IDs are written in full to support mechanical validation. No test or evidence row may be silently replaced by prose such as “CI docs”.
 
@@ -1307,3 +1340,4 @@ This document describes an implemented local slice, not an activated integration
 | 2026-08-09 | **Cohesion/ROI/safety rewrite**: added provider evidence and rollout gates; narrowed v1 to a Settings text-only pilot; replaced replay-safe idempotency reuse with a non-reclaiming external operation fence; isolated Discord `0105_delivery_journal`; made connector projection DB-aware; fixed crypto, refresh, disconnect, HTTP, privacy, cluster, test, and traceability contracts. |
 | 2026-08-09 | **Implementation synchronization**: aligned the Spec with the default-disabled OAuth/vault/friends/send slice, oauth2-rs 5.0.0, Kakao's comma-delimited scopes and refresh-token omission, bounded provider responses, the inline composer, one cohesive PR, and separate merge versus rollout gates. |
 | 2026-08-09 | **Ready-for-review hardening**: bound every new Kakao Dashboard response to a zod parser, inferred TypeScript types from the schemas, and added valid/invalid boundary tests before moving the PR out of Draft. |
+| 2026-08-09 | **Scheduled fan-out follow-up**: permitted one explicit automatic path—confirmed push reservations—and specified encrypted provider targets, atomic Discord/external outbox handoff, stable outbox-derived idempotency, provider-local retry/status, and terminal ciphertext scrubbing without introducing a Kakao-to-Discord dependency. |

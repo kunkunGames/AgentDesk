@@ -6,7 +6,9 @@
 날짜·시간에:
 
 - **push 모드**: 에이전트 개입 없이 시스템이 `notify` bot으로 곧바로 Discord
-  채널에 전송. 수신 에이전트를 의도적으로 깨워야 할 때만 `announce`를 명시
+  채널에 전송. 수신 에이전트를 의도적으로 깨워야 할 때만 `announce`를 명시.
+  선택적 `providerTargets.kakaoFriendShare`가 있으면 같은 fire에서 Kakao 전달
+  obligation도 원자적으로 handoff
 - **agent 모드**: 지정된 에이전트의 headless 턴을 대상 Discord 채널에서
   시작하고, 에이전트의 relay된 assistant 답변 자체를 전달 메시지로 사용
 
@@ -24,6 +26,8 @@ outbox를 거치지 않고 기존 headless turn relay로 Discord에 게시된다
 | `routines` / `routine_runs` (0035) | 스키마 패턴 차용: 정의 row + 실행 이력 row 분리, `next_due_at` partial index due-scan, lease 기반 중복 실행 방지 |
 | `services/scheduling.rs` | routines와 scheduled messages가 함께 사용하는 `@every`/5-field cron 파싱 및 slot-anchor 다음 시각 계산 |
 | `worker_registry` + `message_outbox_loop` 패턴 | `scheduled_message_loop` 워커를 기존 등록 패턴으로 추가. adaptive backoff(500ms–5s) 폴링 패턴 동일 적용 |
+| `external_share_operations` + Kakao service | Kakao 비멱등 POST의 durable at-most-once fence와 OAuth/refresh/provider adapter 재사용 |
+| `TokenVault` | 예약 recipient target과 fire별 provider payload를 plan/outbox UUID AAD로 암호화 |
 | agent channel bindings | agent 모드는 명시적 `target_channel_id` 유무와 무관하게 primary Discord 채널을 필수로 한다. primary는 turn owner/session 컨텍스트이고, target 미지정 시 delivery 채널로도 사용 |
 | `outbound/source_registry.rs` | push/강등 outbox enqueue 소스 `scheduled_message`를 `LoopbackInternal`로만 허용 |
 
@@ -49,7 +53,8 @@ recurring 자동화 전반은 `routines`의 영역이다. 이 테이블은 "이 
 
 Postgres 전용 (messages 라우트와 동일하게 pg pool 필수). 마이그레이션:
 `migrations/postgres/0082_scheduled_messages.sql`부터
-`0104_scheduled_image_consumer_floor.sql`까지
+`0104_scheduled_image_consumer_floor.sql` 및 provider fan-out용
+`0108_scheduled_external_share_outbox.sql`까지
 사용한다 (`0079`~`0081`은 최신 upstream 계열이 선점). 라이브에 적용된 0082와
 이어지는 0083의 원문은 immutable하게 유지하고, recurrence anchor 컬럼과 최종
 non-null invariant는 0084/0085에서 additive하게 적용한다. 0086은 agent launch의
@@ -174,6 +179,43 @@ SQLSTATE `55000`으로 중단한다. preflight 통과 뒤 설치되는 PostgreSQ
 요구한다. 구버전 process는 migration 이후 재시작할 수 없으며, 전체 cutover 및
 rollback 절차는 `docs/agent-maintenance/multinode-transition.md`를 따른다.
 
+### Provider fan-out (0108)
+
+`deliveryKind='push'` 예약은 선택적으로 동일 본문을 Discord와 Kakao 친구에게
+함께 보낼 수 있다. 이는 Kakao-only 스케줄러가 아니라 기존 Discord push
+reservation의 명시적 sidecar다. `agent` 모드에는 허용하지 않는다.
+
+- 생성/PATCH 요청은 `providerTargets.kakaoFriendShare.confirmed=true`와 1~5개의
+  고유 `receiverUuids`를 요구한다. Kakao가 포함된 본문은 1~200자다.
+- recipient UUID는 plaintext column에 저장하지 않는다. 활성 정의는
+  `external_delivery_plan_*` AEAD envelope만 저장하고 API에는
+  `recipientCount`, `contentMode`, `imageForwarded`만 반환한다.
+- `imageAttachment`가 함께 있어도 이미지는 Discord에만 전달되고 Kakao는 text +
+  서버 고정 landing link만 받는다. 응답의 `imageForwarded=false`가 이를 명시한다.
+- push fire는 active parent/delivery를 다시 lock한 한 transaction에서 기존
+  `message_outbox`와 신규 `external_share_outbox`를 모두 INSERT한 뒤 delivery와
+  parent를 종료한다. 취소나 stale claim이 먼저 이기면 어느 outbox도 생기지 않는다.
+- `external_share_outbox` worker는 lease/CAS claim과 bounded backoff를 사용한다.
+  durable outbox UUID로 `scheduled-kakao:<uuid>` 멱등 키를 만들고 기존
+  `external_share_operations` fence를 통과한다. provider POST 뒤 crash하면 같은
+  key의 terminal result를 replay하거나 `unknown`으로 닫을 뿐 POST를 반복하지 않는다.
+- `deliver_before`가 지난 미시작 `pending` row는 `failed`로 종료한다. 이미 claim된
+  `processing` row는 active lease 동안 결과 기록 기회를 보장하고, lease까지 만료돼
+  provider side effect가 모호해지면 재전송 없이 `unknown`으로 종료한다.
+- Discord와 Kakao는 obligation 생성까지만 원자적이다. 실제 transport 결과와
+  retry budget은 독립적이며 한 provider 실패가 이미 handoff된 다른 provider를
+  재전송하지 않는다. GET delivery 응답은 `outboxStatus`와
+  `providerDeliveries[]`를 함께 보여준다.
+- one-shot 성공, 취소, 실패, 만료 등 terminal 정의는 safe summary만 유지하고
+  plan ciphertext를 trigger에서 즉시 scrub한다. external outbox도 terminal
+  UPDATE에서 payload ciphertext를 제거한다. 반복 정의는 다음 slot을 위해 active
+  plan을 유지한다.
+- 0108도 stop-and-drain consumer floor다. migration과 create/PATCH gate는 모든
+  online node의 `scheduled_messages.external_delivery_consumer_v1` 광고를 요구하고,
+  DB trigger는 provider plan을 `firing`으로 claim하는 transaction의
+  `agentdesk.scheduled_external_delivery_consumer_v1=enabled` 선언을 요구한다. 따라서
+  구버전 worker가 재기동돼도 Kakao sidecar를 누락한 Discord-only 발화를 만들 수 없다.
+
 ### `scheduled_message_deliveries` — 발화 이력 (routine_runs 패턴)
 
 반복 예약은 발화 slot당 1 row를 사용한다. 중단된 slot의 재시도는
@@ -238,9 +280,10 @@ scheduled ──(DELETE)──▶ canceled
 firing    ──(DELETE)──▶ canceled   (진행 중 delivery는 interrupted 마킹)
 ```
 
-- **push 모드의 "sent" 판정 = outbox handoff 성공**: `message_outbox` INSERT가
-  성공하면 delivery는 즉시 터미널(`sent`, 의미상 "handed off"). 부모와
-  delivery를 먼저 lock하고 outbox INSERT와 두 상태 전이를 한 transaction으로
+- **push 모드의 "sent" 판정 = 구성된 모든 outbox handoff 성공**: Discord
+  `message_outbox`와 선택적 `external_share_outbox` INSERT가 성공하면 delivery는
+  즉시 터미널(`sent`, 의미상 "handed off"). 부모와 delivery를 먼저 lock하고
+  모든 outbox INSERT와 두 상태 전이를 한 transaction으로
   commit하므로, 취소가 먼저 이기면 outbox side effect가 생기지 않는다. 이후
   재시도·최종 실패는 outbox가 자체 소유하며(retry_count/next_attempt_at),
   스케줄러는 outbox 상태를 다시 폴링하지 않는다 — 감시 책임을 이중으로 두지
@@ -296,9 +339,10 @@ idle 시 5s 상한까지 늘어나는 기존 백오프 로직을 그대로 사�
    - push:  active parent+delivery lock → message_outbox INSERT
             (target=channel_id, content, bot, source='scheduled_message',
              slot 단위의 만료 없는 durable dedupe key)
-            → 새 row 또는 기존 활성 row ID 확보 + delivery/parent 종료를 같은
+            + provider target이 있으면 encrypted external_share_outbox INSERT
+            → 모든 obligation row 확보 + delivery/parent 종료를 같은
               transaction으로 commit하면 delivery=sent(터미널, "handed off").
-              이후 재시도/실패는 outbox_loop 소유 — 여기서 다시 감시하지 않는다.
+              이후 재시도/실패는 각 outbox worker 소유 — 여기서 다시 감시하지 않는다.
    - agent: primary channel/provider binding을 해석하고 target(미지정 시 primary)에서
             headless turn을 시작. 예약한 turn ID와 `turn_intent_at`을 claim_token
             조건으로 먼저 기록하되 lease는 갱신하지 않는다. 외부 runtime 호출
@@ -373,17 +417,20 @@ budget을 소비하지 않고 정의를 되돌린다. 원래 recurrence anchor�
   "title": "스탠드업 리마인더",                      // 선택
   "targetChannelId": "1492021444308238487",        // push면 필수, agent면 선택
   "bot": "notify",                                 // 선택, 기본 notify
-  "deliveryKind": "agent",                         // 'push' | 'agent', 기본 push
-  "agentId": "coder",                              // agent 모드 필수
-  "agentInstruction": "핵심만 3줄로 요약해서 보내줘", // 선택
-  "onAgentFailure": "push_raw",                    // 선택, 기본 fail
+  "deliveryKind": "push",                          // 'push' | 'agent', 기본 push
   "scheduledAt": "2026-07-08T09:00:00+09:00",      // 필수, ISO 8601
   "schedule": "0 9 * * 1-5",                       // 선택 (반복), @every 24h 도 가능
   "timezone": "Asia/Seoul",                        // 선택, 기본 Asia/Seoul
   "expiresAt": "2026-08-01T00:00:00+09:00",        // 선택
   "source": "agent",                               // 선택
   "createdBy": "planner",                          // 선택
-  "dedupeKey": "standup-reminder-w28"              // 선택
+  "dedupeKey": "standup-reminder-w28",             // 선택
+  "providerTargets": {                              // 선택, push 전용
+    "kakaoFriendShare": {
+      "receiverUuids": ["provider-recipient-uuid"],
+      "confirmed": true
+    }
+  }
 }
 // 201 Response
 { "scheduledMessage": { "id": "smsg_...", "status": "scheduled", ... } }
@@ -406,6 +453,10 @@ budget을 소비하지 않고 정의를 되돌린다. 원래 recurrence anchor�
   `targetChannelId` 명시 여부와 무관하게 거부. primary channel은 headless turn의
   owner/session 컨텍스트이고, `targetChannelId`는 relay 대상이다.
 - `expiresAt <= scheduledAt` → 거부
+- `providerTargets`가 있는데 `deliveryKind!='push'` → 거부
+- Kakao target이 있는데 connector가 비활성화됐거나 token vault key가 없음 → 503
+- Kakao target의 `confirmed!=true`, recipient가 1~5개 고유 printable UUID가 아님,
+  또는 content가 1~200자가 아님 → 400
 - 활성 `dedupeKey` 충돌 → 409 + 기존 row 반환 (idempotent create)
 
 `bot`을 생략하면 info-only sink인 `notify`를 사용한다. `announce`는 AgentDesk의
@@ -436,7 +487,10 @@ agent를 호출하지 않더라도 agent-bound 대상 채널의 수신 에이전
 `status IN ('scheduled')`일 때만 허용 (firing/터미널이면 409).
 수정 가능 필드: `content`, `title`, `targetChannelId`, `bot`, `agentId`,
 `agentInstruction`, `onAgentFailure`, `scheduledAt`, `schedule`, `timezone`,
-`expiresAt`. 검증은 POST와 동일. 반복 정의의 효과적 `scheduledAt`이
+`expiresAt`, `providerTargets`. `providerTargets` 생략은 유지, `null`은 제거,
+object는 encrypted plan 전체 교체다. 단, 기존 Kakao target을 유지하면서 `content`,
+`scheduledAt`, `schedule`, `timezone`, `expiresAt` 중 실제 값을 바꾸는 PATCH는
+`providerTargets.kakaoFriendShare.confirmed=true`를 다시 제출해야 한다. 검증은 POST와 동일. 반복 정의의 효과적 `scheduledAt`이
 과거면 PATCH도 기존 `scheduledAt`을 anchor로 현재 시각 이후의 다음 schedule
 시각으로 보정해 metadata-only 수정이 `@every` cadence를 edit 시각으로 옮기지
 않는다. `schedule`을
@@ -469,6 +523,11 @@ agent를 호출하지 않더라도 agent-bound 대상 채널의 수신 에이전
 ### GET `/api/scheduled-messages/:id/deliveries` — 발화 이력
 
 쿼리: `limit`(기본 20), `before` 커서.
+
+각 delivery에는 기존 `outboxStatus`/`fallbackOutboxStatus`와 함께
+`providerDeliveries`가 포함된다. provider row는 `provider`, `channelId`, `status`,
+요청/성공/실패 수, safe `errorCode`, operation ID, retry count와 시각만 노출하며
+receiver UUID, nickname, text, raw provider body는 노출하지 않는다.
 
 ### 에이전트가 예약을 넣는 경로
 
@@ -503,13 +562,14 @@ agent를 호출하지 않더라도 agent-bound 대상 채널의 수신 에이전
 
 | 파일 | 내용 |
 |---|---|
-| `migrations/postgres/0082_scheduled_messages.sql` ~ `0104_scheduled_image_consumer_floor.sql` | 예약 정의/영속 outbox의 이미지 첨부와 재시도 안전 전송을 포함한 스키마 |
-| `src/db/scheduled_messages.rs`, `src/db/scheduled_messages/{agent,outbox}.rs` | CRUD + due-claim + delivery/agent-poll/outbox 조회 쿼리 |
-| `src/server/routes/scheduled_messages.rs` | 위 7개 핸들러 |
+| `migrations/postgres/0082_scheduled_messages.sql` ~ `0108_scheduled_external_share_outbox.sql` | 예약 정의, Discord outbox, 암호화된 외부 provider target/outbox, rolling-upgrade consumer floor를 포함한 스키마 |
+| `src/db/scheduled_messages.rs`, `src/db/scheduled_messages/{agent,external_delivery,outbox}.rs` | CRUD + due-claim + delivery/agent-poll/outbox 조회와 provider consumer floor |
+| `src/server/routes/scheduled_messages.rs`, `src/server/routes/scheduled_messages/provider_targets.rs` | 위 7개 핸들러 + provider target 요청 검증/암호화 계획 생성 |
 | `src/server/routes/mod.rs`, `domains/ops.rs` | 라우트 등록 (protected ops 도메인) |
 | `src/server/routes/docs/inventory/endpoints/part_09.rs` | API docs 인벤토리 항목 (coverage 가드 필수) |
-| `src/services/scheduled_messages.rs`, `src/services/scheduled_messages/{evidence,timing}.rs` | `scheduled_message_loop` 워커 (fire/감시/복구) + 완료 evidence + 반복/retry timing 정책 |
-| `src/server/worker_registry.rs` | 워커 등록 항목 추가 (`ScheduledMessages`, leader-only) |
+| `src/services/scheduled_messages.rs`, `src/services/scheduled_messages/{evidence,external_delivery,push_handoff,timing}.rs` | `scheduled_message_loop` 워커 (fire/감시/복구), provider plan 암복호화, Discord+provider 원자적 handoff, 반복/retry timing 정책 |
+| `src/services/external_share_outbox.rs` | 외부 provider별 독립 lease/CAS claim, Kakao operation fence 연계, 제한적 사전-dispatch retry와 안전한 이력 조회 |
+| `src/server/worker_registry.rs` | leader-only `ScheduledMessages`와 `ExternalShareOutbox` 워커 등록 |
 | `src/services/message_outbox.rs`, `src/services/maintenance/jobs/db_retention.rs` | 영구 slot dedupe identity를 보존하고 전송 완료 첨부 payload를 기간 제한 |
 | `src/services/discord/outbound/image_attachment.rs` | Discord MIME/파일 확장자 공용 계약 |
 | `src/services/scheduling.rs` | routines와 scheduled messages 양쪽이 의존하는 공용 스케줄 문법 + slot-anchor 계산 |

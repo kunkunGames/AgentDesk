@@ -33,9 +33,11 @@ pub async fn insert_scheduled_message_tx(
              agent_instruction, on_agent_failure, scheduled_at, schedule, timezone,
              expires_at, source, created_by, dedupe_key, context_strategy,
              context_snapshot_id, on_context_failure, image_filename, image_content_type,
-             image_data)
+             image_data, external_delivery_plan_id, external_delivery_plan_ciphertext,
+             external_delivery_plan_nonce, external_delivery_plan_key_version,
+             external_delivery_summary)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
          RETURNING {DEFINITION_COLUMNS}"
     ))
     .bind(&id)
@@ -71,6 +73,27 @@ pub async fn insert_scheduled_message_tx(
         new.image_attachment
             .as_ref()
             .map(|image| image.data.as_slice()),
+    )
+    .bind(new.external_delivery_plan.as_ref().map(|plan| plan.id))
+    .bind(
+        new.external_delivery_plan
+            .as_ref()
+            .map(|plan| plan.ciphertext.as_slice()),
+    )
+    .bind(
+        new.external_delivery_plan
+            .as_ref()
+            .map(|plan| plan.nonce.as_slice()),
+    )
+    .bind(
+        new.external_delivery_plan
+            .as_ref()
+            .map(|plan| plan.key_version),
+    )
+    .bind(
+        new.external_delivery_plan
+            .as_ref()
+            .map(|plan| &plan.summary),
     )
     .fetch_one(&mut **tx)
     .await
