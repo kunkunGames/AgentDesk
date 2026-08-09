@@ -157,6 +157,9 @@ cli::utils::memento_hook_install_tests::uninstall_removes_only_memento_entries
 config::cluster_semaphore_config_tests::cluster_intake_routing_parses_defaults_and_yaml_fields
 config::cluster_semaphore_config_tests::cluster_nodes_parse_max_concurrent_dispatches
 config::cluster_semaphore_config_tests::cluster_semaphores_parse_kebab_scope_and_default_capacity
+config::kakao_friend_share_config_tests::kakao_friend_share_defaults_to_disabled_and_safe_local_urls
+config::kakao_friend_share_config_tests::kakao_friend_share_rejects_credentials_fragments_and_non_http_urls
+config::kakao_friend_share_config_tests::kakao_friend_share_rejects_unbounded_send_limits
 config::remote_settings_tests::settings_load_exposes_no_remote_profiles
 config::routine_config_unit_tests::database_foreground_reserve_default_is_consistent_across_paths
 config::routine_config_unit_tests::database_foreground_reserve_deserializes_when_provided
@@ -888,6 +891,8 @@ server::routes::health_api::tests::public_health_json_sanitizes_provider_ids_inc
 server::routes::health_api::tests::registry_purge_decision_gates_on_request_and_fully_applied_repair
 server::routes::health_api::tests::stale_mailbox_repair_applied_includes_session_only_disconnect
 server::routes::health_api::tests::supported_provider_ids_contain_no_colon
+server::routes::kakao::tests::callback_error_never_reflects_provider_input
+server::routes::kakao::tests::friends_query_defaults_are_bounded
 server::routes::kanban::update_card_validation_tests::update_card_validation_accepts_valid_metadata_json_object
 server::routes::kanban::update_card_validation_tests::update_card_validation_accepts_valid_metadata_json_scalar
 server::routes::kanban::update_card_validation_tests::update_card_validation_allows_status_only_or_valid_metadata_only
@@ -6270,6 +6275,8 @@ services::dispatches::wait_queue::tests::wake_query_preserves_fifo_ordering
 services::dispatches::wait_queue::tests::wake_waiting_dispatch_outbox_pg_reassigns_wait_rows_fifo
 services::escalation_settings::tests::escalation_defaults_keep_discord_owner_fallback_boot_bound
 services::escalation_settings::tests::escalation_defaults_still_use_live_escalation_owner_override
+services::external_share::tests::safe_summary_contains_counts_only
+services::external_share::tests::share_states_use_stable_wire_names
 services::gemini::path_expansion_tests::expand_gemini_working_dir_keeps_existing_trimmed_relative_behavior
 services::gemini::path_expansion_tests::expand_gemini_working_dir_reuses_runtime_tilde_expansion
 services::git::commit_resolver::fail_closed_tests::git_tracked_change_paths_strict_fails_closed_on_non_repo_dir
@@ -6335,6 +6342,14 @@ services::health_diagnostics::tests::dispatch_outbox_stats_json_contract_keeps_f
 services::health_diagnostics::tests::every_health_path_database_await_is_bracketed
 services::issue_announcements::tests::renders_active_card_with_agent_and_timestamp
 services::issue_announcements::tests::renders_completed_card_for_pr_merge
+services::kakao::tests::an_explicit_empty_scope_response_does_not_gain_consent
+services::kakao::tests::bounded_json_rejects_declared_and_streamed_oversize
+services::kakao::tests::classifies_complete_and_partial_provider_results
+services::kakao::tests::comma_scope_is_one_oauth_scope_value
+services::kakao::tests::incomplete_provider_accounting_is_ambiguous
+services::kakao::tests::parses_kakao_refresh_token_expiry_extension
+services::kakao::tests::request_fingerprint_is_recipient_order_independent_and_payload_bound
+services::kakao::tests::validates_send_limits_and_idempotency_key
 services::long_turn_watchdog::tests::alert_cooldown_exceeds_scan_cadence_by_default
 services::long_turn_watchdog::tests::alert_message_contains_actionable_context
 services::long_turn_watchdog::tests::cluster_threshold_triggers_at_three
@@ -6457,6 +6472,9 @@ services::message_outbox_recovery_tests::redrive_same_key_is_exact_once_even_aft
 services::message_outbox_recovery_tests::sent_or_active_semantic_sibling_blocks_redrive_pg
 services::message_outbox_recovery_tests::unknown_source_preflight_blocks_all_mutation_pg
 services::message_outbox_recovery_tests::worker_claim_race_has_one_owner_and_no_double_claim_pg
+services::oauth_connection::tests::sha256_helper_is_stable_and_fixed_width
+services::oauth_connection::tests::token_payload_round_trips_without_plaintext_in_ciphertext
+services::oauth_connection::tests::token_vault_round_trips_and_binds_aad
 services::observability::cancellation_observability_tests::turn_cancelled_emit_records_normalized_payload_without_pg
 services::observability::emit::tests::every_emit_surface_records_one_recent_event
 services::observability::emit::tests::invariant_severity_routes_to_exact_log_level_and_suffix_4422

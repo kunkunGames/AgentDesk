@@ -231,7 +231,8 @@ src/
 │   │   │   │       ├── part_07.rs
 │   │   │   │       ├── part_08.rs
 │   │   │   │       ├── part_09.rs
-│   │   │   │       └── part_10.rs
+│   │   │   │       ├── part_10.rs
+│   │   │   │       └── part_11.rs
 │   │   │   ├── guides.rs
 │   │   │   ├── inventory.rs
 │   │   │   └── taxonomy.rs
@@ -290,6 +291,7 @@ src/
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
 │   │   ├── idle_recap.rs
+│   │   ├── kakao.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
@@ -1397,12 +1399,14 @@ src/
 │   ├── dispatched_sessions.rs
 │   ├── dispatches_followup.rs
 │   ├── escalation_settings.rs
+│   ├── external_share.rs
 │   ├── gemini.rs
 │   ├── github_issue_creation.rs
 │   ├── hang_forensics.rs
 │   ├── health_active_session_audit.rs
 │   ├── health_diagnostics.rs
 │   ├── issue_announcements.rs
+│   ├── kakao.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
 │   ├── long_turn_watchdog.rs
@@ -1415,6 +1419,7 @@ src/
 │   ├── message_outbox_recovery_tests.rs
 │   ├── mod.rs
 │   ├── monitoring_store.rs
+│   ├── oauth_connection.rs
 │   ├── opencode.rs
 │   ├── operator_connectors.rs
 │   ├── pane_readiness.rs

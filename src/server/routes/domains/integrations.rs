@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, claude_accounts_api, discord, dm_reply, github, github_dashboard, hooks,
-    meetings, pr_summary, protected_api_domain,
+    kakao, meetings, pr_summary, protected_api_domain,
 };
 
 // Category: integrations
@@ -39,6 +39,10 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 patch(github_dashboard::close_issue),
             )
             .route("/github-closed-today", get(github_dashboard::closed_today))
+            .route("/kakao/oauth/start", post(kakao::start_oauth))
+            .route("/kakao/connection", delete(kakao::disconnect))
+            .route("/kakao/friends", get(kakao::list_friends))
+            .route("/kakao/messages/send", post(kakao::send_message))
             .route("/discord/bindings", get(discord::list_bindings))
             .route(
                 "/discord/channels/{id}/messages",

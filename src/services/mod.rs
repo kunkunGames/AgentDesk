@@ -38,6 +38,7 @@ pub mod dispatches;
 #[allow(dead_code)]
 pub mod dispatches_followup;
 pub mod escalation_settings;
+pub mod external_share;
 pub mod gemini;
 pub mod git;
 pub mod github_issue_creation;
@@ -45,6 +46,7 @@ pub(crate) mod hang_forensics;
 pub mod health_active_session_audit;
 pub mod health_diagnostics;
 pub mod issue_announcements;
+pub mod kakao;
 pub mod kanban;
 pub mod kanban_cards;
 pub mod long_turn_watchdog;
@@ -66,6 +68,7 @@ pub(crate) mod message_outbox_recovery_support;
 #[cfg(test)]
 mod message_outbox_recovery_tests;
 pub mod monitoring_store;
+pub mod oauth_connection;
 pub mod observability;
 pub mod onboarding;
 pub mod opencode;

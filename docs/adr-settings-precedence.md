@@ -40,6 +40,7 @@ We keep per-surface storage, but every settings surface must declare:
 | Company settings JSON | Dashboard general settings UI and any caller that owns the merged JSON document | No YAML baseline. `kv_meta['settings']` is the canonical document. | Persists until explicitly replaced. Restart does not rebuild it from YAML. | `PUT /api/settings` is full replace. Callers must merge hidden keys themselves. |
 | Runtime config | Dashboard live-runtime controls | hardcoded defaults -> `agentdesk.yaml runtime:` -> `kv_meta['runtime-config']` override JSON | Explicit live overrides apply immediately and survive restart ahead of YAML unless `runtime.reset_overrides_on_restart=true`. Non-explicit saved values rebase onto YAML/defaults. | `PUT /api/settings/runtime-config` fully replaces the object. Supplied `__runtimeConfigExplicitKeys` metadata is authoritative, including an empty list; without it, every known body key is explicit. `GET` returns `current` + `defaults` + `explicit_keys`. |
 | Policy/config keys | Dashboard policy controls and automation helpers | hardcoded defaults -> YAML sections (`review:`, `runtime:`, `automation:`, `kanban:`) -> individual `kv_meta` rows | YAML-backed keys are re-seeded on restart. Hardcoded-only keys keep their DB override unless the reset flag is on. Read-only entries are surfaced as config metadata only. | `PATCH /api/settings/config` writes editable keys only. `GET` returns effective value plus baseline metadata. |
+| External integrations | Operator-owned daemon configuration | hardcoded disabled defaults -> `agentdesk.yaml integrations:`; fixed secret environment variables supply credentials; dedicated Postgres tables hold encrypted OAuth/runtime state | Restart-required. No `kv_meta` or company-settings override. Local disconnect deletes stored OAuth state but does not rewrite YAML or claim remote unlink. | YAML/env are the only config writers. Settings connector endpoints expose safe status and explicit connect/disconnect/test actions, never secret values. |
 | Escalation routing | Dashboard escalation panel and Discord `!escalation` command | `escalation:` config baseline plus fallback owner/channel defaults, overridden by `kv_meta['escalation-settings-override']` | Override persists until changed back to defaults. When `runtime.reset_overrides_on_restart=true`, the stored override is cleared on boot. | `PUT /api/settings/escalation` replaces the override. Sending the default body clears the stored override. |
 | Onboarding / secrets | Onboarding wizard | Dedicated onboarding keys and flows, not general settings | Persist until onboarding updates them. | Managed only through `/api/onboarding/*` and onboarding-specific helpers. |
 
@@ -80,12 +81,21 @@ We keep per-surface storage, but every settings surface must declare:
 - Defaults come from config, not from dashboard state
 - The override is a dedicated JSON document rather than a collection of unrelated `kv_meta` keys
 
+### `agentdesk.yaml integrations:`
+
+- Canonical config: non-secret, default-disabled integration fields under `integrations:`
+- Secret owner: fixed environment variables registered with the process redaction utility
+- Runtime state: dedicated Postgres tables with encrypted tokens and hashed OAuth/idempotency values
+- Restart semantics: config changes require restart; there is no live override or dashboard config write
+- Dashboard contract: `/api/settings/operator-connectors` is a read/status projection; provider action routes perform explicit OAuth and test operations only
+
 ## Operator Rules
 
 - Changing a YAML-backed key from the dashboard is a live override, not a YAML edit.
 - If a key reports `restart_behavior = reseed-from-yaml`, the dashboard value is temporary until reboot.
 - If a key reports `restart_behavior = persist-live-override`, the DB override is the restart value until someone changes it or enables reset-on-restart.
 - Read-only metadata such as `server_port` must not be exposed as a writable live setting.
+- External integration secrets must not be copied into YAML, `kv_meta`, connector JSON, or browser persistence.
 
 ## Local Verification Notes
 

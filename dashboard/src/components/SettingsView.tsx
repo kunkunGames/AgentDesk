@@ -144,6 +144,41 @@ export default function SettingsView({
   }, [tr]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("connector") !== "kakao_friend_share") return;
+    const oauthResult = url.searchParams.get("oauth");
+    if (oauthResult !== "ok" && oauthResult !== "error") return;
+
+    setActivePanel("connectors");
+    if (oauthResult === "ok") {
+      notify("카카오 연결이 완료되었습니다.", "Kakao connection completed.", "success");
+    } else {
+      const safeReason = new Set([
+        "denied",
+        "invalid_state",
+        "expired",
+        "token_exchange",
+        "consent",
+        "internal",
+      ]).has(url.searchParams.get("reason") ?? "")
+        ? url.searchParams.get("reason")
+        : "internal";
+      notify(
+        `카카오 연결을 완료하지 못했습니다. (${safeReason})`,
+        `Kakao connection did not complete. (${safeReason})`,
+        "error",
+      );
+    }
+    url.searchParams.delete("connector");
+    url.searchParams.delete("oauth");
+    url.searchParams.delete("reason");
+    window.history.replaceState(window.history.state, "", url);
+    setOperatorConnectorsLoaded(false);
+    void loadOperatorConnectors();
+  }, [loadOperatorConnectors, notify]);
+
+  useEffect(() => {
     setCompanyName(settings.companyName);
     setCeoName(settings.ceoName);
     setLanguage(settings.language);

@@ -23,6 +23,7 @@ pub mod health_api;
 pub mod home_metrics;
 pub mod hooks;
 pub mod idle_recap;
+pub mod kakao;
 pub mod kanban;
 pub mod kanban_repos;
 mod maintenance;

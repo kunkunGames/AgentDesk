@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,22 @@ pub enum OptionalConnectorState {
     MissingPath,
     MissingProvider,
     InvalidConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalConnectorKind {
+    Filesystem,
+    Oauth,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OAuthConnectorConnection {
+    pub state: String,
+    pub reason: Option<&'static str>,
+    pub scopes: Vec<String>,
+    pub access_expires_at: Option<DateTime<Utc>>,
+    pub landing_url: Option<String>,
 }
 
 impl OptionalConnectorState {
@@ -41,12 +58,17 @@ pub struct OptionalConnectorStatus {
     pub name: &'static str,
     pub state: OptionalConnectorState,
     pub optional: bool,
+    pub kind: OptionalConnectorKind,
     pub env_var: &'static str,
+    pub env_vars: Vec<&'static str>,
     pub source: Option<String>,
     pub reason: Option<&'static str>,
     pub detail: String,
     pub setup_actions: Vec<String>,
     pub capabilities: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<OAuthConnectorConnection>,
+    pub actions: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,6 +123,19 @@ pub struct OptionalConnectorsResponse {
 impl OptionalConnectorsResponse {
     pub fn current() -> Self {
         let connectors = optional_connector_statuses();
+        let summary = OptionalConnectorSummary::from_statuses(&connectors);
+        Self {
+            connectors,
+            summary,
+        }
+    }
+
+    pub async fn current_with_kakao(
+        pool: Option<&sqlx::PgPool>,
+        config: &crate::config::KakaoFriendShareConfig,
+    ) -> Self {
+        let mut connectors = optional_connector_statuses();
+        connectors.push(kakao_connector_status(pool, config).await);
         let summary = OptionalConnectorSummary::from_statuses(&connectors);
         Self {
             connectors,
@@ -187,12 +222,16 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
             name: spec.name,
             state: OptionalConnectorState::MissingConfig,
             optional: true,
+            kind: OptionalConnectorKind::Filesystem,
             env_var: spec.env_var,
+            env_vars: vec![spec.env_var],
             source: None,
             reason: Some("home_unavailable"),
             detail: "state=missing_config reason=home_unavailable; core runtime does not require this connector".to_string(),
             setup_actions: vec![format!("Set {} to an existing directory.", spec.env_var)],
             capabilities: vec![spec.capability],
+            connection: None,
+            actions: Vec::new(),
         };
     };
 
@@ -203,12 +242,16 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
             name: spec.name,
             state: OptionalConnectorState::Ready,
             optional: true,
+            kind: OptionalConnectorKind::Filesystem,
             env_var: spec.env_var,
+            env_vars: vec![spec.env_var],
             source: Some(source_text.clone()),
             reason: None,
             detail: format!("state=ready source={source_text}"),
             setup_actions: Vec::new(),
             capabilities: vec![spec.capability],
+            connection: None,
+            actions: Vec::new(),
         }
     } else if spec.explicit {
         OptionalConnectorStatus {
@@ -216,7 +259,9 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
             name: spec.name,
             state: OptionalConnectorState::MissingPath,
             optional: true,
+            kind: OptionalConnectorKind::Filesystem,
             env_var: spec.env_var,
+            env_vars: vec![spec.env_var],
             source: Some(source_text.clone()),
             reason: Some("missing_path"),
             detail: format!("state=missing_path source={source_text} reason=missing_path"),
@@ -228,6 +273,8 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
                 ),
             ],
             capabilities: vec![spec.capability],
+            connection: None,
+            actions: Vec::new(),
         }
     } else {
         OptionalConnectorStatus {
@@ -235,13 +282,92 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
             name: spec.name,
             state: OptionalConnectorState::MissingConfig,
             optional: true,
+            kind: OptionalConnectorKind::Filesystem,
             env_var: spec.env_var,
+            env_vars: vec![spec.env_var],
             source: Some(source_text.clone()),
             reason: Some("missing_config"),
             detail: format!("state=missing_config source={source_text} reason=missing_config"),
             setup_actions: vec![spec.setup_hint.to_string()],
             capabilities: vec![spec.capability],
+            connection: None,
+            actions: Vec::new(),
         }
+    }
+}
+
+async fn kakao_connector_status(
+    pool: Option<&sqlx::PgPool>,
+    config: &crate::config::KakaoFriendShareConfig,
+) -> OptionalConnectorStatus {
+    use crate::services::kakao::{
+        KAKAO_CLIENT_SECRET_ENV, KAKAO_CONNECTOR_ID, KAKAO_REST_API_KEY_ENV, KakaoConnectionState,
+        connection_status,
+    };
+    use crate::services::oauth_connection::TOKEN_KEY_ENV;
+
+    let status = connection_status(pool, config).await;
+    let (state, actions) = match status.state {
+        KakaoConnectionState::Disabled => (OptionalConnectorState::Skipped, Vec::new()),
+        KakaoConnectionState::MissingConfig => (OptionalConnectorState::MissingConfig, Vec::new()),
+        KakaoConnectionState::NotConnected => {
+            (OptionalConnectorState::MissingConfig, vec!["connect"])
+        }
+        KakaoConnectionState::Connected => (
+            OptionalConnectorState::Ready,
+            vec!["reconnect", "disconnect", "test_send"],
+        ),
+        KakaoConnectionState::ConsentIncomplete
+        | KakaoConnectionState::ReauthorizationRequired
+        | KakaoConnectionState::InvalidConfig => (
+            OptionalConnectorState::InvalidConfig,
+            vec!["reconnect", "disconnect"],
+        ),
+        KakaoConnectionState::StorageUnavailable => {
+            (OptionalConnectorState::MissingProvider, Vec::new())
+        }
+    };
+    let connection_state = status.state.as_str().to_string();
+    let reason = status.reason;
+    OptionalConnectorStatus {
+        id: KAKAO_CONNECTOR_ID,
+        name: "Kakao friend share",
+        state,
+        optional: true,
+        kind: OptionalConnectorKind::Oauth,
+        env_var: KAKAO_REST_API_KEY_ENV,
+        env_vars: vec![KAKAO_REST_API_KEY_ENV, KAKAO_CLIENT_SECRET_ENV, TOKEN_KEY_ENV],
+        source: None,
+        reason,
+        detail: format!(
+            "state={} reason={}",
+            connection_state,
+            reason.unwrap_or("none")
+        ),
+        setup_actions: match status.state {
+            KakaoConnectionState::Disabled => vec![
+                "Enable integrations.kakao_friend_share after completing the Kakao app prerequisites."
+                    .to_string(),
+            ],
+            KakaoConnectionState::MissingConfig => vec![
+                format!("Set {KAKAO_REST_API_KEY_ENV} and {KAKAO_CLIENT_SECRET_ENV}."),
+                format!("Set {TOKEN_KEY_ENV} to standard base64 for exactly 32 bytes."),
+            ],
+            KakaoConnectionState::StorageUnavailable => vec![
+                "Restore the AgentDesk PostgreSQL connection before using OAuth connectors."
+                    .to_string(),
+            ],
+            _ => Vec::new(),
+        },
+        capabilities: vec!["kakao_friend_list", "kakao_friend_message"],
+        connection: Some(OAuthConnectorConnection {
+            state: connection_state,
+            reason,
+            scopes: status.scopes,
+            access_expires_at: status.access_expires_at,
+            landing_url: Some(config.landing_url.clone()),
+        }),
+        actions,
     }
 }
 
