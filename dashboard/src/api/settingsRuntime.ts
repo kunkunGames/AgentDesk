@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 import type { CompanySettings, VoiceConfigPutBody, VoiceConfigResponse } from "../types";
 import { clearCachedGet, readCachedGet, request, type CachedGetEntry } from "./httpClient";
 
@@ -147,58 +149,117 @@ export async function getOperatorConnectors(): Promise<OperatorConnectorsRespons
   return request("/api/settings/operator-connectors");
 }
 
-export interface KakaoOAuthStartResponse {
-  authorize_url: string;
-  expires_in_seconds: number;
-}
+const kakaoOAuthStartResponseSchema = z.object({
+  authorize_url: z.string().url(),
+  expires_in_seconds: z.number().int().positive(),
+});
 
-export interface KakaoFriendView {
-  uuid: string;
-  display_name: string;
-}
+const kakaoDisconnectResponseSchema = z.object({
+  ok: z.boolean(),
+  connector_id: z.string().min(1),
+  connection_state: z.string().min(1),
+  remote_unlinked: z.literal(false),
+});
 
-export interface KakaoFriendsPage {
-  friends: KakaoFriendView[];
-  total_count: number;
-  offset: number;
-  limit: number;
-  next_offset: number | null;
-}
+const kakaoFriendViewSchema = z.object({
+  uuid: z.string().min(1),
+  display_name: z.string(),
+});
 
-export type KakaoSendStatus = "success" | "partial_success" | "failed" | "unknown";
+const kakaoFriendsPageSchema = z.object({
+  friends: z.array(kakaoFriendViewSchema).max(100),
+  total_count: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  limit: z.number().int().min(1).max(100),
+  next_offset: z.number().int().nonnegative().nullable(),
+});
 
-export interface KakaoSendResult {
-  request_id: string;
-  status: KakaoSendStatus;
-  requested_count: number;
-  successful_count: number;
-  failed_count: number;
-  replayed: boolean;
-  delivery_may_have_occurred: boolean;
-  automatic_retry_allowed: false;
-}
+const kakaoSendStatusSchema = z.enum([
+  "success",
+  "partial_success",
+  "failed",
+  "unknown",
+]);
+
+const kakaoSendResultSchema = z
+  .object({
+    request_id: z.string().uuid(),
+    status: kakaoSendStatusSchema,
+    requested_count: z.number().int().min(1).max(5),
+    successful_count: z.number().int().min(0).max(5),
+    failed_count: z.number().int().min(0).max(5),
+    replayed: z.boolean(),
+    delivery_may_have_occurred: z.boolean(),
+    automatic_retry_allowed: z.literal(false),
+  })
+  .refine(
+    ({
+      status,
+      requested_count,
+      successful_count,
+      failed_count,
+      delivery_may_have_occurred,
+    }) => {
+      switch (status) {
+        case "success":
+          return successful_count === requested_count
+            && failed_count === 0
+            && delivery_may_have_occurred;
+        case "partial_success":
+          return successful_count > 0
+            && failed_count > 0
+            && successful_count + failed_count === requested_count
+            && delivery_may_have_occurred;
+        case "failed":
+          return successful_count === 0
+            && failed_count === requested_count
+            && !delivery_may_have_occurred;
+        case "unknown":
+          return successful_count === 0
+            && failed_count === 0
+            && delivery_may_have_occurred;
+      }
+    },
+    { message: "Kakao result status, counts, and delivery risk are inconsistent" },
+  );
+
+export type KakaoOAuthStartResponse = z.infer<
+  typeof kakaoOAuthStartResponseSchema
+>;
+export type KakaoDisconnectResponse = z.infer<typeof kakaoDisconnectResponseSchema>;
+export type KakaoFriendView = z.infer<typeof kakaoFriendViewSchema>;
+export type KakaoFriendsPage = z.infer<typeof kakaoFriendsPageSchema>;
+export type KakaoSendStatus = z.infer<typeof kakaoSendStatusSchema>;
+export type KakaoSendResult = z.infer<typeof kakaoSendResultSchema>;
 
 export async function startKakaoOAuth(): Promise<KakaoOAuthStartResponse> {
-  return request("/api/kakao/oauth/start", {
-    method: "POST",
-    maxRetries: 0,
-  });
+  return request(
+    "/api/kakao/oauth/start",
+    {
+      method: "POST",
+      maxRetries: 0,
+    },
+    kakaoOAuthStartResponseSchema,
+  );
 }
 
-export async function disconnectKakao(): Promise<{
-  ok: boolean;
-  connector_id: string;
-  connection_state: string;
-  remote_unlinked: boolean;
-}> {
-  return request("/api/kakao/connection", {
-    method: "DELETE",
-    maxRetries: 0,
-  });
+export async function disconnectKakao(): Promise<KakaoDisconnectResponse> {
+  return request(
+    "/api/kakao/connection",
+    {
+      method: "DELETE",
+      maxRetries: 0,
+    },
+    kakaoDisconnectResponseSchema,
+  );
 }
 
 export async function getKakaoFriends(offset = 0, limit = 20): Promise<KakaoFriendsPage> {
-  return request(`/api/kakao/friends?offset=${offset}&limit=${limit}`);
+  return request(
+    `/api/kakao/friends?offset=${offset}&limit=${limit}`,
+    undefined,
+    kakaoFriendsPageSchema,
+  );
 }
 
 export async function sendKakaoFriendMessage(
@@ -206,16 +267,20 @@ export async function sendKakaoFriendMessage(
   receiverUuids: string[],
   text: string,
 ): Promise<KakaoSendResult> {
-  return request("/api/kakao/messages/send", {
-    method: "POST",
-    headers: { "Idempotency-Key": idempotencyKey },
-    body: JSON.stringify({
-      receiver_uuids: receiverUuids,
-      text,
-      confirmed: true,
-    }),
-    maxRetries: 0,
-  });
+  return request(
+    "/api/kakao/messages/send",
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({
+        receiver_uuids: receiverUuids,
+        text,
+        confirmed: true,
+      }),
+      maxRetries: 0,
+    },
+    kakaoSendResultSchema,
+  );
 }
 
 export async function getEscalationSettings(): Promise<EscalationSettingsResponse> {

@@ -1015,6 +1015,13 @@ The browser keeps friend data only while the inline Settings composer is open an
 
 There is no global toolbar or result-card entry in v1.
 
+### 15.3 Dashboard response boundary
+
+- Every new Kakao Dashboard API call passes a zod response schema as the third `request` argument; TypeScript types are inferred from those schemas rather than maintained as parallel interfaces.
+- OAuth start, local disconnect, friends pagination, and send-result payloads fail closed before malformed data can enter the response cache or UI state.
+- The schemas retain the safety bounds from this Spec: HTTPS-shaped authorization URL, local-only `remote_unlinked=false`, at most 100 friends per page, 1..=5 requested recipients, UUID operation ID, the closed send-status set, status/count/delivery-risk consistency, and `automatic_retry_allowed=false`.
+- Component-level authorization endpoint allowlisting remains a second, stricter check after schema parsing.
+
 ---
 
 ## 16. Requirement Registry
@@ -1049,6 +1056,7 @@ There is no global toolbar or result-card entry in v1.
 - [REQ-028] Crash-before-POST, crash-after-POST, terminal-write failure, and multi-node races are blocking tests for rollout activation; unverified paths stay default-disabled.
 - [REQ-029] Missing Postgres or connector configuration fails the optional feature closed without blocking core AgentDesk.
 - [REQ-030] Product entrypoints beyond Settings require the PRD pilot promotion gate.
+- [REQ-031] Every new Kakao Dashboard endpoint validates its response with a zod parser before caching or rendering; inferred types and runtime schemas have one owner.
 
 ---
 
@@ -1080,7 +1088,7 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 - [TSK-B-002] **LOCAL-IMPLEMENTED** — add friends and text-message provider adapters with bounded JSON and conservative response classification.
 - [TSK-B-003] **LOCAL-IMPLEMENTED** — add concrete `KakaoFriendShareService`, DB-backed send cap, and operation state machine.
 - [TSK-B-004] **LOCAL-IMPLEMENTED** — add protected friends/send routes with the normative wire types.
-- [TSK-B-005] **LOCAL-IMPLEMENTED** — add the Settings inline composer, unknown/duplicate-risk UX, and typed connector actions.
+- [TSK-B-005] **LOCAL-IMPLEMENTED** — add the Settings inline composer, unknown/duplicate-risk UX, typed connector actions, and zod-validated Kakao response boundaries.
 - [TSK-B-006] **ROLLOUT-BLOCKED** — add PostgreSQL crash/multi-node/privacy integration coverage and live-provider fixtures before activation.
 
 ### Merge and rollout boundaries
@@ -1157,6 +1165,7 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 - [TEST-038] Inventory generator and git-diff gate pass in every route-changing PR.
 - [TEST-039] Migration immutable checksum validation passes in every migration-changing PR.
 - [TEST-040] Pilot aggregate derives counts without raw recipient/text fields or a new audit table.
+- [TEST-041] Dashboard API tests accept valid OAuth/disconnect/friends/send payloads and reject malformed URLs, remote-unlink claims, friend pages, operation IDs, counts, statuses, and retry flags before UI/cache use.
 
 ---
 
@@ -1194,6 +1203,7 @@ The current change is one cohesive, default-disabled vertical slice. Keeping con
 | REQ-028 | TSK-B-006 | TEST-021, TEST-025, TEST-026, TEST-027 |
 | REQ-029 | TSK-A-001, TSK-A-005, TSK-B-003 | TEST-016, TEST-019, TEST-020 |
 | REQ-030 | TSK-PILOT-001, TSK-PILOT-002, TSK-C-001, TSK-C-002 | TEST-003, TEST-040 |
+| REQ-031 | TSK-B-005 | TEST-035, TEST-041 |
 
 All IDs are written in full to support mechanical validation. No test or evidence row may be silently replaced by prose such as “CI docs”.
 
@@ -1257,7 +1267,7 @@ This document describes an implemented local slice, not an activated integration
 | At-most-once send contract | Locally implemented; rollout blocked | PostgreSQL crash/multi-node tests and live ambiguity evidence |
 | OAuth/scope/token contract | Official wire verified; locally implemented | Kakao console and live E2E; PKCE intentionally excluded because no official contract was found |
 | Friends/message provider DTO | Official wire verified; locally implemented | sanitized live-account fixtures |
-| Connector/status architecture | Locally implemented with focused safety-helper tests | rendered component interaction coverage before rollout |
+| Connector/status architecture | Locally implemented with focused safety-helper and response-schema tests | rendered component interaction coverage before rollout |
 | Vault and DB invariants | Locally implemented | PostgreSQL integration/race coverage; dependency versions are lockfile-pinned |
 | ROI | Blocked | EVIDENCE-G0-010 and Gate 0 demand confirmation |
 | Code | **Local verification complete** | default-disabled until all rollout gates pass |
@@ -1296,3 +1306,4 @@ This document describes an implemented local slice, not an activated integration
 | 2026-08-09 | Detailed OAuth/friends/send/idempotency/connectors draft |
 | 2026-08-09 | **Cohesion/ROI/safety rewrite**: added provider evidence and rollout gates; narrowed v1 to a Settings text-only pilot; replaced replay-safe idempotency reuse with a non-reclaiming external operation fence; isolated Discord `0105_delivery_journal`; made connector projection DB-aware; fixed crypto, refresh, disconnect, HTTP, privacy, cluster, test, and traceability contracts. |
 | 2026-08-09 | **Implementation synchronization**: aligned the Spec with the default-disabled OAuth/vault/friends/send slice, oauth2-rs 5.0.0, Kakao's comma-delimited scopes and refresh-token omission, bounded provider responses, the inline composer, one cohesive PR, and separate merge versus rollout gates. |
+| 2026-08-09 | **Ready-for-review hardening**: bound every new Kakao Dashboard response to a zod parser, inferred TypeScript types from the schemas, and added valid/invalid boundary tests before moving the PR out of Draft. |
