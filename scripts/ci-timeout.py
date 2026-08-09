@@ -208,6 +208,18 @@ def _cleanup(proc: subprocess.Popen[bytes], state: _RunState, enabled: bool) -> 
     _checkpoint(state, enabled, "kill_boundary")  # R2″ ④: post-KILL
     _refresh_reaped(proc, state)
     if not state.reaped:
+        try:
+            if hasattr(proc, "wait"):
+                # Use a very short wait, we know it's not dead but this might reap a zombie
+                proc.wait(timeout=0.01)
+                state.reaped = True
+            elif hasattr(os, "waitpid"):
+                pid, status = os.waitpid(proc.pid, os.WNOHANG)
+                if pid == proc.pid:
+                    state.reaped = True
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError, AttributeError, ChildProcessError):
+            pass
+    if not state.reaped:
         print(
             f"::warning::ci-timeout: child pid {proc.pid} unreaped after KILL_WAIT",
             file=sys.stderr,
