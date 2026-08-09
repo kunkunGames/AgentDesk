@@ -97,7 +97,7 @@
 | `GET` | `/api/dispatches/delivery-events/reconcile-stats` | `dispatches::get_dispatch_delivery_reconcile_stats` | `src/server/routes/dispatches/crud.rs:129` | `src/server/routes/domains/ops.rs:113` |
 | `GET` | `/api/dispatches/pending` | `queue_api::list_pending_dispatches` | `src/server/routes/queue_api.rs:67` | `src/server/routes/domains/ops.rs:330` |
 | `GET` | `/api/dispatches/{id}` | `dispatches::get_dispatch` | `src/server/routes/dispatches/crud.rs:77` | `src/server/routes/domains/ops.rs:117` |
-| `PATCH` | `/api/dispatches/{id}` | `dispatches::update_dispatch` | `src/server/routes/dispatches/crud.rs:225` | `src/server/routes/domains/ops.rs:117` |
+| `PATCH` | `/api/dispatches/{id}` | `dispatches::update_dispatch` | `src/server/routes/dispatches/crud.rs:232` | `src/server/routes/domains/ops.rs:117` |
 | `POST` | `/api/dispatches/{id}/cancel` | `queue_api::cancel_dispatch` | `src/server/routes/queue_api.rs:105` | `src/server/routes/domains/ops.rs:334` |
 | `GET` | `/api/dispatches/{id}/events` | `dispatches::get_dispatch_delivery_events` | `src/server/routes/dispatches/crud.rs:99` | `src/server/routes/domains/ops.rs:121` |
 | `POST` | `/api/dm-reply/register` | `dm_reply::register_handler` | `src/server/routes/dm_reply.rs:23` | `src/server/routes/domains/integrations.rs:48` |
@@ -201,7 +201,7 @@
 | `PUT` | `/api/pipeline/stages` | `pipeline::put_stages` | `src/server/routes/pipeline.rs:112` | `src/server/routes/domains/ops.rs:134` |
 | `POST` | `/api/pm-decision` | `kanban::pm_decision` | `src/server/routes/kanban.rs:1264` | `src/server/routes/domains/kanban.rs:60` |
 | `GET` | `/api/policies` | `agents_crud::list_policies` | `src/server/routes/agents_crud.rs:1282` | `src/server/routes/domains/agents.rs:50` |
-| `GET` | `/api/prompt-manifest/retention` | `prompt_manifest_retention::get_retention_status` | `src/server/routes/prompt_manifest_retention.rs:39` | `src/server/routes/domains/ops.rs:240` |
+| `GET` | `/api/prompt-manifest/retention` | `prompt_manifest_retention::get_retention_status` | `src/server/routes/prompt_manifest_retention.rs:36` | `src/server/routes/domains/ops.rs:240` |
 | `GET` | `/api/provider-cli` | `provider_cli_api::get_provider_cli_status` | `src/server/routes/provider_cli_api.rs:29` | `src/server/routes/domains/ops.rs:351` |
 | `PATCH` | `/api/provider-cli/{provider}` | `provider_cli_api::patch_provider_cli` | `src/server/routes/provider_cli_api.rs:90` | `src/server/routes/domains/ops.rs:355` |
 | `GET` | `/api/quality/events` | `analytics::quality_events` | `src/server/routes/analytics.rs:316` | `src/server/routes/domains/analytics.rs:14` |

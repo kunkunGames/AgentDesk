@@ -969,6 +969,7 @@ server::routes::scheduled_messages::tests::patch_realigns_stale_recurring_time
 server::routes::scheduled_messages::tests::patch_rejects_stale_effective_one_shot_time
 server::routes::scheduled_messages::tests::snapshot_patch_retarget_is_rejected_but_fresh_and_other_fields_pass
 server::routes::scheduled_messages::tests::target_channel_ids_are_normalized_and_invalid_values_rejected
+server::routes::stats::memento_feedback_stats_pg_tests::load_memento_feedback_counts_returns_persisted_writer_values_pg
 server::routes::voice_config::tests::put_body_rejects_duplicate_dashboard_aliases
 server::routes::voice_config::tests::version_changes_when_voice_alias_changes
 server::startup_preflight::tests::startup_preflight_runs_the_resolved_check_without_propagating_failure
@@ -1003,7 +1004,7 @@ server::worker_recovery::tests::stable_run_resets_backoff
 server::worker_registry::leader_takeover_tests::policy_tick_thread_captures_the_process_health_registry
 server::worker_registry::leader_takeover_tests::supervisor_respawns_worker_after_lease_takeover
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_column_decode_error
-services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_other_errors
+services::agent_quality::regression_alerts::explicit_decode_fallback_tests::falls_back_on_column_not_found
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::metric_thresholds_preserve_retired_authority_policy
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::preserves_none_for_legitimately_absent_optional_column
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::quality_channel_target_normalizes_without_implicit_fallback
