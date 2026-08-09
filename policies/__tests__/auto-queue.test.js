@@ -486,6 +486,58 @@ test("auto-queue finds a free path from backlog to the nearest dispatchable stat
   assert.deepEqual(toPlain(path), ["requested"]);
 });
 
+test("auto-queue free-path traversal avoids quadratic array primitives", () => {
+  const previousAgentdesk = global.agentdesk;
+  global.agentdesk = {
+    pipeline: {
+      hasState(stateId, cfg) {
+        return cfg.states.some((state) => state.id === stateId);
+      },
+    },
+  };
+  const dispatch = require("../lib/auto-queue-dispatch");
+  const cfg = {
+    states: [
+      { id: "backlog" },
+      { id: "__proto__" },
+      { id: "constructor" },
+      { id: "requested" },
+      { id: "done", terminal: true },
+    ],
+    transitions: [
+      { from: "backlog", to: "__proto__", type: "free" },
+      { from: "__proto__", to: "constructor", type: "free" },
+      { from: "constructor", to: "backlog", type: "free" },
+      { from: "constructor", to: "requested", type: "free" },
+      { from: "requested", to: "done", type: "gated" },
+    ],
+  };
+  const originalShift = Array.prototype.shift;
+  const originalUnshift = Array.prototype.unshift;
+  const originalIndexOf = Array.prototype.indexOf;
+  let path;
+
+  try {
+    Array.prototype.shift = function() {
+      throw new Error("free-path traversal must use a queue head index");
+    };
+    Array.prototype.unshift = function() {
+      throw new Error("free-path reconstruction must build in reverse");
+    };
+    Array.prototype.indexOf = function() {
+      throw new Error("free-path target membership must use a set");
+    };
+    path = dispatch.freePathToDispatchable("backlog", cfg);
+  } finally {
+    Array.prototype.shift = originalShift;
+    Array.prototype.unshift = originalUnshift;
+    Array.prototype.indexOf = originalIndexOf;
+    global.agentdesk = previousAgentdesk;
+  }
+
+  assert.deepEqual(path, ["__proto__", "constructor", "requested"]);
+});
+
 test("auto-queue stale terminal statuses accept normalized strings and arrays", () => {
   const stringConfig = loadPolicy("policies/lib/auto-queue-config.js", {
     config: {
