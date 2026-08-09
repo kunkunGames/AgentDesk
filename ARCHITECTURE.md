@@ -240,6 +240,7 @@ src/
 │   │   │   ├── admin.rs
 │   │   │   ├── agents.rs
 │   │   │   ├── analytics.rs
+│   │   │   ├── cluster.rs
 │   │   │   ├── integrations.rs
 │   │   │   ├── kanban.rs
 │   │   │   ├── mod.rs
