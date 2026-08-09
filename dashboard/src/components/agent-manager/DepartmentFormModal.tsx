@@ -318,18 +318,12 @@ export default function DepartmentFormModal({
               <div className="flex items-start gap-3">
                 <div>
                   <label htmlFor={iconBtnId} className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
-                    {tr("이모지", "Emoji")}
+                    {tr("아이콘", "Icon")}
                   </label>
                   <EmojiPicker
                     id={iconBtnId}
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
-                    aria-label={
-                      form.icon
-                        ? t({ ko: `선택된 이모지: ${form.icon}, 이모지 변경`, en: `Selected emoji: ${form.icon}, change emoji` })
-                        : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
-                    }
-                    dialogLabel={t({ ko: "이모지 선택", en: "Choose an emoji" })}
                   />
                 </div>
                 <div className="flex-1">
