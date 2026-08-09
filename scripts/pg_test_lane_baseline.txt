@@ -63,7 +63,6 @@ src/server/mod.rs
 src/server/multinode_regression.rs
 src/server/routes/escalation.rs
 src/server/routes/memory_api.rs
-src/server/routes/stats.rs
 src/services/agent_quality/regression_alerts.rs
 src/services/cluster/intake_preflight.rs
 src/services/discord/catch_up/too_old_notice.rs
