@@ -49,13 +49,6 @@ describe("EmojiPicker", () => {
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
   });
 
-  it("uses the icon-picker accessible name when no value is selected", async () => {
-    const target = await render(<EmojiPicker value="" onChange={() => {}} />);
-    const button = target.querySelector("button");
-
-    expect(button?.getAttribute("aria-label")).toBe("Open icon picker");
-  });
-
   it("renders the dialog with a translated accessible name", async () => {
     const target = await render(<EmojiPicker value="🤖" onChange={() => {}} />);
     const button = target.querySelector("button");

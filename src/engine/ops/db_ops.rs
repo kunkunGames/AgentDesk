@@ -560,6 +560,12 @@ fn previous_sql_token(sql: &str, before: usize) -> Option<SqlPrecedingToken> {
             break;
         }
     }
+    // Qualified name ending in '.' is not a completed standalone expression token
+    // for alias purposes (the identifier continues after the dot in the scanner).
+    if start > 0 && bytes[start - 1] == b'.' {
+        return Some(SqlPrecedingToken::ClauseKeyword);
+    }
+
     let word = &sql[start..end];
     if word.eq_ignore_ascii_case("as") {
         return Some(SqlPrecedingToken::As);

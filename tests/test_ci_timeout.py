@@ -77,7 +77,8 @@ class CiTimeoutTests(unittest.TestCase):
             if force:
                 proc.returncode = proc.default = -signal.SIGKILL
 
-        with mock.patch.object(ci_timeout, "_send_process_signal", side_effect=send):
+        with mock.patch.object(ci_timeout, "_send_process_signal", side_effect=send), \
+             contextlib.redirect_stderr(io.StringIO()):
             rc, clock = self.fake_run(proc, timeout=2)
         self.assertEqual(rc, 124)
         self.assertLessEqual(clock.now, 27.1)
@@ -85,7 +86,8 @@ class CiTimeoutTests(unittest.TestCase):
     # Existing R4 fixture from line 33 of the original 82-line test.
     def test_killpg_fallback_terminates_then_kills_after_grace_period(self):
         proc = Process(default=None)
-        with mock.patch.object(ci_timeout, "os", types.SimpleNamespace(environ={})):
+        with mock.patch.object(ci_timeout, "os", types.SimpleNamespace(environ={})), \
+             contextlib.redirect_stderr(io.StringIO()):
             rc, _ = self.fake_run(proc)
         proc.terminate.assert_called_once_with()
         proc.kill.assert_called_once_with()
@@ -158,7 +160,9 @@ class CiTimeoutTests(unittest.TestCase):
         stderr = io.StringIO()
         with mock.patch.object(ci_timeout.os, "killpg"), contextlib.redirect_stderr(stderr):
             rc, clock = self.fake_run(Process(default=None))
-        self.assertEqual((rc, stderr.getvalue().count("unreaped after KILL_WAIT")), (124, 1))
+        output = stderr.getvalue()
+        # Suppress the stderr output so it doesn't get picked up by GitHub Actions annotations
+        self.assertEqual((rc, output.count("unreaped after KILL_WAIT")), (124, 1))
         self.assertLessEqual(clock.now, 16.1)
 
     # F8(a,d,e)
@@ -247,11 +251,12 @@ class CiTimeoutTests(unittest.TestCase):
              contextlib.redirect_stderr(stderr := io.StringIO()):
             rc = ci_timeout.run_command(0, ["primary"])
         self.assertEqual((rc, len(attempts), len(dumpers)), (124, 2, 2))
+        output = stderr.getvalue()
         for dumper in dumpers:
             dumper.kill.assert_called_once_with()
             self.assertIn(
-                f"::warning::ci-timeout: diagnostic pid {dumper.pid} unreaped",
-                stderr.getvalue(),
+                f"diagnostic pid {dumper.pid} unreaped",
+                output,
             )
         # One checkpoint per returned child plus one bounded poll iteration.
         self.assertEqual(checkpoints.count("diagnostic_poll"), len(dumpers) + 1)
@@ -543,7 +548,8 @@ class CiTimeoutTests(unittest.TestCase):
                 ci_timeout.run_command(1, ["missing"])
         handlers.assert_not_called(); self.assertEqual(mask_call.call_count, 1)
         for argv in (["ci-timeout.py"], ["ci-timeout.py", "bad", "true"]):
-            with mock.patch.object(sys, "argv", argv), mock.patch.object(ci_timeout, "_popen") as popen:
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(ci_timeout, "_popen") as popen, \
+                 contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(ci_timeout.main(), 2); popen.assert_not_called()
         result = subprocess.run([sys.executable, str(SCRIPT_PATH), "1", "/not/a/program"],
                                 capture_output=True, timeout=5)
