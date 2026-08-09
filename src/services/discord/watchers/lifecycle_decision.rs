@@ -329,6 +329,7 @@ mod tests {
 
     #[test]
     fn watcher_activity_heartbeat_uses_runtime_output_mtime() {
+        let _env_guard = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmux_name = format!("AgentDesk-claude-heartbeat-{}", uuid::Uuid::new_v4());
         let output_path = std::path::PathBuf::from(
             crate::services::tmux_common::session_temp_path(&tmux_name, "jsonl"),

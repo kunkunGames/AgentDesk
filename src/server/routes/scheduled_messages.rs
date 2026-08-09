@@ -23,7 +23,14 @@ use crate::db::scheduled_messages::{
 };
 use crate::error::{AppError, AppResult, ErrorCode};
 
+mod provider_targets;
 mod snapshot_capture;
+
+pub use provider_targets::ScheduledProviderTargetsBody;
+use provider_targets::{
+    ensure_external_delivery_rollout_ready, patch_provider_targets, prepare_provider_targets,
+    provider_delivery_intent_changed, validate_kakao_content_if_targeted,
+};
 
 #[cfg(test)]
 mod postgres_tests;
@@ -98,6 +105,9 @@ pub struct CreateScheduledMessageBody {
     pub created_by: Option<String>,
     pub dedupe_key: Option<String>,
     pub image_attachment: Option<ScheduledMessageImageAttachmentBody>,
+    /// Optional provider fan-out. When present, the same push fire is handed
+    /// off to Discord and Kakao in one database transaction.
+    pub provider_targets: Option<ScheduledProviderTargetsBody>,
     /// #4658: 'fresh' (default) or 'snapshot'. Snapshot freezes the source
     /// channel's conversation context at creation time.
     pub context_strategy: Option<String>,
@@ -194,7 +204,13 @@ pub async fn create_scheduled_message(
     Json(body): Json<CreateScheduledMessageBody>,
 ) -> ApiResponse {
     let pool = pool_or_unavailable(&state)?;
-    let new = validate_create(pool, &body, state.config.cluster.enabled).await?;
+    let new = validate_create(
+        pool,
+        &body,
+        state.config.cluster.enabled,
+        &state.config.integrations.kakao_friend_share,
+    )
+    .await?;
 
     // #4658: capture the immutable snapshot atomically with the definition
     // insert. Success guarantees the snapshot row exists (FK + CHECK); an empty
@@ -235,6 +251,7 @@ async fn validate_create(
     pool: &PgPool,
     body: &CreateScheduledMessageBody,
     cluster_enabled: bool,
+    kakao_config: &crate::config::KakaoFriendShareConfig,
 ) -> Result<NewScheduledMessage, AppError> {
     let content = body.content.trim();
     if content.is_empty() {
@@ -398,6 +415,15 @@ async fn validate_create(
     if image_attachment.is_some() {
         ensure_image_attachment_rollout_ready(pool, cluster_enabled).await?;
     }
+    if body.provider_targets.is_some() {
+        ensure_external_delivery_rollout_ready(pool, cluster_enabled).await?;
+    }
+    let external_delivery_plan = prepare_provider_targets(
+        body.provider_targets.as_ref(),
+        content,
+        &delivery_kind,
+        kakao_config,
+    )?;
 
     Ok(NewScheduledMessage {
         content: content.to_string(),
@@ -426,6 +452,7 @@ async fn validate_create(
             .clone()
             .filter(|value| !value.trim().is_empty()),
         image_attachment,
+        external_delivery_plan,
         context_strategy,
         // Captured in the create transaction (snapshot strategy only); NULL here.
         context_snapshot_id: None,
@@ -720,7 +747,14 @@ pub async fn patch_scheduled_message(
         ));
     }
 
-    let patch = build_patch(pool, body, &existing, state.config.cluster.enabled).await?;
+    let patch = build_patch(
+        pool,
+        body,
+        &existing,
+        state.config.cluster.enabled,
+        &state.config.integrations.kakao_friend_share,
+    )
+    .await?;
 
     match db::update_scheduled_message_pg(pool, &id, &patch).await {
         Ok(Some(row)) => Ok((
@@ -822,6 +856,7 @@ async fn build_patch(
     body: &serde_json::Map<String, JsonValue>,
     existing: &ScheduledMessageRow,
     cluster_enabled: bool,
+    kakao_config: &crate::config::KakaoFriendShareConfig,
 ) -> Result<ScheduledMessagePatch, AppError> {
     let bad_request = |message: String| app_error(StatusCode::BAD_REQUEST, message);
     let mut patch = ScheduledMessagePatch::default();
@@ -917,6 +952,38 @@ async fn build_patch(
         ));
     }
     let effective_content = patch.content.as_deref().unwrap_or(&existing.content);
+    patch.external_delivery_plan =
+        patch_provider_targets(body, effective_content, effective_kind, kakao_config)?;
+    if existing.external_delivery_plan_id.is_some()
+        && patch.external_delivery_plan.is_none()
+        && provider_delivery_intent_changed(
+            &patch,
+            &existing.content,
+            existing.scheduled_at,
+            existing.schedule.as_deref(),
+            &existing.timezone,
+            existing.expires_at,
+        )
+    {
+        return Err(bad_request(
+            "providerTargets must be resubmitted with confirmed=true when Kakao delivery content or timing changes"
+                .to_string(),
+        ));
+    }
+    if patch
+        .external_delivery_plan
+        .as_ref()
+        .is_some_and(Option::is_some)
+    {
+        ensure_external_delivery_rollout_ready(pool, cluster_enabled).await?;
+    }
+    let effective_has_external_target = match &patch.external_delivery_plan {
+        Some(plan) => plan.is_some(),
+        None => existing.external_delivery_plan_id.is_some(),
+    };
+    if effective_has_external_target {
+        validate_kakao_content_if_targeted(effective_content)?;
+    }
     let effective_has_image_attachment = match &patch.image_attachment {
         Some(image_attachment) => image_attachment.is_some(),
         None => existing.image_data.is_some(),
@@ -1129,12 +1196,23 @@ async fn render_deliveries(
     pool: &PgPool,
     deliveries: Vec<crate::db::scheduled_messages::DeliveryRow>,
 ) -> Vec<JsonValue> {
+    let delivery_ids = deliveries
+        .iter()
+        .map(|delivery| delivery.id.clone())
+        .collect::<Vec<_>>();
     let outbox_ids: Vec<i64> = deliveries
         .iter()
         .flat_map(|delivery| [delivery.outbox_id, delivery.fallback_outbox_id])
         .flatten()
         .collect();
     let statuses = db::outbox_statuses_for_deliveries_pg(pool, &outbox_ids)
+        .await
+        .unwrap_or_default();
+    let provider_deliveries =
+        crate::services::external_share_outbox::provider_deliveries_for_scheduled_deliveries_pg(
+            pool,
+            &delivery_ids,
+        )
         .await
         .unwrap_or_default();
     let status_of = |id: Option<i64>| {
@@ -1157,6 +1235,15 @@ async fn render_deliveries(
                 object.insert(
                     "fallbackOutboxStatus".to_string(),
                     json!(status_of(delivery.fallback_outbox_id)),
+                );
+                object.insert(
+                    "providerDeliveries".to_string(),
+                    json!(
+                        provider_deliveries
+                            .get(&delivery.id)
+                            .cloned()
+                            .unwrap_or_default()
+                    ),
                 );
             }
             rendered

@@ -133,7 +133,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/scheduled-messages",
             "messages",
-            "Create a scheduled-message reservation delivered at scheduledAt via direct push or a delivering agent.",
+            "Create a scheduled-message reservation delivered at scheduledAt via direct push or a delivering agent. Push reservations may atomically fan out to an encrypted Kakao provider target.",
         )
         .with_params([
             ("content", body_param("string", true, "Message body to deliver")),
@@ -150,10 +150,11 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ("title", body_param("string", false, "Display title")),
             ("dedupeKey", body_param("string", false, "Idempotency key; unique among live reservations")),
             ("imageAttachment", body_param("object", false, "Optional push-only representative image: filename with a MIME-matching extension, image MIME, and standard base64 data (JPEG/PNG/WebP/GIF, up to 8 MiB)")),
+            ("providerTargets", body_param("object", false, "Optional push-only provider fan-out. kakaoFriendShare requires confirmed=true and 1-5 receiverUuids; identifiers are encrypted at rest")),
         ])
         .with_example(
-            json!({"body": {"content": "standup agenda", "targetChannelId": "123", "scheduledAt": "2026-07-09T09:00:00+09:00"}}),
-            json!({"scheduledMessage": {"id": "smsg_1", "status": "scheduled", "deliveryKind": "push", "scheduledAt": "2026-07-09T00:00:00+00:00"}}),
+            json!({"body": {"content": "standup agenda", "targetChannelId": "123", "scheduledAt": "2026-07-09T09:00:00+09:00", "providerTargets": {"kakaoFriendShare": {"receiverUuids": ["provider-recipient-uuid"], "confirmed": true}}}}),
+            json!({"scheduledMessage": {"id": "smsg_1", "status": "scheduled", "deliveryKind": "push", "scheduledAt": "2026-07-09T00:00:00+00:00", "providerTargets": {"kakaoFriendShare": {"enabled": true, "recipientCount": 1, "contentMode": "text", "imageForwarded": false}}}}),
         ),
         ep(
             "GET",
@@ -191,7 +192,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/scheduled-messages/{id}/deliveries",
             "messages",
-            "Fire history for one reservation, enriched with the final message_outbox status of each handoff.",
+            "Fire history for one reservation, enriched with Discord outbox status and PII-free provider delivery states for each handoff.",
         )
         .with_params([
             ("id", path_param("Scheduled message id")),

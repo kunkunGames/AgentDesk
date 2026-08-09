@@ -141,13 +141,19 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
         image_attachment: None,
+        provider_targets: None,
         context_strategy: None,
         on_context_failure: None,
     };
 
-    let new = validate_create(&pool, &body, false)
-        .await
-        .expect("validate explicit bot create");
+    let new = validate_create(
+        &pool,
+        &body,
+        false,
+        &crate::config::KakaoFriendShareConfig::default(),
+    )
+    .await
+    .expect("validate explicit bot create");
     assert_eq!(new.bot, "notify");
     let row = db::insert_scheduled_message_pg(&pool, &new)
         .await
@@ -183,13 +189,19 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
         created_by: Some("postgres_test".to_string()),
         dedupe_key: None,
         image_attachment: None,
+        provider_targets: None,
         context_strategy: None,
         on_context_failure: None,
     };
 
-    let err = validate_create(&pool, &body, false)
-        .await
-        .expect_err("push agentId must fail as a request error before INSERT");
+    let err = validate_create(
+        &pool,
+        &body,
+        false,
+        &crate::config::KakaoFriendShareConfig::default(),
+    )
+    .await
+    .expect_err("push agentId must fail as a request error before INSERT");
     assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         err.to_json_value().get("error").and_then(JsonValue::as_str),
@@ -232,6 +244,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -246,6 +259,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         metadata_body.as_object().expect("metadata patch object"),
         &existing,
         false,
+        &crate::config::KakaoFriendShareConfig::default(),
     )
     .await
     .expect("metadata-only PATCH must not treat stored default fail as explicit input");
@@ -260,6 +274,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         clear_body.as_object().expect("agent clear patch object"),
         &existing,
         false,
+        &crate::config::KakaoFriendShareConfig::default(),
     )
     .await
     .expect("explicit null clears leave no effective agent-only value");
@@ -285,6 +300,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
             body.as_object().expect("invalid push patch object"),
             &existing,
             false,
+            &crate::config::KakaoFriendShareConfig::default(),
         )
         .await
         .expect_err("push PATCH must reject effective agent-only values");

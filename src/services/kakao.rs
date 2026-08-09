@@ -17,6 +17,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::config::KakaoFriendShareConfig;
 
@@ -205,7 +206,7 @@ pub struct FriendsPage {
     pub next_offset: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct KakaoFriendShareCommand {
     pub receiver_uuids: Vec<String>,
     pub text: String,
@@ -702,9 +703,6 @@ fn validate_send_request(
     idempotency_key: &str,
     request: &KakaoFriendShareCommand,
 ) -> Result<(), KakaoError> {
-    if !request.confirmed {
-        return Err(KakaoError::Validation("confirmed must be true"));
-    }
     if !(8..=128).contains(&idempotency_key.len())
         || !idempotency_key
             .bytes()
@@ -712,14 +710,29 @@ fn validate_send_request(
     {
         return Err(KakaoError::Validation("Idempotency-Key is invalid"));
     }
-    if request.receiver_uuids.is_empty() || request.receiver_uuids.len() > 5 {
+    validate_friend_share_payload(request)
+}
+
+/// Validate the provider payload independently from HTTP idempotency metadata.
+/// Scheduled delivery uses this at reservation time, then derives a stable
+/// idempotency key from the durable outbox id when the provider worker runs.
+pub fn validate_friend_share_payload(request: &KakaoFriendShareCommand) -> Result<(), KakaoError> {
+    if !request.confirmed {
+        return Err(KakaoError::Validation("confirmed must be true"));
+    }
+    validate_friend_share_recipients(&request.receiver_uuids)?;
+    validate_friend_share_text(&request.text)
+}
+
+pub fn validate_friend_share_recipients(receiver_uuids: &[String]) -> Result<(), KakaoError> {
+    if receiver_uuids.is_empty() || receiver_uuids.len() > 5 {
         return Err(KakaoError::Validation(
             "receiver_uuids must contain 1 to 5 entries",
         ));
     }
-    let recipients = request.receiver_uuids.iter().collect::<BTreeSet<_>>();
-    if recipients.len() != request.receiver_uuids.len()
-        || request.receiver_uuids.iter().any(|value| {
+    let recipients = receiver_uuids.iter().collect::<BTreeSet<_>>();
+    if recipients.len() != receiver_uuids.len()
+        || receiver_uuids.iter().any(|value| {
             value.is_empty()
                 || value.len() > 128
                 || !value.bytes().all(|byte| byte.is_ascii_graphic())
@@ -727,8 +740,12 @@ fn validate_send_request(
     {
         return Err(KakaoError::Validation("receiver_uuids are invalid"));
     }
-    let char_count = request.text.chars().count();
-    if request.text.trim().is_empty() || char_count > 200 {
+    Ok(())
+}
+
+pub fn validate_friend_share_text(text: &str) -> Result<(), KakaoError> {
+    let char_count = text.chars().count();
+    if text.trim().is_empty() || char_count > 200 {
         return Err(KakaoError::Validation(
             "text must contain 1 to 200 characters",
         ));

@@ -47,6 +47,7 @@ async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMess
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -95,6 +96,7 @@ async fn postgres_list_scheduled_messages_keeps_image_blobs_out_of_memory() {
                 content_type: "image/png".to_string(),
                 data: image_data.clone(),
             }),
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -122,6 +124,151 @@ async fn postgres_list_scheduled_messages_keeps_image_blobs_out_of_memory() {
         .expect("load scheduled definition")
         .expect("definition exists");
     assert_eq!(loaded.image_data, Some(image_data));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_provider_plan_is_hidden_from_lists_and_scrubbed_on_terminal_state() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_provider_plan_scrub",
+        "scheduled provider target encrypted plan lifecycle",
+    )
+    .await;
+    let plan_id = Uuid::new_v4();
+    let message = insert_scheduled_message_pg(
+        &pool,
+        &NewScheduledMessage {
+            content: "provider plan privacy lifecycle".to_string(),
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() + Duration::minutes(5),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+            image_attachment: None,
+            external_delivery_plan: Some(EncryptedExternalDeliveryPlan {
+                id: plan_id,
+                ciphertext: b"encrypted-recipient-target".to_vec(),
+                nonce: vec![9_u8; 24],
+                key_version: 1,
+                summary: serde_json::json!({
+                    "kakaoFriendShare": {
+                        "enabled": true,
+                        "recipientCount": 2,
+                        "contentMode": "text",
+                        "imageForwarded": false
+                    }
+                }),
+            }),
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
+        },
+    )
+    .await
+    .expect("insert encrypted provider plan");
+
+    let listed = list_scheduled_messages_pg(&pool, &ListFilters::default())
+        .await
+        .expect("list provider-targeted definitions")
+        .into_iter()
+        .find(|row| row.id == message.id)
+        .expect("provider-targeted definition is listed");
+    assert_eq!(listed.external_delivery_plan_id, Some(plan_id));
+    assert_eq!(listed.external_delivery_plan_ciphertext, None);
+    assert_eq!(
+        listed.to_api_json()["providerTargets"]["kakaoFriendShare"]["recipientCount"],
+        2
+    );
+
+    sqlx::query(
+        "INSERT INTO worker_nodes (instance_id, status, capabilities, last_heartbeat_at)
+         VALUES ('legacy-external-worker', 'online', $1, NOW())",
+    )
+    .bind(serde_json::json!({}))
+    .execute(&pool)
+    .await
+    .expect("seed legacy external-delivery worker");
+    assert!(
+        !external_delivery_rollout_ready_pg(&pool)
+            .await
+            .expect("query external-delivery rollout gate")
+    );
+    let legacy_preflight_error =
+        sqlx::query("SELECT agentdesk_assert_scheduled_external_delivery_consumer_v1_ready()")
+            .execute(&pool)
+            .await
+            .expect_err("an online legacy external-delivery consumer must block the cutover");
+    assert_eq!(
+        legacy_preflight_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    sqlx::query(
+        "UPDATE worker_nodes SET capabilities = $1
+         WHERE instance_id = 'legacy-external-worker'",
+    )
+    .bind(serde_json::json!({
+        "scheduled_messages": { "external_delivery_consumer_v1": true }
+    }))
+    .execute(&pool)
+    .await
+    .expect("upgrade external-delivery worker capability");
+    assert!(
+        external_delivery_rollout_ready_pg(&pool)
+            .await
+            .expect("query upgraded external-delivery rollout gate")
+    );
+    sqlx::query("SELECT agentdesk_assert_scheduled_external_delivery_consumer_v1_ready()")
+        .execute(&pool)
+        .await
+        .expect("upgraded fleet passes external-delivery cutover preflight");
+
+    let legacy_claim_error =
+        sqlx::query("UPDATE scheduled_messages SET status = 'firing' WHERE id = $1")
+            .bind(&message.id)
+            .execute(&pool)
+            .await
+            .expect_err("a claim without the 0108 transaction capability must fail closed");
+    assert_eq!(
+        legacy_claim_error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+
+    assert!(matches!(
+        cancel_scheduled_message_pg(&pool, &message.id)
+            .await
+            .expect("cancel provider-targeted definition"),
+        CancelOutcome::Canceled { .. }
+    ));
+    let terminal = get_scheduled_message_pg(&pool, &message.id)
+        .await
+        .expect("load canceled provider-targeted definition")
+        .expect("canceled definition exists");
+    assert_eq!(terminal.external_delivery_plan_id, Some(plan_id));
+    assert_eq!(terminal.external_delivery_plan_ciphertext, None);
+    assert_eq!(terminal.external_delivery_plan_nonce, None);
+    assert_eq!(terminal.external_delivery_plan_key_version, None);
+    assert!(terminal.external_delivery_plan_scrubbed_at.is_some());
+    assert_eq!(
+        terminal.to_api_json()["providerTargets"]["kakaoFriendShare"]["recipientCount"],
+        2
+    );
 
     pool.close().await;
     pg_db.drop().await;
@@ -248,6 +395,7 @@ async fn postgres_scheduled_image_floor_preflight_requires_upgraded_drained_flee
                 content_type: "image/png".to_string(),
                 data: b"\x89PNG\r\n\x1a\npreflight".to_vec(),
             }),
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -382,6 +530,7 @@ async fn postgres_scheduled_image_consumer_floor_fences_legacy_claims() {
                 content_type: "image/png".to_string(),
                 data: b"\x89PNG\r\n\x1a\nconsumer-floor".to_vec(),
             }),
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
@@ -1010,6 +1159,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
                 created_by: Some("postgres_test".to_string()),
                 dedupe_key: None,
                 image_attachment: None,
+                external_delivery_plan: None,
                 context_strategy: "fresh".to_string(),
                 context_snapshot_id: None,
                 on_context_failure: "fail".to_string(),
@@ -1703,6 +1853,7 @@ async fn postgres_cancel_reports_committed_agent_handoff_not_intent() {
             created_by: Some("postgres_test".to_string()),
             dedupe_key: None,
             image_attachment: None,
+            external_delivery_plan: None,
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),

@@ -283,6 +283,7 @@ enum ServerWorkerId {
     RateLimitSync,
     MaintenanceScheduler,
     MessageOutbox,
+    ExternalShareOutbox,
     ScheduledMessages,
     DispatchOutbox,
     DmReplyRetry,
@@ -409,7 +410,7 @@ pub(crate) struct WorkerSpec {
     pub(crate) notes: &'static str,
 }
 
-pub(crate) const WORKER_SPECS: [WorkerSpec; 12] = [
+pub(crate) const WORKER_SPECS: [WorkerSpec; 13] = [
     WorkerSpec {
         id: ServerWorkerId::GithubSync,
         name: "github_sync_loop",
@@ -484,6 +485,21 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 12] = [
         execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "message_outbox row state and delivery tracing",
         notes: "Waits three seconds for Discord runtime readiness before polling with adaptive backoff",
+    },
+    WorkerSpec {
+        id: ServerWorkerId::ExternalShareOutbox,
+        name: "external_share_outbox_loop",
+        kind: WorkerKind::TokioTask,
+        target: "services::external_share_outbox::external_share_outbox_loop",
+        responsibility: "Drain encrypted scheduled provider fan-out rows through connector-specific delivery services",
+        owner: "server::worker_registry",
+        start_stage: WorkerStartStage::AfterBootReconcile,
+        start_order: 42,
+        restart_policy: WorkerRestartPolicy::LoopOwned,
+        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
+        health_owner: "external_share_outbox row state and provider delivery tracing",
+        notes: "Uses lease/CAS claims and stable provider idempotency keys; terminal rows scrub encrypted payloads",
     },
     WorkerSpec {
         id: ServerWorkerId::ScheduledMessages,
@@ -925,6 +941,25 @@ impl SupervisedWorkerRegistry {
                     let outbox_health_registry = outbox_health_registry.clone();
                     async move {
                         super::message_outbox_loop(outbox_pg_pool, outbox_health_registry).await;
+                    }
+                });
+                Ok(None)
+            }
+            ServerWorkerId::ExternalShareOutbox => {
+                let Some(external_outbox_pg_pool) = self.pg_pool.clone() else {
+                    self.log_skip(spec, "postgres pool unavailable");
+                    return Ok(None);
+                };
+                let kakao_config = self.config.integrations.kakao_friend_share.clone();
+                self.register_leader_tokio(spec, move || {
+                    let external_outbox_pg_pool = external_outbox_pg_pool.clone();
+                    let kakao_config = kakao_config.clone();
+                    async move {
+                        crate::services::external_share_outbox::external_share_outbox_loop(
+                            external_outbox_pg_pool,
+                            kakao_config,
+                        )
+                        .await;
                     }
                 });
                 Ok(None)

@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 pub(crate) mod context_snapshot;
 mod evidence;
+pub(crate) mod external_delivery;
+mod push_handoff;
 mod timing;
 
 #[cfg(test)]
@@ -37,6 +39,8 @@ use crate::services::message_outbox::{
     OutboxAttachment, OutboxEnqueueError, OutboxMessage,
     enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx,
 };
+use external_delivery::prepare_external_share_outbox;
+use push_handoff::commit_push_handoff;
 
 const CLAIM_BATCH: i64 = 10;
 const AGENT_POLL_BATCH: i64 = 20;
@@ -195,6 +199,16 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
         message.id,
         fire.fire_scheduled_at.timestamp_micros()
     );
+    let external_share =
+        match prepare_external_share_outbox(message, &fire.delivery_id, &reason_code) {
+            Ok(external_share) => external_share,
+            Err(error) => {
+                let error = format!("external provider handoff preparation failed: {error}");
+                tracing::warn!(id = message.id, "[smsg] {error}");
+                interrupt_for_retry(pool, fire, &error).await;
+                return;
+            }
+        };
     match commit_push_handoff(
         pool,
         fire,
@@ -218,6 +232,7 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
                 _ => None,
             },
         },
+        external_share.as_ref(),
         now,
     )
     .await
@@ -234,55 +249,6 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
             interrupt_for_retry(pool, fire, &error).await;
         }
     }
-}
-
-async fn commit_push_handoff(
-    pool: &PgPool,
-    fire: &ClaimedFire,
-    message: OutboxMessage<'_>,
-    now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await?;
-    if !db::lock_active_delivery_tx(
-        &mut tx,
-        &fire.message.id,
-        &fire.delivery_id,
-        &fire.claim_token,
-    )
-    .await?
-    {
-        return Ok(false);
-    }
-    let outbox_id =
-        enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(&mut tx, message).await?;
-    let (next, forced_terminal) = compute_resume(
-        fire.message.schedule.as_deref(),
-        &fire.message.timezone,
-        fire.message.scheduled_at,
-        fire.message.expires_at,
-        now,
-    );
-    let terminal_status = forced_terminal.unwrap_or(db::STATUS_SENT);
-    let next = forced_terminal.is_none().then_some(next).flatten();
-    let transitioned = db::finish_locked_delivery_and_finalize_parent_tx(
-        &mut tx,
-        &fire.delivery_id,
-        &fire.claim_token,
-        db::DELIVERY_SENT,
-        None,
-        Some(outbox_id),
-        None,
-        &fire.message.id,
-        true,
-        terminal_status,
-        next,
-    )
-    .await?;
-    if !transitioned {
-        return Ok(false);
-    }
-    tx.commit().await?;
-    Ok(true)
 }
 
 async fn fire_agent(pool: &PgPool, health_registry: Option<&HealthRegistry>, fire: &ClaimedFire) {
@@ -1281,6 +1247,12 @@ mod tests {
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,
             on_context_failure: "fail".to_string(),
+            external_delivery_plan_id: None,
+            external_delivery_plan_ciphertext: None,
+            external_delivery_plan_nonce: None,
+            external_delivery_plan_key_version: None,
+            external_delivery_summary: None,
+            external_delivery_plan_scrubbed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

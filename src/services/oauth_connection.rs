@@ -70,6 +70,13 @@ impl TokenVault {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(key: [u8; 32]) -> Self {
+        Self {
+            key: Zeroizing::new(key),
+        }
+    }
+
     pub fn seal(
         &self,
         plaintext: &[u8],
