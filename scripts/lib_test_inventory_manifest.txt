@@ -364,6 +364,15 @@ db::dispatches::metadata::tests::parse_pg_dispatch_context_ignores_empty_context
 db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_malformed_json
 db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_non_object_context
 db::dispatches::outbox::delivery::tests::old_owner_completion_after_stale_reclaim_is_noop_pg
+db::fixture_target::tests::config_representation_rejects_socket_transport
+db::fixture_target::tests::configured_target_rejects_changed_host
+db::fixture_target::tests::configured_target_rejects_changed_port
+db::fixture_target::tests::endpoint_enumeration_matrix_has_no_ambient_authority
+db::fixture_target::tests::explicit_authority_fields_are_required
+db::fixture_target::tests::raw_tcp_hosts_discriminate
+db::fixture_target::tests::socket_transport_precedes_host_transport
+db::fixture_target::tests::tls_routing_is_part_of_identity
+db::fixture_target::tests::unconfigured_target_is_rejected_without_panicking
 db::idempotency::tests::fingerprint_differs_when_body_changes
 db::idempotency::tests::fingerprint_differs_when_path_changes
 db::idempotency::tests::fingerprint_handles_non_json_body
@@ -420,6 +429,7 @@ db::postgres::tests::core_status_constraints_reject_invalid_values_and_allow_val
 db::postgres::tests::deploy_gate_constraint_allows_supported_legacy_values_and_rejects_deploy_gate
 db::postgres::tests::deploy_gate_constraint_migration_blocks_existing_deploy_gate_rows
 db::postgres::tests::deploy_gate_constraint_serializes_concurrent_legacy_writer
+db::postgres::tests::ownership_registry_key_matches_between_admin_url_and_config_options
 db::postgres::tests::postgres_advisory_lock_lease_allows_only_one_live_holder
 db::postgres::tests::postgres_advisory_lock_lease_does_not_exhaust_shared_pool
 db::postgres::tests::postgres_advisory_lock_lease_releases_on_drop_across_separate_pools
@@ -439,7 +449,6 @@ db::postgres::tests::require_pg_guard_preserves_errors_when_ci_lane_does_not_req
 db::postgres::tests::runtime_pool_settings_enable_dead_peer_detection
 db::postgres::tests::startup_pool_settings_raise_pool_size_and_acquire_timeout
 db::postgres::tests::sync_agents_writes_and_preserves_preferred_intake_node_labels
-db::postgres::tests::test_database_server_identity_normalizes_loopback_aliases_without_collisions
 db::postgres::tests::worker_node_reseed_does_not_clobber_shared_agent_roster
 db::prompt_manifests::tests::manifest_storage_stats_counts_utf8_bytes_not_chars_pg
 db::prompt_manifests::tests::prompt_manifest_apply_retention_trims_old_full_content_pg
@@ -2548,6 +2557,8 @@ services::discord::health::transcript_binding_stall::tests::a_superseded_binding
 services::discord::health::transcript_binding_stall::tests::a_transcript_that_grew_recently_is_healthy_even_mid_rotation
 services::discord::health::transcript_binding_stall::tests::an_idle_channel_is_never_alerted_on
 services::discord::health::transcript_binding_stall::tests::an_unresolvable_bound_transcript_is_not_this_verdict
+services::discord::health::unpaired_active_token::tests::completion_between_initial_reads_and_recheck_invalidates_candidate
+services::discord::health::unpaired_active_token::tests::every_identity_coordinate_must_remain_stable
 services::discord::health::watcher_respawn::tests::deadman_switch_escalates_after_threshold_then_clears_on_watcher_return
 services::discord::health::watcher_respawn::tests::deadman_switch_ignores_idle_channel_without_relay_work
 services::discord::health::watcher_respawn::tests::force_clean_respawn_offset_floor_ignores_stale_prior_generation_frontier
@@ -3814,7 +3825,9 @@ services::discord::recovery_paths::shared::tests::transient_failure_counts_until
 services::discord::relay_coord_tests::relay_progress_heartbeat_stamps_each_confirmed_chunk
 services::discord::relay_health::frontier::tests::reset_frontier_publishes_a_new_incarnation_token
 services::discord::relay_health::frontier::tests::reset_yields_to_pending_mutation_on_same_thread_without_deadlock
+services::discord::relay_health::tests::observation_age_rejects_future_and_overflowing_timestamps
 services::discord::relay_health::tests::relay_stall_classifier_is_table_driven
+services::discord::relay_health::tests::serialized_snapshot_exposes_ages_but_not_internal_recheck_proof
 services::discord::relay_owner_observability::tests::finalizer_ledger_owner_extra_fields
 services::discord::relay_owner_observability::tests::inflight_clear_extra_carries_three_signals_and_flag
 services::discord::relay_owner_observability::tests::invariant_violated_only_on_committed_without_ui_or_obligation
@@ -3901,6 +3914,7 @@ services::discord::relay_recovery::tests::relay_recovery_takeover_keeps_differen
 services::discord::relay_recovery::tests::stale_watcher_with_jsonl_progress_rebinds_without_canceling_turn
 services::discord::relay_recovery::tests::token_only_agentdesk_tmux_confirmed_dead_is_reclaimed_after_grace
 services::discord::relay_recovery::tests::token_only_agentdesk_tmux_with_unknown_liveness_stays_protected_after_grace
+services::discord::relay_recovery::tests::unpaired_active_token_is_observe_only
 services::discord::relay_recovery::tests::watchdog_auto_apply_is_rate_limited_after_first_token_reclaim
 services::discord::relay_recovery::tests::watcher_owned_live_relay_with_relay_progress_is_not_destructive_cancel_candidate
 services::discord::relay_recovery::tests::watcher_owned_live_relay_with_unread_bytes_and_zero_relay_offset_is_actionable
@@ -4687,7 +4701,16 @@ services::discord::tmux::tmux_output_stream::tests::string_api_error_envelope_ha
 services::discord::tmux::tmux_output_stream::tests::unique_provider_prose_flood_uses_fixed_category_slots
 services::discord::tmux::tmux_output_stream::tests::watcher_status_panel_bound_placeholder_keeps_events_on_status_panel
 services::discord::tmux::tmux_output_stream::tests::watcher_status_panel_fallback_inlines_events_without_status_message
+services::discord::tmux::tmux_session_files::tests::adoption_current_generation_marker_is_a_noop
+services::discord::tmux::tmux_session_files::tests::adoption_never_stamps_a_fresh_incarnation_with_an_old_mtime
+services::discord::tmux::tmux_session_files::tests::adoption_recovers_an_absent_marker_with_nonzero_identity
 services::discord::tmux::tmux_session_files::tests::committed_frontier_gated_on_same_generation
+services::discord::tmux::tmux_session_files::tests::every_spawn_site_uses_the_combined_marker_gate
+services::discord::tmux::tmux_session_files::tests::generation_write_failure_emits_exactly_one_warn_and_still_writes_nonce
+services::discord::tmux::tmux_session_files::tests::spawn_markers_log_fixture_legacy_paths_unchanged
+services::discord::tmux::tmux_session_files::tests::spawn_markers_stamp_generation_before_nonce
+services::discord::tmux::tmux_session_files::tests::spawn_stamp_replaces_the_inode
+services::discord::tmux::tmux_session_files::tests::stamp_spawn_markers_returns_nonce_result_verbatim
 services::discord::tmux::tmux_watcher::commit_decisions::runtime_binding_offset_tests::acknowledged_session_bound_delivery_is_not_missing_inflight_fallback
 services::discord::tmux::tmux_watcher::commit_decisions::runtime_binding_offset_tests::busy_observation_without_delivery_still_advances_runtime_binding
 services::discord::tmux::tmux_watcher::commit_decisions::runtime_binding_offset_tests::busy_observation_without_terminal_delivery_allows_cleanup

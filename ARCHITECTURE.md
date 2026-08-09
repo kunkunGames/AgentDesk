@@ -120,6 +120,7 @@ src/
 │   ├── cancel_tombstones.rs
 │   ├── dispatch_semaphores.rs
 │   ├── dispatched_sessions.rs
+│   ├── fixture_target.rs
 │   ├── idempotency.rs
 │   ├── intake_outbox.rs
 │   ├── kanban.rs
@@ -549,6 +550,7 @@ src/
 │   │   │   ├── stall_liveness.rs
 │   │   │   ├── stall_verdict.rs
 │   │   │   ├── transcript_binding_stall.rs
+│   │   │   ├── unpaired_active_token.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── idle_recap/
 │   │   │   ├── card.rs

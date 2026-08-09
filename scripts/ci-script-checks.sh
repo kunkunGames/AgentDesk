@@ -161,10 +161,9 @@ fi
 echo "=== Test-target integrity gate (#5003/#5008) ==="
 # cargo exits 0 on zero filter matches, so a curated lane with the wrong
 # --lib/--bin/--test flag can run 0 tests while its required check stays
-# green. Warn-only until the known offenders are repaired (separate slice);
-# flip to --enforce afterwards. The unittest run below is the gate's own
-# mutation proof (bad fixture must fail, fixed fixture must pass).
-"$PYTHON" scripts/check_test_target_integrity.py
+# green. The gate consumes workflow and justfile command sites and is enforced
+# here. The unittest run below is the gate's own mutation proof.
+"$PYTHON" scripts/check_test_target_integrity.py --enforce
 "$PYTHON" scripts/check_test_target_integrity.py --verify-lib-inventory
 "$PYTHON" -m unittest tests.test_check_test_target_integrity
 
@@ -284,6 +283,10 @@ echo "=== Shell test suites (tests/*.sh) ==="
 # while every required check stayed green. Run them here, in the job that already
 # owns script-level gates.
 SHELL_TESTS_FAILED=0
+required_shell_suites=(tests/test_deploy_smoke_wedge_coverage_5244.sh)
+for required_suite in "${required_shell_suites[@]}"; do
+  [ -f "$required_suite" ] || { echo "✗ required shell suite missing: $required_suite" >&2; SHELL_TESTS_FAILED=1; }
+done
 for shell_test in tests/*.sh; do
   [ -f "$shell_test" ] || continue
   echo "--- $shell_test"
