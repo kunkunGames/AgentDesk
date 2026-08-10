@@ -13,12 +13,7 @@ use crate::config::{
     MeetingSummaryAgentDef,
 };
 use crate::services::provider::ProviderKind;
-
-fn expand_tilde(path: &str) -> String {
-    crate::utils::format::expand_tilde_path(path)
-        .to_string_lossy()
-        .into_owned()
-}
+use crate::utils::format::expand_tilde_string as expand_tilde;
 
 fn load_agentdesk_config_with_path() -> Option<(Config, std::path::PathBuf)> {
     let root = crate::config::runtime_root()?;
