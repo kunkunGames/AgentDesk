@@ -61,13 +61,14 @@ function rotateActiveRunSweepCursors(runIds) {
 function _isDispatchableState(state, cfg) {
   if (!cfg || !cfg.transitions) return false;
   var hasGatedOut = false;
-  var hasGatedIn = false;
   for (var i = 0; i < cfg.transitions.length; i++) {
     var t = cfg.transitions[i];
-    if (t.from === state && t.type === "gated") hasGatedOut = true;
-    if (t.to === state && t.type === "gated") hasGatedIn = true;
+    if (t.type === "gated") {
+      if (t.to === state) return false;
+      if (t.from === state) hasGatedOut = true;
+    }
   }
-  return hasGatedOut && !hasGatedIn;
+  return hasGatedOut;
 }
 
 function _dispatchableTargets(cfg) {
