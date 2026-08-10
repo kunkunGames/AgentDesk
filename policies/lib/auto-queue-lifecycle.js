@@ -65,17 +65,28 @@ function finalizeRunWithoutPhaseGate(runId) {
   if (!runId) return false;
 
   if (runHasBlockingPhaseGate(runId)) return false;
-  if (remainingRunnableEntryCount(runId) > 0) return false;
-  // #815 P1: `user_cancelled` entries are operator-held terminal state.
-  // They are intentionally non-runnable, but they must still block the
-  // tick-side backstop from auto-completing the run; otherwise the next
-  // minute tick would strand a user-stopped run in `completed`.
-  if (runHasUserCancelledEntry(runId)) {
-    autoQueueLog("info", "Deferring finalize for run " + runId + " — user_cancelled entry still present", {
-      run_id: runId
-    });
-    return false;
+
+  var stateCheck = agentdesk.db.query(
+    "SELECT " +
+    "  EXISTS(SELECT 1 FROM auto_queue_entries WHERE run_id = ? AND status IN ('pending', 'dispatched')) as has_runnable, " +
+    "  EXISTS(SELECT 1 FROM auto_queue_entries WHERE run_id = ? AND status = 'user_cancelled') as has_cancelled",
+    [runId, runId]
+  );
+
+  if (stateCheck.length > 0) {
+    if (stateCheck[0].has_runnable) return false;
+    // #815 P1: `user_cancelled` entries are operator-held terminal state.
+    // They are intentionally non-runnable, but they must still block the
+    // tick-side backstop from auto-completing the run; otherwise the next
+    // minute tick would strand a user-stopped run in `completed`.
+    if (stateCheck[0].has_cancelled) {
+      autoQueueLog("info", "Deferring finalize for run " + runId + " — user_cancelled entry still present", {
+        run_id: runId
+      });
+      return false;
+    }
   }
+
   // Phase-gate race guard: the main engine's `onCardTerminal` may still be
   // in the middle of creating gate dispatches. Respect the grace window so
   // we never mark a run completed before phase gates get registered.
