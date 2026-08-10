@@ -8,9 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_MEMENTO_URL = "http://100.123.183.105:57332"
-
-
 @dataclass(frozen=True)
 class ToolSpec:
     key: str
@@ -247,22 +244,6 @@ def tool_inventory() -> tuple[ToolSpec, ...]:
                 "https://github.com/anomalyco/opencode/releases",
             ),
             ToolSpec(
-                "memento-mcp",
-                "memento MCP",
-                "remote-service",
-                "report-only",
-                "memento-health",
-                os.environ.get("AGENTDESK_TOOLCHAIN_MEMENTO_URL", DEFAULT_MEMENTO_URL),
-                "remote-managed",
-                "mac-mini service owner",
-                None,
-                None,
-                None,
-                "remote mac-mini service; local mutation is forbidden",
-                "http://100.123.183.105:57332/health",
-                report_only=True,
-            ),
-            ToolSpec(
                 "brave-search-mcp",
                 "brave-search MCP",
                 "npx-always-latest",
@@ -312,4 +293,24 @@ def tool_inventory() -> tuple[ToolSpec, ...]:
             ),
         ]
     )
+    memento_url = os.environ.get("AGENTDESK_TOOLCHAIN_MEMENTO_URL", "").strip()
+    if memento_url:
+        specs.append(
+            ToolSpec(
+                "memento-mcp",
+                "memento MCP",
+                "remote-service",
+                "report-only",
+                "memento-health",
+                memento_url,
+                "remote-managed",
+                "mac-mini service owner",
+                None,
+                None,
+                None,
+                "explicitly configured remote service; local mutation is forbidden",
+                f"{memento_url.rstrip('/')}/health",
+                report_only=True,
+            )
+        )
     return tuple(specs)
