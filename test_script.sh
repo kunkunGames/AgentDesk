@@ -1,2 +1,0 @@
-#!/bin/bash
-cargo check --all-targets
