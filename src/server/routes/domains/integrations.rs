@@ -43,6 +43,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/kakao/connection", delete(kakao::disconnect))
             .route("/kakao/friends", get(kakao::list_friends))
             .route("/kakao/messages/send", post(kakao::send_message))
+            .route("/kakao/messages/send-to-me", post(kakao::send_memo_message))
             .route("/discord/bindings", get(discord::list_bindings))
             .route(
                 "/discord/channels/{id}/messages",

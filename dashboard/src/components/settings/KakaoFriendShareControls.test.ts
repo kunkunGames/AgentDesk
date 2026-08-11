@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
   isAllowedKakaoAuthorizeUrl,
+  kakaoMemoIntentFingerprint,
   kakaoSendIntentFingerprint,
   resolveKakaoSendIntent,
 } from "./KakaoFriendShareControls";
 
 describe("Kakao friend share safety helpers", () => {
+  it("keeps self-send idempotency separate from friend-recipient payloads", () => {
+    expect(kakaoMemoIntentFingerprint("hello")).not.toBe(
+      kakaoSendIntentFingerprint([], "hello"),
+    );
+  });
+
   it("uses a recipient-order-independent fingerprint that remains bound to text", () => {
     const first = kakaoSendIntentFingerprint(["friend-b", "friend-a"], "hello");
     const reordered = kakaoSendIntentFingerprint(["friend-a", "friend-b"], "hello");

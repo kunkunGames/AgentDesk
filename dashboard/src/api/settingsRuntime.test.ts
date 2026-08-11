@@ -4,6 +4,7 @@ import {
   disconnectKakao,
   getKakaoFriends,
   sendKakaoFriendMessage,
+  sendKakaoMemoMessage,
   startKakaoOAuth,
 } from "./settingsRuntime";
 
@@ -55,6 +56,20 @@ const invalidResponseCases: InvalidResponseCase[] = [
   [
     "send",
     () => sendKakaoFriendMessage("idempotency-key", ["friend-a"], "안녕하세요"),
+    {
+      request_id: "not-a-uuid",
+      status: "success",
+      requested_count: 1,
+      successful_count: 2,
+      failed_count: 0,
+      replayed: false,
+      delivery_may_have_occurred: true,
+      automatic_retry_allowed: true,
+    },
+  ],
+  [
+    "memo send",
+    () => sendKakaoMemoMessage("idempotency-key", "안녕하세요"),
     {
       request_id: "not-a-uuid",
       status: "success",
@@ -130,6 +145,16 @@ describe("Kakao runtime response contracts", () => {
         replayed: false,
         delivery_may_have_occurred: true,
         automatic_retry_allowed: false,
+      }))
+      .mockResolvedValueOnce(mockJsonResponse({
+        request_id: "123e4567-e89b-42d3-a456-426614174004",
+        status: "success",
+        requested_count: 1,
+        successful_count: 1,
+        failed_count: 0,
+        replayed: false,
+        delivery_may_have_occurred: true,
+        automatic_retry_allowed: false,
       }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -143,6 +168,10 @@ describe("Kakao runtime response contracts", () => {
     await expect(
       sendKakaoFriendMessage("idempotency-key", ["friend-a"], "안녕하세요"),
     ).resolves.toMatchObject({
+      status: "success",
+      automatic_retry_allowed: false,
+    });
+    await expect(sendKakaoMemoMessage("idempotency-key", "안녕하세요")).resolves.toMatchObject({
       status: "success",
       automatic_retry_allowed: false,
     });

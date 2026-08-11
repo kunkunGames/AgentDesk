@@ -283,6 +283,22 @@ export async function sendKakaoFriendMessage(
   );
 }
 
+export async function sendKakaoMemoMessage(
+  idempotencyKey: string,
+  text: string,
+): Promise<KakaoSendResult> {
+  return request(
+    "/api/kakao/messages/send-to-me",
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ text, confirmed: true }),
+      maxRetries: 0,
+    },
+    kakaoSendResultSchema,
+  );
+}
+
 export async function getEscalationSettings(): Promise<EscalationSettingsResponse> {
   return request("/api/settings/escalation");
 }

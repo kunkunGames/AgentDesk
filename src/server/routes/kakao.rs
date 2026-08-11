@@ -14,7 +14,7 @@ use crate::error::{AppError, ErrorCode};
 use crate::services::external_share::ExternalShareError;
 use crate::services::kakao::{
     FriendsPage, KAKAO_CONNECTOR_ID, KakaoError, KakaoFriendShareCommand, KakaoFriendShareService,
-    OAuthStart,
+    KakaoMemoSendCommand, OAuthStart,
 };
 use crate::services::oauth_connection::OAuthConnectionError;
 
@@ -166,6 +166,28 @@ pub async fn send_message(
         })?;
     service(&state, operation)?
         .send_friend_message(idempotency_key, body)
+        .await
+        .map(Json)
+        .map_err(|error| map_error(error, operation))
+}
+
+/// POST /api/kakao/messages/send-to-me
+pub async fn send_memo_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<KakaoMemoSendCommand>, JsonRejection>,
+) -> Result<Json<crate::services::external_share::ShareOperationResult>, KakaoRouteError> {
+    let operation = "kakao.messages.send_to_me";
+    let Json(body) =
+        body.map_err(|_| KakaoRouteError::validation("invalid JSON body", operation))?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            KakaoRouteError::validation("Idempotency-Key header is required", operation)
+        })?;
+    service(&state, operation)?
+        .send_memo_message(idempotency_key, body)
         .await
         .map(Json)
         .map_err(|error| map_error(error, operation))

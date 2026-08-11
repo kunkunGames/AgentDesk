@@ -126,5 +126,48 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 "automatic_retry_allowed": false
             }),
         ),
+        ep(
+            "POST",
+            "/api/kakao/messages/send-to-me",
+            "kakao",
+            "Send one confirmed default text template to the connected operator's Kakao My Chatroom. This does not require friends-list access and uses the same durable at-most-once operation fence.",
+        )
+        .with_params([
+            (
+                "Idempotency-Key",
+                header_param(
+                    "string",
+                    true,
+                    "8–128 safe-ASCII bytes scoped to the Kakao connector account",
+                ),
+            ),
+            (
+                "text",
+                body_param("string", true, "1–200 Unicode scalar values"),
+            ),
+            (
+                "confirmed",
+                body_param("boolean", true, "Must be true for every manual send"),
+            ),
+        ])
+        .with_example(
+            json!({
+                "headers": {"Idempotency-Key": "self-send-3c855579-2c78-4cf2-a814-4dfef84e744f"},
+                "body": {
+                    "text": "AgentDesk self-send test message",
+                    "confirmed": true
+                }
+            }),
+            json!({
+                "request_id": "46a44a24-790e-4f41-aec6-8bf6ac5b2d3d",
+                "status": "success",
+                "requested_count": 1,
+                "successful_count": 1,
+                "failed_count": 0,
+                "replayed": false,
+                "delivery_may_have_occurred": true,
+                "automatic_retry_allowed": false
+            }),
+        ),
     ]
 }

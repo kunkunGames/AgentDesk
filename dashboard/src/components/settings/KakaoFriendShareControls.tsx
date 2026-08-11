@@ -25,6 +25,10 @@ export function kakaoSendIntentFingerprint(receiverUuids: Iterable<string>, text
   return JSON.stringify({ receiver_uuids: [...receiverUuids].sort(), text });
 }
 
+export function kakaoMemoIntentFingerprint(text: string): string {
+  return JSON.stringify({ target: "self", text });
+}
+
 export function isAllowedKakaoAuthorizeUrl(target: URL): boolean {
   return target.protocol === "https:"
     && target.hostname === "kauth.kakao.com"
@@ -73,9 +77,12 @@ export function KakaoFriendShareControls({
   const canTestSend = actions.has("test_send");
   const charCount = Array.from(text).length;
   const sendDisabled = sending || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
+  const memoSendDisabled = sending || text.trim().length === 0 || charCount > 200;
   const friends = useMemo(() => friendsPage?.friends ?? [], [friendsPage]);
   const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(selected, text), [selected, text]);
+  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(text), [text]);
   const safelyReplaysCurrentIntent = pendingIntent?.fingerprint === currentFingerprint;
+  const safelyReplaysMemoIntent = pendingIntent?.fingerprint === memoFingerprint;
 
   const connect = async () => {
     setBusyAction("connect");
@@ -224,6 +231,57 @@ export function KakaoFriendShareControls({
     }
   };
 
+  const sendToMe = async () => {
+    if (memoSendDisabled) return;
+    if (duplicateRiskPending && !safelyReplaysMemoIntent) {
+      const acceptsDuplicateRisk = window.confirm(
+        tr(
+          "이전 요청은 이미 전달되었을 수 있습니다. 새 요청으로 다시 보내면 중복 메시지가 생길 수 있습니다. 계속할까요?",
+          "The previous request may already have delivered. Sending a new request can create a duplicate. Continue?",
+        ),
+      );
+      if (!acceptsDuplicateRisk) return;
+    }
+    const confirmed = window.confirm(
+      safelyReplaysMemoIntent
+        ? tr(
+          "같은 요청 키로 기존 나에게 보내기 결과를 다시 확인할까요? 새 전송은 시작하지 않습니다.",
+          "Check the existing self-send with the same request key? No new send will start.",
+        )
+        : tr(
+          "내 카카오톡 나와의 채팅방으로 지금 한 번 전송할까요? 자동 재전송은 하지 않습니다.",
+          "Send once to your Kakao My Chatroom? AgentDesk will not retry automatically.",
+        ),
+    );
+    if (!confirmed) return;
+    setSending(true);
+    setError(null);
+    setResult(null);
+    const resolvedIntent = resolveKakaoSendIntent(
+      pendingIntent,
+      memoFingerprint,
+      () => crypto.randomUUID(),
+    );
+    setPendingIntent(resolvedIntent.intent);
+    try {
+      const response = await api.sendKakaoMemoMessage(resolvedIntent.intent.idempotencyKey, text);
+      setResult(response);
+      const hasDuplicateRisk = response.status === "unknown" || response.status === "partial_success";
+      setDuplicateRiskPending(hasDuplicateRisk);
+      if (!hasDuplicateRisk) setPendingIntent(null);
+    } catch {
+      setDuplicateRiskPending(true);
+      setError(
+        tr(
+          "나에게 보내기 결과를 확인하지 못했습니다. 중복 가능성이 있으므로 같은 내용을 바로 다시 보내지 마세요.",
+          "The self-send result could not be confirmed. Do not immediately resend because delivery may have occurred.",
+        ),
+      );
+    } finally {
+      setSending(false);
+    }
+  };
+
   return (
     <div className="mt-4 border-t pt-4" style={{ borderColor: "color-mix(in srgb, var(--th-border) 62%, transparent)" }}>
       {connector.connection?.landing_url ? (
@@ -335,6 +393,15 @@ export function KakaoFriendShareControls({
               : safelyReplaysCurrentIntent
                 ? tr("같은 요청 결과 다시 확인", "Check the same request")
                 : tr("선택한 친구에게 지금 전송", "Send now to selected friends")}
+          </button>
+
+          <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={memoSendDisabled} onClick={() => void sendToMe()}>
+            {sending ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+            {sending
+              ? tr("한 번 전송 중...", "Sending once...")
+              : safelyReplaysMemoIntent
+                ? tr("나에게 보낸 같은 요청 결과 확인", "Check the same self-send")
+                : tr("나에게 지금 전송", "Send now to me")}
           </button>
 
           {result ? <KakaoSendOutcome result={result} tr={tr} /> : null}

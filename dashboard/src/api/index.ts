@@ -103,6 +103,7 @@ export {
   disconnectKakao,
   getKakaoFriends,
   sendKakaoFriendMessage,
+  sendKakaoMemoMessage,
   getEscalationSettings,
   saveEscalationSettings,
   reorderAutoQueueEntries,
