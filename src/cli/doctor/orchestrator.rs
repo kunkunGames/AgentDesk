@@ -1231,7 +1231,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             "missing_agents": db.get("missing_agents").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
             "extra_agents": db.get("extra_agents").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
             "mismatched_agents": db.get("mismatched_agents").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
-            "synced_agents": db.get("synced_agents").cloned().unwrap_or(Value::Null)
+            "synced_agents": db.get("synced_agents").and_then(Value::as_array).map(Vec::len).unwrap_or(0)
         }
     });
     let detail = format!("status={status} warnings={warnings_count} actions={actions_count}");
