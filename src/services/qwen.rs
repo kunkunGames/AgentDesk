@@ -1971,7 +1971,12 @@ pub(crate) fn qwen_project_cache_key(working_dir: &str) -> String {
 }
 
 fn normalize_qwen_working_dir(working_dir: &str) -> PathBuf {
-    let expanded = expand_home_dir(working_dir);
+    let expanded = if working_dir.starts_with('~') {
+        crate::runtime_layout::expand_user_path(working_dir)
+            .unwrap_or_else(|| PathBuf::from(working_dir))
+    } else {
+        PathBuf::from(working_dir)
+    };
     std::fs::canonicalize(&expanded).unwrap_or(expanded)
 }
 
@@ -1990,18 +1995,6 @@ fn qwen_home_dir() -> Option<PathBuf> {
                 .map(PathBuf::from)
         })
         .or_else(dirs::home_dir)
-}
-
-fn expand_home_dir(path: &str) -> PathBuf {
-    if path == "~" {
-        return qwen_home_dir().unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = qwen_home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn track_session_id(state: &mut QwenAttemptState, session_id: Option<&str>) {
