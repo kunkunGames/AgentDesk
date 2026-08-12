@@ -332,6 +332,7 @@ def main():
                     "onboardingsmith": "OnboardingSmith:",
                     "domainkeeper": "DomainKeeper:",
                     "api-routemaster": "ApiRoutemaster:",
+                    "parity-lite": "Parity-Lite:",
                 }
                 if agent_slug in overrides:
                     expected_prefix = overrides[agent_slug]
