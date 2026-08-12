@@ -391,7 +391,7 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
@@ -484,7 +484,7 @@ jobs:
 
       - name: Setup sccache
         if: runner.os != 'macOS'
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # `target/` is intentionally NOT cached — sccache (GHA-backed) handles
       # compiled rustc output, and caching multi-GB `target/` directories
@@ -625,7 +625,7 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # See `check_fast` for rationale: `target/` excluded to protect sccache
       # GHA cache quota.
@@ -758,7 +758,7 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # See `check_fast` for rationale.
       - name: Cache Cargo dependencies
@@ -1095,7 +1095,7 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # See `check_fast` for rationale: `target/` excluded to protect the
       # sccache GHA cache quota.
@@ -1185,7 +1185,7 @@ jobs:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       # See `check_fast` for rationale.
       - name: Cache Cargo dependencies
@@ -1268,7 +1268,7 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache for lib inventory
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       - name: Cache Cargo dependencies for lib inventory
         uses: Swatinem/rust-cache@v2
@@ -1365,7 +1365,7 @@ jobs:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.8
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
