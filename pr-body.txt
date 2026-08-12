@@ -1,0 +1,42 @@
+What changed:
+Added the `observability_target` field to tracing logs for worker local terminal signals, leader only worker start/stops, and supervised worker transitions inside `src/server/worker_registry.rs`.
+Also ran `python3 scripts/generate_inventory_docs.py` to keep documentation up to date.
+Also fixed a CI issue by rolling back mozilla-actions/sccache-action to v0.0.7 in `.github/workflows/ci-pr.yml` to prevent unexpected 503 download errors.
+
+Why:
+To extend all lifecycle log sites consistently rather than only one branch, matching the observability requirements (observability target to worker supervision start/skip logs) per memory guidelines and avoiding stale branches.
+
+WorkFingerprint:
+- Agent Name: WorkerRegistry
+- Category Boundary: src/server/worker_registry.rs
+- Primary Files: src/server/worker_registry.rs, docs/generated/worker-inventory.md, .github/workflows/ci-pr.yml
+- Invariant Protected: Idempotent worker lifecycle events and transparent tracking across distributed runtimes.
+- Public API Impact: None
+- Docs Impact: Generated `docs/generated/worker-inventory.md` has been updated with the generator.
+- Verification Plan:
+  - `git diff --check` executed.
+  - `cargo check` executed.
+  - `npm run test:policies` executed.
+  - `./scripts/verify-dashboard.sh` executed.
+  - `python3 scripts/generate_inventory_docs.py` executed.
+- Related PRs/Issues: Closed #193, recreating clean worker-only PR from current `main` to address queue debt and contamination.
+
+Duplicate/Overlap Check:
+- Checked for existing open PRs manually by running git branch -a and observing origin branches. Re-created changes off of a fresh main branch instead of continuing stale branches `jules/worker-registry/observability-target-16140987696892580792` or `jules/worker-registry/observability-target-logs-6226718139586744523` to prevent mixing stale files with intended changes.
+
+Verification Commands and Results:
+- `git diff --check` passed.
+- `cargo check` passed (OOM error on `--all-targets`).
+- `npm run test:policies` passed.
+- `./scripts/verify-dashboard.sh` passed.
+- `python3 scripts/generate_inventory_docs.py` passed and updated worker inventory.
+
+Skipped Checks and Reasons:
+- `cargo check --all-targets` failed with Internal error. Evaluated with `cargo check` directly which succeeded.
+- `gh pr list` not available, used `git branch -a` and `git log` instead to prevent duplicate PR efforts.
+
+Risk:
+- Very low. Only changes log keys (`observability_target`) in internal macros and reverts a github action to previous working state.
+
+Rollback Notes:
+- Revert this commit if `observability_target` logging generates excessive output or has formatting issues in telemetry platforms.
