@@ -209,30 +209,45 @@ def has_template_summary(body):
     return has_non_empty_body_field(body, ["summary"], stop_at_field_labels=False)
 
 def is_scratch_file_path(path):
-    if not path or "/" in path:
+    if not path:
         return False
-    if path.endswith(".diff") or path.endswith(".patch"):
+
+    is_nested = "/" in path
+    basename = path.split("/")[-1]
+
+    if basename.endswith(".diff") or basename.endswith(".patch"):
         return True
-    root_scratch_files = {
+
+    global_scratch_files = {
         "pr-body.md",
         "plan.md",
         "plan.txt",
+        "prs.json",
+        "scratch.json",
+        "scratchpad.json",
+    }
+
+    root_only_scratch_files = {
         "test.sh",
         "test.sql",
         "test.py",
         "test.js",
         "verify.sh",
         "sql_test.rs",
-        "prs.json",
-        "scratch.json",
-        "scratchpad.json",
     }
-    if path in root_scratch_files:
+
+    if basename in global_scratch_files:
         return True
-    return bool(
-        re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", path)
-        or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", path)
-    )
+
+    if not is_nested and basename in root_only_scratch_files:
+        return True
+
+    if not is_nested:
+        return bool(
+            re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename)
+            or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
+        )
+    return False
 
 def is_generated_inventory_path(path):
     # Regenerated wholesale by scripts/generate_inventory_docs.py. A PR whose
