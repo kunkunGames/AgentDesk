@@ -35,6 +35,8 @@ pub enum OAuthConnectionError {
     InvalidTokenPayload,
     #[error("OAuth token refresh is already in progress")]
     RefreshInProgress,
+    #[error("OAuth account identity changed while the connection was being saved")]
+    AccountIdentityConflict,
 }
 
 impl From<sqlx::Error> for OAuthConnectionError {
@@ -122,6 +124,17 @@ impl TokenVault {
             )
             .map_err(|_| OAuthConnectionError::Decrypt)?;
         Ok(Zeroizing::new(plaintext))
+    }
+
+    pub fn subject_hash(&self, provider: &str, subject: &[u8]) -> Vec<u8> {
+        let key: &[u8; 32] = &self.key;
+        let mut hasher = blake3::Hasher::new_keyed(key);
+        hasher.update(b"agentdesk/oauth-subject/v1\0");
+        hasher.update(&(provider.len() as u64).to_be_bytes());
+        hasher.update(provider.as_bytes());
+        hasher.update(&(subject.len() as u64).to_be_bytes());
+        hasher.update(subject);
+        hasher.finalize().as_bytes().to_vec()
     }
 }
 
@@ -337,9 +350,39 @@ pub async fn upsert_account(
     account_key: &str,
     subject_hash: Option<&[u8]>,
     update: AccountTokenUpdate<'_>,
-) -> Result<(), OAuthConnectionError> {
-    let encrypted = update.tokens.encrypt(vault, account_key)?;
-    sqlx::query(
+) -> Result<String, OAuthConnectionError> {
+    let mut tx = pool.begin().await?;
+    let actual_account_key = if let Some(subject_hash) = subject_hash {
+        // Two OAuth callbacks for the same Kakao subject may finish together on
+        // different nodes. Serialize identity selection before encrypting so a
+        // conflict can never copy ciphertext whose AAD names the losing UUID
+        // onto the winning account row.
+        let subject_lock = format!(
+            "oauth-subject:{KAKAO_PROVIDER}:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(subject_hash)
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)")
+            .bind(subject_lock)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT account_key
+            FROM oauth_connection_accounts
+            WHERE provider = $1 AND subject_hash = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(KAKAO_PROVIDER)
+        .bind(subject_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| account_key.to_string())
+    } else {
+        account_key.to_string()
+    };
+    let encrypted = update.tokens.encrypt(vault, &actual_account_key)?;
+    let saved_account_key = sqlx::query_scalar::<_, String>(
         r#"
         INSERT INTO oauth_connection_accounts (
             provider,
@@ -366,10 +409,14 @@ pub async fn upsert_account(
             refresh_lease_id = NULL,
             refresh_lease_expires_at = NULL,
             updated_at = NOW()
+        WHERE oauth_connection_accounts.subject_hash IS NULL
+           OR EXCLUDED.subject_hash IS NULL
+           OR oauth_connection_accounts.subject_hash = EXCLUDED.subject_hash
+        RETURNING account_key
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(account_key)
+    .bind(&actual_account_key)
     .bind(subject_hash)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
@@ -377,29 +424,43 @@ pub async fn upsert_account(
     .bind(update.scopes)
     .bind(update.access_expires_at)
     .bind(update.refresh_expires_at)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(OAuthConnectionError::AccountIdentityConflict)?;
+    tx.commit().await?;
+    Ok(saved_account_key)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteAccountOutcome {
+    Deleted,
+    NotFound,
+    InUse,
 }
 
 pub async fn delete_account(
     pool: &PgPool,
     account_key: &str,
-) -> Result<bool, OAuthConnectionError> {
-    let result = sqlx::query(
-        "DELETE FROM oauth_connection_accounts WHERE provider = $1 AND account_key = $2",
+) -> Result<DeleteAccountOutcome, OAuthConnectionError> {
+    let mut tx = pool.begin().await?;
+    // Migration 0109 makes every new schedule/operation/outbox reference take
+    // a FOR KEY SHARE lock on this row. FOR UPDATE therefore serializes the
+    // reference check with those inserts and closes the check-then-delete race.
+    let found = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT account_key
+        FROM oauth_connection_accounts
+        WHERE provider = $1 AND account_key = $2
+        FOR UPDATE
+        "#,
     )
     .bind(KAKAO_PROVIDER)
     .bind(account_key)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected() == 1)
-}
-
-pub async fn account_has_active_delivery_references(
-    pool: &PgPool,
-    account_key: &str,
-) -> Result<bool, OAuthConnectionError> {
+    if found.is_none() {
+        return Ok(DeleteAccountOutcome::NotFound);
+    }
     let referenced = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS (
@@ -424,9 +485,18 @@ pub async fn account_has_active_delivery_references(
     )
     .bind(account_key)
     .bind(KAKAO_PROVIDER)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(referenced)
+    if referenced {
+        return Ok(DeleteAccountOutcome::InUse);
+    }
+    sqlx::query("DELETE FROM oauth_connection_accounts WHERE provider = $1 AND account_key = $2")
+        .bind(KAKAO_PROVIDER)
+        .bind(account_key)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(DeleteAccountOutcome::Deleted)
 }
 
 pub async fn set_account_status(
@@ -595,6 +665,17 @@ mod tests {
         let first = sha256_bytes(b"same");
         assert_eq!(first, sha256_bytes(b"same"));
         assert_ne!(first, sha256_bytes(b"different"));
+        assert_eq!(first.len(), 32);
+    }
+
+    #[test]
+    fn subject_hash_is_keyed_and_provider_bound() {
+        let first = test_vault().subject_hash("kakao", b"12345");
+        let other_key = TokenVault::for_test([8_u8; 32]).subject_hash("kakao", b"12345");
+        let other_provider = test_vault().subject_hash("other", b"12345");
+        assert_eq!(first, test_vault().subject_hash("kakao", b"12345"));
+        assert_ne!(first, other_key);
+        assert_ne!(first, other_provider);
         assert_eq!(first.len(), 32);
     }
 }

@@ -30,6 +30,17 @@ export function kakaoMemoIntentFingerprint(accountId: string, text: string): str
   return JSON.stringify({ account_id: accountId, target: "self", text });
 }
 
+export function kakaoAccountCanSendToFriends(account: KakaoAccountSummary): boolean {
+  return account.status === "active"
+    && account.scopes.includes("friends")
+    && account.scopes.includes("talk_message");
+}
+
+export function kakaoAccountCanSendMemo(account: KakaoAccountSummary): boolean {
+  return (account.status === "active" || account.status === "consent_incomplete")
+    && account.scopes.includes("talk_message");
+}
+
 export function isAllowedKakaoAuthorizeUrl(target: URL): boolean {
   return target.protocol === "https:"
     && target.hostname === "kauth.kakao.com"
@@ -78,10 +89,12 @@ export function KakaoFriendShareControls({
 
   const actions = new Set(connector.actions ?? []);
   const canConnect = actions.has("connect") || actions.has("reconnect");
-  const canTestSend = accounts.some((account) => account.status === "active");
+  const canTestSend = accounts.some(kakaoAccountCanSendMemo);
+  const selectedCanSendToFriends = selectedAccount ? kakaoAccountCanSendToFriends(selectedAccount) : false;
+  const selectedCanSendMemo = selectedAccount ? kakaoAccountCanSendMemo(selectedAccount) : false;
   const charCount = Array.from(text).length;
-  const sendDisabled = sending || !selectedAccount || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
-  const memoSendDisabled = sending || !selectedAccount || text.trim().length === 0 || charCount > 200;
+  const sendDisabled = sending || !selectedCanSendToFriends || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
+  const memoSendDisabled = sending || !selectedCanSendMemo || text.trim().length === 0 || charCount > 200;
   const friends = useMemo(() => friendsPage?.friends ?? [], [friendsPage]);
   const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(accountId, selected, text), [accountId, selected, text]);
   const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(accountId, text), [accountId, text]);
@@ -131,12 +144,13 @@ export function KakaoFriendShareControls({
   };
 
   const loadFriends = async (offset = 0, append = false) => {
-    if (!accountId) return;
+    if (!accountId || !selectedCanSendToFriends) return;
     const requestVersion = ++friendRequestVersion.current;
+    const requestAccountId = accountId;
     setFriendsLoading(true);
     setError(null);
     try {
-      const page = await api.getKakaoFriends(accountId, offset, 20);
+      const page = await api.getKakaoFriends(requestAccountId, offset, 20);
       if (requestVersion !== friendRequestVersion.current) return;
       if (!append) {
         setSelected(new Set());
@@ -149,9 +163,10 @@ export function KakaoFriendShareControls({
         return { ...page, friends: [...merged.values()] };
       });
     } catch {
+      if (requestVersion !== friendRequestVersion.current) return;
       setError(tr("메시지를 보낼 수 있는 친구 목록을 불러오지 못했습니다.", "Failed to load message-eligible friends."));
     } finally {
-      setFriendsLoading(false);
+      if (requestVersion === friendRequestVersion.current) setFriendsLoading(false);
     }
   };
 
@@ -172,6 +187,7 @@ export function KakaoFriendShareControls({
 
   const selectAccount = (nextAccountId: string) => {
     friendRequestVersion.current += 1;
+    setFriendsLoading(false);
     setAccountId(nextAccountId);
     setFriendsPage(null);
     setSelected(new Set());
@@ -363,19 +379,23 @@ export function KakaoFriendShareControls({
             <div className="mb-2 text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("발신 카카오 계정", "Sender Kakao account")}</div>
             <select value={accountId} onChange={(event) => selectAccount(event.target.value)} className="w-full rounded-xl border px-3 py-2 text-sm" style={{ borderColor: "var(--th-border)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}>
               <option value="">{tr("계정을 선택하세요", "Select an account")}</option>
-              {accounts.filter((account) => account.status === "active").map((account) => <option key={account.account_id} value={account.account_id}>{account.is_legacy ? "primary" : account.account_id.slice(0, 8)}</option>)}
+              {accounts.filter(kakaoAccountCanSendMemo).map((account) => <option key={account.account_id} value={account.account_id}>{account.is_legacy ? "primary" : account.account_id.slice(0, 8)}{kakaoAccountCanSendToFriends(account) ? "" : tr(" (나에게 보내기 전용)", " (self-send only)")}</option>)}
             </select>
           </label>
           <div>
             <div className="mb-2 flex items-center justify-between text-xs" style={{ color: "var(--th-text-muted)" }}>
               <span>{tr(`수신자 ${selected.size}/5`, `Recipients ${selected.size}/5`)}</span>
-              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={friendsLoading} onClick={() => void loadFriends()}>
+              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={friendsLoading || !selectedCanSendToFriends} onClick={() => void loadFriends()}>
                 {friendsLoading ? <Loader2 size={12} className="animate-spin" /> : null}
                 {tr("새로고침", "Refresh")}
               </button>
             </div>
             <div className="max-h-52 space-y-2 overflow-y-auto rounded-xl border p-3" style={{ borderColor: "color-mix(in srgb, var(--th-border) 62%, transparent)" }}>
-              {friendsLoading && friends.length === 0 ? (
+              {!selectedAccount ? (
+                <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("먼저 발신 계정을 선택하세요.", "Select a sender account first.")}</div>
+              ) : !selectedCanSendToFriends ? (
+                <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("이 계정은 친구 발송 동의가 없습니다. 나에게 보내기로 연결을 시험할 수 있습니다.", "This account lacks friend-send consent. You can still test it with Send to me.")}</div>
+              ) : friendsLoading && friends.length === 0 ? (
                 <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("친구를 불러오는 중입니다.", "Loading friends.")}</div>
               ) : friends.length === 0 ? (
                 <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("메시지 수신 동의를 완료한 친구가 없습니다.", "No message-eligible friends are available.")}</div>

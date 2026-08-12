@@ -1,12 +1,31 @@
 import { describe, expect, it } from "vitest";
 import {
   isAllowedKakaoAuthorizeUrl,
+  kakaoAccountCanSendMemo,
+  kakaoAccountCanSendToFriends,
   kakaoMemoIntentFingerprint,
   kakaoSendIntentFingerprint,
   resolveKakaoSendIntent,
 } from "./KakaoFriendShareControls";
 
 describe("Kakao friend share safety helpers", () => {
+  it("keeps talk-message-only accounts available for self-send but not friend send", () => {
+    const account = {
+      account_id: "account-a",
+      status: "consent_incomplete",
+      scopes: ["talk_message"],
+      access_expires_at: null,
+      is_legacy: false,
+    };
+    expect(kakaoAccountCanSendMemo(account)).toBe(true);
+    expect(kakaoAccountCanSendToFriends(account)).toBe(false);
+    expect(kakaoAccountCanSendToFriends({
+      ...account,
+      status: "active",
+      scopes: ["friends", "talk_message"],
+    })).toBe(true);
+  });
+
   it("keeps self-send idempotency separate from friend-recipient payloads", () => {
     expect(kakaoMemoIntentFingerprint("account-a", "hello")).not.toBe(
       kakaoSendIntentFingerprint("account-a", [], "hello"),

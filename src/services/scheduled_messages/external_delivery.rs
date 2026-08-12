@@ -120,6 +120,10 @@ pub(crate) fn prepare_external_share_outbox(
     if !(1..=PLAN_SCHEMA_VERSION).contains(&stored.schema_version) {
         return Err(ExternalDeliveryPlanError::InvalidStoredPlan);
     }
+    let account_key = stored.kakao_friend_share.account_key.clone();
+    if message.external_delivery_account_key.as_deref() != Some(account_key.as_str()) {
+        return Err(ExternalDeliveryPlanError::InvalidStoredPlan);
+    }
 
     let command = KakaoFriendShareCommand {
         receiver_uuids: stored.kakao_friend_share.receiver_uuids.clone(),
@@ -142,7 +146,7 @@ pub(crate) fn prepare_external_share_outbox(
         id: outbox_id,
         provider: KAKAO_PROVIDER.to_string(),
         channel_id: KAKAO_CHANNEL_ID.to_string(),
-        account_key: stored.kakao_friend_share.account_key,
+        account_key,
         source: OUTBOX_SOURCE.to_string(),
         source_key: source_key.to_string(),
         scheduled_delivery_id: delivery_id.to_string(),

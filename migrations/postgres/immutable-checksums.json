@@ -558,7 +558,7 @@
     },
     {
       "path": "migrations/postgres/0109_kakao_multi_accounts.sql",
-      "sha256": "567a0093e3ef97193e2d942e5f035e5eefcdefb79a17b87c24e596995cafa7b5",
+      "sha256": "f8add07539a9698760361c90b043259d782148b095b98b6d11515056ee7f71cd",
       "version": 109
     }
   ],

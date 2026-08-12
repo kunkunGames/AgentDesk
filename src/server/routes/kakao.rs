@@ -353,6 +353,7 @@ fn map_error(error: KakaoError, operation: &'static str) -> KakaoRouteError {
         ),
         KakaoError::Connection(OAuthConnectionError::Encrypt)
         | KakaoError::Connection(OAuthConnectionError::InvalidTokenPayload)
+        | KakaoError::Connection(OAuthConnectionError::AccountIdentityConflict)
         | KakaoError::ExternalShare(ExternalShareError::CorruptOperation) => (
             AppError::internal("Kakao integration encountered an internal error"),
             None,

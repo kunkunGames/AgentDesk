@@ -114,6 +114,26 @@ pub(super) fn prepare_provider_targets(
     })
 }
 
+pub(super) async fn ensure_provider_target_account_connected(
+    pool: &PgPool,
+    plan: Option<&EncryptedExternalDeliveryPlan>,
+) -> Result<(), AppError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    match crate::services::oauth_connection::load_account(pool, &plan.account_key).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "providerTargets.kakaoFriendShare.accountId is not connected",
+        )),
+        Err(error) => Err(app_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("load Kakao provider-target account: {error}"),
+        )),
+    }
+}
+
 pub(super) fn patch_provider_targets(
     body: &Map<String, JsonValue>,
     content: &str,

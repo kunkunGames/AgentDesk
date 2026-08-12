@@ -9,6 +9,16 @@ async fn postgres_external_share_outbox_reclaims_stale_leases_and_scrubs_termina
     .await;
     let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
     sqlx::query(
+        "INSERT INTO oauth_connection_accounts
+            (provider, account_key, token_ciphertext, token_nonce, scopes, status)
+         VALUES ('kakao', 'primary', $1, $2, ARRAY['friends', 'talk_message'], 'active')",
+    )
+    .bind(b"encrypted-test-token".as_slice())
+    .bind(vec![7_u8; 24])
+    .execute(&pool)
+    .await
+    .expect("seed Kakao account reference");
+    sqlx::query(
         "INSERT INTO scheduled_messages
             (id, content, target_channel_id, scheduled_at, timezone)
          VALUES ('smsg-external-outbox-test', 'safe payload', '123456789', NOW(), 'UTC')",

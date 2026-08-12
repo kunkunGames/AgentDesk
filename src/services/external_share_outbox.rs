@@ -417,6 +417,9 @@ fn classify_kakao_error(error: &KakaoError) -> (&'static str, bool, bool) {
         KakaoError::Connection(OAuthConnectionError::Encrypt) => {
             ("oauth_token_encrypt_failed", true, false)
         }
+        KakaoError::Connection(OAuthConnectionError::AccountIdentityConflict) => {
+            ("oauth_account_identity_conflict", false, false)
+        }
         KakaoError::Disabled => ("connector_disabled", true, false),
         KakaoError::MissingConfig => ("connector_config_incomplete", true, false),
         KakaoError::MissingDatabase => ("storage_unavailable", true, false),
