@@ -126,6 +126,7 @@ export interface OperatorConnectorStatus {
     scopes: string[];
     access_expires_at: string | null;
     landing_url: string | null;
+    accounts?: KakaoAccountSummary[];
   };
   actions: string[];
 }
@@ -156,10 +157,19 @@ const kakaoOAuthStartResponseSchema = z.object({
 
 const kakaoDisconnectResponseSchema = z.object({
   ok: z.boolean(),
-  connector_id: z.string().min(1),
-  connection_state: z.string().min(1),
+  account_id: z.string().min(1),
   remote_unlinked: z.literal(false),
 });
+
+const kakaoAccountSummarySchema = z.object({
+  account_id: z.string().min(1),
+  status: z.string().min(1),
+  scopes: z.array(z.string()),
+  access_expires_at: z.string().nullable(),
+  is_legacy: z.boolean(),
+});
+
+const kakaoAccountsResponseSchema = z.object({ accounts: z.array(kakaoAccountSummarySchema) });
 
 const kakaoFriendViewSchema = z.object({
   uuid: z.string().min(1),
@@ -227,6 +237,7 @@ export type KakaoOAuthStartResponse = z.infer<
   typeof kakaoOAuthStartResponseSchema
 >;
 export type KakaoDisconnectResponse = z.infer<typeof kakaoDisconnectResponseSchema>;
+export type KakaoAccountSummary = z.infer<typeof kakaoAccountSummarySchema>;
 export type KakaoFriendView = z.infer<typeof kakaoFriendViewSchema>;
 export type KakaoFriendsPage = z.infer<typeof kakaoFriendsPageSchema>;
 export type KakaoSendStatus = z.infer<typeof kakaoSendStatusSchema>;
@@ -243,9 +254,13 @@ export async function startKakaoOAuth(): Promise<KakaoOAuthStartResponse> {
   );
 }
 
-export async function disconnectKakao(): Promise<KakaoDisconnectResponse> {
+export async function getKakaoAccounts(): Promise<KakaoAccountSummary[]> {
+  return request("/api/kakao/accounts", undefined, kakaoAccountsResponseSchema).then((response) => response.accounts);
+}
+
+export async function disconnectKakao(accountId: string): Promise<KakaoDisconnectResponse> {
   return request(
-    "/api/kakao/connection",
+    `/api/kakao/accounts/${encodeURIComponent(accountId)}`,
     {
       method: "DELETE",
       maxRetries: 0,
@@ -254,9 +269,9 @@ export async function disconnectKakao(): Promise<KakaoDisconnectResponse> {
   );
 }
 
-export async function getKakaoFriends(offset = 0, limit = 20): Promise<KakaoFriendsPage> {
+export async function getKakaoFriends(accountId: string, offset = 0, limit = 20): Promise<KakaoFriendsPage> {
   return request(
-    `/api/kakao/friends?offset=${offset}&limit=${limit}`,
+    `/api/kakao/friends?account_id=${encodeURIComponent(accountId)}&offset=${offset}&limit=${limit}`,
     undefined,
     kakaoFriendsPageSchema,
   );
@@ -264,6 +279,7 @@ export async function getKakaoFriends(offset = 0, limit = 20): Promise<KakaoFrie
 
 export async function sendKakaoFriendMessage(
   idempotencyKey: string,
+  accountId: string,
   receiverUuids: string[],
   text: string,
 ): Promise<KakaoSendResult> {
@@ -273,6 +289,7 @@ export async function sendKakaoFriendMessage(
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({
+        account_id: accountId,
         receiver_uuids: receiverUuids,
         text,
         confirmed: true,
@@ -285,6 +302,7 @@ export async function sendKakaoFriendMessage(
 
 export async function sendKakaoMemoMessage(
   idempotencyKey: string,
+  accountId: string,
   text: string,
 ): Promise<KakaoSendResult> {
   return request(
@@ -292,7 +310,7 @@ export async function sendKakaoMemoMessage(
     {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ text, confirmed: true }),
+      body: JSON.stringify({ account_id: accountId, text, confirmed: true }),
       maxRetries: 0,
     },
     kakaoSendResultSchema,

@@ -138,7 +138,6 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 결과별 공개 링크 저장소
 - 범용 채널 registry와 동적 plugin 계약
 - 메시지 템플릿 DSL
-- 다중 Kakao account UI
 - 장기 감사/분석 이벤트 파이프라인
 - Discord transport/retry 또는 delivery journal 변경 (`message_outbox` enqueue 계약은 그대로 재사용)
 - 친구 thumbnail proxy/cache
@@ -170,7 +169,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 알림톡, 전화번호 발송, 전체 친구 발송
 - feed/list/commerce 등 추가 Kakao 템플릿
 - 친구 검색 인덱스, 즐겨찾기 동기화, thumbnail 저장
-- Kakao 계정 여러 개 연결
+- Kakao 계정 별칭·profile nickname 저장(다중 계정 연결/선택 자체는 지원)
 - 원격 Kakao unlink; v1 disconnect는 AgentDesk 로컬 자격증명 삭제
 - 두 번째 외부 채널
 - `ExternalShareChannel` trait/registry

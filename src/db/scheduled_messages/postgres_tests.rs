@@ -169,6 +169,7 @@ async fn postgres_scheduled_provider_plan_is_hidden_from_lists_and_scrubbed_on_t
                         "imageForwarded": false
                     }
                 }),
+                account_key: "primary".to_string(),
             }),
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,

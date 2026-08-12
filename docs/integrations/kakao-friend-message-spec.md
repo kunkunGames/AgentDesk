@@ -305,9 +305,9 @@ CREATE TABLE oauth_connection_accounts (
 
 Contract:
 
-- v1 `account_key` is always `primary`.
-- access/refresh token live inside one encrypted envelope.
-- provider external user ID is not stored in v1 because it is not needed for the product contract.
+- legacy `account_key = 'primary'` remains readable. New connections use an AgentDesk UUID account key.
+- access/refresh token lives in one encrypted envelope per account, with its account key in AEAD AAD.
+- provider external user ID is not stored or returned; a 32-byte subject hash deduplicates reconnects.
 - token expiry columns are nullable because provider/token responses may omit them; Gate 0 fixes exact parsing.
 - no `disabled` row exists. Local disconnect deletes the account row and outstanding provider sessions.
 - remote Kakao unlink is out of scope.
@@ -354,7 +354,7 @@ CREATE INDEX external_share_operations_rate_idx
 
 Contract:
 
-- `provider = 'kakao'`, `channel_id = 'kakao_friend_share'`, `account_key = 'primary'` in v1.
+- `provider = 'kakao'`, `channel_id = 'kakao_friend_share'`, `account_key` is the explicit sender account (legacy rows retain `primary`).
 - row insert is the durable at-most-once fence.
 - raw recipient UUIDs, nickname, text, landing URL, token, provider raw response are not stored.
 - `idempotency_key_hash` and `request_fingerprint` are 32-byte SHA-256 values; the fingerprint length-prefixes text, landing URL, and sorted recipient UUIDs.

@@ -293,7 +293,6 @@ async fn process_claim(
     if claim.provider != crate::services::oauth_connection::KAKAO_PROVIDER
         || claim.channel_id
             != crate::services::scheduled_messages::external_delivery::KAKAO_CHANNEL_ID
-        || claim.account_key != crate::services::oauth_connection::PRIMARY_ACCOUNT_KEY
     {
         finish_pre_dispatch_failure(pool, &claim, "unsupported_provider").await;
         return;
@@ -315,7 +314,10 @@ async fn process_claim(
         }
     };
     let idempotency_key = format!("scheduled-kakao:{}", claim.id);
-    match service.send_friend_message(&idempotency_key, command).await {
+    match service
+        .send_friend_message(&claim.account_key, &idempotency_key, command)
+        .await
+    {
         Ok(result) => finish_result_pg(pool, &claim, result).await,
         Err(error) => handle_kakao_error(pool, &claim, &error).await,
     }
@@ -421,6 +423,8 @@ fn classify_kakao_error(error: &KakaoError) -> (&'static str, bool, bool) {
         KakaoError::ConsentIncomplete => ("consent_incomplete", true, false),
         KakaoError::ReauthorizationRequired => ("reauthorization_required", true, false),
         KakaoError::NotConnected => ("not_connected", true, false),
+        KakaoError::InvalidAccount => ("account_not_found", false, false),
+        KakaoError::AccountInUse => ("account_in_use", false, false),
         KakaoError::OAuthExchange => ("oauth_exchange_failed", true, false),
         KakaoError::Provider => ("provider_unavailable", true, false),
         KakaoError::OperationInProgress => ("operation_in_progress", true, false),

@@ -19,6 +19,12 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "GET",
+            "/api/kakao/accounts",
+            "kakao",
+            "List locally connected Kakao accounts using opaque AgentDesk account IDs. Tokens and Kakao user identifiers are never returned.",
+        ),
+        ep(
+            "GET",
             "/api/kakao/oauth/callback",
             "kakao",
             "Public Kakao OAuth callback. Consumes the hashed single-use state and always redirects to a fixed Settings result URL; query values are never reflected.",
@@ -39,16 +45,19 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         ]),
         ep(
             "DELETE",
-            "/api/kakao/connection",
+            "/api/kakao/accounts/{account_id}",
             "kakao",
-            "Delete the locally encrypted Kakao account and pending OAuth sessions. This does not revoke the remote Kakao app grant.",
+            "Delete one locally encrypted Kakao account. This does not revoke the remote Kakao app grant and rejects accounts referenced by active scheduled delivery.",
         )
+        .with_params([(
+            "account_id",
+            query_param("string", true, "Opaque local account ID from GET /api/kakao/accounts"),
+        )])
         .with_example(
             json!({}),
             json!({
                 "ok": true,
-                "connector_id": "kakao_friend_share",
-                "connection_state": "disconnected",
+                "account_id": "primary",
                 "remote_unlinked": false
             }),
         ),
@@ -56,9 +65,13 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/kakao/friends",
             "kakao",
-            "List the connected operator's message-eligible Kakao friends without server-side friend caching.",
+            "List the selected sender account's Kakao friends without server-side friend caching.",
         )
         .with_params([
+            (
+                "account_id",
+                query_param("string", true, "Opaque sender account ID"),
+            ),
             (
                 "offset",
                 query_param("integer", false, "Provider page offset").with_default(0),
@@ -69,7 +82,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ),
         ])
         .with_example(
-            json!({"query": {"offset": 0, "limit": 20}}),
+            json!({"query": {"account_id": "primary", "offset": 0, "limit": 20}}),
             json!({
                 "friends": [{"uuid": "provider-opaque-uuid", "display_name": "Friend"}],
                 "total_count": 1,
@@ -98,6 +111,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 body_param("string[]", true, "1–5 unique provider UUIDs"),
             ),
             (
+                "account_id",
+                body_param("string", true, "Opaque sender account ID"),
+            ),
+            (
                 "text",
                 body_param("string", true, "1–200 Unicode scalar values"),
             ),
@@ -110,6 +127,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             json!({
                 "headers": {"Idempotency-Key": "3c855579-2c78-4cf2-a814-4dfef84e744f"},
                 "body": {
+                    "account_id": "primary",
                     "receiver_uuids": ["provider-opaque-uuid"],
                     "text": "AgentDesk test message",
                     "confirmed": true
@@ -146,6 +164,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                 body_param("string", true, "1–200 Unicode scalar values"),
             ),
             (
+                "account_id",
+                body_param("string", true, "Opaque sender account ID"),
+            ),
+            (
                 "confirmed",
                 body_param("boolean", true, "Must be true for every manual send"),
             ),
@@ -154,6 +176,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             json!({
                 "headers": {"Idempotency-Key": "self-send-3c855579-2c78-4cf2-a814-4dfef84e744f"},
                 "body": {
+                    "account_id": "primary",
                     "text": "AgentDesk self-send test message",
                     "confirmed": true
                 }

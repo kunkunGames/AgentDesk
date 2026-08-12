@@ -35,9 +35,9 @@ pub async fn insert_scheduled_message_tx(
              context_snapshot_id, on_context_failure, image_filename, image_content_type,
              image_data, external_delivery_plan_id, external_delivery_plan_ciphertext,
              external_delivery_plan_nonce, external_delivery_plan_key_version,
-             external_delivery_summary)
+             external_delivery_summary, external_delivery_account_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
          RETURNING {DEFINITION_COLUMNS}"
     ))
     .bind(&id)
@@ -94,6 +94,11 @@ pub async fn insert_scheduled_message_tx(
         new.external_delivery_plan
             .as_ref()
             .map(|plan| &plan.summary),
+    )
+    .bind(
+        new.external_delivery_plan
+            .as_ref()
+            .map(|plan| &plan.account_key),
     )
     .fetch_one(&mut **tx)
     .await

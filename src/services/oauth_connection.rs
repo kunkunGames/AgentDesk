@@ -139,11 +139,15 @@ pub struct StoredOAuthTokens {
 }
 
 impl StoredOAuthTokens {
-    fn encrypt(&self, vault: &TokenVault) -> Result<EncryptedValue, OAuthConnectionError> {
+    fn encrypt(
+        &self,
+        vault: &TokenVault,
+        account_key: &str,
+    ) -> Result<EncryptedValue, OAuthConnectionError> {
         let mut serialized = Zeroizing::new(
             serde_json::to_vec(self).map_err(|_| OAuthConnectionError::InvalidTokenPayload)?,
         );
-        let encrypted = vault.seal(&serialized, account_aad().as_bytes());
+        let encrypted = vault.seal(&serialized, account_aad(account_key).as_bytes());
         serialized.zeroize();
         encrypted
     }
@@ -151,14 +155,17 @@ impl StoredOAuthTokens {
     fn decrypt(
         encrypted: &EncryptedValue,
         vault: &TokenVault,
+        account_key: &str,
     ) -> Result<Self, OAuthConnectionError> {
-        let plaintext = vault.open(encrypted, account_aad().as_bytes())?;
+        let plaintext = vault.open(encrypted, account_aad(account_key).as_bytes())?;
         serde_json::from_slice(&plaintext).map_err(|_| OAuthConnectionError::InvalidTokenPayload)
     }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthAccountRecord {
+    pub account_key: String,
+    pub subject_hash: Option<Vec<u8>>,
     pub token_ciphertext: Vec<u8>,
     pub token_nonce: Vec<u8>,
     pub key_version: i16,
@@ -180,6 +187,7 @@ impl OAuthAccountRecord {
                 key_version: self.key_version,
             },
             vault,
+            &self.account_key,
         )
     }
 }
@@ -244,10 +252,13 @@ pub async fn consume_session(pool: &PgPool, state: &str) -> Result<bool, OAuthCo
 
 pub async fn load_account(
     pool: &PgPool,
+    account_key: &str,
 ) -> Result<Option<OAuthAccountRecord>, OAuthConnectionError> {
     sqlx::query_as::<_, OAuthAccountRecord>(
         r#"
         SELECT
+            account_key,
+            subject_hash,
             token_ciphertext,
             token_nonce,
             key_version,
@@ -260,7 +271,54 @@ pub async fn load_account(
         "#,
     )
     .bind(KAKAO_PROVIDER)
+    .bind(account_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct OAuthAccountSummary {
+    pub account_id: String,
+    pub status: String,
+    pub scopes: Vec<String>,
+    pub access_expires_at: Option<DateTime<Utc>>,
+    pub is_legacy: bool,
+}
+
+pub async fn list_accounts(
+    pool: &PgPool,
+) -> Result<Vec<OAuthAccountSummary>, OAuthConnectionError> {
+    sqlx::query_as::<_, OAuthAccountSummary>(
+        r#"
+        SELECT account_key AS account_id, status, scopes, access_expires_at,
+               account_key = $2 AS is_legacy
+        FROM oauth_connection_accounts
+        WHERE provider = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(KAKAO_PROVIDER)
     .bind(PRIMARY_ACCOUNT_KEY)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn find_account_by_subject_hash(
+    pool: &PgPool,
+    subject_hash: &[u8],
+) -> Result<Option<OAuthAccountRecord>, OAuthConnectionError> {
+    sqlx::query_as::<_, OAuthAccountRecord>(
+        r#"
+        SELECT account_key, subject_hash, token_ciphertext, token_nonce, key_version,
+               scopes, access_expires_at, refresh_expires_at, status
+        FROM oauth_connection_accounts
+        WHERE provider = $1 AND subject_hash = $2
+        "#,
+    )
+    .bind(KAKAO_PROVIDER)
+    .bind(subject_hash)
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
@@ -276,14 +334,17 @@ pub struct AccountTokenUpdate<'a> {
 pub async fn upsert_account(
     pool: &PgPool,
     vault: &TokenVault,
+    account_key: &str,
+    subject_hash: Option<&[u8]>,
     update: AccountTokenUpdate<'_>,
 ) -> Result<(), OAuthConnectionError> {
-    let encrypted = update.tokens.encrypt(vault)?;
+    let encrypted = update.tokens.encrypt(vault, account_key)?;
     sqlx::query(
         r#"
         INSERT INTO oauth_connection_accounts (
             provider,
             account_key,
+            subject_hash,
             token_ciphertext,
             token_nonce,
             key_version,
@@ -292,9 +353,10 @@ pub async fn upsert_account(
             refresh_expires_at,
             status,
             updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', NOW())
         ON CONFLICT (provider, account_key) DO UPDATE SET
             token_ciphertext = EXCLUDED.token_ciphertext,
+            subject_hash = COALESCE(EXCLUDED.subject_hash, oauth_connection_accounts.subject_hash),
             token_nonce = EXCLUDED.token_nonce,
             key_version = EXCLUDED.key_version,
             scopes = EXCLUDED.scopes,
@@ -307,7 +369,8 @@ pub async fn upsert_account(
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
+    .bind(subject_hash)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(encrypted.key_version)
@@ -319,22 +382,58 @@ pub async fn upsert_account(
     Ok(())
 }
 
-pub async fn delete_connection(pool: &PgPool) -> Result<(), OAuthConnectionError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM oauth_connection_sessions WHERE provider = $1")
-        .bind(KAKAO_PROVIDER)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM oauth_connection_accounts WHERE provider = $1 AND account_key = $2")
-        .bind(KAKAO_PROVIDER)
-        .bind(PRIMARY_ACCOUNT_KEY)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
+pub async fn delete_account(
+    pool: &PgPool,
+    account_key: &str,
+) -> Result<bool, OAuthConnectionError> {
+    let result = sqlx::query(
+        "DELETE FROM oauth_connection_accounts WHERE provider = $1 AND account_key = $2",
+    )
+    .bind(KAKAO_PROVIDER)
+    .bind(account_key)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
-pub async fn set_account_status(pool: &PgPool, status: &str) -> Result<(), OAuthConnectionError> {
+pub async fn account_has_active_delivery_references(
+    pool: &PgPool,
+    account_key: &str,
+) -> Result<bool, OAuthConnectionError> {
+    let referenced = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM scheduled_messages
+            WHERE external_delivery_account_key = $1
+              AND status IN ('scheduled', 'firing')
+            UNION ALL
+            SELECT 1
+            FROM external_share_outbox
+            WHERE provider = $2
+              AND account_key = $1
+              AND status IN ('pending', 'processing')
+            UNION ALL
+            SELECT 1
+            FROM external_share_operations
+            WHERE provider = $2
+              AND account_key = $1
+              AND state = 'dispatching'
+        )
+        "#,
+    )
+    .bind(account_key)
+    .bind(KAKAO_PROVIDER)
+    .fetch_one(pool)
+    .await?;
+    Ok(referenced)
+}
+
+pub async fn set_account_status(
+    pool: &PgPool,
+    account_key: &str,
+    status: &str,
+) -> Result<(), OAuthConnectionError> {
     sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -343,14 +442,17 @@ pub async fn set_account_status(pool: &PgPool, status: &str) -> Result<(), OAuth
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(status)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectionError> {
+pub async fn acquire_refresh_lease(
+    pool: &PgPool,
+    account_key: &str,
+) -> Result<Uuid, OAuthConnectionError> {
     let lease_id = Uuid::new_v4();
     // Seal the account before the provider call. If the process or database
     // fails after Kakao may have rotated the refresh token, the old token can
@@ -371,7 +473,7 @@ pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectio
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .bind(REFRESH_LEASE_SECONDS as f64)
     .fetch_optional(pool)
@@ -382,10 +484,11 @@ pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectio
 pub async fn complete_refresh(
     pool: &PgPool,
     vault: &TokenVault,
+    account_key: &str,
     lease_id: Uuid,
     update: AccountTokenUpdate<'_>,
 ) -> Result<bool, OAuthConnectionError> {
-    let encrypted = update.tokens.encrypt(vault)?;
+    let encrypted = update.tokens.encrypt(vault, account_key)?;
     let result = sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -404,7 +507,7 @@ pub async fn complete_refresh(
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
@@ -417,7 +520,11 @@ pub async fn complete_refresh(
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn fail_refresh(pool: &PgPool, lease_id: Uuid) -> Result<(), OAuthConnectionError> {
+pub async fn fail_refresh(
+    pool: &PgPool,
+    account_key: &str,
+    lease_id: Uuid,
+) -> Result<(), OAuthConnectionError> {
     sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -430,7 +537,7 @@ pub async fn fail_refresh(pool: &PgPool, lease_id: Uuid) -> Result<(), OAuthConn
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .execute(pool)
     .await?;
@@ -443,8 +550,8 @@ pub fn token_expiry_from_now(seconds: Option<std::time::Duration>) -> Option<Dat
         .and_then(|seconds| Utc::now().checked_add_signed(Duration::seconds(seconds)))
 }
 
-fn account_aad() -> String {
-    format!("agentdesk/oauth-account/v1/{KAKAO_PROVIDER}/{PRIMARY_ACCOUNT_KEY}")
+pub fn account_aad(account_key: &str) -> String {
+    format!("agentdesk/oauth-account/v1/{KAKAO_PROVIDER}/{account_key}")
 }
 
 #[cfg(test)]
@@ -476,9 +583,9 @@ mod tests {
             access_token: "access-secret".to_string(),
             refresh_token: Some("refresh-secret".to_string()),
         };
-        let encrypted = tokens.encrypt(&vault).unwrap();
+        let encrypted = tokens.encrypt(&vault, "account-a").unwrap();
         assert!(!String::from_utf8_lossy(&encrypted.ciphertext).contains("access-secret"));
-        let opened = StoredOAuthTokens::decrypt(&encrypted, &vault).unwrap();
+        let opened = StoredOAuthTokens::decrypt(&encrypted, &vault, "account-a").unwrap();
         assert_eq!(opened.access_token, "access-secret");
         assert_eq!(opened.refresh_token.as_deref(), Some("refresh-secret"));
     }

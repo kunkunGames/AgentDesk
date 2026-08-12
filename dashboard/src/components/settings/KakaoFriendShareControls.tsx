@@ -1,9 +1,10 @@
 import { Link2, Loader2, MessageSquareShare, Send, Unlink } from "lucide-react";
-import { useMemo, useState, type CSSProperties } from "react";
+import { useMemo, useRef, useState, type CSSProperties } from "react";
 import * as api from "../../api";
 import type {
   KakaoFriendView,
   KakaoFriendsPage,
+  KakaoAccountSummary,
   KakaoSendResult,
   OperatorConnectorStatus,
 } from "../../api";
@@ -21,12 +22,12 @@ export interface PendingSendIntent {
   fingerprint: string;
 }
 
-export function kakaoSendIntentFingerprint(receiverUuids: Iterable<string>, text: string): string {
-  return JSON.stringify({ receiver_uuids: [...receiverUuids].sort(), text });
+export function kakaoSendIntentFingerprint(accountId: string, receiverUuids: Iterable<string>, text: string): string {
+  return JSON.stringify({ account_id: accountId, receiver_uuids: [...receiverUuids].sort(), text });
 }
 
-export function kakaoMemoIntentFingerprint(text: string): string {
-  return JSON.stringify({ target: "self", text });
+export function kakaoMemoIntentFingerprint(accountId: string, text: string): string {
+  return JSON.stringify({ account_id: accountId, target: "self", text });
 }
 
 export function isAllowedKakaoAuthorizeUrl(target: URL): boolean {
@@ -70,17 +71,20 @@ export function KakaoFriendShareControls({
   const [pendingIntent, setPendingIntent] = useState<PendingSendIntent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<KakaoSendResult | null>(null);
+  const [accountId, setAccountId] = useState("");
+  const friendRequestVersion = useRef(0);
+  const accounts: KakaoAccountSummary[] = connector.connection?.accounts ?? [];
+  const selectedAccount = accounts.find((account) => account.account_id === accountId) ?? null;
 
   const actions = new Set(connector.actions ?? []);
   const canConnect = actions.has("connect") || actions.has("reconnect");
-  const canDisconnect = actions.has("disconnect");
-  const canTestSend = actions.has("test_send");
+  const canTestSend = accounts.some((account) => account.status === "active");
   const charCount = Array.from(text).length;
-  const sendDisabled = sending || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
-  const memoSendDisabled = sending || text.trim().length === 0 || charCount > 200;
+  const sendDisabled = sending || !selectedAccount || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
+  const memoSendDisabled = sending || !selectedAccount || text.trim().length === 0 || charCount > 200;
   const friends = useMemo(() => friendsPage?.friends ?? [], [friendsPage]);
-  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(selected, text), [selected, text]);
-  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(text), [text]);
+  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(accountId, selected, text), [accountId, selected, text]);
+  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(accountId, text), [accountId, text]);
   const safelyReplaysCurrentIntent = pendingIntent?.fingerprint === currentFingerprint;
   const safelyReplaysMemoIntent = pendingIntent?.fingerprint === memoFingerprint;
 
@@ -100,7 +104,7 @@ export function KakaoFriendShareControls({
     }
   };
 
-  const disconnect = async () => {
+  const disconnect = async (targetAccountId: string) => {
     const confirmed = window.confirm(
       tr(
         "AgentDesk에 저장된 카카오 연결을 해제할까요? 카카오 계정의 앱 동의는 원격으로 철회되지 않습니다.",
@@ -111,7 +115,7 @@ export function KakaoFriendShareControls({
     setBusyAction("disconnect");
     setError(null);
     try {
-      await api.disconnectKakao();
+      await api.disconnectKakao(targetAccountId);
       setComposerOpen(false);
       setFriendsPage(null);
       setSelected(new Set());
@@ -127,10 +131,13 @@ export function KakaoFriendShareControls({
   };
 
   const loadFriends = async (offset = 0, append = false) => {
+    if (!accountId) return;
+    const requestVersion = ++friendRequestVersion.current;
     setFriendsLoading(true);
     setError(null);
     try {
-      const page = await api.getKakaoFriends(offset, 20);
+      const page = await api.getKakaoFriends(accountId, offset, 20);
+      if (requestVersion !== friendRequestVersion.current) return;
       if (!append) {
         setSelected(new Set());
         setResult(null);
@@ -154,13 +161,23 @@ export function KakaoFriendShareControls({
     setResult(null);
     setError(null);
     if (next) {
-      void loadFriends();
+      setAccountId("");
     } else {
       setFriendsPage(null);
       setSelected(new Set());
       setText("");
       setPendingIntent(null);
     }
+  };
+
+  const selectAccount = (nextAccountId: string) => {
+    friendRequestVersion.current += 1;
+    setAccountId(nextAccountId);
+    setFriendsPage(null);
+    setSelected(new Set());
+    setResult(null);
+    setDuplicateRiskPending(false);
+    setPendingIntent(null);
   };
 
   const toggleRecipient = (uuid: string) => {
@@ -211,6 +228,7 @@ export function KakaoFriendShareControls({
     try {
       const response = await api.sendKakaoFriendMessage(
         resolvedIntent.intent.idempotencyKey,
+        accountId,
         [...selected],
         text,
       );
@@ -264,7 +282,7 @@ export function KakaoFriendShareControls({
     );
     setPendingIntent(resolvedIntent.intent);
     try {
-      const response = await api.sendKakaoMemoMessage(resolvedIntent.intent.idempotencyKey, text);
+      const response = await api.sendKakaoMemoMessage(resolvedIntent.intent.idempotencyKey, accountId, text);
       setResult(response);
       const hasDuplicateRisk = response.status === "unknown" || response.status === "partial_success";
       setDuplicateRiskPending(hasDuplicateRisk);
@@ -307,18 +325,6 @@ export function KakaoFriendShareControls({
               : tr("다시 연결", "Reconnect")}
           </button>
         ) : null}
-        {canDisconnect ? (
-          <button
-            type="button"
-            className={secondaryActionClass}
-            style={secondaryActionStyle}
-            disabled={busyAction !== null}
-            onClick={() => void disconnect()}
-          >
-            {busyAction === "disconnect" ? <Loader2 size={13} className="animate-spin" /> : <Unlink size={13} />}
-            {tr("로컬 연결 해제", "Disconnect locally")}
-          </button>
-        ) : null}
         {canTestSend ? (
           <button
             type="button"
@@ -338,8 +344,28 @@ export function KakaoFriendShareControls({
         </div>
       ) : null}
 
+      {accounts.length > 0 ? (
+        <div className="mt-3 space-y-2" data-testid="kakao-account-list">
+          {accounts.map((account) => (
+            <div key={account.account_id} className="flex items-center justify-between rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "var(--th-border)", color: "var(--th-text)" }}>
+              <span>{tr("카카오 계정", "Kakao account")} · {account.is_legacy ? "primary" : account.account_id.slice(0, 8)} · {account.status}</span>
+              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={busyAction !== null} onClick={() => void disconnect(account.account_id)} aria-label={tr("계정 연결 해제", "Disconnect account")}>
+                {busyAction === "disconnect" ? <Loader2 size={13} className="animate-spin" /> : <Unlink size={13} />} ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {composerOpen ? (
         <div className="mt-4 space-y-4" data-testid="kakao-friend-share-composer">
+          <label className="block">
+            <div className="mb-2 text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("발신 카카오 계정", "Sender Kakao account")}</div>
+            <select value={accountId} onChange={(event) => selectAccount(event.target.value)} className="w-full rounded-xl border px-3 py-2 text-sm" style={{ borderColor: "var(--th-border)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}>
+              <option value="">{tr("계정을 선택하세요", "Select an account")}</option>
+              {accounts.filter((account) => account.status === "active").map((account) => <option key={account.account_id} value={account.account_id}>{account.is_legacy ? "primary" : account.account_id.slice(0, 8)}</option>)}
+            </select>
+          </label>
           <div>
             <div className="mb-2 flex items-center justify-between text-xs" style={{ color: "var(--th-text-muted)" }}>
               <span>{tr(`수신자 ${selected.size}/5`, `Recipients ${selected.size}/5`)}</span>

@@ -26,11 +26,14 @@ use super::external_share::{
     ShareOperationResult, ShareOperationState, begin_operation, finish_operation, mark_unknown,
 };
 use super::oauth_connection::{
-    AccountTokenUpdate, KAKAO_PROVIDER, OAuthAccountRecord, OAuthConnectionError,
-    PRIMARY_ACCOUNT_KEY, StoredOAuthTokens, TokenVault, acquire_refresh_lease, complete_refresh,
-    consume_session, create_session, delete_connection, fail_refresh, load_account,
-    set_account_status, token_expiry_from_now, upsert_account,
+    AccountTokenUpdate, KAKAO_PROVIDER, OAuthAccountRecord, OAuthAccountSummary,
+    OAuthConnectionError, PRIMARY_ACCOUNT_KEY, StoredOAuthTokens, TokenVault,
+    account_has_active_delivery_references, acquire_refresh_lease, complete_refresh,
+    consume_session, create_session, delete_account, fail_refresh, find_account_by_subject_hash,
+    list_accounts, load_account, set_account_status, sha256_bytes, token_expiry_from_now,
+    upsert_account,
 };
+use uuid::Uuid;
 
 pub const KAKAO_CONNECTOR_ID: &str = "kakao_friend_share";
 pub const KAKAO_REST_API_KEY_ENV: &str = "KAKAO_REST_API_KEY";
@@ -39,6 +42,7 @@ pub const REQUIRED_SCOPES: [&str; 2] = ["friends", "talk_message"];
 
 const AUTHORIZE_URL: &str = "https://kauth.kakao.com/oauth/authorize";
 const TOKEN_URL: &str = "https://kauth.kakao.com/oauth/token";
+const USER_ME_URL: &str = "https://kapi.kakao.com/v2/user/me";
 const FRIENDS_URL: &str = "https://kapi.kakao.com/v1/api/talk/friends";
 const SEND_URL: &str = "https://kapi.kakao.com/v1/api/talk/friends/message/default/send";
 const MEMO_SEND_URL: &str = "https://kapi.kakao.com/v2/api/talk/memo/default/send";
@@ -47,6 +51,7 @@ const HTTP_TIMEOUT_SECONDS: u64 = 10;
 const ACCESS_TOKEN_REFRESH_SKEW_SECONDS: i64 = 60;
 const FRIENDS_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 const SEND_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const USER_ME_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct KakaoExtraTokenFields {
@@ -106,6 +111,10 @@ pub enum KakaoError {
     ReauthorizationRequired,
     #[error("Kakao connection is not established")]
     NotConnected,
+    #[error("Kakao account selection is invalid")]
+    InvalidAccount,
+    #[error("Kakao account is referenced by scheduled delivery")]
+    AccountInUse,
     #[error("Kakao provider request failed")]
     Provider,
     #[error("Kakao provider result is ambiguous")]
@@ -154,6 +163,7 @@ pub struct KakaoConnectionStatus {
     pub reason: Option<&'static str>,
     pub scopes: Vec<String>,
     pub access_expires_at: Option<DateTime<Utc>>,
+    pub accounts: Vec<OAuthAccountSummary>,
 }
 
 impl KakaoConnectionStatus {
@@ -163,6 +173,7 @@ impl KakaoConnectionStatus {
             reason: Some(reason),
             scopes: Vec::new(),
             access_expires_at: None,
+            accounts: Vec::new(),
         }
     }
 }
@@ -171,6 +182,16 @@ impl KakaoConnectionStatus {
 pub struct OAuthStart {
     pub authorize_url: String,
     pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OAuthCompletion {
+    pub account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KakaoUserMeResponse {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +289,7 @@ impl<'a> KakaoFriendShareService<'a> {
         let (authorize_url, _) = client
             .authorize_url(|| CsrfToken::new(state))
             .add_scope(Scope::new(KAKAO_SCOPE_VALUE.to_string()))
+            .add_extra_param("prompt", "select_account")
             .url();
         Ok(OAuthStart {
             authorize_url: authorize_url.to_string(),
@@ -275,7 +297,11 @@ impl<'a> KakaoFriendShareService<'a> {
         })
     }
 
-    pub async fn complete_oauth(&self, state: &str, code: &str) -> Result<(), KakaoError> {
+    pub async fn complete_oauth(
+        &self,
+        state: &str,
+        code: &str,
+    ) -> Result<OAuthCompletion, KakaoError> {
         if state.is_empty() || code.is_empty() || state.len() > 256 || code.len() > 2_048 {
             return Err(KakaoError::InvalidOAuthRequest);
         }
@@ -296,9 +322,16 @@ impl<'a> KakaoFriendShareService<'a> {
                 .refresh_token()
                 .map(|value| value.secret().to_string()),
         };
+        let subject_hash = self.subject_hash(&tokens.access_token).await?;
+        let account_key = match find_account_by_subject_hash(self.pool, &subject_hash).await? {
+            Some(account) => account.account_key,
+            None => self.legacy_primary_key_for_subject(&subject_hash).await,
+        };
         upsert_account(
             self.pool,
             &TokenVault::from_env()?,
+            &account_key,
+            Some(&subject_hash),
             AccountTokenUpdate {
                 tokens: &tokens,
                 scopes: &scopes,
@@ -313,10 +346,12 @@ impl<'a> KakaoFriendShareService<'a> {
         )
         .await?;
         if !has_required_scopes {
-            set_account_status(self.pool, "consent_incomplete").await?;
+            set_account_status(self.pool, &account_key, "consent_incomplete").await?;
             return Err(KakaoError::ConsentIncomplete);
         }
-        Ok(())
+        Ok(OAuthCompletion {
+            account_id: account_key,
+        })
     }
 
     pub async fn consume_denied_oauth(&self, state: &str) -> Result<(), KakaoError> {
@@ -326,16 +361,29 @@ impl<'a> KakaoFriendShareService<'a> {
         Ok(())
     }
 
-    pub async fn disconnect(&self) -> Result<(), KakaoError> {
-        delete_connection(self.pool).await?;
-        Ok(())
+    pub async fn disconnect(&self, account_key: &str) -> Result<bool, KakaoError> {
+        validate_account_key(account_key)?;
+        if account_has_active_delivery_references(self.pool, account_key).await? {
+            return Err(KakaoError::AccountInUse);
+        }
+        Ok(delete_account(self.pool, account_key).await?)
     }
 
-    pub async fn list_friends(&self, offset: u32, limit: u32) -> Result<FriendsPage, KakaoError> {
+    pub async fn accounts(&self) -> Result<Vec<OAuthAccountSummary>, KakaoError> {
+        Ok(list_accounts(self.pool).await?)
+    }
+
+    pub async fn list_friends(
+        &self,
+        account_key: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<FriendsPage, KakaoError> {
+        validate_account_key(account_key)?;
         if !(1..=100).contains(&limit) {
             return Err(KakaoError::Validation("limit must be between 1 and 100"));
         }
-        let access_token = self.access_token().await?;
+        let access_token = self.access_token(account_key).await?;
         let response = http_client()?
             .get(FRIENDS_URL)
             .bearer_auth(&access_token)
@@ -344,11 +392,11 @@ impl<'a> KakaoFriendShareService<'a> {
             .await
             .map_err(|_| KakaoError::Provider)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            set_account_status(self.pool, "reauth_required").await?;
+            set_account_status(self.pool, account_key, "reauth_required").await?;
             return Err(KakaoError::ReauthorizationRequired);
         }
         if response.status() == reqwest::StatusCode::FORBIDDEN {
-            set_account_status(self.pool, "consent_incomplete").await?;
+            set_account_status(self.pool, account_key, "consent_incomplete").await?;
             return Err(KakaoError::ConsentIncomplete);
         }
         if !response.status().is_success() {
@@ -363,7 +411,6 @@ impl<'a> KakaoFriendShareService<'a> {
         let friends = payload
             .elements
             .into_iter()
-            .filter(|friend| friend.allowed_msg)
             .map(|friend| FriendView {
                 uuid: friend.uuid,
                 display_name: friend.profile_nickname,
@@ -383,6 +430,7 @@ impl<'a> KakaoFriendShareService<'a> {
 
     pub async fn send_friend_message(
         &self,
+        account_key: &str,
         idempotency_key: &str,
         request: KakaoFriendShareCommand,
     ) -> Result<ShareOperationResult, KakaoError> {
@@ -390,7 +438,8 @@ impl<'a> KakaoFriendShareService<'a> {
         // Complete connection validation and any refresh before creating the
         // non-reclaiming send fence. A disconnected account therefore returns
         // a normal 409 and never consumes an idempotency key as `unknown`.
-        let access_token = self.access_token().await?;
+        validate_account_key(account_key)?;
+        let access_token = self.access_token(account_key).await?;
         let fingerprint = request_fingerprint(&request, &self.config.landing_url);
         let requested_count = request.receiver_uuids.len();
         match begin_operation(
@@ -398,7 +447,7 @@ impl<'a> KakaoFriendShareService<'a> {
             ExternalShareScope {
                 provider: KAKAO_PROVIDER,
                 channel_id: KAKAO_CONNECTOR_ID,
-                account_key: PRIMARY_ACCOUNT_KEY,
+                account_key,
             },
             idempotency_key,
             &fingerprint,
@@ -413,7 +462,7 @@ impl<'a> KakaoFriendShareService<'a> {
             }
             BeginShareOperation::Dispatch { operation_id } => {
                 let result = self
-                    .dispatch_once(&access_token, &request)
+                    .dispatch_once(account_key, &access_token, &request)
                     .await
                     .and_then(|payload| classify_send_response(&request.receiver_uuids, payload));
                 match result {
@@ -438,6 +487,7 @@ impl<'a> KakaoFriendShareService<'a> {
 
     pub async fn send_memo_message(
         &self,
+        account_key: &str,
         idempotency_key: &str,
         request: KakaoMemoSendCommand,
     ) -> Result<ShareOperationResult, KakaoError> {
@@ -445,14 +495,15 @@ impl<'a> KakaoFriendShareService<'a> {
         // A memo send only needs `talk_message`. In particular, an unavailable
         // friends-list entitlement must not prevent the operator's own-account
         // smoke test.
-        let access_token = self.memo_access_token().await?;
+        validate_account_key(account_key)?;
+        let access_token = self.memo_access_token(account_key).await?;
         let fingerprint = memo_request_fingerprint(&request, &self.config.landing_url);
         match begin_operation(
             self.pool,
             ExternalShareScope {
                 provider: KAKAO_PROVIDER,
                 channel_id: KAKAO_CONNECTOR_ID,
-                account_key: PRIMARY_ACCOUNT_KEY,
+                account_key,
             },
             idempotency_key,
             &fingerprint,
@@ -464,7 +515,9 @@ impl<'a> KakaoFriendShareService<'a> {
             BeginShareOperation::Replay(result) => Ok(result),
             BeginShareOperation::InProgress => Err(KakaoError::OperationInProgress),
             BeginShareOperation::Dispatch { operation_id } => {
-                let result = self.dispatch_memo_once(&access_token, &request).await;
+                let result = self
+                    .dispatch_memo_once(account_key, &access_token, &request)
+                    .await;
                 match result {
                     Ok((state, summary)) => {
                         match finish_operation(self.pool, operation_id, state, summary).await {
@@ -487,6 +540,7 @@ impl<'a> KakaoFriendShareService<'a> {
 
     async fn dispatch_once(
         &self,
+        account_key: &str,
         access_token: &str,
         request: &KakaoFriendShareCommand,
     ) -> Result<KakaoSendResponse, KakaoError> {
@@ -512,11 +566,11 @@ impl<'a> KakaoFriendShareService<'a> {
             .await
             .map_err(|_| KakaoError::AmbiguousProviderResult)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            set_account_status(self.pool, "reauth_required").await?;
+            set_account_status(self.pool, account_key, "reauth_required").await?;
             return Err(KakaoError::AmbiguousProviderResult);
         }
         if response.status() == reqwest::StatusCode::FORBIDDEN {
-            set_account_status(self.pool, "consent_incomplete").await?;
+            set_account_status(self.pool, account_key, "consent_incomplete").await?;
             return Err(KakaoError::AmbiguousProviderResult);
         }
         if response.status() != reqwest::StatusCode::OK {
@@ -529,6 +583,7 @@ impl<'a> KakaoFriendShareService<'a> {
 
     async fn dispatch_memo_once(
         &self,
+        account_key: &str,
         access_token: &str,
         request: &KakaoMemoSendCommand,
     ) -> Result<(ShareOperationState, SafeShareSummary), KakaoError> {
@@ -541,7 +596,7 @@ impl<'a> KakaoFriendShareService<'a> {
             .await
             .map_err(|_| KakaoError::AmbiguousProviderResult)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            set_account_status(self.pool, "reauth_required").await?;
+            set_account_status(self.pool, account_key, "reauth_required").await?;
             return Err(KakaoError::AmbiguousProviderResult);
         }
         if response.status() != reqwest::StatusCode::OK {
@@ -572,21 +627,24 @@ impl<'a> KakaoFriendShareService<'a> {
         }
     }
 
-    async fn access_token(&self) -> Result<String, KakaoError> {
-        self.access_token_for_scopes(&REQUIRED_SCOPES, false).await
+    async fn access_token(&self, account_key: &str) -> Result<String, KakaoError> {
+        self.access_token_for_scopes(account_key, &REQUIRED_SCOPES, false)
+            .await
     }
 
-    async fn memo_access_token(&self) -> Result<String, KakaoError> {
-        self.access_token_for_scopes(&["talk_message"], true).await
+    async fn memo_access_token(&self, account_key: &str) -> Result<String, KakaoError> {
+        self.access_token_for_scopes(account_key, &["talk_message"], true)
+            .await
     }
 
     async fn access_token_for_scopes(
         &self,
+        account_key: &str,
         required_scopes: &[&str],
         allows_consent_incomplete: bool,
     ) -> Result<String, KakaoError> {
         let vault = TokenVault::from_env()?;
-        let account = load_account(self.pool)
+        let account = load_account(self.pool, account_key)
             .await?
             .ok_or(KakaoError::NotConnected)?;
         ensure_account_usable_for_scopes(&account, required_scopes, allows_consent_incomplete)?;
@@ -600,11 +658,11 @@ impl<'a> KakaoFriendShareService<'a> {
         let refresh_token = match tokens.refresh_token.as_deref() {
             Some(value) => value.to_string(),
             None => {
-                set_account_status(self.pool, "reauth_required").await?;
+                set_account_status(self.pool, account_key, "reauth_required").await?;
                 return Err(KakaoError::ReauthorizationRequired);
             }
         };
-        let lease_id = acquire_refresh_lease(self.pool).await?;
+        let lease_id = acquire_refresh_lease(self.pool, account_key).await?;
         let refreshed = oauth_client(self.config)?
             .exchange_refresh_token(&RefreshToken::new(refresh_token))
             .request_async(http_client()?)
@@ -612,7 +670,7 @@ impl<'a> KakaoFriendShareService<'a> {
         let refreshed = match refreshed {
             Ok(value) => value,
             Err(_) => {
-                fail_refresh(self.pool, lease_id).await?;
+                fail_refresh(self.pool, account_key, lease_id).await?;
                 return Err(KakaoError::ReauthorizationRequired);
             }
         };
@@ -631,6 +689,7 @@ impl<'a> KakaoFriendShareService<'a> {
         let completed = match complete_refresh(
             self.pool,
             &vault,
+            account_key,
             lease_id,
             AccountTokenUpdate {
                 tokens: &updated_tokens,
@@ -649,7 +708,7 @@ impl<'a> KakaoFriendShareService<'a> {
         {
             Ok(completed) => completed,
             Err(_) => {
-                let _ = fail_refresh(self.pool, lease_id).await;
+                let _ = fail_refresh(self.pool, account_key, lease_id).await;
                 return Err(KakaoError::ReauthorizationRequired);
             }
         };
@@ -657,10 +716,49 @@ impl<'a> KakaoFriendShareService<'a> {
             return Err(KakaoError::ReauthorizationRequired);
         }
         if !scopes_present(&scopes, required_scopes) {
-            set_account_status(self.pool, "consent_incomplete").await?;
+            set_account_status(self.pool, account_key, "consent_incomplete").await?;
             return Err(KakaoError::ConsentIncomplete);
         }
         Ok(updated_tokens.access_token.clone())
+    }
+
+    async fn subject_hash(&self, access_token: &str) -> Result<Vec<u8>, KakaoError> {
+        let response = http_client()?
+            .get(USER_ME_URL)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| KakaoError::OAuthExchange)?;
+        if !response.status().is_success() {
+            return Err(KakaoError::OAuthExchange);
+        }
+        let user = read_bounded_json::<KakaoUserMeResponse>(response, USER_ME_RESPONSE_MAX_BYTES)
+            .await
+            .map_err(|_| KakaoError::OAuthExchange)?;
+        Ok(sha256_bytes(format!("kakao:{}", user.id).as_bytes()))
+    }
+
+    async fn legacy_primary_key_for_subject(&self, subject_hash: &[u8]) -> String {
+        let Ok(Some(primary)) = load_account(self.pool, PRIMARY_ACCOUNT_KEY).await else {
+            return Uuid::new_v4().to_string();
+        };
+        if primary.subject_hash.is_some() {
+            return Uuid::new_v4().to_string();
+        }
+        // A legacy primary row predates subject hashing. Best-effort identity
+        // lookup keeps a same-account reconnect on primary without changing its
+        // legacy AAD. Failure is non-destructive: the new OAuth account is kept
+        // separately rather than risking a different account overwrite.
+        let Ok(access_token) = self
+            .access_token_for_scopes(PRIMARY_ACCOUNT_KEY, &[], true)
+            .await
+        else {
+            return Uuid::new_v4().to_string();
+        };
+        match self.subject_hash(&access_token).await {
+            Ok(primary_hash) if primary_hash == subject_hash => PRIMARY_ACCOUNT_KEY.to_string(),
+            _ => Uuid::new_v4().to_string(),
+        }
     }
 }
 
@@ -692,14 +790,14 @@ pub async fn connection_status(
             "database_unavailable",
         );
     };
-    let account = match load_account(pool).await {
-        Ok(Some(account)) => account,
-        Ok(None) => {
+    let accounts = match list_accounts(pool).await {
+        Ok(accounts) if accounts.is_empty() => {
             return KakaoConnectionStatus::simple(
                 KakaoConnectionState::NotConnected,
                 "not_connected",
             );
         }
+        Ok(accounts) => accounts,
         Err(_) => {
             return KakaoConnectionStatus::simple(
                 KakaoConnectionState::StorageUnavailable,
@@ -707,14 +805,30 @@ pub async fn connection_status(
             );
         }
     };
-    if account.decrypt_tokens(&vault).is_err() {
-        return KakaoConnectionStatus::simple(
-            KakaoConnectionState::InvalidConfig,
-            "token_decryption_failed",
-        );
+    let primary = accounts
+        .iter()
+        .find(|account| account.account_id == PRIMARY_ACCOUNT_KEY)
+        .or_else(|| accounts.first());
+    let Some(primary) = primary else {
+        return KakaoConnectionStatus::simple(KakaoConnectionState::NotConnected, "not_connected");
+    };
+    match load_account(pool, &primary.account_id).await {
+        Ok(Some(account)) if account.decrypt_tokens(&vault).is_ok() => {}
+        Ok(Some(_)) => {
+            return KakaoConnectionStatus::simple(
+                KakaoConnectionState::InvalidConfig,
+                "token_decryption_failed",
+            );
+        }
+        Ok(None) | Err(_) => {
+            return KakaoConnectionStatus::simple(
+                KakaoConnectionState::StorageUnavailable,
+                "database_unavailable",
+            );
+        }
     }
-    let state = match account.status.as_str() {
-        "active" if required_scopes_present(&account.scopes) => KakaoConnectionState::Connected,
+    let state = match primary.status.as_str() {
+        "active" if required_scopes_present(&primary.scopes) => KakaoConnectionState::Connected,
         "active" | "consent_incomplete" => KakaoConnectionState::ConsentIncomplete,
         "reauth_required" => KakaoConnectionState::ReauthorizationRequired,
         _ => KakaoConnectionState::InvalidConfig,
@@ -727,8 +841,9 @@ pub async fn connection_status(
             KakaoConnectionState::ReauthorizationRequired => Some("reauth_required"),
             _ => Some("invalid_account_state"),
         },
-        scopes: account.scopes,
-        access_expires_at: account.access_expires_at,
+        scopes: primary.scopes.clone(),
+        access_expires_at: primary.access_expires_at,
+        accounts,
     }
 }
 
@@ -830,6 +945,14 @@ fn ensure_account_usable_for_scopes(
         "active" | "consent_incomplete" => Err(KakaoError::ConsentIncomplete),
         "reauth_required" => Err(KakaoError::ReauthorizationRequired),
         _ => Err(KakaoError::NotConnected),
+    }
+}
+
+pub fn validate_account_key(account_key: &str) -> Result<(), KakaoError> {
+    if account_key == PRIMARY_ACCOUNT_KEY || Uuid::parse_str(account_key).is_ok() {
+        Ok(())
+    } else {
+        Err(KakaoError::InvalidAccount)
     }
 }
 
