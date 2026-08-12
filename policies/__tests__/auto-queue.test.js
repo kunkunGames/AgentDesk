@@ -772,12 +772,10 @@ test("auto-queue finalization sweep filters blocked runs before LIMIT", () => {
         result: [{ cnt: 0 }]
       },
       {
-        match: "SELECT COUNT(*) as cnt FROM auto_queue_entries WHERE run_id = ? AND status IN ('pending', 'dispatched')",
-        result: [{ cnt: 0 }]
-      },
-      {
-        match: "SELECT COUNT(*) as cnt FROM auto_queue_entries WHERE run_id = ? AND status = 'user_cancelled'",
-        result: [{ cnt: 0 }]
+        match(sql) {
+          return sql.includes("EXISTS(SELECT 1 FROM auto_queue_entries WHERE run_id = ? AND status IN ('pending', 'dispatched'))");
+        },
+        result: [{ has_runnable: 0, has_cancelled: 0 }]
       },
       {
         match: "SELECT phase_gate_grace_until FROM auto_queue_runs WHERE id = ?",
