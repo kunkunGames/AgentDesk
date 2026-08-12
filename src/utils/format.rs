@@ -94,6 +94,18 @@ pub fn tail_with_ellipsis_bytes(text: &str, max_bytes: usize) -> String {
     format!("{ELLIPSIS}{suffix}")
 }
 
+/// `~` 또는 `~/...` 경로를 홈 디렉토리로 확장하여 문자열로 반환한다.
+/// 확장할 필요가 없는 경우 원본 문자열을 그대로 반환하여 불필요한 할당 및
+/// `to_string_lossy`로 인한 경로 변형을 방지한다.
+pub fn expand_tilde_string(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
 /// `~` 또는 `~/...` 경로를 홈 디렉토리로 확장한다.
 /// `~user/...` 형태는 확장하지 않고 그대로 반환한다.
 pub fn expand_tilde_path(path: &str) -> std::path::PathBuf {
