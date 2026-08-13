@@ -33,3 +33,27 @@ Error: connect ECONNREFUSED 127.0.0.1:8791
 11:53:48 PM [vite] http proxy error: /api/offices
 Error: connect ECONNREFUSED 127.0.0.1:8791
     at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:40 AM [vite] http proxy error: /api/auth/session
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:40 AM [vite] ws proxy error:
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:40 AM [vite] ws proxy error:
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:41 AM [vite] http proxy error: /api/auth/session
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:41 AM [vite] ws proxy error:
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:42 AM [vite] http proxy error: /api/auth/session
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:42 AM [vite] http proxy error: /api/offices
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
+12:32:42 AM [vite] http proxy error: /api/offices
+Error: connect ECONNREFUSED 127.0.0.1:8791
+    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1637:16)
