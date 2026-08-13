@@ -480,6 +480,14 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
         self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
 
+    def test_nested_scratch_files_are_not_flagged(self):
+        self.assertFalse(is_scratch_file_path("tests/test.py"))
+        self.assertFalse(is_scratch_file_path("src/test.sh"))
+        self.assertFalse(is_scratch_file_path("migrations/test.sql"))
+        self.assertFalse(is_scratch_file_path("scripts/test.js"))
+        self.assertFalse(is_scratch_file_path("test/verify.sh"))
+        self.assertFalse(is_scratch_file_path("tests/sql_test.rs"))
+
 
 class PrAnalyzerGeneratedInventoryPathTests(unittest.TestCase):
     def test_generated_inventory_docs_are_flagged(self):
