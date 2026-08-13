@@ -476,6 +476,19 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
         self.assertTrue(is_scratch_file_path("patch.diff"))
         self.assertTrue(is_scratch_file_path("changes.patch"))
 
+    def test_global_scratch_files_flagged_everywhere(self):
+        self.assertTrue(is_scratch_file_path("tests/pr-body.md"))
+        self.assertTrue(is_scratch_file_path("nested/dir/plan.md"))
+        self.assertTrue(is_scratch_file_path("src/prs.json"))
+        self.assertTrue(is_scratch_file_path("docs/patch.diff"))
+
+    def test_root_only_scratch_files_permitted_in_nested_dirs(self):
+        self.assertFalse(is_scratch_file_path("tests/test.py"))
+        self.assertFalse(is_scratch_file_path("scripts/test.sh"))
+        self.assertFalse(is_scratch_file_path("src/sql_test.rs"))
+        self.assertFalse(is_scratch_file_path("tests/test_script.py"))
+        self.assertFalse(is_scratch_file_path("src/verify.sh"))
+
     def test_checked_in_scripts_and_migrations_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
         self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
