@@ -457,6 +457,13 @@ Update analyzer hygiene checks to match the current template.
 
 
 class PrAnalyzerScratchPathTests(unittest.TestCase):
+    def test_nested_scratch_files_are_flagged_but_tests_are_exempt(self):
+        self.assertTrue(is_scratch_file_path("nested/plan.md"))
+        self.assertTrue(is_scratch_file_path("nested/scratchpad.json"))
+        self.assertFalse(is_scratch_file_path("nested/test.py"))
+        self.assertFalse(is_scratch_file_path("tests/test_cli.rs"))
+        self.assertFalse(is_scratch_file_path("nested/test_scratch.py"))
+
     def test_root_scratch_files_are_flagged(self):
         self.assertTrue(is_scratch_file_path("pr-body.md"))
         self.assertTrue(is_scratch_file_path("test.sh"))
