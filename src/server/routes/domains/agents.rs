@@ -46,8 +46,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/agents/{id}/turn/stop", post(agents::stop_agent_turn))
             .route("/agents/{id}/transcripts", get(agents::agent_transcripts))
             .route("/agents/{id}/timeline", get(agents::agent_timeline))
-            .route("/sessions", get(agents_crud::list_sessions))
-            .route("/policies", get(agents_crud::list_policies))
             // #1066 /api/memory dual-mode (memento-or-local)
             .route("/memory/recall", post(memory_api::memory_recall))
             .route("/memory/remember", post(memory_api::memory_remember))
