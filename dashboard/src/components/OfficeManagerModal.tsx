@@ -346,7 +346,7 @@ export default function OfficeManagerModal({
                           key={ic}
                           type="button"
                           role="radio"
-                          aria-label={tr(`아이콘 ${ic}`, `Icon ${ic}`)}
+                          aria-label={draft.icon === ic ? tr(`선택된 아이콘: ${ic}`, `Selected icon: ${ic}`) : tr(`아이콘 ${ic}`, `Icon ${ic}`)}
                           aria-checked={draft.icon === ic}
                           tabIndex={draft.icon === ic || (!OFFICE_ICONS.includes(draft.icon) && idx === 0) ? 0 : -1}
                           onKeyDown={(e) => {
@@ -402,7 +402,7 @@ export default function OfficeManagerModal({
                           key={c}
                           type="button"
                           role="radio"
-                          aria-label={tr(`색상 ${c}`, `Color ${c}`)}
+                          aria-label={draft.color === c ? tr(`선택된 색상: ${c}`, `Selected color: ${c}`) : tr(`색상 ${c}`, `Color ${c}`)}
                           aria-checked={draft.color === c}
                           tabIndex={draft.color === c || (!OFFICE_COLORS.includes(draft.color) && idx === 0) ? 0 : -1}
                           onKeyDown={(e) => {

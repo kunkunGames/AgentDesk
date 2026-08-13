@@ -72,7 +72,7 @@ describe("Office manager icon picker accessibility", () => {
       />,
     );
 
-    const selectedIcon = queryIconButton(target, "Icon 🎮");
+    const selectedIcon = queryIconButton(target, "Selected icon: 🎮");
     expect(selectedIcon.getAttribute("type")).toBe("button");
     expect(selectedIcon.getAttribute("role")).toBe("radio");
     expect(selectedIcon.getAttribute("aria-checked")).toBe("true");
@@ -103,7 +103,7 @@ describe("Office manager icon picker accessibility", () => {
       addButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    const defaultIcon = queryIconButton(target, "아이콘 🏢");
+    const defaultIcon = queryIconButton(target, "선택된 아이콘: 🏢");
     expect(defaultIcon.getAttribute("type")).toBe("button");
     expect(defaultIcon.getAttribute("role")).toBe("radio");
     expect(defaultIcon.getAttribute("aria-checked")).toBe("true");
