@@ -49,6 +49,7 @@ impl fmt::Debug for ScheduledProviderTargetsBody {
 #[derive(Deserialize, Zeroize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduledKakaoFriendShareTargetBody {
+    pub account_id: String,
     pub receiver_uuids: Vec<String>,
     #[serde(default)]
     pub confirmed: bool,
@@ -93,14 +94,44 @@ pub(super) fn prepare_provider_targets(
             "OAuth token encryption key is required for scheduled provider targets",
         )
     })?;
-    encrypt_kakao_provider_target(&vault, target.receiver_uuids.clone())
-        .map(Some)
-        .map_err(|_| {
-            app_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to encrypt scheduled provider targets",
-            )
-        })
+    crate::services::kakao::validate_account_key(&target.account_id).map_err(|_| {
+        app_error(
+            StatusCode::BAD_REQUEST,
+            "providerTargets.kakaoFriendShare.accountId is invalid",
+        )
+    })?;
+    encrypt_kakao_provider_target(
+        &vault,
+        target.account_id.clone(),
+        target.receiver_uuids.clone(),
+    )
+    .map(Some)
+    .map_err(|_| {
+        app_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to encrypt scheduled provider targets",
+        )
+    })
+}
+
+pub(super) async fn ensure_provider_target_account_connected(
+    pool: &PgPool,
+    plan: Option<&EncryptedExternalDeliveryPlan>,
+) -> Result<(), AppError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    match crate::services::oauth_connection::load_account(pool, &plan.account_key).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "providerTargets.kakaoFriendShare.accountId is not connected",
+        )),
+        Err(error) => Err(app_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("load Kakao provider-target account: {error}"),
+        )),
+    }
 }
 
 pub(super) fn patch_provider_targets(
@@ -196,6 +227,7 @@ mod tests {
     fn targets(confirmed: bool, recipients: &[&str]) -> ScheduledProviderTargetsBody {
         ScheduledProviderTargetsBody {
             kakao_friend_share: ScheduledKakaoFriendShareTargetBody {
+                account_id: "primary".to_string(),
                 receiver_uuids: recipients
                     .iter()
                     .map(|recipient| (*recipient).to_string())

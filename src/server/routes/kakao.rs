@@ -13,10 +13,10 @@ use super::AppState;
 use crate::error::{AppError, ErrorCode};
 use crate::services::external_share::ExternalShareError;
 use crate::services::kakao::{
-    FriendsPage, KAKAO_CONNECTOR_ID, KakaoError, KakaoFriendShareCommand, KakaoFriendShareService,
-    OAuthStart,
+    FriendsPage, KakaoError, KakaoFriendShareCommand, KakaoFriendShareService,
+    KakaoMemoSendCommand, OAuthStart,
 };
-use crate::services::oauth_connection::OAuthConnectionError;
+use crate::services::oauth_connection::{OAuthAccountSummary, OAuthConnectionError};
 
 const CALLBACK_OK: &str = "/settings?connector=kakao_friend_share&oauth=ok";
 
@@ -31,6 +31,7 @@ pub struct OAuthCallbackQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct FriendsQuery {
+    account_id: String,
     #[serde(default)]
     offset: u32,
     #[serde(default = "default_friend_limit")]
@@ -40,9 +41,30 @@ pub struct FriendsQuery {
 #[derive(Debug, Serialize)]
 pub struct DisconnectResponse {
     ok: bool,
-    connector_id: &'static str,
-    connection_state: &'static str,
+    account_id: String,
     remote_unlinked: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountsResponse {
+    accounts: Vec<OAuthAccountSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KakaoFriendMessageRequest {
+    account_id: String,
+    receiver_uuids: Vec<String>,
+    text: String,
+    #[serde(default)]
+    confirmed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KakaoMemoMessageRequest {
+    account_id: String,
+    text: String,
+    #[serde(default)]
+    confirmed: bool,
 }
 
 pub struct KakaoRouteError {
@@ -102,7 +124,7 @@ pub async fn oauth_callback(
         return callback_error("invalid_state");
     };
     match service.complete_oauth(callback_state, code).await {
-        Ok(()) => Redirect::to(CALLBACK_OK),
+        Ok(completion) => Redirect::to(&format!("{CALLBACK_OK}&account={}", completion.account_id)),
         Err(KakaoError::InvalidOAuthState) => callback_error("invalid_state"),
         Err(KakaoError::ConsentIncomplete) => callback_error("consent"),
         Err(KakaoError::OAuthExchange) => callback_error("token_exchange"),
@@ -121,18 +143,36 @@ pub async fn start_oauth(
         .map_err(|error| map_error(error, "kakao.oauth.start"))
 }
 
-/// DELETE /api/kakao/connection
+/// GET /api/kakao/accounts
+pub async fn list_accounts(
+    State(state): State<AppState>,
+) -> Result<Json<AccountsResponse>, KakaoRouteError> {
+    service(&state, "kakao.accounts.list")?
+        .accounts()
+        .await
+        .map(|accounts| Json(AccountsResponse { accounts }))
+        .map_err(|error| map_error(error, "kakao.accounts.list"))
+}
+
+/// DELETE /api/kakao/accounts/{account_id}
 pub async fn disconnect(
     State(state): State<AppState>,
+    axum::extract::Path(account_id): axum::extract::Path<String>,
 ) -> Result<Json<DisconnectResponse>, KakaoRouteError> {
-    service(&state, "kakao.connection.disconnect")?
-        .disconnect()
+    let deleted = service(&state, "kakao.connection.disconnect")?
+        .disconnect(&account_id)
         .await
         .map_err(|error| map_error(error, "kakao.connection.disconnect"))?;
+    if !deleted {
+        return Err(KakaoRouteError {
+            error: AppError::not_found("Kakao account is not connected")
+                .with_operation("kakao.connection.disconnect"),
+            retry_after_seconds: None,
+        });
+    }
     Ok(Json(DisconnectResponse {
         ok: true,
-        connector_id: KAKAO_CONNECTOR_ID,
-        connection_state: "disconnected",
+        account_id,
         remote_unlinked: false,
     }))
 }
@@ -143,7 +183,7 @@ pub async fn list_friends(
     Query(query): Query<FriendsQuery>,
 ) -> Result<Json<FriendsPage>, KakaoRouteError> {
     service(&state, "kakao.friends.list")?
-        .list_friends(query.offset, query.limit)
+        .list_friends(&query.account_id, query.offset, query.limit)
         .await
         .map(Json)
         .map_err(|error| map_error(error, "kakao.friends.list"))
@@ -153,7 +193,7 @@ pub async fn list_friends(
 pub async fn send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Result<Json<KakaoFriendShareCommand>, JsonRejection>,
+    body: Result<Json<KakaoFriendMessageRequest>, JsonRejection>,
 ) -> Result<Json<crate::services::external_share::ShareOperationResult>, KakaoRouteError> {
     let operation = "kakao.messages.send";
     let Json(body) =
@@ -164,8 +204,41 @@ pub async fn send_message(
         .ok_or_else(|| {
             KakaoRouteError::validation("Idempotency-Key header is required", operation)
         })?;
+    let account_id = body.account_id.clone();
+    let command = KakaoFriendShareCommand {
+        receiver_uuids: body.receiver_uuids,
+        text: body.text,
+        confirmed: body.confirmed,
+    };
     service(&state, operation)?
-        .send_friend_message(idempotency_key, body)
+        .send_friend_message(&account_id, idempotency_key, command)
+        .await
+        .map(Json)
+        .map_err(|error| map_error(error, operation))
+}
+
+/// POST /api/kakao/messages/send-to-me
+pub async fn send_memo_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<KakaoMemoMessageRequest>, JsonRejection>,
+) -> Result<Json<crate::services::external_share::ShareOperationResult>, KakaoRouteError> {
+    let operation = "kakao.messages.send_to_me";
+    let Json(body) =
+        body.map_err(|_| KakaoRouteError::validation("invalid JSON body", operation))?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            KakaoRouteError::validation("Idempotency-Key header is required", operation)
+        })?;
+    let account_id = body.account_id.clone();
+    let command = KakaoMemoSendCommand {
+        text: body.text,
+        confirmed: body.confirmed,
+    };
+    service(&state, operation)?
+        .send_memo_message(&account_id, idempotency_key, command)
         .await
         .map(Json)
         .map_err(|error| map_error(error, operation))
@@ -203,6 +276,14 @@ fn map_error(error: KakaoError, operation: &'static str) -> KakaoRouteError {
         ),
         KakaoError::NotConnected => (
             AppError::conflict("Kakao connection is not established"),
+            None,
+        ),
+        KakaoError::InvalidAccount => (
+            AppError::bad_request("Kakao account selection is invalid"),
+            None,
+        ),
+        KakaoError::AccountInUse => (
+            AppError::conflict("Kakao account is referenced by scheduled delivery"),
             None,
         ),
         KakaoError::ConsentIncomplete => (AppError::conflict("Kakao consent is incomplete"), None),
@@ -272,6 +353,7 @@ fn map_error(error: KakaoError, operation: &'static str) -> KakaoRouteError {
         ),
         KakaoError::Connection(OAuthConnectionError::Encrypt)
         | KakaoError::Connection(OAuthConnectionError::InvalidTokenPayload)
+        | KakaoError::Connection(OAuthConnectionError::AccountIdentityConflict)
         | KakaoError::ExternalShare(ExternalShareError::CorruptOperation) => (
             AppError::internal("Kakao integration encountered an internal error"),
             None,

@@ -555,6 +555,11 @@
       "path": "migrations/postgres/0108_scheduled_external_share_outbox.sql",
       "sha256": "13521e19395ef0832b0c14ec1d9b62221a60f79b79bf6a7bc617204768a51305",
       "version": 108
+    },
+    {
+      "path": "migrations/postgres/0109_kakao_multi_accounts.sql",
+      "sha256": "f8add07539a9698760361c90b043259d782148b095b98b6d11515056ee7f71cd",
+      "version": 109
     }
   ],
   "version": 1

@@ -28,7 +28,7 @@ external_evidence_status: "official-contracts-verified-live-account-pending"
 
 v1이 제공하는 기능은 다음 한 문장으로 고정한다.
 
-> **연결된 AgentDesk 운영자가 Settings에서 카카오톡 친구 1~5명을 선택해, 200자 이하의 텍스트와 고정된 AgentDesk 랜딩 링크를 확인 후 한 번 전송한다.**
+> **연결된 AgentDesk 운영자가 Settings에서 카카오톡 친구 1~5명을 선택하거나 자신의 나와의 채팅방을 대상으로, 200자 이하의 텍스트와 고정된 AgentDesk 랜딩 링크를 확인 후 한 번 전송한다.**
 
 v1은 AgentDesk 결과나 카드를 외부에 공개하지 않는다. 고정 랜딩 링크는 특정 결과를 가리키지 않으며, 수신자에게 사설 AgentDesk 데이터 접근 권한을 부여하지 않는다.
 
@@ -40,6 +40,7 @@ v1은 AgentDesk 결과나 카드를 외부에 공개하지 않는다. 고정 랜
 | 콘텐츠 | 텍스트 + 서버 고정 랜딩 링크 | 공개 artifact·권한·만료 링크 범위를 분리 |
 | 전송 보장 | 영속 `external_share_operations` fence 기반 at-most-once | Kakao POST가 비멱등이어도 crash 후 자동 재전송하지 않음 |
 | 예약 fan-out | 명시적으로 확인된 `push` 예약만 Discord + Kakao 동시 handoff | 기존 fire-slot/Discord outbox를 재사용하고 provider별 최종 전달·재시도 상태는 분리 |
+| 나에게 테스트 발송 | 연결한 운영자 본인의 카카오톡 나와의 채팅방 | 친구 목록 권한 없이 `talk_message` 동의와 명시 확인만으로 OAuth·템플릿을 검증 |
 | 기존 idempotency | fingerprint helper만 재사용 가능; claim/TTL 재claim은 사용 금지 | 현재 계약은 replay-safe mutation 전용 |
 | 기존 delivery journal | 개념만 참고; 테이블·writer 재사용 금지 | `0105_delivery_journal`은 Discord 전용 hot surface와 제약을 가짐. 예약 fan-out은 별도 `external_share_outbox`를 사용 |
 | connector | 기존 Settings connector 표면을 DB-aware로 확장 | 새 Integrations 탭 없이 상태 원천을 하나로 유지 |
@@ -137,7 +138,6 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 결과별 공개 링크 저장소
 - 범용 채널 registry와 동적 plugin 계약
 - 메시지 템플릿 DSL
-- 다중 Kakao account UI
 - 장기 감사/분석 이벤트 파이프라인
 - Discord transport/retry 또는 delivery journal 변경 (`message_outbox` enqueue 계약은 그대로 재사용)
 - 친구 thumbnail proxy/cache
@@ -154,6 +154,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 4. 1~200자 텍스트 편집
 5. 고정 랜딩 링크를 포함한 미리보기
 6. 명시적 확인 후 단 한 번의 provider POST
+7. 친구 목록 권한이 없는 초기 검증에는 동일한 텍스트를 운영자 자신의 나와의 채팅방으로 한 번 발송
 7. `success`, `partial_success`, `failed`, `unknown` 결과
 8. 동일 `Idempotency-Key` replay와 payload mismatch 방지
 9. 다중 노드에서 동일 operation 중복 POST 방지
@@ -168,7 +169,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - 알림톡, 전화번호 발송, 전체 친구 발송
 - feed/list/commerce 등 추가 Kakao 템플릿
 - 친구 검색 인덱스, 즐겨찾기 동기화, thumbnail 저장
-- Kakao 계정 여러 개 연결
+- Kakao 계정 별칭·profile nickname 저장(다중 계정 연결/선택 자체는 지원)
 - 원격 Kakao unlink; v1 disconnect는 AgentDesk 로컬 자격증명 삭제
 - 두 번째 외부 채널
 - `ExternalShareChannel` trait/registry

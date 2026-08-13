@@ -52,7 +52,7 @@ const DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, de
      context_strategy, context_snapshot_id, \
      on_context_failure, external_delivery_plan_id, external_delivery_plan_ciphertext, \
      external_delivery_plan_nonce, external_delivery_plan_key_version, \
-     external_delivery_summary, external_delivery_plan_scrubbed_at, created_at, updated_at";
+     external_delivery_summary, external_delivery_account_key, external_delivery_plan_scrubbed_at, created_at, updated_at";
 
 // The list endpoint only exposes attachment metadata. Do not select image_data
 // there: a valid page can otherwise retain up to 1.6 GiB of decoded blobs.
@@ -66,7 +66,7 @@ const LIST_DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bo
      NULL::BYTEA AS external_delivery_plan_ciphertext, \
      NULL::BYTEA AS external_delivery_plan_nonce, \
      NULL::SMALLINT AS external_delivery_plan_key_version, \
-     external_delivery_summary, external_delivery_plan_scrubbed_at, created_at, updated_at";
+     external_delivery_summary, external_delivery_account_key, external_delivery_plan_scrubbed_at, created_at, updated_at";
 
 pub const CONTEXT_STRATEGY_FRESH: &str = "fresh";
 pub const CONTEXT_STRATEGY_SNAPSHOT: &str = "snapshot";
@@ -117,6 +117,7 @@ pub struct ScheduledMessageRow {
     pub external_delivery_plan_nonce: Option<Vec<u8>>,
     pub external_delivery_plan_key_version: Option<i16>,
     pub external_delivery_summary: Option<JsonValue>,
+    pub external_delivery_account_key: Option<String>,
     pub external_delivery_plan_scrubbed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -151,6 +152,7 @@ impl ScheduledMessageRow {
             "contextSnapshotId": self.context_snapshot_id,
             "onContextFailure": self.on_context_failure,
             "providerTargets": self.external_delivery_summary.clone().unwrap_or_else(|| json!({})),
+            "providerTargetAccountId": self.external_delivery_account_key,
             "createdAt": self.created_at.to_rfc3339(),
             "updatedAt": self.updated_at.to_rfc3339(),
         })
@@ -194,6 +196,7 @@ pub struct EncryptedExternalDeliveryPlan {
     pub nonce: Vec<u8>,
     pub key_version: i16,
     pub summary: JsonValue,
+    pub account_key: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -489,6 +492,9 @@ pub async fn update_scheduled_message_pg(
         builder
             .push(", external_delivery_summary = ")
             .push_bind(plan.as_ref().map(|plan| &plan.summary));
+        builder
+            .push(", external_delivery_account_key = ")
+            .push_bind(plan.as_ref().map(|plan| &plan.account_key));
         builder.push(", external_delivery_plan_scrubbed_at = NULL");
     }
     builder

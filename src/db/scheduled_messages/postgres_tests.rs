@@ -11,7 +11,22 @@ async fn create_test_pool(
 ) {
     let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(prefix, label).await;
     let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
+    seed_kakao_account(&pool).await;
     (pg_db, pool)
+}
+
+async fn seed_kakao_account(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO oauth_connection_accounts
+            (provider, account_key, token_ciphertext, token_nonce, scopes, status)
+         VALUES ('kakao', 'primary', $1, $2, ARRAY['friends', 'talk_message'], 'active')
+         ON CONFLICT (provider, account_key) DO NOTHING",
+    )
+    .bind(b"encrypted-test-token".as_slice())
+    .bind(vec![7_u8; 24])
+    .execute(pool)
+    .await
+    .expect("seed Kakao account reference");
 }
 
 async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMessageRow {
@@ -169,6 +184,7 @@ async fn postgres_scheduled_provider_plan_is_hidden_from_lists_and_scrubbed_on_t
                         "imageForwarded": false
                     }
                 }),
+                account_key: "primary".to_string(),
             }),
             context_strategy: "fresh".to_string(),
             context_snapshot_id: None,

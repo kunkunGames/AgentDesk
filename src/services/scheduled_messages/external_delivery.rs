@@ -20,7 +20,7 @@ use crate::services::oauth_connection::{
     EncryptedValue, KAKAO_PROVIDER, OAuthConnectionError, PRIMARY_ACCOUNT_KEY, TokenVault,
 };
 
-const PLAN_SCHEMA_VERSION: u8 = 1;
+const PLAN_SCHEMA_VERSION: u8 = 2;
 const PLAN_AAD_DOMAIN: &str = "agentdesk/scheduled-message/provider-targets/v1";
 const OUTBOX_AAD_DOMAIN: &str = "agentdesk/external-share-outbox/payload/v1";
 pub(crate) const KAKAO_CHANNEL_ID: &str = "kakao_friend_share";
@@ -47,19 +47,27 @@ struct StoredProviderTargets {
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredKakaoFriendShare {
     receiver_uuids: Vec<String>,
+    #[serde(default = "legacy_primary_account_key")]
+    account_key: String,
 }
 
 pub fn encrypt_kakao_provider_target(
     vault: &TokenVault,
+    account_key: String,
     receiver_uuids: Vec<String>,
 ) -> Result<EncryptedExternalDeliveryPlan, ExternalDeliveryPlanError> {
+    crate::services::kakao::validate_account_key(&account_key)
+        .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
     validate_friend_share_recipients(&receiver_uuids)
         .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
 
     let plan_id = Uuid::new_v4();
     let plan = StoredProviderTargets {
         schema_version: PLAN_SCHEMA_VERSION,
-        kakao_friend_share: StoredKakaoFriendShare { receiver_uuids },
+        kakao_friend_share: StoredKakaoFriendShare {
+            receiver_uuids,
+            account_key,
+        },
     };
     let mut plaintext = Zeroizing::new(
         serde_json::to_vec(&plan).map_err(|_| ExternalDeliveryPlanError::InvalidPayload)?,
@@ -80,6 +88,7 @@ pub fn encrypt_kakao_provider_target(
                 "imageForwarded": false
             }
         }),
+        account_key: plan.kakao_friend_share.account_key.clone(),
     })
 }
 
@@ -108,7 +117,11 @@ pub(crate) fn prepare_external_share_outbox(
     let plaintext = vault.open(&encrypted, plan_aad(plan_id).as_bytes())?;
     let stored: StoredProviderTargets = serde_json::from_slice(&plaintext)
         .map_err(|_| ExternalDeliveryPlanError::InvalidStoredPlan)?;
-    if stored.schema_version != PLAN_SCHEMA_VERSION {
+    if !(1..=PLAN_SCHEMA_VERSION).contains(&stored.schema_version) {
+        return Err(ExternalDeliveryPlanError::InvalidStoredPlan);
+    }
+    let account_key = stored.kakao_friend_share.account_key.clone();
+    if message.external_delivery_account_key.as_deref() != Some(account_key.as_str()) {
         return Err(ExternalDeliveryPlanError::InvalidStoredPlan);
     }
 
@@ -133,7 +146,7 @@ pub(crate) fn prepare_external_share_outbox(
         id: outbox_id,
         provider: KAKAO_PROVIDER.to_string(),
         channel_id: KAKAO_CHANNEL_ID.to_string(),
-        account_key: PRIMARY_ACCOUNT_KEY.to_string(),
+        account_key,
         source: OUTBOX_SOURCE.to_string(),
         source_key: source_key.to_string(),
         scheduled_delivery_id: delivery_id.to_string(),
@@ -152,6 +165,10 @@ fn plan_aad(id: Uuid) -> String {
     format!("{PLAN_AAD_DOMAIN}:{id}")
 }
 
+fn legacy_primary_account_key() -> String {
+    PRIMARY_ACCOUNT_KEY.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +177,12 @@ mod tests {
     fn encrypted_plan_exposes_counts_but_not_recipient_identifiers() {
         let vault = TokenVault::for_test([7_u8; 32]);
         let recipient = "recipient-private-uuid".to_string();
-        let plan = encrypt_kakao_provider_target(&vault, vec![recipient.clone()]).unwrap();
+        let plan = encrypt_kakao_provider_target(
+            &vault,
+            PRIMARY_ACCOUNT_KEY.to_string(),
+            vec![recipient.clone()],
+        )
+        .unwrap();
 
         assert_eq!(plan.summary["kakaoFriendShare"]["recipientCount"], 1);
         assert!(!String::from_utf8_lossy(&plan.ciphertext).contains(&recipient));
@@ -180,7 +202,12 @@ mod tests {
     #[test]
     fn plan_ciphertext_is_bound_to_its_plan_id() {
         let vault = TokenVault::for_test([8_u8; 32]);
-        let plan = encrypt_kakao_provider_target(&vault, vec!["recipient-a".to_string()]).unwrap();
+        let plan = encrypt_kakao_provider_target(
+            &vault,
+            PRIMARY_ACCOUNT_KEY.to_string(),
+            vec!["recipient-a".to_string()],
+        )
+        .unwrap();
         let encrypted = EncryptedValue {
             ciphertext: plan.ciphertext,
             nonce: plan.nonce,

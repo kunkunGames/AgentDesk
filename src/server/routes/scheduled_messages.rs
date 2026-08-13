@@ -28,8 +28,9 @@ mod snapshot_capture;
 
 pub use provider_targets::ScheduledProviderTargetsBody;
 use provider_targets::{
-    ensure_external_delivery_rollout_ready, patch_provider_targets, prepare_provider_targets,
-    provider_delivery_intent_changed, validate_kakao_content_if_targeted,
+    ensure_external_delivery_rollout_ready, ensure_provider_target_account_connected,
+    patch_provider_targets, prepare_provider_targets, provider_delivery_intent_changed,
+    validate_kakao_content_if_targeted,
 };
 
 #[cfg(test)]
@@ -424,6 +425,7 @@ async fn validate_create(
         &delivery_kind,
         kakao_config,
     )?;
+    ensure_provider_target_account_connected(pool, external_delivery_plan.as_ref()).await?;
 
     Ok(NewScheduledMessage {
         content: content.to_string(),
@@ -954,6 +956,13 @@ async fn build_patch(
     let effective_content = patch.content.as_deref().unwrap_or(&existing.content);
     patch.external_delivery_plan =
         patch_provider_targets(body, effective_content, effective_kind, kakao_config)?;
+    if let Some(plan) = patch
+        .external_delivery_plan
+        .as_ref()
+        .and_then(Option::as_ref)
+    {
+        ensure_provider_target_account_connected(pool, Some(plan)).await?;
+    }
     if existing.external_delivery_plan_id.is_some()
         && patch.external_delivery_plan.is_none()
         && provider_delivery_intent_changed(

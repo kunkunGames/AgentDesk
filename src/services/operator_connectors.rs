@@ -30,6 +30,7 @@ pub struct OAuthConnectorConnection {
     pub scopes: Vec<String>,
     pub access_expires_at: Option<DateTime<Utc>>,
     pub landing_url: Option<String>,
+    pub accounts: Vec<crate::services::oauth_connection::OAuthAccountSummary>,
 }
 
 impl OptionalConnectorState {
@@ -313,16 +314,14 @@ async fn kakao_connector_status(
         KakaoConnectionState::NotConnected => {
             (OptionalConnectorState::MissingConfig, vec!["connect"])
         }
-        KakaoConnectionState::Connected => (
-            OptionalConnectorState::Ready,
-            vec!["reconnect", "disconnect", "test_send"],
-        ),
+        KakaoConnectionState::Connected => {
+            (OptionalConnectorState::Ready, vec!["connect", "test_send"])
+        }
         KakaoConnectionState::ConsentIncomplete
         | KakaoConnectionState::ReauthorizationRequired
-        | KakaoConnectionState::InvalidConfig => (
-            OptionalConnectorState::InvalidConfig,
-            vec!["reconnect", "disconnect"],
-        ),
+        | KakaoConnectionState::InvalidConfig => {
+            (OptionalConnectorState::InvalidConfig, vec!["connect"])
+        }
         KakaoConnectionState::StorageUnavailable => {
             (OptionalConnectorState::MissingProvider, Vec::new())
         }
@@ -366,6 +365,7 @@ async fn kakao_connector_status(
             scopes: status.scopes,
             access_expires_at: status.access_expires_at,
             landing_url: Some(config.landing_url.clone()),
+            accounts: status.accounts,
         }),
         actions,
     }

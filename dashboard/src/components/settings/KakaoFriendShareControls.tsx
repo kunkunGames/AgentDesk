@@ -1,9 +1,10 @@
 import { Link2, Loader2, MessageSquareShare, Send, Unlink } from "lucide-react";
-import { useMemo, useState, type CSSProperties } from "react";
+import { useMemo, useRef, useState, type CSSProperties } from "react";
 import * as api from "../../api";
 import type {
   KakaoFriendView,
   KakaoFriendsPage,
+  KakaoAccountSummary,
   KakaoSendResult,
   OperatorConnectorStatus,
 } from "../../api";
@@ -21,8 +22,23 @@ export interface PendingSendIntent {
   fingerprint: string;
 }
 
-export function kakaoSendIntentFingerprint(receiverUuids: Iterable<string>, text: string): string {
-  return JSON.stringify({ receiver_uuids: [...receiverUuids].sort(), text });
+export function kakaoSendIntentFingerprint(accountId: string, receiverUuids: Iterable<string>, text: string): string {
+  return JSON.stringify({ account_id: accountId, receiver_uuids: [...receiverUuids].sort(), text });
+}
+
+export function kakaoMemoIntentFingerprint(accountId: string, text: string): string {
+  return JSON.stringify({ account_id: accountId, target: "self", text });
+}
+
+export function kakaoAccountCanSendToFriends(account: KakaoAccountSummary): boolean {
+  return account.status === "active"
+    && account.scopes.includes("friends")
+    && account.scopes.includes("talk_message");
+}
+
+export function kakaoAccountCanSendMemo(account: KakaoAccountSummary): boolean {
+  return (account.status === "active" || account.status === "consent_incomplete")
+    && account.scopes.includes("talk_message");
 }
 
 export function isAllowedKakaoAuthorizeUrl(target: URL): boolean {
@@ -66,16 +82,24 @@ export function KakaoFriendShareControls({
   const [pendingIntent, setPendingIntent] = useState<PendingSendIntent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<KakaoSendResult | null>(null);
+  const [accountId, setAccountId] = useState("");
+  const friendRequestVersion = useRef(0);
+  const accounts: KakaoAccountSummary[] = connector.connection?.accounts ?? [];
+  const selectedAccount = accounts.find((account) => account.account_id === accountId) ?? null;
 
   const actions = new Set(connector.actions ?? []);
   const canConnect = actions.has("connect") || actions.has("reconnect");
-  const canDisconnect = actions.has("disconnect");
-  const canTestSend = actions.has("test_send");
+  const canTestSend = accounts.some(kakaoAccountCanSendMemo);
+  const selectedCanSendToFriends = selectedAccount ? kakaoAccountCanSendToFriends(selectedAccount) : false;
+  const selectedCanSendMemo = selectedAccount ? kakaoAccountCanSendMemo(selectedAccount) : false;
   const charCount = Array.from(text).length;
-  const sendDisabled = sending || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
+  const sendDisabled = sending || !selectedCanSendToFriends || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
+  const memoSendDisabled = sending || !selectedCanSendMemo || text.trim().length === 0 || charCount > 200;
   const friends = useMemo(() => friendsPage?.friends ?? [], [friendsPage]);
-  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(selected, text), [selected, text]);
+  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(accountId, selected, text), [accountId, selected, text]);
+  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(accountId, text), [accountId, text]);
   const safelyReplaysCurrentIntent = pendingIntent?.fingerprint === currentFingerprint;
+  const safelyReplaysMemoIntent = pendingIntent?.fingerprint === memoFingerprint;
 
   const connect = async () => {
     setBusyAction("connect");
@@ -93,7 +117,7 @@ export function KakaoFriendShareControls({
     }
   };
 
-  const disconnect = async () => {
+  const disconnect = async (targetAccountId: string) => {
     const confirmed = window.confirm(
       tr(
         "AgentDesk에 저장된 카카오 연결을 해제할까요? 카카오 계정의 앱 동의는 원격으로 철회되지 않습니다.",
@@ -104,7 +128,7 @@ export function KakaoFriendShareControls({
     setBusyAction("disconnect");
     setError(null);
     try {
-      await api.disconnectKakao();
+      await api.disconnectKakao(targetAccountId);
       setComposerOpen(false);
       setFriendsPage(null);
       setSelected(new Set());
@@ -120,10 +144,14 @@ export function KakaoFriendShareControls({
   };
 
   const loadFriends = async (offset = 0, append = false) => {
+    if (!accountId || !selectedCanSendToFriends) return;
+    const requestVersion = ++friendRequestVersion.current;
+    const requestAccountId = accountId;
     setFriendsLoading(true);
     setError(null);
     try {
-      const page = await api.getKakaoFriends(offset, 20);
+      const page = await api.getKakaoFriends(requestAccountId, offset, 20);
+      if (requestVersion !== friendRequestVersion.current) return;
       if (!append) {
         setSelected(new Set());
         setResult(null);
@@ -135,9 +163,10 @@ export function KakaoFriendShareControls({
         return { ...page, friends: [...merged.values()] };
       });
     } catch {
+      if (requestVersion !== friendRequestVersion.current) return;
       setError(tr("메시지를 보낼 수 있는 친구 목록을 불러오지 못했습니다.", "Failed to load message-eligible friends."));
     } finally {
-      setFriendsLoading(false);
+      if (requestVersion === friendRequestVersion.current) setFriendsLoading(false);
     }
   };
 
@@ -147,13 +176,24 @@ export function KakaoFriendShareControls({
     setResult(null);
     setError(null);
     if (next) {
-      void loadFriends();
+      setAccountId("");
     } else {
       setFriendsPage(null);
       setSelected(new Set());
       setText("");
       setPendingIntent(null);
     }
+  };
+
+  const selectAccount = (nextAccountId: string) => {
+    friendRequestVersion.current += 1;
+    setFriendsLoading(false);
+    setAccountId(nextAccountId);
+    setFriendsPage(null);
+    setSelected(new Set());
+    setResult(null);
+    setDuplicateRiskPending(false);
+    setPendingIntent(null);
   };
 
   const toggleRecipient = (uuid: string) => {
@@ -204,6 +244,7 @@ export function KakaoFriendShareControls({
     try {
       const response = await api.sendKakaoFriendMessage(
         resolvedIntent.intent.idempotencyKey,
+        accountId,
         [...selected],
         text,
       );
@@ -217,6 +258,57 @@ export function KakaoFriendShareControls({
         tr(
           "요청 결과를 확인하지 못했습니다. 중복 가능성이 있으므로 같은 내용을 바로 다시 보내지 마세요.",
           "The request result could not be confirmed. Do not immediately resend because delivery may have occurred.",
+        ),
+      );
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendToMe = async () => {
+    if (memoSendDisabled) return;
+    if (duplicateRiskPending && !safelyReplaysMemoIntent) {
+      const acceptsDuplicateRisk = window.confirm(
+        tr(
+          "이전 요청은 이미 전달되었을 수 있습니다. 새 요청으로 다시 보내면 중복 메시지가 생길 수 있습니다. 계속할까요?",
+          "The previous request may already have delivered. Sending a new request can create a duplicate. Continue?",
+        ),
+      );
+      if (!acceptsDuplicateRisk) return;
+    }
+    const confirmed = window.confirm(
+      safelyReplaysMemoIntent
+        ? tr(
+          "같은 요청 키로 기존 나에게 보내기 결과를 다시 확인할까요? 새 전송은 시작하지 않습니다.",
+          "Check the existing self-send with the same request key? No new send will start.",
+        )
+        : tr(
+          "내 카카오톡 나와의 채팅방으로 지금 한 번 전송할까요? 자동 재전송은 하지 않습니다.",
+          "Send once to your Kakao My Chatroom? AgentDesk will not retry automatically.",
+        ),
+    );
+    if (!confirmed) return;
+    setSending(true);
+    setError(null);
+    setResult(null);
+    const resolvedIntent = resolveKakaoSendIntent(
+      pendingIntent,
+      memoFingerprint,
+      () => crypto.randomUUID(),
+    );
+    setPendingIntent(resolvedIntent.intent);
+    try {
+      const response = await api.sendKakaoMemoMessage(resolvedIntent.intent.idempotencyKey, accountId, text);
+      setResult(response);
+      const hasDuplicateRisk = response.status === "unknown" || response.status === "partial_success";
+      setDuplicateRiskPending(hasDuplicateRisk);
+      if (!hasDuplicateRisk) setPendingIntent(null);
+    } catch {
+      setDuplicateRiskPending(true);
+      setError(
+        tr(
+          "나에게 보내기 결과를 확인하지 못했습니다. 중복 가능성이 있으므로 같은 내용을 바로 다시 보내지 마세요.",
+          "The self-send result could not be confirmed. Do not immediately resend because delivery may have occurred.",
         ),
       );
     } finally {
@@ -249,18 +341,6 @@ export function KakaoFriendShareControls({
               : tr("다시 연결", "Reconnect")}
           </button>
         ) : null}
-        {canDisconnect ? (
-          <button
-            type="button"
-            className={secondaryActionClass}
-            style={secondaryActionStyle}
-            disabled={busyAction !== null}
-            onClick={() => void disconnect()}
-          >
-            {busyAction === "disconnect" ? <Loader2 size={13} className="animate-spin" /> : <Unlink size={13} />}
-            {tr("로컬 연결 해제", "Disconnect locally")}
-          </button>
-        ) : null}
         {canTestSend ? (
           <button
             type="button"
@@ -280,18 +360,42 @@ export function KakaoFriendShareControls({
         </div>
       ) : null}
 
+      {accounts.length > 0 ? (
+        <div className="mt-3 space-y-2" data-testid="kakao-account-list">
+          {accounts.map((account) => (
+            <div key={account.account_id} className="flex items-center justify-between rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "var(--th-border)", color: "var(--th-text)" }}>
+              <span>{tr("카카오 계정", "Kakao account")} · {account.is_legacy ? "primary" : account.account_id.slice(0, 8)} · {account.status}</span>
+              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={busyAction !== null} onClick={() => void disconnect(account.account_id)} aria-label={tr("계정 연결 해제", "Disconnect account")}>
+                {busyAction === "disconnect" ? <Loader2 size={13} className="animate-spin" /> : <Unlink size={13} />} ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {composerOpen ? (
         <div className="mt-4 space-y-4" data-testid="kakao-friend-share-composer">
+          <label className="block">
+            <div className="mb-2 text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("발신 카카오 계정", "Sender Kakao account")}</div>
+            <select value={accountId} onChange={(event) => selectAccount(event.target.value)} className="w-full rounded-xl border px-3 py-2 text-sm" style={{ borderColor: "var(--th-border)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}>
+              <option value="">{tr("계정을 선택하세요", "Select an account")}</option>
+              {accounts.filter(kakaoAccountCanSendMemo).map((account) => <option key={account.account_id} value={account.account_id}>{account.is_legacy ? "primary" : account.account_id.slice(0, 8)}{kakaoAccountCanSendToFriends(account) ? "" : tr(" (나에게 보내기 전용)", " (self-send only)")}</option>)}
+            </select>
+          </label>
           <div>
             <div className="mb-2 flex items-center justify-between text-xs" style={{ color: "var(--th-text-muted)" }}>
               <span>{tr(`수신자 ${selected.size}/5`, `Recipients ${selected.size}/5`)}</span>
-              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={friendsLoading} onClick={() => void loadFriends()}>
+              <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={friendsLoading || !selectedCanSendToFriends} onClick={() => void loadFriends()}>
                 {friendsLoading ? <Loader2 size={12} className="animate-spin" /> : null}
                 {tr("새로고침", "Refresh")}
               </button>
             </div>
             <div className="max-h-52 space-y-2 overflow-y-auto rounded-xl border p-3" style={{ borderColor: "color-mix(in srgb, var(--th-border) 62%, transparent)" }}>
-              {friendsLoading && friends.length === 0 ? (
+              {!selectedAccount ? (
+                <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("먼저 발신 계정을 선택하세요.", "Select a sender account first.")}</div>
+              ) : !selectedCanSendToFriends ? (
+                <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("이 계정은 친구 발송 동의가 없습니다. 나에게 보내기로 연결을 시험할 수 있습니다.", "This account lacks friend-send consent. You can still test it with Send to me.")}</div>
+              ) : friendsLoading && friends.length === 0 ? (
                 <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("친구를 불러오는 중입니다.", "Loading friends.")}</div>
               ) : friends.length === 0 ? (
                 <div className="text-xs leading-5" style={{ color: "var(--th-text-muted)" }}>{tr("메시지 수신 동의를 완료한 친구가 없습니다.", "No message-eligible friends are available.")}</div>
@@ -335,6 +439,15 @@ export function KakaoFriendShareControls({
               : safelyReplaysCurrentIntent
                 ? tr("같은 요청 결과 다시 확인", "Check the same request")
                 : tr("선택한 친구에게 지금 전송", "Send now to selected friends")}
+          </button>
+
+          <button type="button" className={secondaryActionClass} style={secondaryActionStyle} disabled={memoSendDisabled} onClick={() => void sendToMe()}>
+            {sending ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+            {sending
+              ? tr("한 번 전송 중...", "Sending once...")
+              : safelyReplaysMemoIntent
+                ? tr("나에게 보낸 같은 요청 결과 확인", "Check the same self-send")
+                : tr("나에게 지금 전송", "Send now to me")}
           </button>
 
           {result ? <KakaoSendOutcome result={result} tr={tr} /> : null}

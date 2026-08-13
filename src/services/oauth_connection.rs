@@ -35,6 +35,8 @@ pub enum OAuthConnectionError {
     InvalidTokenPayload,
     #[error("OAuth token refresh is already in progress")]
     RefreshInProgress,
+    #[error("OAuth account identity changed while the connection was being saved")]
+    AccountIdentityConflict,
 }
 
 impl From<sqlx::Error> for OAuthConnectionError {
@@ -123,6 +125,17 @@ impl TokenVault {
             .map_err(|_| OAuthConnectionError::Decrypt)?;
         Ok(Zeroizing::new(plaintext))
     }
+
+    pub fn subject_hash(&self, provider: &str, subject: &[u8]) -> Vec<u8> {
+        let key: &[u8; 32] = &self.key;
+        let mut hasher = blake3::Hasher::new_keyed(key);
+        hasher.update(b"agentdesk/oauth-subject/v1\0");
+        hasher.update(&(provider.len() as u64).to_be_bytes());
+        hasher.update(provider.as_bytes());
+        hasher.update(&(subject.len() as u64).to_be_bytes());
+        hasher.update(subject);
+        hasher.finalize().as_bytes().to_vec()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,11 +152,15 @@ pub struct StoredOAuthTokens {
 }
 
 impl StoredOAuthTokens {
-    fn encrypt(&self, vault: &TokenVault) -> Result<EncryptedValue, OAuthConnectionError> {
+    fn encrypt(
+        &self,
+        vault: &TokenVault,
+        account_key: &str,
+    ) -> Result<EncryptedValue, OAuthConnectionError> {
         let mut serialized = Zeroizing::new(
             serde_json::to_vec(self).map_err(|_| OAuthConnectionError::InvalidTokenPayload)?,
         );
-        let encrypted = vault.seal(&serialized, account_aad().as_bytes());
+        let encrypted = vault.seal(&serialized, account_aad(account_key).as_bytes());
         serialized.zeroize();
         encrypted
     }
@@ -151,14 +168,17 @@ impl StoredOAuthTokens {
     fn decrypt(
         encrypted: &EncryptedValue,
         vault: &TokenVault,
+        account_key: &str,
     ) -> Result<Self, OAuthConnectionError> {
-        let plaintext = vault.open(encrypted, account_aad().as_bytes())?;
+        let plaintext = vault.open(encrypted, account_aad(account_key).as_bytes())?;
         serde_json::from_slice(&plaintext).map_err(|_| OAuthConnectionError::InvalidTokenPayload)
     }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthAccountRecord {
+    pub account_key: String,
+    pub subject_hash: Option<Vec<u8>>,
     pub token_ciphertext: Vec<u8>,
     pub token_nonce: Vec<u8>,
     pub key_version: i16,
@@ -180,6 +200,7 @@ impl OAuthAccountRecord {
                 key_version: self.key_version,
             },
             vault,
+            &self.account_key,
         )
     }
 }
@@ -244,10 +265,13 @@ pub async fn consume_session(pool: &PgPool, state: &str) -> Result<bool, OAuthCo
 
 pub async fn load_account(
     pool: &PgPool,
+    account_key: &str,
 ) -> Result<Option<OAuthAccountRecord>, OAuthConnectionError> {
     sqlx::query_as::<_, OAuthAccountRecord>(
         r#"
         SELECT
+            account_key,
+            subject_hash,
             token_ciphertext,
             token_nonce,
             key_version,
@@ -260,7 +284,54 @@ pub async fn load_account(
         "#,
     )
     .bind(KAKAO_PROVIDER)
+    .bind(account_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct OAuthAccountSummary {
+    pub account_id: String,
+    pub status: String,
+    pub scopes: Vec<String>,
+    pub access_expires_at: Option<DateTime<Utc>>,
+    pub is_legacy: bool,
+}
+
+pub async fn list_accounts(
+    pool: &PgPool,
+) -> Result<Vec<OAuthAccountSummary>, OAuthConnectionError> {
+    sqlx::query_as::<_, OAuthAccountSummary>(
+        r#"
+        SELECT account_key AS account_id, status, scopes, access_expires_at,
+               account_key = $2 AS is_legacy
+        FROM oauth_connection_accounts
+        WHERE provider = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(KAKAO_PROVIDER)
     .bind(PRIMARY_ACCOUNT_KEY)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn find_account_by_subject_hash(
+    pool: &PgPool,
+    subject_hash: &[u8],
+) -> Result<Option<OAuthAccountRecord>, OAuthConnectionError> {
+    sqlx::query_as::<_, OAuthAccountRecord>(
+        r#"
+        SELECT account_key, subject_hash, token_ciphertext, token_nonce, key_version,
+               scopes, access_expires_at, refresh_expires_at, status
+        FROM oauth_connection_accounts
+        WHERE provider = $1 AND subject_hash = $2
+        "#,
+    )
+    .bind(KAKAO_PROVIDER)
+    .bind(subject_hash)
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
@@ -276,14 +347,47 @@ pub struct AccountTokenUpdate<'a> {
 pub async fn upsert_account(
     pool: &PgPool,
     vault: &TokenVault,
+    account_key: &str,
+    subject_hash: Option<&[u8]>,
     update: AccountTokenUpdate<'_>,
-) -> Result<(), OAuthConnectionError> {
-    let encrypted = update.tokens.encrypt(vault)?;
-    sqlx::query(
+) -> Result<String, OAuthConnectionError> {
+    let mut tx = pool.begin().await?;
+    let actual_account_key = if let Some(subject_hash) = subject_hash {
+        // Two OAuth callbacks for the same Kakao subject may finish together on
+        // different nodes. Serialize identity selection before encrypting so a
+        // conflict can never copy ciphertext whose AAD names the losing UUID
+        // onto the winning account row.
+        let subject_lock = format!(
+            "oauth-subject:{KAKAO_PROVIDER}:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(subject_hash)
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)")
+            .bind(subject_lock)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT account_key
+            FROM oauth_connection_accounts
+            WHERE provider = $1 AND subject_hash = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(KAKAO_PROVIDER)
+        .bind(subject_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| account_key.to_string())
+    } else {
+        account_key.to_string()
+    };
+    let encrypted = update.tokens.encrypt(vault, &actual_account_key)?;
+    let saved_account_key = sqlx::query_scalar::<_, String>(
         r#"
         INSERT INTO oauth_connection_accounts (
             provider,
             account_key,
+            subject_hash,
             token_ciphertext,
             token_nonce,
             key_version,
@@ -292,9 +396,10 @@ pub async fn upsert_account(
             refresh_expires_at,
             status,
             updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'active', NOW())
         ON CONFLICT (provider, account_key) DO UPDATE SET
             token_ciphertext = EXCLUDED.token_ciphertext,
+            subject_hash = COALESCE(EXCLUDED.subject_hash, oauth_connection_accounts.subject_hash),
             token_nonce = EXCLUDED.token_nonce,
             key_version = EXCLUDED.key_version,
             scopes = EXCLUDED.scopes,
@@ -304,37 +409,101 @@ pub async fn upsert_account(
             refresh_lease_id = NULL,
             refresh_lease_expires_at = NULL,
             updated_at = NOW()
+        WHERE oauth_connection_accounts.subject_hash IS NULL
+           OR EXCLUDED.subject_hash IS NULL
+           OR oauth_connection_accounts.subject_hash = EXCLUDED.subject_hash
+        RETURNING account_key
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(&actual_account_key)
+    .bind(subject_hash)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(encrypted.key_version)
     .bind(update.scopes)
     .bind(update.access_expires_at)
     .bind(update.refresh_expires_at)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(OAuthConnectionError::AccountIdentityConflict)?;
+    tx.commit().await?;
+    Ok(saved_account_key)
 }
 
-pub async fn delete_connection(pool: &PgPool) -> Result<(), OAuthConnectionError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteAccountOutcome {
+    Deleted,
+    NotFound,
+    InUse,
+}
+
+pub async fn delete_account(
+    pool: &PgPool,
+    account_key: &str,
+) -> Result<DeleteAccountOutcome, OAuthConnectionError> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM oauth_connection_sessions WHERE provider = $1")
-        .bind(KAKAO_PROVIDER)
-        .execute(&mut *tx)
-        .await?;
+    // Migration 0109 makes every new schedule/operation/outbox reference take
+    // a FOR KEY SHARE lock on this row. FOR UPDATE therefore serializes the
+    // reference check with those inserts and closes the check-then-delete race.
+    let found = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT account_key
+        FROM oauth_connection_accounts
+        WHERE provider = $1 AND account_key = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(KAKAO_PROVIDER)
+    .bind(account_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if found.is_none() {
+        return Ok(DeleteAccountOutcome::NotFound);
+    }
+    let referenced = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM scheduled_messages
+            WHERE external_delivery_account_key = $1
+              AND status IN ('scheduled', 'firing')
+            UNION ALL
+            SELECT 1
+            FROM external_share_outbox
+            WHERE provider = $2
+              AND account_key = $1
+              AND status IN ('pending', 'processing')
+            UNION ALL
+            SELECT 1
+            FROM external_share_operations
+            WHERE provider = $2
+              AND account_key = $1
+              AND state = 'dispatching'
+        )
+        "#,
+    )
+    .bind(account_key)
+    .bind(KAKAO_PROVIDER)
+    .fetch_one(&mut *tx)
+    .await?;
+    if referenced {
+        return Ok(DeleteAccountOutcome::InUse);
+    }
     sqlx::query("DELETE FROM oauth_connection_accounts WHERE provider = $1 AND account_key = $2")
         .bind(KAKAO_PROVIDER)
-        .bind(PRIMARY_ACCOUNT_KEY)
+        .bind(account_key)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(DeleteAccountOutcome::Deleted)
 }
 
-pub async fn set_account_status(pool: &PgPool, status: &str) -> Result<(), OAuthConnectionError> {
+pub async fn set_account_status(
+    pool: &PgPool,
+    account_key: &str,
+    status: &str,
+) -> Result<(), OAuthConnectionError> {
     sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -343,14 +512,17 @@ pub async fn set_account_status(pool: &PgPool, status: &str) -> Result<(), OAuth
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(status)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectionError> {
+pub async fn acquire_refresh_lease(
+    pool: &PgPool,
+    account_key: &str,
+) -> Result<Uuid, OAuthConnectionError> {
     let lease_id = Uuid::new_v4();
     // Seal the account before the provider call. If the process or database
     // fails after Kakao may have rotated the refresh token, the old token can
@@ -371,7 +543,7 @@ pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectio
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .bind(REFRESH_LEASE_SECONDS as f64)
     .fetch_optional(pool)
@@ -382,10 +554,11 @@ pub async fn acquire_refresh_lease(pool: &PgPool) -> Result<Uuid, OAuthConnectio
 pub async fn complete_refresh(
     pool: &PgPool,
     vault: &TokenVault,
+    account_key: &str,
     lease_id: Uuid,
     update: AccountTokenUpdate<'_>,
 ) -> Result<bool, OAuthConnectionError> {
-    let encrypted = update.tokens.encrypt(vault)?;
+    let encrypted = update.tokens.encrypt(vault, account_key)?;
     let result = sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -404,7 +577,7 @@ pub async fn complete_refresh(
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
@@ -417,7 +590,11 @@ pub async fn complete_refresh(
     Ok(result.rows_affected() == 1)
 }
 
-pub async fn fail_refresh(pool: &PgPool, lease_id: Uuid) -> Result<(), OAuthConnectionError> {
+pub async fn fail_refresh(
+    pool: &PgPool,
+    account_key: &str,
+    lease_id: Uuid,
+) -> Result<(), OAuthConnectionError> {
     sqlx::query(
         r#"
         UPDATE oauth_connection_accounts
@@ -430,7 +607,7 @@ pub async fn fail_refresh(pool: &PgPool, lease_id: Uuid) -> Result<(), OAuthConn
         "#,
     )
     .bind(KAKAO_PROVIDER)
-    .bind(PRIMARY_ACCOUNT_KEY)
+    .bind(account_key)
     .bind(lease_id)
     .execute(pool)
     .await?;
@@ -443,8 +620,8 @@ pub fn token_expiry_from_now(seconds: Option<std::time::Duration>) -> Option<Dat
         .and_then(|seconds| Utc::now().checked_add_signed(Duration::seconds(seconds)))
 }
 
-fn account_aad() -> String {
-    format!("agentdesk/oauth-account/v1/{KAKAO_PROVIDER}/{PRIMARY_ACCOUNT_KEY}")
+pub fn account_aad(account_key: &str) -> String {
+    format!("agentdesk/oauth-account/v1/{KAKAO_PROVIDER}/{account_key}")
 }
 
 #[cfg(test)]
@@ -476,9 +653,9 @@ mod tests {
             access_token: "access-secret".to_string(),
             refresh_token: Some("refresh-secret".to_string()),
         };
-        let encrypted = tokens.encrypt(&vault).unwrap();
+        let encrypted = tokens.encrypt(&vault, "account-a").unwrap();
         assert!(!String::from_utf8_lossy(&encrypted.ciphertext).contains("access-secret"));
-        let opened = StoredOAuthTokens::decrypt(&encrypted, &vault).unwrap();
+        let opened = StoredOAuthTokens::decrypt(&encrypted, &vault, "account-a").unwrap();
         assert_eq!(opened.access_token, "access-secret");
         assert_eq!(opened.refresh_token.as_deref(), Some("refresh-secret"));
     }
@@ -488,6 +665,17 @@ mod tests {
         let first = sha256_bytes(b"same");
         assert_eq!(first, sha256_bytes(b"same"));
         assert_ne!(first, sha256_bytes(b"different"));
+        assert_eq!(first.len(), 32);
+    }
+
+    #[test]
+    fn subject_hash_is_keyed_and_provider_bound() {
+        let first = test_vault().subject_hash("kakao", b"12345");
+        let other_key = TokenVault::for_test([8_u8; 32]).subject_hash("kakao", b"12345");
+        let other_provider = test_vault().subject_hash("other", b"12345");
+        assert_eq!(first, test_vault().subject_hash("kakao", b"12345"));
+        assert_ne!(first, other_key);
+        assert_ne!(first, other_provider);
         assert_eq!(first.len(), 32);
     }
 }

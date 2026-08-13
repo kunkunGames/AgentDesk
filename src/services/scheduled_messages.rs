@@ -1252,6 +1252,7 @@ mod tests {
             external_delivery_plan_nonce: None,
             external_delivery_plan_key_version: None,
             external_delivery_summary: None,
+            external_delivery_account_key: None,
             external_delivery_plan_scrubbed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
