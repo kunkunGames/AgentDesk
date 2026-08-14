@@ -2198,3 +2198,4 @@ reintroducing bespoke clamp expressions.
   issue (deadline-less registration is rejected by the generator) and add it to
   its feature block in the same PR — do not let the inventory generator be the
   only signal.
+- `src/services/kakao.rs` (frozen giant surface).
