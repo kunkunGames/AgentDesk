@@ -898,3 +898,11 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+# Unregistered giant: 'src/services/kakao.rs' has crossed the 1000 prod lines
+# threshold. Keeping it registered as it is a recently added feature module.
+file = "src/services/kakao.rs"
+owner = "server-runtime"
+deadline = "2026-10-31"
+decompose_issue = "#4710"
