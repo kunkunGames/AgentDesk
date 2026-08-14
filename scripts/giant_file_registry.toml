@@ -655,13 +655,13 @@ keep_reason = "Enqueue-on-transaction, claim/drain, replay, attempt-cap dead-let
 
 [[entry]]
 file = "src/db/scheduled_messages.rs"
-owner = "scheduled-messages"
+owner = "server-runtime"
 decision = "keep"
 keep_reason = "Scheduled-message row conversion, durable lease transitions, attachment metadata, and worker capability reads share one SQL projection contract; retain the cohesive persistence boundary until a scoped extraction is planned."
 
 [[entry]]
 file = "src/server/routes/scheduled_messages.rs"
-owner = "scheduled-messages"
+owner = "server-runtime"
 decision = "keep"
 keep_reason = "Scheduled-message API validation, patch semantics, rollout gates, and response shaping share one request contract; retain the cohesive route boundary until a scoped extraction is planned."
 
@@ -898,3 +898,9 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+file = "src/services/kakao.rs"
+owner = "server-runtime"
+deadline = "2026-12-31"
+decompose_issue = "#4710"
