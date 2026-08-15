@@ -1780,3 +1780,4 @@
   definition state, so any node computes the identical, channel-independent key
   — the reserved turn never mutates the channel's live `sessions.session_key`
   row. No node-local timer, leader singleton, or advisory lease is introduced.
+- #4519 migration 0093 rollout contract
