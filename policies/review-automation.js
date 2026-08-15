@@ -1536,15 +1536,13 @@ function processVerdict(cardId, verdict, result, options) {
             }
             return;
           }
-          var counterCardInfo = agentdesk.db.query(
-            "SELECT assigned_agent_id, title, github_issue_number FROM kanban_cards WHERE id = ?", [cardId]
-          );
-          if (counterCardInfo.length > 0 && counterCardInfo[0].assigned_agent_id) {
-            var issueNum = counterCardInfo[0].github_issue_number || "?";
+          var counterCardInfo = agentdesk.cards.get(cardId);
+          if (counterCardInfo && counterCardInfo.assigned_agent_id) {
+            var issueNum = counterCardInfo.github_issue_number || "?";
             try {
               agentdesk.dispatch.create(
-                cardId, counterCardInfo[0].assigned_agent_id, "e2e-test",
-                "[E2E Test] #" + issueNum + " " + counterCardInfo[0].title
+                cardId, counterCardInfo.assigned_agent_id, "e2e-test",
+                "[E2E Test] #" + issueNum + " " + counterCardInfo.title
               );
               agentdesk.log.info("[review] E2E test dispatch created for stage " + nextStage.stage_name);
             } catch (e) {
@@ -1556,8 +1554,8 @@ function processVerdict(cardId, verdict, result, options) {
         else {
           var stageAgent = nextStage.agent_override_id;
           if (!stageAgent) {
-            var cardAgent = agentdesk.db.query("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?", [cardId]);
-            stageAgent = (cardAgent.length > 0 && cardAgent[0].assigned_agent_id) ? cardAgent[0].assigned_agent_id : null;
+            var cardAgent = agentdesk.cards.get(cardId);
+            stageAgent = (cardAgent && cardAgent.assigned_agent_id) ? cardAgent.assigned_agent_id : null;
           }
           if (stageAgent) {
             try {
