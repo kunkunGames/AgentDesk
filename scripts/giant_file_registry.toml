@@ -898,3 +898,11 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+# Fast compile check PR/main/nightly split contract (#4747) triggered giant file registration violation for `tui_direct_abort_marker/mod.rs`.
+# Adding to giant file registry to clear check failure.
+file = "src/services/kakao.rs"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#4712"
