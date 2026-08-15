@@ -898,3 +898,9 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+file = "src/services/kakao.rs"
+decision = "keep"
+owner = "Steward"
+keep_reason = "Feature expansion bumped it over 1000 lines but it remains cohesive as a single domain module."
