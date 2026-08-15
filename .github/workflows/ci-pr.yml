@@ -1290,7 +1290,7 @@ jobs:
       # parser claims to handle. setup-python gives a clean interpreter, so the
       # oracle must be installed explicitly or the suite errors on import.
       - name: Install script-test Python deps
-        run: python3 -m pip install --disable-pip-version-check pyyaml
+        run: python3 -m pip install --disable-pip-version-check pyyaml PyYAML
 
       - name: Large file guard
         shell: bash
