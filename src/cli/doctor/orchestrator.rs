@@ -478,7 +478,7 @@ fn provider_runtime_guidance(provider: &ProviderKind) -> String {
     let provider_name = provider.as_str();
     let log_hint = dcserver_log_hint();
     format!(
-        "Check {provider_name} CLI installation/PATH and service runtime PATH. If there are connection issues, check {log_hint} logs and provider authentication status."
+        "{provider_name} CLI 설치/PATH 및 서비스 런타임 PATH를 확인하세요. 연결 문제가 있는 경우 {log_hint} 로그와 provider 인증 상태를 확인하세요."
     )
 }
 
@@ -569,7 +569,7 @@ fn check_qwen_settings_files(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen can operate without settings, but for reliable model picker and operational surface usage, configuring ~/.qwen/settings.json or <workspace>/.qwen/settings.json is recommended.";
+    let guidance = "Qwen은 설정 없이도 작동할 수 있지만, 안정적인 모델 선택기 및 운영 화면 사용을 위해 ~/.qwen/settings.json 또는 <workspace>/.qwen/settings.json을 구성하는 것이 권장됩니다.";
     if configured {
         Check::warn(
             "provider_qwen_settings",
@@ -643,7 +643,7 @@ fn check_qwen_auth_hints(configured: bool) -> Check {
         ]);
     }
 
-    let guidance = "Check the API key path in the project .qwen/.env first, then .env. The Qwen CLI does not merge env-files. Check DashScope web console or official documentation for usage/limits instead of hardcoding numbers in doctor.";
+    let guidance = "먼저 프로젝트의 .qwen/.env에서 API 키 경로를 확인한 다음 .env를 확인하세요. Qwen CLI는 env 파일을 병합하지 않습니다. doctor에 숫자를 하드코딩하는 대신 DashScope 웹 콘솔이나 공식 문서에서 사용량/제한을 확인하세요.";
     if configured {
         Check::warn(
             "provider_qwen_auth",
@@ -798,7 +798,7 @@ fn check_qwen_runtime_artifacts(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen uses local assets such as ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, and <workspace>/.qwen/.env as-is. In a headless environment, check whether the project .qwen/.env takes precedence.";
+    let guidance = "Qwen은 ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, 그리고 <workspace>/.qwen/.env와 같은 로컬 자산을 그대로 사용합니다. 헤드리스 환경에서는 프로젝트의 .qwen/.env가 우선순위를 갖는지 확인하세요.";
     if configured {
         Check::warn(
             "provider_qwen_runtime",
