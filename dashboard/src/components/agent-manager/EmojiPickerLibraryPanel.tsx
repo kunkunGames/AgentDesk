@@ -4,6 +4,7 @@ import EmojiPickerReact, {
   Theme,
   type EmojiClickData,
 } from "emoji-picker-react";
+import { useI18n } from "../../i18n";
 
 interface EmojiPickerLibraryPanelProps {
   height: number;
@@ -19,6 +20,7 @@ export default function EmojiPickerLibraryPanel({
   value,
 }: EmojiPickerLibraryPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const { t: tr } = useI18n();
 
   const handleEmojiClick = (emojiData: EmojiClickData) => {
     onSelect(emojiData.emoji);
@@ -40,10 +42,14 @@ export default function EmojiPickerLibraryPanel({
 
     const syncSelected = () => {
       container.querySelectorAll("button.epr-emoji").forEach((button) => {
-        if (normalize(button.textContent ?? "") === target) {
+        const text = button.textContent ?? "";
+        if (normalize(text) === target) {
           button.setAttribute("aria-pressed", "true");
         } else {
           button.setAttribute("aria-pressed", "false");
+        }
+        if (text && !button.hasAttribute("aria-label")) {
+          button.setAttribute("aria-label", tr({ ko: `아이콘 ${text}`, en: `Icon ${text}` }));
         }
       });
     };
@@ -55,7 +61,7 @@ export default function EmojiPickerLibraryPanel({
     const observer = new MutationObserver(syncSelected);
     observer.observe(container, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [value]);
+  }, [tr, value]);
 
   return (
     <div ref={containerRef}>

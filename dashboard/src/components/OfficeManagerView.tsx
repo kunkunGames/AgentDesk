@@ -384,7 +384,7 @@ export default function OfficeManagerView({
                           key={icon}
                           type="button"
                           role="radio"
-                          aria-label={tr(`아이콘 ${icon}`, `Icon ${icon}`)}
+                          aria-label={draft.icon === icon ? tr(`선택된 아이콘: ${icon}`, `Selected icon: ${icon}`) : tr(`아이콘 ${icon}`, `Icon ${icon}`)}
                           aria-checked={draft.icon === icon}
                           tabIndex={draft.icon === icon || (!OFFICE_ICONS.includes(draft.icon) && idx === 0) ? 0 : -1}
                           onKeyDown={(e) => {
@@ -435,7 +435,7 @@ export default function OfficeManagerView({
                           key={color}
                           type="button"
                           role="radio"
-                          aria-label={tr(`색상 ${color}`, `Color ${color}`)}
+                          aria-label={draft.color === color ? tr(`선택된 색상: ${color}`, `Selected color: ${color}`) : tr(`색상 ${color}`, `Color ${color}`)}
                           aria-checked={draft.color === color}
                           tabIndex={draft.color === color || (!OFFICE_COLORS.includes(draft.color) && idx === 0) ? 0 : -1}
                           onKeyDown={(e) => {
