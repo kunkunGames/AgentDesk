@@ -6387,8 +6387,8 @@ services::kakao::tests::memo_fingerprint_is_distinct_from_friend_send
 services::kakao::tests::multi_account_connection_state_prefers_a_usable_sender
 services::kakao::tests::parses_kakao_refresh_token_expiry_extension
 services::kakao::tests::request_fingerprint_is_recipient_order_independent_and_payload_bound
-services::kakao::tests::validates_memo_send_without_friend_recipients
 services::kakao::tests::validates_send_limits_and_idempotency_key
+services::kakao::tests::validates_memo_send_without_friend_recipients
 services::long_turn_watchdog::tests::alert_cooldown_exceeds_scan_cadence_by_default
 services::long_turn_watchdog::tests::alert_message_contains_actionable_context
 services::long_turn_watchdog::tests::cluster_threshold_triggers_at_three
