@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+# Direct `python3 scripts/check_root_scratch_files.py` does not put the repo
+# root on sys.path, so the scripts.* import would fail without this.
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
 
 from scripts.analyze_prs import is_scratch_file_path
 
