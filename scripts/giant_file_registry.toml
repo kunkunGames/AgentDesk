@@ -898,3 +898,9 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+file = "src/services/kakao.rs"
+owner = "kakao"
+decision = "keep"
+keep_reason = "Pending module decomposition"
