@@ -6,16 +6,19 @@
 pub(crate) fn constant_time_token_eq(expected: &str, supplied: &str) -> bool {
     let expected = expected.as_bytes();
     let supplied = supplied.as_bytes();
-    let max_len = expected.len().max(supplied.len());
-    let mut diff = expected.len() ^ supplied.len();
+    let mut diff = 0;
 
-    for index in 0..max_len {
-        let expected_byte = expected.get(index).copied().unwrap_or(0);
+    // Always loop exactly `expected.len()` times. This hides the length
+    // of `supplied` and prevents a DoS attack where a massive `supplied`
+    // payload forces an excessively long loop.
+    for index in 0..expected.len() {
+        let expected_byte = expected[index];
         let supplied_byte = supplied.get(index).copied().unwrap_or(0);
-        diff |= (expected_byte ^ supplied_byte) as usize;
+        diff |= expected_byte ^ supplied_byte;
     }
 
-    diff == 0
+    let lengths_match = expected.len() == supplied.len();
+    (diff == 0) && lengths_match
 }
 
 #[cfg(test)]
