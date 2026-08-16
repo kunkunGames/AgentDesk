@@ -106,22 +106,99 @@ pub(in crate::services::discord) fn compose_completion_footer_text(
     body: &str,
     completion_block: Option<&str>,
 ) -> String {
+    if let Some(completion_block) = completion_block
+        && let Some((completion_without_warning, warning)) =
+            super::turn_end_wip_warning::split_merged_turn_end_wip_warning(completion_block)
+    {
+        let completion_without_warning =
+            (!completion_without_warning.trim().is_empty()).then_some(completion_without_warning);
+        let warning = completion_footer_subtext(&warning);
+        let separator_units = super::formatting::discord_message_units("\n\n");
+        // Subtracting a byte budget from a UTF-16-unit limit is conservative because UTF-8 bytes
+        // are never fewer than UTF-16 units. It reserves that many rendered non-warning units but
+        // not a whole source section: `completion_footer_subtext` adds three units per non-empty line.
+        let warning_budget = super::DISCORD_MSG_LIMIT.saturating_sub(
+            SINGLE_MESSAGE_PANEL_FOOTER_BUDGET_BYTES
+                .saturating_add(6)
+                .saturating_add(separator_units),
+        );
+        let warning =
+            super::turn_end_wip_warning::bounded_turn_end_wip_warning(&warning, warning_budget);
+        let content_limit = super::DISCORD_MSG_LIMIT.saturating_sub(
+            super::formatting::discord_message_units(&warning).saturating_add(separator_units),
+        );
+        let composed = compose_completion_footer_text_without_warning_with_limit(
+            body,
+            completion_without_warning.as_deref(),
+            content_limit,
+            true,
+        );
+        return if composed.trim().is_empty() {
+            warning
+        } else {
+            format!("{composed}\n\n{warning}")
+        };
+    }
+    compose_completion_footer_text_without_warning(body, completion_block)
+}
+
+fn compose_completion_footer_text_without_warning(
+    body: &str,
+    completion_block: Option<&str>,
+) -> String {
+    compose_completion_footer_text_without_warning_with_limit(
+        body,
+        completion_block,
+        super::DISCORD_MSG_LIMIT,
+        false,
+    )
+}
+
+fn compose_completion_footer_text_without_warning_with_limit(
+    body: &str,
+    completion_block: Option<&str>,
+    message_limit: usize,
+    clamp_unadorned_body: bool,
+) -> String {
     let body = body.trim_end();
     let Some(block) = completion_block
         .map(str::trim)
         .filter(|block| !block.is_empty())
     else {
-        return body.to_string();
+        return if clamp_unadorned_body {
+            let safe_end =
+                super::formatting::byte_index_at_discord_message_units(body, message_limit);
+            repair_fence_parity(&body[..safe_end])
+        } else {
+            body.to_string()
+        };
     };
     let block = completion_footer_subtext(block);
+
+    let max_block_units = message_limit.saturating_sub(6);
+    let block = if max_block_units == 0 {
+        String::new()
+    } else if super::formatting::discord_message_units(&block) <= max_block_units {
+        repair_fence_parity(&block)
+    } else {
+        let ellipsis = "…";
+        let body_budget =
+            max_block_units.saturating_sub(super::formatting::discord_message_units(ellipsis));
+        let safe_end = super::formatting::byte_index_at_discord_message_units(&block, body_budget);
+        repair_fence_parity(&format!("{}{}", &block[..safe_end], ellipsis))
+    };
+    if block.is_empty() {
+        let safe_end = super::formatting::byte_index_at_discord_message_units(body, message_limit);
+        return repair_fence_parity(&body[..safe_end]);
+    }
     if body.is_empty() {
-        return clamp_footer_status_block(block);
+        return block;
     }
 
     let suffix = format!("\n\n{block}");
-    let max_len = super::DISCORD_MSG_LIMIT.saturating_sub(suffix.len());
-    let base = if body.len() > max_len {
-        let safe_end = super::formatting::floor_char_boundary(body, max_len);
+    let max_units = message_limit.saturating_sub(super::formatting::discord_message_units(&suffix));
+    let base = if super::formatting::discord_message_units(body) > max_units {
+        let safe_end = super::formatting::byte_index_at_discord_message_units(body, max_units);
         &body[..safe_end]
     } else {
         body
@@ -133,18 +210,13 @@ pub(in crate::services::discord) fn compose_completion_footer_text(
     // so a body whose fence was chopped by the Discord-limit trim above would, on
     // the combined `{base}{suffix}`, take the appended footer down with it.
     //
-    // #3391 delivered-ID honesty invariant: `delivered_terminal_ids` for this
-    // footer were already computed from the footer block (completion_footer.rs:202)
-    // and are evicted once this edit returns Ok. If repair ate the footer, the
-    // ✓/✗ marks would vanish from the delivered text yet their slots would still
-    // be evicted — reporting marks the user never saw. Repairing only the body
-    // keeps every footer mark in the delivered text, so whenever this edit
-    // succeeds every reported terminal slot's mark was actually present.
+    // #3391: body-only repair prevents `repair_fence_parity` from consuming the rendered footer.
+    // Its ids were computed earlier, so the inline block clamp can still cut a reported mark (#5348).
     //
-    // The footer block is fence-balanced by construction: `render_completion_footer`
-    // emits only the context-usage line plus Tasks/Subagents slot lines (no fenced Recent
-    // block lives here), so it carries zero ``` runs (an even count). balanced base
-    // + balanced footer = balanced combined.
+    // Append the rendered footer to the separately repaired body. The assertion
+    // below checks the renderer's current even fence parity; the runtime branch
+    // repairs the suffix separately if that assumption stops holding, without
+    // reaching back across the body/footer boundary.
     let base = repair_fence_parity(base);
     let combined = format!("{base}{suffix}");
     debug_assert_eq!(
@@ -304,19 +376,21 @@ fn clamp_footer_panel_text(panel_text: &str) -> String {
 fn clamp_footer_status_block(status_block: String) -> String {
     // #3394: this is the universal live-panel finalization sink (every
     // `compose_footer_status_block` call lands here, after the upstream 600-byte
-    // `clamp_footer_panel_text` body trim and this Discord-limit trim — either of
-    // which can chop the Recent block's closing ```). Re-balance fence parity on
-    // EVERY return path so Discord never renders a dangling fence as literal text.
-    let max_bytes = super::DISCORD_MSG_LIMIT.saturating_sub(6);
-    let clamped = if status_block.len() <= max_bytes {
+    // `clamp_footer_panel_text` body trim and this Discord-unit trim — either
+    // can chop the Recent block's closing ```). Re-balance fence parity on EVERY
+    // return path so Discord never renders a dangling fence as literal text.
+    let max_units = super::DISCORD_MSG_LIMIT.saturating_sub(6);
+    let clamped = if super::formatting::discord_message_units(&status_block) <= max_units {
         status_block
     } else {
         let ellipsis = "…";
-        let body_budget = max_bytes.saturating_sub(ellipsis.len());
+        let body_budget =
+            max_units.saturating_sub(super::formatting::discord_message_units(ellipsis));
         if body_budget == 0 {
             ellipsis.to_string()
         } else {
-            let safe_end = super::formatting::floor_char_boundary(&status_block, body_budget);
+            let safe_end =
+                super::formatting::byte_index_at_discord_message_units(&status_block, body_budget);
             format!("{}{}", &status_block[..safe_end], ellipsis)
         }
     };
@@ -1224,12 +1298,18 @@ mod tests {
         );
     }
 
-    /// #3394 round 2 (P1): the registered-refresh composition site
-    /// (`completion_footer_edit_for_registered_target_at`, ~258) shares the
-    /// `compose_completion_footer_text` pattern. A registered body carrying an
-    /// unterminated fence must still emit the rendered footer's terminal ✓ in the
-    /// delivered edit text, with even combined parity — so the #3391 eviction that
-    /// follows a successful edit only drops marks the user actually saw.
+    /// #3394 round 2 (P1): the registered-refresh edit is implemented by
+    /// `footer_view_reconciler/registry.rs::completion_footer_edit_for_registered_target_at`,
+    /// which uses `compose_completion_footer_text`. With no WIP warning, the
+    /// message limit remains `DISCORD_MSG_LIMIT` and `max_block_units` is 1994,
+    /// so the 600-byte task-section cap plus the other footer lines leave the
+    /// rendered footer's terminal mark in the edit text after body-only repair;
+    /// a successful edit can then evict only a mark present in that text. When
+    /// warning reservation shrinks the remaining block budget as low as 600
+    /// units, the inline clamp can still cut a retained terminal tail after its
+    /// render-local id was selected. That residual risk is accepted to keep the
+    /// warning from being the truncation victim: the possible sacrifice moves
+    /// to the footer tail instead.
     #[test]
     fn registered_refresh_repair_scoped_to_body_keeps_footer_marks_3394() {
         let channel_id = ChannelId::new(3_394_201);
@@ -1287,6 +1367,111 @@ mod tests {
                 "📦 10 / 100 (10%) · auto-compact 50%\n\nTasks\n└ Bash Done ✓\n⏱ 2m 34s"
             ),
             "-# 📦 10 / 100 (10%) · auto-compact 50%\n\n-# Tasks\n-# └ Bash Done ✓\n-# ⏱ 2m 34s"
+        );
+    }
+
+    #[test]
+    fn completion_footer_with_body_clamps_oversized_suffix_5177() {
+        let body = "본문!";
+        let completion = "한".repeat(2_497);
+        let rendered_completion = super::completion_footer_subtext(&completion);
+        assert_eq!(
+            super::super::formatting::discord_message_units(&rendered_completion),
+            2_500,
+            "rendered completion fixture unit count"
+        );
+        let unclamped = format!("{body}\n\n{rendered_completion}");
+        assert_eq!(
+            super::super::formatting::discord_message_units(&unclamped),
+            2_505,
+            "origin/main with-body payload unit count"
+        );
+
+        let composed = super::compose_completion_footer_text(body, Some(&completion));
+        assert!(
+            super::super::formatting::discord_message_units(&composed) <= DISCORD_MSG_LIMIT,
+            "final with-body payload must fit the shared limit: {}",
+            super::super::formatting::discord_message_units(&composed)
+        );
+        assert!(composed.starts_with(body));
+        assert!(composed.ends_with('…'));
+    }
+
+    #[test]
+    fn completion_footer_preserves_korean_payload_within_unit_limit_5177() {
+        let body = "본문!";
+        let completion = "한".repeat(1_990);
+        let expected = format!(
+            "{body}\n\n{}",
+            super::completion_footer_subtext(&completion)
+        );
+        assert_eq!(
+            super::super::formatting::discord_message_units(&expected),
+            1_998,
+            "fixture must fit the shared message-unit limit"
+        );
+
+        let composed = super::compose_completion_footer_text(body, Some(&completion));
+
+        assert_eq!(
+            composed, expected,
+            "in-limit Korean footer must be preserved"
+        );
+    }
+
+    #[test]
+    fn footer_only_preserves_korean_payload_within_unit_limit_5177() {
+        let completion = "한".repeat(700);
+        let expected = super::completion_footer_subtext(&completion);
+        assert_eq!(
+            super::super::formatting::discord_message_units(&expected),
+            703,
+            "rendered footer fixture unit count"
+        );
+
+        let composed = super::compose_completion_footer_text("", Some(&completion));
+
+        assert_eq!(
+            composed, expected,
+            "in-limit footer-only Korean payload must not be byte-clamped"
+        );
+    }
+
+    #[test]
+    fn streaming_placeholder_counts_supplementary_utf16_units_5178() {
+        let body = "😀".repeat(1_200);
+        assert_eq!(
+            super::super::formatting::discord_message_units(&body),
+            2_400,
+            "fixture unit count"
+        );
+        let rendered = super::super::formatting::build_streaming_placeholder_text(&body, "status");
+        assert_eq!(
+            super::super::formatting::discord_message_units(&rendered),
+            1_989,
+            "rendered placeholder uses 1981 body units plus the 8-unit footer"
+        );
+        assert!(rendered.starts_with('…'));
+    }
+
+    #[test]
+    fn streaming_rollover_limits_supplementary_frozen_chunk_units_5177() {
+        let body = "😀".repeat(1_100);
+        let plan = super::super::formatting::plan_streaming_rollover(&body, "STATUS")
+            .expect("2200 message units must roll over before delivery");
+
+        assert_eq!(
+            super::super::formatting::discord_message_units(&plan.frozen_chunk),
+            1_982,
+            "frozen body reserves the 8-unit footer and 10-unit margin"
+        );
+        assert!(
+            super::super::formatting::discord_message_units(&plan.display_snapshot)
+                <= DISCORD_MSG_LIMIT
+        );
+        assert_eq!(
+            format!("{}{}", plan.frozen_chunk, &body[plan.split_at..]),
+            body
         );
     }
 
@@ -1374,7 +1559,6 @@ mod tests {
         let panel = panel_portion(&block);
         let panel_lines: Vec<&str> = panel.lines().collect();
 
-        assert!(std::str::from_utf8(panel.as_bytes()).is_ok());
         assert!(panel.len() <= super::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES);
         assert_eq!(panel_lines.last().copied(), Some("-# …"));
         assert_eq!(panel_lines.len(), 2);

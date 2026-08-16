@@ -46,6 +46,7 @@ src/
 │   ├── discord_thread_create_lock.rs
 │   ├── doctor.rs
 │   ├── init.rs
+│   ├── intake_outbox.rs
 │   ├── json_output.rs
 │   ├── migrate.rs
 │   ├── mod.rs
@@ -79,7 +80,8 @@ src/
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
 │   │   ├── canonical_identity_pg_tests.rs
-│   │   └── rebind_override.rs
+│   │   ├── rebind_override.rs
+│   │   └── tests.rs
 │   ├── dispatches/
 │   │   ├── outbox/
 │   │   │   ├── claim.rs
@@ -93,6 +95,8 @@ src/
 │   │   ├── delivery_events.rs
 │   │   ├── metadata.rs
 │   │   └── mod.rs
+│   ├── intake_outbox_dispatch_stamp/
+│   │   └── tests.rs
 │   ├── kanban_cards/
 │   │   ├── crud.rs
 │   │   ├── listing.rs
@@ -122,7 +126,14 @@ src/
 │   ├── dispatched_sessions.rs
 │   ├── fixture_target.rs
 │   ├── idempotency.rs
+│   ├── intake_delivery_required_migrations.rs
 │   ├── intake_outbox.rs
+│   ├── intake_outbox_delivery_proof.rs
+│   ├── intake_outbox_dispatch_stamp.rs
+│   ├── intake_outbox_dispatched_audit.rs
+│   ├── intake_outbox_force_fail.rs
+│   ├── intake_outbox_open_status.rs
+│   ├── intake_outbox_status.rs
 │   ├── kanban.rs
 │   ├── meetings.rs
 │   ├── mod.rs
@@ -438,6 +449,8 @@ src/
 │   │   ├── intake_router_hook/
 │   │   │   ├── owner_record.rs
 │   │   │   └── session_owner.rs
+│   │   ├── intake_worker/
+│   │   │   └── dispatch_stamp_tests.rs
 │   │   ├── stream_relay/
 │   │   │   ├── identity.rs
 │   │   │   └── terminal_resolution.rs
@@ -562,6 +575,10 @@ src/
 │   │   │   │   ├── abandon.rs
 │   │   │   │   ├── identity.rs
 │   │   │   │   └── mod.rs
+│   │   │   ├── model/
+│   │   │   │   ├── identity.rs
+│   │   │   │   ├── serde_adapters.rs
+│   │   │   │   └── turn_kinds.rs
 │   │   │   ├── save_store/
 │   │   │   │   ├── identity_gate/
 │   │   │   │   │   ├── bridge_entry.rs
@@ -730,6 +747,8 @@ src/
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── intake_turn/
+│   │   │   │   │   ├── dispatch_stamp/
+│   │   │   │   │   │   └── tests.rs
 │   │   │   │   │   ├── race_loss/
 │   │   │   │   │   │   ├── mailbox_reaction.rs
 │   │   │   │   │   │   ├── mailbox_reaction_tests.rs
@@ -738,6 +757,7 @@ src/
 │   │   │   │   │   ├── adk_thread.rs
 │   │   │   │   │   ├── claim_bootstrap.rs
 │   │   │   │   │   ├── dispatch_runtime.rs
+│   │   │   │   │   ├── dispatch_stamp.rs
 │   │   │   │   │   ├── inflight_create_log.rs
 │   │   │   │   │   ├── placeholder_handoff.rs
 │   │   │   │   │   ├── race_loss.rs
@@ -773,6 +793,11 @@ src/
 │   │   │   ├── thread_binding.rs
 │   │   │   └── turn_start.rs
 │   │   ├── runtime_bootstrap/
+│   │   │   ├── intake_delivery_capability/
+│   │   │   │   ├── cache.rs
+│   │   │   │   └── tests.rs
+│   │   │   ├── intake_delivery_sweep/
+│   │   │   │   └── tests.rs
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
 │   │   │   ├── gateway_lease_recovery.rs
@@ -780,6 +805,9 @@ src/
 │   │   │   ├── gateway_lease_tests.rs
 │   │   │   ├── gateway_runtime.rs
 │   │   │   ├── intake.rs
+│   │   │   ├── intake_delivery_capability.rs
+│   │   │   ├── intake_delivery_reconciler.rs
+│   │   │   ├── intake_delivery_sweep.rs
 │   │   │   ├── orphan_recovery.rs
 │   │   │   ├── queued_placeholders.rs
 │   │   │   ├── recovery_flush.rs
@@ -942,6 +970,10 @@ src/
 │   │   │   ├── completion_postlude/
 │   │   │   │   ├── channel_writeback.rs
 │   │   │   │   └── contracts.rs
+│   │   │   ├── headless_delivery/
+│   │   │   │   └── intake_outbox_argument.rs
+│   │   │   ├── intake_settlement/
+│   │   │   │   └── tests.rs
 │   │   │   ├── runtime_handoff_loop/
 │   │   │   │   ├── claude_e.rs
 │   │   │   │   ├── guarded_save.rs
@@ -1006,6 +1038,7 @@ src/
 │   │   │   ├── followup_requeue.rs
 │   │   │   ├── guards.rs
 │   │   │   ├── headless_delivery.rs
+│   │   │   ├── intake_settlement.rs
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── output_lifecycle.rs
@@ -1111,6 +1144,7 @@ src/
 │   │   ├── discord_io.rs
 │   │   ├── dispatch_policy.rs
 │   │   ├── e2e_control.rs
+│   │   ├── execution_identity.rs
 │   │   ├── formatting.rs
 │   │   ├── gateway.rs
 │   │   ├── gateway_voice_queue.rs
@@ -1394,7 +1428,6 @@ src/
 │   ├── claude_command.rs
 │   ├── claude_compact_context.rs
 │   ├── claude_compact_trigger.rs
-│   ├── claude_gateway_proxy.rs
 │   ├── codex.rs
 │   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs
@@ -1447,6 +1480,7 @@ src/
 │   ├── queue.rs
 │   ├── qwen.rs
 │   ├── qwen_tmux_wrapper.rs
+│   ├── release_source.rs
 │   ├── remote_stub.rs
 │   ├── retrospectives.rs
 │   ├── review_decision.rs

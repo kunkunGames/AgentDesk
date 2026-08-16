@@ -1614,14 +1614,158 @@ fn default_prompt_max_bytes_user_derived() -> u64 {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryJournalMode {
+    /// Keep the legacy delivery writer and do not emit delivery-journal rows.
     #[default]
     Legacy,
+    /// Emit delivery-journal observations while the legacy writer remains authoritative.
     Shadow,
+    /// Keep emitting observations, and let explicitly wired readers treat the journal as
+    /// authoritative. Existing delivery writers remain in place until the hot-file handoff.
+    /// This mode is selected by the YAML `runtime.delivery_journal_mode` field only:
+    /// `kv_meta['runtime-config']` and `SettingsService::put_runtime_config` do not read this
+    /// key. A value placed there through the runtime-config API is stored and echoed by that API,
+    /// but the journal consumers ignore it.
+    ///
+    /// Activation is not safe by itself. The fence risk belongs to any transition that exits
+    /// `Legacy`, not to `Authority` alone: a direct `Legacy` to `Authority` transition, or a
+    /// `Legacy` to `Shadow` transition before its admission scope is warmed, can leave an
+    /// in-flight delivery permanently absent. Legacy admits with no observation, then a later
+    /// Authority settle sees `None` and is a no-op. `JournalObserver::submit` also uses bounded
+    /// `try_send`, so a full mailbox drops an observation. Cutover therefore requires Shadow
+    /// warm-up and an in-flight drain/fence; this dormant slice does not provide either one.
+    ///
+    /// `Shadow` to `Authority` prevents that same half-recorded delivery only for deliveries
+    /// actually admitted under `Shadow`. Admission is additionally gated by the cohort and
+    /// internal-channel settings (`cohort_bucket(id) < delivery_journal_cohort_percent.min(100)` unless
+    /// the channel is internal). The shipped defaults are cohort `0` and an empty internal
+    /// channel list, so the admitted scope is empty: no observation is captured, and this
+    /// transition is equivalent to `Legacy` to `Authority` (the reconciler reaches
+    /// `settle_dispatched_unknown`). Cutover requires **the entire target scope to be admitted;
+    /// cohort warm-up complete**, in addition to the drain/fence above.
+    Authority,
+}
+
+impl DeliveryJournalMode {
+    /// Both rollout modes need observations in the journal. `Authority` does not revoke an
+    /// existing writer; that handoff belongs to a later slice.
+    pub const fn records_shadow_observations(self) -> bool {
+        matches!(self, Self::Shadow | Self::Authority)
+    }
+
+    /// Only the explicit authority mode changes a reader's source of truth.
+    pub const fn reads_as_authority(self) -> bool {
+        matches!(self, Self::Authority)
+    }
 }
 
 fn is_legacy_delivery_journal_mode(mode: &DeliveryJournalMode) -> bool {
     *mode == DeliveryJournalMode::Legacy
 }
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeDeliverySettlementStage {
+    /// Disable fresh-turn dispatched stamping and bridge-exit settlement, and skip the schema
+    /// probe. The turn path performs no intake-delivery database work.
+    #[default]
+    Off,
+    /// Reserve the observation stage while leaving fresh turns database-neutral: no probe,
+    /// dispatched stamp, or bridge-exit settlement runs on the turn path.
+    Observe,
+    /// Probe the schema and, when ready, enable bridge-exit settlement and stale-debt sweep.
+    /// Dispatched stamping remains disabled.
+    Settle,
+    /// Probe the schema and, when ready, enable dispatched handoff stamping, bridge-exit
+    /// settlement, and stale-debt sweep.
+    Enforce,
+}
+
+fn is_off_intake_delivery_settlement(stage: &IntakeDeliverySettlementStage) -> bool {
+    *stage == IntakeDeliverySettlementStage::Off
+}
+
+/// Rollout stage for the #5071 T3 execution-identity fence.
+///
+/// The read model behind this switch
+/// (`services::discord::execution_identity::SessionIncarnationRef`) only reads
+/// the per-spawn `.spawn_nonce` marker that provider spawns already write; no
+/// mode introduces a durable row, a new marker, or a new file format. T3-A0
+/// landed that model with no destructive consumer; T3-A1 converted the call
+/// sites, so the modes are no longer behaviourally identical — `Enforce` now
+/// refuses at the two automatic watcher-registry CAS removals described on that
+/// variant.
+///
+/// This switch does not restore anything T3-A1 deleted. The two #5067 in-flight
+/// emission fences are gone in every mode; only a revert of that PR brings them
+/// back.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionIdentityMode {
+    /// Never consult the spawn nonce for a deny decision and do not count
+    /// observations. The fenced call sites still *read* the nonce marker in
+    /// every mode (`WatcherIdentityFence` captures it up front and re-reads it
+    /// once inside the registry lock) — Legacy discards the result, so the
+    /// destructive outcome matches the pre-A1 CAS while the marker-file I/O is
+    /// new (short-circuiting it is tracked in #5399). The pre-existing
+    /// `(session, output_path, cancel pointer)` registry CAS is untouched.
+    #[default]
+    Legacy,
+    /// Legacy behaviour plus captured-vs-current nonce counters and logs, and a
+    /// log whenever the pinned owner channel or output path no longer equals the
+    /// live one. Still never denies.
+    Observe,
+    /// Refuse the two automatic watcher-registry removals T3-A1 converted — the
+    /// relay-recovery dead-frontier cancel and the TUI stale-FOREIGN demote —
+    /// unless every pinned VALUE still equals the live one (owner channel,
+    /// session name, output path, and `Arc::ptr_eq` on the cancel pointer) AND
+    /// the captured `Some(nonce)` equals the marker re-read inside the registry
+    /// lock. Absent and mismatched nonces are both a deny, so on a platform with
+    /// no tmux marker store at all this mode refuses both paths unconditionally.
+    ///
+    /// Equal values are all this establishes. The registry keeps no incarnation
+    /// counter, so this mode cannot tell a row that never moved from one that was
+    /// replaced and then re-admitted with every pinned value restored; see
+    /// `services::discord::tmux_watcher_registry::WatcherIdentityFence` for that
+    /// declared limit.
+    ///
+    /// Nothing else changes: operator/CLI resets, tmux and process kills, and
+    /// every registry removal T3 did not convert are out of scope, and refusing
+    /// is the only thing this mode does.
+    Enforce,
+}
+
+impl ExecutionIdentityMode {
+    /// Both post-`Legacy` modes count the comparison outcome; counting is not a
+    /// decision, so `Enforce` shares the observation path rather than replacing
+    /// it.
+    pub const fn records_identity_observations(self) -> bool {
+        matches!(self, Self::Observe | Self::Enforce)
+    }
+
+    /// Only `Enforce` may turn a non-matching observation into a refusal, and
+    /// only at the call sites T3-A1 converted. Two consumers read this: the
+    /// nonce deny predicate `destruction_permitted_under_identity` in
+    /// `services::discord::execution_identity` (with a shim of the same name in
+    /// `tmux_watcher_registry` for platforms that host no tmux marker), and the
+    /// pinned-binding conjunct on `tmux_watcher_registry`'s identity-fenced
+    /// registry view.
+    pub const fn denies_on_incarnation_mismatch(self) -> bool {
+        matches!(self, Self::Enforce)
+    }
+}
+
+fn is_legacy_execution_identity_mode(mode: &ExecutionIdentityMode) -> bool {
+    *mode == ExecutionIdentityMode::Legacy
+}
+
+/// A conservative bound that stays within chrono's duration and UTC datetime
+/// ranges while remaining far above any operational sweep TTL.
+pub(crate) const MAX_INTAKE_SWEEP_CUTOFF_SECS: u64 = i64::MAX as u64 / 1_000_000_000;
+/// Gives startup recovery and session restoration two minutes before the first
+/// intake-delivery sweep. This matches the sibling session-GC startup delay.
+pub(crate) const INTAKE_DELIVERY_SWEEP_INITIAL_DELAY_SECS: u64 = 120;
+/// Bounds each intake-delivery settlement transaction's PostgreSQL lock wait.
+pub(crate) const INTAKE_DELIVERY_SWEEP_LOCK_TIMEOUT_SECS: u64 = 3;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1632,6 +1776,19 @@ pub struct RuntimeSettingsConfig {
     pub delivery_journal_cohort_percent: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delivery_journal_internal_channel_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_off_intake_delivery_settlement")]
+    pub intake_delivery_settlement: IntakeDeliverySettlementStage,
+    #[serde(default, skip_serializing_if = "is_legacy_execution_identity_mode")]
+    pub execution_identity_mode: ExecutionIdentityMode,
+    /// Heartbeat-absence TTL for stale dispatched debt; unset defaults to 1800 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_delivery_sweep_dispatched_cutoff_secs: Option<u64>,
+    /// Heartbeat-absence TTL for stale spawned debt; defaults to 1800s because queued forwarding can stay spawned for a full turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_delivery_sweep_spawned_cutoff_secs: Option<u64>,
+    /// Per-state sweep batch limit; unset defaults to 200 and values clamp to 1..=500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_delivery_sweep_batch_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_timeout_min: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1651,13 +1808,6 @@ pub struct RuntimeSettingsConfig {
     /// can share the lower-bound policy without inheriting Claude's transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_compact_lower_bound_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub claude_gateway_proxy_enabled: bool,
-    #[serde(
-        default = "default_claude_gateway_proxy_url",
-        skip_serializing_if = "is_default_claude_gateway_proxy_url"
-    )]
-    pub claude_gateway_proxy_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_poll_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1808,6 +1958,11 @@ impl RuntimeSettingsConfig {
         self.delivery_journal_mode == DeliveryJournalMode::Legacy
             && self.delivery_journal_cohort_percent == 0
             && self.delivery_journal_internal_channel_ids.is_empty()
+            && self.intake_delivery_settlement == IntakeDeliverySettlementStage::Off
+            && self.execution_identity_mode == ExecutionIdentityMode::Legacy
+            && self.intake_delivery_sweep_dispatched_cutoff_secs.is_none()
+            && self.intake_delivery_sweep_spawned_cutoff_secs.is_none()
+            && self.intake_delivery_sweep_batch_limit.is_none()
             && self.requested_timeout_min.is_none()
             && self.in_progress_stale_min.is_none()
             && self.long_turn_alert_interval_min.is_none()
@@ -1815,8 +1970,6 @@ impl RuntimeSettingsConfig {
             && self.context_compact_percent_codex.is_none()
             && self.context_compact_percent_claude.is_none()
             && self.context_compact_lower_bound_tokens.is_none()
-            && !self.claude_gateway_proxy_enabled
-            && is_default_claude_gateway_proxy_url(&self.claude_gateway_proxy_url)
             && self.dispatch_poll_sec.is_none()
             && self.agent_sync_sec.is_none()
             && self.github_issue_sync_sec.is_none()
@@ -1848,30 +2001,24 @@ impl RuntimeSettingsConfig {
             && self.dispatch_rate_limit_gate_danger_pct.is_none()
             && !self.reset_overrides_on_restart
     }
-}
 
-pub(crate) const DEFAULT_CLAUDE_GATEWAY_PROXY_URL: &str = "http://127.0.0.1:10100";
-
-fn default_claude_gateway_proxy_url() -> String {
-    DEFAULT_CLAUDE_GATEWAY_PROXY_URL.to_string()
-}
-
-fn is_default_claude_gateway_proxy_url(value: &str) -> bool {
-    value.is_empty() || value == DEFAULT_CLAUDE_GATEWAY_PROXY_URL
+    pub(crate) fn intake_delivery_sweep_settings(&self) -> (u64, u64, i64) {
+        (
+            self.intake_delivery_sweep_dispatched_cutoff_secs
+                .unwrap_or(1800)
+                .min(MAX_INTAKE_SWEEP_CUTOFF_SECS),
+            self.intake_delivery_sweep_spawned_cutoff_secs
+                .unwrap_or(1800)
+                .min(MAX_INTAKE_SWEEP_CUTOFF_SECS),
+            self.intake_delivery_sweep_batch_limit
+                .unwrap_or(200)
+                .clamp(1, 500) as i64,
+        )
+    }
 }
 
 fn is_zero_u8(value: &u8) -> bool {
     *value == 0
-}
-
-impl RuntimeSettingsConfig {
-    pub(crate) fn resolved_claude_gateway_proxy_url(&self) -> &str {
-        if self.claude_gateway_proxy_url.is_empty() {
-            DEFAULT_CLAUDE_GATEWAY_PROXY_URL
-        } else {
-            &self.claude_gateway_proxy_url
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1883,8 +2030,50 @@ mod runtime_hook_registry_config_tests {
     // (otherwise the `skip_serializing_if = "RuntimeSettingsConfig::is_empty"`
     // on the parent would drop the operator's override on a round-trip).
     #[test]
-    fn hook_registry_keys_count_toward_is_empty() {
+    fn hook_registry_keys_count_toward_is_empty_and_pin_authority_serde_contract() {
         assert!(RuntimeSettingsConfig::default().is_empty());
+
+        // The DESERIALIZED empty section must also report empty, not just the
+        // `Default` impl. These are separate paths: serde builds each field from
+        // its own `#[serde(default = "…")]` attribute, so a field whose serde
+        // default diverges from `Default` (or whose non-`Option` default is not
+        // accounted for in `is_empty`) makes `{}` deserialize to a non-empty
+        // section while the assertion above still passes. That would mark the
+        // `runtime` section present in EVERY config, and only this positive
+        // direction catches it — the negative assertions below never can.
+        // This assertion preserves coverage of the serde-deserialization path.
+        let absent: RuntimeSettingsConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(absent.delivery_journal_mode, DeliveryJournalMode::Legacy);
+        assert_eq!(absent.delivery_journal_cohort_percent, 0);
+        assert_eq!(
+            absent.intake_delivery_settlement,
+            IntakeDeliverySettlementStage::Off
+        );
+        assert!(!absent.delivery_journal_mode.records_shadow_observations());
+        assert!(!absent.delivery_journal_mode.reads_as_authority());
+        assert!(absent.is_empty());
+
+        let authority: RuntimeSettingsConfig =
+            serde_yaml::from_str("delivery_journal_mode: authority\n").unwrap();
+        assert_eq!(
+            authority.delivery_journal_mode,
+            DeliveryJournalMode::Authority
+        );
+        assert_eq!(authority.delivery_journal_cohort_percent, 0);
+        assert!(
+            authority
+                .delivery_journal_mode
+                .records_shadow_observations()
+        );
+        assert!(authority.delivery_journal_mode.reads_as_authority());
+        assert!(!authority.is_empty());
+        assert_eq!(
+            serde_yaml::from_str::<RuntimeSettingsConfig>(
+                &serde_yaml::to_string(&authority).unwrap()
+            )
+            .unwrap(),
+            authority
+        );
 
         let ttl_only = RuntimeSettingsConfig {
             tui_hook_buffer_ttl_secs: Some(45),
@@ -1904,26 +2093,6 @@ mod runtime_hook_registry_config_tests {
             ..RuntimeSettingsConfig::default()
         };
         assert!(!disabled.is_empty());
-    }
-
-    #[test]
-    fn claude_gateway_proxy_defaults_off_with_loopback_url() {
-        let parsed: RuntimeSettingsConfig = serde_yaml::from_str("{}").unwrap();
-        assert!(!parsed.claude_gateway_proxy_enabled);
-        assert_eq!(
-            parsed.claude_gateway_proxy_url,
-            DEFAULT_CLAUDE_GATEWAY_PROXY_URL
-        );
-        assert!(parsed.is_empty());
-
-        let enabled: RuntimeSettingsConfig =
-            serde_yaml::from_str("claude_gateway_proxy_enabled: true\n").unwrap();
-        assert!(enabled.claude_gateway_proxy_enabled);
-        assert_eq!(
-            enabled.resolved_claude_gateway_proxy_url(),
-            DEFAULT_CLAUDE_GATEWAY_PROXY_URL
-        );
-        assert!(!enabled.is_empty());
     }
 
     // The keys survive a YAML round-trip with their types intact, and an absent
@@ -1948,6 +2117,134 @@ mod runtime_hook_registry_config_tests {
         assert_eq!(empty.tui_hook_buffer_ttl_secs, None);
         assert_eq!(empty.tui_unclaimed_stop_delay_ms, None);
         assert_eq!(empty.tui_hook_registry_enabled, None);
+    }
+
+    #[test]
+    fn intake_delivery_settlement_defaults_off_and_round_trips() {
+        let default = RuntimeSettingsConfig::default();
+        assert_eq!(
+            default.intake_delivery_settlement,
+            IntakeDeliverySettlementStage::Off
+        );
+        assert!(
+            !serde_yaml::to_string(&default)
+                .expect("serialize default runtime")
+                .contains("intake_delivery_settlement")
+        );
+
+        for stage in [
+            IntakeDeliverySettlementStage::Off,
+            IntakeDeliverySettlementStage::Observe,
+            IntakeDeliverySettlementStage::Settle,
+            IntakeDeliverySettlementStage::Enforce,
+        ] {
+            let yaml = format!(
+                "intake_delivery_settlement: {}\n",
+                serde_yaml::to_value(stage)
+                    .expect("serialize stage")
+                    .as_str()
+                    .expect("stage serializes as a string")
+            );
+            let parsed: RuntimeSettingsConfig =
+                serde_yaml::from_str(&yaml).expect("parse settlement stage");
+            assert_eq!(parsed.intake_delivery_settlement, stage);
+            assert_eq!(
+                serde_yaml::from_str::<RuntimeSettingsConfig>(
+                    &serde_yaml::to_string(&parsed).expect("serialize runtime")
+                )
+                .expect("reparse runtime"),
+                parsed
+            );
+        }
+    }
+
+    // #5071 T3-A0: an operator who never writes the key must land on `Legacy`,
+    // which consults no nonce for a deny and records no observation. The serde-deserialization
+    // path is asserted separately from the `Default` impl because the two are
+    // independent, and `is_empty` must account for the new field or a config
+    // that sets ONLY this key loses it on a round-trip.
+    #[test]
+    fn execution_identity_mode_defaults_legacy_and_round_trips() {
+        let default = RuntimeSettingsConfig::default();
+        assert_eq!(
+            default.execution_identity_mode,
+            ExecutionIdentityMode::Legacy
+        );
+        assert!(
+            !serde_yaml::to_string(&default)
+                .expect("serialize default runtime")
+                .contains("execution_identity_mode")
+        );
+
+        let absent: RuntimeSettingsConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(
+            absent.execution_identity_mode,
+            ExecutionIdentityMode::Legacy
+        );
+        assert!(
+            !absent
+                .execution_identity_mode
+                .records_identity_observations()
+        );
+        assert!(
+            !absent
+                .execution_identity_mode
+                .denies_on_incarnation_mismatch()
+        );
+        assert!(absent.is_empty());
+
+        for mode in [
+            ExecutionIdentityMode::Legacy,
+            ExecutionIdentityMode::Observe,
+            ExecutionIdentityMode::Enforce,
+        ] {
+            let yaml = format!(
+                "execution_identity_mode: {}\n",
+                serde_yaml::to_value(mode)
+                    .expect("serialize mode")
+                    .as_str()
+                    .expect("mode serializes as a string")
+            );
+            let parsed: RuntimeSettingsConfig =
+                serde_yaml::from_str(&yaml).expect("parse execution identity mode");
+            assert_eq!(parsed.execution_identity_mode, mode);
+            assert_eq!(
+                parsed.is_empty(),
+                mode == ExecutionIdentityMode::Legacy,
+                "a non-Legacy mode must keep the runtime section serialized"
+            );
+            assert_eq!(
+                serde_yaml::from_str::<RuntimeSettingsConfig>(
+                    &serde_yaml::to_string(&parsed).expect("serialize runtime")
+                )
+                .expect("reparse runtime"),
+                parsed
+            );
+        }
+    }
+
+    #[test]
+    fn intake_delivery_sweep_cutoffs_clamp_before_chrono_conversion() {
+        let runtime = RuntimeSettingsConfig {
+            intake_delivery_sweep_dispatched_cutoff_secs: Some(u64::MAX),
+            intake_delivery_sweep_spawned_cutoff_secs: Some(u64::MAX),
+            ..RuntimeSettingsConfig::default()
+        };
+        let (dispatched, spawned, _) = runtime.intake_delivery_sweep_settings();
+        assert_eq!(
+            (dispatched, spawned),
+            (MAX_INTAKE_SWEEP_CUTOFF_SECS, MAX_INTAKE_SWEEP_CUTOFF_SECS)
+        );
+    }
+
+    #[test]
+    fn intake_delivery_sweep_initial_delay_stays_within_boot_grace_contract() {
+        assert!((60..=180).contains(&INTAKE_DELIVERY_SWEEP_INITIAL_DELAY_SECS));
+    }
+
+    #[test]
+    fn intake_delivery_sweep_lock_timeout_stays_within_short_retry_contract() {
+        assert!((1..=5).contains(&INTAKE_DELIVERY_SWEEP_LOCK_TIMEOUT_SECS));
     }
 }
 

@@ -11,7 +11,6 @@ pub(crate) mod claude_command;
 pub mod claude_compact_context;
 pub mod claude_compact_trigger;
 pub mod claude_e;
-pub(crate) mod claude_gateway_proxy;
 pub mod claude_tui;
 pub mod cluster;
 pub mod codex;
@@ -105,6 +104,7 @@ pub mod queue;
 pub mod qwen;
 #[cfg(unix)]
 pub mod qwen_tmux_wrapper;
+pub(crate) mod release_source;
 // #3034: 2 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during remote_stub dead-code cleanup.
 #[allow(dead_code)]

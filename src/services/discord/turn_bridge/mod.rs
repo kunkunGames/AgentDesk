@@ -13,6 +13,7 @@ mod finalize_epilogue;
 mod followup_requeue;
 mod guards;
 mod headless_delivery;
+pub(in crate::services::discord) mod intake_settlement;
 mod memory_lifecycle;
 mod output_lifecycle;
 mod panel_lifecycle;
@@ -257,6 +258,7 @@ pub(super) fn spawn_turn_bridge(
     mut bridge: TurnBridgeContext,
 ) {
     use tracing::Instrument;
+    intake_settlement::bind_bridge_turn_snapshot(&shared_owned, &mut bridge);
     let bridge_turn_id = discord_turn_id(
         &bridge.provider,
         bridge.channel_id,
@@ -710,10 +712,8 @@ pub(super) fn spawn_turn_bridge(
                 return;
             }
         }
-        let pending_long_running_open_after_state_save =
-            stream_loop_output.pending_long_running_open_after_state_save;
-        let pending_long_running_retarget_after_state_save =
-            stream_loop_output.pending_long_running_retarget_after_state_save;
+        #[rustfmt::skip]
+        let (pending_long_running_open_after_state_save, pending_long_running_retarget_after_state_save) = (stream_loop_output.pending_long_running_open_after_state_save, stream_loop_output.pending_long_running_retarget_after_state_save);
 
         let post_loop_finalize_output = post_loop_finalize::run_post_loop_finalize(
             post_loop_finalize::PostLoopFinalizeContext {
@@ -788,7 +788,6 @@ pub(super) fn spawn_turn_bridge(
         #[cfg(unix)]
         let bridge_tui_gate_outcome_early =
             post_loop_finalize_output.bridge_tui_gate_outcome_early;
-
         let terminal_outcome_delivery_output =
             terminal_outcome_delivery::run_terminal_outcome_delivery(
                 terminal_outcome_delivery::TerminalOutcomeDeliveryContext {
@@ -801,6 +800,7 @@ pub(super) fn spawn_turn_bridge(
                     recovery_retry,
                     rx_disconnected,
                     tmux_last_offset,
+                    codex_tui_terminal_range: stream_loop_output.codex_tui_terminal_range,
                     watcher_owner_channel_id,
                     watcher_handoff_claim_outcome,
                     bridge_created_response_placeholder_msg_id,

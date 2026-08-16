@@ -8,6 +8,17 @@ use std::num::NonZeroU64;
 use super::*;
 use crate::services::agent_protocol::TaskNotificationKind;
 
+mod identity;
+mod serde_adapters;
+mod turn_kinds;
+
+pub(in crate::services::discord) use identity::InflightTurnIdentity;
+use serde_adapters::{
+    deserialize_relay_owner_kind_tolerant, deserialize_runtime_kind_tolerant,
+    deserialize_task_notification_kind, serialize_task_notification_kind,
+};
+pub(in crate::services::discord) use turn_kinds::{RelayOwnerKind, TurnSource};
+
 /// Build an optional `serenity::MessageId` from a possibly-zero raw persisted id.
 ///
 /// A zero message id is a legitimate sentinel for an unanchored TUI-direct or
@@ -117,6 +128,15 @@ pub(in crate::services::discord) struct InflightTurnState {
     pub thread_title: Option<String>,
     pub request_owner_user_id: u64,
     pub user_msg_id: u64,
+    /// Primary key of the `intake_outbox` row that produced this turn. Worker
+    /// turns carry `Some`; leader-local and legacy turns carry `None`. Production
+    /// construction sets it through `adopt_intake_outbox`; serde deserialization
+    /// intentionally restores the persisted value for state-file compatibility.
+    #[serde(default)]
+    intake_outbox_id: Option<i64>,
+    /// Transient bridge-turn authority; never persisted or restored from disk.
+    #[serde(skip)]
+    intake_delivery_capabilities: crate::services::discord::runtime_bootstrap::intake_delivery_capability::SettlementCapabilities,
     /// Queue-merge source identity for the durable retry budget and notice.
     #[serde(default)]
     pub busy_followup_retry_user_msg_id: u64,
@@ -499,92 +519,6 @@ pub(in crate::services::discord) struct InflightTurnState {
     pub streaming_rollover_frozen_msg_ids: Vec<u64>,
 }
 
-/// Origin of a turn whose state is captured in [`InflightTurnState`]. Pure
-/// audit metadata for #2285 / #2161 — callers must not branch RELAY routing on
-/// this value; the session-bound relay (epic #2285 E1–E5) treats every matched
-/// session uniformly.
-///
-/// EXCEPTION (#3969, behavioral dependency — do not silently regress): the
-/// watcher's completion-footer suppression for #3089 footer chrome DOES key on
-/// `turn_source == Managed`. The #3089 footer is kept only for Discord-origin
-/// (`Managed`) turns; every non-`Managed` mirror origin (e.g. `/loop`
-/// self-paced / monitor / external-input TUI mirrors) suppresses the footer. So
-/// the `Managed` discriminant is now load-bearing for that footer decision —
-/// preserve this carve-out when changing how `turn_source` is assigned.
-///
-/// EXCEPTION (#4455): Codex manual rebind uses the origin only to choose the
-/// conservative timestamp ordering for prompt evidence. Managed/monitor rows
-/// are born before prompt injection; external-input/adopted rows are observed
-/// after the rollout prompt exists. Missing evidence never changes ownership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::services::discord) enum TurnSource {
-    /// AgentDesk-launched tmux session via the normal Discord intake path.
-    /// This is the historical default for every legacy row.
-    #[default]
-    Managed,
-    /// Triggered by a Monitor pattern auto-turn synthesised on top of an
-    /// existing managed session (`TaskNotificationKind::MonitorAutoTurn`).
-    MonitorTriggered,
-    /// User typed directly into the tmux pane (SSH / local tty) while the
-    /// pane was bound to a Discord channel. Detected by the watcher when
-    /// rollout activity advances without a Discord-origin inflight in
-    /// place.
-    ExternalInput,
-    /// AgentDesk discovered a session created externally (e.g. operator ran
-    /// `tmux new -s <expected>` and started a provider) and adopted it via
-    /// `SessionDiscovery` + `SessionRegistry` (epic #2285 E2). Distinct
-    /// from `ExternalInput` (which keeps an existing Discord-bound session
-    /// running) — `ExternalAdopted` is the *first* time AgentDesk sees the
-    /// session.
-    ExternalAdopted,
-}
-
-/// Active relay owner persisted with an in-flight turn.
-///
-/// `None` preserves the historical bridge-owned/default shape. `Watcher` is
-/// equivalent to legacy `watcher_owns_live_relay = true`. `StandbyRelay`
-/// captures the cluster-standby JSONL relay: it does not own a tmux watcher
-/// slot, but it does own live Discord delivery while it is running. `Unknown`
-/// is a conservative forward-compat fallback for future live-owner variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::services::discord) enum RelayOwnerKind {
-    #[default]
-    None,
-    Watcher,
-    StandbyRelay,
-    SessionBoundRelay,
-    Unknown,
-}
-
-impl RelayOwnerKind {
-    pub(in crate::services::discord) fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Watcher => "watcher",
-            Self::StandbyRelay => "standby_relay",
-            Self::SessionBoundRelay => "session_bound_relay",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl TurnSource {
-    /// Stable wire representation for audit logs / metrics labels.
-    // #3034: wire-contract surface pinned by the unit tests below; not yet read
-    // by a live audit/metrics callsite.
-    #[allow(dead_code)]
-    pub(in crate::services::discord) fn as_str(self) -> &'static str {
-        match self {
-            Self::Managed => "managed",
-            Self::MonitorTriggered => "monitor_triggered",
-            Self::ExternalInput => "external_input",
-            Self::ExternalAdopted => "external_adopted",
-        }
-    }
-}
-
 #[cfg(test)]
 mod turn_source_tests {
     use super::{InflightTurnState, RelayOwnerKind, TurnSource};
@@ -924,6 +858,46 @@ mod turn_source_tests {
             serde_json::json!(3)
         );
     }
+
+    #[test]
+    fn intake_outbox_id_is_additive_and_bidirectionally_compatible() {
+        #[derive(serde::Deserialize)]
+        struct LegacyStateProjection {
+            version: u32,
+            provider: String,
+        }
+
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            42,
+            Some("adk-cdx".to_string()),
+            7,
+            8,
+            9,
+            "hello".to_string(),
+            None,
+            Some("AgentDesk-claude-adk-cdx".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.adopt_intake_outbox(Some(5071));
+        let mut encoded = serde_json::to_value(&state).expect("serialize intake id");
+        assert_eq!(encoded["intake_outbox_id"], serde_json::json!(5071));
+
+        let old_reader: LegacyStateProjection =
+            serde_json::from_value(encoded.clone()).expect("old reader ignores additive field");
+        assert_eq!(old_reader.version, state.version);
+        assert_eq!(old_reader.provider, "claude");
+
+        encoded
+            .as_object_mut()
+            .expect("state serializes as object")
+            .remove("intake_outbox_id");
+        let legacy: InflightTurnState =
+            serde_json::from_value(encoded).expect("new reader accepts legacy state");
+        assert_eq!(legacy.intake_outbox_id(), None);
+    }
 }
 
 impl InflightTurnState {
@@ -974,6 +948,8 @@ impl InflightTurnState {
             thread_title: None,
             request_owner_user_id,
             user_msg_id,
+            intake_outbox_id: None,
+            intake_delivery_capabilities: Default::default(),
             busy_followup_retry_user_msg_id: user_msg_id,
             finalizer_turn_id,
             status_message_id: None,
@@ -1047,6 +1023,37 @@ impl InflightTurnState {
             followup_preserve_on_cancel: false,
             streaming_rollover_frozen_msg_ids: Vec::new(),
         }
+    }
+
+    /// Adopt the intake outbox identity at the sole production construction
+    /// boundary. Deserialization separately restores persisted state and is not
+    /// a runtime wiring entry point. Once present, the identity is immutable so
+    /// a later adoption attempt cannot replace the durable row association.
+    pub(in crate::services::discord) fn adopt_intake_outbox(
+        &mut self,
+        intake_outbox_id: Option<i64>,
+    ) {
+        if self.intake_outbox_id.is_none() {
+            self.intake_outbox_id = intake_outbox_id;
+        }
+    }
+
+    pub(in crate::services::discord) fn intake_outbox_id(&self) -> Option<i64> {
+        self.intake_outbox_id
+    }
+
+    pub(in crate::services::discord) fn bind_intake_delivery_capabilities(
+        &mut self,
+        capabilities: crate::services::discord::runtime_bootstrap::intake_delivery_capability::SettlementCapabilities,
+    ) {
+        self.intake_delivery_capabilities = capabilities;
+    }
+
+    pub(in crate::services::discord) fn intake_delivery_capabilities(
+        &self,
+    ) -> crate::services::discord::runtime_bootstrap::intake_delivery_capability::SettlementCapabilities
+    {
+        self.intake_delivery_capabilities
     }
 
     pub fn provider_kind(&self) -> Option<ProviderKind> {
@@ -1246,103 +1253,4 @@ impl InflightTurnState {
         self.followup_voice_announcement = voice_announcement;
         self.followup_preserve_on_cancel = preserve_on_cancel;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::services::discord) struct InflightTurnIdentity {
-    pub user_msg_id: u64,
-    pub started_at: String,
-    pub tmux_session_name: Option<String>,
-    /// #3041 P1-3 (codex P1-3 issue 2): the turn's `turn_start_offset` — the JSONL
-    /// byte offset at which this turn began. Disambiguates two consecutive
-    /// `user_msg_id == 0` TUI-direct turns whose `started_at` collides at
-    /// `now_string`'s 1-second resolution; monotonic per turn → unique identity.
-    pub turn_start_offset: Option<u64>,
-}
-
-impl InflightTurnIdentity {
-    pub(in crate::services::discord) fn from_state(state: &InflightTurnState) -> Self {
-        Self {
-            user_msg_id: state.user_msg_id,
-            started_at: state.started_at.clone(),
-            tmux_session_name: state.tmux_session_name.clone(),
-            turn_start_offset: state.turn_start_offset,
-        }
-    }
-
-    pub(in crate::services::discord) fn matches_state(&self, state: &InflightTurnState) -> bool {
-        self.user_msg_id == state.user_msg_id
-            && self.started_at == state.started_at
-            && self.tmux_session_name == state.tmux_session_name
-            // #3419 R3 (codex MEDIUM): keep the clear key == full-struct-eq decision key (TOCTOU on offset-only-diff rows).
-            && self.turn_start_offset == state.turn_start_offset
-    }
-}
-
-/// #2235: tolerant deserializer for `runtime_kind`. A newer binary may write
-/// a `RuntimeHandoffKind` variant this binary does not know about; serde's
-/// default `deny_unknown_variants` posture would propagate a parse error and
-/// `load_inflight_states_from_root` would delete the entire row as malformed
-/// (`inflight_malformed_json_graceful_skip`). Instead we map unknown strings
-/// to `None`. The recovery engine consults this `None` together with the
-/// row-shape heuristic to decide whether to silent-skip recovery (issue
-/// #2235 DoD #3) instead of guessing a runtime and surfacing a misleading
-/// "input fifo path missing" notice.
-fn deserialize_runtime_kind_tolerant<'de, D>(
-    deserializer: D,
-) -> Result<Option<RuntimeHandoffKind>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.as_deref().and_then(|value| match value {
-        "legacy_tmux_wrapper" => Some(RuntimeHandoffKind::LegacyTmuxWrapper),
-        "claude_tui" => Some(RuntimeHandoffKind::ClaudeTui),
-        "codex_tui" => Some(RuntimeHandoffKind::CodexTui),
-        "process_backend" => Some(RuntimeHandoffKind::ProcessBackend),
-        "claude_e_adapter" => Some(RuntimeHandoffKind::ClaudeEAdapter),
-        _ => None,
-    }))
-}
-
-/// #2376: tolerant deserializer for `relay_owner_kind`. Older binaries must
-/// not delete an otherwise valid inflight row just because a newer binary
-/// wrote a relay-owner variant they do not understand.
-fn deserialize_relay_owner_kind_tolerant<'de, D>(
-    deserializer: D,
-) -> Result<RelayOwnerKind, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(match raw.as_deref() {
-        Some("watcher") => RelayOwnerKind::Watcher,
-        Some("standby_relay") => RelayOwnerKind::StandbyRelay,
-        Some("session_bound_relay") => RelayOwnerKind::SessionBoundRelay,
-        Some("none") | None => RelayOwnerKind::None,
-        _ => RelayOwnerKind::Unknown,
-    })
-}
-
-fn serialize_task_notification_kind<S>(
-    value: &Option<TaskNotificationKind>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match value {
-        Some(kind) => serializer.serialize_some(kind.as_str()),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn deserialize_task_notification_kind<'de, D>(
-    deserializer: D,
-) -> Result<Option<TaskNotificationKind>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    Ok(value.as_deref().and_then(TaskNotificationKind::from_str))
 }

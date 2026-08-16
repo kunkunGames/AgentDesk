@@ -178,6 +178,15 @@ jobs:
               # required mirror is `Fast targeted tests (ubuntu-latest)`.
               - 'src/services/discord/inflight.rs'
               - 'src/services/discord/inflight/**'
+              # #5071 T2-W S-W1: the bridge-handoff stamp and its PG-backed
+              # sidecar tests must select the PostgreSQL lane together.
+              - 'src/services/cluster/intake_worker.rs'
+              - 'src/services/cluster/intake_worker/**'
+              - 'src/services/discord/router/message_handler/intake_turn.rs'
+              - 'src/services/discord/router/message_handler/intake_turn/**'
+              - 'src/services/discord/runtime_bootstrap/intake_delivery_capability.rs'
+              - 'src/services/discord/runtime_bootstrap/intake_delivery_capability/**'
+              - 'src/services/discord/runtime_bootstrap/**'
               - 'src/services/discord/tmux_watcher.rs'
               - 'src/services/discord/tmux_watcher/**'
               - 'src/services/discord/turn_bridge/terminal_outcome_delivery.rs'
@@ -921,13 +930,19 @@ jobs:
   # THIS JOB NEEDS POSTGRESQL, even though its filters are named for excluding
   # it. The canonical non-PG filter is a substring filter over test
   # ids, and PostgreSQL dependence is a property of a test *body*. The two do
-  # not coincide: `scripts/pg_test_lane_manifest.txt` classifies 477 library
-  # tests as PG-dependent and 55 of them carry none of those three substrings
-  # in their id, so this lane selects those 55. That residual was 61 until
-  # #5218 renamed `server::multinode_regression::tests` (5 ids) and the
-  # Postgres half of `server::issue_specs::tests` (1 id) into `_pg_` modules,
-  # which handed those 6 to the id-filtered `test_fast` lane; the count moves
-  # again whenever a module gains or loses a lane token.
+  # not coincide: `scripts/pg_test_lane_manifest.txt` classifies 625 library
+  # tests as PG-dependent and 68 of them carry none of those three substrings
+  # in their id, so this lane selects those 68. Both figures are what
+  # `scripts/check_pg_test_lane_membership.py` prints at this commit (the
+  # residual is its `rule2` count); rerun it rather than trusting this
+  # sentence. The residual was 61 until #5218 renamed
+  # `server::multinode_regression::tests` (5 ids) and the Postgres half of
+  # `server::issue_specs::tests` (1 id) into `_pg_` modules, which handed
+  # those 6 to the id-filtered `test_fast` lane, leaving 55; #5266 then
+  # widened *discovery* (Rust-2018 sibling module paths, and `#[test]` items
+  # that sit outside an inline `#[cfg(test)] mod`) and surfaced pre-existing
+  # tests neither figure had been counting. The count moves again whenever a
+  # module gains or loses a lane token, or whenever discovery widens.
   #
   # The two counts move independently, and #5142 is the worked example: it took
   # the PG-dependent total from 460 to 477 while leaving the residual at 55 --
@@ -1251,7 +1266,7 @@ jobs:
         run: ./scripts/required-check-mirror.sh
 
   scripts:
-    name: Script checks
+    name: Script checks runner
     needs: changes
     runs-on: ubuntu-latest
     steps:
@@ -1311,9 +1326,25 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get install -y shellcheck
 
+      # This direct PR-job step is deliberately outside the aggregate it
+      # inspects, so deleting an aggregate writer gate or its wiring test cannot
+      # also prevent the deletion check from running.
+      - name: Protect writer gate aggregate wiring (#5308)
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          python3 scripts/check_writer_gate_ci_wiring.py
+          python3 -m unittest tests.test_writer_gate_ci_wiring
+          scripts/check-ci-runner-hardening.sh
+
       - name: Run script checks
+        shell: bash
         run: ./scripts/ci-script-checks.sh
         env:
+          # Keep the aggregate interpreter and non-interactive Bash startup
+          # behavior explicit at the protected step boundary.
+          BASH_ENV: /dev/null
+          PYTHON: python3
           # Required Script checks only run on protected PR candidates. Their
           # synthetic merge first parent is the exact immutable base snapshot.
           TEST_LANE_BASELINE_REF: HEAD^1
@@ -1344,6 +1375,57 @@ jobs:
           path: target/maintainability-audit.yaml
           if-no-files-found: ignore
           retention-days: 14
+
+  scripts_required_context:
+    name: Script checks
+    needs:
+      - changes
+      - scripts
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin the shared result primitive out-of-band before running structural
+      # checks. Intentional helper edits must update this value, the independent
+      # relay-authority backstop below, and check-ci-runner-hardening.sh together.
+      - name: Verify Script checks mirror contract (#5321)
+        env:
+          BASH_ENV: /dev/null
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          helper_path=scripts/required-check-mirror.sh
+          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update all three #5321 pins together"
+            exit 1
+          fi
+          gate_path=scripts/check-ci-runner-hardening.sh
+          expected=9be327684586ffccd0ccd5ac99db81cf4af45e6425bd4deab402fb9eb8f27a56
+          actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
+            exit 1
+          fi
+          scripts/check-ci-runner-hardening.sh
+          python3 scripts/check_writer_gate_ci_wiring.py
+
+      # Keep the branch-protection context on an unconditional result mirror.
+      # required-check-mirror.sh fails closed when either `changes` or the
+      # execution job is skipped, failed, or cancelled, regardless of which
+      # upstream primitive caused that result.
+      - name: Mirror script checks result for branch protection
+        env:
+          BASH_ENV: /dev/null
+          PYTHON: python3
+          CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
+          FILTER_NAME: scripts
+          FILTER_OUTPUT: true
+          UPSTREAM_JOB_NAME: scripts
+          UPSTREAM_RESULT: ${{ needs.scripts.result }}
+        run: ./scripts/required-check-mirror.sh
 
   # #5071 T0: this required-context candidate is intentionally unconditional.
   # Its version-controlled manifest names every current T1-T5 contract target,
@@ -1404,6 +1486,34 @@ jobs:
         shell: bash
         timeout-minutes: 30
         run: bash scripts/run_relay_authority_mutations.sh
+
+      # Independent out-of-band backstop: conditional helper or gate mutations
+      # still change bytes and must fail this required, unconditional context.
+      # Run the gate only after its bytes match the reviewed pin, so this job
+      # catches a skipped Script checks publisher as well as helper tampering.
+      - name: Pin required-check mirror content (#5321)
+        env:
+          BASH_ENV: /dev/null
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          helper_path=scripts/required-check-mirror.sh
+          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update all three #5321 pins together"
+            exit 1
+          fi
+          gate_path=scripts/check-ci-runner-hardening.sh
+          expected=9be327684586ffccd0ccd5ac99db81cf4af45e6425bd4deab402fb9eb8f27a56
+          actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
+            exit 1
+          fi
+          scripts/check-ci-runner-hardening.sh
 
       - name: sccache stats
         if: always()

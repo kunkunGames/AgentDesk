@@ -45,6 +45,13 @@ use super::tmux_restart_handoff::{
 use super::{
     SharedData, TmuxWatcherHandle, TmuxWatcherRegistry, lock_tmux_watcher_registry, rate_limit_wait,
 };
+// #5071 T3-A0: `.spawn_nonce` read model, registered here so it sits beside the
+// `tmux_session_files` reader it reuses and inherits this file's unix gate.
+// T3-A1 made `tmux_watcher_registry` its consumer, and that module is NOT
+// unix-gated, so the module is visible module-wide behind that file's own
+// `cfg(unix)`/`cfg(not(unix))` shim pair.
+#[path = "execution_identity.rs"]
+pub(in crate::services::discord) mod execution_identity;
 #[path = "tmux_placeholder_suppression/mod.rs"]
 mod placeholder_suppression;
 #[path = "tmux_reattach_offsets.rs"]

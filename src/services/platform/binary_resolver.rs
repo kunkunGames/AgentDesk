@@ -873,20 +873,6 @@ where
     output
 }
 
-fn configure_version_probe_command(command: &mut Command, resolution: &BinaryResolution) {
-    apply_binary_resolution(command, resolution);
-    if resolution.requested_binary == "claude" {
-        // `--version` never routes models or spawns subagents, so probes always
-        // run native (Scrub). The gateway policy for this launch class lives in
-        // the single chokepoint authority (`VersionProbe => Scrub`); turn
-        // launches take the `Turn` intent there.
-        crate::services::claude_command::ClaudeLaunchEnv::resolve(
-            crate::services::claude_command::ClaudeLaunchIntent::VersionProbe,
-        )
-        .apply_to_command(command);
-    }
-}
-
 pub fn probe_resolved_binary_version(
     binary_path: impl AsRef<OsStr>,
     resolution: &BinaryResolution,
@@ -903,7 +889,7 @@ pub fn probe_resolved_binary_version(
         .into_command()
     } else {
         let mut command = Command::new(binary_path);
-        configure_version_probe_command(&mut command, resolution);
+        apply_binary_resolution(&mut command, resolution);
         command
     };
     command.arg("--version");
@@ -1498,57 +1484,6 @@ fn record_context_launch_artifact(
 mod tests {
     use super::*;
 
-    fn configured_probe_env(provider: &str) -> HashMap<String, Option<String>> {
-        let resolution = BinaryResolution {
-            requested_binary: provider.to_string(),
-            resolved_path: Some(format!("/test/bin/{provider}")),
-            canonical_path: None,
-            source: Some("test".to_string()),
-            attempts: Vec::new(),
-            failure_kind: None,
-            exec_path: Some("/test/bin".to_string()),
-        };
-        let mut command = Command::new(provider);
-        command
-            .env("ANTHROPIC_BASE_URL", "http://inherited.example:9999")
-            .env(
-                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-                "inherited-value",
-            );
-        configure_version_probe_command(&mut command, &resolution);
-        command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.map(|value| value.to_string_lossy().into_owned()),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn version_probe_scrubs_gateway_env_only_for_claude() {
-        let claude_env = configured_probe_env("claude");
-        assert_eq!(claude_env.get("ANTHROPIC_BASE_URL"), Some(&None));
-        assert_eq!(
-            claude_env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
-            Some(&None)
-        );
-
-        for provider in ["codex", "qwen"] {
-            let provider_env = configured_probe_env(provider);
-            assert_eq!(
-                provider_env.get("ANTHROPIC_BASE_URL"),
-                Some(&Some("http://inherited.example:9999".to_string()))
-            );
-            assert_eq!(
-                provider_env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"),
-                Some(&Some("inherited-value".to_string()))
-            );
-        }
-    }
-
     #[test]
     fn parses_codex_cli_semver_from_version_output() {
         assert_eq!(
@@ -1658,17 +1593,36 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
-    /// Process-global lock serializing the `#[cfg(unix)]` tests that mutate
+    /// Lock serializing the `#[cfg(unix)]` tests that mutate
     /// `AGENTDESK_CLAUDE_PATH` / `PATH`. The Rust harness runs tests in parallel
     /// threads within one binary, so two env-mutating seal tests would otherwise
-    /// race on the same variables. Poison is recovered (a mutation-demo panic
-    /// while holding the lock must not cascade into unrelated failures).
+    /// race on the same variables.
+    ///
+    /// #5400: this MUST be the crate-wide
+    /// [`crate::config::shared_test_env_lock`] and not a module-private mutex.
+    /// `resolve_provider_binary_redacts_claude_paths_in_attempts` REPLACES the
+    /// process-global `PATH` with a temp dir holding only a `claude` stub, and
+    /// `PATH` is process-global state that reaches far past this module: on
+    /// non-Windows [`git_binary`] resolves to the bare name `git`, so every
+    /// `Command::new(git_binary())` in the crate performs its lookup against
+    /// whatever `PATH` holds AT SPAWN TIME. A module-private mutex excludes the
+    /// other tests in this module and nothing else, so any test running
+    /// concurrently on another harness thread saw its git subprocesses fail to
+    /// spawn with `ENOENT` for the duration of the override. That surfaced as
+    /// `worktree_orphan_sweep`'s
+    /// `terminal_managed_worktree_is_swept_via_recursion` intermittently
+    /// failing in full-suite runs: `cleanup_managed_worktree` maps a git spawn
+    /// error onto its fail-closed KEEP arms (`skipped_dirty` when
+    /// `git status --porcelain` cannot run, `skipped_unmerged` when
+    /// `git rev-parse`/`merge-base` cannot), so the worktree was reported as
+    /// "not removed" with no trace of the real cause.
+    ///
+    /// Poison is recovered by the canonical acquisition path (a mutation-demo
+    /// panic while holding the lock must not cascade into unrelated failures),
+    /// which also rejects same-thread re-entry.
     #[cfg(unix)]
-    fn env_mutation_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn env_mutation_lock() -> crate::config::test_env_lock::SharedTestEnvLockGuard {
+        crate::config::test_env_lock::acquire_shared_test_env_lock()
     }
 
     /// Scoped guard that sets an env var to a value and restores the previous

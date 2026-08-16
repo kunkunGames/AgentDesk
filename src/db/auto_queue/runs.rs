@@ -141,39 +141,78 @@ pub(super) async fn maybe_finalize_run_after_terminal_entry_pg(
     maybe_finalize_run_if_ready_pg(tx, run_id).await
 }
 
-/// #5142 P2 — why this writer does NOT take the cancel path's per-run advisory
-/// lock (`pg_advisory_xact_lock(hashtext('aq_run:' || id))`, taken by
-/// `terminalize_selected_runs_with_pg`).
+pub(super) async fn acquire_run_advisory_xact_lock_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<(), String> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('aq_run:' || $1))")
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| format!("lock auto-queue run {run_id}: {error}"))?;
+    Ok(())
+}
+
+/// Acquire multiple run tokens in the incumbent force-pause order.
 ///
-/// What serializes this function against a concurrent cancel/End is the
-/// `auto_queue_runs` row lock plus the compare-and-set predicate below: both
-/// writers flip the status with `AND status IN (...)`, so the second one to
-/// reach the row sees a status outside its predicate, gets `rows_affected() ==
-/// 0`, and stops before releasing slots or queueing the completion notify.
-/// Taking the advisory lock as well would not change that outcome — it would
-/// only order the two waits.
-///
-/// It would, however, invert a lock order. `update_entry_status_on_pg_tx`
-/// updates the `auto_queue_entries` row first and then calls into this function
-/// on the same transaction, while `terminalize_selected_runs_with_pg` takes the
-/// advisory lock first and only then runs `SELECT ... FROM auto_queue_entries
-/// ... FOR UPDATE`. Adding the lock here makes those two an ABBA pair.
-///
-/// Reachability of the original concern is still open: no interleaving of the
-/// cancel path and this writer that produces observable damage has been
-/// reproduced. Note that `phase_gates::lock_phase_gate_state_on_pg_tx` uses the
-/// TWO-argument `pg_advisory_xact_lock(hashtext(run_id), hashtext(phase))`,
-/// which is a separate lock space from the one-argument key above and therefore
-/// never serialized against the cancel path either.
-pub(crate) async fn maybe_finalize_run_if_ready_pg(
+/// Loading the ordered ids separately makes lock acquisition order explicit;
+/// it does not rely on a planner preserving an `ORDER BY` through a CTE that
+/// also invokes `pg_advisory_xact_lock`.
+pub(crate) async fn acquire_run_advisory_xact_locks_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let ordered_run_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id
+         FROM auto_queue_runs
+         WHERE id = ANY($1)
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(run_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| format!("order auto-queue runs before advisory locking: {error}"))?;
+
+    for run_id in &ordered_run_ids {
+        acquire_run_advisory_xact_lock_on_pg_tx(tx, run_id).await?;
+    }
+
+    Ok(ordered_run_ids)
+}
+
+async fn try_acquire_run_advisory_xact_lock_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: &str,
 ) -> Result<bool, String> {
-    if super::phase_gates::run_has_blocking_phase_gate_on_pg_tx(tx, run_id).await? {
-        return Ok(false);
-    }
+    sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock(hashtext('aq_run:' || $1))")
+        .bind(run_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|error| format!("try-lock auto-queue run {run_id}: {error}"))
+}
 
-    let remaining = sqlx::query_scalar::<_, i64>(
+/// Transaction-local opt-out for a failed-sync whose replacement attachment
+/// completes later in the same combined transaction, after the intervening
+/// dispatch, event, outbox, and card writes. The caller must restore the
+/// setting in the same transaction; this helper only changes the
+/// transaction-local flag.
+pub(crate) async fn set_terminal_entry_finalize_suppressed_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    suppressed: bool,
+) -> Result<(), String> {
+    sqlx::query("SELECT set_config('agentdesk.suppress_terminal_entry_finalize', $1, true)")
+        .bind(if suppressed { "on" } else { "off" })
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| format!("set terminal-entry finalizer suppression: {error}"))?;
+    Ok(())
+}
+
+async fn remaining_runnable_entry_count_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<i64, String> {
+    sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)
          FROM auto_queue_entries
          WHERE run_id = $1
@@ -182,7 +221,80 @@ pub(crate) async fn maybe_finalize_run_if_ready_pg(
     .bind(run_id)
     .fetch_one(&mut **tx)
     .await
-    .map_err(|error| format!("count remaining auto-queue entries for run {run_id}: {error}"))?;
+    .map_err(|error| format!("count remaining auto-queue entries for run {run_id}: {error}"))
+}
+
+/// A blocking advisory acquisition here would invert the lock order used by
+/// terminal entry writers: `update_entry_status_on_pg_tx` can already hold an
+/// entry row while `terminalize_selected_runs_with_pg` acquires the run token
+/// before locking entries. The non-blocking acquisition below adds no wait and
+/// defers finalization whenever another transaction owns the token.
+///
+/// When the try-lock succeeds, the token remains held until the caller's
+/// transaction commits. Blocking attach, cancel, and explicit-completion
+/// participants can therefore wait behind this opportunistic finalizer. That
+/// set includes the activate tail through `complete_run_after_activate_on_pg`:
+/// JS policy calls are bounded by the bridge deadline, while the HTTP activate
+/// path has no corresponding deadline. Avoiding an entry-row/run-token ABBA
+/// therefore comes with possible participant delay rather than no waiting in
+/// the protocol.
+///
+/// Moving a blocking acquisition above every entry, card, and run write in the
+/// callers of this helper would broaden per-run serialization across the sync,
+/// GitHub, phase-gate reconciliation, and dispatch-terminal paths. Those paths
+/// therefore retain their existing lock order and use this opportunistic
+/// finalizer instead. Its remaining-entry predicate is derived only after the
+/// token is acquired, so a previously computed count cannot cross an attach
+/// commit protected by the same token.
+///
+/// Blocking participants take `aq_run:<run_id>` before row locks: cancel and
+/// terminalize, force-pause, phase-gate attachment (including its attachment-
+/// free branch), consultation attachment, explicit completion, dispatched-
+/// entry choke points, done-entry reactivation, and retry attachment. Retry
+/// already takes the d1 retry token first and then the run token before its
+/// failed-sync and replacement attachment. Later cards/entries/runs/slots
+/// ordering is serialized by that first run token for these participants.
+/// `maybe_finalize_run_if_ready_pg` is the exception: callers may already hold
+/// entry or run rows, so its try-lock is non-blocking and adds no wait edge.
+///
+/// `lock_phase_gate_state_on_pg_tx` uses PostgreSQL's two-argument advisory
+/// key space. It is separate from the one-argument `aq_run:<run_id>` token and
+/// does not serialize phase-gate state writes with cancel.
+///
+/// Known completed writers outside this token protocol are intentionally
+/// scoped: `complete_run_if_empty` cleans a genuinely entry-less run during
+/// activate, `submit_order_with_pg` completes a newly-created run when no
+/// ready card was accepted, `reset_scoped_with_pg`/`reset_global_with_pg`
+/// destructively remove queue entries before completing runs, and
+/// `update_run_with_pg` is an explicit admin override. They do not inherit the
+/// attach-versus-terminal atomicity guaranteed by the participants above.
+pub(crate) async fn maybe_finalize_run_if_ready_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+) -> Result<bool, String> {
+    if !try_acquire_run_advisory_xact_lock_on_pg_tx(tx, run_id).await? {
+        tracing::info!(run_id = %run_id, "run_finalize_deferred_lock_contended");
+        return Ok(false);
+    }
+
+    let finalize_suppressed = sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE(
+             current_setting('agentdesk.suppress_terminal_entry_finalize', true) = 'on',
+             false
+         )",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| format!("read terminal-entry finalizer suppression: {error}"))?;
+    if finalize_suppressed {
+        return Ok(false);
+    }
+
+    if super::phase_gates::run_has_blocking_phase_gate_on_pg_tx(tx, run_id).await? {
+        return Ok(false);
+    }
+
+    let remaining = remaining_runnable_entry_count_on_pg_tx(tx, run_id).await?;
     if remaining > 0 {
         return Ok(false);
     }
@@ -285,18 +397,38 @@ pub async fn resume_run_on_pg(pool: &PgPool, run_id: &str) -> Result<bool, Strin
     Ok(updated > 0)
 }
 
-/// #5142 P2: like `maybe_finalize_run_if_ready_pg`, this writer deliberately
-/// does not take the cancel path's `aq_run:<id>` advisory lock. The guarded
-/// status UPDATE below is the serialization point — the rollback on
-/// `updated == 0` is what keeps a run that a concurrent cancel already
-/// terminalized from being released or notified twice. See the note on
-/// `maybe_finalize_run_if_ready_pg` for the lock-order inversion that adding it
-/// would introduce.
-pub async fn complete_run_on_pg(pool: &PgPool, run_id: &str) -> Result<bool, String> {
+/// Explicit completion begins with the same blocking run token used by attach
+/// and cancel writers. Unlike the opportunistic finalizer, this function owns
+/// its transaction and holds no row locks before acquiring the token. It then
+/// derives the remaining-entry predicate under that token before changing phase
+/// gates, the run, slots, or completion notifications.
+async fn complete_run_on_pg_inner(
+    pool: &PgPool,
+    run_id: &str,
+    queue_completion_notification: bool,
+) -> Result<bool, String> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|error| format!("begin postgres complete auto-queue run {run_id}: {error}"))?;
+    acquire_run_advisory_xact_lock_on_pg_tx(&mut tx, run_id).await?;
+
+    // `user_cancelled` is intentionally not runnable: it is an operator-held
+    // state whose dispatch link has already been cleared. The same predicate is
+    // used by `maybe_finalize_run_if_ready_pg`.
+    let remaining = remaining_runnable_entry_count_on_pg_tx(&mut tx, run_id).await?;
+    if remaining > 0 {
+        tracing::info!(
+            run_id = %run_id,
+            remaining,
+            "complete_run_refused_live_entries"
+        );
+        tx.rollback().await.map_err(|error| {
+            format!("rollback refused postgres complete auto-queue run {run_id}: {error}")
+        })?;
+        return Ok(false);
+    }
+
     // #2048 F17: even an explicit "manual complete" call must drop any
     // pending/failed phase-gate rows AND release the run's slot bindings.
     // Otherwise a completed run leaves stale phase_gate rows that next
@@ -332,9 +464,29 @@ pub async fn complete_run_on_pg(pool: &PgPool, run_id: &str) -> Result<bool, Str
         .await
         .map_err(|error| format!("release slots for completed run {run_id}: {error}"))?;
 
-    queue_run_completion_notify_on_pg(&mut tx, run_id).await?;
+    if queue_completion_notification {
+        queue_run_completion_notify_on_pg(&mut tx, run_id).await?;
+    }
     tx.commit()
         .await
         .map_err(|error| format!("commit postgres complete auto-queue run {run_id}: {error}"))?;
     Ok(true)
+}
+
+pub async fn complete_run_on_pg(pool: &PgPool, run_id: &str) -> Result<bool, String> {
+    complete_run_on_pg_inner(pool, run_id, true).await
+}
+
+/// Adapter for the drained-run tail of activate. It deliberately omits the
+/// completion notification, deletes phase-gate rows on successful completion,
+/// and releases slots only inside that successful transaction; activate no
+/// longer performs an unconditional slot pre-release. The activate caller
+/// treats a refused completion as informational and demotes database errors to
+/// a warning instead of turning the otherwise successful activate response
+/// into HTTP 500.
+pub(crate) async fn complete_run_after_activate_on_pg(
+    pool: &PgPool,
+    run_id: &str,
+) -> Result<bool, String> {
+    complete_run_on_pg_inner(pool, run_id, false).await
 }
