@@ -45,8 +45,7 @@
         "src/services/settings.rs",
         "src/services/turn_orchestrator.rs",
         "src/server/worker_registry.rs",
-        "src/server/maintenance.rs",
-        "src/services/kakao.rs"
+        "src/server/maintenance.rs"
       ]
     },
     {
