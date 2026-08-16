@@ -5,9 +5,9 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, auto_queue, cron_api, dispatched_sessions, dispatches, docs, e2e_control,
-    health_api, idle_recap, maintenance, message_outbox, messages, monitoring, pipeline,
-    prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
+    ApiRouter, AppState, agents_crud, auto_queue, cron_api, dispatched_sessions, dispatches, docs,
+    e2e_control, health_api, idle_recap, maintenance, message_outbox, messages, monitoring,
+    pipeline, prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api,
     scheduled_messages, skills_api, termination_events,
 };
 
@@ -146,6 +146,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/dispatched-sessions/clear-session-id",
                 post(dispatched_sessions::clear_session_id_by_key),
             )
+            .route("/sessions", get(agents_crud::list_sessions))
             .route(
                 "/sessions/{session_key}/force-kill",
                 post(dispatched_sessions::force_kill_session),
@@ -180,6 +181,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/messages",
                 get(messages::list_messages).post(messages::create_message),
             )
+            .route("/policies", get(agents_crud::list_policies))
             .route("/skills/catalog", get(skills_api::catalog))
             .route("/skills/ranking", get(skills_api::ranking))
             .route("/skills/prune", post(skills_api::prune))
