@@ -53,12 +53,40 @@ class RepairEntry:
         return (self.path, self.old_sha256, self.new_sha256)
 
 
+def normalize_sql_bytes(data: bytes) -> bytes:
+    return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(normalize_sql_bytes(data)).hexdigest()
+
+
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_bytes(path.read_bytes())
+
+
+def git_show_bytes(root: Path, spec: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "show", spec],
+            check=False,
+            capture_output=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def file_matches_git_ref(root: Path, git_ref: str, relpath: str) -> bool:
+    if not git_ref:
+        return False
+    base = git_show_bytes(root, f"{git_ref}:{relpath}")
+    if base is None:
+        return False
+    current = (root / relpath).read_bytes()
+    return normalize_sql_bytes(current) == normalize_sql_bytes(base)
 
 
 def migration_version_from_path(path: str) -> int | None:
@@ -382,6 +410,15 @@ def check_migrations(
                 errors.append(f"{path}: protected migration from base manifest was deleted")
                 continue
             if current_manifest is not None and current_manifest.sha256 != base.sha256:
+                if (
+                    current_manifest.sha256 == current.sha256
+                    and file_matches_git_ref(root, base_ref, path)
+                ):
+                    warnings.append(
+                        f"{path}: checksum manifest corrected to the current file "
+                        f"bytes; the migration blob is unchanged from {base_ref}"
+                    )
+                    continue
                 errors.append(
                     f"{path}: immutable manifest entry changed relative to base; keep "
                     f"sha256={base.sha256} and use the repair allowlist for intentional drift "

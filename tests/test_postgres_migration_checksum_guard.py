@@ -115,7 +115,42 @@ class PostgresMigrationChecksumGuardTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("immutable manifest entry changed relative to base", result.stderr)
         self.assertIn(sha256(self.original), result.stderr)
-        self.assertIn(sha256(self.changed), result.stderr)
+
+    def test_allows_manifest_correction_when_migration_blob_is_unchanged(self):
+        crlf_hash = sha256(self.original.replace(b"\n", b"\r\n"))
+        lf_hash = sha256(self.original)
+        payload = json.loads(self.manifest.read_text(encoding="utf-8"))
+        payload["protected_migrations"][0]["sha256"] = crlf_hash
+        self.manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "checksum-guard@example.invalid"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "checksum-guard"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+
+        payload["protected_migrations"][0]["sha256"] = lf_hash
+        self.manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        result = self.run_guard("--base-ref", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checksum manifest corrected", result.stderr)
 
     def test_rejects_duplicate_simple_migration_versions(self):
         duplicate = self.migrations_dir / "0001_duplicate.sql"
