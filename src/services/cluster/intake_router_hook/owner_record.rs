@@ -21,6 +21,8 @@
 #![allow(dead_code)]
 
 use crate::db::intake_outbox::{InsertPendingPayload, IntakeOutboxRow};
+use crate::db::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
+use crate::db::intake_outbox_status::IntakeOutboxStatus;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::future::Future;
 
@@ -177,10 +179,10 @@ impl AdmissionKind {
         }
     }
 
-    fn initial_status(self) -> &'static str {
+    fn initial_status(self) -> IntakeOutboxStatus {
         match self {
-            AdmissionKind::Local => "spawned",
-            AdmissionKind::Forwarded => "pending",
+            AdmissionKind::Local => IntakeOutboxStatus::Spawned,
+            AdmissionKind::Forwarded => IntakeOutboxStatus::Pending,
         }
     }
 }
@@ -664,24 +666,25 @@ pub(crate) async fn insert_admission_savepoint(
     }
 }
 
-/// The single open-route row for a channel (`pending`/`claimed`/`accepted`/
-/// `spawned`), if any. The channel-only open-route unique index guarantees at
-/// most one.
+/// The single open-route row for a channel, if any. The status set is defined
+/// by [`INTAKE_OUTBOX_OPEN_STATUSES_SQL`], and the channel-only open-route
+/// unique index guarantees at most one.
 async fn existing_open_route_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     channel_id: &str,
 ) -> Result<Option<OpenRouteRow>, sqlx::Error> {
-    sqlx::query_as::<_, OpenRouteRow>(
+    let query = format!(
         "SELECT id, target_instance_id, user_msg_id
            FROM intake_outbox
           WHERE channel_id = $1
-            AND status IN ('pending', 'claimed', 'accepted', 'spawned')
+            AND status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
           ORDER BY created_at ASC
-          LIMIT 1",
-    )
-    .bind(channel_id)
-    .fetch_optional(&mut **tx)
-    .await
+          LIMIT 1"
+    );
+    sqlx::query_as::<_, OpenRouteRow>(&query)
+        .bind(channel_id)
+        .fetch_optional(&mut **tx)
+        .await
 }
 
 async fn lookup_outbox_id_by_idempotency_in_tx(
@@ -759,12 +762,12 @@ struct ClaimCandidate {
 /// second (defense-in-depth) fence; the primary linearization is the channel
 /// advisory lock the claim takes before this UPDATE (P1-B), which mutually
 /// excludes an in-flight `transfer`. `$1` = row id, `$2` = claimer instance,
-/// `$3` = claim token. A 0-row UPDATE means ownership moved: no claim.
+/// `$3` = claim token, `$4` = Claimed, `$5` = Pending; 0 rows means ownership moved.
 const CLAIM_PROMOTE_SQL: &str = r#"
 UPDATE intake_outbox AS io
-   SET status = 'claimed', claim_owner = $3, claimed_at = NOW()
+   SET status = $4, claim_owner = $3, claimed_at = NOW()
  WHERE io.id = $1
-   AND io.status = 'pending'
+   AND io.status = $5
    AND io.target_instance_id = $2
    AND io.owner_instance_id = $2
    AND EXISTS (
@@ -853,6 +856,8 @@ where
         .bind(candidate.id)
         .bind(claimer_instance_id)
         .bind(claim_token)
+        .bind(IntakeOutboxStatus::Claimed)
+        .bind(IntakeOutboxStatus::Pending)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -872,10 +877,10 @@ where
 /// tautology, letting another provider's active generation on the same raw
 /// channel wrongly resurrect a stale/orphaned claim. Fence-failing rows
 /// (superseded / transferred / legacy NULL) are intentionally left `claimed`
-/// for the activation-phase park/terminalize path. `$1` = stale-after seconds.
+/// for activation parking. `$1` = age, `$2` = Pending; claimed stays literal for the partial index.
 const SWEEP_STALE_CLAIMS_SQL: &str = r#"
 UPDATE intake_outbox AS io
-   SET status = 'pending', claim_owner = NULL, claimed_at = NULL
+   SET status = $2, claim_owner = NULL, claimed_at = NULL
  WHERE io.status = 'claimed'
    AND io.claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
    AND EXISTS (
@@ -895,6 +900,7 @@ pub(crate) async fn sweep_stale_pre_accept_claims_fenced(
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(SWEEP_STALE_CLAIMS_SQL)
         .bind(stale_after_secs.max(1))
+        .bind(IntakeOutboxStatus::Pending)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
@@ -920,14 +926,16 @@ pub(crate) async fn retire_stale_pending_route_for_local(
         .await?;
     let result = sqlx::query(
         "UPDATE intake_outbox
-            SET status = 'failed_pre_accept', completed_at = NOW(),
+            SET status = $4, completed_at = NOW(),
                 last_error = 'stale route retired for local recovery'
-          WHERE id = $1 AND channel_id = $2 AND status = 'pending'
+          WHERE id = $1 AND channel_id = $2 AND status = $5
             AND created_at <= NOW() - ($3::BIGINT * INTERVAL '1 second')",
     )
     .bind(route_id)
     .bind(channel_id)
     .bind(stale_after_secs.max(1) as i64)
+    .bind(IntakeOutboxStatus::FailedPreAccept)
+    .bind(IntakeOutboxStatus::Pending)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1989,7 +1997,7 @@ mod tests {
             .unwrap();
         let claimed = claimed.expect("fence-valid row must be claimed");
         assert_eq!(claimed.id, row_id);
-        assert_eq!(claimed.status, "claimed");
+        assert_eq!(claimed.status, IntakeOutboxStatus::Claimed);
         assert_eq!(claimed.claim_owner.as_deref(), Some("node-W#restart7"));
 
         pool.close().await;
@@ -2131,11 +2139,12 @@ mod tests {
             xf.commit().await.unwrap();
         }
 
-        // Promote UPDATE now sees node-V@1 as active → fence fails → 0 rows.
         let promoted: Option<IntakeOutboxRow> = sqlx::query_as(CLAIM_PROMOTE_SQL)
             .bind(row_id)
             .bind("node-W")
             .bind("node-W#restart1")
+            .bind(IntakeOutboxStatus::Claimed)
+            .bind(IntakeOutboxStatus::Pending)
             .fetch_optional(&mut *claim_tx)
             .await
             .unwrap();

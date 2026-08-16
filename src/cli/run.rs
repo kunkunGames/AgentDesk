@@ -312,6 +312,23 @@ pub(crate) fn execute(command: Commands, json: bool) -> Result<()> {
             MonitoringAction::Stop { channel, key } => super::monitoring::stop(channel, &key),
         }),
         Commands::IntakeOutbox { action } => exit_for_cli(match action {
+            IntakeOutboxAction::DispatchedAudit => {
+                super::direct::run_async(super::intake_outbox::cmd_dispatched_audit())
+            }
+            IntakeOutboxAction::DispatchedSettle { id, reason } => {
+                super::direct::run_async(super::intake_outbox::cmd_settle(
+                    id,
+                    &reason,
+                    crate::db::intake_outbox_status::IntakeOutboxStatus::Dispatched,
+                ))
+            }
+            IntakeOutboxAction::SpawnedSettle { id, reason } => {
+                super::direct::run_async(super::intake_outbox::cmd_settle(
+                    id,
+                    &reason,
+                    crate::db::intake_outbox_status::IntakeOutboxStatus::Spawned,
+                ))
+            }
             IntakeOutboxAction::Status { channel_id, limit } => super::direct::run_async(
                 super::direct::cmd_intake_outbox_status(channel_id.as_deref(), limit),
             ),

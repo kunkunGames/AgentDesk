@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-08-06 (against #5071 T1 S3b).
+> Last refreshed: 2026-08-12 (against #5280/#5284 near-threshold health surfaces and stable symbol references).
 >
 > — the dead-tmux tail drain in `tmux.rs`
 > (`drain_missing_inflight_dead_tmux_tail_to_eof`) now records itself in
@@ -70,11 +70,18 @@
 - `active_callsite_coverage` only applies to surfaces with a parallel canonical
   path already implemented (e.g. Discord outbound v3). For pre-migration giant
   files (no canonical replacement yet), the column is `n/a`.
-- **At-cap surfaces (#5150).** Two files sit on a hard size gate with no usable
-  headroom. The two gates measure DIFFERENT things, so check which one applies
-  before adding a line. This was previously recorded only in a comment inside
-  `scripts/audit_maintainability_config.toml`, i.e. nowhere a reader of this
-  registry would see it.
+- **At-cap and near-cap surfaces (#5150/#5280).** This issue-scoped list retains
+  #5150's two at-cap entries and #5280's audited health and giant-admission
+  surfaces; it is not a headroom ranking or an exhaustive inventory. The gates
+  measure DIFFERENT things, so check which one applies before adding a line. To
+  find every candidate, regenerate the inventory and sort its `Prod` column.
+  Production figures are the `Prod` column in
+  `docs/generated/module-inventory.md`; because that file and
+  `docs/generated/giant-file-registry.md` are gitignored checkout-local views,
+  run `python3 scripts/generate_inventory_docs.py` in your checkout immediately
+  before an edit and inspect its fresh output. This was previously recorded only
+  in a comment inside `scripts/audit_maintainability_config.toml`, i.e. nowhere
+  a reader of this registry would see it.
   - `src/services/discord/turn_bridge/stream_loop.rs` — **979 raw file lines**
     against its `979` `[namespace_size_caps]` entry. That gate counts every
     line in the file (inline `#[cfg(test)]` blocks included — unlike the
@@ -85,13 +92,37 @@
     purely so its three call sites fit on one line each. Extract before adding.
   - `src/services/discord/gateway.rs` — **999 production lines** (1568 raw,
     569 test) against the `>= 1000` giant threshold. One added PRODUCTION line
-    makes it a giant; test-only lines are free. It is registered in neither
-    `scripts/giant_file_registry.toml` nor
-    `scripts/audit_maintainability_giant_baseline.toml`, and the registry's
-    `grandfathered_baseline_paths` array is a closed baseline, so crossing the
-    threshold forces a new `[[entry]]` carrying an owner, a deadline, and a
-    decompose issue before CI goes green again.
-  - Both figures measured 2026-08-06 on `main` @ `9721fc70a` with the gates'
+    makes it a giant; test-only lines are free. It is absent from
+    `scripts/giant_file_registry.toml`,
+    `scripts/audit_maintainability_giant_baseline.toml`, and the generated giant
+    inventory, and the registry's `grandfathered_baseline_paths` array is a
+    closed baseline, so crossing the threshold forces a new `[[entry]]` with
+    either a `shrink` decision (owner + deadline + decompose issue) or a `keep`
+    decision (owner + keep_reason) before CI goes green again.
+  - `src/services/discord/task_notification_delivery/store/response_fence.rs`
+    — **999 production lines**, with **1 production line of headroom** before
+    the `>= 1000` giant threshold. It is absent from
+    `scripts/giant_file_registry.toml`,
+    `scripts/audit_maintainability_giant_baseline.toml`, and the generated giant
+    inventory, so one production line can require a new giant admission before
+    CI goes green. Extract before production growth.
+  - `src/services/discord/turn_bridge/terminal_controller_cutover.rs` — **998
+    production lines**, with **2 production lines of headroom** before the `>=
+    1000` giant threshold. Plan an extraction before consuming that headroom.
+  - `src/services/discord/task_notification_delivery/mod.rs` — **998 production
+    lines**, with **2 production lines of headroom** before the `>= 1000` giant
+    threshold. Plan an extraction before consuming that headroom.
+  - `src/services/discord/health/snapshot.rs` — **941 production lines**, with
+    **59 production lines of headroom** before the `>= 1000` giant threshold.
+    It is not presently a near-cap surface; re-run the inventory generator in
+    this worktree and inspect `Prod` before relying on this figure.
+  - `src/services/discord/health/stall_liveness.rs` — **977 production lines**,
+    with **23 production lines of headroom** before the `>= 1000` giant
+    threshold, measured from the same generated inventory on 2026-08-12 at
+    `main` @ `8d8111fd6`. Re-measure from the `Prod` column and plan an
+    extraction before consuming that headroom.
+  - The `stream_loop.rs` and `gateway.rs` figures were measured 2026-08-06 on
+    `main` @ `9721fc70a` with the gates'
     own code: `audit_maintainability/checks/namespace_size_caps.count_lines`
     for the raw figure and `generate_inventory_docs.split_prod_test_lines` (the
     `Prod` column of the generated `module-inventory.md`) for the production
@@ -133,6 +164,166 @@ time for diagnostics; neither is a stored approval value.
   friend/memo send, and connection-state live in one provider client).
 - related_issues: #4710.
 - allowed_changes: bugfix only until a scoped extraction under #4710.
+
+
+### `writer_gate_ci_wiring`
+
+- canonical_modules: `scripts/check_writer_gate_ci_wiring.py` owns the exact
+  aggregate-command inventory in `REQUIRED_INVOCATIONS`; its `CI_SCRIPT`
+  constant points at `scripts/ci-script-checks.sh`. If the aggregate moves to a
+  different script, update `CI_SCRIPT` as part of the same change.
+- invariants: the seven command lines in `REQUIRED_INVOCATIONS` are pinned
+  byte-for-byte as complete, unindented lines. Intentional spelling changes
+  such as `"$PYTHON"` to `"${PYTHON}"`, line-continuation refactors, or trailing
+  comments require synchronized updates to `REQUIRED_INVOCATIONS` and
+  `tests/test_writer_gate_ci_wiring.py` fixtures. The external `Script checks runner`
+  protection step pins those aggregate lines. The aggregate hardening and
+  fast-wiring unittest lines inspect the external step. The static invocation
+  chain ends if one diff removes that external step and both aggregate
+  self-protection lines together; it does not extend to branch protection.
+- non_guarantees: the checker is not a shell parser. A required line kept at
+  column zero inside an `if` or function still satisfies the textual contract,
+  so unconditional execution is not established. The hardening guard owns the
+  workflow execution contract; this checker only byte-pins its two assertion
+  blocks.
+- tests: `tests/test_writer_gate_ci_wiring.py` builds temporary aggregate
+  fixtures and requires a nonzero process exit for deletion of each aggregate
+  self-protection line. `tests/test_fast_check_ci_wiring.py` mutation-tests the
+  external workflow-step contract.
+- related_issues: #5308.
+
+### `script_checks_effective_execution_contract`
+
+- canonical_modules: `scripts/check-ci-runner-hardening.sh` parses `.github/workflows/ci-pr.yml`,
+  pins the calculated execution surface of the `jobs.scripts`
+  writer-protection/aggregate pair, and verifies the SHA-256 of
+  `scripts/required-check-mirror.sh`. The required `Script checks` publisher
+  compares both the helper digest and the digest of
+  `scripts/check-ci-runner-hardening.sh` immediately after checkout; the
+  unconditional required `relay-authority-contract` job repeats the same two
+  comparisons before its own gate run (they sit after its toolchain and
+  relay-contract steps, and any earlier step failure already turns that
+  required job red), and each job then runs only its verified gate copy. The publisher-side copy is intentional and
+  symmetric: it catches a skipped/altered relay job, while the relay copy
+  catches a skipped/altered publisher. The helper's
+  behavior tests remain useful regressions, but byte identity is primary:
+  environment, step-instance, argv0, and unconditional-success branches all
+  change the pinned file bytes.
+- fixed surfaces: the `Script checks` publisher has exactly checkout,
+  contract, and result-mirror steps; its `name`, `needs: [changes, scripts]`,
+  required job-level `if: always()`, `runs-on`, checkout provenance, and
+  absence of `continue-on-error`,
+  `defaults`/`env`/`environment`/`strategy`/`container` are pinned. The
+  publisher's `if: always()` is what runs the fail-closed
+  mirror after an upstream failure, skip, or cancellation. The independent
+  `relay-authority-contract` publisher has no `needs` and must omit job-level
+  `if`; the internal `changes` and `scripts` execution jobs must also omit
+  job-level `if` so their own work cannot be condition-skipped.
+  Its source-byte range is also hashed, so YAML scalar tags and styles remain in
+  the comparison; Psych cannot erase an explicit tag such as `!!binary` or
+  equate YAML 1.1 spellings such as `yes` and `012` with the intended
+  Actions scalars. Plain YAML-boolean-like job IDs fail closed, while quoted
+  `"yes"` remains a valid string job ID. The relay job's semantic hash and
+  explicit step registry pin its absent `needs`/`if`, non-matrix shape, and
+  content-hash backstop. Starting at the two required publishers, the complete
+  recursive `needs` closure is the finite set
+  `{scripts_required_context, relay-authority-contract, scripts, changes}`;
+  every member must exist and omit `continue-on-error`, the Script checks
+  publisher must carry exactly `if: always()`, and the other three jobs must
+  omit job-level `if`. Any edge that expands that set is a review-triggering
+  gate failure.
+- aggregate execution: the calculator records shell/working-directory
+  candidates, environment scopes, `runs-on`, prior recognized file writes, and
+  the selected
+  effective values. The protection pair is fixed at indices `[8, 9]` with no
+  interstitial step. Inventory drift reports expected and observed indices
+  separately from other execution-surface failures, and a dedicated malicious
+  pre-pair overwrite fixture prevents an index shift from masquerading as the
+  asserted attack.
+- update procedure: treat `scripts/required-check-mirror.sh` as a redline. For
+  an intentional reviewed edit, run
+  `shasum -a 256 scripts/required-check-mirror.sh`, replace the old digest in
+  the gate plus both workflow backstops (three production pins total), sync the
+  test fixture's expected digest, then run
+  `scripts/check-ci-runner-hardening.sh` and
+  `python3 -m unittest tests.test_fast_check_ci_wiring`. A digest-only edit
+  with unchanged helper bytes is red; changing the helper first is red until
+  all three reviewed pins agree. Separately, the gate pins a source-range
+  digest of the `scripts_required_context` mirror job itself (a fourth literal
+  in `check-ci-runner-hardening.sh`); any edit inside that job — comments
+  included — is red until that literal is re-pinned to the hash the failure
+  message prints.
+  Treat `scripts/check-ci-runner-hardening.sh` as a separately pinned gate. An
+  intentional gate edit must first make both workflow backstops red. Update any
+  affected in-gate semantic/source-range digest, run
+  `shasum -a 256 scripts/check-ci-runner-hardening.sh`, replace the gate digest
+  in the `Script checks` contract step and the `relay-authority-contract`
+  backstop (two workflow gate pins), sync the fixture's expected gate digest
+  (`CI_RUNNER_HARDENING_SHA256` in `tests/test_fast_check_ci_wiring.py`), then
+  rerun the gate and `python3 -m unittest tests.test_fast_check_ci_wiring` to
+  complete the red-to-green round trip; the wiring fixture is wired into the
+  required aggregate, so skipping that sync leaves the required context red.
+  Do not copy a pre-edit digest or update only one backstop.
+- tests: permanent fixtures cover the historical environment, `GITHUB_ACTION`,
+  argv0, and unconditional-`exit 0` attacks; one-byte helper
+  and digest-only mutations; mirror defaults/env/environment/strategy/container
+  and checkout provenance; relay needs/if/matrix; exact aggregate inventory;
+  YAML boolean-like keys; Psych resolution splits including `!!binary`; and
+  deletion of each independent aggregate-defense assertion. Duplicate job IDs
+  fail closed in the required gate before Psych's last-wins mapping can diverge
+  from the source-range pin. `actionlint` also diagnoses duplicate keys when
+  run, but it is not invoked by the required `Script checks` path, so it is a
+  supplemental check rather than the authority for this property. The
+  aggregate explicitly requires `tests/test_required_check_mirror.sh`; skipped
+  and failed helper inputs remain covered by that shell suite, while the
+  cancelled input is exercised by the `("success", "cancelled")` case in
+  `tests/test_fast_check_ci_wiring.py`, which runs the real helper.
+- threat model — covered: any helper tamper whose bytes differ from the reviewed
+  digest, including conditionally activated code; changes to the fixed
+  publisher surface; the registered relay job surface; and the enumerated
+  aggregate execution inputs above. Hashes are review triggers, so an
+  intentional helper change plus all three digest updates is accepted only as a
+  visible coordinated diff.
+- threat model — not covered: branch protection and hosted-runner policy;
+  compromise of the runner, checkout action, or hashing tool; a coordinated
+  edit of repository-local guards and their pins; or successful-but-different
+  execution outside the declared snapshots. For `jobs.scripts`, N1′ in-place
+  edits to earlier steps are outside the snapshot except for the narrow
+  mechanical scan of quoted writes on `run` lines whose final shell operation
+  is a redirect to `$GITHUB_ENV` or `$GITHUB_PATH`. N1b checkout
+  `repository:` overrides in that runner job, N3 steps after the protected
+  pair, `container`, `timeout-minutes`, `strategy`, `environment`, and
+  pull-request subfilters such as `paths-ignore` are likewise not guaranteed.
+  The result mirror detects skipped/failed/cancelled upstream jobs; it cannot
+  prove that an upstream success used the intended semantics. Because the
+  publisher runs with `if: always()`, a failure, skip, or cancellation of a
+  single upstream job still reaches the mirror and makes the required context
+  red.
+  More fundamentally, a single PR that consistently rewrites every guard and
+  every pin can pass this in-repository gate system. A cheaper edit in the same
+  class: GitHub treats a condition-skipped required check as satisfied, so one
+  PR that adds skip conditions to both the `Script checks` publisher and
+  `relay-authority-contract` leaves no required job to execute the gate. A skip
+  condition on just one required publisher stays blocked because the surviving
+  required job still runs the pinned gate against the edited workflow. This
+  simultaneous required-job skip is an inherent limit
+  of in-repo gating, not a property these hashes claim to solve; human review
+  and branch protection own that trust decision.
+- related_issues: #5308, #5321.
+
+### `ci_failure_classification`
+
+- canonical_modules: `scripts/ci/real-failure-predicate.sh` owns deterministic
+  real-failure markers shared by `scripts/ci/infra-failure-rerun.sh` and
+  `scripts/main-ci-triage.sh`; neither consumer may define a local override.
+- invariants: a real-failure marker wins over mixed runner-termination noise;
+  pure infrastructure termination remains eligible for the existing skip/rerun
+  policy. Keep the shared predicate, both consumers, and
+  `docs/ci/release-gates.md` synchronized.
+- tests: both script self-tests are wired through `scripts/ci-script-checks.sh`;
+  the rerun self-test sources triage in a separate process and exercises its
+  effective predicate to catch wiring or override drift.
+- related_issues: #3996, #5210.
 
 ### `provider_output_guard`
 
@@ -313,7 +504,10 @@ time for diagnostics; neither is a stored approval value.
   `src/services/discord/inflight/removal.rs` (load-time prune + removal
   logging), `src/services/discord/inflight/clear_store/mod.rs` and
   `src/services/discord/inflight/clear_store/abandon.rs` (clear/abandon
-  store-side CAS paths).
+  store-side CAS paths). The #5071 T2 S1 precursor moves the turn-kind enums,
+  inflight identity, and serde adapters from `inflight/model.rs` to
+  `inflight/model/*.rs` (mechanical, non-behavioral); the facade re-exports and
+  persisted serde representation remain unchanged.
 - `.generation` writer contract (#5264):
 
   | Writer family | Spawn/adoption sites | Contract |
@@ -545,9 +739,9 @@ time for diagnostics; neither is a stored approval value.
     `계속 처리 중` streaming footer off the committed-but-unrelayed placeholder;
     +46 from #3016 option A codex R2 `pinned_finalize_user_msg_id` pure helper
     that binds the watcher normal-completion finalize id to the OUTPUT RANGE
-    (`turn_start_offset.unwrap_or(last_offset) < current_offset`, mirroring the
-    yield guard at `tmux.rs:2110-2111`) so a follow-up turn started after this
-    range is not released by stale output;
+    (`turn_start_offset.unwrap_or(last_offset) < current_offset`, mirroring
+    `tmux::watcher_should_yield_to_inflight_state`) so a follow-up turn started
+    after this range is not released by stale output;
     +143 from #3017 the no-inflight relay-dedup gate (reads `committed_relay_offset`
     + generation-aware watermark resets, suppresses a wake/idle terminal already
     committed by another relay actor) and the monitor-auto-turn synthetic-id /
@@ -696,8 +890,12 @@ time for diagnostics; neither is a stored approval value.
     session, current_offset)` (the id==0-INCLUSIVE anchor variant catches a newer
     id==0 external-input/injected panel owner the id!=0 sibling would miss; the
     OFFSET test — not `pinned == 0` — keeps an in-range id==0 watcher-direct turn
-    NON-suppressed). turn_bridge/mod.rs:2009 (BRIDGE path / #3016 core hotfile) is
-    explicitly OUT OF SCOPE and deferred to a follow-up. New test
+    NON-suppressed). The BRIDGE path through
+    `turn_bridge::complete_status_panel_v2_with_http` and its
+    `status_panel_completion_action` dispatch in `turn_bridge/status_panel.rs`
+    is explicitly OUT OF SCOPE and deferred to a follow-up. #3016's
+    concurrent-edit hotfile is `turn_bridge/mod.rs`, which only re-exports the
+    symbol. New test
     `status_panel_adopt_and_edit_gate_is_turn_aliasing_safe` covers stale-newer
     (incl. id==0 external/injected) NOT adopted/edited, in-range id==0
     watcher-direct STILL adopts+edits (over-suppression guard), and in-range id!=0
@@ -1774,8 +1972,11 @@ time for diagnostics; neither is a stored approval value.
 - active_callsite_coverage: retired DB compatibility history is tracked in
   `known-legacy.md`.
 - invariants:
-  - `/api/inflight/rebind` is the only synthetic inflight writer
-    (`src/server/routes/health_api.rs:684`).
+  - `/api/inflight/rebind` is the only synthetic inflight writer: in
+    `src/server/routes/health_api.rs` (a production giant, so keep it named
+    here — the `giant_files` hard gate resolves giants by the explicit path
+    written on this page), `health_api::rebind_inflight_handler` delegates to
+    `health::handle_rebind_inflight` for the write.
   - Dashboard routes never write to canonical config files; they read DB
     state and emit events.
 - allowed_changes: `bugfix` only on giant routes; `new_feature` only when
@@ -1802,8 +2003,15 @@ time for diagnostics; neither is a stored approval value.
 - active_callsite_coverage: n/a.
 - invariants: LaunchAgent plist and runtime layout are generated only — see
   the matrix in `docs/source-of-truth.md`.
-- allowed_changes: `bugfix` only; PG-cutover retention plan is owned by
-  #1239.
+- allowed_changes: `bugfix` only, except per #5071 T2-W B3a-1,
+  `src/cli/intake_outbox.rs` may host the DB-row-read-only `dispatched-audit`
+  feature and `src/cli/args.rs`, `src/cli/run.rs`, and `src/cli/mod.rs` may
+  contain its purely mechanical clap registration, dispatch arm, and module
+  registration. `config::load` may harden secret-bearing config-file permissions
+  via `utils::secret_file::audit_or_harden_secret_file` and create
+  `config.data.dir`.
+  That exception does not permit feature growth in any giant on this surface;
+  the PG-cutover retention plan remains owned by #1239.
 
 ### `runtime_core`
 
@@ -1895,16 +2103,28 @@ time for diagnostics; neither is a stored approval value.
     the giant-file threshold; bugfix only).
   - `src/db/prompt_manifests/` (directory, refactored).
   - `src/db/intake_outbox.rs` is the intake-node-routing claim/transition/sweep
-    surface; its production LoC is now below the giant-file threshold once the
-    `#[cfg(test)] mod` PG coverage is excluded (bugfix only).
+    surface, with operator force-fail isolated in
+    `src/db/intake_outbox_force_fail.rs`; both production surfaces are below the
+    giant-file threshold once `#[cfg(test)] mod` PG coverage is excluded
+    (bugfix only; +4 from #5071 T2-W B3a-1 mechanically extracting the provider
+    guard for audit reuse, non-behavioral).
+  - #5071 T2-W S-W2 is a same-shaped B3a-1 exception: the new receipt-backed
+    `done` authority lives only in `src/db/intake_outbox_delivery_proof.rs`.
+    `src/db/intake_outbox.rs` remains bugfix-only and is deliberately untouched;
+    adding this authority there would widen the claim/transition surface.
+  - #5071 T2-W S-W3 extends that sibling authority with bounded stale `spawned`/`dispatched` settlement and NULL-clock operator repair. Frozen `src/db/intake_outbox.rs` stays untouched; scheduling lives in capped `runtime_bootstrap/intake_delivery_sweep.rs`.
   - `src/db/scheduled_messages.rs` (giant persistence surface): row conversion,
     durable lease transitions, attachment metadata, and worker-capability reads
     share one SQL projection contract. Preserve the projection invariants and
     PostgreSQL coverage; split only by an explicit persistence contract boundary.
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
-- invariants: production reads/writes go through `pg_pool_ref()`; retired DB
-  compatibility handles must not be reintroduced as live route fallbacks.
+- invariants: production reads/writes go through `AppState::pg_pool_ref()`,
+  except per #5071 T2-W B3a-1: the one-shot, migration/reseed-free
+  `cmd_dispatched_audit` path uses `db::postgres::connect` directly before
+  `list_dispatched_audit`, because `build_app_state` would run migration and
+  reseed. Retired DB compatibility handles must not be reintroduced as live
+  route fallbacks.
 - allowed_changes: `bugfix` on existing path; `new_feature` MUST use PG.
 - tests: `src/integration_tests/postgres_only/*`.
 - related_issues: #843 epic, #1237, #1238, #1239.

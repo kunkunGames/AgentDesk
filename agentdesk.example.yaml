@@ -407,6 +407,12 @@ placeholder:
   two_message_panel_enabled: false
 
 runtime:
+  # T2-W rollout: off keeps the legacy row lifecycle. In this build, observe is a
+  # turn-path no-op; rollout observation telemetry ships with settlement slice (S-W2).
+  # Schema probing starts at settle and new handoff stamps require enforce. Only
+  # dispatched stamping is clamped off; settle_and_sweep is calculated, but this
+  # build has no consumer for that flag.
+  intake_delivery_settlement: off
   requested_timeout_min: 45
   in_progress_stale_min: 120
   long_turn_alert_interval_min: 30
@@ -415,10 +421,6 @@ runtime:
   context_compact_percent_claude: 70
   # Minimum context occupancy (tokens) before model-aware compaction is requested.
   context_compact_lower_bound_tokens: 300000
-  # Global Claude gateway-proxy routing toggle. Default: false (off).
-  claude_gateway_proxy_enabled: false
-  # Proxy base URL used only when the toggle is on. Default: http://127.0.0.1:10100
-  claude_gateway_proxy_url: "http://127.0.0.1:10100"
   dispatch_poll_sec: 30
   agent_sync_sec: 300
   github_issue_sync_sec: 900

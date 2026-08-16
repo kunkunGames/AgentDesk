@@ -1,6 +1,153 @@
 # Multinode Transition
 
+> Last refreshed: 2026-08-15 (against #5071 T2-W S-W3 intake-delivery sweep).
+
 ### Audited touches
+- 2026-08-17 (itismyfield main port): intake-outbox dispatched migrations landed as 0110-0114 so they do not collide with kunkunGames 0105-0109 kakao/delivery-journal versions. INTAKE_DELIVERY_REQUIRED_MIGRATIONS now pins 103,110-114. Auto-queue sweep cursor rotation keeps the batch caller API and a static single-row UPDATE so the SQL surface inventory still sees the blocked write.
+- 2026-08-15 (#5071 T2-W S-W3): framework setup is per bot, but an active-task latch permits one process sweep and resets on task exit; per-tick panic containment lets the same loop continue after a tick panic. The latch reset permits a later bootstrap call to restart a dead loop, but there is no task-exit detector or automatic respawn. The first sweep waits two minutes so startup recovery and session restoration can publish their state. The sweep is PG-lease-free: `FOR UPDATE SKIP LOCKED` plus terminal CAS gives dispatched one winner, and spawned uses the same CAS property. Leader-only is a load recommendation, not a correctness requirement. Before settlement it checks every channel-matching durable session whose status is `turn_active`, regardless of `active_dispatch_id`: a heartbeat fresh within 30 seconds is live, while a NULL heartbeat or one whose absence has not exceeded the state cutoff is ambiguous. Both results defer. The settlement transaction then locks the intake row followed by every existing durable session row for its channel with `FOR SHARE`, re-evaluates freshness under those locks, and only then performs the terminal CAS. Existing-row heartbeat/status writers therefore serialize with the terminal decision through commit. PostgreSQL cannot row-lock a missing session row: a turn with no durable row, or an existing active shape whose status is not `turn_active`, is read as Absent and may settle. Both state cutoffs therefore mean heartbeat-absence time. Both open stamp-debt states restart the sweep after downgrade/restart. §6.1의 미회수·오회수 창: (1) `dispatched_at IS NULL` 인 `dispatched` 행, `spawned_at IS NULL` 인 `spawned` 행 → operator CLI 전용. (2) cutoff 이전 구간 → 자동 회수 없음. cutoff 를 줄이면 진행 중인 긴 턴을 `unknown` 으로 오종결한다. 이 트레이드오프는 제거되지 않는다. (3) sweep 루프가 뜨지 않은 상태(스키마 결함으로 probe 실패 + debt 존재) → sweep 은 뜨되 매 틱 SQL 실패 → `error!`. operator CLI 가 유일한 탈출구. (4) `PreservedForRetry` 로 열어 둔 행 중 재배달이 끝내 실패한 것 → cutoff 후 sweep 이 `unknown` 으로 종결. (5) sweep 배치 한도(`normalize_limit` 1..=500)를 초과하는 백로그 → 다음 틱으로 이월. 실제 `warn!` 으로 잘린 수를 남긴다. (6) 세션 행이 `turn_active` 이고 heartbeat가 NULL이면 ambiguous로 보류되어 session GC TTL까지 회수가 늦어질 수 있다. (7) sweep task가 루프 자체에서 종료되면 다음 bootstrap spawn 시도까지 미회수 상태가 지속된다. (8) durable 행 부재 턴과 비-`turn_active` 활성 형태는 Absent 로 읽혀 cutoff 후 오정산될 수 있다. 행 부재 상태에서는 잠글 대상도 없으므로 이 창은 닫히지 않는다. (9) writer 장기 트랜잭션이 sessions 행 배타락을 보유하면 해당 행 정산은 3초 `lock_timeout`으로 bounded 지연되고 ambiguous로 건너뛴다; writer가 반복해서 오래 점유하면 그 행은 매 tick skip되고 다른 후보는 계속 처리된다. Restore 열거는 captured-full-response, ordinary output-completed, worktree-failure 두 경로와 completed-during-downtime을 포함한 실측이며 완전성 증명이 아니다; 미열거 경로의 최종 회수자는 상태 sweep이다. Production O-payload의 `intake_outbox_id` binding writer는 0건이라 journal 판정은 사실상 `Unknown`이다. `Unknown`은 배달 실패의 증거가 아니다.
+- 2026-08-15 (#5071 T2-W S-W1 r2): Discord bootstrap owns one
+  intake-delivery capability cache per bot instance. Each node subscribes to
+  live configuration and independently resolves and installs its local cache;
+  no cache value, probe result, or reload completion is shared across nodes.
+- 2026-08-14 (#5071 T2-W B3a-1): the operator CLI adds a DB-row-read-only
+  `intake-outbox dispatched-audit` inventory. `cmd_dispatched_audit` calls
+  `config::load`, which may harden secret-bearing config-file permissions via
+  `utils::secret_file::audit_or_harden_secret_file` and create `config.data.dir`.
+  Its PostgreSQL path connects without migration or reseed and uses no explicit
+  multi-statement transaction, row lock, or advisory lock. `list_dispatched_audit`'s
+  `SELECT ... FROM public.intake_outbox` takes an ordinary ACCESS SHARE relation
+  lock in its implicit transaction. That lock is compatible with DML but can
+  delay ACCESS EXCLUSIVE DDL for the duration of the query. The command lists
+  every dispatched row, including a legacy NULL clock.
+  `provider_nonempty` reuses the exact force-fail provider guard but is not a
+  worker-readiness verdict; dispatched remains refused by the operator-retry
+  classifier. This slice adds no writer, periodic job, capability wiring, or
+  settlement authority.
+- 2026-08-13 (#5071 T2-W S-R2c B2): `runtime_bootstrap` now declares a
+  dormant per-row reducer at the proof-owner path. Its transaction judges until the first delivery proof (or all
+  obligations if none proves it) before locking, then attempts at most one terminal CAS only if the row remains
+  strictly stale; a refreshed row returns unchanged with no CAS. All relations are `public`-qualified and the stale
+  reader decodes only `id`. No boot, configuration, lifecycle, timer, or production call reaches the reducer, so
+  this slice grants no authority. The reducer is compiled only on Unix because its journal judgment dependency is
+  Unix-only; non-Unix builds have no reducer.
+
+  B3 retains eight constraints: (1) the `capability_accepts_public_0109_under_hostile_search_path_pg`
+  characterization reproduces the OID-continuity gap that the relookup B1 removed as inert could not close;
+  (2) false-to-`Unchanged` settlement is
+  uncharacterized; (3) tests permit split lock/CAS transactions; (4) the stale recheck must retain its B2
+  `IntakeOutboxStatus` binding; (5) cutoff still selects which rows are stale candidates, but cannot make the terminal
+  judgment sound: journal append is lossy because `JournalObserver::submit` drops a full `MAILBOX_CAPACITY` queue and
+  `delivery_journal_observer` discards a `pg_error` batch, neither with retry. No finite cutoff removes that ambiguity:
+  it can absorb delay, not loss. While the journal remains lossy, `Unknown` is terminal ambiguity from absent
+  observation, not proof of delivery failure; delivery may already have occurred, so operators must audit
+  delivery/receipt evidence and accept the duplicate consequence before retrying; (6) first-proof short-circuit means
+  not all obligations are judged; (7) the reducer's join key has no production binding writer. `reconcile_in_tx`
+  selects `event_kind = 'O'` with `canonical_payload ->> 'intake_outbox_id' = $1`, but every current production O-event
+  payload omits `intake_outbox_id`: `TuiObligationKey::payload()` emits only `canonical_key_sha256`, and the watcher,
+  controller, and recovery `obligation_payload` functions emit only their own routing/frontier fields. The only
+  executable payload reads are `exact_delivery_predicate` and `reconcile_in_tx`; other occurrences are `#[cfg(test)]`
+  fixtures or the migration 0109 index substrate and its capability checks. As `intake-node-routing.md` specifies, the
+  binding writer does not exist before the future S-W1 binding-writer slice. With today's production writers,
+  `obligations` is empty and `delivered` remains false, so activating the reducer would terminalize every stale
+  `dispatched` row as `Unknown`. B3 must not make terminal CAS reachable through configuration alone; activation
+  requires the S-W1 binding writer to have landed in code; (8) before S-W2 can create `dispatched` rows on non-Unix,
+  B3 must provide a non-Unix reduction path or those rows will form a permanent backlog.
+- 2026-08-13 (#5071 T2-W S-R2c B1): `runtime_bootstrap` declares a dormant
+  capability module. If `public` names stay bound from its repeatable-read
+  snapshot through both name-based `ACCESS SHARE` locks, it checks exact
+  relation/type OIDs, migrations, privileges, columns, constraints, bad rows
+  under NOT VALID checks, and required indexes. DDL committed in that interval
+  can leave it validating old snapshot objects while locking replacements.
+  Conflicting table DDL is blocked only after both locks; later DDL is outside
+  the result. B2 moves privilege classification before those locks, so missing
+  table `SELECT` is now `Privilege` rather than a lock error collapsed to
+  `Query`, and `probe_transaction` now owns the rollback path. Errors fail
+  closed. No caller or boot wiring changes runtime behavior.
+- 2026-08-13 (#5071 T2-W S-R2a): the journal-owned obligation-window facade
+  reads every row in `(event_seq, event_id)` order and restores only closed
+  `O/A/T/C/S/U` events. It fails closed on malformed kinds, slots, attempts,
+  frontiers, receipts, obligation IDs, or optional positive top-level
+  `intake_outbox_id` evidence. Delivered requires exactly one `O/A/T/C`, no
+  `S/U`, one consistent attempt and frontier, and an exact same-channel receipt.
+  Only the verified outbox ID and malformed bit escape; there is no production
+  caller, reconciler, writer, transaction owner, or authority change, so runtime
+  behavior is unchanged.
+- 2026-08-13 (#5071 T2-W S-R1): migrations 0107-0109 add the nullable
+  `dispatched_at` clock, the official terminal `unknown` status, two NOT VALID
+  CHECKs, and valid concurrent indexes for future stale-dispatch and journal
+  binding readers. The channel-open set remains exactly `pending`, `claimed`,
+  `accepted`, `spawned`, and `dispatched`; `unknown` releases the route.
+  `IntakeOutboxStatus::Unknown` is a decoded domain value, while
+  `UnknownIntakeStatus` remains the error for unregistered spellings such as
+  `future_status`. Operator retry preserves an unknown source and only appends
+  a pending child; retry-as-new is an explicit operator action and does not
+  reinterpret or overwrite that unknown evidence. Because `unknown` is terminal
+  ambiguity and delivery may already have occurred, executing that child can
+  emit twice. An operator must first audit delivery/receipt evidence and accept
+  the duplicate consequence; this is not an automated reconciler policy. This
+  schema slice adds no dispatched/unknown writer, reconciler, or delivery
+  authority. Migration 0109 is forward-compatible substrate; its binding
+  writer does not exist before the future S-W1 binding-writer slice.
+
+  Rollout order is strict: deploy S-R1-capable binaries to the entire fleet
+  before any writer can create `unknown`. Migrations 0107-0109 establish an
+  immediate forward-only binary floor as soon as they are recorded: a binary
+  embedding only 0106 or earlier uses SQLx `ignore_missing=false`, fails startup
+  migration validation with `VersionMissing`, and must not restart or be rolled
+  back. The first official `unknown` row establishes a separate codec/data
+  downgrade floor: a coordinated database downgrade must normalize those rows
+  before removing the widened constraint.
+
+  Migration 0107 drops and re-adds the status CHECK as NOT VALID, so even a
+  manually validated pre-S-R1 status CHECK becomes unvalidated again. Existing
+  manually-created `dispatched` rows with a NULL clock are preserved because
+  no validation scan runs. A later UPDATE is rejected only if it leaves both
+  `status = 'dispatched'` and `dispatched_at IS NULL`; remediation may instead
+  fill the clock or move the row to a terminal status. Merely observing the NOT
+  VALID constraints is therefore not a sufficient capability signal. Before
+  authority activation, a later gate must remediate bad rows and require
+  completed validation, or prove bad-row absence fail-closed, in addition to
+  checking both concurrent indexes are present and `indisvalid=true`. Recovery
+  that records an already-applied manual migration must never copy the 64-hex
+  SHA-256 from `immutable-checksums.json` into `_sqlx_migrations`; that manifest
+  verifies exact migration file bytes only. `_sqlx_migrations.checksum` must be
+  the 96-hex SHA-384 resolved from those bytes by the exact pinned SQLx
+  migrator. For diagnosis and any approved guarded row repair, follow the
+  [PostgreSQL migration checksum repair procedure](../postgres-migration-checksum-repair.md).
+- 2026-08-13 (#5071 T2-R): intake-outbox row status now decodes through the
+  strong Rust enum, and owner-record status writes bind that enum only for the
+  intake-outbox domain. Unknown database spellings fail row decoding instead
+  of becoming a recoverable state. The stale local-route exception requires
+  every existing route-id, age, owner, and rollout condition plus exactly
+  `Some(Pending)`; `None` and every other status keep local execution fenced.
+  `None` records that route status could not be established after an insert
+  conflict and does not represent an unknown database spelling. This change
+  adds no owner, lease, migration, or cross-node execution authority.
+- 2026-08-12 (#5071 T2-M): `intake_router_hook.rs` and `owner_record.rs` extract open-status
+  domain constant to prevent drift. The predicate widens to include `dispatched`, but the result
+  set is unchanged while no production writer emits that status; no new ownership, fencing, or
+  multinode assumption is added. Owner-fenced routes (forwarded mode with instance_id + generation)
+  use the same constant pattern; caller ownership and lease assumptions are preserved. T2-W must
+  add its stale-`dispatched` reader because that open row occupies the route until terminalized; dispatch
+  failure remains post-accept terminal/operator-only, and T2-R does not widen accepted/spawned SLA predicates.
+  The two `NOT EXISTS` retry guards in `intake_outbox.rs` have the opposite polarity from the
+  other open-route reads: widening their inner set shrinks retry candidates, so T2-W must confirm
+  that a `dispatched` sibling is intended to block failed-pre-accept retry.
+  Migrations 0105 and 0106 are applied by `cmd_release_migrate_postgres` (under
+  `with_startup_advisory_lock`) before `deploy-release.sh` requests restart drain. The concurrent
+  index build in 0105 runs while the existing runtime is live and keeps ordinary table reads/writes
+  available, while SQLx's 0106 transaction requests ACCESS EXCLUSIVE for the catalog-only
+  CHECK/index swap. From the time 0106's request enters the lock queue, later conflicting reads and
+  writes can also wait behind it; after acquisition, that lock blocks reads and writes through
+  commit. The acquired-lock execution interval remains catalog-only, but total traffic blocking is
+  dominated by the remaining duration of preceding transactions plus the O(1) catalog and commit
+  work. The repository config sets no `lock_timeout`, so a preceding transaction can extend
+  blocking past the 10-second pool acquire timeout; if blocked accesses exhaust the pool, later
+  acquisitions can surface `sqlx::Error::PoolTimedOut`. The old open-route index remains until that
+  swap, so there is no fence gap. Migration 0105 establishes a
+  forward-only binary floor as soon as it is recorded: binaries embedding only migrations 0104 or
+  earlier fail SQLx migration validation and must not restart or be rolled back; recover by
+  forward-fix or coordinated database/fleet rollback.
 - 2026-08-05 (#5035): `runtime_bootstrap.rs` changes only the signature of the
   bootstrap stale-queued-placeholder delete helper (it now receives `SharedData`
   so each card is re-decided by `placeholder_controller::queued_card_gate`). The
@@ -1780,3 +1927,12 @@
   definition state, so any node computes the identical, channel-independent key
   — the reserved turn never mutates the channel's live `sessions.session_key`
   row. No node-local timer, leader singleton, or advisory lease is introduced.
+- #5071 S-R2c preparatory safety gate — **no runtime authority yet**: the gate
+  pins both intake-outbox `done` symbols. While
+  `src/services/discord/runtime_bootstrap/intake_delivery_reconciler.rs` is
+  present, the proof writer requires exactly one canonical call there and,
+  within the gate's declared lexical bounds, rejects a stray protected import
+  or call anywhere. The source-contract test pins the present state, so module
+  removal cannot silently return the gate to its preparatory zero-site state.
+  B2 adds only a dormant reducer; it adds no task, configuration, lease, routing
+  decision, or reachable database write.

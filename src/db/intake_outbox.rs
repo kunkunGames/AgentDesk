@@ -11,6 +11,8 @@
 //! global state — so they can be unit-tested with PG fixtures and reused
 //! by leader and worker code paths without coupling.
 
+use super::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
+use super::intake_outbox_status::IntakeOutboxStatus;
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -42,7 +44,7 @@ pub(crate) struct IntakeOutboxRow {
     /// Provider of the bot that forwarded this row (#4349). Carried through
     /// `force_fail_and_retry_as_new` so a retry stays on the same bot.
     pub provider: String,
-    pub status: String,
+    pub status: IntakeOutboxStatus,
     // reason: intake-outbox row column consumed by select claim/retry routes,
     // not every compile target. See #3034.
     #[allow(dead_code)]
@@ -120,7 +122,7 @@ pub(crate) async fn insert_pending(
             $8, $9, $10, $11, $12,
             $13, $14, $15,
             $16, $17, $18, $19,
-            'pending', $20, $21
+            $20, $21, $22
         )
         RETURNING id
         "#,
@@ -144,6 +146,7 @@ pub(crate) async fn insert_pending(
     .bind(payload.preserve_on_cancel)
     .bind(&payload.agent_id)
     .bind(&payload.provider)
+    .bind(IntakeOutboxStatus::Pending)
     .bind(attempt_no)
     .bind(parent_outbox_id)
     .fetch_one(pool)
@@ -239,7 +242,11 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     let retry_after_secs = retry_authorization_secs.map(|value| value.max(1) as i64);
     let _ = local_leader;
     let mut tx = pool.begin().await?;
-    let capable_source: Option<IntakeOutboxRow> = sqlx::query_as(
+    // LIMITS: both candidate queries retain `failed_pre_accept` literals, as do
+    // the pending claim, claimed stale sweep, and accepted SLA predicates below.
+    // Each matches a partial-index predicate that must remain a planner constant;
+    // a typed parameter can prevent generic-plan implication.
+    let capable_source_sql = format!(
         r#"
         SELECT parent.*
           FROM intake_outbox parent
@@ -256,7 +263,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
            AND NOT EXISTS (
                 SELECT 1 FROM intake_outbox open_row
                  WHERE open_row.channel_id = parent.channel_id
-                   AND open_row.status IN ('pending', 'claimed', 'accepted', 'spawned')
+                   AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
            )
            AND EXISTS (
                 SELECT 1 FROM worker_nodes worker
@@ -272,7 +279,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                          FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'providers')
                               AS provider_entry(value)
                         WHERE jsonb_typeof(provider_entry.value) = 'string'
-                          AND lower(btrim(provider_entry.value #>> '{}')) = lower(btrim(parent.provider))
+                          AND lower(btrim(provider_entry.value #>> '{{}}')) = lower(btrim(parent.provider))
                    )
                    AND (COALESCE(parent.preserve_on_cancel, false) = false OR
                         (jsonb_typeof(worker.capabilities->'intake_worker'->'features') = 'array' AND
@@ -281,7 +288,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                                FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'features')
                                     AS feature_entry(value)
                               WHERE jsonb_typeof(feature_entry.value) = 'string'
-                                AND lower(btrim(feature_entry.value #>> '{}')) = 'preserve_on_cancel_v1'
+                                AND lower(btrim(feature_entry.value #>> '{{}}')) = 'preserve_on_cancel_v1'
                          )))
                    AND jsonb_typeof(parent.required_labels) = 'array'
                    AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(parent.required_labels) v
@@ -305,17 +312,18 @@ pub(crate) async fn sweep_failed_pre_accept_once(
          ORDER BY parent.updated_at ASC, parent.id ASC
          LIMIT 1
          FOR UPDATE OF parent SKIP LOCKED
-        "#,
-    )
-    .bind(stale_after_secs)
-    .bind(max_attempts)
-    .bind(retry_after_secs)
-    .fetch_optional(&mut *tx)
-    .await?;
+        "#
+    );
+    let capable_source: Option<IntakeOutboxRow> = sqlx::query_as(&capable_source_sql)
+        .bind(stale_after_secs)
+        .bind(max_attempts)
+        .bind(retry_after_secs)
+        .fetch_optional(&mut *tx)
+        .await?;
     let source = if capable_source.is_some() {
         capable_source
     } else {
-        sqlx::query_as(
+        let fallback_source_sql = format!(
             r#"
             SELECT parent.*
               FROM intake_outbox parent
@@ -331,16 +339,17 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                AND NOT EXISTS (
                     SELECT 1 FROM intake_outbox open_row
                      WHERE open_row.channel_id = parent.channel_id
-                       AND open_row.status IN ('pending', 'claimed', 'accepted', 'spawned')
+                       AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
                )
              ORDER BY parent.updated_at ASC, parent.id ASC
              LIMIT 1
              FOR UPDATE OF parent SKIP LOCKED
-            "#,
-        )
-        .bind(retry_after_secs)
-        .fetch_optional(&mut *tx)
-        .await?
+            "#
+        );
+        sqlx::query_as(&fallback_source_sql)
+            .bind(retry_after_secs)
+            .fetch_optional(&mut *tx)
+            .await?
     };
 
     let Some(source) = source else {
@@ -470,7 +479,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
             status, attempt_no, parent_outbox_id
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                   $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                  'pending', $23, $24)
+                  $23, $24, $25)
         RETURNING id"#,
     )
     .bind(&target)
@@ -495,6 +504,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     .bind(source.owner_instance_id.as_deref())
     .bind(source.owner_generation)
     .bind(&source.admission_kind)
+    .bind(IntakeOutboxStatus::Pending)
     .bind(next_attempt)
     .bind(source.id)
     .fetch_one(&mut *tx)
@@ -560,7 +570,7 @@ pub(crate) async fn claim_pending_for_target(
 
     let row: IntakeOutboxRow = sqlx::query_as(
         "UPDATE intake_outbox
-         SET status = 'claimed',
+         SET status = $3,
              claim_owner = $2,
              claimed_at = NOW()
          WHERE id = $1
@@ -568,6 +578,7 @@ pub(crate) async fn claim_pending_for_target(
     )
     .bind(id)
     .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Claimed)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -590,13 +601,15 @@ pub(crate) async fn return_claimed_to_pending(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'pending',
+         SET status = $3,
              claim_owner = NULL,
              claimed_at = NULL
-         WHERE id = $1 AND status = 'claimed' AND claim_owner = $2",
+         WHERE id = $1 AND status = $4 AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Pending)
+    .bind(IntakeOutboxStatus::Claimed)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -619,11 +632,13 @@ pub(crate) async fn mark_accepted(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'accepted', accepted_at = NOW()
-         WHERE id = $1 AND status = 'claimed' AND claim_owner = $2",
+         SET status = $3, accepted_at = NOW()
+         WHERE id = $1 AND status = $4 AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Accepted)
+    .bind(IntakeOutboxStatus::Claimed)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -643,11 +658,13 @@ pub(crate) async fn mark_spawned(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'spawned', spawned_at = NOW()
-         WHERE id = $1 AND status = 'accepted' AND claim_owner = $2",
+         SET status = $3, spawned_at = NOW()
+         WHERE id = $1 AND status = $4 AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Spawned)
+    .bind(IntakeOutboxStatus::Accepted)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -656,10 +673,10 @@ pub(crate) async fn mark_spawned(
 /// Successful completion: `spawned → done`. Worker calls this on
 /// `Ok(())` from `execute_intake_turn_core`.
 ///
-/// Returns `Ok(true)` on a real transition; `Ok(false)` if the row was
-/// no longer in `spawned` (e.g., already moved to `failed_post_accept`
-/// by an operator). Workers should log the divergence rather than
-/// retry on `Ok(false)`.
+/// Returns `Ok(true)` on a real transition. `Ok(false)` with `dispatched`
+/// means the bridge handoff stamp won first and is normal; `done` means terminal
+/// settlement won first and is also normal. Other observed states (including a
+/// missing row) are divergence and should be logged rather than retried.
 pub(crate) async fn mark_done(
     pool: &PgPool,
     id: i64,
@@ -667,11 +684,13 @@ pub(crate) async fn mark_done(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'done', completed_at = NOW()
-         WHERE id = $1 AND status = 'spawned' AND claim_owner = $2",
+         SET status = $3, completed_at = NOW()
+         WHERE id = $1 AND status = $4 AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Done)
+    .bind(IntakeOutboxStatus::Spawned)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -693,15 +712,17 @@ pub(crate) async fn mark_failed_pre_accept(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'failed_pre_accept',
+         SET status = $4,
              completed_at = NOW(),
              last_error = $3,
              retry_count = retry_count + 1
-         WHERE id = $1 AND status = 'claimed' AND claim_owner = $2",
+         WHERE id = $1 AND status = $5 AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
     .bind(error_message)
+    .bind(IntakeOutboxStatus::FailedPreAccept)
+    .bind(IntakeOutboxStatus::Claimed)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -723,16 +744,19 @@ pub(crate) async fn mark_failed_post_accept(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'failed_post_accept',
+         SET status = $4,
              completed_at = NOW(),
              last_error = $3
          WHERE id = $1
-           AND status IN ('accepted', 'spawned')
+           AND status IN ($5, $6)
            AND claim_owner = $2",
     )
     .bind(id)
     .bind(claim_owner)
     .bind(error_message)
+    .bind(IntakeOutboxStatus::FailedPostAccept)
+    .bind(IntakeOutboxStatus::Accepted)
+    .bind(IntakeOutboxStatus::Spawned)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -754,184 +778,17 @@ pub(crate) async fn sweep_stale_pre_accept_claims(
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE intake_outbox
-         SET status = 'pending',
+         SET status = $2,
              claim_owner = NULL,
              claimed_at = NULL
          WHERE status = 'claimed'
            AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 second')",
     )
     .bind(stale_after_secs.max(1))
+    .bind(IntakeOutboxStatus::Pending)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
-}
-
-/// Statuses that `force_fail_and_retry_as_new` will accept. Other
-/// states (notably `done` — codex Phase 5 P0 #2) are refused: a worker
-/// `mark_done` racing with operator force-fail could rewrite a
-/// completed row into `failed_post_accept` and double-emit on retry.
-const TRANSITION_12_ALLOWED: [&str; 3] = ["accepted", "spawned", "failed_post_accept"];
-
-/// Reasons `force_fail_and_retry_as_new` may refuse to operate.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ForceFailError {
-    #[error("intake_outbox row id={0} does not exist")]
-    NotFound(i64),
-    #[error(
-        "intake_outbox row id={id} is in status='{status}'; force-fail is only allowed from \
-         accepted/spawned/failed_post_accept (running transition 12 from any other state could \
-         double-emit a Discord turn)"
-    )]
-    DisallowedStatus { id: i64, status: String },
-    #[error(
-        "intake_outbox row id={id} has no recorded provider; a retry would insert pending work \
-         that no worker can claim (claim is scoped on intake_outbox.provider since #4349). This \
-         row predates the provider column and its forwarding bot is unknowable — set \
-         intake_outbox.provider explicitly before retrying, or leave it terminal"
-    )]
-    UnknownProvider { id: i64 },
-    #[error("postgres error: {0}")]
-    Db(#[from] sqlx::Error),
-}
-
-/// Operator-driven force-fail + retry-as-new. Phase 5 transition 12:
-/// when a row is stuck in `accepted`, `spawned`, or `failed_post_accept`
-/// (worker hung mid-turn or post-accept failure pinged the operator
-/// alert), this single-transaction helper:
-///
-///   1. Marks the stuck row as `failed_post_accept` with the operator's
-///      reason text (no-op if already `failed_post_accept`).
-///   2. INSERTs a fresh row in the same `(channel_id, user_msg_id)`
-///      family with `attempt_no = MAX + 1` and
-///      `parent_outbox_id = <stuck_id>`, copying the original payload
-///      so the worker can re-run the turn from scratch.
-///
-/// Both writes happen inside one transaction so the partial unique
-/// index `intake_outbox_one_open_route_per_channel` never observes
-/// the stuck row AND the new row in OPEN states at the same moment —
-/// the stuck row is force-failed BEFORE the new row enters `pending`.
-///
-/// Codex Phase 5 P0 #2: explicitly REFUSES `done`,
-/// `failed_pre_accept`, `pending`, and `claimed`. The `done` case is
-/// the dangerous one — a worker `mark_done` racing with the operator
-/// CLI could otherwise rewrite a completed row into
-/// `failed_post_accept` and trigger a double-execution. The other
-/// rejected statuses are not stuck (the natural retry path covers
-/// them) so refusing is the right semantic.
-///
-/// Returns the new row's `id`. Errors with `ForceFailError::NotFound`
-/// if `stuck_id` does not exist, or `ForceFailError::DisallowedStatus`
-/// for any rejected status.
-pub(crate) async fn force_fail_and_retry_as_new(
-    pool: &PgPool,
-    stuck_id: i64,
-    operator_reason: &str,
-) -> Result<i64, ForceFailError> {
-    let mut tx = pool.begin().await?;
-
-    let row: Option<IntakeOutboxRow> =
-        sqlx::query_as("SELECT * FROM intake_outbox WHERE id = $1 FOR UPDATE")
-            .bind(stuck_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let row = row.ok_or(ForceFailError::NotFound(stuck_id))?;
-
-    if !TRANSITION_12_ALLOWED.contains(&row.status.as_str()) {
-        return Err(ForceFailError::DisallowedStatus {
-            id: stuck_id,
-            status: row.status.clone(),
-        });
-    }
-
-    // #4349 review r2: the retry below copies `row.provider` into a fresh
-    // `pending` row, and claim is scoped on `intake_outbox.provider`. An empty
-    // provider matches no worker, so retrying such a row would silently strand
-    // it in `pending` forever — exactly the failure migration 0080 fails closed
-    // to avoid. Refuse loudly and BEFORE any state change, so the operator sees
-    // it instead of inheriting invisible pending work.
-    //
-    // Only rows that predate the provider column and whose `claim_owner` was
-    // unusable can reach here; 0080 recovers every other row.
-    if row.provider.trim().is_empty() {
-        return Err(ForceFailError::UnknownProvider { id: stuck_id });
-    }
-
-    // Force-terminate if not already terminal:
-    //   - 'accepted' / 'spawned': hung mid-turn; mark failed_post_accept.
-    //   - 'failed_post_accept': already terminal; just rebuild a new attempt.
-    if row.status != "failed_post_accept" {
-        sqlx::query(
-            "UPDATE intake_outbox
-             SET status = 'failed_post_accept',
-                 completed_at = COALESCE(completed_at, NOW()),
-                 last_error = $2
-             WHERE id = $1",
-        )
-        .bind(stuck_id)
-        .bind(format!(
-            "operator force-fail (was: {}); reason: {}",
-            row.status, operator_reason
-        ))
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let next_attempt: Option<i32> = sqlx::query_scalar(
-        "SELECT MAX(attempt_no) FROM intake_outbox
-         WHERE channel_id = $1 AND user_msg_id = $2",
-    )
-    .bind(&row.channel_id)
-    .bind(&row.user_msg_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let next_attempt = next_attempt.unwrap_or(0) + 1;
-
-    let new_id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO intake_outbox (
-            target_instance_id, forwarded_by_instance_id, required_labels,
-            channel_id, user_msg_id, request_owner_id, request_owner_name,
-            user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
-            merge_consecutive, reply_to_user_message, defer_watcher_resume,
-            wait_for_completion, preserve_on_cancel, agent_id, provider,
-            status, attempt_no, parent_outbox_id
-        ) VALUES (
-            $1, $2, $3,
-            $4, $5, $6, $7,
-            $8, $9, $10, $11, $12,
-            $13, $14, $15,
-            $16, $17, $18, $19,
-            'pending', $20, $21
-        )
-        RETURNING id
-        "#,
-    )
-    .bind(&row.target_instance_id)
-    .bind(&row.forwarded_by_instance_id)
-    .bind(&row.required_labels)
-    .bind(&row.channel_id)
-    .bind(&row.user_msg_id)
-    .bind(&row.request_owner_id)
-    .bind(row.request_owner_name.as_deref())
-    .bind(&row.user_text)
-    .bind(row.reply_context.as_deref())
-    .bind(row.has_reply_boundary)
-    .bind(row.dm_hint)
-    .bind(&row.turn_kind)
-    .bind(row.merge_consecutive)
-    .bind(row.reply_to_user_message)
-    .bind(row.defer_watcher_resume)
-    .bind(row.wait_for_completion)
-    .bind(row.preserve_on_cancel)
-    .bind(&row.agent_id)
-    .bind(&row.provider)
-    .bind(next_attempt)
-    .bind(stuck_id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(new_id)
 }
 
 /// Operator-driven status query. Returns the most recent `limit` rows
@@ -994,6 +851,9 @@ pub(crate) async fn list_accepted_unspawned_sla(
 #[cfg(test)]
 mod migration_pg_tests {
     use crate::db::auto_queue::test_support::TestPostgresDb;
+    use crate::db::intake_outbox_force_fail::{ForceFailError, force_fail_and_retry_as_new};
+    use crate::db::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
+    use crate::db::intake_outbox_status::{IntakeOutboxStatus, OperatorRetryClass};
     use serde_json::json;
     use sqlx::Row;
 
@@ -1129,15 +989,18 @@ mod migration_pg_tests {
             "post-accept row must not be misclassified as retryable pre-accept"
         );
         // It lands in a state force_fail_and_retry_as_new would otherwise accept…
-        assert!(super::TRANSITION_12_ALLOWED.contains(&orphan_status.as_str()));
+        assert_eq!(
+            IntakeOutboxStatus::FailedPostAccept.operator_retry(),
+            OperatorRetryClass::AlreadyTerminal
+        );
 
         // …but retrying it would insert `pending` work with provider='' that no
         // worker can claim. #4349 review r2: refuse loudly, change nothing.
-        let err = super::force_fail_and_retry_as_new(&pool, orphan_post, "operator: retry")
+        let err = force_fail_and_retry_as_new(&pool, orphan_post, "operator: retry")
             .await
             .expect_err("orphan row with no provider must be refused");
         match err {
-            super::ForceFailError::UnknownProvider { id } => assert_eq!(id, orphan_post),
+            ForceFailError::UnknownProvider { id } => assert_eq!(id, orphan_post),
             other => panic!("expected UnknownProvider, got {other:?}"), // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
         }
 
@@ -1155,13 +1018,14 @@ mod migration_pg_tests {
         );
 
         // No pending row anywhere can carry an unclaimable empty provider.
-        let unclaimable: i64 = sqlx::query_scalar(
+        let unclaimable_sql = format!(
             "SELECT COUNT(*)::BIGINT FROM intake_outbox
-             WHERE provider = '' AND status IN ('pending','claimed','accepted','spawned')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count unclaimable open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+             WHERE provider = '' AND status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})"
+        );
+        let unclaimable: i64 = sqlx::query_scalar(&unclaimable_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("count unclaimable open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
         assert_eq!(
             unclaimable, 0,
             "migration must leave no open row that a worker can never claim"
@@ -1200,11 +1064,10 @@ mod migration_pg_tests {
         pg_db.drop().await;
     }
 
-    /// CHECK constraint must reject an unknown status value. Production
-    /// code only writes the seven values from the design; this guard
-    /// catches accidental typos at insert time.
+    /// CHECK constraint must reject an unrecognized status value. This guard
+    /// distinguishes spelling mistakes from the official terminal `unknown`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn intake_outbox_status_check_rejects_unknown_value() {
+    async fn intake_outbox_status_check_rejects_unrecognized_value() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
 
@@ -1303,6 +1166,213 @@ mod migration_pg_tests {
         insert_minimal_row(&pool, "ch-open", "msg-B", 1, "pending")
             .await
             .expect("fresh OPEN row after parent terminal");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// T2-M is schema-only: before any writer produces `dispatched`, widening
+    /// the open-status predicate must select exactly the same rows as the
+    /// pre-T2-M predicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn intake_outbox_dispatched_extension_is_dormant_without_dispatched_rows() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        for (offset, status) in [
+            "pending",
+            "claimed",
+            "accepted",
+            "spawned",
+            "done",
+            "failed_pre_accept",
+            "failed_post_accept",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert_minimal_row(
+                &pool,
+                &format!("ch-dormant-{offset}"),
+                &format!("msg-dormant-{offset}"),
+                1,
+                status,
+            )
+            .await
+            .expect("seed pre-dispatched lifecycle row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+        }
+
+        let dispatched_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE status = 'dispatched'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count dispatched rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+        assert_eq!(
+            dispatched_rows, 0,
+            "fixture must prove dormancy without manufacturing dispatched behavior"
+        );
+
+        let prior_statuses = ["pending", "claimed", "accepted", "spawned"]
+            .map(|status| format!("'{status}'"))
+            .join(", ");
+        let prior_sql = format!(
+            "SELECT id FROM intake_outbox
+             WHERE status IN ({prior_statuses})
+             ORDER BY id"
+        );
+        let old_ids: Vec<i64> = sqlx::query_scalar(&prior_sql)
+            .fetch_all(&pool)
+            .await
+            .expect("select pre-T2-M open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+        let widened_sql = format!(
+            "SELECT id FROM intake_outbox
+             WHERE status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
+             ORDER BY id"
+        );
+        let widened_ids: Vec<i64> = sqlx::query_scalar(&widened_sql)
+            .fetch_all(&pool)
+            .await
+            .expect("select T2-M open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+        assert_eq!(
+            widened_ids, old_ids,
+            "adding an unwritten dispatched status must leave query results unchanged"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// S-R1 installs the official terminal `unknown` state, dispatch clock
+    /// invariant, and both reconciler-supporting indexes without changing the
+    /// five-state open-route predicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn intake_outbox_sr1_schema_enforces_unknown_clock_and_indexes_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        let missing_clock =
+            insert_minimal_row(&pool, "ch-dispatched", "msg-no-clock", 1, "dispatched")
+                .await
+                .expect_err("dispatched without dispatched_at must fail closed");
+        assert!(
+            missing_clock
+                .to_string()
+                .contains("intake_outbox_dispatched_requires_clock"),
+            "expected named dispatch-clock CHECK violation, got: {missing_clock}"
+        );
+
+        sqlx::query(
+            "INSERT INTO intake_outbox (
+                target_instance_id, forwarded_by_instance_id, required_labels,
+                channel_id, user_msg_id, request_owner_id, request_owner_name,
+                user_text, turn_kind, agent_id, status, attempt_no, dispatched_at
+             ) VALUES (
+                'worker-1', 'leader-1', '[]'::JSONB,
+                'ch-dispatched', 'msg-clock', 'user-1', 'Tester',
+                'hello', 'standard', 'agent-x', 'dispatched', 1, NOW()
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("dispatched with a clock must satisfy both CHECKs"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        let error = insert_minimal_row(&pool, "ch-dispatched", "msg-B", 1, "pending")
+            .await
+            .expect_err("clocked dispatched must retain the channel open-route fence");
+        assert!(
+            error
+                .to_string()
+                .contains("intake_outbox_one_open_route_per_channel"),
+            "expected named open-route index violation after dispatched row, got: {error}"
+        );
+
+        insert_minimal_row(&pool, "ch-unknown", "msg-unknown", 1, "unknown")
+            .await
+            .expect("official unknown must satisfy intake_outbox_status_check"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+        let decoded: IntakeOutboxStatus = sqlx::query_scalar(
+            "SELECT status FROM intake_outbox
+             WHERE channel_id='ch-unknown' AND user_msg_id='msg-unknown'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("decode official unknown through the typed SQLx codec"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        assert_eq!(decoded, IntakeOutboxStatus::Unknown);
+        assert_eq!(decoded.to_string(), "unknown");
+        assert!(
+            !decoded.is_open(),
+            "official unknown must release its route"
+        );
+        insert_minimal_row(&pool, "ch-unknown", "msg-after-unknown", 1, "pending")
+            .await
+            .expect("a same-channel pending row is allowed after terminal unknown"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+
+        let future = insert_minimal_row(&pool, "ch-future", "msg-future", 1, "future_status")
+            .await
+            .expect_err("unregistered future_status must remain rejected");
+        assert!(
+            future.to_string().contains("intake_outbox_status_check"),
+            "expected named status CHECK violation for future_status, got: {future}"
+        );
+
+        for constraint in [
+            "intake_outbox_status_check",
+            "intake_outbox_dispatched_requires_clock",
+        ] {
+            let convalidated: bool = sqlx::query_scalar(
+                "SELECT convalidated FROM pg_constraint
+                 WHERE conrelid = 'intake_outbox'::regclass AND conname = $1",
+            )
+            .bind(constraint)
+            .fetch_one(&pool)
+            .await
+            .expect("read S-R1 CHECK validation state"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+            assert!(!convalidated, "{constraint} must remain NOT VALID in S-R1");
+        }
+        for (index, table, column_or_expression, predicate) in [
+            (
+                "idx_intake_outbox_stale_dispatched",
+                "intake_outbox",
+                "dispatched_at",
+                "(status = 'dispatched'::text)",
+            ),
+            (
+                "idx_delivery_journal_intake_binding",
+                "delivery_journal_events",
+                "(canonical_payload ->> 'intake_outbox_id'::text)",
+                "(event_kind = 'O'::text)",
+            ),
+        ] {
+            let catalog: (String, String, String, bool, i16, i16, String, String) = sqlx::query_as(
+                "SELECT index_ns.nspname, table_ns.nspname, t.relname, i.indisvalid,
+                        i.indnkeyatts, i.indnatts,
+                        pg_get_indexdef(i.indexrelid, 1, true),
+                        pg_get_expr(i.indpred, i.indrelid)
+                   FROM pg_index i
+                   JOIN pg_class c ON c.oid = i.indexrelid
+                   JOIN pg_class t ON t.oid = i.indrelid
+                   JOIN pg_namespace index_ns ON index_ns.oid = c.relnamespace
+                   JOIN pg_namespace table_ns ON table_ns.oid = t.relnamespace
+                  WHERE index_ns.nspname = 'public' AND c.relname = $1",
+            )
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("read S-R1 concurrent index catalog contract"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+            assert_eq!(catalog.0, "public", "{index} index must live in public");
+            assert_eq!(catalog.1, "public", "{index} table must live in public");
+            assert_eq!(catalog.2, table, "{index} must bind the intended table");
+            assert!(catalog.3, "fresh migration must build valid index {index}");
+            assert_eq!(catalog.4, 1, "{index} must have exactly one key attribute");
+            assert_eq!(catalog.5, 1, "{index} must not have INCLUDE attributes");
+            assert_eq!(
+                catalog.6, column_or_expression,
+                "{index} must retain its exact indexed expression"
+            );
+            assert_eq!(
+                catalog.7, predicate,
+                "{index} must retain its exact partial predicate"
+            );
+        }
 
         pool.close().await;
         pg_db.drop().await;
@@ -1479,6 +1549,8 @@ mod migration_pg_tests {
 mod postgres_tests {
     use super::*;
     use crate::db::auto_queue::test_support::TestPostgresDb;
+    use crate::db::intake_outbox_force_fail::{ForceFailError, force_fail_and_retry_as_new};
+    use crate::db::intake_outbox_status::IntakeOutboxStatus;
     use serde_json::json;
 
     fn payload(channel: &str, msg: &str) -> InsertPendingPayload {
@@ -1521,7 +1593,7 @@ mod postgres_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn insert_pending_round_trips_payload_and_returns_id() {
+    async fn insert_pending_round_trips_payload_and_returns_id() -> Result<(), sqlx::Error> {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
@@ -1539,13 +1611,32 @@ mod postgres_tests {
         assert_eq!(row.channel_id, "ch-1");
         assert_eq!(row.user_msg_id, "msg-1");
         assert_eq!(row.attempt_no, 1);
-        assert_eq!(row.status, "pending");
+        assert_eq!(row.status, IntakeOutboxStatus::Pending);
         assert!(row.parent_outbox_id.is_none());
         assert_eq!(row.required_labels, json!(["unreal"]));
         assert_eq!(row.preserve_on_cancel, Some(false));
 
+        for status in IntakeOutboxStatus::ALL {
+            let (raw_status, typed_status): (String, IntakeOutboxStatus) =
+                match sqlx::query_as("SELECT $1::TEXT, $1::TEXT")
+                    .bind(status)
+                    .fetch_one(&pool)
+                    .await
+                {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        pool.close().await;
+                        pg_db.drop().await;
+                        return Err(error);
+                    }
+                };
+            assert_eq!(raw_status, status.as_str());
+            assert_eq!(typed_status, status);
+        }
+
         pool.close().await;
         pg_db.drop().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1664,7 +1755,7 @@ mod postgres_tests {
             .expect("claim")
             .expect("must claim something");
         assert_eq!(claimed.id, id1);
-        assert_eq!(claimed.status, "claimed");
+        assert_eq!(claimed.status, IntakeOutboxStatus::Claimed);
         assert_eq!(claimed.claim_owner.as_deref(), Some("worker-1.local"));
 
         pool.close().await;
@@ -1729,7 +1820,7 @@ mod postgres_tests {
             .await
             .expect("claim")
             .expect("row");
-        assert_eq!(claimed.status, "claimed");
+        assert_eq!(claimed.status, IntakeOutboxStatus::Claimed);
 
         let advanced = mark_accepted(&pool, claimed.id, "owner-1")
             .await
@@ -2341,7 +2432,7 @@ mod postgres_tests {
             .fetch_one(&pool)
             .await
             .expect("read row");
-        assert_eq!(row.status, "failed_pre_accept");
+        assert_eq!(row.status, IntakeOutboxStatus::FailedPreAccept);
         assert_eq!(row.retry_count, 1);
 
         pool.close().await;
@@ -2573,54 +2664,128 @@ mod postgres_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn force_fail_and_retry_as_new_on_already_terminal_row_just_appends_attempt() {
-        // Operator hits the helper after the worker already wrote
-        // failed_post_accept (the alert path's normal flow). The
-        // helper must NOT overwrite the existing last_error and must
-        // still insert the new attempt.
+        // Preserve the original failed-post-accept regression proof alongside
+        // the new official-unknown proof below: both are terminal evidence.
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
 
         insert_pending(&pool, &payload("ch-terminal", "msg-terminal"), 1, None)
             .await
-            .expect("seed");
+            .expect("seed"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
         let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
             .await
-            .expect("claim")
-            .expect("row");
+            .expect("claim") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+            .expect("row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
         mark_accepted(&pool, claimed.id, "owner-1")
             .await
-            .expect("accept");
+            .expect("accept"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
         mark_failed_post_accept(&pool, claimed.id, "owner-1", "original failure")
             .await
-            .expect("fail post-accept");
+            .expect("fail post-accept"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
 
         let new_id = force_fail_and_retry_as_new(&pool, claimed.id, "operator: retry approved")
             .await
-            .expect("force-fail");
-
-        let stuck_last_error: Option<String> =
-            sqlx::query_scalar("SELECT last_error FROM intake_outbox WHERE id = $1")
+            .expect("force-fail"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        let source: (IntakeOutboxStatus, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM intake_outbox WHERE id = $1")
                 .bind(claimed.id)
                 .fetch_one(&pool)
                 .await
-                .expect("read stuck last_error");
+                .expect("read failed-post-accept source"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
         assert_eq!(
-            stuck_last_error.as_deref(),
-            Some("original failure"),
-            "already-terminal row must preserve its original last_error"
+            source,
+            (
+                IntakeOutboxStatus::FailedPostAccept,
+                Some("original failure".to_string()),
+            ),
+            "retry must preserve already-terminal source evidence"
         );
 
-        let new_attempt: i32 =
-            sqlx::query_scalar("SELECT attempt_no FROM intake_outbox WHERE id = $1")
-                .bind(new_id)
-                .fetch_one(&pool)
-                .await
-                .expect("read new attempt");
-        assert_eq!(new_attempt, 2);
+        let child: (IntakeOutboxStatus, i32, Option<i64>) = sqlx::query_as(
+            "SELECT status, attempt_no, parent_outbox_id FROM intake_outbox WHERE id = $1",
+        )
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read failed-post-accept child attempt"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        assert_eq!(
+            child,
+            (IntakeOutboxStatus::Pending, 2, Some(claimed.id)),
+            "retry must append one pending child"
+        );
 
         pool.close().await;
         pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_fail_and_retry_as_new_preserves_unknown_source_and_appends_pending_attempt()
+    -> Result<(), ForceFailError> {
+        // Official unknown is terminal evidence, not a failure alias. Operator
+        // retry appends a child but must not rewrite the source status/error.
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        seed_default_test_agent(&pool).await;
+
+        insert_pending(
+            &pool,
+            &payload("ch-unknown-retry", "msg-unknown-retry"),
+            1,
+            None,
+        )
+        .await
+        .expect("seed"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        let source_id: i64 = sqlx::query_scalar(
+            "UPDATE intake_outbox
+                SET status = $1, completed_at = NOW(), last_error = 'delivery outcome unknown'
+              WHERE channel_id = 'ch-unknown-retry'
+          RETURNING id",
+        )
+        .bind(IntakeOutboxStatus::Unknown)
+        .fetch_one(&pool)
+        .await
+        .expect("settle source as official unknown"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+
+        let new_id =
+            match force_fail_and_retry_as_new(&pool, source_id, "operator: retry approved").await {
+                Ok(new_id) => new_id,
+                Err(error) => {
+                    pool.close().await;
+                    pg_db.drop().await;
+                    return Err(error);
+                }
+            };
+
+        let source: (IntakeOutboxStatus, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM intake_outbox WHERE id = $1")
+                .bind(source_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read unknown source"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        assert_eq!(source.0, IntakeOutboxStatus::Unknown);
+        assert_eq!(
+            source.1.as_deref(),
+            Some("delivery outcome unknown"),
+            "retry must preserve unknown evidence instead of collapsing it to failure"
+        );
+
+        let child: (IntakeOutboxStatus, i32, Option<i64>) = sqlx::query_as(
+            "SELECT status, attempt_no, parent_outbox_id FROM intake_outbox WHERE id = $1",
+        )
+        .bind(new_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read child attempt"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
+        assert_eq!(
+            child,
+            (IntakeOutboxStatus::Pending, 2, Some(source_id)),
+            "retry must append one pending child linked to the unchanged source"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2674,7 +2839,8 @@ mod postgres_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn force_fail_and_retry_as_new_refuses_pending_and_claimed_states() {
+    async fn force_fail_and_retry_as_new_refuses_pending_and_claimed_states()
+    -> Result<(), sqlx::Error> {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
@@ -2702,8 +2868,39 @@ mod postgres_tests {
             ForceFailError::DisallowedStatus { .. }
         ));
 
+        let unknown_fixture = async {
+            sqlx::query("ALTER TABLE intake_outbox DROP CONSTRAINT intake_outbox_status_check")
+                .execute(&pool)
+                .await?;
+            sqlx::query("UPDATE intake_outbox SET status = 'future_status' WHERE id = $1")
+                .bind(claimed.id)
+                .execute(&pool)
+                .await?;
+            let unknown = force_fail_and_retry_as_new(&pool, claimed.id, "x")
+                .await
+                .expect_err("unknown strong-enum spelling must fail at row decode");
+            let unchanged: (String, i64) = sqlx::query_as(
+                "SELECT status, COUNT(*) OVER ()::BIGINT FROM intake_outbox WHERE channel_id = 'ch-p'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            Ok::<_, sqlx::Error>((unknown, unchanged))
+        }
+        .await;
         pool.close().await;
         pg_db.drop().await;
+
+        let (unknown, unchanged) = unknown_fixture?;
+        assert!(
+            matches!(
+                unknown,
+                ForceFailError::Db(sqlx::Error::ColumnDecode { ref index, .. })
+                    if index.trim_matches('"') == "status"
+            ),
+            "unknown spelling must surface as status ColumnDecode: {unknown:?}"
+        );
+        assert_eq!(unchanged, ("future_status".to_string(), 1));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

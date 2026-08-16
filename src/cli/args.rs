@@ -660,6 +660,20 @@ pub(crate) enum DispatchAction {
 
 #[derive(Subcommand)]
 pub(crate) enum IntakeOutboxAction {
+    /// List dispatched rows and their recorded audit facts without changing them.
+    DispatchedAudit,
+    /// Settle a dispatched handoff as unknown without creating a retry child that could redeliver an already delivered turn.
+    DispatchedSettle {
+        id: i64,
+        #[arg(long, default_value = "operator dispatched-settle via CLI")]
+        reason: String,
+    },
+    /// Settle a spawned handoff as unknown without creating a retry child that could redeliver an already delivered turn.
+    SpawnedSettle {
+        id: i64,
+        #[arg(long, default_value = "operator spawned-settle via CLI")]
+        reason: String,
+    },
     /// Show recent intake_outbox rows (newest first).
     Status {
         /// Filter to a single Discord channel id.
@@ -1041,6 +1055,7 @@ mod tests {
             "terminations",
             "doctor",
             "migrate",
+            "release-migrate-postgres",
             "provider-cli",
             "show",
             "health",

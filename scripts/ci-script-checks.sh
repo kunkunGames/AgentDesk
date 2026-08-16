@@ -65,6 +65,15 @@ echo "=== Policy DB capability manifest guard (#3734) ==="
   --require-manifest policies/merge-automation.cap.yaml
 "$PYTHON" -m unittest tests.test_policy_db_capabilities
 
+echo "=== SQL execution surface inventory baseline (#5358) ==="
+"$PYTHON" scripts/check_sql_execution_surface_inventory.py --check
+git diff --exit-code HEAD -- scripts/sql_execution_surface_inventory.json
+"$PYTHON" -m unittest tests.test_sql_execution_surface_inventory
+
+echo "=== Destructive call-site per-file ratchet (#5071 T3-A4) ==="
+"$PYTHON" scripts/check_destructive_call_site_ratchet.py --check
+"$PYTHON" -m unittest tests.test_destructive_call_site_ratchet
+
 echo "=== Merge automation policy tests (#4250) ==="
 node --test policies/__tests__/merge-automation.test.js
 
@@ -100,6 +109,12 @@ echo "=== Durable frontier writer per-file call-site allowlist (#5071) ==="
 "$PYTHON" scripts/check_durable_frontier_writer_call_sites.py
 "$PYTHON" -m unittest tests.test_durable_frontier_writer_call_sites
 
+echo "=== Intake-outbox done writer per-file call-site allowlist (#5071 T2) ==="
+# Pins the pre-T2 `mark_done` owner by exact per-file textual count over src/;
+# the script docstring declares the lexical forms and semantic facts it cannot see.
+"$PYTHON" scripts/check_intake_outbox_done_writer_call_sites.py
+"$PYTHON" -m unittest tests.test_intake_outbox_done_writer_call_sites
+
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
 "$PYTHON" -m unittest scripts.test_ratchet_admission
@@ -124,12 +139,13 @@ echo "=== CI runner hardening guard ==="
 "$PYTHON" -m unittest tests.test_discord_thread_create_ci_wiring
 
 echo "=== PR infrastructure failure rerun classifier (#4392/#5207) ==="
-# The self-test also enforces the #5207 sibling-regex sync contract: the
+# These self-tests also enforce the #5207 sibling-regex sync contract: the
 # classifier's INFRA_TERMINATION_REGEX must stay byte-identical to
 # log_has_infra_termination in scripts/main-ci-triage.sh, and drift fails here.
 # tests/test_infra_failure_classifier_5207.sh (tests/*.sh loop below) carries
 # the discriminating matrix and proves drift detection actually discriminates.
 ./scripts/ci/infra-failure-rerun.sh --self-test
+bash scripts/main-ci-triage.sh --self-test
 
 echo "=== CI timeout wrapper tests (#4413) ==="
 "$PYTHON" -m unittest tests.test_ci_timeout
@@ -241,6 +257,15 @@ echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invar
 # scripts/giant_file_registry.toml. The following git diff is the PR-time
 # drift gate: generation updates snapshots, then CI rejects changes to tracked
 # source-of-truth docs instead of comparing the generated workspace to itself.
+# The #5234 gate reads only scripts/giant_file_issue_metadata.json. Snapshot
+# staleness and closed issue pointers are individually reported but remain
+# non-blocking during AC3 disposition; operators refresh the snapshot with
+# `python3 scripts/refresh_giant_file_issue_metadata.py`.
+# AC3 is complete only when every reported entry has a decided replacement or
+# keep policy and this aggregate invocation sets
+# GIANT_FILE_REGISTRY_ENFORCE_CLOSED_ISSUES=1. That setting makes both snapshot
+# staleness and closed issue pointers fatal; until then the gate deliberately
+# does not claim that closed deadline pointers are absent.
 "$PYTHON" scripts/generate_inventory_docs.py
 git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
 
@@ -283,7 +308,10 @@ echo "=== Shell test suites (tests/*.sh) ==="
 # while every required check stayed green. Run them here, in the job that already
 # owns script-level gates.
 SHELL_TESTS_FAILED=0
-required_shell_suites=(tests/test_deploy_smoke_wedge_coverage_5244.sh)
+required_shell_suites=(
+  tests/test_deploy_smoke_wedge_coverage_5244.sh
+  tests/test_required_check_mirror.sh
+)
 for required_suite in "${required_shell_suites[@]}"; do
   [ -f "$required_suite" ] || { echo "✗ required shell suite missing: $required_suite" >&2; SHELL_TESTS_FAILED=1; }
 done
