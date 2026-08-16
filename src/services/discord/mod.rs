@@ -918,6 +918,7 @@ pub(super) struct DiscordBotSettings {
     pub(super) agent: Option<String>,
     pub(super) provider: ProviderKind,
     pub(super) allowed_tools: Vec<String>,
+    pub(super) tool_policy: crate::services::stream_json_cli::ConfiguredToolPolicy,
     /// Explicit Discord channel allowlist for this bot token.
     /// Empty means "no channel restriction".
     pub(super) allowed_channel_ids: Vec<u64>,
@@ -954,6 +955,9 @@ impl Default for DiscordBotSettings {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            tool_policy:
+                crate::services::stream_json_cli::ConfiguredToolPolicy::for_new_stream_json_provider(
+                ),
             allowed_channel_ids: Vec::new(),
             require_mention_channel_ids: Vec::new(),
             channel_model_overrides: std::collections::HashMap::new(),

@@ -9,6 +9,7 @@ const PROVIDER_PREFIXES = [
   "qwen",
   "copilot",
   "opencode",
+  "grok",
   "antigravity",
   "api",
 ] as const;

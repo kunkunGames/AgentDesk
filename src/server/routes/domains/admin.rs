@@ -4,8 +4,8 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, departments, escalation, offices, protected_api_domain, settings, stats,
-    voice_config,
+    ApiRouter, AppState, departments, escalation, offices, protected_api_domain, providers_api,
+    settings, stats, voice_config,
 };
 
 // Category: admin
@@ -43,6 +43,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/departments/{id}",
                 patch(departments::update_department).delete(departments::delete_department),
             )
+            .route("/providers", get(providers_api::get_providers))
             .route("/stats", get(stats::get_stats))
             .route("/stats/memento", get(stats::get_memento_stats))
             .route(

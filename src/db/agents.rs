@@ -43,14 +43,11 @@ impl AgentChannelBindings {
         match provider {
             ProviderKind::Claude => self.claude_channel(),
             ProviderKind::Codex => self.codex_channel(),
-            ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen
-                if self.configured_provider_kind().as_ref() == Some(provider) =>
-            {
+            ProviderKind::Unsupported(_) => None,
+            other if self.configured_provider_kind().as_ref() == Some(other) => {
                 let primary = self.legacy_primary_channel()?;
                 let explicit_claude = normalized_channel(self.discord_channel_cc.clone());
-                if matches!(provider, ProviderKind::Gemini | ProviderKind::Qwen)
-                    && explicit_claude.as_deref() == Some(primary.as_str())
-                {
+                if explicit_claude.as_deref() == Some(primary.as_str()) {
                     None
                 } else {
                     Some(primary)
@@ -230,6 +227,43 @@ mod tests {
         assert_eq!(
             bindings.primary_channel().as_deref(),
             Some("1470000000000000003")
+        );
+    }
+
+    #[test]
+    fn resolved_primary_provider_does_not_treat_claude_fallback_as_grok() {
+        let bindings = AgentChannelBindings {
+            provider: Some("grok".to_string()),
+            discord_channel_id: Some("1470000000000000007".to_string()),
+            discord_channel_cc: Some("1470000000000000007".to_string()),
+            ..AgentChannelBindings::default()
+        };
+
+        assert_eq!(
+            bindings.resolved_primary_provider_kind(),
+            Some(ProviderKind::Claude)
+        );
+    }
+
+    #[test]
+    fn resolved_primary_provider_preserves_grok_primary_binding() {
+        let bindings = binding("grok", "1470000000000000008");
+        assert_eq!(
+            bindings.resolved_primary_provider_kind(),
+            Some(ProviderKind::Grok)
+        );
+        assert_eq!(
+            bindings.primary_channel().as_deref(),
+            Some("1470000000000000008")
+        );
+    }
+
+    #[test]
+    fn resolved_primary_provider_preserves_antigravity_primary_binding() {
+        let bindings = binding("antigravity", "1470000000000000009");
+        assert_eq!(
+            bindings.resolved_primary_provider_kind(),
+            Some(ProviderKind::Antigravity)
         );
     }
 

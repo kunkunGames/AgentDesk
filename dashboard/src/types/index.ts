@@ -40,6 +40,7 @@ export type CliProvider =
   | "gemini"
   | "qwen"
   | "opencode"
+  | "grok"
   | "copilot"
   | "antigravity"
   | "api";

@@ -892,6 +892,8 @@ fn provider_check_id(provider: &ProviderKind) -> &'static str {
         ProviderKind::Gemini => "provider_gemini",
         ProviderKind::OpenCode => "provider_opencode",
         ProviderKind::Qwen => "provider_qwen",
+        ProviderKind::Grok => "provider_grok",
+        ProviderKind::Antigravity => "provider_antigravity",
         ProviderKind::Unsupported(_) => "provider_unsupported",
     }
 }
@@ -925,29 +927,27 @@ fn build_provider_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec
     let configured = configured_provider_names(cfg, snapshot);
     let opencode_configured = configured.contains("opencode");
     let qwen_configured = configured.contains("qwen");
-    vec![
-        check_runtime_path(),
-        check_provider_cli(
-            ProviderKind::Claude,
-            configured.contains("claude"),
+    let mut checks = vec![check_runtime_path()];
+    for entry in crate::services::provider::provider_registry() {
+        let Some(kind) = crate::services::provider::ProviderKind::from_str(entry.id) else {
+            continue;
+        };
+        checks.push(check_provider_cli(
+            kind,
+            configured.contains(entry.id),
             snapshot,
-        ),
-        check_provider_cli(ProviderKind::Codex, configured.contains("codex"), snapshot),
-        check_provider_cli(
-            ProviderKind::Gemini,
-            configured.contains("gemini"),
-            snapshot,
-        ),
-        check_provider_cli(ProviderKind::OpenCode, opencode_configured, snapshot),
+        ));
+    }
+    checks.extend([
         check_opencode_mcp_config(opencode_configured),
         check_opencode_serve_health_probe(opencode_configured),
-        check_provider_cli(ProviderKind::Qwen, qwen_configured, snapshot),
         check_qwen_settings_files(qwen_configured),
         check_qwen_auth_hints(qwen_configured),
         check_qwen_runtime_artifacts(qwen_configured),
         check_provider_bindings(cfg, snapshot),
         check_credential_permissions(cfg),
-    ]
+    ]);
+    checks
 }
 
 fn check_opencode_mcp_config(configured: bool) -> Check {
@@ -1312,9 +1312,6 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
     for agent in &cfg.agents {
         let mut agent_has_channel = false;
         for (slot_provider, channel) in agent.channels.iter() {
-            let Some(channel) = channel else {
-                continue;
-            };
             let Some(target) = channel.target() else {
                 continue;
             };
@@ -2653,6 +2650,8 @@ fn check_provider_cli(
         ProviderKind::Gemini => "gemini CLI",
         ProviderKind::OpenCode => "opencode CLI",
         ProviderKind::Qwen => "qwen CLI",
+        ProviderKind::Grok => "grok CLI",
+        ProviderKind::Antigravity => "agy CLI",
         ProviderKind::Unsupported(_) => "provider CLI",
     };
     let capability_summary = provider_capability_summary(&provider);

@@ -224,9 +224,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     );
     let user_msg_id = reservation.user_msg_id;
     let placeholder_msg_id = reservation.placeholder_msg_id;
-    let (settings_provider, allowed_tools) = {
+    let (settings_provider, allowed_tools, tool_policy) = {
         let settings = shared.settings.read().await;
-        (settings.provider.clone(), settings.allowed_tools.clone())
+        (
+            settings.provider.clone(),
+            settings.allowed_tools.clone(),
+            settings.tool_policy.clone(),
+        )
     };
     let routine_role_binding = routine_metadata_role_binding(metadata.as_ref(), &settings_provider);
     let (early_stale_session_id, early_channel_name) = {
@@ -934,14 +938,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     }
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
     let memory_backend_label = memory_settings.backend.as_str();
-    let provider_label = match &provider {
-        ProviderKind::Claude => "claude",
-        ProviderKind::Codex => "codex",
-        ProviderKind::Gemini => "gemini",
-        ProviderKind::OpenCode => "opencode",
-        ProviderKind::Qwen => "qwen",
-        ProviderKind::Unsupported(_) => "unsupported",
-    };
+    let provider_label = provider.as_str();
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts}] [prompt-prep] headless channel={} provider={} dispatch={} memory_backend={} reused_session={} duration_ms={}",
@@ -1173,92 +1170,109 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                             session_id_clone.as_deref(),
                             &system_prompt_owned,
                         );
-                    match &provider_for_blocking {
-                        ProviderKind::Claude => claude::execute_command_streaming(
-                            &context_prompt,
-                            session_id_clone.as_deref(),
-                            &current_path_clone,
+                    match provider_for_blocking.execution_adapter() {
+                        Some(crate::services::provider::ProviderExecutionAdapter::Claude) => {
+                            claude::execute_command_streaming(
+                                &context_prompt,
+                                session_id_clone.as_deref(),
+                                &current_path_clone,
+                                tx.clone(),
+                                system_prompt_for_turn,
+                                Some(&allowed_tools),
+                                Some(cancel_token_clone),
+                                remote_profile.as_ref(),
+                                tmux_session_name.as_deref(),
+                                Some(channel_id.get()),
+                                Some(provider_for_blocking.clone()),
+                                model_for_turn.as_deref(),
+                                native_fast_mode_override,
+                                compact_percent_for_claude,
+                                compact_lower_bound_tokens,
+                                cache_ttl_minutes,
+                                None,
+                            )
+                        }
+                        Some(crate::services::provider::ProviderExecutionAdapter::Codex) => {
+                            codex::execute_command_streaming(
+                                &context_prompt,
+                                session_id_clone.as_deref(),
+                                &current_path_clone,
+                                tx.clone(),
+                                system_prompt_for_turn,
+                                Some(&allowed_tools),
+                                Some(cancel_token_clone),
+                                remote_profile.as_ref(),
+                                tmux_session_name.as_deref(),
+                                Some(channel_id.get()),
+                                Some(provider_for_blocking.clone()),
+                                model_for_turn.as_deref(),
+                                native_fast_mode_override,
+                                codex_goals_override,
+                                compact_token_limit_for_codex,
+                                force_fresh_provider_session,
+                            )
+                        }
+                        Some(crate::services::provider::ProviderExecutionAdapter::Qwen) => {
+                            qwen::execute_command_streaming(
+                                &context_prompt,
+                                session_id_clone.as_deref(),
+                                &current_path_clone,
+                                tx.clone(),
+                                system_prompt_for_turn,
+                                Some(&allowed_tools),
+                                Some(cancel_token_clone),
+                                remote_profile.as_ref(),
+                                tmux_session_name.as_deref(),
+                                Some(channel_id.get()),
+                                Some(provider_for_blocking.clone()),
+                                model_for_turn.as_deref(),
+                                None,
+                            )
+                        }
+                        Some(crate::services::provider::ProviderExecutionAdapter::OpenCode) => {
+                            opencode::execute_command_streaming(
+                                &context_prompt,
+                                session_id_clone.as_deref(),
+                                &current_path_clone,
+                                tx.clone(),
+                                system_prompt_for_turn,
+                                Some(&allowed_tools),
+                                Some(cancel_token_clone),
+                                remote_profile.as_ref(),
+                                tmux_session_name.as_deref(),
+                                Some(channel_id.get()),
+                                Some(provider_for_blocking.clone()),
+                                model_for_turn.as_deref(),
+                                None,
+                            )
+                        }
+                        Some(
+                            crate::services::provider::ProviderExecutionAdapter::StreamJsonCli(
+                                dialect,
+                            ),
+                        ) => crate::services::stream_json_cli::execute_streaming(
+                            dialect,
+                            crate::services::stream_json_cli::ProviderTurnRequest::for_discord_turn(
+                                provider_for_blocking.clone(),
+                                context_prompt.clone(),
+                                system_prompt_for_turn.map(str::to_string),
+                                tool_policy.clone(),
+                                model_for_turn.clone(),
+                                std::path::PathBuf::from(&current_path_clone),
+                                session_id_clone.as_deref(),
+                                force_fresh_provider_session,
+                                remote_profile.clone(),
+                                std::time::Duration::from_secs(300),
+                                Some(cancel_token_clone),
+                            ),
                             tx.clone(),
-                            system_prompt_for_turn,
-                            Some(&allowed_tools),
-                            Some(cancel_token_clone),
-                            remote_profile.as_ref(),
-                            tmux_session_name.as_deref(),
-                            Some(channel_id.get()),
-                            Some(provider_for_blocking.clone()),
-                            model_for_turn.as_deref(),
-                            native_fast_mode_override,
-                            compact_percent_for_claude,
-                            compact_lower_bound_tokens,
-                            cache_ttl_minutes,
-                            None,
                         ),
-                        ProviderKind::Codex => codex::execute_command_streaming(
-                            &context_prompt,
-                            session_id_clone.as_deref(),
-                            &current_path_clone,
-                            tx.clone(),
-                            system_prompt_for_turn,
-                            Some(&allowed_tools),
-                            Some(cancel_token_clone),
-                            remote_profile.as_ref(),
-                            tmux_session_name.as_deref(),
-                            Some(channel_id.get()),
-                            Some(provider_for_blocking.clone()),
-                            model_for_turn.as_deref(),
-                            native_fast_mode_override,
-                            codex_goals_override,
-                            compact_token_limit_for_codex,
-                            force_fresh_provider_session,
-                        ),
-                        ProviderKind::Gemini => gemini::execute_command_streaming(
-                            &context_prompt,
-                            session_id_clone.as_deref(),
-                            &current_path_clone,
-                            tx.clone(),
-                            system_prompt_for_turn,
-                            Some(&allowed_tools),
-                            Some(cancel_token_clone),
-                            remote_profile.as_ref(),
-                            tmux_session_name.as_deref(),
-                            Some(channel_id.get()),
-                            Some(provider_for_blocking.clone()),
-                            model_for_turn.as_deref(),
-                            None,
-                        ),
-                        ProviderKind::Qwen => qwen::execute_command_streaming(
-                            &context_prompt,
-                            session_id_clone.as_deref(),
-                            &current_path_clone,
-                            tx.clone(),
-                            system_prompt_for_turn,
-                            Some(&allowed_tools),
-                            Some(cancel_token_clone),
-                            remote_profile.as_ref(),
-                            tmux_session_name.as_deref(),
-                            Some(channel_id.get()),
-                            Some(provider_for_blocking.clone()),
-                            model_for_turn.as_deref(),
-                            None,
-                        ),
-                        ProviderKind::OpenCode => opencode::execute_command_streaming(
-                            &context_prompt,
-                            session_id_clone.as_deref(),
-                            &current_path_clone,
-                            tx.clone(),
-                            system_prompt_for_turn,
-                            Some(&allowed_tools),
-                            Some(cancel_token_clone),
-                            remote_profile.as_ref(),
-                            tmux_session_name.as_deref(),
-                            Some(channel_id.get()),
-                            Some(provider_for_blocking.clone()),
-                            model_for_turn.as_deref(),
-                            None,
-                        ),
-                        ProviderKind::Unsupported(name) => {
+                        None => {
                             let _ = tx.send(StreamMessage::Error {
-                                message: format!("Provider '{}' is not installed", name),
+                                message: format!(
+                                    "Provider '{}' is not installed",
+                                    provider_for_blocking.as_str()
+                                ),
                                 stdout: String::new(),
                                 stderr: String::new(),
                                 exit_code: None,

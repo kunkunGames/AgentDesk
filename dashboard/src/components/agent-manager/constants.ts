@@ -1,7 +1,18 @@
 import type { CliProvider } from "../../types";
 import type { DeptForm, FormData } from "./types";
 
-export const CLI_PROVIDERS: CliProvider[] = ["claude", "codex", "gemini", "opencode", "qwen", "copilot", "antigravity", "api"];
+export const LEGACY_ONLY_PROVIDERS: CliProvider[] = ["copilot", "api"];
+
+/** Fallback list when GET /api/providers is unavailable. Authority is the backend catalog. */
+export const CLI_PROVIDERS: CliProvider[] = [
+  "claude",
+  "codex",
+  "gemini",
+  "opencode",
+  "qwen",
+  "grok",
+  "antigravity",
+];
 
 export const STATUS_DOT: Record<string, string> = {
   working: "bg-emerald-400 shadow-emerald-400/50 shadow-sm",

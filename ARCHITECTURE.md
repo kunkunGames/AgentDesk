@@ -58,6 +58,8 @@ src/
 │   ├── legacy_db_paths.rs
 │   ├── legacy_tmp_paths.rs
 │   └── mod.rs
+├── config/
+│   └── agent_channels.rs
 ├── db/
 │   ├── auto_queue/
 │   │   ├── entries/
@@ -321,6 +323,7 @@ src/
 │   │   ├── pr_summary.rs
 │   │   ├── prompt_manifest_retention.rs
 │   │   ├── provider_cli_api.rs
+│   │   ├── providers_api.rs
 │   │   ├── queue_api.rs
 │   │   ├── receipt.rs
 │   │   ├── resume.rs
@@ -1341,7 +1344,9 @@ src/
 │   │   ├── cancel_token_claude_interrupt.rs
 │   │   ├── cancel_token_cleanup.rs
 │   │   ├── cancel_watchdog.rs
-│   │   └── provider_conformance_invariant_tests.rs
+│   │   ├── catalog.rs
+│   │   ├── provider_conformance_invariant_tests.rs
+│   │   └── registry.rs
 │   ├── provider_cli/
 │   │   ├── canary.rs
 │   │   ├── context.rs
@@ -1397,6 +1402,17 @@ src/
 │   │   └── runtime_config_put.rs
 │   ├── slo/
 │   │   └── mod.rs
+│   ├── stream_json_cli/
+│   │   ├── dialects/
+│   │   │   ├── agy.rs
+│   │   │   ├── grok.rs
+│   │   │   └── mod.rs
+│   │   ├── codec.rs
+│   │   ├── mod.rs
+│   │   ├── policy.rs
+│   │   ├── request.rs
+│   │   ├── runner.rs
+│   │   └── session.rs
 │   ├── tui_prompt_dedupe/
 │   │   ├── extract.rs
 │   │   ├── observation.rs
@@ -1590,6 +1606,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | --- | --- |
 | `src/cli/` | Operator-facing CLI commands, direct API shims, migrations, and Discord send helpers. |
 | `src/compat/` | Centralised home for compatibility/legacy/fallback shims (#1076). Each public item carries a `REMOVE_WHEN` comment so retirement is grep-driven. |
+| `src/config/` | Config newtypes extracted from the `config.rs` facade, including the provider-keyed AgentChannels map. |
 | `src/db/` | PostgreSQL access layer, migration helpers, and schema authority. |
 | `src/dispatch/` | Dispatch context construction, review metadata, and worktree targeting. |
 | `src/engine/` | QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops. |

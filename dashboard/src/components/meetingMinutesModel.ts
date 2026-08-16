@@ -10,13 +10,21 @@ import { getDisplayMeetingReferenceHashes } from "./meetingReferenceHash";
 
 export const STORAGE_KEY = STORAGE_KEYS.meetingChannelId;
 export const FIXED_PARTICIPANTS_STORAGE_KEY = STORAGE_KEYS.meetingFixedParticipants;
-export const MEETING_PROVIDERS = ["claude", "codex", "gemini", "opencode", "qwen"] as const;
+export const MEETING_PROVIDERS = [
+  "claude",
+  "codex",
+  "gemini",
+  "opencode",
+  "qwen",
+  "grok",
+] as const;
 export const PROVIDER_LABELS: Record<string, string> = {
   claude: "Claude",
   codex: "Codex",
   gemini: "Gemini",
   qwen: "Qwen",
   opencode: "OpenCode",
+  grok: "Grok",
   copilot: "Copilot",
   antigravity: "Antigravity",
   api: "API",
@@ -89,9 +97,10 @@ export function parseStoredFixedParticipants(): string[] {
 export function getDefaultReviewerProvider(
   primaryProvider: string,
   ownerProvider?: string | null,
+  providers: readonly string[] = MEETING_PROVIDERS,
 ): string {
   return (
-    MEETING_PROVIDERS.find(
+    providers.find(
       (provider) =>
         provider !== primaryProvider && provider !== (ownerProvider ?? null),
     ) ?? ""

@@ -63,6 +63,7 @@ export const PROVIDER_SUFFIX_MAP: Record<string, CliProvider> = {
   "-gem": "gemini",
   "-qw": "qwen",
   "-oc": "opencode",
+  "-gx": "grok",
   "-cop": "copilot",
   "-ag": "antigravity",
   "-api": "api",

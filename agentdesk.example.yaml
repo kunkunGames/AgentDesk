@@ -115,6 +115,10 @@ providers:
     tui_hosting: false
   opencode:
     tui_hosting: false
+  grok:
+    tui_hosting: false
+  antigravity:
+    tui_hosting: false
 
 voice:
   # Enables Discord voice capture, transcription, and TTS paths.

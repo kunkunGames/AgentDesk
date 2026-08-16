@@ -79,6 +79,10 @@ fn detect_provider_file_auth(provider: &str, spec: &ProviderAuthSpec) -> Option<
         "gemini" => detect_gemini_oauth_source(),
         "opencode" => detect_opencode_file_auth(),
         "qwen" => detect_qwen_file_auth(spec),
+        "grok" => detect_json_token_source(
+            "~/.grok/auth.json",
+            &["apiKey", "api_key", "accessToken", "token", "xaiApiKey"],
+        ),
         _ => None,
     }
 }

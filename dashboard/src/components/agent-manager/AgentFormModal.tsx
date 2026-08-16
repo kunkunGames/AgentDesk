@@ -1,5 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useRef } from "react";
+import { useEffect, useId } from "react";
+import { catalogLabel, useProviderCatalog } from "../../api/providers";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import type { Department } from "../../types";
@@ -21,7 +22,7 @@ const agentFormSchema = z.object({
   name_ja: z.string(),
   name_zh: z.string(),
   department_id: z.string(),
-  cli_provider: z.enum(["claude", "codex", "gemini", "qwen", "opencode", "copilot", "antigravity", "api"]),
+  cli_provider: z.string().trim().min(1, "required"),
   avatar_emoji: z.string().trim().min(1, "required"),
   sprite_number: z.number().nullable(),
   personality: z.string(),
@@ -70,6 +71,7 @@ export default function AgentFormModal({
   const formValues = watch();
   const spriteNum = formValues.sprite_number ?? 0;
   const emojiBtnId = useId();
+  const providerCatalog = useProviderCatalog(formValues.cli_provider);
 
   // ESC 키로 닫기
   useEffect(() => {
@@ -92,7 +94,10 @@ export default function AgentFormModal({
     color: "var(--th-text-primary)",
   };
   const handleSave = handleSubmit(async (values) => {
-    await onSave(values);
+    await onSave({
+      ...values,
+      cli_provider: values.cli_provider as FormData["cli_provider"],
+    });
   });
 
   return (
@@ -346,6 +351,35 @@ export default function AgentFormModal({
                     </option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label htmlFor="agent-provider" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                  {tr("메인 Provider", "Main Provider")}
+                </label>
+                <select
+                  id="agent-provider"
+                  {...register("cli_provider")}
+                  disabled={providerCatalog.loading || (!isEdit && providerCatalog.error)}
+                  className={`${inputCls} cursor-pointer`}
+                  style={inputStyle}
+                >
+                  {providerCatalog.selectableIds.map((provider) => (
+                    <option key={provider} value={provider}>
+                      {catalogLabel(providerCatalog.entries, provider)}
+                    </option>
+                  ))}
+                </select>
+                {providerCatalog.loading ? (
+                  <span className="mt-1 block text-[11px]" style={{ color: "var(--th-text-muted)" }}>
+                    {tr("프로바이더 목록을 불러오는 중...", "Loading providers...")}
+                  </span>
+                ) : providerCatalog.error ? (
+                  <span className="mt-1 block text-[11px]" style={{ color: "var(--th-accent-danger)" }}>
+                    {isEdit
+                      ? tr("카탈로그를 못 불러 로컬 목록을 씁니다.", "Catalog unavailable; using local list.")
+                      : tr("카탈로그를 불러오지 못해 새 provider를 고를 수 없습니다.", "Catalog unavailable; new provider selection is disabled.")}
+                  </span>
+                ) : null}
               </div>
             </div>
             </div>

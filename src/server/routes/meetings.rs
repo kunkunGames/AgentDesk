@@ -1195,6 +1195,12 @@ fn resolve_start_meeting_providers(
         Some(owner_provider) => {
             let primary_provider =
                 requested_primary_provider.unwrap_or_else(|| owner_provider.clone());
+            if !primary_provider.is_meeting_eligible() {
+                return Err(format!(
+                    "provider '{}' does not support restricted meeting tool policy",
+                    primary_provider.as_str()
+                ));
+            }
             Ok((owner_provider, primary_provider))
         }
         None => Err("channel_id is not a registered meeting channel".to_string()),
@@ -1211,6 +1217,12 @@ fn validate_reviewer_provider(
     }
     if reviewer_provider == primary_provider {
         return Err("reviewer_provider must differ from primary_provider".to_string());
+    }
+    if !reviewer_provider.is_meeting_eligible() {
+        return Err(format!(
+            "provider '{}' does not support restricted meeting tool policy",
+            reviewer_provider.as_str()
+        ));
     }
     Ok(())
 }

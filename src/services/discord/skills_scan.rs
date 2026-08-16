@@ -51,7 +51,9 @@ pub(in crate::services) fn scan_skills(
         ProviderKind::Codex
         | ProviderKind::Gemini
         | ProviderKind::OpenCode
-        | ProviderKind::Qwen => {
+        | ProviderKind::Qwen
+        | ProviderKind::Grok
+        | ProviderKind::Antigravity => {
             scan_directory_skills(
                 collect_provider_skill_roots(provider, project_path),
                 &mut seen,
@@ -162,6 +164,8 @@ fn provider_supports_directory_skills(provider: &ProviderKind) -> bool {
             | ProviderKind::Gemini
             | ProviderKind::OpenCode
             | ProviderKind::Qwen
+            | ProviderKind::Grok
+            | ProviderKind::Antigravity
     )
 }
 
@@ -172,6 +176,8 @@ fn provider_home_skill_dir(provider: &ProviderKind, home: &Path) -> Option<std::
         ProviderKind::Gemini => Some(home.join(".gemini").join("skills")),
         ProviderKind::OpenCode => Some(home.join(".opencode").join("skills")),
         ProviderKind::Qwen => Some(home.join(".qwen").join("skills")),
+        ProviderKind::Grok => Some(home.join(".grok").join("skills")),
+        ProviderKind::Antigravity => Some(home.join(".agy").join("skills")),
         ProviderKind::Unsupported(_) => None,
     }
 }
@@ -187,6 +193,8 @@ fn provider_project_skill_dir(
         ProviderKind::Gemini => Some(project_root.join(".gemini").join("skills")),
         ProviderKind::OpenCode => Some(project_root.join(".opencode").join("skills")),
         ProviderKind::Qwen => Some(project_root.join(".qwen").join("skills")),
+        ProviderKind::Grok => Some(project_root.join(".grok").join("skills")),
+        ProviderKind::Antigravity => Some(project_root.join(".agy").join("skills")),
         ProviderKind::Unsupported(_) => None,
     }
 }

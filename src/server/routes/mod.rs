@@ -38,6 +38,7 @@ pub mod pipeline;
 pub mod pr_summary;
 pub mod prompt_manifest_retention;
 pub mod provider_cli_api;
+pub mod providers_api;
 mod queue_api;
 pub mod receipt;
 pub mod resume;
