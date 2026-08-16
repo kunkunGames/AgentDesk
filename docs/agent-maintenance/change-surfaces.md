@@ -127,6 +127,13 @@ time for diagnostics; neither is a stored approval value.
 
 ## Surface Map (by feature)
 
+### `kakao_client`
+
+- canonical_modules: `src/services/kakao.rs` (frozen giant surface; OAuth,
+  friend/memo send, and connection-state live in one provider client).
+- related_issues: #4710.
+- allowed_changes: bugfix only until a scoped extraction under #4710.
+
 ### `provider_output_guard`
 
 - canonical_modules:
