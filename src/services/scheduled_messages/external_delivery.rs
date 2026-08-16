@@ -14,16 +14,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::db::scheduled_messages::{EncryptedExternalDeliveryPlan, ScheduledMessageRow};
 use crate::services::external_share_outbox::NewExternalShareOutbox;
 use crate::services::kakao::{
-    KakaoFriendShareCommand, validate_friend_share_payload, validate_friend_share_recipients,
+    KAKAO_MEMO_CHANNEL_ID, KakaoFriendShareCommand, KakaoMemoSendCommand,
+    validate_friend_share_payload, validate_friend_share_recipients, validate_kakao_image_url,
 };
 use crate::services::oauth_connection::{
     EncryptedValue, KAKAO_PROVIDER, OAuthConnectionError, PRIMARY_ACCOUNT_KEY, TokenVault,
 };
 
-const PLAN_SCHEMA_VERSION: u8 = 2;
+const PLAN_SCHEMA_VERSION: u8 = 3;
 const PLAN_AAD_DOMAIN: &str = "agentdesk/scheduled-message/provider-targets/v1";
 const OUTBOX_AAD_DOMAIN: &str = "agentdesk/external-share-outbox/payload/v1";
-pub(crate) const KAKAO_CHANNEL_ID: &str = "kakao_friend_share";
+pub(crate) const KAKAO_FRIEND_CHANNEL_ID: &str = "kakao_friend_share";
+// Existing outbox rows and migration-era callers use this stable channel ID.
+pub(crate) const KAKAO_CHANNEL_ID: &str = KAKAO_FRIEND_CHANNEL_ID;
 pub(crate) const OUTBOX_SOURCE: &str = "scheduled_message";
 
 #[derive(Debug, Error)]
@@ -49,16 +52,24 @@ struct StoredKakaoFriendShare {
     receiver_uuids: Vec<String>,
     #[serde(default = "legacy_primary_account_key")]
     account_key: String,
+    #[serde(default)]
+    send_to_me: bool,
+    #[serde(default)]
+    image_url: Option<String>,
 }
 
 pub fn encrypt_kakao_provider_target(
     vault: &TokenVault,
     account_key: String,
     receiver_uuids: Vec<String>,
+    send_to_me: bool,
+    image_url: Option<String>,
 ) -> Result<EncryptedExternalDeliveryPlan, ExternalDeliveryPlanError> {
     crate::services::kakao::validate_account_key(&account_key)
         .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
     validate_friend_share_recipients(&receiver_uuids)
+        .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
+    validate_kakao_image_url(image_url.as_deref())
         .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
 
     let plan_id = Uuid::new_v4();
@@ -67,6 +78,8 @@ pub fn encrypt_kakao_provider_target(
         kakao_friend_share: StoredKakaoFriendShare {
             receiver_uuids,
             account_key,
+            send_to_me,
+            image_url,
         },
     };
     let mut plaintext = Zeroizing::new(
@@ -75,19 +88,27 @@ pub fn encrypt_kakao_provider_target(
     let encrypted = vault.seal(&plaintext, plan_aad(plan_id).as_bytes())?;
     plaintext.zeroize();
     let recipient_count = plan.kakao_friend_share.receiver_uuids.len();
+    let mut summary = json!({
+        "kakaoFriendShare": {
+            "enabled": true,
+            "recipientCount": recipient_count,
+            "contentMode": if plan.kakao_friend_share.image_url.is_some() { "feed" } else { "text" },
+            "imageForwarded": plan.kakao_friend_share.image_url.is_some()
+        }
+    });
+    if plan.kakao_friend_share.send_to_me {
+        summary["kakaoMemo"] = json!({
+            "enabled": true,
+            "contentMode": if plan.kakao_friend_share.image_url.is_some() { "feed" } else { "text" },
+            "imageForwarded": plan.kakao_friend_share.image_url.is_some()
+        });
+    }
     Ok(EncryptedExternalDeliveryPlan {
         id: plan_id,
         ciphertext: encrypted.ciphertext,
         nonce: encrypted.nonce,
         key_version: encrypted.key_version,
-        summary: json!({
-            "kakaoFriendShare": {
-                "enabled": true,
-                "recipientCount": recipient_count,
-                "contentMode": "text",
-                "imageForwarded": false
-            }
-        }),
+        summary,
         account_key: plan.kakao_friend_share.account_key.clone(),
     })
 }
@@ -96,9 +117,9 @@ pub(crate) fn prepare_external_share_outbox(
     message: &ScheduledMessageRow,
     delivery_id: &str,
     source_key: &str,
-) -> Result<Option<NewExternalShareOutbox>, ExternalDeliveryPlanError> {
+) -> Result<Vec<NewExternalShareOutbox>, ExternalDeliveryPlanError> {
     let Some(plan_id) = message.external_delivery_plan_id else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let encrypted = EncryptedValue {
         ciphertext: message
@@ -128,6 +149,7 @@ pub(crate) fn prepare_external_share_outbox(
     let command = KakaoFriendShareCommand {
         receiver_uuids: stored.kakao_friend_share.receiver_uuids.clone(),
         text: message.content.clone(),
+        image_url: stored.kakao_friend_share.image_url.clone(),
         // The protected schedule create/PATCH request is the explicit operator
         // confirmation boundary. Workers replay that durable authorization.
         confirmed: true,
@@ -135,18 +157,17 @@ pub(crate) fn prepare_external_share_outbox(
     validate_friend_share_payload(&command)
         .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
     let requested_count = command.receiver_uuids.len();
-    let outbox_id = Uuid::new_v4();
+    let friend_outbox_id = Uuid::new_v4();
     let mut payload = Zeroizing::new(
         serde_json::to_vec(&command).map_err(|_| ExternalDeliveryPlanError::InvalidPayload)?,
     );
-    let encrypted_payload = vault.seal(&payload, outbox_aad(outbox_id).as_bytes())?;
+    let encrypted_payload = vault.seal(&payload, outbox_aad(friend_outbox_id).as_bytes())?;
     payload.zeroize();
-
-    Ok(Some(NewExternalShareOutbox {
-        id: outbox_id,
+    let mut outboxes = vec![NewExternalShareOutbox {
+        id: friend_outbox_id,
         provider: KAKAO_PROVIDER.to_string(),
-        channel_id: KAKAO_CHANNEL_ID.to_string(),
-        account_key,
+        channel_id: KAKAO_FRIEND_CHANNEL_ID.to_string(),
+        account_key: account_key.clone(),
         source: OUTBOX_SOURCE.to_string(),
         source_key: source_key.to_string(),
         scheduled_delivery_id: delivery_id.to_string(),
@@ -154,7 +175,35 @@ pub(crate) fn prepare_external_share_outbox(
             .map_err(|_| ExternalDeliveryPlanError::InvalidPayload)?,
         encrypted_payload,
         deliver_before: message.expires_at,
-    }))
+    }];
+    if stored.kakao_friend_share.send_to_me {
+        let command = KakaoMemoSendCommand {
+            text: message.content.clone(),
+            image_url: stored.kakao_friend_share.image_url.clone(),
+            confirmed: true,
+        };
+        crate::services::kakao::validate_memo_send_payload(&command)
+            .map_err(|_| ExternalDeliveryPlanError::InvalidKakaoTarget)?;
+        let outbox_id = Uuid::new_v4();
+        let mut payload = Zeroizing::new(
+            serde_json::to_vec(&command).map_err(|_| ExternalDeliveryPlanError::InvalidPayload)?,
+        );
+        let encrypted_payload = vault.seal(&payload, outbox_aad(outbox_id).as_bytes())?;
+        payload.zeroize();
+        outboxes.push(NewExternalShareOutbox {
+            id: outbox_id,
+            provider: KAKAO_PROVIDER.to_string(),
+            channel_id: KAKAO_MEMO_CHANNEL_ID.to_string(),
+            account_key,
+            source: OUTBOX_SOURCE.to_string(),
+            source_key: source_key.to_string(),
+            scheduled_delivery_id: delivery_id.to_string(),
+            requested_count: 1,
+            encrypted_payload,
+            deliver_before: message.expires_at,
+        });
+    }
+    Ok(outboxes)
 }
 
 pub(crate) fn outbox_aad(id: Uuid) -> String {
@@ -181,6 +230,8 @@ mod tests {
             &vault,
             PRIMARY_ACCOUNT_KEY.to_string(),
             vec![recipient.clone()],
+            true,
+            Some("https://example.com/thumbnail.jpg".to_string()),
         )
         .unwrap();
 
@@ -197,6 +248,8 @@ mod tests {
             )
             .unwrap();
         assert!(String::from_utf8_lossy(&plaintext).contains(&recipient));
+        assert_eq!(plan.summary["kakaoMemo"]["enabled"], true);
+        assert_eq!(plan.summary["kakaoFriendShare"]["contentMode"], "feed");
     }
 
     #[test]
@@ -206,6 +259,8 @@ mod tests {
             &vault,
             PRIMARY_ACCOUNT_KEY.to_string(),
             vec!["recipient-a".to_string()],
+            false,
+            None,
         )
         .unwrap();
         let encrypted = EncryptedValue {

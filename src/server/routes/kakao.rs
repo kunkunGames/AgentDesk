@@ -56,6 +56,8 @@ pub struct KakaoFriendMessageRequest {
     receiver_uuids: Vec<String>,
     text: String,
     #[serde(default)]
+    image_url: Option<String>,
+    #[serde(default)]
     confirmed: bool,
 }
 
@@ -63,6 +65,8 @@ pub struct KakaoFriendMessageRequest {
 pub struct KakaoMemoMessageRequest {
     account_id: String,
     text: String,
+    #[serde(default)]
+    image_url: Option<String>,
     #[serde(default)]
     confirmed: bool,
 }
@@ -208,6 +212,7 @@ pub async fn send_message(
     let command = KakaoFriendShareCommand {
         receiver_uuids: body.receiver_uuids,
         text: body.text,
+        image_url: body.image_url,
         confirmed: body.confirmed,
     };
     service(&state, operation)?
@@ -235,6 +240,7 @@ pub async fn send_memo_message(
     let account_id = body.account_id.clone();
     let command = KakaoMemoSendCommand {
         text: body.text,
+        image_url: body.image_url,
         confirmed: body.confirmed,
     };
     service(&state, operation)?

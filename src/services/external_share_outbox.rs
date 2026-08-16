@@ -13,12 +13,16 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::config::KakaoFriendShareConfig;
 use crate::services::external_share::{
     ExternalShareError, SafeShareSummary, ShareOperationResult, ShareOperationState,
 };
-use crate::services::kakao::{KakaoError, KakaoFriendShareCommand, KakaoFriendShareService};
+use crate::services::kakao::{
+    KAKAO_MEMO_CHANNEL_ID, KakaoError, KakaoFriendShareCommand, KakaoFriendShareService,
+    KakaoMemoSendCommand,
+};
 use crate::services::oauth_connection::{EncryptedValue, OAuthConnectionError, TokenVault};
 use crate::services::scheduled_messages::external_delivery::outbox_aad;
 
@@ -290,16 +294,12 @@ async fn process_claim(
     kakao_config: &KakaoFriendShareConfig,
     claim: ClaimedExternalShare,
 ) {
-    if claim.provider != crate::services::oauth_connection::KAKAO_PROVIDER
-        || claim.channel_id
-            != crate::services::scheduled_messages::external_delivery::KAKAO_CHANNEL_ID
-    {
+    if claim.provider != crate::services::oauth_connection::KAKAO_PROVIDER {
         finish_pre_dispatch_failure(pool, &claim, "unsupported_provider").await;
         return;
     }
 
-    let command = decrypt_claim_command(&claim);
-    let command = match command {
+    let payload = match decrypt_claim_payload(&claim) {
         Ok(command) => command,
         Err((code, retryable)) => {
             handle_retryable_failure(pool, &claim, code, retryable).await;
@@ -314,18 +314,51 @@ async fn process_claim(
         }
     };
     let idempotency_key = format!("scheduled-kakao:{}", claim.id);
-    match service
-        .send_friend_message(&claim.account_key, &idempotency_key, command)
-        .await
-    {
+    let result = match claim.channel_id.as_str() {
+        crate::services::scheduled_messages::external_delivery::KAKAO_FRIEND_CHANNEL_ID => {
+            let command = serde_json::from_slice::<KakaoFriendShareCommand>(&payload)
+                .map_err(|_| ("payload_invalid", false));
+            match command {
+                Ok(command) => {
+                    service
+                        .send_friend_message(&claim.account_key, &idempotency_key, command)
+                        .await
+                }
+                Err((code, retryable)) => {
+                    handle_retryable_failure(pool, &claim, code, retryable).await;
+                    return;
+                }
+            }
+        }
+        KAKAO_MEMO_CHANNEL_ID => {
+            let command = serde_json::from_slice::<KakaoMemoSendCommand>(&payload)
+                .map_err(|_| ("payload_invalid", false));
+            match command {
+                Ok(command) => {
+                    service
+                        .send_memo_message(&claim.account_key, &idempotency_key, command)
+                        .await
+                }
+                Err((code, retryable)) => {
+                    handle_retryable_failure(pool, &claim, code, retryable).await;
+                    return;
+                }
+            }
+        }
+        _ => {
+            finish_pre_dispatch_failure(pool, &claim, "unsupported_provider").await;
+            return;
+        }
+    };
+    match result {
         Ok(result) => finish_result_pg(pool, &claim, result).await,
         Err(error) => handle_kakao_error(pool, &claim, &error).await,
     }
 }
 
-fn decrypt_claim_command(
+fn decrypt_claim_payload(
     claim: &ClaimedExternalShare,
-) -> Result<KakaoFriendShareCommand, (&'static str, bool)> {
+) -> Result<Zeroizing<Vec<u8>>, (&'static str, bool)> {
     let vault = TokenVault::from_env().map_err(|error| match error {
         OAuthConnectionError::MissingTokenKey | OAuthConnectionError::InvalidTokenKey => {
             ("token_key_unavailable", true)
@@ -342,7 +375,7 @@ fn decrypt_claim_command(
             outbox_aad(claim.id).as_bytes(),
         )
         .map_err(|_| ("payload_decrypt_failed", false))?;
-    serde_json::from_slice(&plaintext).map_err(|_| ("payload_invalid", false))
+    Ok(plaintext)
 }
 
 async fn finish_result_pg(

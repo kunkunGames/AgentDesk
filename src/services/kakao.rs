@@ -38,6 +38,7 @@ pub const KAKAO_CONNECTOR_ID: &str = "kakao_friend_share";
 pub const KAKAO_REST_API_KEY_ENV: &str = "KAKAO_REST_API_KEY";
 pub const KAKAO_CLIENT_SECRET_ENV: &str = "KAKAO_CLIENT_SECRET";
 pub const REQUIRED_SCOPES: [&str; 2] = ["friends", "talk_message"];
+pub const KAKAO_MEMO_CHANNEL_ID: &str = "kakao_memo";
 
 const AUTHORIZE_URL: &str = "https://kauth.kakao.com/oauth/authorize";
 const TOKEN_URL: &str = "https://kauth.kakao.com/oauth/token";
@@ -232,6 +233,8 @@ pub struct KakaoFriendShareCommand {
     pub receiver_uuids: Vec<String>,
     pub text: String,
     #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
     pub confirmed: bool,
 }
 
@@ -240,6 +243,8 @@ pub struct KakaoFriendShareCommand {
 #[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct KakaoMemoSendCommand {
     pub text: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -496,7 +501,7 @@ impl<'a> KakaoFriendShareService<'a> {
             self.pool,
             ExternalShareScope {
                 provider: KAKAO_PROVIDER,
-                channel_id: KAKAO_CONNECTOR_ID,
+                channel_id: KAKAO_MEMO_CHANNEL_ID,
                 account_key,
             },
             idempotency_key,
@@ -540,15 +545,11 @@ impl<'a> KakaoFriendShareService<'a> {
     ) -> Result<KakaoSendResponse, KakaoError> {
         let receiver_uuids = serde_json::to_string(&request.receiver_uuids)
             .map_err(|_| KakaoError::Validation("receiver_uuids are invalid"))?;
-        let template = json!({
-            "object_type": "text",
-            "text": request.text,
-            "link": {
-                "web_url": self.config.landing_url,
-                "mobile_web_url": self.config.landing_url
-            }
-        })
-        .to_string();
+        let template = message_template(
+            &request.text,
+            request.image_url.as_deref(),
+            &self.config.landing_url,
+        );
         let response = http_client()?
             .post(SEND_URL)
             .bearer_auth(access_token)
@@ -581,7 +582,11 @@ impl<'a> KakaoFriendShareService<'a> {
         access_token: &str,
         request: &KakaoMemoSendCommand,
     ) -> Result<(ShareOperationState, SafeShareSummary), KakaoError> {
-        let template = text_template(&request.text, &self.config.landing_url);
+        let template = message_template(
+            &request.text,
+            request.image_url.as_deref(),
+            &self.config.landing_url,
+        );
         let response = http_client()?
             .post(MEMO_SEND_URL)
             .bearer_auth(access_token)
@@ -999,10 +1004,7 @@ fn validate_memo_send_request(
     request: &KakaoMemoSendCommand,
 ) -> Result<(), KakaoError> {
     validate_idempotency_key(idempotency_key)?;
-    if !request.confirmed {
-        return Err(KakaoError::Validation("confirmed must be true"));
-    }
-    validate_friend_share_text(&request.text)
+    validate_memo_send_payload(request)
 }
 
 fn validate_idempotency_key(idempotency_key: &str) -> Result<(), KakaoError> {
@@ -1024,7 +1026,18 @@ pub fn validate_friend_share_payload(request: &KakaoFriendShareCommand) -> Resul
         return Err(KakaoError::Validation("confirmed must be true"));
     }
     validate_friend_share_recipients(&request.receiver_uuids)?;
-    validate_friend_share_text(&request.text)
+    validate_friend_share_text(&request.text)?;
+    validate_kakao_image_url(request.image_url.as_deref())
+}
+
+/// Validate an operator-confirmed self-chatroom payload independently from its
+/// idempotency metadata so scheduled outbox workers can replay it safely.
+pub fn validate_memo_send_payload(request: &KakaoMemoSendCommand) -> Result<(), KakaoError> {
+    if !request.confirmed {
+        return Err(KakaoError::Validation("confirmed must be true"));
+    }
+    validate_friend_share_text(&request.text)?;
+    validate_kakao_image_url(request.image_url.as_deref())
 }
 
 pub fn validate_friend_share_recipients(receiver_uuids: &[String]) -> Result<(), KakaoError> {
@@ -1056,10 +1069,70 @@ pub fn validate_friend_share_text(text: &str) -> Result<(), KakaoError> {
     Ok(())
 }
 
+/// Kakao fetches feed images itself. Restrict the URL to a bounded public HTTPS
+/// location so an operator cannot accidentally hand a private network address
+/// or a local scheduled attachment blob to the external provider.
+pub fn validate_kakao_image_url(image_url: Option<&str>) -> Result<(), KakaoError> {
+    let Some(image_url) = image_url else {
+        return Ok(());
+    };
+    if image_url.len() > 2_048 || image_url.trim() != image_url {
+        return Err(KakaoError::Validation(
+            "image_url must be a public HTTPS URL",
+        ));
+    }
+    let url = reqwest::Url::parse(image_url)
+        .map_err(|_| KakaoError::Validation("image_url must be a public HTTPS URL"))?;
+    let host = url.host_str();
+    if url.scheme() != "https"
+        || host.is_none()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some()
+        || host.is_some_and(|value| value.eq_ignore_ascii_case("localhost"))
+        || host.is_some_and(is_private_ip_literal)
+    {
+        return Err(KakaoError::Validation(
+            "image_url must be a public HTTPS URL",
+        ));
+    }
+    Ok(())
+}
+
+fn is_private_ip_literal(host: &str) -> bool {
+    let Ok(address) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || matches!(
+                    octets,
+                    [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+                )
+        }
+        std::net::IpAddr::V6(address) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
 fn request_fingerprint(request: &KakaoFriendShareCommand, landing_url: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"agentdesk/kakao-friend-share/request/v1\0");
     update_length_prefixed(&mut hasher, request.text.as_bytes());
+    update_optional_length_prefixed(&mut hasher, request.image_url.as_deref());
     update_length_prefixed(&mut hasher, landing_url.as_bytes());
     let mut recipients = request.receiver_uuids.iter().collect::<Vec<_>>();
     recipients.sort_unstable();
@@ -1073,25 +1146,60 @@ fn memo_request_fingerprint(request: &KakaoMemoSendCommand, landing_url: &str) -
     let mut hasher = Sha256::new();
     hasher.update(b"agentdesk/kakao-memo/request/v1\0");
     update_length_prefixed(&mut hasher, request.text.as_bytes());
+    update_optional_length_prefixed(&mut hasher, request.image_url.as_deref());
     update_length_prefixed(&mut hasher, landing_url.as_bytes());
     hasher.finalize().to_vec()
 }
 
-fn text_template(text: &str, landing_url: &str) -> String {
-    json!({
-        "object_type": "text",
-        "text": text,
-        "link": {
-            "web_url": landing_url,
-            "mobile_web_url": landing_url
-        }
-    })
-    .to_string()
+fn message_template(text: &str, image_url: Option<&str>, landing_url: &str) -> String {
+    let link = json!({
+        "web_url": landing_url,
+        "mobile_web_url": landing_url
+    });
+    match image_url {
+        Some(image_url) => json!({
+            "object_type": "feed",
+            "content": {
+                "title": feed_title(text),
+                "description": text,
+                "image_url": image_url,
+                "link": link
+            },
+            "button_title": "문서 보기"
+        })
+        .to_string(),
+        None => json!({
+            "object_type": "text",
+            "text": text,
+            "link": link
+        })
+        .to_string(),
+    }
+}
+
+fn feed_title(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("예약 메시지")
+        .chars()
+        .take(50)
+        .collect()
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
+}
+
+fn update_optional_length_prefixed(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            update_length_prefixed(hasher, value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
 }
 
 fn classify_send_response(
@@ -1172,6 +1280,7 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect(),
             text: text.to_string(),
+            image_url: None,
             confirmed: true,
         }
     }
@@ -1223,6 +1332,7 @@ mod tests {
     fn validates_memo_send_without_friend_recipients() {
         let valid = KakaoMemoSendCommand {
             text: "self test".to_string(),
+            image_url: None,
             confirmed: true,
         };
         assert!(validate_memo_send_request("memo-send-123", &valid).is_ok());
@@ -1232,9 +1342,34 @@ mod tests {
                 "memo-send-123",
                 &KakaoMemoSendCommand {
                     text: " ".to_string(),
+                    image_url: None,
                     confirmed: true,
                 },
             )
+            .is_err()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "feed memo".to_string(),
+                image_url: Some("https://example.com/thumbnail.jpg".to_string()),
+                confirmed: true,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "unsafe feed memo".to_string(),
+                image_url: Some("http://127.0.0.1/image.jpg".to_string()),
+                confirmed: true,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "private feed memo".to_string(),
+                image_url: Some("https://192.168.0.2/image.jpg".to_string()),
+                confirmed: true,
+            })
             .is_err()
         );
         assert!(
@@ -1242,6 +1377,7 @@ mod tests {
                 "memo-send-123",
                 &KakaoMemoSendCommand {
                     text: "hello".to_string(),
+                    image_url: None,
                     confirmed: false,
                 },
             )
@@ -1253,6 +1389,7 @@ mod tests {
     fn memo_fingerprint_is_distinct_from_friend_send() {
         let memo = KakaoMemoSendCommand {
             text: "hello".to_string(),
+            image_url: None,
             confirmed: true,
         };
         assert_ne!(
@@ -1268,6 +1405,50 @@ mod tests {
         let changed = request_fingerprint(&request(&["a", "b"], "changed"), "https://example.com");
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn feed_template_is_used_only_for_a_validated_image_url() {
+        let feed: serde_json::Value = serde_json::from_str(&message_template(
+            "소복이 D-7 알림",
+            Some("https://example.com/thumbnail.jpg"),
+            "https://universe.vr11.net/Docs/",
+        ))
+        .unwrap();
+        assert_eq!(feed["object_type"], "feed");
+        assert_eq!(
+            feed["content"]["image_url"],
+            "https://example.com/thumbnail.jpg"
+        );
+        assert_eq!(
+            feed["content"]["link"]["web_url"],
+            "https://universe.vr11.net/Docs/"
+        );
+
+        let text: serde_json::Value = serde_json::from_str(&message_template(
+            "소복이 D-7 알림",
+            None,
+            "https://universe.vr11.net/Docs/",
+        ))
+        .unwrap();
+        assert_eq!(text["object_type"], "text");
+        assert!(text.get("content").is_none());
+    }
+
+    #[test]
+    fn image_url_validation_rejects_private_and_credentialed_locations() {
+        for invalid in [
+            "https://127.0.0.1/image.jpg",
+            "https://[::1]/image.jpg",
+            "https://user@example.com/image.jpg",
+            "https://example.com:8443/image.jpg",
+        ] {
+            assert!(
+                validate_kakao_image_url(Some(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_kakao_image_url(Some("https://cdn.example.com/image.jpg")).is_ok());
     }
 
     #[test]

@@ -54,7 +54,7 @@ const invalidResponseCases: InvalidResponseCase[] = [
   ],
   [
     "send",
-    () => sendKakaoFriendMessage("idempotency-key", "primary", ["friend-a"], "안녕하세요"),
+    () => sendKakaoFriendMessage("idempotency-key", "primary", ["friend-a"], "안녕하세요", "https://example.com/thumb.jpg"),
     {
       request_id: "not-a-uuid",
       status: "success",
@@ -68,7 +68,7 @@ const invalidResponseCases: InvalidResponseCase[] = [
   ],
   [
     "memo send",
-    () => sendKakaoMemoMessage("idempotency-key", "primary", "안녕하세요"),
+    () => sendKakaoMemoMessage("idempotency-key", "primary", "안녕하세요", "https://example.com/thumb.jpg"),
     {
       request_id: "not-a-uuid",
       status: "success",
@@ -164,12 +164,12 @@ describe("Kakao runtime response contracts", () => {
     });
     await expect(getKakaoFriends("primary", 0, 20)).resolves.toMatchObject({ total_count: 1 });
     await expect(
-      sendKakaoFriendMessage("idempotency-key", "primary", ["friend-a"], "안녕하세요"),
+      sendKakaoFriendMessage("idempotency-key", "primary", ["friend-a"], "안녕하세요", "https://example.com/thumb.jpg"),
     ).resolves.toMatchObject({
       status: "success",
       automatic_retry_allowed: false,
     });
-    await expect(sendKakaoMemoMessage("idempotency-key", "primary", "안녕하세요")).resolves.toMatchObject({
+    await expect(sendKakaoMemoMessage("idempotency-key", "primary", "안녕하세요", "https://example.com/thumb.jpg")).resolves.toMatchObject({
       status: "success",
       automatic_retry_allowed: false,
     });

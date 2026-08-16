@@ -95,7 +95,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kakao/messages/send",
             "kakao",
-            "Send one confirmed text template to 1–5 selected friends behind a durable, non-reclaiming at-most-once fence. Ambiguous delivery is sticky unknown and is never retried automatically.",
+            "Send one confirmed text template, or a feed template when image_url is a public HTTPS URL, to 1–5 selected friends behind a durable, non-reclaiming at-most-once fence. Ambiguous delivery is sticky unknown and is never retried automatically.",
         )
         .with_params([
             (
@@ -117,6 +117,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             (
                 "text",
                 body_param("string", true, "1–200 Unicode scalar values"),
+            ),
+            (
+                "image_url",
+                body_param("string", false, "Public HTTPS image URL; selects the Kakao feed template"),
             ),
             (
                 "confirmed",
@@ -148,7 +152,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kakao/messages/send-to-me",
             "kakao",
-            "Send one confirmed default text template to the connected operator's Kakao My Chatroom. This does not require friends-list access and uses the same durable at-most-once operation fence.",
+            "Send one confirmed text template, or a feed template when image_url is a public HTTPS URL, to the connected operator's Kakao My Chatroom. This does not require friends-list access and uses the same durable at-most-once operation fence.",
         )
         .with_params([
             (
@@ -166,6 +170,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             (
                 "account_id",
                 body_param("string", true, "Opaque sender account ID"),
+            ),
+            (
+                "image_url",
+                body_param("string", false, "Public HTTPS image URL; selects the Kakao feed template"),
             ),
             (
                 "confirmed",

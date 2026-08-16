@@ -232,7 +232,7 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
                 _ => None,
             },
         },
-        external_share.as_ref(),
+        &external_share,
         now,
     )
     .await

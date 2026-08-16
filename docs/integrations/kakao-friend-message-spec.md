@@ -730,6 +730,7 @@ Request:
 {
   "receiver_uuids": ["opaque-1", "opaque-2"],
   "text": "AgentDesk 공유: 작업 요약",
+  "image_url": "https://cdn.example.com/summary.jpg",
   "confirmed": true
 }
 ```
@@ -740,6 +741,9 @@ Validation before operation insert:
 - `confirmed == true`;
 - 1..=5 unique non-empty UUID strings;
 - text trim result is 1..=200 Unicode scalar values;
+- optional `image_url` is a bounded public HTTPS URL with no credentials or
+  private/loopback IP literal; when present AgentDesk sends Kakao's `feed`
+  default template, otherwise it sends the existing `text` template;
 - connector is Connected;
 - landing URL is valid;
 - token refresh is complete;

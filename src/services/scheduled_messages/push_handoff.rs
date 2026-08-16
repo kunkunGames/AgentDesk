@@ -18,7 +18,7 @@ pub(super) async fn commit_push_handoff(
     pool: &PgPool,
     fire: &ClaimedFire,
     message: OutboxMessage<'_>,
-    external_share: Option<&NewExternalShareOutbox>,
+    external_shares: &[NewExternalShareOutbox],
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
@@ -34,7 +34,7 @@ pub(super) async fn commit_push_handoff(
     }
     let outbox_id =
         enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(&mut tx, message).await?;
-    if let Some(external_share) = external_share {
+    for external_share in external_shares {
         enqueue_external_share_outbox_tx(&mut tx, external_share).await?;
     }
     let (next, forced_terminal) = compute_resume(
