@@ -475,7 +475,9 @@ def scan_migrations(tracked: TrackedInput | Path | str, repo_root: Path = REPO_R
         tracked = TrackedInput(
             "migrations/postgres", "MIGRATION", path, path.relative_to(root).as_posix()
         )
-    content_hash = hashlib.sha256(tracked.path.read_bytes()).hexdigest()
+    content_hash = hashlib.sha256(
+        tracked.path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    ).hexdigest()
     if tracked.kind == "MIGRATION_METADATA":
         return [_record(tracked, "migration.non_sql_tracked", "NON_SQL_TRACKED", content_hash)]
     return [_record(tracked, "migration.file", "STATIC_FILE", content_hash)]
