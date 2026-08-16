@@ -20,6 +20,9 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::config::KakaoFriendShareConfig;
+use crate::services::kakao_message::message_template;
+
+pub use crate::services::kakao_message::validate_kakao_image_url;
 
 use super::external_share::{
     BeginShareOperation, ExternalShareError, ExternalShareScope, SafeShareSummary,
@@ -1069,75 +1072,21 @@ pub fn validate_friend_share_text(text: &str) -> Result<(), KakaoError> {
     Ok(())
 }
 
-/// Kakao fetches feed images itself. Restrict the URL to a bounded public HTTPS
-/// location so an operator cannot accidentally hand a private network address
-/// or a local scheduled attachment blob to the external provider.
-pub fn validate_kakao_image_url(image_url: Option<&str>) -> Result<(), KakaoError> {
-    let Some(image_url) = image_url else {
-        return Ok(());
-    };
-    if image_url.len() > 2_048 || image_url.trim() != image_url {
-        return Err(KakaoError::Validation(
-            "image_url must be a public HTTPS URL",
-        ));
-    }
-    let url = reqwest::Url::parse(image_url)
-        .map_err(|_| KakaoError::Validation("image_url must be a public HTTPS URL"))?;
-    let host = url.host_str();
-    if url.scheme() != "https"
-        || host.is_none()
-        || url.username() != ""
-        || url.password().is_some()
-        || url.port().is_some()
-        || host.is_some_and(|value| value.eq_ignore_ascii_case("localhost"))
-        || host.is_some_and(is_private_ip_literal)
-    {
-        return Err(KakaoError::Validation(
-            "image_url must be a public HTTPS URL",
-        ));
-    }
-    Ok(())
-}
-
-fn is_private_ip_literal(host: &str) -> bool {
-    let Ok(address) = host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    match address {
-        std::net::IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || matches!(
-                    octets,
-                    [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
-                )
-        }
-        std::net::IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || address.is_unique_local()
-                || address.is_unicast_link_local()
-                || address.is_multicast()
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        }
-    }
-}
-
 fn request_fingerprint(request: &KakaoFriendShareCommand, landing_url: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"agentdesk/kakao-friend-share/request/v1\0");
     update_length_prefixed(&mut hasher, request.text.as_bytes());
-    update_optional_length_prefixed(&mut hasher, request.image_url.as_deref());
     update_length_prefixed(&mut hasher, landing_url.as_bytes());
     let mut recipients = request.receiver_uuids.iter().collect::<Vec<_>>();
     recipients.sort_unstable();
     for recipient in recipients {
         update_length_prefixed(&mut hasher, recipient.as_bytes());
+    }
+    // Keep the pre-feed v1 layout when no image is present so in-flight
+    // idempotent retries still match the stored operation fingerprint.
+    if let Some(image_url) = request.image_url.as_deref() {
+        hasher.update(b"image_url\0");
+        update_length_prefixed(&mut hasher, image_url.as_bytes());
     }
     hasher.finalize().to_vec()
 }
@@ -1146,60 +1095,17 @@ fn memo_request_fingerprint(request: &KakaoMemoSendCommand, landing_url: &str) -
     let mut hasher = Sha256::new();
     hasher.update(b"agentdesk/kakao-memo/request/v1\0");
     update_length_prefixed(&mut hasher, request.text.as_bytes());
-    update_optional_length_prefixed(&mut hasher, request.image_url.as_deref());
     update_length_prefixed(&mut hasher, landing_url.as_bytes());
-    hasher.finalize().to_vec()
-}
-
-fn message_template(text: &str, image_url: Option<&str>, landing_url: &str) -> String {
-    let link = json!({
-        "web_url": landing_url,
-        "mobile_web_url": landing_url
-    });
-    match image_url {
-        Some(image_url) => json!({
-            "object_type": "feed",
-            "content": {
-                "title": feed_title(text),
-                "description": text,
-                "image_url": image_url,
-                "link": link
-            },
-            "button_title": "문서 보기"
-        })
-        .to_string(),
-        None => json!({
-            "object_type": "text",
-            "text": text,
-            "link": link
-        })
-        .to_string(),
+    if let Some(image_url) = request.image_url.as_deref() {
+        hasher.update(b"image_url\0");
+        update_length_prefixed(&mut hasher, image_url.as_bytes());
     }
-}
-
-fn feed_title(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("예약 메시지")
-        .chars()
-        .take(50)
-        .collect()
+    hasher.finalize().to_vec()
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
-}
-
-fn update_optional_length_prefixed(hasher: &mut Sha256, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update([1]);
-            update_length_prefixed(hasher, value.as_bytes());
-        }
-        None => hasher.update([0]),
-    }
 }
 
 fn classify_send_response(
@@ -1408,47 +1314,25 @@ mod tests {
     }
 
     #[test]
-    fn feed_template_is_used_only_for_a_validated_image_url() {
-        let feed: serde_json::Value = serde_json::from_str(&message_template(
-            "소복이 D-7 알림",
-            Some("https://example.com/thumbnail.jpg"),
-            "https://universe.vr11.net/Docs/",
-        ))
-        .unwrap();
-        assert_eq!(feed["object_type"], "feed");
+    fn request_fingerprint_stays_stable_when_image_url_is_absent() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"agentdesk/kakao-friend-share/request/v1\0");
+        update_length_prefixed(&mut hasher, b"hello");
+        update_length_prefixed(&mut hasher, b"https://example.com");
+        update_length_prefixed(&mut hasher, b"a");
+        let pre_feed = hasher.finalize().to_vec();
         assert_eq!(
-            feed["content"]["image_url"],
-            "https://example.com/thumbnail.jpg"
-        );
-        assert_eq!(
-            feed["content"]["link"]["web_url"],
-            "https://universe.vr11.net/Docs/"
+            request_fingerprint(&request(&["a"], "hello"), "https://example.com"),
+            pre_feed
         );
 
-        let text: serde_json::Value = serde_json::from_str(&message_template(
-            "소복이 D-7 알림",
-            None,
-            "https://universe.vr11.net/Docs/",
-        ))
-        .unwrap();
-        assert_eq!(text["object_type"], "text");
-        assert!(text.get("content").is_none());
-    }
-
-    #[test]
-    fn image_url_validation_rejects_private_and_credentialed_locations() {
-        for invalid in [
-            "https://127.0.0.1/image.jpg",
-            "https://[::1]/image.jpg",
-            "https://user@example.com/image.jpg",
-            "https://example.com:8443/image.jpg",
-        ] {
-            assert!(
-                validate_kakao_image_url(Some(invalid)).is_err(),
-                "{invalid}"
-            );
-        }
-        assert!(validate_kakao_image_url(Some("https://cdn.example.com/image.jpg")).is_ok());
+        let mut with_image = request(&["a"], "hello");
+        with_image.image_url = Some("https://cdn.example.com/thumbnail.jpg".to_string());
+        assert_ne!(
+            request_fingerprint(&with_image, "https://example.com"),
+            pre_feed
+        );
     }
 
     #[test]

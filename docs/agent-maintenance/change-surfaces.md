@@ -162,8 +162,12 @@ time for diagnostics; neither is a stored approval value.
 
 - canonical_modules: `src/services/kakao.rs` (frozen giant surface; OAuth,
   friend/memo send, and connection-state live in one provider client).
+  `src/services/kakao_message.rs` owns public-HTTPS feed image URL validation
+  and the shared text/feed template builder so scheduled-feed work does not
+  grow the giant under #4710.
 - related_issues: #4710.
-- allowed_changes: bugfix only until a scoped extraction under #4710.
+- allowed_changes: bugfix only on `kakao.rs` until a scoped extraction under
+  #4710. Template and public image-URL validation land in `kakao_message.rs`.
 
 
 ### `writer_gate_ci_wiring`

@@ -302,6 +302,14 @@ mod tests {
         )
         .expect_err("scheduled Kakao content cannot be blank");
         assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+        let mut private_image = targets(true, &["recipient-a"]);
+        private_image.kakao_friend_share.image_url =
+            Some("https://127.0.0.1/thumbnail.jpg".to_string());
+        let private_feed =
+            prepare_provider_targets(Some(&private_image), "hello", db::KIND_PUSH, &enabled)
+                .expect_err("scheduled Kakao feed image must be a public HTTPS URL");
+        assert_eq!(private_feed.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
