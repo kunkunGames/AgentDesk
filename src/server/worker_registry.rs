@@ -101,6 +101,7 @@ fn record_worker_local_terminal_signal(
         tracing::info!(
             worker = spec.name,
             target = spec.target,
+            observability_target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -120,6 +121,7 @@ fn record_worker_local_terminal_signal(
         tracing::error!(
             worker = spec.name,
             target = spec.target,
+            observability_target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -139,6 +141,7 @@ fn record_worker_local_terminal_signal(
         tracing::warn!(
             worker = spec.name,
             target = spec.target,
+            observability_target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -168,6 +171,7 @@ fn record_leader_only_worker_started(spec: WorkerSpec) {
     tracing::info!(
         worker = spec.name,
         target = spec.target,
+        observability_target = spec.target,
         kind = spec.kind.as_doc_str(),
         stage = spec.start_stage.as_doc_str(),
         order = spec.start_order,
@@ -194,6 +198,7 @@ fn record_leader_only_worker_stopped(spec: WorkerSpec, reason: &str) {
     tracing::warn!(
         worker = spec.name,
         target = spec.target,
+        observability_target = spec.target,
         kind = spec.kind.as_doc_str(),
         stage = spec.start_stage.as_doc_str(),
         order = spec.start_order,
