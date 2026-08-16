@@ -898,9 +898,3 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
-
-[[entry]]
-decision = "keep"
-file = "src/services/kakao.rs"
-owner = "kakao"
-keep_reason = "Recent mult-account connection additions pushed it slightly over the 1000 threshold. Should be reviewed later for splitting."
