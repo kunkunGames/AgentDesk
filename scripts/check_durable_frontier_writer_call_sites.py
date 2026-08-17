@@ -186,6 +186,16 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+try:
+    from rust_cfg import find_test_only_cfg_attribute as _cfg_test_only_match
+except ModuleNotFoundError:  # imported from a repo-root unittest
+    from scripts.rust_cfg import find_test_only_cfg_attribute as _cfg_test_only_match
+
+try:
+    from rust_lex import StripState, strip_line
+except ModuleNotFoundError:  # imported from a repo-root unittest
+    from scripts.rust_lex import StripState, strip_line
+
 # Every production call site of every pinned symbol, keyed by symbol then by
 # repo-relative path. An empty map pins the symbol at zero production callers:
 # the API exists and compiles, but nothing outside tests may reach it. Measured
@@ -427,175 +437,6 @@ def _defn_re(symbol: str) -> re.Pattern[str]:
 CALL_RES = {symbol: _call_re(symbol) for symbol in EXPECTED_CALL_SITES}
 DEFN_RES = {symbol: _defn_re(symbol) for symbol in EXPECTED_CALL_SITES}
 
-# Rust cfg attributes are Boolean expressions. A regex that merely spots the
-# token `test` treats `cfg(any(test, unix))` as test-only and hides production
-# code, so the gate now tokenises the cfg expression and checks whether it can
-# be true with `test` disabled. The parser is deliberately lexical and is
-# conservative (unsupported/overly large expressions stay production-visible).
-CFG_ATTR_START_RE = re.compile(r"#\s*\[\s*cfg\s*\(")
-
-
-class _CfgNode:
-    __slots__ = ("kind", "name", "children")
-
-    def __init__(
-        self,
-        kind: str,
-        name: str | None = None,
-        children: tuple["_CfgNode", ...] = (),
-    ) -> None:
-        self.kind = kind
-        self.name = name
-        self.children = children
-
-
-class _CfgAttributeMatch:
-    """Small match-like span object used by the line scanner."""
-
-    __slots__ = ("_start", "_end")
-
-    def __init__(self, start: int, end: int) -> None:
-        self._start = start
-        self._end = end
-
-    def start(self) -> int:
-        return self._start
-
-    def end(self) -> int:
-        return self._end
-
-
-def _cfg_tokens(expression: str) -> list[str]:
-    """Tokenise cfg meta syntax after strings/comments were blanked."""
-
-    return re.findall(r"[A-Za-z_]\w*|[(),=]", expression)
-
-
-def _parse_cfg_expression(expression: str) -> _CfgNode | None:
-    """Parse enough cfg meta grammar to evaluate test-only reachability."""
-
-    tokens = _cfg_tokens(expression)
-    if not tokens:
-        return None
-    index = 0
-
-    def parse_expr() -> _CfgNode | None:
-        nonlocal index
-        if index >= len(tokens):
-            return None
-        name = tokens[index]
-        index += 1
-        if name in {"all", "any", "not"} and index < len(tokens) and tokens[index] == "(":
-            index += 1
-            children: list[_CfgNode] = []
-            while index < len(tokens) and tokens[index] != ")":
-                child = parse_expr()
-                if child is None:
-                    return None
-                children.append(child)
-                if index < len(tokens) and tokens[index] == ",":
-                    index += 1
-                    continue
-                if index < len(tokens) and tokens[index] == ")":
-                    break
-                # A malformed expression is safer to leave visible than to
-                # classify as test-only.
-                return None
-            if index >= len(tokens) or tokens[index] != ")":
-                return None
-            index += 1
-            return _CfgNode(name, children=tuple(children))
-
-        # An atom may be a key/value predicate (`feature = "x"`). The string
-        # was blanked before this parser runs; consume its punctuation through
-        # the next top-level comma/close and retain only the atom kind. Unknown
-        # atoms are free variables for the non-test satisfiability check.
-        while index < len(tokens) and tokens[index] not in {",", ")"}:
-            index += 1
-        return _CfgNode("atom", name=name)
-
-    node = parse_expr()
-    if node is None or index != len(tokens):
-        return None
-    return node
-
-
-def _cfg_eval(node: _CfgNode, values: dict[int, bool], test_enabled: bool) -> bool:
-    if node.kind == "atom":
-        if node.name == "test":
-            return test_enabled
-        return values[id(node)]
-    if node.kind == "all":
-        return all(_cfg_eval(child, values, test_enabled) for child in node.children)
-    if node.kind == "any":
-        return any(_cfg_eval(child, values, test_enabled) for child in node.children)
-    if node.kind == "not" and len(node.children) == 1:
-        return not _cfg_eval(node.children[0], values, test_enabled)
-    # Empty/malformed `not` is not safe to hide.
-    return True
-
-
-def _cfg_can_be_true_without_test(node: _CfgNode) -> bool:
-    unknowns: list[_CfgNode] = []
-
-    def collect(current: _CfgNode) -> None:
-        if current.kind == "atom":
-            if current.name != "test":
-                unknowns.append(current)
-            return
-        for child in current.children:
-            collect(child)
-
-    collect(node)
-    # Avoid an exponential scan on a deliberately hostile attribute. A
-    # conservative production result is the only safe fallback for a lexical
-    # gate: it may over-report, but it never hides a production writer.
-    if len(unknowns) > 12:
-        return True
-    for mask in range(1 << len(unknowns)):
-        values = {
-            id(atom): bool(mask & (1 << bit))
-            for bit, atom in enumerate(unknowns)
-        }
-        if _cfg_eval(node, values, test_enabled=False):
-            return True
-    return False
-
-
-def _cfg_test_only_match(code: str, start: int = 0) -> _CfgAttributeMatch | None:
-    """Find the next cfg attribute whose expression requires `test`."""
-
-    for opening in CFG_ATTR_START_RE.finditer(code, start):
-        open_paren = code.find("(", opening.start(), opening.end())
-        depth = 0
-        close_paren = None
-        for index in range(open_paren, len(code)):
-            char = code[index]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    close_paren = index
-                    break
-        if close_paren is None:
-            continue
-        end = close_paren + 1
-        while end < len(code) and code[end].isspace():
-            end += 1
-        if end >= len(code) or code[end] != "]":
-            continue
-        expression = code[open_paren + 1 : close_paren]
-        parsed = _parse_cfg_expression(expression)
-        if parsed is not None and not _cfg_can_be_true_without_test(parsed):
-            # `production_lines` arms the test-item state while walking this
-            # line. Return the closing `)` position (rather than the span's
-            # final `]`) so the arm is actually visited by that loop; the
-            # attribute's full start is still used when masking its text.
-            return _CfgAttributeMatch(opening.start(), close_paren)
-    return None
-
-
 # An item keyword that introduces a braced body, in ITEM POSITION: at the start
 # of a line, or right after the `]` closing an attribute, or right after a `}`.
 # The position anchor is load-bearing. A bare `\bfn\b` also matches the `fn` in a
@@ -610,102 +451,10 @@ ITEM_START_RE = re.compile(
     r"(?:fn|impl|mod|trait|macro_rules)\b"
 )
 
-# --- Cross-line string/comment stripper, ported verbatim from
-# scripts/check_inflight_blind_save_ratchet.py (#4259), which ported it from
-# scripts/check_log_key_drift.py (#4218). Copied rather than imported so each
-# guard stays a dependency-free single-file script, per the convention those two
-# state; if a bug is found here, fix it in all three. Blanked output keeps
-# `{` / `}` / `;` / `,` counts honest for the cfg(test) tracking below: without
-# cross-line state, an unbalanced `{` inside a multi-line raw string poisons the
-# brace depth and hides every later call in the file. ---
-
-# Char literal (so `'"'` / `'{'` cannot desync the scanners). Lifetimes (`'a`)
-# do not match and fall through harmlessly.
-_CHAR_LITERAL = re.compile(r"'(\\.|[^'\\])'")
-
-# Raw / byte string openers: r"…", r#"…"#, br"…"; b"…" is handled separately.
-_RAW_STRING_OPEN = re.compile(r'(?:r|br)(#*)"')
-
-
-class StripState:
-    """Cross-line lexer state: strings and block comments span lines."""
-
-    __slots__ = ("in_string", "raw_hashes", "block_depth")
-
-    def __init__(self) -> None:
-        self.in_string = False  # inside a normal "…" / b"…" string
-        self.raw_hashes: int | None = None  # inside r"…" / r#"…"# (hash count)
-        self.block_depth = 0  # nested /* … */ depth
-
-
-def strip_line(line: str, state: StripState) -> str:
-    """Blank out string-literal/comment content, preserving column positions."""
-    out: list[str] = []
-    i = 0
-    n = len(line)
-    while i < n:
-        if state.block_depth > 0:
-            if line.startswith("/*", i):
-                state.block_depth += 1
-                out.append("  ")
-                i += 2
-            elif line.startswith("*/", i):
-                state.block_depth -= 1
-                out.append("  ")
-                i += 2
-            else:
-                out.append(" ")
-                i += 1
-            continue
-        if state.raw_hashes is not None:
-            closer = '"' + "#" * state.raw_hashes
-            if line.startswith(closer, i):
-                state.raw_hashes = None
-                out.append(" " * len(closer))
-                i += len(closer)
-            else:
-                out.append(" ")
-                i += 1
-            continue
-        if state.in_string:
-            if line[i] == "\\" and i + 1 < n:
-                out.append("  ")
-                i += 2
-            else:
-                if line[i] == '"':
-                    state.in_string = False
-                out.append(" ")
-                i += 1
-            continue
-        # --- normal code ---
-        if line.startswith("//", i):
-            break  # line comment: drop the rest of the line
-        if line.startswith("/*", i):
-            state.block_depth = 1
-            out.append("  ")
-            i += 2
-            continue
-        raw = _RAW_STRING_OPEN.match(line, i)
-        if raw:
-            state.raw_hashes = len(raw.group(1))
-            out.append(" " * (raw.end() - i))
-            i = raw.end()
-            continue
-        if line[i] == '"' or line.startswith('b"', i):
-            skip = 2 if line[i] == "b" else 1
-            state.in_string = True
-            out.append(" " * skip)
-            i += skip
-            continue
-        if line[i] == "'":
-            m = _CHAR_LITERAL.match(line, i)
-            if m:
-                out.append(" " * (m.end() - i))
-                i = m.end()
-                continue
-        out.append(line[i])
-        i += 1
-    return "".join(out)
+# Cross-line string/comment stripper imported from scripts/rust_lex.py.
+# Blanked output keeps `{` / `}` / `;` / `,` counts honest for the cfg(test)
+# tracking below: without cross-line state, an unbalanced `{` inside a
+# multi-line raw string poisons the brace depth and hides every later call.
 
 
 def is_test_file(name: str) -> bool:

@@ -3,9 +3,10 @@
 
 The gate identifies PG-dependent Rust tests only inside test regions, checks four
 lane contracts, and ratchets existing violations through a sectioned baseline.
-During T0, newly discovered live debt is warn-only. Return code 1 is reserved for
-manifest drift, candidate baseline growth, and stale baseline entries; malformed
-inputs and configuration errors return code 2. T1 promotes new debt to enforcement.
+Newly discovered live debt (baseline drift) is enforced; existing baseline entries
+are maintained as a ledger. Return code 1 is reserved for manifest drift, candidate
+baseline growth, and any baseline drift (new or stale); malformed inputs and
+configuration errors return code 2.
 """
 
 from __future__ import annotations
@@ -63,11 +64,12 @@ SEED_PATTERNS = tuple(_seed_pattern(seed) for seed in SEEDS)
 CONNECT_SEED_PATTERNS = tuple(_seed_pattern(seed) for seed in CONNECT_SEEDS)
 SECTIONS = ("rule1", "rule2", "rule3", "rule4")
 # rule5 is deliberately NOT a baseline section. Every section in SECTIONS is
-# ratcheted: existing entries are tolerated and only growth is refused, which
-# makes a rule warn-only for a tree that already carries the debt. rule5 admits
-# no debt at all, so it has nothing to ratchet and is enforced directly in
-# `check_analysis`. Adding it to SECTIONS would also make the checked-in
-# baseline unparseable against `origin/main`, which has no `[rule5]` section.
+# an exact ledger: candidate growth against the reference fails, and both new
+# and stale live-debt drift against the candidate fail. An unchanged ledger may
+# carry existing debt without output. rule5 admits no debt at all, so it has
+# nothing to ledger and is enforced directly in `check_analysis`. Adding it to
+# SECTIONS would also make the checked-in baseline unparseable against
+# `origin/main`, which has no `[rule5]` section.
 #
 # The baseline is only one of the two ways a gate gets talked down, and rule5
 # is closed against both. The other is the allowlist, and it used to be wide
@@ -143,7 +145,7 @@ class Job:
 
     @property
     def key(self) -> str:
-        return f"{self.workflow}:{self.name}"
+        return f"{Path(self.workflow).as_posix()}:{self.name}"
 
     @property
     def code(self) -> str:
@@ -440,9 +442,12 @@ def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = 
                 targets.add(target)
             elif findings is not None:
                 line = source.count("\n", 0, match.start()) + 1
-                tried = ", ".join(os.path.relpath(candidate, repo_root) for candidate in candidates)
+                tried = ", ".join(
+                    Path(os.path.relpath(candidate, repo_root)).as_posix()
+                    for candidate in candidates
+                )
                 detail = f"mod {match.group('name')}; did not resolve inside src; tried: {tried}"
-                findings.append(Finding("unresolved-external-test-module", f"{path.relative_to(repo_root)}:{line}", detail))
+                findings.append(Finding("unresolved-external-test-module", f"{path.relative_to(repo_root).as_posix()}:{line}", detail))
     return targets
 
 
@@ -655,7 +660,7 @@ def discover_pg_inventory(
             # Reaching an external file through a cfg(test) declaration already
             # proves that its direct tests are part of the library test target.
             if name in declared_tests or external:
-                records.append((name, str(path.relative_to(repo_root)), logical[:-1], body))
+                records.append((name, path.relative_to(repo_root).as_posix(), logical[:-1], body))
 
     by_path: dict[tuple[tuple[str, ...], str], set[tuple[tuple[str, ...], str, str]]] = {}
     for key in item_bodies:
@@ -829,7 +834,7 @@ def parse_jobs(
             match for match in in_section
             if _indent_width(match.group("indent")) == job_indent
         ]
-    rel = str(path.relative_to(repo_root))
+    rel = path.relative_to(repo_root).as_posix()
     if not candidates and findings is not None:
         findings.append(
             Finding(
@@ -1496,7 +1501,7 @@ def check_analysis(
         new = sorted(analysis.debts[section] - baseline[section])
         stale = sorted(baseline[section] - analysis.debts[section])
         if new or stale:
-            level = "FAIL" if stale else "WARN"
+            level = "FAIL"
             print(f"{level}: [{section}] baseline drift: {len(new)} new, {len(stale)} stale.", file=sys.stderr)
             for entry in new:
                 print(f"  + {entry}", file=sys.stderr)
@@ -1512,8 +1517,7 @@ def check_analysis(
                 "every entry requires an inline reason comment.",
                 file=sys.stderr,
             )
-            if stale:
-                failed = True
+            failed = True
     counts = analysis.debts
     # rule5: no ratchet, and the allowlist cannot reach it. Both halves are
     # properties of the code above rather than intentions -- `analyze` computes
@@ -1533,8 +1537,8 @@ def check_analysis(
             print(f"  ! {entry}", file=sys.stderr)
         print(
             "Give that job `./scripts/ci/postgres-service.sh start` plus the "
-            "`AGENTDESK_REQUIRE_PG: \"1\"` env rule4 tracks (rule4 only WARNs "
-            "on a missing one -- it is a ledger, not a guard), or narrow its "
+            "`AGENTDESK_REQUIRE_PG: \"1\"` env rule4 tracks (rule4 enforces new "
+            "violations but maintains existing debt as a ledger), or narrow its "
             "selection so it stops choosing these ids. Those two are the "
             "fixes this rule accepts; the two levers that talk other rules "
             "down do not reach it. It has no baseline section, and it reads "
@@ -1578,9 +1582,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         epilog=(
-            "During T0, new live debt is warn-only. Manifest drift, candidate "
-            "baseline growth, and stale baseline entries return rc=1; T1 promotes "
-            "new debt to enforcement."
+            "Newly discovered live debt (baseline drift) is enforced; existing baseline "
+            "entries are maintained as a ledger. Return code 1 is reserved for manifest "
+            "drift, candidate baseline growth, and any baseline drift (new or stale); "
+            "malformed inputs and configuration errors return code 2."
         ),
     )
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)

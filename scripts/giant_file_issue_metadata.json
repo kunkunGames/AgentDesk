@@ -46,8 +46,7 @@
         "src/services/settings.rs",
         "src/services/turn_orchestrator.rs",
         "src/server/worker_registry.rs",
-        "src/server/maintenance.rs",
-        "src/services/kakao.rs"
+        "src/server/maintenance.rs"
       ]
     },
     {
@@ -125,16 +124,14 @@
       ]
     },
     {
-      "number": 4713,
-      "state": "closed",
-      "title": "decompose(4519): voice-runtime grandfathered giant follow-up",
+      "number": 1622,
+      "state": "open",
+      "title": "decompose: src/services/kakao.rs giant (fork-only Kakao connector)",
       "owners": [
-        "voice-runtime"
+        "server-runtime"
       ],
       "files": [
-        "src/voice/receiver.rs",
-        "src/services/discord/voice_barge_in.rs",
-        "src/voice/announce_meta.rs"
+        "src/services/kakao.rs"
       ]
     }
   ]

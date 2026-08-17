@@ -1025,7 +1025,7 @@ pub struct ClusterConfig {
     /// Epic #2285 / E3 + E4 + E5 gate. When `true` (default since E5 / #2412),
     /// the session-bound `WatcherSupervisor` + `StreamRelay` infrastructure runs
     /// in production with a Discord `RelaySink`, and the production tmux frame
-    /// producer (`services::discord::tmux_watcher`) pushes every chunk it reads
+    /// producer (`services::discord::tmux::tmux_watcher`) pushes every chunk it reads
     /// into the supervisor-owned relay via `RelayProducerRegistry`. The
     /// session-bound sink owns Discord terminal delivery for eligible inflight
     /// shapes (rebind-origin/adopted sessions and watcher-owned relays); the
@@ -1687,7 +1687,7 @@ fn is_off_intake_delivery_settlement(stage: &IntakeDeliverySettlementStage) -> b
 /// Rollout stage for the #5071 T3 execution-identity fence.
 ///
 /// The read model behind this switch
-/// (`services::discord::execution_identity::SessionIncarnationRef`) only reads
+/// (`services::discord::tmux::execution_identity::SessionIncarnationRef`) only reads
 /// the per-spawn `.spawn_nonce` marker that provider spawns already write; no
 /// mode introduces a durable row, a new marker, or a new file format. T3-A0
 /// landed that model with no destructive consumer; T3-A1 converted the call
@@ -1702,12 +1702,12 @@ fn is_off_intake_delivery_settlement(stage: &IntakeDeliverySettlementStage) -> b
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionIdentityMode {
     /// Never consult the spawn nonce for a deny decision and do not count
-    /// observations. The fenced call sites still *read* the nonce marker in
-    /// every mode (`WatcherIdentityFence` captures it up front and re-reads it
-    /// once inside the registry lock) — Legacy discards the result, so the
-    /// destructive outcome matches the pre-A1 CAS while the marker-file I/O is
-    /// new (short-circuiting it is tracked in #5399). The pre-existing
-    /// `(session, output_path, cancel pointer)` registry CAS is untouched.
+    /// observations — and, since #5399, never read the marker either. Both
+    /// reads a fenced call site would make are skipped here: the up-front
+    /// `WatcherIdentityFence` capture and the re-read inside the registry lock.
+    /// So this mode reproduces the pre-A1 destructive outcome at the pre-A1
+    /// marker-file I/O cost, which is none. The pre-existing `(session,
+    /// output_path, cancel pointer)` registry CAS is untouched.
     #[default]
     Legacy,
     /// Legacy behaviour plus captured-vs-current nonce counters and logs, and a
@@ -1745,12 +1745,23 @@ impl ExecutionIdentityMode {
     /// Only `Enforce` may turn a non-matching observation into a refusal, and
     /// only at the call sites T3-A1 converted. Two consumers read this: the
     /// nonce deny predicate `destruction_permitted_under_identity` in
-    /// `services::discord::execution_identity` (with a shim of the same name in
+    /// `services::discord::tmux::execution_identity` (with a shim of the same name in
     /// `tmux_watcher_registry` for platforms that host no tmux marker), and the
     /// pinned-binding conjunct on `tmux_watcher_registry`'s identity-fenced
     /// registry view.
     pub const fn denies_on_incarnation_mismatch(self) -> bool {
         matches!(self, Self::Enforce)
+    }
+
+    /// Whether the `.spawn_nonce` marker is worth reading at all: a mode that
+    /// neither counts the comparison nor refuses on it has nothing to do with
+    /// the answer, so #5399 skips the read instead of discarding its result.
+    ///
+    /// Derived from the two predicates above rather than matching `Legacy`, so
+    /// a future mode that starts consuming the comparison keeps its read
+    /// without editing this.
+    pub const fn consults_spawn_nonce(self) -> bool {
+        self.records_identity_observations() || self.denies_on_incarnation_mismatch()
     }
 }
 
@@ -2190,6 +2201,13 @@ mod runtime_hook_registry_config_tests {
             !absent
                 .execution_identity_mode
                 .denies_on_incarnation_mismatch()
+        );
+        // #5399: the default consumes no comparison, so it reads no marker.
+        assert!(!absent.execution_identity_mode.consults_spawn_nonce());
+        assert!(
+            ExecutionIdentityMode::Observe.consults_spawn_nonce()
+                && ExecutionIdentityMode::Enforce.consults_spawn_nonce(),
+            "a mode that counts or refuses must keep its read"
         );
         assert!(absent.is_empty());
 
@@ -2700,7 +2718,7 @@ fn default_gateway_yield_grace_secs() -> u64 {
 }
 fn default_session_bound_relay_enabled() -> bool {
     // Epic #2285 / E5 (#2412): flipped to `true` once the production tmux
-    // frame producer (`services::discord::tmux_watcher`) pushed frames into
+    // frame producer (`services::discord::tmux::tmux_watcher`) pushed frames into
     // the supervisor-owned StreamRelay via `RelayProducerRegistry`. E4
     // (#2346) now wires that relay to a Discord sink for session-bound
     // terminal delivery on eligible inflight shapes, while preserving the

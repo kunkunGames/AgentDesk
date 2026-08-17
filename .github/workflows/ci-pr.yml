@@ -150,16 +150,21 @@ jobs:
               - 'src/reconcile.rs'
               - 'src/server/routes/auto_queue.rs'
               - 'src/server/routes/auto_queue_lifecycle_pg_tests.rs'
+              - 'src/server/routes/tests/auto_queue_preflight_harness_tests.rs'
               - 'src/server/routes/dispatched_sessions.rs'
               - 'src/server/routes/dispatches/**'
               - 'src/server/routes/message_outbox.rs'
               - 'src/server/routes/scheduled_messages.rs'
+              - 'src/server/routes/scheduled_messages/**'
               - 'src/server/worker_registry.rs'
               - 'src/services/auto_queue.rs'
               - 'src/services/auto_queue/**'
+              - 'src/services/automation_candidate_materializer/**'
               - 'src/services/dispatches/**'
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
+              - 'src/services/external_share_outbox.rs'
+              - 'src/services/external_share_outbox/**'
               - 'src/services/discord/outbound/source_registry.rs'
               - 'src/services/queue.rs'
               - 'src/services/session_forwarding.rs'
@@ -191,6 +196,8 @@ jobs:
               - 'src/services/discord/tmux_watcher/**'
               - 'src/services/discord/turn_bridge/terminal_outcome_delivery.rs'
               - 'src/services/discord/turn_bridge/terminal_outcome_delivery/**'
+              - 'src/services/discord/turn_bridge/intake_settlement/**'
+              - 'src/services/discord/turn_bridge/voice_completion_tests.rs'
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
               - 'src/services/discord/outbound/source_registry.rs'
@@ -207,6 +214,7 @@ jobs:
               - 'src/services/message_outbox_recovery.rs'
               - 'src/services/message_outbox_recovery_support.rs'
               - 'src/services/message_outbox_recovery_tests.rs'
+              - 'src/services/message_outbox_circuit_authority_tests.rs'
               - 'src/services/api_friction/**'
               - 'src/services/retrospectives.rs'
               - 'src/services/discord_dm_reply_store.rs'
@@ -1087,12 +1095,11 @@ jobs:
       PGPASSWORD: postgres
       # #4979 S2 contract, and rule4 of check_pg_test_lane_membership.py: any
       # job that starts the service must also hard-fail on an unreachable
-      # database instead of soft-skipping to green. rule4 does not ENFORCE
-      # that. A newly appearing rule4 debt entry prints as `WARN` and the check
-      # still exits 0 -- only a *stale* baseline entry is `FAIL` -- so deleting
-      # this line turns no gate red; it quietly returns the PG-dependent tests
-      # this lane selects to soft-skip green. Treat rule4 as a ledger, and this
-      # line as load-bearing on its own.
+      # database instead of soft-skipping to green. rule4 enforces this.
+      # A newly appearing rule4 debt entry (missing this env var) prints as
+      # `FAIL` and the check exits 1. Deleting this line would turn this gate
+      # red before the PG-dependent tests selected by this lane could quietly
+      # soft-skip to green. This line is load-bearing on rule4 enforcement.
       AGENTDESK_REQUIRE_PG: "1"
       # Match the other test lanes: assertions and panic text are preserved,
       # only native debug symbols are dropped to cut link memory (#4245).
