@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { getProviderLabel } from "../app/providerTheme";
 import { request } from "./httpClient";
 import { CLI_PROVIDERS, LEGACY_ONLY_PROVIDERS } from "../components/agent-manager/constants";
 
@@ -48,7 +49,12 @@ export function catalogLabel(
   id: string,
   fallback?: string,
 ): string {
-  return entries.find((entry) => entry.id === id)?.display_name ?? fallback ?? id;
+  const fromCatalog = entries
+    .find((entry) => entry.id === id)
+    ?.display_name?.trim();
+  if (fromCatalog) return fromCatalog;
+  if (fallback) return fallback;
+  return getProviderLabel(id);
 }
 
 export function useProviderCatalog(currentId?: string | null) {

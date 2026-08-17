@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  catalogLabel,
   meetingCatalogIds,
   selectableCatalogIds,
   type ProviderCatalogEntry,
@@ -50,5 +51,14 @@ describe("provider catalog presentation", () => {
       entry("antigravity", { supports_restricted_tool_policy: false }),
     ]);
     expect(ids).toEqual(["claude", "grok"]);
+  });
+
+  it("prefers catalog display names and falls back to themed labels", () => {
+    expect(catalogLabel([entry("qwen", { display_name: "Qwen Code" })], "qwen")).toBe(
+      "Qwen Code",
+    );
+    expect(catalogLabel([], "claude")).toBe("Claude");
+    expect(catalogLabel([], "grok")).toBe("Grok");
+    expect(catalogLabel([], "antigravity")).toBe("Antigravity");
   });
 });

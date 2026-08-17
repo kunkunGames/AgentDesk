@@ -202,7 +202,7 @@ export default function AgentSetupWizard({
                           providerTouchedRef.current = true;
                           setDraft({ ...draft, provider: event.target.value as CliProvider });
                         }}
-                        disabled={providerCatalog.loading || providerCatalog.error}
+                        disabled={providerCatalog.loading}
                         className={inputClass}
                         style={inputStyle}
                       >

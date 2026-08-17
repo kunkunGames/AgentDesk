@@ -248,6 +248,10 @@ describe("MeetingMinutesView rendered form contract", () => {
     expect(markup).toContain("Codex");
     expect(markup).toContain("Gemini");
     expect(markup).toContain("Qwen");
+    expect(markup).toContain("OpenCode");
+    expect(markup).toContain("Grok");
+    expect(markup).not.toContain("Antigravity");
+    expect(markup).not.toContain('value="antigravity"');
   });
 });
 

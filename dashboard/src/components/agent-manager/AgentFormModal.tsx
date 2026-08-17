@@ -359,7 +359,7 @@ export default function AgentFormModal({
                 <select
                   id="agent-provider"
                   {...register("cli_provider")}
-                  disabled={providerCatalog.loading || (!isEdit && providerCatalog.error)}
+                  disabled={providerCatalog.loading}
                   className={`${inputCls} cursor-pointer`}
                   style={inputStyle}
                 >
@@ -375,9 +375,7 @@ export default function AgentFormModal({
                   </span>
                 ) : providerCatalog.error ? (
                   <span className="mt-1 block text-[11px]" style={{ color: "var(--th-accent-danger)" }}>
-                    {isEdit
-                      ? tr("카탈로그를 못 불러 로컬 목록을 씁니다.", "Catalog unavailable; using local list.")
-                      : tr("카탈로그를 불러오지 못해 새 provider를 고를 수 없습니다.", "Catalog unavailable; new provider selection is disabled.")}
+                    {tr("카탈로그를 못 불러 로컬 목록을 씁니다.", "Catalog unavailable; using local list.")}
                   </span>
                 ) : null}
               </div>
