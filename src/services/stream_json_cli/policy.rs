@@ -83,6 +83,12 @@ impl ConfiguredToolPolicy {
     }
 }
 
+impl Default for ConfiguredToolPolicy {
+    fn default() -> Self {
+        Self::for_new_stream_json_provider()
+    }
+}
+
 pub fn is_readonly_tool_names(tools: &[AgentTool]) -> bool {
     !tools.is_empty()
         && tools

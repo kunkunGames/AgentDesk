@@ -955,9 +955,7 @@ impl Default for DiscordBotSettings {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            tool_policy:
-                crate::services::stream_json_cli::ConfiguredToolPolicy::for_new_stream_json_provider(
-                ),
+            tool_policy: Default::default(),
             allowed_channel_ids: Vec::new(),
             require_mention_channel_ids: Vec::new(),
             channel_model_overrides: std::collections::HashMap::new(),
