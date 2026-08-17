@@ -27,3 +27,7 @@ docs/generated/worker-inventory.md merge=regen-inventory
 # and crash on them. `-text` additionally keeps EOL conversion away from files
 # whose exact bytes are the assertion.
 tests/fixtures/relay_obligation/*.jsonl -diff -text
+# `.expected` is the same corpus's third-party golden output. Without `-text`,
+# a Windows checkout rewrites LF to CRLF and the Python/Rust byte-equal gate
+# fails even though both implementations still emit LF.
+tests/fixtures/relay_obligation/*.expected -diff -text
