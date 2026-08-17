@@ -56,11 +56,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/cluster/task-dispatches/claim",
                 post(cluster::claim_task_dispatches),
-            )
-            .route("/cluster/issue-specs", get(cluster::list_issue_specs))
-            .route(
-                "/cluster/issue-specs/upsert",
-                post(cluster::upsert_issue_spec),
             ),
         state,
     )

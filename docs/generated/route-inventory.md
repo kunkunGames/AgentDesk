@@ -51,8 +51,8 @@
 | `GET` | `/api/channels/{id}/watcher-state` | `queue_api::get_watcher_state` | `src/server/routes/queue_api.rs:240` | `src/server/routes/domains/ops.rs:264` |
 | `GET` | `/api/claude-accounts` | `claude_accounts_api::get_claude_accounts` | `src/server/routes/claude_accounts_api.rs:16` | `src/server/routes/domains/integrations.rs:16` |
 | `POST` | `/api/claude-accounts/switch` | `claude_accounts_api::switch_claude_account` | `src/server/routes/claude_accounts_api.rs:47` | `src/server/routes/domains/integrations.rs:20` |
-| `GET` | `/api/cluster/issue-specs` | `cluster::list_issue_specs` | `src/server/routes/cluster.rs:314` | `src/server/routes/domains/cluster.rs:60` |
-| `POST` | `/api/cluster/issue-specs/upsert` | `cluster::upsert_issue_spec` | `src/server/routes/cluster.rs:325` | `src/server/routes/domains/cluster.rs:61` |
+| `GET` | `/api/cluster/issue-specs` | `cluster::list_issue_specs` | `src/server/routes/cluster.rs:314` | `src/server/routes/domains/kanban.rs:85` |
+| `POST` | `/api/cluster/issue-specs/upsert` | `cluster::upsert_issue_spec` | `src/server/routes/cluster.rs:325` | `src/server/routes/domains/kanban.rs:86` |
 | `GET` | `/api/cluster/nodes` | `cluster::list_nodes` | `src/server/routes/cluster.rs:22` | `src/server/routes/domains/cluster.rs:13` |
 | `GET` | `/api/cluster/resource-locks` | `cluster::list_resource_locks` | `src/server/routes/cluster.rs:146` | `src/server/routes/domains/cluster.rs:19` |
 | `POST` | `/api/cluster/resource-locks/acquire` | `cluster::acquire_resource_lock` | `src/server/routes/cluster.rs:163` | `src/server/routes/domains/cluster.rs:20` |

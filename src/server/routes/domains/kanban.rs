@@ -4,7 +4,7 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, automation_candidates, kanban, kanban_repos, protected_api_domain, resume,
+    ApiRouter, AppState, automation_candidates, cluster, kanban, kanban_repos, protected_api_domain, resume,
 };
 
 // Category: kanban
@@ -81,6 +81,11 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/automation-candidates/{card_id}/prepare-worktree",
                 post(automation_candidates::prepare_worktree),
+            )
+            .route("/cluster/issue-specs", get(cluster::list_issue_specs))
+            .route(
+                "/cluster/issue-specs/upsert",
+                post(cluster::upsert_issue_spec),
             ),
         state,
     )
