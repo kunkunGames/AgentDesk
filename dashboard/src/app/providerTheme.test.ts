@@ -23,6 +23,7 @@ const PROVIDERS = [
   "gemini",
   "qwen",
   "opencode",
+  "grok",
   "copilot",
   "antigravity",
   "api",

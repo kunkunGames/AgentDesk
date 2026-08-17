@@ -22,29 +22,34 @@ fn provider_exec_registry_conformance_invariant() {
         let execution_adapter = provider
             .execution_adapter()
             .unwrap_or_else(|| panic!("registry provider {} has no execution adapter", entry.id));
-
         assert_eq!(
-            execution_adapter.provider_id(),
-            entry.id,
-            "{} execution adapter is wired to another provider",
+            execution_adapter, entry.execution_adapter,
+            "{} execution adapter does not match its registry row",
             entry.id
         );
-        assert_eq!(
-            execution_adapter.supported_capabilities(),
-            entry.capabilities,
-            "{} declared capabilities do not match its execution adapter",
-            entry.id
-        );
+        match (entry.id, execution_adapter) {
+            (
+                "gemini",
+                super::ProviderExecutionAdapter::StreamJsonCli(super::StreamJsonDialectId::Gemini),
+            )
+            | (
+                "grok",
+                super::ProviderExecutionAdapter::StreamJsonCli(super::StreamJsonDialectId::Grok),
+            )
+            | (
+                "antigravity",
+                super::ProviderExecutionAdapter::StreamJsonCli(super::StreamJsonDialectId::Agy),
+            )
+            | ("claude", super::ProviderExecutionAdapter::Claude)
+            | ("codex", super::ProviderExecutionAdapter::Codex)
+            | ("opencode", super::ProviderExecutionAdapter::OpenCode)
+            | ("qwen", super::ProviderExecutionAdapter::Qwen) => {}
+            (id, adapter) => panic!("{id} has unexpected adapter {adapter:?}"),
+        }
 
         let compaction_adapter = provider
             .compaction_adapter()
             .unwrap_or_else(|| panic!("registry provider {} has no compaction adapter", entry.id));
-        assert_eq!(
-            compaction_adapter.provider_id(),
-            entry.id,
-            "{} compaction adapter is not provider-specific",
-            entry.id
-        );
         match compaction_adapter {
             ProviderCompactionAdapter::ClaudeEnvironment => {
                 assert!(provider.compact_env_vars(80).is_empty());
@@ -54,23 +59,15 @@ fn provider_exec_registry_conformance_invariant() {
                 assert!(provider.compact_env_vars(80).is_empty());
                 assert!(!provider.compact_cli_config(80, 100_000).is_empty());
             }
-            ProviderCompactionAdapter::GeminiDisabled
-            | ProviderCompactionAdapter::OpenCodeDisabled
-            | ProviderCompactionAdapter::QwenDisabled => {
+            ProviderCompactionAdapter::Disabled => {
                 assert!(provider.compact_env_vars(80).is_empty());
                 assert!(provider.compact_cli_config(80, 100_000).is_empty());
             }
         }
 
-        let readiness_adapter = provider
+        let _readiness_adapter = provider
             .readiness_adapter()
             .unwrap_or_else(|| panic!("registry provider {} has no readiness adapter", entry.id));
-        assert_eq!(
-            readiness_adapter.provider_id(),
-            entry.id,
-            "{} readiness must use a concrete provider adapter",
-            entry.id
-        );
         assert!(
             super::tmux_capture_indicates_ready_for_input(READY_CAPTURE, &provider),
             "{} readiness adapter rejected its ready banner",
@@ -87,7 +84,34 @@ fn provider_exec_registry_conformance_invariant() {
         !provider_ids.is_empty(),
         "provider registry must not be empty"
     );
+    assert_eq!(
+        ProviderKind::from_str("agy"),
+        Some(ProviderKind::Antigravity)
+    );
+    assert_eq!(ProviderKind::Antigravity.as_str(), "antigravity");
     assert_scoped_dispatches_have_no_wildcard_arms();
+}
+
+#[test]
+fn counterpart_first_item_is_frozen() {
+    assert_eq!(ProviderKind::Claude.counterpart(), ProviderKind::Codex);
+    assert_eq!(ProviderKind::Codex.counterpart(), ProviderKind::Claude);
+    assert_eq!(ProviderKind::Gemini.counterpart(), ProviderKind::Codex);
+    assert_eq!(ProviderKind::OpenCode.counterpart(), ProviderKind::Codex);
+    assert_eq!(ProviderKind::Qwen.counterpart(), ProviderKind::Codex);
+    assert_eq!(ProviderKind::Grok.counterpart(), ProviderKind::Codex);
+    assert_eq!(ProviderKind::Antigravity.counterpart(), ProviderKind::Codex);
+    let rest: Vec<_> = ProviderKind::Claude
+        .preferred_counterparts()
+        .into_iter()
+        .skip(1)
+        .map(|provider| provider.as_str().to_string())
+        .collect();
+    let mut expected = rest.clone();
+    expected.sort();
+    assert_eq!(rest, expected);
+    assert!(!ProviderKind::Antigravity.is_meeting_eligible());
+    assert!(ProviderKind::Grok.is_meeting_eligible());
 }
 
 #[test]

@@ -2276,7 +2276,7 @@ these contextual numbers to match ordinary LoC churn.
   behavior.
 - `src/services/claude.rs` (frozen giant surface; +9 net from #4553 replacing dead native cache-TTL launch wiring with guarded gateway-proxy launch decisions and covering the simple-command spawn; -21 from #4113 backend_routing/availability extraction), `src/services/gemini.rs` (frozen giant surface),
   `src/services/qwen.rs` (frozen giant surface), `src/services/codex.rs` (frozen giant surface),
-  `src/services/opencode.rs` (frozen giant surface), `src/services/provider.rs` (frozen giant surface; +4 from #4566 publishing the session-generation registry binding as a monotonic max() guard with the token-local tmux-session name kept for SIGINT/pid tracking) —
+  `src/services/opencode.rs` (frozen giant surface), `src/services/provider.rs` (frozen giant surface; Stream-JSON family + Grok/Antigravity: registry table, counterparts, and intern helpers moved to `src/services/provider/registry.rs` so the facade stays net-negative; catalog projection lives in `provider/catalog.rs`. Adapter no longer owns provider identity/capabilities.) —
   provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
   twins from the claude/codex/gemini adapters and a superseded
   `select_counterpart_from` from provider. #3263 added the Codex max-of-cache

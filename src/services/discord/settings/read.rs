@@ -5,6 +5,7 @@ struct LegacyBotSettingsEntry {
     agent: Option<String>,
     provider: Option<ProviderKind>,
     allowed_tools: Option<Vec<String>>,
+    tool_policy_mode: Option<String>,
     allowed_channel_ids: Vec<u64>,
     require_mention_channel_ids: Vec<u64>,
     channel_model_overrides: std::collections::HashMap<String, String>,
@@ -147,11 +148,18 @@ fn load_legacy_bot_settings_entry(token: &str) -> LegacyBotSettingsEntry {
             .as_array()
             .map(|tools_arr| normalize_allowed_tools(tools_arr.iter().filter_map(|v| v.as_str()))),
     };
+    let tool_policy_mode = entry
+        .get("tool_policy_mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
 
     LegacyBotSettingsEntry {
         agent,
         provider,
         allowed_tools,
+        tool_policy_mode,
         allowed_channel_ids,
         require_mention_channel_ids,
         channel_model_overrides,
@@ -301,12 +309,23 @@ pub(crate) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         "provider",
     )
     .unwrap_or(ProviderKind::Claude);
-    let allowed_tools = configured
+    let raw_tools = configured
         .as_ref()
         .and_then(|bot| bot.auth.allowed_tools.as_ref().cloned())
         .map(|tools| normalize_allowed_tools(&tools))
-        .or(legacy.allowed_tools.clone())
-        .unwrap_or_else(|| default_allowed_tools_for_provider(&provider));
+        .or(legacy.allowed_tools.clone());
+    let raw_mode = configured
+        .as_ref()
+        .and_then(|bot| bot.auth.tool_policy_mode.as_deref())
+        .or(legacy.tool_policy_mode.as_deref());
+    let tool_policy = crate::services::stream_json_cli::ConfiguredToolPolicy::from_raw(
+        raw_mode,
+        raw_tools.as_deref(),
+    )
+    .unwrap_or_else(|_| {
+        crate::services::stream_json_cli::ConfiguredToolPolicy::for_new_stream_json_provider()
+    });
+    let allowed_tools = super::materialized_tools_for_settings(&provider, &tool_policy);
 
     DiscordBotSettings {
         agent: fallback_legacy_option(
@@ -316,6 +335,7 @@ pub(crate) fn load_bot_settings(token: &str) -> DiscordBotSettings {
         ),
         provider,
         allowed_tools,
+        tool_policy,
         allowed_channel_ids: fallback_legacy_vec(
             configured
                 .as_ref()

@@ -88,6 +88,20 @@ fn persist_bot_auth_to_yaml_checked(
         bot.auth.require_mention_channel_ids = Some(settings.require_mention_channel_ids.clone());
         bot.auth.allowed_user_ids = Some(settings.allowed_user_ids.clone());
         bot.auth.allowed_tools = Some(normalize_allowed_tools(&settings.allowed_tools));
+        bot.auth.tool_policy_mode = Some(match &settings.tool_policy {
+            crate::services::stream_json_cli::ConfiguredToolPolicy::Explicit(
+                crate::services::stream_json_cli::ToolPolicy::ProviderDefault,
+            ) => "provider_default".to_string(),
+            crate::services::stream_json_cli::ConfiguredToolPolicy::Explicit(
+                crate::services::stream_json_cli::ToolPolicy::ReadOnly,
+            ) => "read_only".to_string(),
+            crate::services::stream_json_cli::ConfiguredToolPolicy::Explicit(
+                crate::services::stream_json_cli::ToolPolicy::AllowListed(_),
+            ) => "allowlist".to_string(),
+            crate::services::stream_json_cli::ConfiguredToolPolicy::LegacyAllowedTools(_) => {
+                "allowlist".to_string()
+            }
+        });
         bot.auth.allow_all_users = Some(settings.allow_all_users);
         bot.auth.allowed_bot_ids = Some(settings.allowed_bot_ids.clone());
     }

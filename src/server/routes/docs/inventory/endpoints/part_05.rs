@@ -342,6 +342,33 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             json!({"path": {"id": "dept-platform"}}),
             json!({"ok": true}),
         ),
+        ep(
+            "GET",
+            "/api/providers",
+            "providers",
+            "List the authenticated dashboard provider catalog",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "providers": [
+                    {
+                        "id": "grok",
+                        "display_name": "Grok",
+                        "channel_suffix": "-gx",
+                        "binary_name": "grok",
+                        "execution_surface": "stream_json_cli",
+                        "supports_resume": true,
+                        "supports_structured_output": false,
+                        "supports_tool_stream": true,
+                        "supports_restricted_tool_policy": true,
+                        "supports_tui_hosting": false,
+                        "system_prompt_transport": "native",
+                        "context_window": "unknown"
+                    }
+                ]
+            }),
+        ),
         ep("GET", "/api/stats", "stats", "Get system stats"),
         ep(
             "GET",

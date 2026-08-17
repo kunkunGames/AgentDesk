@@ -54,6 +54,11 @@
   maintainability checklist deferred until relay recovery and CookingHeart
   two-node readiness are stable. Use this page to decide when P2 cleanup may be
   promoted into a runtime lane.
+- Stream-JSON CLI family + Grok/Antigravity (AGY) pipe:
+  [`docs/design/stream-json-cli-family-spec.md`](../design/stream-json-cli-family-spec.md)
+  and [`docs/design/stream-json-cli-family-prd.md`](../design/stream-json-cli-family-prd.md).
+  Grok and Antigravity (AGY) land as dialects over `src/services/stream_json_cli`.
+  Do not start TUI/ACP from those docs.
 
 ## Generated Companions (read-only)
 

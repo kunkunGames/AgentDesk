@@ -106,6 +106,7 @@ pub mod qwen;
 #[cfg(unix)]
 pub mod qwen_tmux_wrapper;
 pub(crate) mod release_source;
+pub mod stream_json_cli;
 // #3034: 2 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during remote_stub dead-code cleanup.
 #[allow(dead_code)]

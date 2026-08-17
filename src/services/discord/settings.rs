@@ -12,6 +12,7 @@ use poise::serenity_prelude as serenity;
 use crate::runtime_layout;
 use crate::services::agent_protocol::DEFAULT_ALLOWED_TOOLS;
 use crate::services::provider::ProviderKind;
+use crate::services::stream_json_cli::{ConfiguredToolPolicy, ToolPolicy};
 
 mod content;
 mod memory;
@@ -72,6 +73,33 @@ pub(crate) fn discord_token_hash(token: &str) -> String {
     hasher.update(token.as_bytes());
     let result = hasher.finalize();
     format!("discord_{}", hex::encode(&result[..8]))
+}
+
+fn materialized_tools_for_settings(
+    provider: &ProviderKind,
+    policy: &ConfiguredToolPolicy,
+) -> Vec<String> {
+    if matches!(provider, ProviderKind::Grok | ProviderKind::Antigravity) {
+        return match policy.effective_for_stream_json() {
+            ToolPolicy::ProviderDefault => Vec::new(),
+            ToolPolicy::ReadOnly => vec!["Read".to_string()],
+            ToolPolicy::AllowListed(tools) => {
+                tools.iter().map(|tool| tool.as_str().to_string()).collect()
+            }
+        };
+    }
+    match policy {
+        ConfiguredToolPolicy::Explicit(ToolPolicy::ProviderDefault) => {
+            default_allowed_tools_for_provider(provider)
+        }
+        ConfiguredToolPolicy::Explicit(ToolPolicy::ReadOnly) => vec!["Read".to_string()],
+        ConfiguredToolPolicy::Explicit(ToolPolicy::AllowListed(tools)) => {
+            tools.iter().map(|tool| tool.as_str().to_string()).collect()
+        }
+        ConfiguredToolPolicy::LegacyAllowedTools(tools) => {
+            tools.iter().map(|tool| tool.as_str().to_string()).collect()
+        }
+    }
 }
 
 fn default_allowed_tools_for_provider(provider: &ProviderKind) -> Vec<String> {

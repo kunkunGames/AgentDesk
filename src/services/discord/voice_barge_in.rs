@@ -412,6 +412,37 @@ fn voice_lobby_accepts_source_channel(config: &VoiceConfig, channel_id: ChannelI
     }
 }
 
+fn execute_voice_model_instant(
+    provider: &str,
+    prompt: &str,
+    model: &str,
+    cancel: Arc<crate::services::provider::CancelToken>,
+    role: &str,
+) -> Result<String, String> {
+    let provider_kind = ProviderKind::from_str_or_unsupported(provider);
+    match provider_kind {
+        ProviderKind::Claude => {
+            crate::services::claude::execute_command_simple_cancellable_with_model(
+                prompt,
+                Some(model),
+                Some(cancel),
+            )
+        }
+        ProviderKind::Codex => {
+            crate::services::codex::execute_command_simple_cancellable_with_model(
+                prompt,
+                Some(model),
+                Some(cancel),
+            )
+        }
+        ProviderKind::Unsupported(value) => Err(format!("unsupported {role} provider: {value}")),
+        other => Err(format!(
+            "{role} provider {} does not support model-scoped instant call yet",
+            other.as_str()
+        )),
+    }
+}
+
 async fn generate_foreground_ack_text(
     transcript: &str,
     language: &str,
@@ -430,30 +461,13 @@ async fn generate_foreground_ack_text(
     let result = tokio::time::timeout(
         timeout + FOREGROUND_MODEL_TIMEOUT_SLACK,
         tokio::task::spawn_blocking(move || {
-            let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
-            match provider_kind {
-                ProviderKind::Claude => {
-                    crate::services::claude::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
-                    "foreground provider {} does not support model-scoped instant call yet",
-                    provider_kind.as_str()
-                )),
-                ProviderKind::Unsupported(value) => {
-                    Err(format!("unsupported foreground provider: {value}"))
-                }
-            }
+            execute_voice_model_instant(
+                &provider,
+                &prompt,
+                &model,
+                cancel_for_blocking,
+                "foreground",
+            )
         }),
     )
     .await;
@@ -541,30 +555,13 @@ async fn generate_voice_channel_text_reply(
     let result = tokio::time::timeout(
         timeout + FOREGROUND_MODEL_TIMEOUT_SLACK,
         tokio::task::spawn_blocking(move || {
-            let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
-            match provider_kind {
-                ProviderKind::Claude => {
-                    crate::services::claude::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
-                    "voice channel text provider {} does not support model-scoped instant call yet",
-                    provider_kind.as_str()
-                )),
-                ProviderKind::Unsupported(value) => {
-                    Err(format!("unsupported voice channel text provider: {value}"))
-                }
-            }
+            execute_voice_model_instant(
+                &provider,
+                &prompt,
+                &model,
+                cancel_for_blocking,
+                "voice channel text",
+            )
         }),
     )
     .await;
@@ -630,30 +627,13 @@ async fn generate_voice_background_result_summary(
     let result = tokio::time::timeout(
         timeout + FOREGROUND_MODEL_TIMEOUT_SLACK,
         tokio::task::spawn_blocking(move || {
-            let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
-            match provider_kind {
-                ProviderKind::Claude => {
-                    crate::services::claude::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_cancellable_with_model(
-                        &prompt,
-                        Some(&model),
-                        Some(cancel_for_blocking),
-                    )
-                }
-                ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
-                    "voice background summary provider {} does not support model-scoped instant call yet",
-                    provider_kind.as_str()
-                )),
-                ProviderKind::Unsupported(value) => {
-                    Err(format!("unsupported voice background summary provider: {value}"))
-                }
-            }
+            execute_voice_model_instant(
+                &provider,
+                &prompt,
+                &model,
+                cancel_for_blocking,
+                "voice background summary",
+            )
         }),
     )
     .await;
@@ -2442,13 +2422,9 @@ mod tests {
                 foreground: crate::config::AgentVoiceForegroundConfig::default(),
             },
             provider: provider.to_string(),
-            channels: crate::config::AgentChannels {
-                claude: Some(crate::config::AgentChannel::from("100")),
-                codex: Some(crate::config::AgentChannel::from("200")),
-                gemini: None,
-                opencode: None,
-                qwen: None,
-            },
+            channels: crate::config::AgentChannels::new()
+                .with("claude", crate::config::AgentChannel::from("100"))
+                .with("codex", crate::config::AgentChannel::from("200")),
             keywords: Vec::new(),
             department: None,
             avatar_emoji: None,

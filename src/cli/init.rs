@@ -140,17 +140,10 @@ fn cli_init_provider_labels() -> Vec<&'static str> {
 }
 
 fn cli_init_provider_from_index(index: usize) -> &'static str {
-    match ProviderKind::provider_for_cli_init_index(index)
+    ProviderKind::provider_for_cli_init_index(index)
         .or_else(ProviderKind::default_channel_provider)
-        .unwrap_or(ProviderKind::Claude)
-    {
-        ProviderKind::Claude => "claude",
-        ProviderKind::Codex => "codex",
-        ProviderKind::Gemini => "gemini",
-        ProviderKind::OpenCode => "opencode",
-        ProviderKind::Qwen => "qwen",
-        ProviderKind::Unsupported(_) => "claude",
-    }
+        .and_then(|kind| crate::services::provider::intern_provider_id(kind.as_str()))
+        .unwrap_or("claude")
 }
 
 fn cli_init_provider_readiness_line(provider: &str) -> Option<String> {
