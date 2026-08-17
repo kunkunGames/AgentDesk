@@ -215,7 +215,7 @@ def is_scratch_file_path(path):
     basename = path.split("/")[-1]
     is_nested = "/" in path
 
-    if path.endswith(".diff") or path.endswith(".patch"):
+    if path.endswith(".diff") or path.endswith(".patch") or path.endswith(".log"):
         return True
 
     global_scratch_files = {
@@ -225,6 +225,9 @@ def is_scratch_file_path(path):
         "prs.json",
         "scratch.json",
         "scratchpad.json",
+        "cargo_out.txt",
+        "npm_output.log",
+        "bun_output.txt",
     }
     if basename in global_scratch_files:
         return True
