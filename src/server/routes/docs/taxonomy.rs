@@ -203,9 +203,7 @@ pub(super) fn category_description(category: &str) -> &'static str {
         "pipeline" => "Pipeline stages, config overrides, graphs, and card history.",
         "pm" => "PM decision workflow for force-only pipeline states.",
         "policies" => "Loaded policy inventory.",
-        "providers" => {
-            "Supported CLI provider catalog for dashboard and meeting selectors."
-        }
+        "providers" => "Supported CLI provider catalog for dashboard and meeting selectors.",
         "provider-cli" => {
             "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback."
         }
