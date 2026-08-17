@@ -4,7 +4,8 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, automation_candidates, cluster, kanban, kanban_repos, protected_api_domain, resume,
+    ApiRouter, AppState, automation_candidates, cluster, kanban, kanban_repos,
+    protected_api_domain, resume,
 };
 
 // Category: kanban
