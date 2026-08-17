@@ -22,12 +22,12 @@ export interface PendingSendIntent {
   fingerprint: string;
 }
 
-export function kakaoSendIntentFingerprint(accountId: string, receiverUuids: Iterable<string>, text: string): string {
-  return JSON.stringify({ account_id: accountId, receiver_uuids: [...receiverUuids].sort(), text });
+export function kakaoSendIntentFingerprint(accountId: string, receiverUuids: Iterable<string>, text: string, imageUrl?: string): string {
+  return JSON.stringify({ account_id: accountId, receiver_uuids: [...receiverUuids].sort(), text, image_url: imageUrl ?? null });
 }
 
-export function kakaoMemoIntentFingerprint(accountId: string, text: string): string {
-  return JSON.stringify({ account_id: accountId, target: "self", text });
+export function kakaoMemoIntentFingerprint(accountId: string, text: string, imageUrl?: string): string {
+  return JSON.stringify({ account_id: accountId, target: "self", text, image_url: imageUrl ?? null });
 }
 
 export function kakaoAccountCanSendToFriends(account: KakaoAccountSummary): boolean {
@@ -77,6 +77,7 @@ export function KakaoFriendShareControls({
   const [friendsLoading, setFriendsLoading] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [text, setText] = useState("");
+  const [imageUrl, setImageUrl] = useState("");
   const [sending, setSending] = useState(false);
   const [duplicateRiskPending, setDuplicateRiskPending] = useState(false);
   const [pendingIntent, setPendingIntent] = useState<PendingSendIntent | null>(null);
@@ -93,11 +94,12 @@ export function KakaoFriendShareControls({
   const selectedCanSendToFriends = selectedAccount ? kakaoAccountCanSendToFriends(selectedAccount) : false;
   const selectedCanSendMemo = selectedAccount ? kakaoAccountCanSendMemo(selectedAccount) : false;
   const charCount = Array.from(text).length;
+  const feedImageUrl = imageUrl.trim() || undefined;
   const sendDisabled = sending || !selectedCanSendToFriends || selected.size === 0 || selected.size > 5 || text.trim().length === 0 || charCount > 200;
   const memoSendDisabled = sending || !selectedCanSendMemo || text.trim().length === 0 || charCount > 200;
   const friends = useMemo(() => friendsPage?.friends ?? [], [friendsPage]);
-  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(accountId, selected, text), [accountId, selected, text]);
-  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(accountId, text), [accountId, text]);
+  const currentFingerprint = useMemo(() => kakaoSendIntentFingerprint(accountId, selected, text, feedImageUrl), [accountId, selected, text, feedImageUrl]);
+  const memoFingerprint = useMemo(() => kakaoMemoIntentFingerprint(accountId, text, feedImageUrl), [accountId, text, feedImageUrl]);
   const safelyReplaysCurrentIntent = pendingIntent?.fingerprint === currentFingerprint;
   const safelyReplaysMemoIntent = pendingIntent?.fingerprint === memoFingerprint;
 
@@ -181,6 +183,7 @@ export function KakaoFriendShareControls({
       setFriendsPage(null);
       setSelected(new Set());
       setText("");
+      setImageUrl("");
       setPendingIntent(null);
     }
   };
@@ -247,6 +250,7 @@ export function KakaoFriendShareControls({
         accountId,
         [...selected],
         text,
+        feedImageUrl,
       );
       setResult(response);
       const hasDuplicateRisk = response.status === "unknown" || response.status === "partial_success";
@@ -298,7 +302,12 @@ export function KakaoFriendShareControls({
     );
     setPendingIntent(resolvedIntent.intent);
     try {
-      const response = await api.sendKakaoMemoMessage(resolvedIntent.intent.idempotencyKey, accountId, text);
+      const response = await api.sendKakaoMemoMessage(
+        resolvedIntent.intent.idempotencyKey,
+        accountId,
+        text,
+        feedImageUrl,
+      );
       setResult(response);
       const hasDuplicateRisk = response.status === "unknown" || response.status === "partial_success";
       setDuplicateRiskPending(hasDuplicateRisk);
@@ -429,6 +438,22 @@ export function KakaoFriendShareControls({
               className="w-full resize-y rounded-xl border px-3 py-2 text-sm outline-none"
               style={{ borderColor: charCount > 200 ? "rgba(248, 113, 113, 0.62)" : "var(--th-border)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}
               placeholder={tr("200자 이하의 텍스트를 입력하세요.", "Enter up to 200 characters.")}
+            />
+          </label>
+
+          <label className="block">
+            <div className="mb-2 text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("대표 이미지 URL", "Thumbnail image URL")}</div>
+            <input
+              type="url"
+              value={imageUrl}
+              onChange={(event) => {
+                setImageUrl(event.target.value);
+                setResult(null);
+              }}
+              maxLength={2048}
+              className="w-full rounded-xl border px-3 py-2 text-sm outline-none"
+              style={{ borderColor: "var(--th-border)", background: "var(--th-bg-surface)", color: "var(--th-text)" }}
+              placeholder="https://..."
             />
           </label>
 

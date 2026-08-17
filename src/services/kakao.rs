@@ -20,6 +20,9 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::config::KakaoFriendShareConfig;
+use crate::services::kakao_message::message_template;
+
+pub use crate::services::kakao_message::validate_kakao_image_url;
 
 use super::external_share::{
     BeginShareOperation, ExternalShareError, ExternalShareScope, SafeShareSummary,
@@ -38,6 +41,7 @@ pub const KAKAO_CONNECTOR_ID: &str = "kakao_friend_share";
 pub const KAKAO_REST_API_KEY_ENV: &str = "KAKAO_REST_API_KEY";
 pub const KAKAO_CLIENT_SECRET_ENV: &str = "KAKAO_CLIENT_SECRET";
 pub const REQUIRED_SCOPES: [&str; 2] = ["friends", "talk_message"];
+pub const KAKAO_MEMO_CHANNEL_ID: &str = "kakao_memo";
 
 const AUTHORIZE_URL: &str = "https://kauth.kakao.com/oauth/authorize";
 const TOKEN_URL: &str = "https://kauth.kakao.com/oauth/token";
@@ -232,6 +236,8 @@ pub struct KakaoFriendShareCommand {
     pub receiver_uuids: Vec<String>,
     pub text: String,
     #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
     pub confirmed: bool,
 }
 
@@ -240,6 +246,8 @@ pub struct KakaoFriendShareCommand {
 #[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct KakaoMemoSendCommand {
     pub text: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -496,7 +504,7 @@ impl<'a> KakaoFriendShareService<'a> {
             self.pool,
             ExternalShareScope {
                 provider: KAKAO_PROVIDER,
-                channel_id: KAKAO_CONNECTOR_ID,
+                channel_id: KAKAO_MEMO_CHANNEL_ID,
                 account_key,
             },
             idempotency_key,
@@ -540,15 +548,11 @@ impl<'a> KakaoFriendShareService<'a> {
     ) -> Result<KakaoSendResponse, KakaoError> {
         let receiver_uuids = serde_json::to_string(&request.receiver_uuids)
             .map_err(|_| KakaoError::Validation("receiver_uuids are invalid"))?;
-        let template = json!({
-            "object_type": "text",
-            "text": request.text,
-            "link": {
-                "web_url": self.config.landing_url,
-                "mobile_web_url": self.config.landing_url
-            }
-        })
-        .to_string();
+        let template = message_template(
+            &request.text,
+            request.image_url.as_deref(),
+            &self.config.landing_url,
+        );
         let response = http_client()?
             .post(SEND_URL)
             .bearer_auth(access_token)
@@ -581,7 +585,11 @@ impl<'a> KakaoFriendShareService<'a> {
         access_token: &str,
         request: &KakaoMemoSendCommand,
     ) -> Result<(ShareOperationState, SafeShareSummary), KakaoError> {
-        let template = text_template(&request.text, &self.config.landing_url);
+        let template = message_template(
+            &request.text,
+            request.image_url.as_deref(),
+            &self.config.landing_url,
+        );
         let response = http_client()?
             .post(MEMO_SEND_URL)
             .bearer_auth(access_token)
@@ -999,10 +1007,7 @@ fn validate_memo_send_request(
     request: &KakaoMemoSendCommand,
 ) -> Result<(), KakaoError> {
     validate_idempotency_key(idempotency_key)?;
-    if !request.confirmed {
-        return Err(KakaoError::Validation("confirmed must be true"));
-    }
-    validate_friend_share_text(&request.text)
+    validate_memo_send_payload(request)
 }
 
 fn validate_idempotency_key(idempotency_key: &str) -> Result<(), KakaoError> {
@@ -1024,7 +1029,18 @@ pub fn validate_friend_share_payload(request: &KakaoFriendShareCommand) -> Resul
         return Err(KakaoError::Validation("confirmed must be true"));
     }
     validate_friend_share_recipients(&request.receiver_uuids)?;
-    validate_friend_share_text(&request.text)
+    validate_friend_share_text(&request.text)?;
+    validate_kakao_image_url(request.image_url.as_deref())
+}
+
+/// Validate an operator-confirmed self-chatroom payload independently from its
+/// idempotency metadata so scheduled outbox workers can replay it safely.
+pub fn validate_memo_send_payload(request: &KakaoMemoSendCommand) -> Result<(), KakaoError> {
+    if !request.confirmed {
+        return Err(KakaoError::Validation("confirmed must be true"));
+    }
+    validate_friend_share_text(&request.text)?;
+    validate_kakao_image_url(request.image_url.as_deref())
 }
 
 pub fn validate_friend_share_recipients(receiver_uuids: &[String]) -> Result<(), KakaoError> {
@@ -1066,6 +1082,12 @@ fn request_fingerprint(request: &KakaoFriendShareCommand, landing_url: &str) -> 
     for recipient in recipients {
         update_length_prefixed(&mut hasher, recipient.as_bytes());
     }
+    // Keep the pre-feed v1 layout when no image is present so in-flight
+    // idempotent retries still match the stored operation fingerprint.
+    if let Some(image_url) = request.image_url.as_deref() {
+        hasher.update(b"image_url\0");
+        update_length_prefixed(&mut hasher, image_url.as_bytes());
+    }
     hasher.finalize().to_vec()
 }
 
@@ -1074,19 +1096,11 @@ fn memo_request_fingerprint(request: &KakaoMemoSendCommand, landing_url: &str) -
     hasher.update(b"agentdesk/kakao-memo/request/v1\0");
     update_length_prefixed(&mut hasher, request.text.as_bytes());
     update_length_prefixed(&mut hasher, landing_url.as_bytes());
+    if let Some(image_url) = request.image_url.as_deref() {
+        hasher.update(b"image_url\0");
+        update_length_prefixed(&mut hasher, image_url.as_bytes());
+    }
     hasher.finalize().to_vec()
-}
-
-fn text_template(text: &str, landing_url: &str) -> String {
-    json!({
-        "object_type": "text",
-        "text": text,
-        "link": {
-            "web_url": landing_url,
-            "mobile_web_url": landing_url
-        }
-    })
-    .to_string()
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
@@ -1172,6 +1186,7 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect(),
             text: text.to_string(),
+            image_url: None,
             confirmed: true,
         }
     }
@@ -1223,6 +1238,7 @@ mod tests {
     fn validates_memo_send_without_friend_recipients() {
         let valid = KakaoMemoSendCommand {
             text: "self test".to_string(),
+            image_url: None,
             confirmed: true,
         };
         assert!(validate_memo_send_request("memo-send-123", &valid).is_ok());
@@ -1232,9 +1248,34 @@ mod tests {
                 "memo-send-123",
                 &KakaoMemoSendCommand {
                     text: " ".to_string(),
+                    image_url: None,
                     confirmed: true,
                 },
             )
+            .is_err()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "feed memo".to_string(),
+                image_url: Some("https://example.com/thumbnail.jpg".to_string()),
+                confirmed: true,
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "unsafe feed memo".to_string(),
+                image_url: Some("http://127.0.0.1/image.jpg".to_string()),
+                confirmed: true,
+            })
+            .is_err()
+        );
+        assert!(
+            validate_memo_send_payload(&KakaoMemoSendCommand {
+                text: "private feed memo".to_string(),
+                image_url: Some("https://192.168.0.2/image.jpg".to_string()),
+                confirmed: true,
+            })
             .is_err()
         );
         assert!(
@@ -1242,6 +1283,7 @@ mod tests {
                 "memo-send-123",
                 &KakaoMemoSendCommand {
                     text: "hello".to_string(),
+                    image_url: None,
                     confirmed: false,
                 },
             )
@@ -1253,6 +1295,7 @@ mod tests {
     fn memo_fingerprint_is_distinct_from_friend_send() {
         let memo = KakaoMemoSendCommand {
             text: "hello".to_string(),
+            image_url: None,
             confirmed: true,
         };
         assert_ne!(
@@ -1268,6 +1311,28 @@ mod tests {
         let changed = request_fingerprint(&request(&["a", "b"], "changed"), "https://example.com");
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn request_fingerprint_stays_stable_when_image_url_is_absent() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"agentdesk/kakao-friend-share/request/v1\0");
+        update_length_prefixed(&mut hasher, b"hello");
+        update_length_prefixed(&mut hasher, b"https://example.com");
+        update_length_prefixed(&mut hasher, b"a");
+        let pre_feed = hasher.finalize().to_vec();
+        assert_eq!(
+            request_fingerprint(&request(&["a"], "hello"), "https://example.com"),
+            pre_feed
+        );
+
+        let mut with_image = request(&["a"], "hello");
+        with_image.image_url = Some("https://cdn.example.com/thumbnail.jpg".to_string());
+        assert_ne!(
+            request_fingerprint(&with_image, "https://example.com"),
+            pre_feed
+        );
     }
 
     #[test]

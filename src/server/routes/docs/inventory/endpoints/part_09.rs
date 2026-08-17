@@ -150,11 +150,11 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ("title", body_param("string", false, "Display title")),
             ("dedupeKey", body_param("string", false, "Idempotency key; unique among live reservations")),
             ("imageAttachment", body_param("object", false, "Optional push-only representative image: filename with a MIME-matching extension, image MIME, and standard base64 data (JPEG/PNG/WebP/GIF, up to 8 MiB)")),
-            ("providerTargets", body_param("object", false, "Optional push-only provider fan-out. kakaoFriendShare requires confirmed=true and 1-5 receiverUuids; identifiers are encrypted at rest")),
+            ("providerTargets", body_param("object", false, "Optional push-only provider fan-out. kakaoFriendShare requires confirmed=true and 1-5 receiverUuids; sendToMe adds an independent Kakao My Chatroom delivery; imageUrl must be a public HTTPS URL and selects a feed template; identifiers are encrypted at rest")),
         ])
         .with_example(
-            json!({"body": {"content": "standup agenda", "targetChannelId": "123", "scheduledAt": "2026-07-09T09:00:00+09:00", "providerTargets": {"kakaoFriendShare": {"receiverUuids": ["provider-recipient-uuid"], "confirmed": true}}}}),
-            json!({"scheduledMessage": {"id": "smsg_1", "status": "scheduled", "deliveryKind": "push", "scheduledAt": "2026-07-09T00:00:00+00:00", "providerTargets": {"kakaoFriendShare": {"enabled": true, "recipientCount": 1, "contentMode": "text", "imageForwarded": false}}}}),
+            json!({"body": {"content": "standup agenda", "targetChannelId": "123", "scheduledAt": "2026-07-09T09:00:00+09:00", "providerTargets": {"kakaoFriendShare": {"receiverUuids": ["provider-recipient-uuid"], "sendToMe": true, "imageUrl": "https://cdn.example.com/standup.jpg", "confirmed": true}}}}),
+            json!({"scheduledMessage": {"id": "smsg_1", "status": "scheduled", "deliveryKind": "push", "scheduledAt": "2026-07-09T00:00:00+00:00", "providerTargets": {"kakaoFriendShare": {"enabled": true, "recipientCount": 1, "contentMode": "feed", "imageForwarded": true}, "kakaoMemo": {"enabled": true, "contentMode": "feed", "imageForwarded": true}}}}),
         ),
         ep(
             "GET",

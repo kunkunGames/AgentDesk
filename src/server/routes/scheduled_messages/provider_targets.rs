@@ -42,6 +42,11 @@ impl fmt::Debug for ScheduledProviderTargetsBody {
                 "kakao_friend_share_confirmed",
                 &self.kakao_friend_share.confirmed,
             )
+            .field("kakao_send_to_me", &self.kakao_friend_share.send_to_me)
+            .field(
+                "kakao_image_feed_enabled",
+                &self.kakao_friend_share.image_url.is_some(),
+            )
             .finish()
     }
 }
@@ -51,6 +56,10 @@ impl fmt::Debug for ScheduledProviderTargetsBody {
 pub struct ScheduledKakaoFriendShareTargetBody {
     pub account_id: String,
     pub receiver_uuids: Vec<String>,
+    #[serde(default)]
+    pub send_to_me: bool,
+    #[serde(default)]
+    pub image_url: Option<String>,
     #[serde(default)]
     pub confirmed: bool,
 }
@@ -80,6 +89,7 @@ pub(super) fn prepare_provider_targets(
     let command = KakaoFriendShareCommand {
         receiver_uuids: target.receiver_uuids.clone(),
         text: content.to_string(),
+        image_url: target.image_url.clone(),
         confirmed: target.confirmed,
     };
     validate_friend_share_payload(&command).map_err(|error| {
@@ -104,6 +114,8 @@ pub(super) fn prepare_provider_targets(
         &vault,
         target.account_id.clone(),
         target.receiver_uuids.clone(),
+        target.send_to_me,
+        target.image_url.clone(),
     )
     .map(Some)
     .map_err(|_| {
@@ -232,6 +244,8 @@ mod tests {
                     .iter()
                     .map(|recipient| (*recipient).to_string())
                     .collect(),
+                send_to_me: false,
+                image_url: None,
                 confirmed,
             },
         }
@@ -288,6 +302,14 @@ mod tests {
         )
         .expect_err("scheduled Kakao content cannot be blank");
         assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+        let mut private_image = targets(true, &["recipient-a"]);
+        private_image.kakao_friend_share.image_url =
+            Some("https://127.0.0.1/thumbnail.jpg".to_string());
+        let private_feed =
+            prepare_provider_targets(Some(&private_image), "hello", db::KIND_PUSH, &enabled)
+                .expect_err("scheduled Kakao feed image must be a public HTTPS URL");
+        assert_eq!(private_feed.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -306,6 +328,22 @@ mod tests {
                 }
             }))
             .is_err()
+        );
+
+        let feed_target = serde_json::from_value::<ScheduledProviderTargetsBody>(json!({
+            "kakaoFriendShare": {
+                "accountId": "primary",
+                "receiverUuids": ["recipient-a"],
+                "sendToMe": true,
+                "imageUrl": "https://cdn.example.com/thumbnail.jpg",
+                "confirmed": true
+            }
+        }))
+        .expect("feed and self-send target is accepted");
+        assert!(feed_target.kakao_friend_share.send_to_me);
+        assert_eq!(
+            feed_target.kakao_friend_share.image_url.as_deref(),
+            Some("https://cdn.example.com/thumbnail.jpg")
         );
 
         let body = json!({"providerTargets": null});

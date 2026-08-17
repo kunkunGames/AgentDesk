@@ -182,7 +182,8 @@ rollback 절차는 `docs/agent-maintenance/multinode-transition.md`를 따른다
 ### Provider fan-out (0108)
 
 `deliveryKind='push'` 예약은 선택적으로 동일 본문을 Discord와 Kakao 친구에게
-함께 보낼 수 있다. 이는 Kakao-only 스케줄러가 아니라 기존 Discord push
+함께 보낼 수 있고, `sendToMe=true`이면 연결된 계정의 Kakao 나와의 채팅방에도
+독립적으로 보낼 수 있다. 이는 Kakao-only 스케줄러가 아니라 기존 Discord push
 reservation의 명시적 sidecar다. `agent` 모드에는 허용하지 않는다.
 
 - 생성/PATCH 요청은 `providerTargets.kakaoFriendShare.confirmed=true`와 1~5개의
@@ -190,8 +191,11 @@ reservation의 명시적 sidecar다. `agent` 모드에는 허용하지 않는다
 - recipient UUID는 plaintext column에 저장하지 않는다. 활성 정의는
   `external_delivery_plan_*` AEAD envelope만 저장하고 API에는
   `recipientCount`, `contentMode`, `imageForwarded`만 반환한다.
-- `imageAttachment`가 함께 있어도 이미지는 Discord에만 전달되고 Kakao는 text +
-  서버 고정 landing link만 받는다. 응답의 `imageForwarded=false`가 이를 명시한다.
+- `imageAttachment`의 바이트는 Discord에만 전달한다. Kakao feed를 원하면
+  `imageUrl`에 외부에서 접근 가능한 public HTTPS URL을 명시해야 하며, 그 URL은
+  encrypted plan/outbox 안에서만 보관한다. URL이 없으면 Kakao는 text + 서버 고정
+  landing link를 받는다. 응답은 friend와 memo 각각의 `contentMode`와
+  `imageForwarded`만 반환한다.
 - push fire는 active parent/delivery를 다시 lock한 한 transaction에서 기존
   `message_outbox`와 신규 `external_share_outbox`를 모두 INSERT한 뒤 delivery와
   parent를 종료한다. 취소나 stale claim이 먼저 이기면 어느 outbox도 생기지 않는다.
@@ -428,6 +432,8 @@ budget을 소비하지 않고 정의를 되돌린다. 원래 recurrence anchor�
   "providerTargets": {                              // 선택, push 전용
     "kakaoFriendShare": {
       "receiverUuids": ["provider-recipient-uuid"],
+      "sendToMe": true,
+      "imageUrl": "https://cdn.example.com/standup.jpg",
       "confirmed": true
     }
   }

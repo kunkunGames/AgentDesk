@@ -40,6 +40,7 @@ describe("Kakao friend share safety helpers", () => {
     expect(first).toBe(reordered);
     expect(first).not.toBe(changed);
     expect(first).not.toBe(kakaoSendIntentFingerprint("account-b", ["friend-a", "friend-b"], "hello"));
+    expect(first).not.toBe(kakaoSendIntentFingerprint("account-a", ["friend-a", "friend-b"], "hello", "https://example.com/thumbnail.jpg"));
   });
 
   it("reuses an in-memory idempotency key only for the identical payload", () => {

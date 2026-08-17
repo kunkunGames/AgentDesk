@@ -379,7 +379,7 @@ async fn postgres_scheduled_push_atomically_hands_off_discord_and_kakao_outboxes
             session_key: None,
             attachment: None,
         },
-        Some(&external),
+        std::slice::from_ref(&external),
         Utc::now(),
     )
     .await
@@ -421,7 +421,7 @@ async fn postgres_scheduled_push_atomically_hands_off_discord_and_kakao_outboxes
             session_key: None,
             attachment: None,
         },
-        Some(&external),
+        std::slice::from_ref(&external),
         Utc::now(),
     )
     .await
@@ -472,7 +472,7 @@ async fn postgres_scheduled_push_rolls_back_discord_when_provider_handoff_fails(
             session_key: None,
             attachment: None,
         },
-        Some(&invalid_external),
+        std::slice::from_ref(&invalid_external),
         Utc::now(),
     )
     .await
@@ -525,7 +525,7 @@ async fn postgres_scheduled_push_cancellation_wins_before_all_provider_handoffs(
             session_key: None,
             attachment: None,
         },
-        Some(&external),
+        std::slice::from_ref(&external),
         Utc::now(),
     )
     .await

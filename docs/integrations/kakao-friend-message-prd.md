@@ -167,7 +167,7 @@ v1에서 다음 비용을 의도적으로 만들지 않는다.
 - AgentDesk 결과/카드의 공개 공유
 - 이벤트 기반·암묵적 background 메시지와 Kakao-only 예약. 단, 명시적 `providerTargets.kakaoFriendShare.confirmed=true`를 포함한 push 예약 fan-out은 포함
 - 알림톡, 전화번호 발송, 전체 친구 발송
-- feed/list/commerce 등 추가 Kakao 템플릿
+- list/commerce 등 추가 Kakao 템플릿
 - 친구 검색 인덱스, 즐겨찾기 동기화, thumbnail 저장
 - Kakao 계정 별칭·profile nickname 저장(다중 계정 연결/선택 자체는 지원)
 - 원격 Kakao unlink; v1 disconnect는 AgentDesk 로컬 자격증명 삭제

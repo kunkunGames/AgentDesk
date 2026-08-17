@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "42816aa4123dd84b7b84b7054a9bf68d971a8411",
+  "measured_at_sha": "fb72a8384f211789860656dd7c6994a80741bd5d",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1017,7 +1017,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:b114525f7c7b585b688e83a0bd2259e8cfa159caabe097076fe7e965503f084e"
+      "fingerprint": "sha256:d780351b9d3f7be8fee83bd766e7c1c174668c777e0130b0ee1fa2ca1ff602d4"
     },
     {
       "root": "migrations/postgres",
@@ -1026,7 +1026,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:b72d7337242c6520d727d08380646ec715be3302f23aab117a620fe45b013bff"
+      "fingerprint": "sha256:b06a8fca2f1d192053a92894486514fd90d51d5f24eadb8ec6b16c0a6d33a3f9"
     },
     {
       "root": "migrations/postgres",
@@ -1035,7 +1035,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:2eaed4c868ff2c562330a39af40dc2b50a347827bcaeac81f0e2099f32b46cd5"
+      "fingerprint": "sha256:752c458efe3087726e42d4072663ac8e2f1889ea74107f962d1ea8880eb77ee6"
     },
     {
       "root": "migrations/postgres",
@@ -1044,7 +1044,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:5af62ad1e25e95404c778cfc17628b29a91dd9435d5899c9a46a83e403a26838"
+      "fingerprint": "sha256:13635ce3017a5719407e1d48001d32e0494da49d57c2b4c2f2ffca397dc55dd9"
     },
     {
       "root": "migrations/postgres",
@@ -1053,7 +1053,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:6c9c5eddfd210dcc5ebe3fe01815063097fcc6678dab73524e7c0b52c8ccb7cf"
+      "fingerprint": "sha256:198326828c2fa805775f3c6786ce8802c24fbb7251948a8a9408148127392fd0"
     },
     {
       "root": "migrations/postgres",
@@ -1062,7 +1062,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:b0ac059f4ef3d65c50d5d8f11df6f8f95e25e5050b73351eaaca7752bca37e6e"
+      "fingerprint": "sha256:a34cd467c5c01a75428a046c0f54ff54fb5c5bd33b90abd3c4815e5e9b717ca8"
     },
     {
       "root": "migrations/postgres",
@@ -1071,7 +1071,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:ae8543b7ce0089d052cc76dd8b2f3d701480d067e76cae992d27362abfb10c4f"
+      "fingerprint": "sha256:99a7298b9be53ce6917aac2533d65f6851da93004d7266a06521e39af9f3f85d"
     },
     {
       "root": "policies",

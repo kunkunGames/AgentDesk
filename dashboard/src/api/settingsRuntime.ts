@@ -282,6 +282,7 @@ export async function sendKakaoFriendMessage(
   accountId: string,
   receiverUuids: string[],
   text: string,
+  imageUrl?: string,
 ): Promise<KakaoSendResult> {
   return request(
     "/api/kakao/messages/send",
@@ -292,6 +293,7 @@ export async function sendKakaoFriendMessage(
         account_id: accountId,
         receiver_uuids: receiverUuids,
         text,
+        image_url: imageUrl,
         confirmed: true,
       }),
       maxRetries: 0,
@@ -304,13 +306,14 @@ export async function sendKakaoMemoMessage(
   idempotencyKey: string,
   accountId: string,
   text: string,
+  imageUrl?: string,
 ): Promise<KakaoSendResult> {
   return request(
     "/api/kakao/messages/send-to-me",
     {
       method: "POST",
       headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ account_id: accountId, text, confirmed: true }),
+      body: JSON.stringify({ account_id: accountId, text, image_url: imageUrl, confirmed: true }),
       maxRetries: 0,
     },
     kakaoSendResultSchema,
