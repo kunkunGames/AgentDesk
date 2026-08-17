@@ -41,8 +41,8 @@ pub(super) fn canonical_category(category: &str) -> &'static str {
         "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats" | "v1"
         | "provider-cli" | "claude-accounts" => "ops",
         "discord" | "github" | "github-dashboard" | "kakao" | "meetings" => "integrations",
-        "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
-        | "skills" => "admin",
+        "departments" | "memory" | "offices" | "onboarding" | "policies" | "providers"
+        | "settings" | "skills" => "admin",
         _ => "ops",
     }
 }
@@ -94,7 +94,8 @@ pub(super) fn category_to_group(category: &str) -> &'static str {
         }
         // config — settings, onboarding, knowledge, source-of-truth, skills,
         // offices, departments, memory (#1066 /api/memory dual-mode)
-        "settings" | "onboarding" | "skills" | "offices" | "departments" | "memory" => "config",
+        "settings" | "onboarding" | "skills" | "offices" | "departments" | "memory"
+        | "providers" => "config",
         // observability — analytics, metrics, events, slo, diagnostics,
         // monitoring, stats, health, auth
         "analytics" | "cluster" | "monitoring" | "stats" | "health" | "auth" => "observability",
@@ -202,6 +203,9 @@ pub(super) fn category_description(category: &str) -> &'static str {
         "pipeline" => "Pipeline stages, config overrides, graphs, and card history.",
         "pm" => "PM decision workflow for force-only pipeline states.",
         "policies" => "Loaded policy inventory.",
+        "providers" => {
+            "Supported CLI provider catalog for dashboard and meeting selectors."
+        }
         "provider-cli" => {
             "Provider CLI safe migration: channel registry, upgrade orchestration, and operator promote/rollback."
         }
