@@ -3,13 +3,37 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
 
+python_probe_error() {
+  local invocation="$1"
+  local expected="$2"
+  local actual="$3"
+
+  printf "ERROR: '%s' failed the Python interpreter identity check for the %s invocation.\n" \
+    "$PYTHON" "$invocation" >&2
+  printf "Expected exact stdout marker '%s'; received %q.\n" "$expected" "$actual" >&2
+  echo "AgentDesk script checks require a real Python 3.11+ interpreter for stdin, file, and -m invocations." >&2
+  echo "Set PYTHON=/path/to/python3.11+ or put python3.11+ first on PATH." >&2
+}
+
+require_python_probe_marker() {
+  local invocation="$1"
+  local expected="$2"
+  local actual="$3"
+
+  if [ "$actual" != "$expected" ]; then
+    python_probe_error "$invocation" "$expected" "$actual"
+    return 1
+  fi
+}
+
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
   echo "ERROR: AgentDesk script checks require Python 3.11+, but '$PYTHON' was not found." >&2
   echo "Set PYTHON=/path/to/python3.11+ or put python3.11+ first on PATH." >&2
   exit 1
 fi
 
-if ! "$PYTHON" - <<'PY'
+stdin_probe_marker="agentdesk-python-probe:stdin"
+if ! stdin_probe_output="$("$PYTHON" - <<'PY'
 import platform
 import sys
 
@@ -24,10 +48,55 @@ if sys.version_info < (3, 11):
         file=sys.stderr,
     )
     raise SystemExit(1)
+print("agentdesk-python-probe:stdin")
 PY
-then
+)"; then
+  python_probe_error "stdin (-)" "$stdin_probe_marker" "<process exited non-zero>"
   exit 1
 fi
+require_python_probe_marker "stdin (-)" "$stdin_probe_marker" "$stdin_probe_output"
+
+# The aggregate uses both file and `-m` Python entry points. Verify each shape
+# emits a marker from executed Python code. This catches rc-only no-op stubs and
+# wrappers that do not preserve every invocation shape; the protected workflow
+# execution contract separately prevents injecting a more elaborate wrapper.
+python_probe_dir=""
+cleanup_python_probe() {
+  if [ -n "$python_probe_dir" ]; then
+    rm -rf -- "$python_probe_dir"
+    python_probe_dir=""
+  fi
+}
+trap cleanup_python_probe EXIT
+python_probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentdesk-python-probe.XXXXXX")"
+cat > "$python_probe_dir/agentdesk_python_probe.py" <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+if len(sys.argv) != 2 or sys.argv[1] not in {"file", "module"}:
+    raise SystemExit(1)
+print(f"agentdesk-python-probe:{sys.argv[1]}")
+PY
+
+file_probe_marker="agentdesk-python-probe:file"
+if ! file_probe_output="$("$PYTHON" "$python_probe_dir/agentdesk_python_probe.py" file)"; then
+  python_probe_error "file" "$file_probe_marker" "<process exited non-zero>"
+  exit 1
+fi
+require_python_probe_marker "file" "$file_probe_marker" "$file_probe_output"
+
+module_probe_marker="agentdesk-python-probe:module"
+if ! module_probe_output="$(
+  cd "$python_probe_dir"
+  "$PYTHON" -m agentdesk_python_probe module
+)"; then
+  python_probe_error "-m module" "$module_probe_marker" "<process exited non-zero>"
+  exit 1
+fi
+require_python_probe_marker "-m module" "$module_probe_marker" "$module_probe_output"
+cleanup_python_probe
+trap - EXIT
 
 if command -v shellcheck >/dev/null 2>&1; then
   echo "=== shellcheck scripts ==="
@@ -74,6 +143,39 @@ echo "=== Destructive call-site per-file ratchet (#5071 T3-A4) ==="
 "$PYTHON" scripts/check_destructive_call_site_ratchet.py --check
 "$PYTHON" -m unittest tests.test_destructive_call_site_ratchet
 
+echo "=== Reachability row-independence + change-surface gate (#5071 T4-B1) ==="
+# 4987 §-1.5 withdrew the claim that I14 ("obligation production is independent
+# of the inflight row") is compiler-enforced: InflightTurnState is
+# pub(in crate::services::discord), so the compiler accepts an import from
+# health/reachability/** without complaint. This is the source gate that
+# replaces it, and it is a LINT, NOT A TYPE PROOF -- real enforcement needs a
+# crate boundary, which is out of this series' scope. The second half enforces
+# the relay_reachability change surface of 4987 §9.4, so a tree with no owner
+# entry cannot grow a file nobody reviews as part of this surface. The unittest
+# below is the gate's own mutation proof: it reproduces each violation shape,
+# and each false-positive shape, against a synthetic repo root.
+"$PYTHON" scripts/check_reachability_row_independence.py
+"$PYTHON" -m unittest tests.test_reachability_row_independence
+
+echo "=== Reachability canonical Rust<->Python equivalence gate (#5071 T4-B2a) ==="
+# 4987 blocker B1': the obligation rule has two implementations, and two
+# definitions of "assistant text block" are two oracles of which one is always
+# wrong. Both are compared byte for byte against the golden corpus in
+# tests/fixtures/relay_obligation/ -- this half checks Python, and the Rust half
+# is the obligation lane's corpus test in `just test-non-pg`. The corpus being a
+# THIRD PARTY to both is what stops "we drifted together" from passing.
+#
+# The invocation below also runs the PYTHON half of the mutation runner in
+# process (each declared mutation edits one implementation and must turn its
+# side red) and lints the T4-B2a inactivity invariant: no consumer outside the
+# tree beyond its module declaration, no warn/fail bound inside it. The RUST
+# half of the mutation runner needs a compiler and runs under `--with-rust`
+# (see `just reachability-mutation-runner`); what CI holds instead is the lane,
+# plus the unittest below, which fails if a declared Rust mutation stops
+# anchoring on real source and would therefore be silently skipped.
+"$PYTHON" scripts/check_reachability_canonical_equivalence.py
+"$PYTHON" -m unittest tests.test_reachability_canonical_equivalence
+
 echo "=== Merge automation policy tests (#4250) ==="
 node --test policies/__tests__/merge-automation.test.js
 
@@ -114,6 +216,7 @@ echo "=== Intake-outbox done writer per-file call-site allowlist (#5071 T2) ==="
 # the script docstring declares the lexical forms and semantic facts it cannot see.
 "$PYTHON" scripts/check_intake_outbox_done_writer_call_sites.py
 "$PYTHON" -m unittest tests.test_intake_outbox_done_writer_call_sites
+"$PYTHON" -m unittest tests.test_rust_lex
 
 echo "=== Hotfile LOC ratchet guard (#3565) ==="
 "$PYTHON" scripts/check_hotfile_ratchet.py
@@ -257,15 +360,14 @@ echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invar
 # scripts/giant_file_registry.toml. The following git diff is the PR-time
 # drift gate: generation updates snapshots, then CI rejects changes to tracked
 # source-of-truth docs instead of comparing the generated workspace to itself.
-# The #5234 gate reads only scripts/giant_file_issue_metadata.json. Snapshot
-# staleness and closed issue pointers are individually reported but remain
-# non-blocking during AC3 disposition; operators refresh the snapshot with
-# `python3 scripts/refresh_giant_file_issue_metadata.py`.
-# AC3 is complete only when every reported entry has a decided replacement or
-# keep policy and this aggregate invocation sets
-# GIANT_FILE_REGISTRY_ENFORCE_CLOSED_ISSUES=1. That setting makes both snapshot
-# staleness and closed issue pointers fatal; until then the gate deliberately
-# does not claim that closed deadline pointers are absent.
+# The #5234 gate (#5234 slice A) enforces both snapshot staleness and closed
+# issue pointers as fatal errors (#5327 schema accepts closed state, slice A
+# adds 30-day staleness gate + 80-entry transition ratchet). Operators must
+# refresh the snapshot at least every 30 days with:
+# `python3 scripts/refresh_giant_file_issue_metadata.py && git add ... && git commit ...`
+# Entries in the transition list (#5234 slice A) warn but pass; new dead
+# pointers fail immediately (ratchet: list size can only shrink as slice B
+# processes entries).
 "$PYTHON" scripts/generate_inventory_docs.py
 git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
 

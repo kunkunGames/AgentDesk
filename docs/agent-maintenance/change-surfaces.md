@@ -1585,7 +1585,7 @@ time for diagnostics; neither is a stored approval value.
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (frozen giant surface; +4 from #4615 S1 routing the stall-watchdog capture-liveness decision through the process-local `ProducerLivenessVerdict` authority (`liveness_authority::observe_and_publish_from_tick` / `observe_capture_coordinate`) in place of the removed `stall_liveness::stall_watchdog_capture_offset_advancing` wrapper; +37 from #4535 restricting the provider-known hard-stop finish — both the primary path and the global-handle fallback — to only the mailbox-owning sibling runtime (with a WARN when an observed-but-unresolved actor is declined) (ownership resolved via `local_mailbox_ownership`) so a non-owning/unresolved-ownership hard-stop no longer finishes another runtime's mailbox; +1 from #4465 mapping an exact-episode rebind CAS miss to HTTP 409; #4460 follow-up extracted non-destructive branch-4 paging into `health/recovery/stall_alert.rs` (174 prod lines): alerts use canonical `channel:<id>` plus the real provider session identity so Claude/Codex DMs select their provider bot while public channels keep `notify`, owner 0 and the TUI synthetic owner 1 never render mentions, and the production liveness decision suppresses pre-backstop producer-live pages while genuine stalls still page; the parent branch never cleans/cancels/deletes turn authority. The original #4460 change removed the branch-4 "desynced force-clean" execution and dropped `preserve_resume_selector_on_force_clean` plus the test-only force-clean hook seam; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
+  - `src/services/discord/health/recovery.rs` (frozen giant surface; +4 from #5396 item 5 splitting the relay-dead reattach lane's tick verdict in `run_stall_watchdog_pass` into `handled_tick` (skip the remaining branches) and `counts_as_cleaned` (add to the logged `cleaned` total), so a `reuse_existing_live_watcher` no-op keeps the short-circuit without inflating the counter; the verdict type lives in `health/relay_dead_reattach.rs`; +4 from #4615 S1 routing the stall-watchdog capture-liveness decision through the process-local `ProducerLivenessVerdict` authority (`liveness_authority::observe_and_publish_from_tick` / `observe_capture_coordinate`) in place of the removed `stall_liveness::stall_watchdog_capture_offset_advancing` wrapper; +37 from #4535 restricting the provider-known hard-stop finish — both the primary path and the global-handle fallback — to only the mailbox-owning sibling runtime (with a WARN when an observed-but-unresolved actor is declined) (ownership resolved via `local_mailbox_ownership`) so a non-owning/unresolved-ownership hard-stop no longer finishes another runtime's mailbox; +1 from #4465 mapping an exact-episode rebind CAS miss to HTTP 409; #4460 follow-up extracted non-destructive branch-4 paging into `health/recovery/stall_alert.rs` (174 prod lines): alerts use canonical `channel:<id>` plus the real provider session identity so Claude/Codex DMs select their provider bot while public channels keep `notify`, owner 0 and the TUI synthetic owner 1 never render mentions, and the production liveness decision suppresses pre-backstop producer-live pages while genuine stalls still page; the parent branch never cleans/cancels/deletes turn authority. The original #4460 change removed the branch-4 "desynced force-clean" execution and dropped `preserve_resume_selector_on_force_clean` plus the test-only force-clean hook seam; #4423 moved the rebind request parser into `health/rebind_request.rs`; +26 from #4198 snapshotting the owned role override before the yielding D-section cleanup and replacing the unconditional `role_overrides.remove` with the shared `remove_owned_role_override` guarded remove at both recovery bundles; +7 from #4178 computing `capture_advancing` via `stall_liveness::stall_watchdog_capture_offset_advancing` in `run_stall_watchdog_pass` and threading it into `stall_watchdog_should_force_clean` so a live-but-relay-stalled turn is not force-cleaned; +28 from #4111 r9 capturing the force-clean repair boundary before the watcher snapshot and threading it into the start-bounded stale-mailbox release, plus the test-only force-clean post-cleanup hook seam; +7 from #4111 r7 capturing repair_started_at and passing it to the start-bounded guarded finish so a same-message-id fresh mailbox claim in the clear->finish gap is never finished; +38 from #4111 r6 guarding the post-clear mailbox finish with `mailbox_finish_turn_if_matches` pinned to the cleared turn's user_msg_id (a fresh turn claiming the freed mailbox between clear and finish keeps its token; runtime/session cleanup now runs only when the guarded finish removed the cleared turn's token); +60 from #4111 r4 reworking `clear_idle_tmux_stale_turn` to clear-before-teardown — load ONE candidate row, capture the pin from it, re-check `idle_tmux_repair_has_unrelayed_tail_answer` on that same row (closes the manual stale-mailbox route's TOCTOU), run the generation-pinned guarded clear FIRST, and only on Cleared proceed to mailbox/runtime teardown; non-Cleared outcomes return None with WARNs, preserving mailbox/session/inflight; +4 from #4111 routing the leak-recover offset re-save through the identity-guarded locked field-patch helper (no unlocked whole-row save); +23 from #4048
     round 4 requiring strict provider-less stale-mailbox repair to verify a
     peeked local mailbox has an active token or queue before treating it as
     ownership evidence; +45 from #4048 round 3 scoping provider-less
@@ -1908,6 +1908,119 @@ time for diagnostics; neither is a stored approval value.
 - tests: `src/high_risk_recovery.rs` cancel/recovery suites.
 - related_issues: #964, #1112, #1138, #1222, #1223, #1283.
 
+### `execution_identity_fence`
+
+- canonical_modules: `src/services/discord/execution_identity.rs` (the
+  `.spawn_nonce` read model, mounted at
+  `services::discord::tmux::execution_identity` by a `#[path]` declaration in
+  `tmux.rs`, so it inherits that file's unix gate) and the
+  `WatcherIdentityFence` / `IdentityFencedRegistry` pair in
+  `tmux_watcher_registry.rs`, which is NOT unix-gated and carries its own
+  `#[cfg(not(unix))]` shim pair. Switch: `config::ExecutionIdentityMode` +
+  `RuntimeSettingsConfig.execution_identity_mode`, read live per decision by
+  `tmux_watcher_registry::execution_identity_mode`.
+- converted call sites: exactly two, both keeping their unfenced helper NAMES so
+  the #5071 T3-A4 destructive-call-site ratchet keeps counting them —
+  `relay_recovery/apply.rs` (`DEAD_FRONTIER_CANCEL_IDENTITY_SITE`) and
+  `tui_direct_pending_start.rs` (`STALE_FOREIGN_CANCEL_IDENTITY_SITE`). The other
+  14 production entries in the `registry_remove` category of
+  `scripts/destructive_call_site_baseline.json` stay unfenced in every mode.
+- invariants, non_guarantees, rollout procedure and tests: NOT restated here.
+  The runbooks are the source of truth and are anchored to the same symbols —
+  [promotion criteria](../runbooks/execution-identity-promotion-criteria.md)
+  (Legacy → Observe → Enforce formula, what Observe records),
+  [Enforce rollout](../runbooks/execution-identity-enforce-rollout.md)
+  (fail-closed contract, marker-absent pre-flight, revert, coverage limits),
+  [Manual recovery under Enforce](../runbooks/execution-identity-manual-recovery-under-enforce.md)
+  (why `RelayRecoveryApplySource::Manual` is fenced while process reset is not),
+  and the counter-exposure decision proposal
+  [5399-observe-exposure-options](../design/5399-observe-exposure-options.md).
+- related_issues: #5071 (T3-A0 #5394, T3-A1 #5398), #5396, #5399, #5411.
+
+### `relay_reachability`
+
+- canonical_modules: `src/services/discord/health/reachability.rs` (module root)
+  and everything under `src/services/discord/health/reachability/**`. The
+  receipt-index read path `src/services/discord/outbound/receipt_index.rs`
+  belongs to this surface too and is **not yet on disk** — #5071 T4-B3 lands it.
+  The tree is unix-gated: its transcript coordinate is the `(dev, ino)` file
+  identity of 4987 §-1.3, and `std::fs::Metadata` exposes no stable Windows
+  equivalent.
+- status: **inactive library.** #5071 T4-B1 landed the verdict vocabulary, the
+  row-independent transcript resolution ladder, and the bounded incremental tail
+  reader; #5071 T4-B2a added the canonical obligation framing and the machine
+  that proves the Rust and Python definitions of it agree. There is still no
+  consumer at all — no tick, no task, no health field, no recovery input.
+  Production verdicts are unchanged, and this surface does not count as
+  "4987 S1 active": T4-B2b lands the durable obligation ledger, T4-B2c wires the
+  observation task, and observation starts there.
+- invariants: obligation production is independent of the inflight row
+  (4987 §-1.5 I14), and no verdict authorizes a destructive action or a
+  redelivery (4987 §7.1 I15, S7 stays NO-GO). `TransportUnknown` is neither
+  health nor a redelivery warrant: it contributes to degraded and its alarm text
+  must carry the explicit "do not redeliver by hand" notice, because the
+  success→commit crash window looks like a loss and is not one (4987 §-1.3b).
+  `ReachabilityVerdict != Reachable` denies GREEN whatever the structural
+  signals say (4987 §4.1); the converse does not hold.
+- companion edits: changing the obligation rule REQUIRES changing
+  `scripts/relay_watchdog.py` (`assistant_blocks_from_lines` /
+  `is_harness_control_assistant_record`) and the golden fixture corpus in the
+  same PR. 4987 §2.4: two implementations of "assistant text block" are two
+  oracles, and one of them is then always wrong. Since #5071 T4-B2a that is
+  enforced rather than requested: both halves are compared byte for byte against
+  the golden corpus in `tests/fixtures/relay_obligation/` — Python by
+  `scripts/check_reachability_canonical_equivalence.py`, Rust by
+  `services::discord::health::reachability::obligation::tests` — over the
+  canonical `(generation, start, end, identity, reason)` schema plus its
+  `next_offset` trailer. The trailer is inside the compared bytes because every
+  framing rule is a cursor rule; measured on this corpus, omitting it lets the
+  "a partial line advances the cursor" mutation survive every case. The corpus
+  is a THIRD PARTY to both, so a change applied identically to the two
+  implementations still turns it red. Editing either framing rule means running
+  `just reachability-mutation-runner`, which applies each declared one-sided
+  mutation and requires it to die.
+- non_guarantees: `scripts/check_reachability_row_independence.py` (run by
+  `scripts/ci-script-checks.sh`) enforces I14 as a source **lint, not a type
+  proof** — `InflightTurnState` is `pub(in crate::services::discord)`, so the
+  compiler accepts an import this gate rejects. The scan is lexical over
+  neutralized Rust: it does not follow `#[path]`, does not resolve macros, and
+  cannot see an inflight module laundered through a third file's `as` alias.
+  Its ghost-path check is lexical too: `not yet on disk` exempts only the
+  concrete source path immediately before the marker in the same bullet,
+  before another concrete path appears.
+  Real enforcement needs a crate boundary and is out of this series' scope.
+  I15 is likewise a convention plus a lint: 4987 §-1.5 records the decision not
+  to move the destructive `RelayRecoveryActionKind` variants behind a private
+  constructor.
+- do_not_edit_without_migration_plan: n/a (new surface, no giant file; the tick
+  must not be added to `health/recovery.rs`, which is registry-tracked — 4987
+  §9.4 puts the future reachability tick in `runtime_bootstrap/spawns.rs` as an
+  independent task).
+- active_callsite_coverage: n/a (no consumer exists yet, by design). Since
+  #5071 T4-B2a that "by design" is machine-checked: exactly one file outside the
+  tree may name the module — `src/services/discord/health.rs`, and only in the
+  `mod` declaration. Naming it anywhere else there would re-export it under an
+  alias the consumer scan cannot recognise, which is also why the scan reads the
+  bare module name inside `use` items rather than only qualified
+  `reachability::` paths: `use super::reachability as rx;` is a consumer.
+  `scripts/check_reachability_canonical_equivalence.py` also rejects a
+  `warn_bound`/`fail_bound` appearing inside the tree, because 4987 §10 makes a
+  hardcoded threshold at S1 a NO-GO: the bounds are the OUTPUT of the 30-day
+  observation. Both are source lints, not type proofs — the alias shapes they
+  catch are the lexically visible ones, and a path a macro assembles from string
+  fragments or a `#[path]` redirection still passes. The destructive half is not
+  duplicated there: a destructive call site added to this tree moves
+  `scripts/check_destructive_call_site_ratchet.py`, whose four categories are
+  exactly 4987's destructive surfaces. The observation task's spawn joins the
+  allowlist in T4-B2c, and widening it means widening the declaration-only rule
+  in the same change.
+- tests: `services::discord::health::reachability::{verdict,discovery,tail,obligation}::tests`
+  in the `test-non-pg` lane; `tests/test_reachability_row_independence.py` and
+  `tests/test_reachability_canonical_equivalence.py` for the gates themselves;
+  `just reachability-mutation-runner` for the Rust half of the mutation runner,
+  which needs a compiler and is therefore out of the fast lane.
+- related_issues: #5071, #4987, #4986, #4974.
+
 ### `dashboard_routes`
 
 - canonical_modules: `src/server/routes/*.rs` (per-domain route module), including
@@ -2030,7 +2143,7 @@ time for diagnostics; neither is a stored approval value.
   `src/server/worker_recovery.rs` (worker-local restart budget/backoff execution).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (frozen giant surface; +25 net from #4553 global Claude gateway-proxy fields, defaults, resolver, parse coverage, and corrected retained cache-TTL docs; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease; +7 from #4305 channel recent-context injection config (limit + enable, live-reload)).
+  - `src/config.rs` (frozen giant surface; +25 net from #4553 global Claude gateway-proxy fields, defaults, resolver, parse coverage, and corrected retained cache-TTL docs; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease; +7 from #4305 channel recent-context injection config (limit + enable, live-reload); +114 from #5394 (#5071 T3-A0) `ExecutionIdentityMode` enum + `RuntimeSettingsConfig.execution_identity_mode` field, the two mode predicates, and their parse/round-trip coverage — measured on the landed commit `3df6de3ed`; a further +28 net from #5398 (T3-A1) re-documenting those variants for the converted CAS sites, measured at `5b7eb3524`; #5399 items 5/7 add the `consults_spawn_nonce` predicate that lets `Legacy` skip the marker read it used to discard, correct the `Legacy` variant docs to match, and fix two `services::discord::tmux_watcher` prose paths that drop the `#[path]` parent segment — the same defect class #5396 item 6 fixed for `execution_identity`).
   - `src/server/mod.rs` (frozen giant surface; +42 from #4615 S3b worker delivery fence — the lease-guarded `fence_claimed_delivery` call site in `drain_message_outbox_batch_once` (re-validates circuit authority between claim and the Discord send; fence logic lives in `services::message_outbox_circuit_authority`); -22 from #4449 extracting actionable-alert announce→notify delivery into `src/server/outbox_actionable_delivery.rs`; -21 from #4465 moving stale outbox/expired-held GC ownership into `services::message_outbox`; #1122 extends that shared GC owner to preserve scheduled-message permanent dedupe sentinels; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
   - `src/receipt.rs` (frozen giant surface).
   - `src/github/sync.rs` (frozen giant surface).
