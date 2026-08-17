@@ -145,7 +145,7 @@ class Job:
 
     @property
     def key(self) -> str:
-        return f"{self.workflow}:{self.name}"
+        return f"{Path(self.workflow).as_posix()}:{self.name}"
 
     @property
     def code(self) -> str:
@@ -442,9 +442,12 @@ def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = 
                 targets.add(target)
             elif findings is not None:
                 line = source.count("\n", 0, match.start()) + 1
-                tried = ", ".join(os.path.relpath(candidate, repo_root) for candidate in candidates)
+                tried = ", ".join(
+                    Path(os.path.relpath(candidate, repo_root)).as_posix()
+                    for candidate in candidates
+                )
                 detail = f"mod {match.group('name')}; did not resolve inside src; tried: {tried}"
-                findings.append(Finding("unresolved-external-test-module", f"{path.relative_to(repo_root)}:{line}", detail))
+                findings.append(Finding("unresolved-external-test-module", f"{path.relative_to(repo_root).as_posix()}:{line}", detail))
     return targets
 
 
@@ -657,7 +660,7 @@ def discover_pg_inventory(
             # Reaching an external file through a cfg(test) declaration already
             # proves that its direct tests are part of the library test target.
             if name in declared_tests or external:
-                records.append((name, str(path.relative_to(repo_root)), logical[:-1], body))
+                records.append((name, path.relative_to(repo_root).as_posix(), logical[:-1], body))
 
     by_path: dict[tuple[tuple[str, ...], str], set[tuple[tuple[str, ...], str, str]]] = {}
     for key in item_bodies:
@@ -831,7 +834,7 @@ def parse_jobs(
             match for match in in_section
             if _indent_width(match.group("indent")) == job_indent
         ]
-    rel = str(path.relative_to(repo_root))
+    rel = path.relative_to(repo_root).as_posix()
     if not candidates and findings is not None:
         findings.append(
             Finding(

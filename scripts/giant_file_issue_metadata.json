@@ -46,8 +46,7 @@
         "src/services/settings.rs",
         "src/services/turn_orchestrator.rs",
         "src/server/worker_registry.rs",
-        "src/server/maintenance.rs",
-        "src/services/kakao.rs"
+        "src/server/maintenance.rs"
       ]
     },
     {
@@ -122,6 +121,17 @@
         "src/services/tmux_common.rs",
         "src/services/discord/recovery_engine/manual_rebind/mod.rs",
         "src/services/discord/catch_up.rs"
+      ]
+    },
+    {
+      "number": 1622,
+      "state": "open",
+      "title": "decompose: src/services/kakao.rs giant (fork-only Kakao connector)",
+      "owners": [
+        "server-runtime"
+      ],
+      "files": [
+        "src/services/kakao.rs"
       ]
     }
   ]

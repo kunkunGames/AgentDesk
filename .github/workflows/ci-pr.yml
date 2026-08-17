@@ -163,6 +163,8 @@ jobs:
               - 'src/services/dispatches/**'
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
+              - 'src/services/external_share_outbox.rs'
+              - 'src/services/external_share_outbox/**'
               - 'src/services/discord/outbound/source_registry.rs'
               - 'src/services/queue.rs'
               - 'src/services/session_forwarding.rs'
