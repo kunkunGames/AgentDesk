@@ -556,17 +556,18 @@ async fn rollback_cancelled_run_cards_pg(
             continue;
         }
 
-        let has_active_dispatch = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::BIGINT
-             FROM task_dispatches
-             WHERE kanban_card_id = $1 AND status IN ('pending', 'dispatched')",
+        let has_active_dispatch = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM task_dispatches
+                 WHERE kanban_card_id = $1 AND status IN ('pending', 'dispatched')
+             )",
         )
         .bind(card_id)
         .fetch_one(pool)
         .await
         .ok()
-        .unwrap_or(0)
-            > 0;
+        .unwrap_or(false);
         if has_active_dispatch {
             continue;
         }
