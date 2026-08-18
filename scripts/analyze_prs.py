@@ -347,6 +347,7 @@ def main():
                     "domainkeeper": "DomainKeeper:",
                     "api-routemaster": "ApiRoutemaster:",
                     "parity-lite": "Parity-Lite:",
+                    "supply-lite": "Supply-Lite:",
                 }
                 if agent_slug in overrides:
                     expected_prefix = overrides[agent_slug]
