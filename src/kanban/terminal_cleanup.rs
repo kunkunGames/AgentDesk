@@ -389,11 +389,26 @@ mod scrub_worktree_keys_from_json_tests {
 
     #[test]
     fn returns_none_for_non_object_json() {
-        assert_eq!(scrub_worktree_keys_from_json(Some(r#"["key"]"#), &["key"]), None);
-        assert_eq!(scrub_worktree_keys_from_json(Some(r#""string""#), &["key"]), None);
-        assert_eq!(scrub_worktree_keys_from_json(Some(r#"true"#), &["key"]), None);
-        assert_eq!(scrub_worktree_keys_from_json(Some(r#"123"#), &["key"]), None);
-        assert_eq!(scrub_worktree_keys_from_json(Some(r#"null"#), &["key"]), None);
+        assert_eq!(
+            scrub_worktree_keys_from_json(Some(r#"["key"]"#), &["key"]),
+            None
+        );
+        assert_eq!(
+            scrub_worktree_keys_from_json(Some(r#""string""#), &["key"]),
+            None
+        );
+        assert_eq!(
+            scrub_worktree_keys_from_json(Some(r#"true"#), &["key"]),
+            None
+        );
+        assert_eq!(
+            scrub_worktree_keys_from_json(Some(r#"123"#), &["key"]),
+            None
+        );
+        assert_eq!(
+            scrub_worktree_keys_from_json(Some(r#"null"#), &["key"]),
+            None
+        );
     }
 
     #[test]
@@ -407,7 +422,8 @@ mod scrub_worktree_keys_from_json_tests {
         let raw = r#"{"keep": 1, "remove1": 2, "remove2": 3}"#;
         let result = scrub_worktree_keys_from_json(Some(raw), &["remove1", "remove2", "missing"]);
 
-        let parsed: serde_json::Value = serde_json::from_str(&result.expect("should return modified json")).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result.expect("should return modified json")).unwrap();
         assert_eq!(parsed, json!({"keep": 1}));
     }
 
