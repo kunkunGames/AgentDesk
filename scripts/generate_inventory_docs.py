@@ -2011,6 +2011,30 @@ def write_documents(documents: dict[Path, str], check: bool) -> int:
 
     if wrote_files:
         print("\nNOTE: Generated inventory changed. Check for existing open PRs to avoid duplicate inventory refreshes.")
+        if shutil.which("gh"):
+            try:
+                out = subprocess.check_output(
+                    [
+                        "gh",
+                        "pr",
+                        "list",
+                        "--state",
+                        "open",
+                        "--limit",
+                        "100",
+                        "--json",
+                        "number,title",
+                    ],
+                    text=True,
+                )
+                prs = json.loads(out)
+                inventory_prs = [pr for pr in prs if "inventory" in pr.get("title", "").lower()]
+                if inventory_prs:
+                    print("\nWARNING: Found open PRs related to inventory refreshes. Please review them before opening a new PR:")
+                    for pr in inventory_prs:
+                        print(f"  #{pr['number']} {pr['title']}")
+            except subprocess.SubprocessError:
+                pass
 
     return 0
 
