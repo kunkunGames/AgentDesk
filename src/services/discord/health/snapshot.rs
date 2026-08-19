@@ -4,8 +4,19 @@ use serde::Serialize;
 use super::liveness_authority::CaptureCoordinateObservation;
 use super::mailbox::MailboxHealthSnapshot;
 use super::provider_probe::{self, ProviderHealthSnapshot};
+// #5071 T4-B6: `health::reachability` is `#[cfg(unix)]` (see the `mod` decl in
+// `health.rs`), so the composition wiring built on it — this import,
+// `composite_governs_polarity`, `observe_relay_verdict`, the
+// `RelayVerdictReport` published on the mailbox entry, and
+// `apply_relay_verdict_polarity` — carries the same gate. Windows keeps the
+// pre-B6 snapshot: no composed verdict, no polarity from one.
+#[cfg(unix)]
+use super::reachability::composite::{
+    RelayVerdict, RelayVerdictProbe, RelayVerdictReport, observe_relay_verdict,
+    relay_verdict_source,
+};
 use super::redaction;
-use super::session_enrichment::SessionEnrichment;
+use super::session_enrichment::{self, SessionEnrichment};
 use super::stall_verdict;
 use super::transcript_binding_stall::{self, resolve_bound_selector};
 use super::unpaired_active_token;
@@ -14,7 +25,8 @@ use super::{BotTokenReloadScopes, HealthRegistry, bot_token_reload_scopes};
 use crate::services::discord;
 use crate::services::discord::SharedData;
 use crate::services::discord::relay_health::{
-    RelayActiveTurn, RelayHealthSnapshot, RelayStallClassifier, RelayStallState,
+    FrontierProvenanceReport, RelayActiveTurn, RelayHealthSnapshot, RelayStallClassifier,
+    RelayStallState,
 };
 use crate::services::provider::ProviderKind;
 
@@ -193,6 +205,27 @@ pub(super) struct RelayThreadProofSnapshot {
     pub(super) parent_channel_id: Option<u64>,
     pub(super) thread_channel_id: Option<u64>,
     pub(super) stale_thread_proof: bool,
+}
+
+impl RelayThreadProofSnapshot {
+    /// #5071 relay-tail S1 (I-4): the OTHER end of this channel's parent/thread
+    /// axis, if it has one.
+    ///
+    /// Either field can hold it — `dispatch.thread_parents` is keyed parent →
+    /// thread, so a PARENT resolves its thread through the lookup and a THREAD
+    /// resolves its parent through the reverse scan over the values. For a
+    /// channel that is one end of one axis exactly one field is populated —
+    /// the scope this reader was written for. r2 review (legB P2): nothing
+    /// here proves a channel cannot be a key AND a value, so when both are
+    /// populated the array order below decides it, taking the THREAD side.
+    /// The polled channel itself is filtered out so a self-edge can never
+    /// read as an axis.
+    fn counterpart_channel_id(&self, polled_channel_id: u64) -> Option<u64> {
+        [self.thread_channel_id, self.parent_channel_id]
+            .into_iter()
+            .flatten()
+            .find(|counterpart| *counterpart != polled_channel_id)
+    }
 }
 
 /// #3631: a rebind-origin inflight row (POST /api/inflight/rebind) is a
@@ -573,6 +606,26 @@ async fn watcher_state_snapshot_for_shared(
         tmux_session_alive,
         session.inflight_state_present,
     );
+    // #5071 T4-B4 (4987 S4): compare the row's transcript coordinate against
+    // the registry's independently resolved one by FILE IDENTITY. This does
+    // NOT replace T4-B0's path-string record in `SessionEnrichment`: that one
+    // is untouched and has already fired for this poll inside
+    // `SessionEnrichment::load`, through its
+    // `record_transcript_source_divergence`, so on a split the two records
+    // coexist until a follow-up slice retires B0's. Descriptive record only —
+    // the outcome feeds no verdict, no classifier, and no recovery here;
+    // T4-B6 owns composition. Unix-gated
+    // with the reachability tree because identity is the `(dev, ino)` pair.
+    #[cfg(unix)]
+    super::reachability::divergence::observe_row_coordinate_divergence(
+        provider_name,
+        channel.get(),
+        session
+            .inflight
+            .as_ref()
+            .and_then(|state| state.output_path.as_deref()),
+        session.watcher_output_path.as_deref(),
+    );
     Some(WatcherStateSnapshot {
         provider: provider_name.to_string(),
         attached: session.attached,
@@ -667,6 +720,11 @@ async fn build_health_snapshot_with_options(
     let mut recovery_duration = 0.0f64;
     let mut mailbox_entries = Vec::new();
     let mut provider_active_turns = 0usize;
+    // #5071 T4-B6: read the 4987 §5.1 switch once per snapshot, so every entry
+    // in one response answers under the same authority even if the live config
+    // is edited mid-poll.
+    #[cfg(unix)]
+    let composite_governs_polarity = relay_verdict_source().governs_health_polarity();
 
     if providers.is_empty() {
         degraded_reasons.push("no_providers_registered".to_string());
@@ -703,6 +761,25 @@ async fn build_health_snapshot_with_options(
                         || session.watcher_attached,
                 )
                 .await;
+                // #5071 relay-tail S1 (I-4): the counterpart's coordinate is
+                // read here, where the axis is already resolved, and published
+                // beside this channel's own pair as raw evidence. It feeds NO
+                // hypothesis — H3 is deferred past S1 (design §1.4, §9's S1
+                // row) and the r1 review measured the cost of letting it decide
+                // early. One more lock-free `.get()` on the same in-memory map;
+                // `None` when this channel is not part of a parent/thread pair.
+                let counterpart_coord_observation = relay_thread_proof
+                    .counterpart_channel_id(channel.get())
+                    .map(|counterpart| {
+                        session_enrichment::observe_coord_frontier(
+                            &entry.shared,
+                            ChannelId::new(counterpart),
+                        )
+                    });
+                let frontier_provenance = FrontierProvenanceReport::of(
+                    session.frontier_provenance,
+                    counterpart_coord_observation,
+                );
                 let active_turn = relay_active_turn_from_inflight(
                     mailbox_has_cancel_token,
                     session.inflight.as_ref(),
@@ -754,6 +831,94 @@ async fn build_health_snapshot_with_options(
                     &relay_health,
                     registry.started_at_unix(),
                 );
+                // #5071 T4-B6 (4987 §4.3/§4.4): compose the relay verdict from
+                // the durable T4-B2c ledger, the T4-B3 receipt projection and
+                // the T4-B5 sidecar, and publish it. Whether it may also change
+                // this entry's polarity is the `RelayVerdictSource` switch,
+                // read once per poll below. The row's `output_path` is passed
+                // to the divergence comparison only, matching the descriptive
+                // call above it; nothing here resolves or tails through it.
+                #[cfg(unix)]
+                let relay_verdict = observe_relay_verdict(RelayVerdictProbe {
+                    provider: provider_kind.as_ref(),
+                    channel_id: channel.get(),
+                    row_output_path: session
+                        .inflight
+                        .as_ref()
+                        .and_then(|state| state.output_path.as_deref()),
+                    registry_output_path: session.watcher_output_path.as_deref(),
+                    // 4987 §-1.4's second alive witness: the pane is up, the
+                    // mailbox holds no turn, and the tail has nothing waiting,
+                    // so a transcript that is not growing is idle rather than
+                    // gone.
+                    //
+                    // The third term is three-valued, and #5071 relay-tail S2
+                    // splits its `None` where T4-B6 folded it. `unread_bytes` is
+                    // derived in `SessionEnrichment::load` from the capture
+                    // coordinate of the IN-FLIGHT ROW's `output_path`, so a
+                    // channel with no in-flight row has no coordinate and the
+                    // field is `None` with nothing that could be waiting. That
+                    // half of the old `unwrap_or(0)` fold is the population this
+                    // witness exists for and it is kept: requiring `Some(0)`
+                    // there would deny the witness to every rowless idle
+                    // channel, and one with no held obligation and a transcript
+                    // that is not growing would then classify
+                    // `Unknown{TranscriptUnresolved}`
+                    // (`composite_tests::nothing_observed_is_not_green` pins
+                    // that verdict) — a degraded reason for each such channel
+                    // once `RelayVerdictSource` is `Composite`.
+                    //
+                    // The other half was a `None` beside a row present, where the
+                    // tail is UNKNOWN — the row's `output_path` is absent, its
+                    // stat failed, or the frontier is not attributable to the
+                    // row. That one did let an unknown tail help assert liveness,
+                    // running opposite to
+                    // `RelayHealthSnapshot::relay_frontier_never_advanced_with_unread_tail`,
+                    // whose tail term reads the same field (`is_some_and(|b| b > 0)`
+                    // in one disjunct, an unmeasured-`None` gate in the other) and
+                    // never lets an unmeasured tail carry a FAILURE on its own.
+                    // (#5071 relay-tail S3 gave that predicate a second disjunct
+                    // that fires while `unread_bytes` is `None`, but on an
+                    // independent watcher witness — the `None` permits it and
+                    // testifies to nothing, the same as here.)
+                    // `idle_witness_tail_is_not_waiting` now requires `Some(0)`
+                    // for that case, which is not the rowless population above —
+                    // a row present with `active_turn == None` is its own live
+                    // shape (#3631 rebind-origin, ownerless TUI-direct rows).
+                    // `call_site_withholds_the_pane_idle_witness_for_an_unmeasured_tail`
+                    // builds that shape, runs it through `build_health_snapshot`,
+                    // and reads the verdict this term decides off the published
+                    // `reachability` of the mailbox entry — so folding EITHER this
+                    // line or the predicate back to `unwrap_or(0) == 0` fails it.
+                    pane_idle_confirmed: tmux_present
+                        && matches!(relay_health.active_turn, RelayActiveTurn::None)
+                        && relay_health.idle_witness_tail_is_not_waiting(),
+                    // The RECONFIRMED unpaired token, not the raw one: a second
+                    // mailbox snapshot and inflight read still saw the same
+                    // active episode without a durable row, so an ordinary
+                    // start-of-turn race between the token and the row write
+                    // does not spend a tick as `Unknown{RowlessActiveTurn}`.
+                    rowless_active_turn: unpaired_active_token_reconfirmed,
+                    placeholder_present: relay_health.pending_discord_callback_msg_id.is_some(),
+                    now_epoch_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    process_started_at_epoch_ms: registry
+                        .started_at_unix()
+                        .max(0)
+                        .saturating_mul(1_000)
+                        as u64,
+                });
+                #[cfg(unix)]
+                apply_relay_verdict_polarity(
+                    composite_governs_polarity,
+                    &relay_verdict,
+                    &entry.name,
+                    channel.get(),
+                    &mut degraded_reasons,
+                    &mut status,
+                );
+                #[cfg(unix)]
+                let reachability =
+                    RelayVerdictReport::of(&relay_verdict, composite_governs_polarity);
                 mailbox_entries.push(MailboxHealthSnapshot {
                     provider: entry.name.clone(),
                     channel_id: channel.get(),
@@ -772,6 +937,9 @@ async fn build_health_snapshot_with_options(
                     process_present,
                     active_dispatch_present: session.active_dispatch_present(),
                     stall_shadow_verdict,
+                    #[cfg(unix)]
+                    reachability,
+                    frontier_provenance,
                     relay_stall_state,
                     relay_health,
                 });
@@ -835,6 +1003,43 @@ async fn build_health_snapshot_with_options(
         degraded_reasons,
         providers: provider_entries,
         mailboxes: mailbox_entries,
+    }
+}
+
+/// The only place 4987 §5.1's switch changes a snapshot's polarity (#5071 T4-B6).
+///
+/// The switch is also visible in the response as
+/// `RelayVerdictReport::governs_health_polarity`, published on the mailbox entry
+/// in both modes; what it does NOT do anywhere else is change the aggregate the
+/// caller reads as the process's health. Under `Structural` this returns having
+/// touched neither output — that is what makes the shadow mode a shadow.
+///
+/// One reason per non-green CHANNEL, not per provider: the channel is what an
+/// operator has to look at, and the same response already carries one mailbox
+/// entry per channel. `Degraded`, never `Unhealthy`: 4987 §4.4 asks a
+/// non-`Reachable` relay to set the degraded flag, and taking the process out of
+/// HTTP readiness is authority this switch was not given.
+///
+/// Split out of the per-channel loop so the switch has a seam a test can call.
+/// The polarity is the whole of what T4-B6 granted the composed verdict, and
+/// before this it was reachable only by building a full `HealthRegistry`, which
+/// left both the `composite_governs_polarity` conjunct and the direction of the
+/// `permits_health` test unpinned.
+#[cfg(unix)]
+fn apply_relay_verdict_polarity(
+    composite_governs_polarity: bool,
+    relay_verdict: &RelayVerdict,
+    provider: &str,
+    channel_id: u64,
+    degraded_reasons: &mut Vec<String>,
+    status: &mut HealthStatus,
+) {
+    if composite_governs_polarity && !relay_verdict.permits_health() {
+        degraded_reasons.push(format!(
+            "relay_verdict_{}_{provider}_{channel_id}",
+            relay_verdict.label(),
+        ));
+        *status = status.worsen(HealthStatus::Degraded);
     }
 }
 
@@ -950,7 +1155,20 @@ mod tests {
         HealthRegistry, authoritative_tmux_session, build_health_snapshot,
         rebind_origin_inflight_is_idle, relay_active_turn_from_inflight, resolve_bound_selector,
     };
+    // #5071 T4-B6: the polarity tests below name the `#[cfg(unix)]` reachability
+    // tree, so they are gated with the seam they exercise. `HealthStatus` rides
+    // the same gate because those tests are its only readers here.
+    #[cfg(unix)]
+    use super::{HealthStatus, RelayVerdict, apply_relay_verdict_polarity};
     use crate::services::agent_protocol::RuntimeHandoffKind;
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::composite::compose_relay_verdict;
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::external_verdict::ExternalRelayVerdict;
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::verdict::{
+        ReachabilityUnknownReason, ReachabilityVerdict,
+    };
     use crate::services::discord::inflight::InflightTurnState;
     use crate::services::discord::relay_health::RelayActiveTurn;
     use crate::services::provider::{CancelToken, ProviderKind};
@@ -966,6 +1184,126 @@ mod tests {
         fn drop(&mut self) {
             unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
         }
+    }
+
+    #[cfg(unix)]
+    const POLARITY_PROVIDER: &str = "claude";
+    #[cfg(unix)]
+    const POLARITY_CHANNEL: u64 = 4_987_000_000_071;
+
+    /// An `Unknown{TranscriptUnresolved}` composed with a sidecar that said
+    /// nothing: 4987 §4.1's "an unobservable relay is not a healthy one", and
+    /// the plainest verdict that does not permit health.
+    #[cfg(unix)]
+    fn not_green() -> RelayVerdict {
+        let composed = compose_relay_verdict(
+            ReachabilityVerdict::unknown(ReachabilityUnknownReason::TranscriptUnresolved, 0),
+            ExternalRelayVerdict::Unknown,
+        );
+        assert!(!composed.permits_health());
+        composed
+    }
+
+    /// #5071 T4-B6: the switch's one effect, locked from both sides.
+    ///
+    /// The same verdict is pushed through `apply_relay_verdict_polarity` in both
+    /// modes and only `Composite` may move the snapshot. Dropping the
+    /// `composite_governs_polarity` conjunct makes the `Structural` half fail —
+    /// which is the mutation the r1 review ran green against every gate before
+    /// this test existed.
+    #[cfg(unix)]
+    #[test]
+    fn only_composite_mode_degrades_the_snapshot_for_a_non_green_relay_verdict() {
+        let verdict = not_green();
+
+        let mut composite_reasons = Vec::new();
+        let mut composite_status = HealthStatus::Healthy;
+        apply_relay_verdict_polarity(
+            true,
+            &verdict,
+            POLARITY_PROVIDER,
+            POLARITY_CHANNEL,
+            &mut composite_reasons,
+            &mut composite_status,
+        );
+        assert_eq!(
+            composite_reasons,
+            vec![format!(
+                "relay_verdict_unknown_{POLARITY_PROVIDER}_{POLARITY_CHANNEL}"
+            )],
+            "Composite must name the non-green channel in the degraded reasons"
+        );
+        assert_eq!(composite_status, HealthStatus::Degraded);
+
+        let mut shadow_reasons = Vec::new();
+        let mut shadow_status = HealthStatus::Healthy;
+        apply_relay_verdict_polarity(
+            false,
+            &verdict,
+            POLARITY_PROVIDER,
+            POLARITY_CHANNEL,
+            &mut shadow_reasons,
+            &mut shadow_status,
+        );
+        assert!(
+            shadow_reasons.is_empty(),
+            "Structural is a shadow: the same verdict must move no reason, got {shadow_reasons:?}"
+        );
+        assert_eq!(shadow_status, HealthStatus::Healthy);
+    }
+
+    /// The other direction of the same conditional: `Composite` degrades on a
+    /// verdict that does NOT permit health, so a verdict that does must leave
+    /// the snapshot alone. Without this, inverting the `permits_health` test
+    /// still passes the case above.
+    #[cfg(unix)]
+    #[test]
+    fn a_green_relay_verdict_degrades_the_snapshot_in_neither_mode() {
+        let green =
+            compose_relay_verdict(ReachabilityVerdict::Reachable, ExternalRelayVerdict::NoLoss);
+        assert!(green.permits_health());
+
+        for composite_governs_polarity in [false, true] {
+            let mut reasons = Vec::new();
+            let mut status = HealthStatus::Healthy;
+            apply_relay_verdict_polarity(
+                composite_governs_polarity,
+                &green,
+                POLARITY_PROVIDER,
+                POLARITY_CHANNEL,
+                &mut reasons,
+                &mut status,
+            );
+            assert!(
+                reasons.is_empty(),
+                "a health-permitting verdict degraded nothing to report, got {reasons:?}"
+            );
+            assert_eq!(status, HealthStatus::Healthy);
+        }
+    }
+
+    /// The worsen is a floor, not an assignment: a snapshot already `Unhealthy`
+    /// for an unrelated reason (no providers registered, say) must not be
+    /// improved to `Degraded` by a non-green relay verdict landing after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_green_relay_verdict_never_improves_an_unhealthy_snapshot() {
+        let mut reasons = vec!["no_providers_registered".to_string()];
+        let mut status = HealthStatus::Unhealthy;
+        apply_relay_verdict_polarity(
+            true,
+            &not_green(),
+            POLARITY_PROVIDER,
+            POLARITY_CHANNEL,
+            &mut reasons,
+            &mut status,
+        );
+        assert_eq!(status, HealthStatus::Unhealthy);
+        assert_eq!(
+            reasons.len(),
+            2,
+            "the relay reason is added, not substituted"
+        );
     }
 
     /// #3631: a rebind-origin row with NO cancel token is idle (so the channel
@@ -1031,6 +1369,207 @@ mod tests {
             relay_active_turn_from_inflight(true, Some(&state)),
             RelayActiveTurn::None,
             "restart recovery can resurrect a cancel token for the stale row, but not the lost bridge tail"
+        );
+    }
+
+    /// #5071 relay-tail S2 (r4 review): the tail term's polarity as the LIVE
+    /// health path answers it, read off the surface that path publishes.
+    ///
+    /// The r3 review measured the r2 version of this test evaluating a COPY of
+    /// the call site's conjunction, so reverting the call site alone to the
+    /// pre-S2 `unread_bytes.unwrap_or(0) == 0` fold left it green. This one
+    /// calls `build_health_snapshot` and reads `reachability` off the mailbox
+    /// entry, which is where `pane_idle_confirmed` becomes observable from
+    /// outside the per-channel loop: it is `observe_relay_verdict`'s third alive
+    /// witness, and with a bootstrapped ledger holding no obligation and a
+    /// transcript no longer than that ledger's `last_observed_len`,
+    /// `transcript_liveness`'s `alive` IS that term — so `reachable` versus
+    /// `incarnation_not_alive_no_obligations` on the published surface reports
+    /// the conjunction rather than restating it.
+    ///
+    /// Both channels build the shape the S2 split is about and that a rowless
+    /// fixture cannot: a row IS present, so `bridge_inflight_present` is set,
+    /// while `active_turn` still reads `None` (#3631 rebind-origin without a
+    /// cancel token). They differ in whether that row carries an `output_path`
+    /// for the tail measurement to land on — the first entry of the
+    /// `seed_runtime` absence enumerated on `idle_witness_tail_is_not_waiting`.
+    /// That also moves the descriptive divergence operand (`SameFile` versus
+    /// `NoRowCoordinate`), and neither of those two produces an unknown reason,
+    /// so the verdict this reads apart is still the alive question alone.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn call_site_withholds_the_pane_idle_witness_for_an_unmeasured_tail() {
+        use crate::services::discord::health::reachability::discovery::TranscriptFileId;
+        use crate::services::discord::health::reachability::ledger::{
+            LedgerIncarnation, bootstrap_ledger_at, ledger_path,
+        };
+
+        fn live_watcher_handle(
+            tmux_session_name: &str,
+            output_path: &str,
+        ) -> crate::services::discord::TmuxWatcherHandle {
+            crate::services::discord::TmuxWatcherHandle {
+                tmux_session_name: tmux_session_name.to_string(),
+                output_path: output_path.to_string(),
+                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pause_epoch: Arc::new(AtomicU64::new(0)),
+                turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                    crate::services::discord::tmux_watcher_now_ms(),
+                )),
+            }
+        }
+
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("temp runtime root");
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping #5071 S2 call-site witness: tmux unavailable");
+            return;
+        }
+
+        let provider = ProviderKind::Codex;
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let registry = HealthRegistry::new();
+        registry
+            .register(provider.as_str().to_string(), shared.clone())
+            .await;
+
+        let mut fixtures = Vec::new();
+        for (label, row_carries_output_path) in
+            [("measured drained tail", true), ("unmeasured tail", false)]
+        {
+            let channel =
+                ChannelId::new(NEXT_ABSENT_MAILBOX_CHANNEL.fetch_add(1, Ordering::Relaxed));
+            // The witness's FIRST conjunct is a real live pane, so this fixture
+            // owns one instead of granting the term.
+            let tmux_session = format!(
+                "AgentDesk-codex-s2r4-{}-{}",
+                std::process::id(),
+                channel.get()
+            );
+            let _ = crate::services::platform::tmux::kill_session(
+                &tmux_session,
+                "#5071 S2 call-site fixture reset",
+            );
+            assert!(
+                crate::services::platform::tmux::create_session(&tmux_session, None, "sleep 60")
+                    .expect("start tmux fixture")
+                    .status
+                    .success(),
+                "{label}: the pane-idle witness needs a live pane to be about"
+            );
+
+            // The transcript the live watcher tails, which is the one
+            // `transcript_liveness` stats. Empty, so its EOF cannot exceed the
+            // ledger's `last_observed_len` and the growth half of the alive
+            // question answers `false` — leaving `pane_idle_confirmed` as the
+            // only thing that can still make the incarnation read alive.
+            let transcript = tmp.path().join(format!("s2-r4-{}.jsonl", channel.get()));
+            std::fs::write(&transcript, b"").expect("write transcript fixture");
+            let transcript = transcript.to_str().expect("utf8 path").to_string();
+            shared
+                .tmux_watchers
+                .insert(channel, live_watcher_handle(&tmux_session, &transcript));
+
+            let mut row = InflightTurnState::new(
+                provider.clone(),
+                channel.get(),
+                None,
+                5_071_000_000_002_000,
+                5_071_000_000_002_001,
+                5_071_000_000_002_002,
+                "s2 call-site fixture".to_string(),
+                None,
+                Some(tmux_session.clone()),
+                row_carries_output_path.then(|| transcript.clone()),
+                None,
+                0,
+            );
+            // #3631: a rebind-origin row with no cancel token is idle. That is
+            // how `active_turn` is `None` while a row is present here.
+            row.rebind_origin = true;
+            crate::services::discord::inflight::save_inflight_state(&row)
+                .expect("persist row fixture");
+
+            // A mailbox with no cancel token: what puts the channel into
+            // `provider_probe`'s snapshots, so the per-channel loop runs for it,
+            // without giving the row an active turn.
+            shared.mailboxes.handle(channel);
+
+            // No obligation and `last_observed_len == 0`: the sweep holds
+            // nothing, so `classify_reachability` decides on `alive` alone.
+            bootstrap_ledger_at(
+                &ledger_path(&provider, channel.get()).expect("ledger path"),
+                LedgerIncarnation::new(
+                    tmux_session.clone(),
+                    0,
+                    None,
+                    TranscriptFileId { dev: 0, ino: 0 },
+                ),
+                0,
+            )
+            .expect("bootstrap ledger fixture");
+
+            fixtures.push((label, channel, tmux_session, row_carries_output_path));
+        }
+
+        let health = build_health_snapshot(&registry).await;
+
+        let mut published = Vec::new();
+        for (label, channel, _, row_carries_output_path) in &fixtures {
+            let entry = health
+                .mailboxes
+                .iter()
+                .find(|entry| entry.channel_id == channel.get())
+                .unwrap_or_else(|| panic!("{label}: the fixture channel must reach the snapshot"));
+            assert!(
+                entry.tmux_present && entry.relay_health.tmux_alive == Some(true),
+                "{label}: the fixture pane must be the one the snapshot probed"
+            );
+            assert!(
+                entry.relay_health.bridge_inflight_present,
+                "{label}: the fixture row must be the one the snapshot observed"
+            );
+            assert_eq!(
+                entry.relay_health.active_turn,
+                RelayActiveTurn::None,
+                "{label}: a rebind-origin row without a cancel token must read idle"
+            );
+            assert_eq!(
+                entry.relay_health.unread_bytes,
+                row_carries_output_path.then_some(0),
+                "{label}: enrichment must derive the tail reading this case is about"
+            );
+            published.push((
+                *label,
+                entry.reachability.verdict,
+                entry.reachability.reason,
+            ));
+        }
+
+        for (_, _, tmux_session, _) in &fixtures {
+            let _ = crate::services::platform::tmux::kill_session(
+                tmux_session,
+                "#5071 S2 call-site fixture teardown",
+            );
+        }
+
+        assert_eq!(
+            published,
+            vec![
+                ("measured drained tail", "reachable", None),
+                (
+                    "unmeasured tail",
+                    "unknown",
+                    Some("incarnation_not_alive_no_obligations")
+                ),
+            ],
+            "the live path's witness must survive a measured-empty tail and be withheld for an unmeasured one"
         );
     }
 
@@ -1275,5 +1814,153 @@ mod tests {
                     active_user_msg_id
                 );
             });
+    }
+
+    /// #5071 T4-B4 (4987 S4): the divergence observe call in
+    /// `watcher_state_snapshot_for_shared` is severable without any of
+    /// `reachability::divergence`'s own tests failing (they are pure/local),
+    /// so this drives the real builder end to end — registry binding on a live
+    /// file, in-flight row on a dead path — and asserts the record it emits.
+    #[cfg(unix)]
+    mod row_coordinate_divergence_wiring {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use poise::serenity_prelude::ChannelId;
+
+        use crate::services::provider::ProviderKind;
+
+        #[derive(Clone)]
+        struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+            type Writer = CapturingWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// Install a WARN-level capturing subscriber for the duration of `run`.
+        /// `set_default` is thread-local and the record is emitted on the
+        /// polling thread, so callers must stay on `flavor = "current_thread"`.
+        async fn capture_warn<F, R>(run: F) -> (R, String)
+        where
+            F: std::future::Future<Output = R>,
+        {
+            let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(CapturingWriter(buffer.clone()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let result = run.await;
+            let output = String::from_utf8_lossy(
+                &buffer.lock().unwrap_or_else(|poison| poison.into_inner()),
+            )
+            .into_owned();
+            (result, output)
+        }
+
+        fn watcher_handle(
+            tmux_session_name: &str,
+            output_path: &str,
+        ) -> crate::services::discord::TmuxWatcherHandle {
+            crate::services::discord::TmuxWatcherHandle {
+                tmux_session_name: tmux_session_name.to_string(),
+                output_path: output_path.to_string(),
+                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                    crate::services::discord::tmux_watcher_now_ms(),
+                )),
+            }
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn watcher_state_snapshot_records_row_vs_registry_identity_divergence() {
+            let tmp = tempfile::tempdir().expect("temp runtime root");
+            let _env =
+                crate::config::TestEnvVarGuard::set_path(super::AGENTDESK_ROOT_DIR_ENV, tmp.path());
+
+            let provider = ProviderKind::Codex;
+            let channel =
+                ChannelId::new(super::NEXT_ABSENT_MAILBOX_CHANNEL.fetch_add(1, Ordering::Relaxed));
+            let tmux_session_name = "AgentDesk-codex-adk-t4b4-wiring";
+            let shared = crate::services::discord::make_shared_data_for_tests();
+
+            // #4986 형상1 fixture: the registry tails a live native transcript
+            // while the row still names a path that does not stat.
+            let native = tmp.path().join("t4b4-registry-native.jsonl");
+            std::fs::write(&native, "{\"type\":\"assistant\"}\n").expect("write registry fixture");
+            shared.tmux_watchers.insert(
+                channel,
+                watcher_handle(tmux_session_name, native.to_str().expect("utf8 path")),
+            );
+            let missing_wrapper = tmp.path().join("t4b4-row-wrapper-missing.jsonl");
+            let row = crate::services::discord::inflight::InflightTurnState::new(
+                provider.clone(),
+                channel.get(),
+                None,
+                5_071_000_000_004_000,
+                5_071_000_000_004_001,
+                5_071_000_000_004_002,
+                "t4-b4 wiring fixture".to_string(),
+                None,
+                Some(tmux_session_name.to_string()),
+                Some(missing_wrapper.to_str().expect("utf8 path").to_string()),
+                None,
+                0,
+            );
+            crate::services::discord::inflight::save_inflight_state(&row)
+                .expect("persist row fixture");
+
+            let (snapshot, logs) = capture_warn(super::super::watcher_state_snapshot_for_shared(
+                provider.as_str(),
+                shared,
+                channel,
+            ))
+            .await;
+
+            let snapshot = snapshot.expect("a channel with a live watcher and a row snapshots");
+            assert_eq!(
+                snapshot.inflight_output_path.as_deref(),
+                missing_wrapper.to_str(),
+                "the fixture row must be the one the builder observed"
+            );
+            let records: Vec<&str> = logs
+                .lines()
+                .filter(|line| line.contains("counter=\"reachability_row_coordinate_divergence\""))
+                .collect();
+            assert_eq!(
+                records.len(),
+                1,
+                "one build must emit exactly one divergence record; got:\n{logs}"
+            );
+            assert!(
+                records[0].contains("outcome=\"row_path_unresolvable_while_registry_live\""),
+                "the record must carry the #4986 형상1 outcome; got:\n{}",
+                records[0]
+            );
+        }
     }
 }

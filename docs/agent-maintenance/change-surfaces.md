@@ -1925,6 +1925,66 @@ time for diagnostics; neither is a stored approval value.
   `tui_direct_pending_start.rs` (`STALE_FOREIGN_CANCEL_IDENTITY_SITE`). The other
   14 production entries in the `registry_remove` category of
   `scripts/destructive_call_site_baseline.json` stay unfenced in every mode.
+- second conjunct (#5071 relay-tail S4, I-1): `TerminalDeliveryFence` in the same
+  `tmux_watcher_registry.rs`, chained onto the view by
+  `IdentityFencePendingDelivery::with_terminal_delivery_fence` at both converted
+  call sites and consumed by `commit_under_delivery_fence` inside the same
+  registry lock (the r2 repair below replaced the original bool probe). It answers a DIFFERENT question from the identity conjuncts: not "is this
+  the same watcher incarnation?" but "is a terminal delivery for the very turn
+  being destroyed still in flight?". It refuses only while
+  `LeaseSnapshot::identity_matched` finds the channel's `DeliveryLeaseCell`
+  `Leased` under the probe's own `DeliveryLeaseKey`
+  (`DestructiveCancelProbeSnapshot::delivery_lease_key`) with an unelapsed
+  deadline on the `lease_now_ms` clock. Two deliberate differences from the #5067
+  emission fence T3-A1 deleted: it is key-matched (a later turn's lease is not
+  this destruction's business) and it expires (a dead holder cannot latch it). It
+  is NOT gated by `ExecutionIdentityMode` — a bounded, identity-matched refusal
+  has no Observe-only stage to roll out through.
+- S4 r2 repairs to that conjunct, all three in the same two files:
+  - **judge/commit atomicity.** The r1 shape read the lease through
+    `DeliveryLeaseCell::read`, which drops the cell's payload mutex on return,
+    and answered `bool`; the registry lock the CAS core holds is a different
+    lock, so a `Sink`/`Bridge` `try_acquire` under the very key just judged
+    absent could win before the removal ran. `TerminalDeliveryFence::
+    commit_if_permitted` now judges AND performs the removal (and, on the
+    canceling helper, the `cancel` store) inside one
+    `DeliveryLeaseCell::with_state_locked` hold. The lock order that introduces
+    — registry lock → lease payload mutex → registry DashMap shards — and the
+    enumeration showing neither reverse edge exists are on the
+    `TerminalDeliveryFence` doc comment, which is the source of truth for it.
+    Mutation row `S4-m7` reopens the window; the atomicity target is
+    `tmux_watcher_registry_restore_tests::delivery_fence_judgment_and_destruction_are_atomic_against_a_racing_acquire`.
+  - **the conjunct is no longer optional.** `under_identity_fence` returns
+    `IdentityFencePendingDelivery`, which has NO destructive method;
+    `with_terminal_delivery_fence` consumes it and is the only way to reach
+    `IdentityFencedRegistry`. Deleting the chained call at a site used to
+    compile and still remove — silently unfenced — and now does not typecheck.
+  - **`delivery_fence_bind` pairing.** The destructive ratchet counts
+    `with_terminal_delivery_fence(` as its own category and requires the
+    per-file count to EQUAL `identity_fence_bind`. The growth ratchet could not
+    catch that omission on its own: dropping a binder is a decrease, which it
+    allows by design.
+- what the delivery conjunct still fails OPEN on, beyond the declared id-0
+  collapse: a turn whose relay owner leased under the fallback-offset key from
+  `tmux_watcher::turn_identity::pinned_delivery_lease_key`. That key is
+  `(user_msg_id 0, started_at None, turn_start_offset Some(relay_range_start))`
+  and the probe's key comes from `DeliveryLeaseKey::from_inflight_state_for_site`,
+  which passes no fallback offset and so never produces that shape — the two can
+  never compare equal, so the conjunct permits however live the delivery is. The
+  `TerminalDeliveryFence` doc comment carries the full residual enumeration.
+- S4 domain: the two converted call sites above and nothing else. Explicitly
+  outside it, and still reaching an unfenced destructive path in every mode:
+  `health/recovery.rs`, `health/relay_auto_heal.rs`,
+  `recovery_engine/manual_rebind/`, `tmux_watcher/placeholder_reclaim.rs`,
+  `tmux_watcher/post_stream_exit.rs`, `turn_bridge/runtime_handoff_loop.rs` and
+  its `watcher_handoff.rs` sibling, `watchers/lifecycle/claims.rs`,
+  `inflight_heartbeat_sweeper.rs`, `runtime_bootstrap/gateway_lease.rs`,
+  `task_supervisor.rs`, `turn_finalizer.rs`,
+  `relay_recovery_auto_heal_confirm.rs`, `inflight/destructive_commit.rs`, and
+  the manual stale-mailbox path in `health_api.rs`. The `identity_fence_bind`
+  and `delivery_fence_bind` categories of
+  `scripts/destructive_call_site_baseline.json` pin the fenced set at exactly two
+  so that boundary can only move in a reviewed diff.
 - invariants, non_guarantees, rollout procedure and tests: NOT restated here.
   The runbooks are the source of truth and are anchored to the same symbols —
   [promotion criteria](../runbooks/execution-identity-promotion-criteria.md)
@@ -1935,7 +1995,8 @@ time for diagnostics; neither is a stored approval value.
   (why `RelayRecoveryApplySource::Manual` is fenced while process reset is not),
   and the counter-exposure decision proposal
   [5399-observe-exposure-options](../design/5399-observe-exposure-options.md).
-- related_issues: #5071 (T3-A0 #5394, T3-A1 #5398), #5396, #5399, #5411.
+- related_issues: #5071 (T3-A0 #5394, T3-A1 #5398, relay-tail S4), #5396, #5399,
+  #5411.
 
 ### `relay_reachability`
 
@@ -1983,8 +2044,26 @@ time for diagnostics; neither is a stored approval value.
   `scripts/ci-script-checks.sh`) enforces I14 as a source **lint, not a type
   proof** — `InflightTurnState` is `pub(in crate::services::discord)`, so the
   compiler accepts an import this gate rejects. The scan is lexical over
-  neutralized Rust: it does not follow `#[path]`, does not resolve macros, and
-  cannot see an inflight module laundered through a third file's `as` alias.
+  neutralized Rust, and it closes two routes around that text: it follows
+  `include!("...")` into the included file, transitively, and refuses an
+  argument it cannot resolve to a file on disk; and it forbids every name a
+  `pub use` anywhere under `src/**` launders out of the inflight module —
+  expanded leaf by leaf, closed transitively across further `pub use` hops,
+  with a `*` re-export forbidding the laundering module's own name because its
+  exports cannot be enumerated, and with a `self::<name>` head first rewritten
+  through that same file's own `use` bindings (`use path as alias;` and the
+  bare `use path::Name;` alike, chained), so a re-export laid over a private
+  file-local alias is not a way out. That rewrite is file-local and stops
+  there — the gate is a bounded lexical closure, not a resolver. What it still
+  does not see: `#[path = "..."]` module
+  redirections (resolving one depends on inline-module nesting, and this tree's
+  own uses point inside its own directory, which the file scan already owns),
+  glob imports (`use x::*;` binds a set this scan cannot enumerate, so a name
+  arriving through one is not resolved), any other macro, a launderer outside
+  `src/**`, and an inflight path a macro
+  assembles from string fragments. The name closure is by spelling, so a tree
+  item that merely shares a laundered name is a false positive it accepts
+  rather than a hole it leaves.
   Its ghost-path check is lexical too: `not yet on disk` exempts only the
   concrete source path immediately before the marker in the same bullet,
   before another concrete path appears.
@@ -2038,9 +2117,6 @@ time for diagnostics; neither is a stored approval value.
   finalize) under #3038 — the added doc-commented scaffolding nets a small
   file-LoC increase while shrinking the god-function from ~1158 to ~559 lines.
   Further growth requires a split issue.
-  `src/services/auto_queue/cancel_run.rs` (frozen giant surface) is the canonical
-  auto-queue cancellation and run-stop command surface; split before adding
-  non-bugfix behavior.
   `src/services/auto_queue/cleanup_tasks.rs` (frozen giant surface, #5142) is the
   canonical run-cleanup transactional outbox: `enqueue_run_cleanup_task_on_tx`
   writes the task in the same transaction that commits the cancel/end state
@@ -2258,8 +2334,6 @@ these contextual numbers to match ordinary LoC churn.
   `src/services/auto_queue/activate_command.rs` (frozen giant surface); auto-queue route
   behavior is split across `src/services/auto_queue/*` slices, with
   `activate_command.rs` now giant-file territory.
-  `src/services/auto_queue/cancel_run.rs` (frozen giant surface) is also giant-file territory;
-  split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (frozen giant surface),
   `src/services/dispatched_sessions.rs` (frozen giant surface; #4091 r2 adds the two-sample
   growth-evidence selector cross-check wiring, claude_tui transcript-mtime
@@ -2450,6 +2524,7 @@ these contextual numbers to match ordinary LoC churn.
   from #3864 moving SIGTERM queue-restore merge inside the mailbox actor; +10
   from #4018 round-2 adding the distinct `MonitorAutoTurn` active-turn marker
   while keeping monitor turns background for queue-yield/cancel semantics).
+- `src/services/discord/tmux_watcher_registry.rs` (crossed the 1000-line production threshold at 1092 prod LoC via #5071 relay-tail S4 — the destructive-fence layer added there (`WatcherIdentityFence`/`TerminalDeliveryFence` and the `IdentityFencedRegistry` CAS cores) is the natural split seam; decompose scheduled per #5457, registry entry `shrink` with a 2026-10-31 deadline).
 - `src/services/discord/session_relay_sink.rs` (frozen giant surface; #5071 T0-S4
   moves the 100-physical-line sink-local terminal outcome fold and `RelaySink::deliver`
   implementation to `session_relay_sink/terminal_handoff.rs` with `continue 0`, one

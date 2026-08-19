@@ -3,8 +3,8 @@
 //! This file is vocabulary and polarity. It deliberately holds no composition
 //! rule, no threshold, no clock read, and no I/O:
 //!
-//! * choosing `Degraded` vs `Unreachable` is the `warn_bound`/`fail_bound`
-//!   subtraction T4-B2 adds on top of the obligation ledger;
+//! * choosing `Degraded` vs `Unreachable` from `warn_bound`/`fail_bound` is
+//!   deferred composition; T4-B2c only records observations in the ledger;
 //! * the final product `worst(ReachabilityVerdict, ExternalRelayVerdict)` is
 //!   T4-B6, and turning it on is gated behind `G-T4`.
 //!
@@ -18,7 +18,8 @@
 //!
 //! The converse does NOT hold: `Reachable` does not *declare* health, it only
 //! fails to deny it — §-1.4 additionally requires positive incarnation-alive
-//! evidence before a producer may spell it, and producing verdicts is B2's job.
+//! evidence before a producer may spell it, and producing verdicts remains the
+//! later B6 composition task.
 //!
 //! # `TransportUnknown` is neither health nor a redelivery warrant
 //!
@@ -87,11 +88,43 @@ pub(in crate::services::discord) enum TransportUnknownEvidence {
     PlaceholderPresent,
 }
 
+/// Which of the two obligation states accompanied a not-alive incarnation
+/// (#5071 relay-tail S1, I-5).
+///
+/// One family — the incarnation is not witnessed alive either way — but not one
+/// observation: "nothing was ever owed" and "something is owed and still inside
+/// its grace" are different facts about the relay, and the operator reading the
+/// detail surface acts on them differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum NotAliveObligationState {
+    /// Every obligation retired, or none was ever framed.
+    NoneOutstanding,
+    /// An obligation is outstanding and younger than the warn bound, so it is
+    /// not yet evidence of anything.
+    WithinGrace,
+}
+
 /// Why the obligation set could not be produced (4987 §4.1).
+///
+/// #5071 relay-tail S1 (I-5): five branches used to spell `TranscriptUnresolved`
+/// between them, so the reason published on the health detail could not say
+/// which one answered. `TranscriptUnresolved` now means the resolution ladder
+/// and nothing else; the other four are named below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::services::discord) enum ReachabilityUnknownReason {
-    /// Every rank of the 4987 §-1.3 resolution ladder failed.
+    /// Every rank of the 4987 §-1.3 resolution ladder failed — a coordinate
+    /// exists to resolve and none of the ranks could resolve it.
     TranscriptUnresolved,
+    /// No ledger has ever been written for this channel. 4987 §-1.4: "not
+    /// observed" is not `Reachable` — and it is not an unresolved coordinate
+    /// either, because nothing ever framed one.
+    NeverObserved,
+    /// No provider owns this channel, so no durable material can even be
+    /// located. Upstream of every rank of the ladder.
+    ProviderUnresolved,
+    /// The ladder resolved and the incarnation is not witnessed alive. The
+    /// transcript is not the unknown here — the producer is.
+    IncarnationNotAliveWitnessed(NotAliveObligationState),
     /// Two independently resolved coordinates name different files, or the
     /// file under an established cursor stopped being that file.
     TranscriptCoordinateDivergence,
@@ -112,8 +145,9 @@ impl ReachabilityVerdict {
     /// True for `Reachable` only; `TransportUnknown` is false here by the same
     /// rule as `Unreachable`. Permission is not a declaration: §-1.4 still
     /// requires positive incarnation-alive evidence before a producer may spell
-    /// `Reachable` at all, B6 owns the product this feeds, and nothing calls
-    /// this yet.
+    /// `Reachable` at all. T4-B6's composed `RelayVerdict::permits_health`
+    /// delegates to this for its in-band arm, where a false answer blocks a
+    /// health declaration and authorizes nothing else.
     pub(in crate::services::discord) fn permits_health(&self) -> bool {
         match self {
             Self::Reachable => true,
@@ -236,6 +270,26 @@ mod tests {
                 reason: ReachabilityUnknownReason::ReceiptStoreUnreadable,
                 since_secs: 5,
             },
+            ReachabilityVerdict::Unknown {
+                reason: ReachabilityUnknownReason::NeverObserved,
+                since_secs: 5,
+            },
+            ReachabilityVerdict::Unknown {
+                reason: ReachabilityUnknownReason::ProviderUnresolved,
+                since_secs: 5,
+            },
+            ReachabilityVerdict::Unknown {
+                reason: ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                    NotAliveObligationState::NoneOutstanding,
+                ),
+                since_secs: 5,
+            },
+            ReachabilityVerdict::Unknown {
+                reason: ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                    NotAliveObligationState::WithinGrace,
+                ),
+                since_secs: 5,
+            },
         ]
     }
 
@@ -331,8 +385,10 @@ mod tests {
     }
 
     /// How many reasons 4987 §4.1 defines, and therefore how many distinct
-    /// indices [`unknown_reason_index`] may hand out.
-    const UNKNOWN_REASON_COUNT: usize = 5;
+    /// indices [`unknown_reason_index`] may hand out. #5071 relay-tail S1
+    /// (I-5) took it from five to nine: three new variants, one of which
+    /// carries a two-state payload that is two reasons on the wire.
+    const UNKNOWN_REASON_COUNT: usize = 9;
 
     /// Give each `Unknown` reason its own index.
     ///
@@ -350,6 +406,17 @@ mod tests {
             ReachabilityUnknownReason::RowlessActiveTurn => 2,
             ReachabilityUnknownReason::ReadTruncated => 3,
             ReachabilityUnknownReason::ReceiptStoreUnreadable => 4,
+            ReachabilityUnknownReason::NeverObserved => 5,
+            ReachabilityUnknownReason::ProviderUnresolved => 6,
+            // The payload is matched out, not wildcarded: a third not-alive
+            // state has to claim its own index here, exactly as a sixth variant
+            // would.
+            ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                NotAliveObligationState::NoneOutstanding,
+            ) => 7,
+            ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                NotAliveObligationState::WithinGrace,
+            ) => 8,
         }
     }
 
@@ -372,6 +439,14 @@ mod tests {
             ReachabilityUnknownReason::RowlessActiveTurn,
             ReachabilityUnknownReason::ReadTruncated,
             ReachabilityUnknownReason::ReceiptStoreUnreadable,
+            ReachabilityUnknownReason::NeverObserved,
+            ReachabilityUnknownReason::ProviderUnresolved,
+            ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                NotAliveObligationState::NoneOutstanding,
+            ),
+            ReachabilityUnknownReason::IncarnationNotAliveWitnessed(
+                NotAliveObligationState::WithinGrace,
+            ),
         ];
 
         // Deliberately no `every_reason.len() == UNKNOWN_REASON_COUNT` assert:

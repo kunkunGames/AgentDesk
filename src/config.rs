@@ -1730,6 +1730,50 @@ fn is_legacy_execution_identity_mode(mode: &ExecutionIdentityMode) -> bool {
     *mode == ExecutionIdentityMode::Legacy
 }
 
+/// Which verdict the relay health surface treats as authoritative — #5071 T4-B6
+/// (4987 §5.1).
+///
+/// The composed verdict `worst(ReachabilityVerdict, ExternalRelayVerdict)` is
+/// produced in both modes; this switch only decides whether it is allowed to
+/// change the reported health polarity. Rolling back to `Structural` therefore
+/// stops the composition from being consulted for polarity, but does not
+/// un-land the composition, the sidecar reader, or the durable ledger.
+///
+/// No mode gives the reachability tier a destructive capability: 4987 §7.1 /
+/// I15 keeps turn cancel, tmux/process kill, registry removal, and mailbox
+/// force-clean out of every reachability-derived path in both modes. See
+/// `services::discord::relay_recovery::plan_relay_recovery_under_reachability`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayVerdictSource {
+    /// Only the pre-existing structural signals set the health polarity. The
+    /// composed verdict is still computed and published on the detail surface,
+    /// where it can be compared against the structural answer before the
+    /// switch is moved.
+    #[default]
+    Structural,
+    /// The composed verdict sets the polarity too: a composed verdict other
+    /// than `Reachable` denies GREEN for that channel's detail entry, on the
+    /// 4987 §4.1 rule that an unobservable or uncovered relay is not a healthy
+    /// one. It adds a degraded reason and worsens the reported status; it does
+    /// not lift a status the structural signals already worsened, and it does
+    /// not reach `Unhealthy` on its own.
+    Composite,
+}
+
+impl RelayVerdictSource {
+    /// Whether the composed verdict may change the reported health polarity.
+    /// `Structural` publishes the same composed value without letting it
+    /// decide anything.
+    pub const fn governs_health_polarity(self) -> bool {
+        matches!(self, Self::Composite)
+    }
+}
+
+fn is_structural_relay_verdict_source(source: &RelayVerdictSource) -> bool {
+    *source == RelayVerdictSource::Structural
+}
+
 /// A conservative bound that stays within chrono's duration and UTC datetime
 /// ranges while remaining far above any operational sweep TTL.
 pub(crate) const MAX_INTAKE_SWEEP_CUTOFF_SECS: u64 = i64::MAX as u64 / 1_000_000_000;
@@ -1752,6 +1796,8 @@ pub struct RuntimeSettingsConfig {
     pub intake_delivery_settlement: IntakeDeliverySettlementStage,
     #[serde(default, skip_serializing_if = "is_legacy_execution_identity_mode")]
     pub execution_identity_mode: ExecutionIdentityMode,
+    #[serde(default, skip_serializing_if = "is_structural_relay_verdict_source")]
+    pub relay_verdict_source: RelayVerdictSource,
     /// Heartbeat-absence TTL for stale dispatched debt; unset defaults to 1800 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intake_delivery_sweep_dispatched_cutoff_secs: Option<u64>,
@@ -1932,6 +1978,7 @@ impl RuntimeSettingsConfig {
             && self.delivery_journal_internal_channel_ids.is_empty()
             && self.intake_delivery_settlement == IntakeDeliverySettlementStage::Off
             && self.execution_identity_mode == ExecutionIdentityMode::Legacy
+            && self.relay_verdict_source == RelayVerdictSource::Structural
             && self.intake_delivery_sweep_dispatched_cutoff_secs.is_none()
             && self.intake_delivery_sweep_spawned_cutoff_secs.is_none()
             && self.intake_delivery_sweep_batch_limit.is_none()
@@ -2191,6 +2238,56 @@ mod runtime_hook_registry_config_tests {
                 parsed.is_empty(),
                 mode == ExecutionIdentityMode::Legacy,
                 "a non-Legacy mode must keep the runtime section serialized"
+            );
+            assert_eq!(
+                serde_yaml::from_str::<RuntimeSettingsConfig>(
+                    &serde_yaml::to_string(&parsed).expect("serialize runtime")
+                )
+                .expect("reparse runtime"),
+                parsed
+            );
+        }
+    }
+
+    // #5071 T4-B6: same shape as the T3-A0 switch test above. An operator who
+    // never writes the key lands on `Structural`, where the composed relay
+    // verdict is published but decides no polarity; and `is_empty` must account
+    // for the new field or a config that sets ONLY this key loses it on a
+    // round-trip.
+    #[test]
+    fn relay_verdict_source_defaults_structural_and_round_trips() {
+        let default = RuntimeSettingsConfig::default();
+        assert_eq!(default.relay_verdict_source, RelayVerdictSource::Structural);
+        assert!(
+            !serde_yaml::to_string(&default)
+                .expect("serialize default runtime")
+                .contains("relay_verdict_source")
+        );
+
+        let absent: RuntimeSettingsConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(absent.relay_verdict_source, RelayVerdictSource::Structural);
+        assert!(!absent.relay_verdict_source.governs_health_polarity());
+        assert!(RelayVerdictSource::Composite.governs_health_polarity());
+        assert!(absent.is_empty());
+
+        for source in [
+            RelayVerdictSource::Structural,
+            RelayVerdictSource::Composite,
+        ] {
+            let yaml = format!(
+                "relay_verdict_source: {}\n",
+                serde_yaml::to_value(source)
+                    .expect("serialize source")
+                    .as_str()
+                    .expect("source serializes as a string")
+            );
+            let parsed: RuntimeSettingsConfig =
+                serde_yaml::from_str(&yaml).expect("parse relay verdict source");
+            assert_eq!(parsed.relay_verdict_source, source);
+            assert_eq!(
+                parsed.is_empty(),
+                source == RelayVerdictSource::Structural,
+                "a non-Structural source must keep the runtime section serialized"
             );
             assert_eq!(
                 serde_yaml::from_str::<RuntimeSettingsConfig>(
@@ -3717,6 +3814,58 @@ impl Drop for TestEnvVarGuard {
 #[cfg(test)]
 pub(crate) fn set_agentdesk_root_for_test(path: &std::path::Path) -> TestEnvVarGuard {
     TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", path)
+}
+
+/// Runtime root plus both provider homes, each pinned to a fresh empty tempdir.
+///
+/// Added for #5452 PR-A, where a path's verdict depends on all three: a test that
+/// inherited the host's `CLAUDE_CONFIG_DIR` / `CODEX_HOME` would flip an
+/// owned-or-unknown case to foreign if that home happened to contain the fixture,
+/// and would let a foreign case pass for the wrong reason if it did not.
+///
+/// Field order is drop order, and here it is what keeps the three overrides a
+/// single atom. The shared env mutex lives in its own field declared last, so it
+/// is released last: the tempdirs are removed and all three vars are restored
+/// while this thread still holds it. Parking the mutex inside one of the
+/// `TestEnvVarGuard`s instead — which is what `set_path` does — releases it when
+/// that one guard drops, and the remaining restores then run unlocked; a sibling
+/// test that takes the mutex in that gap sees a half-restored environment, and
+/// the vars still to be restored name tempdirs this value has already deleted.
+#[cfg(test)]
+pub(crate) struct PinnedRuntimeHost {
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) claude_home: tempfile::TempDir,
+    pub(crate) codex_home: tempfile::TempDir,
+    _guards: [TestEnvVarGuard; 3],
+    _env_lock: test_env_lock::SharedTestEnvLockGuard,
+}
+
+/// The mutex is taken once, up front, and every var is then set through the
+/// after-lock constructor. `set_agentdesk_root_for_test` cannot be used for the
+/// runtime root here because it takes that mutex itself, and re-acquiring it on
+/// one thread panics by design — which is why the root's env key is spelled out
+/// below rather than reached through that helper.
+#[cfg(test)]
+pub(crate) fn pin_runtime_host_for_test() -> PinnedRuntimeHost {
+    let env_lock = test_env_lock::acquire_shared_test_env_lock();
+    let root = tempfile::tempdir().expect("tempdir");
+    let claude_home = tempfile::tempdir().expect("tempdir");
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let guards = [
+        TestEnvVarGuard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", root.path()),
+        TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "CLAUDE_CONFIG_DIR",
+            claude_home.path(),
+        ),
+        TestEnvVarGuard::set_path_after_shared_test_env_lock("CODEX_HOME", codex_home.path()),
+    ];
+    PinnedRuntimeHost {
+        root,
+        claude_home,
+        codex_home,
+        _guards: guards,
+        _env_lock: env_lock,
+    }
 }
 
 /// Compatibility shim for legacy provider signatures that still mention

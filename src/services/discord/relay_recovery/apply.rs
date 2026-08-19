@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::services::discord::tmux_watcher_registry::{
-    WatcherIdentityFence, execution_identity_mode,
+    TerminalDeliveryFence, WatcherIdentityFence, execution_identity_mode,
 };
 
 /// #5071 T3-A1 observation label for the dead-frontier automatic watcher cancel.
@@ -83,14 +83,28 @@ pub(super) async fn apply_relay_recovery_decision(
             // manual lane keeps the idle-turn retirement behavior.
             if episode.is_none()
                 && let Some(tmux_session) = decision.affected.tmux_session.as_deref()
-                && decision.evidence.unread_bytes.unwrap_or(0) == 0
+                // #5071 relay-tail S2: `Some(0)`, never `None`. An unmeasured
+                // tail must not open the destructive branch — see
+                // `unread_tail_is_proven_drained`.
+                && unread_tail_is_proven_drained(decision.evidence.unread_bytes)
                 // This branch intentionally does not route through
                 // `destructive_cancel_gate`: the snapshot readiness check is
                 // the turn-scope proof that the provider prompt has returned
-                // (structured JSONL ready state, or tmux prompt fallback), and the
-                // following inflight/tail guards prove there is no deliverable
-                // assistant body left to preserve. The cleanup below only retires
-                // stale mailbox/inflight bookkeeping for an already-idle turn.
+                // (structured JSONL ready state, or tmux prompt fallback), and
+                // the following inflight/tail guards then rule out a
+                // deliverable assistant body. Their reach is bounded by what
+                // they can read: `idle_tmux_repair_has_unrelayed_tail_answer`
+                // proves an empty tail only for a row whose `output_path`
+                // resolves and extracts, and returns `false` — no objection —
+                // when it cannot read one. The `Some(0)` above is what excludes
+                // that blind case, so the two guards prove "nothing left to
+                // preserve" only in conjunction — and only as far as `Some(0)`
+                // reaches, which is one snapshot's stat against the relay
+                // frontier and not a rotated/truncated transcript that reads
+                // drained by that measure (see
+                // `unread_tail_is_proven_drained`). The cleanup below only
+                // retires stale mailbox/inflight bookkeeping for an already-idle
+                // turn.
                 && let Some(inflight_clear_state) =
                     load_idle_tmux_reattach_inflight_clear_candidate(provider, decision.channel_id)
                 && idle_tmux_repair_snapshot_ready_for_input(
@@ -220,6 +234,17 @@ pub(super) async fn apply_relay_recovery_decision(
                                 );
                                 (tmux_session_name, output_path, cancel, identity_fence)
                             });
+                        // #5071 relay-tail S4 (I-1): pin the delivery-lease
+                        // coordinate in the same breath as the execution
+                        // identity. Both re-read live state inside the registry
+                        // CAS below; what is pinned HERE is only which cell and
+                        // which turn key to re-read, taken from the probe so it
+                        // cannot name a different turn than the rest of the gate.
+                        let delivery_fence = TerminalDeliveryFence::capture(
+                            shared.delivery_lease(owner_channel_id),
+                            probe.delivery_lease_key.clone(),
+                            DEAD_FRONTIER_CANCEL_IDENTITY_SITE,
+                        );
                         let gate = super::destructive_cancel_gate::evaluate(
                             shared,
                             provider,
@@ -245,11 +270,19 @@ pub(super) async fn apply_relay_recovery_decision(
                             // row, so a replaced or respawned row is refused. It
                             // does NOT establish a row generation — see
                             // `WatcherIdentityFence` for the A -> B -> A
-                            // readmission it cannot see — and it says nothing
-                            // about a terminal POST the SAME incarnation may
-                            // have in flight. That same-incarnation emission
-                            // race is a declared non-guarantee, not a closed
-                            // hole.
+                            // readmission it cannot see — and it says nothing on
+                            // its own about a terminal POST the SAME incarnation
+                            // may have in flight.
+                            //
+                            // #5071 relay-tail S4 (I-1) narrowed that second
+                            // gap rather than closing it: the CAS below also
+                            // carries `TerminalDeliveryFence`, which refuses
+                            // while THIS turn's delivery lease is still `Leased`
+                            // with an unelapsed deadline. What stays a declared
+                            // non-guarantee is a same-incarnation terminal POST
+                            // that holds NO delivery lease, or one whose holder
+                            // stopped renewing — the fence is a lease read, not
+                            // an HTTP-in-flight observation.
                             if mailbox_active_user_msg_id != probe.pin.mailbox_active_user_msg_id {
                                 tracing::warn!(
                                     target: "agentdesk::discord::relay_recovery",
@@ -305,6 +338,7 @@ pub(super) async fn apply_relay_recovery_decision(
                                     let watcher_removed = shared
                                         .tmux_watchers
                                         .under_identity_fence(identity_fence)
+                                        .with_terminal_delivery_fence(delivery_fence)
                                         .cancel_and_remove_channel_if_current(
                                             &owner_channel_id,
                                             &tmux_session_name,
@@ -425,16 +459,25 @@ pub(super) async fn apply_relay_recovery_decision(
                 reattach_error: None,
             }
         }
-        RelayRecoveryActionKind::ObserveOnly => RelayRecoveryApplyResult {
-            status: "skipped",
-            removed_thread_proofs: 0,
-            removed_mailbox_token: false,
-            post_mailbox_has_cancel_token: None,
-            post_mailbox_queue_depth: None,
-            reattach_watcher_spawned: None,
-            reattach_watcher_replaced: None,
-            reattach_initial_offset: None,
-            reattach_error: None,
-        },
+        // #5071 T4-B6: `ReportRelayUnreachable` shares `ObserveOnly`'s apply
+        // path — "skipped", nothing written — because 4987 §7.1 / I15 keeps the
+        // reachability tier out of every destructive step. The two actions are
+        // separate KINDS so the operator-facing decision says which observation
+        // it is; they are deliberately not separate BEHAVIOURS here, and this
+        // arm is spelled beside its twin rather than merged so that giving the
+        // T4-B6 action an effect is a visible edit.
+        RelayRecoveryActionKind::ObserveOnly | RelayRecoveryActionKind::ReportRelayUnreachable => {
+            RelayRecoveryApplyResult {
+                status: "skipped",
+                removed_thread_proofs: 0,
+                removed_mailbox_token: false,
+                post_mailbox_has_cancel_token: None,
+                post_mailbox_queue_depth: None,
+                reattach_watcher_spawned: None,
+                reattach_watcher_replaced: None,
+                reattach_initial_offset: None,
+                reattach_error: None,
+            }
+        }
     }
 }

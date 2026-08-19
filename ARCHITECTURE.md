@@ -544,11 +544,16 @@ src/
 │   │   │   └── outbound_messages.rs
 │   │   ├── health/
 │   │   │   ├── reachability/
+│   │   │   │   ├── composite.rs
+│   │   │   │   ├── composite_tests.rs
 │   │   │   │   ├── discovery.rs
+│   │   │   │   ├── divergence.rs
+│   │   │   │   ├── external_verdict.rs
 │   │   │   │   ├── ledger.rs
 │   │   │   │   ├── ledger_tests.rs
 │   │   │   │   ├── obligation.rs
 │   │   │   │   ├── obligation_tests.rs
+│   │   │   │   ├── observation.rs
 │   │   │   │   ├── tail.rs
 │   │   │   │   └── verdict.rs
 │   │   │   ├── recovery/
@@ -649,6 +654,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
 │   │   │   ├── reaction_control.rs
+│   │   │   ├── receipt_index.rs
 │   │   │   ├── result.rs
 │   │   │   ├── send_api.rs
 │   │   │   ├── send_gate.rs
@@ -1780,12 +1786,20 @@ restart does not render a still-alive tmux pane "unusable":
   `qwen::execute_streaming_local_tmux`) keep re-attaching to live panes.
   Legacy files are **never** swept at startup — pre-migration wrappers
   may still be writing into them.
-- **Size cap policy:** 20 MB rolling head-truncate. The watcher in
-  `src/services/discord/tmux.rs::tmux_output_watcher` periodically
-  (~every 60 loop ticks) calls `truncate_jsonl_head_safe(path, 20 MB, 15 MB)`
-  which rewrites the file keeping only the last ~15 MB worth of complete
-  lines. Any partial leading line is dropped so downstream stream-json
-  parsers never observe half-records.
+- **Size cap policy:** 20 MB rolling head-truncate, **only on the relay jsonl
+  AgentDesk owns**. The watcher loop
+  (`tmux_watcher/loop_poll_prologue.rs`) periodically — every
+  `ROTATION_CHECK_EVERY` = 120 loop ticks, ~30s at the 250 ms base cadence —
+  reaches `jsonl_rotation::rotate_owned_jsonl`, which calls
+  `truncate_jsonl_head_safe(path, 20 MB, 15 MB)` to keep only the last ~15 MB
+  worth of complete lines; a partial leading line is dropped so stream-json
+  parsers never observe half-records. That rotation is gated on
+  `tmux_common::classify_watcher_jsonl_owner` and rewrites only an `Owned`
+  verdict's own resolved path — this session's `session_temp_path` /
+  `legacy_tmp_session_path` jsonl. A TUI-direct watcher points at the provider's
+  rollout transcript under the Claude/Codex home instead; that, and every other
+  file AgentDesk does not own (operator override paths included), is refused,
+  reported as "nothing rewritten", and left byte-for-byte (#5452).
 - **Cleanup triggers:**
   - Recreate path inside each provider module calls
     `cleanup_session_temp_files(session_name)` before building a fresh

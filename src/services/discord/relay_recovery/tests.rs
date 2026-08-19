@@ -862,6 +862,14 @@ async fn dead_frontier_fixture(
 /// skip fails this test. The design keeps the same-incarnation emission race as
 /// a declared non-guarantee instead of restoring the fence; site 1 of 2 is
 /// pinned by `health::relay_dead_reattach::tests::relay_dead_reattach_no_longer_fences_on_live_relay_emission`.
+///
+/// #5071 relay-tail S4 (I-1) NARROWED this pin rather than repealing it. What
+/// stays retired is the #5067 shape: an unexpiring, identity-free "is any relay
+/// emission slot open on this channel?" veto, which is what `relay_slot` is and
+/// what this test still opens. What S4 adds back is a strictly narrower one —
+/// an identity-matched, deadline-bounded delivery LEASE — pinned by
+/// `post_gate_identity_matched_live_delivery_lease_blocks_dead_frontier_watcher_cancel`
+/// below. The two are not the same fence and this test does not cover that one.
 #[tokio::test]
 async fn post_gate_relay_emission_no_longer_blocks_dead_frontier_watcher_cancel() {
     let _guard = auto_heal_test_lock().lock().await;
@@ -906,6 +914,196 @@ async fn post_gate_relay_emission_no_longer_blocks_dead_frontier_watcher_cancel(
     assert!(
         fixture.watcher_cancel.load(Ordering::Acquire),
         "an in-flight relay emission must no longer veto the committed watcher cancel"
+    );
+    assert!(!shared.tmux_watchers.contains_key(&channel));
+    assert!(fixture.token.cancelled.load(Ordering::Relaxed));
+}
+
+/// The delivery-lease key of the turn currently persisted on `channel`, built
+/// the same way `DestructiveCancelProbeSnapshot::from_pinned_state` builds the
+/// one the production fence re-reads against.
+fn live_turn_delivery_lease_key(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel: ChannelId,
+) -> super::super::DeliveryLeaseKey {
+    let state = super::super::inflight::load_inflight_state(provider, channel.get())
+        .expect("post-gate inflight row");
+    super::super::DeliveryLeaseKey::from_inflight_state_for_site(
+        channel,
+        shared.restart.current_generation,
+        &state,
+        "s4_delivery_fence_test",
+    )
+}
+
+/// #5071 relay-tail S4 (I-1) — the deliberate PARTIAL retraction of #5398's
+/// "nothing vetoes after the gate" rule, at the same post-gate / pre-CAS window
+/// `post_gate_relay_emission_no_longer_blocks_dead_frontier_watcher_cancel`
+/// opens. A veto returns to that window, but only the EXPIRING, KEY-MATCHED one.
+///
+///   * arm A — the channel's delivery lease is `Leased` for THIS turn's key with
+///     an unelapsed deadline, i.e. a terminal delivery for the very turn being
+///     destroyed is in flight. The registry CAS must refuse and leave the
+///     watcher registered, uncancelled, and the turn intact.
+///   * arm B — same key, deadline already elapsed. A DEAD holder must not strand
+///     the watcher, so the cancel proceeds. This is what bounds the veto and is
+///     the property #5067's unexpiring fence lacked.
+///   * arm C — a live lease under a DIFFERENT turn key. Irrelevant to this
+///     destruction, so the cancel proceeds. Without the key comparison the fence
+///     would be channel-wide and a later turn's lease would block stale-watcher
+///     cleanup indefinitely.
+///
+/// Neutering the delivery conjunct in `tmux_watcher_registry` fails arm A;
+/// widening it to "any lease held" fails arm C; dropping the deadline
+/// comparison fails arm B.
+#[tokio::test]
+async fn post_gate_identity_matched_live_delivery_lease_blocks_dead_frontier_watcher_cancel() {
+    let _guard = auto_heal_test_lock().lock().await;
+    let (_root_guard, root_dir) = isolated_agentdesk_root();
+    let provider = ProviderKind::Codex;
+
+    // Arm A: identity-matched lease, deadline in the future -> CAS refuses.
+    clear_auto_heal_attempts_for_tests();
+    let (registry, shared) = registry_with_shared(provider.clone()).await;
+    let channel = ChannelId::new(5_071_010);
+    let fixture = dead_frontier_fixture(
+        &shared,
+        &root_dir,
+        &provider,
+        channel,
+        MessageId::new(5_071_110),
+        "AgentDesk-codex-5071-lease-live",
+        "lease-live",
+    )
+    .await;
+    let hook_shared = Arc::clone(&shared);
+    let hook_provider = provider.clone();
+    let hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+        let key = live_turn_delivery_lease_key(&hook_shared, &hook_provider, channel);
+        assert!(
+            hook_shared.delivery_lease(channel).try_acquire(
+                key,
+                super::super::LeaseHolder::Sink,
+                0,
+                128,
+                super::super::lease_now_ms()
+                    .saturating_add(super::super::DELIVERY_LEASE_DEADLINE_MS),
+            ),
+            "the post-gate window must be able to take this turn's delivery lease"
+        );
+    }));
+    let _ = apply_relay_recovery_decision(
+        &registry,
+        &shared,
+        &provider,
+        &fixture.decision,
+        None,
+        RelayRecoveryApplySource::ProbeAutoHeal,
+    )
+    .await;
+    drop(hook);
+    assert!(
+        !fixture.watcher_cancel.load(Ordering::Acquire),
+        "a live identity-matched delivery lease must veto the committed watcher cancel"
+    );
+    assert!(shared.tmux_watchers.contains_key(&channel));
+    assert!(!fixture.token.cancelled.load(Ordering::Relaxed));
+    assert!(super::super::inflight::load_inflight_state(&provider, channel.get()).is_some());
+
+    // Arm B: identity-matched lease whose deadline already elapsed -> proceeds.
+    clear_auto_heal_attempts_for_tests();
+    let (registry, shared) = registry_with_shared(provider.clone()).await;
+    let channel = ChannelId::new(5_071_011);
+    let fixture = dead_frontier_fixture(
+        &shared,
+        &root_dir,
+        &provider,
+        channel,
+        MessageId::new(5_071_111),
+        "AgentDesk-codex-5071-lease-expired",
+        "lease-expired",
+    )
+    .await;
+    let hook_shared = Arc::clone(&shared);
+    let hook_provider = provider.clone();
+    let hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+        let key = live_turn_delivery_lease_key(&hook_shared, &hook_provider, channel);
+        assert!(hook_shared.delivery_lease(channel).try_acquire(
+            key,
+            super::super::LeaseHolder::Sink,
+            0,
+            128,
+            // Strictly in the past on the same monotonic clock the fence reads,
+            // which only moves forward from here.
+            super::super::lease_now_ms().saturating_sub(1),
+        ));
+    }));
+    let _ = apply_relay_recovery_decision(
+        &registry,
+        &shared,
+        &provider,
+        &fixture.decision,
+        None,
+        RelayRecoveryApplySource::ProbeAutoHeal,
+    )
+    .await;
+    drop(hook);
+    assert!(
+        fixture.watcher_cancel.load(Ordering::Acquire),
+        "an expired lease is a dead holder and must not strand the watcher"
+    );
+    assert!(!shared.tmux_watchers.contains_key(&channel));
+    assert!(fixture.token.cancelled.load(Ordering::Relaxed));
+
+    // Arm C: a live lease belonging to a DIFFERENT turn key -> proceeds.
+    clear_auto_heal_attempts_for_tests();
+    let (registry, shared) = registry_with_shared(provider.clone()).await;
+    let channel = ChannelId::new(5_071_012);
+    let fixture = dead_frontier_fixture(
+        &shared,
+        &root_dir,
+        &provider,
+        channel,
+        MessageId::new(5_071_112),
+        "AgentDesk-codex-5071-lease-foreign",
+        "lease-foreign",
+    )
+    .await;
+    let hook_shared = Arc::clone(&shared);
+    let hook_provider = provider.clone();
+    let hook = set_destructive_cancel_post_gate_hook_for_tests(Arc::new(move || {
+        let live = live_turn_delivery_lease_key(&hook_shared, &hook_provider, channel);
+        let foreign = super::super::DeliveryLeaseKey::new_for_site(
+            channel,
+            hook_shared.restart.current_generation,
+            5_071_912,
+            None,
+            None,
+            "s4_delivery_fence_test.foreign",
+        );
+        assert_ne!(live, foreign, "arm C needs a genuinely different turn key");
+        assert!(hook_shared.delivery_lease(channel).try_acquire(
+            foreign,
+            super::super::LeaseHolder::Sink,
+            0,
+            128,
+            super::super::lease_now_ms().saturating_add(super::super::DELIVERY_LEASE_DEADLINE_MS),
+        ));
+    }));
+    let _ = apply_relay_recovery_decision(
+        &registry,
+        &shared,
+        &provider,
+        &fixture.decision,
+        None,
+        RelayRecoveryApplySource::ProbeAutoHeal,
+    )
+    .await;
+    drop(hook);
+    assert!(
+        fixture.watcher_cancel.load(Ordering::Acquire),
+        "another turn's delivery lease is not this destruction's business"
     );
     assert!(!shared.tmux_watchers.contains_key(&channel));
     assert!(fixture.token.cancelled.load(Ordering::Relaxed));
@@ -1207,6 +1405,148 @@ async fn reattach_idle_tmux_clear_release_publishes_completion_event() {
         super::super::inflight::load_inflight_state(&provider, channel.get()).is_none(),
         "idle-tmux cleanup must clear stale inflight after publishing the release edge"
     );
+}
+
+/// #5071 relay-tail S2: the destructive idle-clear gate's three-valued reading
+/// of `unread_bytes`, at the predicate both lanes share.
+#[test]
+fn unread_tail_is_proven_drained_only_for_a_measured_zero() {
+    assert!(
+        unread_tail_is_proven_drained(Some(0)),
+        "a measured empty tail is the only proof the gates accept"
+    );
+    assert!(
+        !unread_tail_is_proven_drained(None),
+        "an unmeasured tail is unknown, not drained"
+    );
+    assert!(
+        !unread_tail_is_proven_drained(Some(1)),
+        "a measured non-empty tail is live relay evidence"
+    );
+}
+
+/// #5071 relay-tail S2: the same table driven through the whole
+/// `ReattachWatcher` legacy manual lane, because the polarity that matters is
+/// whether the DESTRUCTIVE branch opens — not what the predicate returns.
+///
+/// `None` is the added row. It reaches this lane whenever the tail could not be
+/// measured against the row's frontier, and the companion
+/// `idle_tmux_repair_has_unrelayed_tail_answer` is blind in the same conditions,
+/// so an opened branch here would retire the mailbox token and the inflight row
+/// with neither witness having measured anything.
+#[tokio::test]
+async fn reattach_idle_tmux_clear_requires_a_measured_drained_tail() {
+    let cases: Vec<(&str, Option<u64>, bool)> = vec![
+        ("measured drained tail retires the idle turn", Some(0), true),
+        ("unmeasured tail must not retire the idle turn", None, false),
+        (
+            "measured waiting tail must not retire the idle turn",
+            Some(128),
+            false,
+        ),
+    ];
+    for (index, (label, unread_bytes, expect_cleared)) in cases.into_iter().enumerate() {
+        let _guard = auto_heal_test_lock().lock().await;
+        clear_auto_heal_attempts_for_tests();
+        let (_root_guard, root_dir) = isolated_agentdesk_root();
+        let provider = ProviderKind::Claude;
+        let (registry, shared) = registry_with_shared(provider.clone()).await;
+        let offset = index as u64;
+        let channel = ChannelId::new(4_099_100 + offset);
+        let user_msg = MessageId::new(4_099_200 + offset);
+        let tmux = format!("AgentDesk-claude-4099-s2-unread-{index}");
+        let output_path = root_dir.path().join(format!("s2-unread-{index}.jsonl"));
+        let body = "{\"type\":\"system\",\"subtype\":\"turn_duration\",\"session_id\":\"s\"}\n";
+        std::fs::write(&output_path, body).expect("write ready output fixture");
+        let output_len = std::fs::metadata(&output_path)
+            .expect("output fixture metadata")
+            .len();
+        let token = start_test_turn(&shared, channel, user_msg).await;
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+
+        let mut state = super::super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel.get(),
+            None,
+            1,
+            user_msg.get(),
+            4_099_300 + offset,
+            "idle tmux cleanup".to_string(),
+            None,
+            Some(tmux.clone()),
+            Some(output_path.to_string_lossy().to_string()),
+            None,
+            output_len,
+        );
+        state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+        super::super::inflight::save_inflight_state(&state).expect("save idle-clear inflight");
+
+        let snapshot = RelayHealthSnapshot {
+            provider: provider.as_str().to_string(),
+            channel_id: channel.get(),
+            active_turn: RelayActiveTurn::Foreground,
+            tmux_session: Some(tmux.clone()),
+            tmux_alive: Some(true),
+            bridge_inflight_present: true,
+            mailbox_has_cancel_token: true,
+            mailbox_active_user_msg_id: Some(user_msg.get()),
+            mailbox_turn_started_at_ms: None,
+            last_capture_offset: Some(output_len),
+            last_relay_offset: output_len,
+            unread_bytes,
+            desynced: true,
+            ..snapshot()
+        };
+        let decision = plan_relay_recovery(&snapshot, RelayStallState::TmuxAliveRelayDead, 1_000);
+        assert_eq!(
+            decision.action,
+            RelayRecoveryActionKind::ReattachWatcher,
+            "{label}: the tail term must not move the planned action"
+        );
+        // The tail guard objects in none of the three rows, so `unread_bytes` is
+        // the only term that differs between them.
+        assert!(
+            !idle_tmux_repair_has_unrelayed_tail_answer(&state),
+            "{label}: fixture must keep the companion tail guard silent"
+        );
+
+        let result = apply_relay_recovery_decision(
+            &registry,
+            &shared,
+            &provider,
+            &decision,
+            None,
+            RelayRecoveryApplySource::ProbeAutoHeal,
+        )
+        .await;
+
+        if expect_cleared {
+            assert_eq!(result.status, "cleared_idle_tmux_stale_turn", "{label}");
+            assert!(result.removed_mailbox_token, "{label}");
+            assert!(token.cancelled.load(Ordering::Relaxed), "{label}");
+            assert!(
+                super::super::inflight::load_inflight_state(&provider, channel.get()).is_none(),
+                "{label}: the destructive lane clears the row it retired"
+            );
+        } else {
+            assert_ne!(
+                result.status, "cleared_idle_tmux_stale_turn",
+                "{label}: the destructive lane must stay closed"
+            );
+            assert!(
+                !result.removed_mailbox_token,
+                "{label}: no mailbox token may be retired"
+            );
+            assert!(
+                !token.cancelled.load(Ordering::Relaxed),
+                "{label}: the turn behind the unproven tail must survive"
+            );
+            assert!(
+                super::super::inflight::load_inflight_state(&provider, channel.get()).is_some(),
+                "{label}: the inflight row must survive for the non-destructive path"
+            );
+        }
+    }
 }
 
 #[test]

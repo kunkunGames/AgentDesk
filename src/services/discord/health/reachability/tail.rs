@@ -1,6 +1,6 @@
 //! Bounded incremental tail reader — 4987 S1 (#5071 T4-B1).
 //!
-//! The obligation prober T4-B2 adds needs to read what a transcript grew by
+//! The obligation prober T4-B2c wires needs to read what a transcript grew by
 //! since the last tick, cheaply, without ever concluding "nothing to see" from
 //! a file it is no longer looking at. This file is that read and nothing else:
 //! it returns raw bytes and the byte range they came from.
@@ -54,8 +54,7 @@ impl TailCursor {
 
     /// The cursor to use next tick after a read that ended at `end`.
     ///
-    /// No production caller as of #5071 T4-B2, and not by oversight: the
-    /// observation task advances to `ObligationScan::next_offset`, which is
+    /// The production observation task advances to `ObligationScan::next_offset`, which is
     /// deliberately BEHIND the read end whenever the chunk ended mid-line, so
     /// the partial line is re-read whole. This helper is the unconditional
     /// advance, correct only where framing cannot defer, and it stays because
@@ -78,6 +77,7 @@ pub(in crate::services::discord) enum TailOutcome {
         bytes: Vec<u8>,
         start: u64,
         end: u64,
+        observed_len: u64,
         cap_truncated: bool,
     },
     /// The path now names a different file than the cursor was established
@@ -182,6 +182,7 @@ pub(in crate::services::discord) fn read_incremental(
         bytes,
         start: cursor.next_offset,
         end: cursor.next_offset + to_read,
+        observed_len: len,
         cap_truncated,
     }
 }
@@ -225,6 +226,7 @@ mod tests {
             bytes,
             start,
             end,
+            observed_len,
             cap_truncated,
         } = read_incremental(&path, cursor)
         else {
@@ -232,6 +234,7 @@ mod tests {
         };
         assert_eq!(bytes, b"first\n");
         assert_eq!((start, end), (0, 6));
+        assert_eq!(observed_len, 6);
         assert!(!cap_truncated);
 
         append(&path, b"second\n");
@@ -239,6 +242,7 @@ mod tests {
             bytes,
             start,
             end,
+            observed_len,
             cap_truncated,
         } = read_incremental(&path, cursor.advanced_to(end))
         else {
@@ -246,6 +250,7 @@ mod tests {
         };
         assert_eq!(bytes, b"second\n");
         assert_eq!((start, end), (6, 13));
+        assert_eq!(observed_len, 13);
         assert!(!cap_truncated);
     }
 
@@ -262,6 +267,7 @@ mod tests {
                 bytes: Vec::new(),
                 start: 5,
                 end: 5,
+                observed_len: 5,
                 cap_truncated: false,
             }
         );
@@ -288,6 +294,7 @@ mod tests {
                 bytes,
                 start,
                 end,
+                observed_len,
                 cap_truncated,
             } = read_incremental(&path, cursor_at(&path, 0))
             else {
@@ -296,9 +303,57 @@ mod tests {
             let expected_read = available.min(TAIL_READ_CAP_BYTES);
             assert_eq!(bytes.len() as u64, expected_read);
             assert_eq!((start, end), (0, expected_read));
+            assert_eq!(observed_len, available);
             assert_eq!(
                 cap_truncated, expected_truncated,
                 "unexpected truncation at {available} available bytes"
+            );
+        }
+    }
+
+    /// The cap bounds the UNREAD REMAINDER, not the file.
+    ///
+    /// Every case above starts at offset 0, where `len - next_offset` and `len`
+    /// are the same number, so the whole boundary is pinned in the one position
+    /// that cannot tell them apart. Measured: with the cases above as the only
+    /// coverage, reading the cap against `len` instead of `available` leaves the
+    /// suite green. A second tick — the shape every real tick after the first
+    /// has — separates them, and re-pins `>` against `>=` at that offset.
+    #[test]
+    fn the_read_cap_measures_the_unread_remainder_not_the_file_length() {
+        let dir = TempDir::new().expect("tempdir");
+        // Consumed by an earlier tick, so `len` overshoots `available` by this
+        // much in every case below.
+        const CONSUMED: u64 = 10;
+        let cases = [
+            (TAIL_READ_CAP_BYTES - 1, false),
+            (TAIL_READ_CAP_BYTES, false),
+            (TAIL_READ_CAP_BYTES + 1, true),
+        ];
+
+        for (remaining, expected_truncated) in cases {
+            let path = dir.path().join(format!("transcript-{remaining}.jsonl"));
+            write(&path, &vec![b'x'; (CONSUMED + remaining) as usize]);
+
+            let TailOutcome::Read {
+                bytes,
+                start,
+                end,
+                cap_truncated,
+                observed_len,
+            } = read_incremental(&path, cursor_at(&path, CONSUMED))
+            else {
+                panic!("expected a read with {remaining} bytes remaining");
+            };
+            let expected_read = remaining.min(TAIL_READ_CAP_BYTES);
+            assert_eq!(bytes.len() as u64, expected_read);
+            assert_eq!((start, end), (CONSUMED, CONSUMED + expected_read));
+            // The two quantities this test separates: the full file length vs
+            // the capped read window.
+            assert_eq!(observed_len, CONSUMED + remaining);
+            assert_eq!(
+                cap_truncated, expected_truncated,
+                "unexpected truncation with {remaining} bytes remaining"
             );
         }
     }
@@ -309,6 +364,7 @@ mod tests {
             bytes: vec![b'x'; 8],
             start: 0,
             end: 8,
+            observed_len: 9,
             cap_truncated: true,
         };
         assert_eq!(

@@ -80,7 +80,6 @@ grandfathered_baseline_paths = [
   "src/server/routes/v1.rs",
   "src/services/auto_queue.rs",
   "src/services/auto_queue/activate_command.rs",
-  "src/services/auto_queue/cancel_run.rs",
   "src/services/claude.rs",
   "src/services/claude_tui/input.rs",
   "src/services/codex.rs",
@@ -163,6 +162,13 @@ grandfathered_baseline_paths = [
 # All former grandfathered paths were promoted to explicit tracked decisions in #4519.
 # The empty array is retained as a closed admission surface: new giants must use [[entry]].
 grandfathered = []
+
+[[entry]]
+file = "src/services/discord/tmux_watcher_registry.rs"
+decision = "shrink"
+owner = "discord-relay"
+deadline = "2026-10-31"
+decompose_issue = "#5457"
 
 [[entry]]
 file = "src/cli/client.rs"
@@ -418,13 +424,6 @@ decompose_issue = "#4711"
 
 [[entry]]
 file = "src/services/auto_queue/activate_command.rs"
-decision = "shrink"
-owner = "automation-pipeline"
-deadline = "2027-01-31"
-decompose_issue = "#4711"
-
-[[entry]]
-file = "src/services/auto_queue/cancel_run.rs"
 decision = "shrink"
 owner = "automation-pipeline"
 deadline = "2027-01-31"
@@ -717,6 +716,15 @@ file = "src/services/discord/router/intake_gate.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
+
+[[entry]]
+# Crossed the threshold when #5071 T4-B6 wired the composed relay verdict
+# (RelayVerdictSource polarity switch) into the per-channel snapshot composer.
+file = "src/services/discord/health/snapshot.rs"
+decision = "shrink"
+owner = "discord-relay"
+deadline = "2027-02-28"
+decompose_issue = "#5447"
 
 [[entry]]
 # #3721 first-batch promotion: health recovery surface combines stop/cancel,

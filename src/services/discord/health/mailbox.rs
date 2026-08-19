@@ -3,12 +3,19 @@ use serde::Serialize;
 use poise::serenity_prelude::ChannelId;
 
 use crate::services::discord::SharedData;
-use crate::services::discord::relay_health::{RelayHealthSnapshot, RelayStallState};
+use crate::services::discord::relay_health::{
+    FrontierProvenanceReport, RelayHealthSnapshot, RelayStallState,
+};
 use crate::services::provider::ProviderKind;
 use crate::services::turn_orchestrator::ChannelMailboxSnapshot;
 use crate::services::turn_orchestrator::registry_purge::MailboxPurgeOutcome;
 
 use super::HealthRegistry;
+// #5071 T4-B6: `health::reachability` is `#[cfg(unix)]`, so every item this file
+// takes from it — the `RelayVerdictReport` import and the field typed by it — is
+// gated the same way. Windows keeps the pre-B6 entry, which had no such field.
+#[cfg(unix)]
+use super::reachability::composite::RelayVerdictReport;
 use super::recovery::ProviderMailboxState;
 use super::stall_verdict::StallVerdict;
 
@@ -28,6 +35,18 @@ pub(super) struct MailboxHealthSnapshot {
     pub(super) process_present: bool,
     pub(super) active_dispatch_present: bool,
     pub(super) stall_shadow_verdict: Option<StallVerdict>,
+    /// #5071 T4-B6 (4987 §4.4): the composed relay verdict for this channel.
+    /// Published in both `RelayVerdictSource` modes; its
+    /// `governs_health_polarity` field says whether it also decided anything.
+    #[cfg(unix)]
+    pub(super) reachability: RelayVerdictReport,
+    /// #5071 relay-tail S1 (I-4): which witnesses produced this channel's
+    /// frontier reading, and which E2 hypothesis the pair is consistent with.
+    /// Published beside the relay-health snapshot rather than inside it: this
+    /// entry is a serialization surface, while `RelayHealthSnapshot` is an
+    /// input to `RelayStallClassifier` and to the recovery decisions, and an
+    /// observation-only field has no business within their reach.
+    pub(super) frontier_provenance: FrontierProvenanceReport,
     pub(super) relay_stall_state: RelayStallState,
     pub(super) relay_health: RelayHealthSnapshot,
 }

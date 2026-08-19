@@ -430,8 +430,24 @@ mod tests {
         StallWatchdogLivenessAction, StallWatchdogLivenessDecision, StallWatchdogLivenessEvidence,
     };
     use super::*;
+    // #5071 T4-B6: `health::reachability` is `#[cfg(unix)]`, and so is the
+    // `MailboxHealthSnapshot::reachability` field these build. Windows keeps the
+    // pre-B6 detail entry, which carried no composed verdict to assert on.
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::composite::{
+        RelayVerdictReport, compose_relay_verdict,
+    };
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::external_verdict::ExternalRelayVerdict;
+    #[cfg(unix)]
+    use crate::services::discord::health::reachability::verdict::{
+        ReachabilityUnknownReason, ReachabilityVerdict,
+    };
     use crate::services::discord::inflight::{InflightTurnState, RelayOwnerKind, TurnSource};
-    use crate::services::discord::relay_health::RelayStallState;
+    use crate::services::discord::relay_health::{
+        CoordFrontierObservation, DurableFrontierObservation, FrontierProvenance,
+        FrontierProvenanceReport, RelayStallState,
+    };
 
     const FIXTURE_UPDATED_AT: &str = "2026-07-11 12:00:00";
 
@@ -546,6 +562,13 @@ mod tests {
             unread_bytes: Some(10),
             relay_stale: true,
             capture_lagged: false,
+            // #5071 relay-tail S1 (I-4): an attached fixture's coordinate has
+            // advanced to the same offset the fields above report. Descriptive
+            // only — no predicate in this suite reads it.
+            frontier_provenance: FrontierProvenance::observe(
+                CoordFrontierObservation::Advanced { offset: 10 },
+                DurableFrontierObservation::RowAbsent,
+            ),
         }
     }
 
@@ -1351,11 +1374,68 @@ mod tests {
             process_present: false,
             active_dispatch_present: false,
             stall_shadow_verdict: None,
+            #[cfg(unix)]
+            reachability: RelayVerdictReport::of(
+                &compose_relay_verdict(
+                    ReachabilityVerdict::unknown(
+                        ReachabilityUnknownReason::TranscriptUnresolved,
+                        30,
+                    ),
+                    ExternalRelayVerdict::Unknown,
+                ),
+                false,
+            ),
+            // #5071 relay-tail S1 (I-4): the E2 shape — no coordinate entry
+            // while a durable row still names a relayed offset.
+            frontier_provenance: FrontierProvenanceReport::of(
+                FrontierProvenance::observe(
+                    CoordFrontierObservation::Absent,
+                    DurableFrontierObservation::observe(Some(4_096), Some(7), None),
+                ),
+                None,
+            ),
             relay_stall_state: RelayStallState::Healthy,
             relay_health: relay_fixture(),
         };
 
         let serialized = serde_json::to_value(mailbox).expect("serialize health mailbox");
         assert_eq!(serialized["stall_shadow_verdict"], serde_json::Value::Null);
+        // #5071 relay-tail S1 (I-4): the two witnesses reach the detail surface
+        // as two fields, and the hypothesis they discriminate rides beside them.
+        assert_eq!(
+            serialized["frontier_provenance"]["coord_observation"]["kind"],
+            "absent"
+        );
+        // r1 review (legA P1-1, legB P2-2): with no coordinate entry there is
+        // no live generation for the row's to be compared against, so the
+        // durable witness is `generation_unresolved` — H1's actual production
+        // shape — and it is NOT reported as an agreement it never made.
+        assert_eq!(
+            serialized["frontier_provenance"]["durable_observation"]["kind"],
+            "generation_unresolved"
+        );
+        assert_eq!(
+            serialized["frontier_provenance"]["hypothesis"],
+            "coord_entry_absent_with_durable_row"
+        );
+        assert!(
+            serialized["frontier_provenance"]["counterpart_coord_observation"].is_null(),
+            "a channel off any parent/thread axis reports no counterpart"
+        );
+        // #5071 T4-B6 (4987 §4.4): the composed verdict is published on the
+        // same detail entry, and under `Structural` it announces that it
+        // decided nothing.
+        #[cfg(unix)]
+        {
+            assert_eq!(serialized["reachability"]["verdict"], "unknown");
+            assert_eq!(
+                serialized["reachability"]["reason"],
+                "transcript_unresolved"
+            );
+            assert_eq!(
+                serialized["reachability"]["governs_health_polarity"],
+                serde_json::Value::Bool(false)
+            );
+        }
     }
 }

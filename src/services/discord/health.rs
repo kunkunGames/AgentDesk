@@ -24,12 +24,16 @@ mod headless_turn;
 pub(in crate::services::discord) mod liveness_authority;
 pub(in crate::services::discord) mod mailbox;
 mod provider_probe;
-// #5071 T4-B1 (4987 S1, first half): the relay-reachability observation
-// library. Unix-gated because its transcript coordinate is the `(dev, ino)`
+// #5071 T4-B2c (4987 S1): the relay-reachability observation library and
+// task. Unix-gated because its transcript coordinate is the `(dev, ino)`
 // file identity of 4987 §-1.3, and no stable Windows equivalent exists through
 // `std::fs::Metadata`; the relay transport it observes (`session_relay_sink`)
-// is `#[cfg(unix)]` already. INACTIVE — nothing constructs or consumes it until
-// T4-B2 wires the observation task, so production verdicts are unchanged.
+// is `#[cfg(unix)]` already. It records facts only: the B2c observation task
+// writes obligations to the ledger, and `snapshot.rs` calls
+// `reachability::divergence::observe_row_coordinate_divergence` on the
+// production `cfg(unix)` health-poll path (T4-B4) for a descriptive record.
+// B6 remains the first slice allowed to compose any of it into a production
+// verdict, so production verdicts are unchanged.
 #[cfg(unix)]
 pub(in crate::services::discord) mod reachability;
 #[path = "health/rebind_request.rs"]
@@ -90,7 +94,7 @@ pub use recovery::{
     stop_runtime_turn_preserving_watcher,
 };
 pub(crate) use recovery::{
-    channel_has_active_turn, clear_resume_runtime_owner_after_death,
+    STALL_WATCHDOG_INTERVAL_SECS, channel_has_active_turn, clear_resume_runtime_owner_after_death,
     rebind_channel_provider_session, release_zombie_foreground_turn_by_tmux_name,
     resume_runtime_for_channel, retain_resume_runtime_owner_before_teardown,
     stop_provider_channel_runtime_with_policy,
@@ -205,10 +209,66 @@ pub fn bot_token_reload_scopes() -> BotTokenReloadScopes {
     }
 }
 
+/// Boot-relative age at which a provider's unfinished reconcile stops being
+/// reported as in-progress and is promoted to a named stalled diagnosis (#5449).
+/// The promotion does not release the deploy block — it only bounds how long the
+/// block stays anonymous.
+///
+/// Also reused as the startup-doctor rearm window
+/// (`STARTUP_DOCTOR_REARM_WINDOW`). #5071 S0 r2 F4: that sharing is NOT an
+/// exclusivity proof, and an earlier version of this doc claimed one. The two
+/// clocks have different origins — this age runs from the provider's
+/// `RestartLifecycle::recovery_started_at`, stamped when its `SharedData` is
+/// built and therefore already ticking before it registers, while the rearm
+/// window runs from the barrier's release — so a provider whose reconcile is
+/// already old can register into a still-open rearm window and be reported as
+/// stalled while that window runs.
+///
+/// The rearm does NOT keep every boot from pairing a `reconcile_stalled`
+/// reason with a stale no-provider skip (#5071 S0 r3/r4 review):
+///   • the rearm poll replaces the skip when a poll observes a registration
+///     while the window is still open — `startup_doctor_rearm_due` checks
+///     expiry before the generation, so a registration that no poll observes
+///     before expiry (including one landing inside the final poll interval)
+///     is given up;
+///   • if none ever registers, `provider_probe` has no registered provider to
+///     attribute a `provider:<name>:reconcile_stalled` reason to — an empty
+///     registry reports `no_providers_registered` instead;
+///   • once the window is given up the stale skip persists for the rest of
+///     the boot beside that provider's reasons; deploys are then guarded in
+///     `_defaults.sh` by `_health_json_names_a_provider_runtime`, which
+///     refuses the no-provider rescue when the health body names a provider
+///     runtime, and by the `reconcile_stalled` deny, which rejects such a
+///     body independently of any skip.
+pub(in crate::services::discord) const RECONCILE_STALL_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(180);
+
+/// Whether this boot's startup doctor found an empty provider registry when the
+/// reconcile barrier released. Single writer: the startup-doctor skip branch.
+/// Read by the reconcile-stall WARN, which cannot reach the registry from a
+/// per-provider probe, so that a stalled reconcile which also lost its startup
+/// diagnostic is distinguishable from one that did not (#5449).
+static STARTUP_DOCTOR_SAW_EMPTY_REGISTRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(in crate::services::discord) fn note_startup_doctor_saw_empty_registry() {
+    STARTUP_DOCTOR_SAW_EMPTY_REGISTRY.store(true, Ordering::Release);
+}
+
+pub(in crate::services::discord) fn startup_doctor_saw_empty_registry() -> bool {
+    STARTUP_DOCTOR_SAW_EMPTY_REGISTRY.load(Ordering::Acquire)
+}
+
 /// Registry that providers register with so the unified axum API can query all of them.
 /// Also holds Discord HTTP clients for agent-to-agent message routing.
 pub struct HealthRegistry {
     providers: tokio::sync::Mutex<Vec<ProviderEntry>>,
+    /// Monotonic count of accepted provider registrations. `providers` has no
+    /// notify/watch channel and every one of its observers is a pull-mode
+    /// reader, so the startup doctor polls this counter to notice a
+    /// registration that landed after it had already decided there was nothing
+    /// to diagnose (#5449). Duplicate-ignored registrations do not advance it.
+    registrations: AtomicU64,
     started_at: Instant,
     /// Wall-clock (Unix seconds) at which this dcserver process booted.
     /// `started_at` is a monotonic `Instant` and cannot be compared against
@@ -271,6 +331,7 @@ impl HealthRegistry {
     pub fn new() -> Self {
         Self {
             providers: tokio::sync::Mutex::new(Vec::new()),
+            registrations: AtomicU64::new(0),
             started_at: Instant::now(),
             started_at_unix: chrono::Utc::now().timestamp(),
             discord_http: tokio::sync::Mutex::new(Vec::new()),
@@ -360,6 +421,9 @@ impl HealthRegistry {
             );
         }
         providers.push(ProviderEntry { name, shared, role });
+        // Bumped under the `providers` lock and after the push, so a reader that
+        // observes a new generation and then takes the lock sees the entry.
+        self.registrations.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(in crate::services::discord) async fn dm_default_agent_authorizes_private_channel(
@@ -401,6 +465,13 @@ impl HealthRegistry {
 
     pub(super) async fn registered_provider_count(&self) -> usize {
         self.providers.lock().await.len()
+    }
+
+    /// Snapshot of the accepted-registration counter. Lock-free on purpose: the
+    /// startup-doctor rearm poll must not contend with a provider that is trying
+    /// to register (#5449).
+    pub(super) fn registration_generation(&self) -> u64 {
+        self.registrations.load(Ordering::Acquire)
     }
 
     pub(in crate::services::discord) async fn shared_for_provider(

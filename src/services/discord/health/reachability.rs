@@ -1,18 +1,19 @@
-//! Relay reachability observation library (#5071 T4-B1 = 4987 S1, first half).
+//! Relay reachability observation (#5071 T4-B2c = 4987 S1 observation task).
 //!
-//! # This module is INACTIVE
-//!
-//! Nothing in production constructs, reads, or consumes anything below. There
-//! is no tick, no task, no health field, and no recovery input wired to it —
-//! T4-B2 adds the observation task, T4-B6 adds the health composition, and each
-//! of those is a separate reviewable landing. Consequently this slice changes
-//! **zero** production verdicts and must not be counted as "4987 S1 active".
-//! The `#![allow(dead_code)]` below is the honest spelling of exactly that: the
-//! blanket comes off when B2 lands the first consumer.
+//! Production now resolves and tails each registered watcher transcript and
+//! records canonical obligations plus its resume cursor in the durable ledger.
+//! `health/snapshot.rs` additionally reads [`divergence`] for a descriptive
+//! log record. Everything except [`composite`] is observation: no value in the
+//! other modules changes relay delivery, recovery, or health on its own.
 //!
 //! What lands here is the vocabulary plus the file-facing primitives every
 //! later slice reads through:
 //!
+//! * [`composite`] — T4-B6's judgment layer: the Tier A producer, 4987
+//!   §4.3-1's `worst(ReachabilityVerdict, ExternalRelayVerdict)`, and the
+//!   `RelayVerdictSource` switch that decides whether the product may change
+//!   the reported health polarity. It is the only module here with any
+//!   authority, and that authority is over polarity alone.
 //! * [`verdict`] — the `ReachabilityVerdict` type set (4987 §-1.3b, §4.1) and
 //!   its polarity, with no composition rule and no threshold.
 //! * [`discovery`] — the row-independent transcript resolution ladder of
@@ -25,6 +26,10 @@
 //!   with it is gated byte for byte against the golden corpus in
 //!   `tests/fixtures/relay_obligation/`. It frames bytes a caller already
 //!   read; it opens no file and reads no clock.
+//! * [`divergence`] — the 4987 §-1.5 row-coordinate ↔ resolved-coordinate
+//!   file-identity comparison (#5071 T4-B4). The ONE place in this tree that
+//!   sees the in-flight row's path, as a comparison operand only (I14);
+//!   descriptive outcomes, no verdict.
 //!
 //! # Row independence (4987 §-1.5 I14)
 //!
@@ -45,13 +50,12 @@
 //! surface here is `authorizes_destructive_action()` returning false on every
 //! variant, and a source lint. It is not a sealed capability.
 
-// See the module docs: this is an inactive library by design, so every item is
-// unreachable from production until T4-B2 wires the observation task. Remove
-// this blanket in that slice rather than letting it outlive the wiring.
-#![allow(dead_code)]
-
+pub(in crate::services::discord) mod composite;
 pub(in crate::services::discord) mod discovery;
+pub(in crate::services::discord) mod divergence;
+pub(in crate::services::discord) mod external_verdict;
 pub(in crate::services::discord) mod ledger;
 pub(in crate::services::discord) mod obligation;
+pub(in crate::services::discord) mod observation;
 pub(in crate::services::discord) mod tail;
 pub(in crate::services::discord) mod verdict;

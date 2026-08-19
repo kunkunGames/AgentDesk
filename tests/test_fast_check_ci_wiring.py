@@ -18,7 +18,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "9be327684586ffccd0ccd5ac99db81cf4af45e6425bd4deab402fb9eb8f27a56"
+    "e32217629c135d5cbd16c8bb81eb58fe53e07cea0def203a5ce6380191f80263"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 MAIN_WORKFLOW = REPO_ROOT / ".github/workflows/ci-main.yml"
@@ -42,11 +42,21 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "cargo test --lib services::discord::health::reachability::verdict::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::health::reachability::discovery::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::health::reachability::tail::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::health::reachability::ledger::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::health::reachability::observation::tests -- --skip _pg --skip pg_ --skip postgres",
+    # #5071 T4-B5 (4987 S6): the watchdog sidecar intake lane.
+    "cargo test --lib services::discord::health::reachability::external_verdict::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::health::reachability::obligation::tests -- --skip _pg --skip pg_ --skip postgres",
+    "cargo test --lib services::discord::health::reachability::divergence::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib server::routes::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres",
+    # #5071 T4-B3 (4987 S2): the receipt projection index lane (union coverage
+    # and the frontier operand); the `delivery_record` filter above does not
+    # reach this module.
+    "cargo test --lib services::discord::outbound::receipt_index::tests"
+    " -- --skip _pg --skip pg_ --skip postgres",
     (
         "cargo test --lib services::discord::recovery_known_ids::recovery_known_message_ids_tests"
         " -- --skip _pg --skip pg_ --skip postgres"
@@ -402,7 +412,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"(?m)^  relay-authority-contract:\n"
             r"    name: relay-authority-contract\n"
             r"    runs-on: ubuntu-latest\n"
-            r"    timeout-minutes: 30\n"
+            r"    timeout-minutes: 50\n"
             r"    env:\n"
             r'      CARGO_PROFILE_DEV_DEBUG: "0"\n'
             r'      CARGO_PROFILE_TEST_DEBUG: "0"\n'
@@ -435,7 +445,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r'          CARGO_PROFILE_DEV_DEBUG: "0"\n'
             r'          CARGO_PROFILE_TEST_DEBUG: "0"\n'
             r"        shell: bash\n"
-            r"        timeout-minutes: 30\n"
+            r"        timeout-minutes: 45\n"
             r"        run: bash scripts/run_relay_authority_mutations\.sh$",
         )
 

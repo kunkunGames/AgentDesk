@@ -51,23 +51,41 @@ test-non-pg:
     cargo test --lib delivery_lease_key -- --skip _pg --skip pg_ --skip postgres
     # #5071 T0: keep the delivery-writer/terminal-fold contract seam in a curated lane.
     cargo test --lib services::discord::session_relay_sink::delivery_orchestration_tests -- --skip _pg --skip pg_ --skip postgres
-    # #5071 T4-B1 (4987 S1): the reachability library is inactive, so these are
-    # its ONLY execution. verdict pins the polarity (TransportUnknown is neither
-    # health nor a redelivery warrant); discovery pins fail-closed resolution and
-    # same-size/different-inode divergence; tail pins the 1 MiB per-tick cap and
-    # cursor identity revalidation.
+    # #5071 T4-B1/B2c (4987 S1): verdict pins the polarity (TransportUnknown is
+    # neither health nor a redelivery warrant); discovery pins fail-closed
+    # resolution and same-size/different-inode divergence; tail pins the 1 MiB
+    # per-tick cap and cursor identity revalidation. The ledger/observation
+    # lines pin atomic cursor+obligation commits and the production task seam.
     cargo test --lib services::discord::health::reachability::verdict::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::health::reachability::discovery::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::health::reachability::tail::tests -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib services::discord::health::reachability::ledger::tests -- --skip _pg --skip pg_ --skip postgres
+    cargo test --lib services::discord::health::reachability::observation::tests -- --skip _pg --skip pg_ --skip postgres
+    # #5071 T4-B5 (4987 S6): the watchdog sidecar intake. Pins that an incomplete
+    # read, a wrong incarnation and a regressed watchdog epoch all carry no
+    # authority, and that an accepted claim can only worsen. The Python half that
+    # fills those fields is in `scripts/ci-script-checks.sh`.
+    cargo test --lib services::discord::health::reachability::external_verdict::tests -- --skip _pg --skip pg_ --skip postgres
     # #5071 T4-B2a (4987 S1, second half + blocker B1'): canonical obligation
     # framing. This lane carries the RUST half of the Rust<->Python byte-equal
     # equivalence, so a Rust-only change to the obligation rule dies here in
     # ordinary CI; the Python half is in `scripts/ci-script-checks.sh`.
     cargo test --lib services::discord::health::reachability::obligation::tests -- --skip _pg --skip pg_ --skip postgres
+    # #5071 T4-B4 (4987 S4): row-vs-registry transcript divergence is compared
+    # by file identity, so the same-size/different-inode counterexample
+    # (4987 -1.4 #4) and the fail-closed stat arms are pinned in this lane.
+    cargo test --lib services::discord::health::reachability::divergence::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib services::discord::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib server::routes::e2e_control::tests -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib formatting -- --skip _pg --skip pg_ --skip postgres
     cargo test --lib delivery_record -- --skip _pg --skip pg_ --skip postgres
+    # #5071 T4-B3 (4987 S2): the read-only projection over the same store. The
+    # `delivery_record` filter above does not reach this module, and nothing in
+    # production constructs the index yet, so this line is its only execution.
+    # It pins the two operands of the 4987 section 3.2 subtraction: the receipt
+    # union (adjacent and overlapping ranges fold) and the durable frontier
+    # prefix (which answers alone when the receipt vector is empty).
+    cargo test --lib services::discord::outbound::receipt_index::tests -- --skip _pg --skip pg_ --skip postgres
     # #5191: the catch-up recovery dedup must cover the dequeue→claim window,
     # including a merged head's absorbed source ids, without letting an orphaned
     # reservation suppress a genuinely unanswered message.

@@ -100,6 +100,75 @@ GATEWAY_REASON_WITHOUT_STANDBY_BODY='{"ok":false,"status":"degraded","db":true,"
 HEALTHY_STANDBY_MIXED_BODY='{"ok":true,"status":"healthy","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":false,"degraded_reasons":["gateway_standby","disk_low_free_bytes:1"]}'
 HEALTHY_STANDBY_EMPTY_BODY='{"ok":true,"status":"healthy","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":false,"degraded_reasons":[]}'
 
+# ── #5071 S0b — the ONLY-predicates, element-wise ────────────────────────────
+# `_health_json_gateway_standby_only` and `_health_json_reconcile_only` carried
+# the SAME single-variable `read` defect S0 r3 fixed in the two ANY-predicates
+# below: the loop ran once with the WHOLE CSV in one variable, and their patterns
+# are `$`-anchored with a `[^:]+` name class that cannot span the joining comma,
+# so ANY body with more than one reason failed to match in the jq-less path while
+# jq matched it. S0 r3 left them because their divergence pointed fail-CLOSED and
+# neither was on the enumerated path; S0b put `health_json_is_ready` on the peer
+# deploy verdict, where a false "not standby" is a controller that cannot ever go
+# green on a settled standby peer and burns the whole verdict timeout.
+#
+# One `provider:<name>:gateway_standby` is emitted PER REGISTERED PROVIDER, so
+# the multi-reason body is the ORDINARY case, not an exotic one -- this is the
+# shape measured on the mac-mini peer (2026-08-18).
+MULTI_PROVIDER_STANDBY_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":true,"degraded_reasons":["provider:codex:gateway_standby","provider:claude:gateway_standby"]}'
+# Both element FORMS together (the bare reason and the per-provider one), to keep
+# the alternation covering each branch off the first position.
+MULTI_FORM_STANDBY_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":true,"degraded_reasons":["provider:codex:gateway_standby","gateway_standby","provider:claude:gateway_standby"]}'
+# ONLY must stay ONLY: a non-standby reason in the MIDDLE (neither first nor
+# last, so no positional accident can rescue it) has to REJECT. This is the case
+# a careless rewrite to an ANY test would flip, which would be far worse than the
+# defect being fixed -- it would pass a genuinely broken node.
+MULTI_STANDBY_WITH_INTRUDER_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":true,"degraded_reasons":["provider:codex:gateway_standby","disk_low_free_bytes:1","provider:claude:gateway_standby"]}'
+# An EMPTY element must reject in both modes (jq: "" fails the element test; the
+# CSV pattern requires at least one character per element), preserving the old
+# per-element `-n` guard.
+EMPTY_ELEMENT_STANDBY_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":true,"degraded_reasons":["provider:codex:gateway_standby","","provider:claude:gateway_standby"]}'
+# Multi-provider reconcile: same defect, same shape, on the other ONLY-predicate.
+MULTI_RECONCILE_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":false,"degraded":true,"degraded_reasons":["provider:codex:reconcile_in_progress","provider:claude:reconcile_in_progress"]}'
+# ...and its ONLY guard: a non-reconcile reason in the middle must reject.
+# `fully_recovered` is TRUE here on purpose, so the generic unrecovered allowance
+# in health_json_is_ready cannot supply the READY and mask the predicate.
+MULTI_RECONCILE_WITH_INTRUDER_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":false,"degraded":true,"degraded_reasons":["provider:codex:reconcile_in_progress","disk_low_free_bytes:1","provider:claude:reconcile_in_progress"]}'
+# A provider `<name>` containing a COMMA. The CSV join is lossy for it, so the
+# two modes cannot agree, and the ONLY-predicates are ALLOW tests: jq-less
+# resolves the ambiguity toward NOT matching (deploy blocked), which is the
+# fail-closed direction. Pinned per mode so the divergence stays deliberate --
+# closing it in the permissive direction would be a real regression, and the
+# element-boundary anchoring cannot be loosened to `[^:]+` without doing so.
+COMMA_NAME_STANDBY_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":true,"cluster_standby":true,"degraded":true,"degraded_reasons":["provider:odd,name:gateway_standby"]}'
+
+# ── #5071 S0 — jq/jq-less parity lock over degraded_reasons ELEMENTS ─────────
+# Both reason-scanning predicates added by S0 (`_health_json_has_reconcile_stalled`,
+# `_health_json_names_a_provider_runtime`) read the array through the jq-less CSV,
+# and both first shipped scanning it with `while IFS=, read -r reason`, which
+# assigns the WHOLE line to the single target variable — so the loop ran once with
+# the entire CSV in `$reason` and effectively tested only the array's FIRST
+# element. jq tests EVERY element, so each predicate silently disagreed with
+# itself across the two modes, in the permissive direction, whenever the reason it
+# looks for was not first. These bodies put it NOT first on purpose. Ordering is
+# not an invariant that could excuse it: `snapshot.rs` pushes the non-provider
+# `relay_verdict_*` reason (via `apply_relay_verdict_polarity`) BEFORE it extends
+# with the provider probe's reasons, so a leading non-provider reason is exactly
+# what the real detail body produces.
+#
+# (1) reconcile_stalled riding BEHIND a non-provider reason — must BLOCK.
+TRAILING_STALLED_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":false,"cluster_standby":false,"degraded":true,"degraded_reasons":["disk_low_free_bytes:123","provider:codex:reconcile_stalled"]}'
+# (1b) same, with a colon-bearing `Unsupported(_)` provider id (detail body keeps
+# the id verbatim), so the `.*` name match is exercised off the first element.
+TRAILING_STALLED_COLON_NAME_BODY='{"ok":false,"status":"degraded","db":true,"dashboard":true,"server_up":true,"fully_recovered":false,"cluster_standby":false,"degraded":true,"degraded_reasons":["disk_low_free_bytes:123","provider:prod-mini-01:custA:reconcile_stalled"]}'
+# (2) stale doctor_skipped artifact + a REAL but unhealthy provider named only by
+# a TRAILING reason — the #4348 rescue's premise is false, so it must be REFUSED.
+TRAILING_PROVIDER_STALE_SKIP_BODY='{"ok":false,"status":"unhealthy","db":true,"dashboard":true,"server_up":true,"fully_recovered":false,"cluster_standby":false,"degraded":true,"degraded_reasons":["disk_low_free_bytes:123","provider:codex:disconnected"],"startup_status":"doctor_skipped","latest_startup_doctor":{"available":true,"doctor_status":"skipped","skipped":true,"skipped_reason":"no_provider_runtimes_registered"}}'
+# (3) positive control — a GENUINELY provider-less node that also carries reasons.
+# Its registry-empty axis is the unprefixed `no_providers_registered`, so neither
+# marker matches and the #4348 rescue must still apply. Guards the fixes above
+# against over-matching (`no_providers_registered` must not read as `provider:`).
+GENUINE_NO_PROVIDER_REASONS_BODY='{"ok":false,"status":"unhealthy","db":true,"dashboard":true,"server_up":true,"fully_recovered":false,"cluster_standby":false,"degraded":true,"degraded_reasons":["no_providers_registered","disk_low_free_bytes:123"],"startup_status":"doctor_skipped","latest_startup_doctor":{"available":true,"doctor_status":"skipped","skipped":true,"skipped_reason":"no_provider_runtimes_registered"}}'
+
 run_gate_cases() {
   local mode="$1"
   echo "== Defect 1 gate — ${mode} path =="
@@ -207,6 +276,81 @@ run_gate_cases() {
     health_json_is_ready "$HEALTHY_STANDBY_MIXED_BODY" 1 1
   assert_rc "[$mode] contradictory healthy standby with empty reasons → NOT ready" 1 \
     health_json_is_ready "$HEALTHY_STANDBY_EMPTY_BODY" 1 1
+
+  # #5071 S0b — the ONLY-predicates must test EVERY element, not just read the
+  # whole CSV once. Before the fix every assertion in this group returned the
+  # opposite rc in the jq-less run: the ordinary multi-provider standby node read
+  # as NOT standby-only, so a controller without jq could not verify a settled
+  # standby peer at all.
+  assert_rc "[$mode] multi-provider standby → gateway_standby_only matches" 0 \
+    _health_json_gateway_standby_only "$MULTI_PROVIDER_STANDBY_BODY"
+  assert_rc "[$mode] multi-provider standby → READY" 0 \
+    health_json_is_ready "$MULTI_PROVIDER_STANDBY_BODY" 1 1
+  assert_rc "[$mode] multi-provider standby → READY under deploy flags" 0 \
+    health_json_is_ready "$MULTI_PROVIDER_STANDBY_BODY" 1 1 1
+  assert_rc "[$mode] both standby reason forms mixed → gateway_standby_only matches" 0 \
+    _health_json_gateway_standby_only "$MULTI_FORM_STANDBY_BODY"
+  # ONLY semantics preserved: one intruder anywhere rejects the whole array.
+  assert_rc "[$mode] standby reasons + middle intruder → gateway_standby_only REJECTS" 1 \
+    _health_json_gateway_standby_only "$MULTI_STANDBY_WITH_INTRUDER_BODY"
+  assert_rc "[$mode] standby reasons + middle intruder → NOT ready" 1 \
+    health_json_is_ready "$MULTI_STANDBY_WITH_INTRUDER_BODY" 1 1
+  assert_rc "[$mode] empty reason element → gateway_standby_only REJECTS" 1 \
+    _health_json_gateway_standby_only "$EMPTY_ELEMENT_STANDBY_BODY"
+  assert_rc "[$mode] multi-provider reconcile → reconcile_only matches" 0 \
+    _health_json_reconcile_only "$MULTI_RECONCILE_BODY"
+  assert_rc "[$mode] multi-provider reconcile → READY" 0 \
+    health_json_is_ready "$MULTI_RECONCILE_BODY" 1 1
+  assert_rc "[$mode] reconcile reasons + middle intruder → reconcile_only REJECTS" 1 \
+    _health_json_reconcile_only "$MULTI_RECONCILE_WITH_INTRUDER_BODY"
+  assert_rc "[$mode] reconcile reasons + middle intruder → NOT ready" 1 \
+    health_json_is_ready "$MULTI_RECONCILE_WITH_INTRUDER_BODY" 1 1
+
+  # Deliberate, documented jq/jq-less asymmetry on a comma-bearing provider name:
+  # the CSV cannot represent it unambiguously, and an ALLOW test resolves that
+  # toward REJECTING. jq sees the array element intact and accepts.
+  if [ "$mode" = "jq" ]; then
+    assert_rc "[$mode] comma-bearing provider name → gateway_standby_only matches" 0 \
+      _health_json_gateway_standby_only "$COMMA_NAME_STANDBY_BODY"
+  else
+    assert_rc "[$mode] comma-bearing provider name → gateway_standby_only REJECTS (fail-closed on a lossy CSV)" 1 \
+      _health_json_gateway_standby_only "$COMMA_NAME_STANDBY_BODY"
+  fi
+
+  # #5071 S0 (1) — a stalled reconcile must block from ANY position in the array,
+  # not just the first. Before the element-wise fix the jq-less run returned rc=0
+  # (deploy ALLOWED) on both of these while the jq run returned rc=1.
+  assert_rc "[$mode] trailing reconcile_stalled → has_reconcile_stalled matches" 0 \
+    _health_json_has_reconcile_stalled "$TRAILING_STALLED_BODY"
+  assert_rc "[$mode] trailing reconcile_stalled → NOT ready" 1 \
+    health_json_is_ready "$TRAILING_STALLED_BODY" 1 1
+  assert_rc "[$mode] trailing reconcile_stalled w/ colon-bearing name → matches" 0 \
+    _health_json_has_reconcile_stalled "$TRAILING_STALLED_COLON_NAME_BODY"
+  assert_rc "[$mode] trailing reconcile_stalled w/ colon-bearing name → NOT ready" 1 \
+    health_json_is_ready "$TRAILING_STALLED_COLON_NAME_BODY" 1 1
+  # Negative control — `reconcile_in_progress` is a different reason string and
+  # must stay allowed, so the deny above is not just "any reconcile blocks".
+  assert_rc "[$mode] reconcile_in_progress → has_reconcile_stalled does NOT match" 1 \
+    _health_json_has_reconcile_stalled "$TOP_LEVEL_RECONCILE_BODY"
+
+  # #5071 S0 (2) — a provider named only by a TRAILING reason still proves the
+  # registry is non-empty, so the stale doctor_skipped rescue must be refused.
+  # Before the fix the jq-less run granted it (rc=0) where jq refused.
+  assert_rc "[$mode] trailing provider reason → names_a_provider_runtime matches" 0 \
+    _health_json_names_a_provider_runtime "$TRAILING_PROVIDER_STALE_SKIP_BODY"
+  assert_rc "[$mode] trailing provider reason → rescue predicate REFUSES" 1 \
+    _health_json_unhealthy_only_no_provider_runtimes "$TRAILING_PROVIDER_STALE_SKIP_BODY"
+  assert_rc "[$mode] trailing provider reason + allow=1 → NOT ready" 1 \
+    health_json_is_ready "$TRAILING_PROVIDER_STALE_SKIP_BODY" 1 1 1
+
+  # #5071 S0 (3) — positive control: the genuine no-provider topology the #4348
+  # rescue was written for keeps it, reasons array and all.
+  assert_rc "[$mode] genuine no-provider reasons → names_a_provider_runtime does NOT match" 1 \
+    _health_json_names_a_provider_runtime "$GENUINE_NO_PROVIDER_REASONS_BODY"
+  assert_rc "[$mode] genuine no-provider reasons → rescue predicate matches" 0 \
+    _health_json_unhealthy_only_no_provider_runtimes "$GENUINE_NO_PROVIDER_REASONS_BODY"
+  assert_rc "[$mode] genuine no-provider reasons + allow=1 → READY" 0 \
+    health_json_is_ready "$GENUINE_NO_PROVIDER_REASONS_BODY" 1 1 1
 }
 
 # jq path (jq is present in this environment).

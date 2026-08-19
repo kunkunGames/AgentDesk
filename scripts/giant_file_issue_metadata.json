@@ -1,6 +1,10 @@
 {
-  "schema_version": 1,
-  "refreshed_at": "2026-08-13T09:14:55Z",
+  "schema_version": 2,
+  "refreshed_at": "2026-08-18T21:57:44Z",
+  "ratchets": {
+    "closed_deadline_entries": 79,
+    "transition_list_entries": 79
+  },
   "issues": [
     {
       "number": 4710,
@@ -132,6 +136,25 @@
       ],
       "files": [
         "src/services/kakao.rs"
+      "number": 5447,
+      "state": "open",
+      "title": "Decompose src/services/discord/health/snapshot.rs (prod-giant: 1022 LoC after T4-B6)",
+      "owners": [
+        "discord-relay"
+      ],
+      "files": [
+        "src/services/discord/health/snapshot.rs"
+      ]
+    },
+    {
+      "number": 5457,
+      "state": "open",
+      "title": "decompose tmux_watcher_registry.rs below the 1000-line prod ceiling (post S4 fence)",
+      "owners": [
+        "discord-relay"
+      ],
+      "files": [
+        "src/services/discord/tmux_watcher_registry.rs"
       ]
     }
   ]
