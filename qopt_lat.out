@@ -1,0 +1,16 @@
+                                                                                            QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1246.59..1246.71 rows=50 width=17) (actual time=1.849..1.857 rows=50 loops=1)
+   ->  Sort  (cost=1246.59..1247.26 rows=270 width=17) (actual time=1.848..1.852 rows=50 loops=1)
+         Sort Key: e.updated_at
+         Sort Method: quicksort  Memory: 26kB
+         ->  Nested Loop  (cost=0.42..1237.62 rows=270 width=17) (actual time=0.116..1.810 rows=50 loops=1)
+               ->  Seq Scan on auto_queue_runs r  (cost=0.00..13.38 rows=270 width=9) (actual time=0.019..0.033 rows=50 loops=1)
+                     Filter: (status = 'active'::text)
+               ->  Limit  (cost=0.42..4.52 rows=1 width=8) (actual time=0.035..0.035 rows=1 loops=50)
+                     ->  Index Only Scan using idx_auto_queue_entries_run_status_updated_at on auto_queue_entries e  (cost=0.42..41.46 rows=10 width=8) (actual time=0.035..0.035 rows=1 loops=50)
+                           Index Cond: ((run_id = r.id) AND (status = 'pending'::text))
+                           Heap Fetches: 50
+ Planning Time: 1.249 ms
+ Execution Time: 1.928 ms
+(13 rows)

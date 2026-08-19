@@ -1,0 +1,20 @@
+                                                                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=29.64..29.64 rows=1 width=40) (actual time=3.195..3.203 rows=50 loops=1)
+   ->  Sort  (cost=29.64..29.64 rows=1 width=40) (actual time=3.194..3.199 rows=50 loops=1)
+         Sort Key: ((SubPlan 1))
+         Sort Method: quicksort  Memory: 26kB
+         ->  Nested Loop Semi Join  (cost=0.41..29.62 rows=1 width=40) (actual time=0.153..3.119 rows=50 loops=1)
+               ->  Seq Scan on auto_queue_runs r  (cost=0.00..12.75 rows=1 width=32) (actual time=0.020..0.045 rows=50 loops=1)
+                     Filter: (status = 'active'::text)
+               ->  Index Only Scan using idx_auto_queue_entries_run_status_updated_at on auto_queue_entries e  (cost=0.41..8.43 rows=1 width=32) (actual time=0.042..0.042 rows=1 loops=50)
+                     Index Cond: ((run_id = r.id) AND (status = 'pending'::text))
+                     Heap Fetches: 50
+               SubPlan 1
+                 ->  Limit  (cost=0.41..8.43 rows=1 width=8) (actual time=0.018..0.019 rows=1 loops=50)
+                       ->  Index Only Scan using idx_auto_queue_entries_run_status_updated_at on auto_queue_entries e_1  (cost=0.41..8.43 rows=1 width=8) (actual time=0.018..0.018 rows=1 loops=50)
+                             Index Cond: ((run_id = r.id) AND (status = 'pending'::text))
+                             Heap Fetches: 50
+ Planning Time: 1.757 ms
+ Execution Time: 3.365 ms
+(17 rows)

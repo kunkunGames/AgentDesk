@@ -1,0 +1,21 @@
+                                                                          QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4781.62..4781.75 rows=50 width=16) (actual time=146.345..146.357 rows=50 loops=1)
+   ->  Sort  (cost=4781.62..4786.62 rows=2000 width=16) (actual time=146.343..146.350 rows=50 loops=1)
+         Sort Key: pr.min_updated_at
+         Sort Method: top-N heapsort  Memory: 26kB
+         ->  Hash Join  (cost=4353.22..4715.18 rows=2000 width=16) (actual time=129.272..141.971 rows=20000 loops=1)
+               Hash Cond: (r.id = pr.run_id)
+               ->  Seq Scan on auto_queue_runs r  (cost=0.00..343.74 rows=6939 width=8) (actual time=0.011..5.095 rows=20000 loops=1)
+                     Filter: (status = 'active'::text)
+               ->  Hash  (cost=4328.22..4328.22 rows=2000 width=16) (actual time=129.232..129.235 rows=20000 loops=1)
+                     Buckets: 32768 (originally 2048)  Batches: 1 (originally 1)  Memory Usage: 1222kB
+                     ->  Subquery Scan on pr  (cost=4288.22..4328.22 rows=2000 width=16) (actual time=116.417..123.593 rows=20000 loops=1)
+                           ->  HashAggregate  (cost=4288.22..4308.22 rows=2000 width=16) (actual time=116.416..121.532 rows=20000 loops=1)
+                                 Group Key: auto_queue_entries.run_id
+                                 Batches: 1  Memory Usage: 2065kB
+                                 ->  Seq Scan on auto_queue_entries  (cost=0.00..3885.30 rows=80584 width=16) (actual time=0.010..67.030 rows=200000 loops=1)
+                                       Filter: (status = 'pending'::text)
+ Planning Time: 1.353 ms
+ Execution Time: 146.867 ms
+(18 rows)

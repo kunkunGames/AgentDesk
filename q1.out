@@ -1,0 +1,26 @@
+                                                                           QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=130.73..130.74 rows=1 width=17) (actual time=446.654..446.668 rows=50 loops=1)
+   ->  Sort  (cost=130.73..130.74 rows=1 width=17) (actual time=446.652..446.662 rows=50 loops=1)
+         Sort Key: ((SubPlan 1))
+         Sort Method: quicksort  Memory: 26kB
+         ->  Nested Loop Semi Join  (cost=4.76..130.72 rows=1 width=17) (actual time=5.188..446.416 rows=50 loops=1)
+               ->  Index Scan using auto_queue_runs_pkey on auto_queue_runs r  (cost=0.38..109.90 rows=1 width=9) (actual time=0.009..23.745 rows=50000 loops=1)
+                     Filter: (status = 'active'::text)
+               ->  Bitmap Heap Scan on auto_queue_entries e  (cost=4.38..8.40 rows=1 width=9) (actual time=0.002..0.002 rows=0 loops=50000)
+                     Recheck Cond: ((r.id = run_id) AND (status <> ALL ('{skipped,cancelled}'::text[])))
+                     Filter: (status = 'pending'::text)
+                     Heap Blocks: exact=50
+                     ->  Bitmap Index Scan on uq_auto_queue_entry_card  (cost=0.00..4.38 rows=1 width=0) (actual time=0.002..0.002 rows=10 loops=50000)
+                           Index Cond: (run_id = r.id)
+               SubPlan 1
+                 ->  Aggregate  (cost=8.40..8.41 rows=1 width=8) (actual time=4.392..4.392 rows=1 loops=50)
+                       ->  Bitmap Heap Scan on auto_queue_entries e_1  (cost=4.38..8.40 rows=1 width=8) (actual time=0.292..3.762 rows=10000 loops=50)
+                             Recheck Cond: ((run_id = r.id) AND (status <> ALL ('{skipped,cancelled}'::text[])))
+                             Filter: (status = 'pending'::text)
+                             Heap Blocks: exact=7192
+                             ->  Bitmap Index Scan on uq_auto_queue_entry_card  (cost=0.00..4.38 rows=1 width=0) (actual time=0.273..0.273 rows=10000 loops=50)
+                                   Index Cond: (run_id = r.id)
+ Planning Time: 1.892 ms
+ Execution Time: 446.803 ms
+(23 rows)
