@@ -1,0 +1,23 @@
+                                                                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=516.41..516.54 rows=50 width=18) (actual time=2.232..2.240 rows=50 loops=1)
+   ->  Sort  (cost=516.41..516.54 rows=50 width=18) (actual time=2.231..2.235 rows=50 loops=1)
+         Sort Key: ((SubPlan 1))
+         Sort Method: quicksort  Memory: 26kB
+         ->  Nested Loop  (cost=73.92..515.00 rows=50 width=18) (actual time=1.166..2.182 rows=50 loops=1)
+               ->  HashAggregate  (cost=73.50..74.00 rows=50 width=6) (actual time=1.044..1.054 rows=50 loops=1)
+                     Group Key: e.run_id
+                     Batches: 1  Memory Usage: 24kB
+                     ->  Seq Scan on auto_queue_entries e  (cost=0.00..67.25 rows=2500 width=6) (actual time=0.007..0.628 rows=2500 loops=1)
+                           Filter: (status = 'pending'::text)
+               ->  Index Scan using auto_queue_runs_pkey on auto_queue_runs r  (cost=0.42..8.44 rows=1 width=10) (actual time=0.013..0.013 rows=1 loops=50)
+                     Index Cond: (id = e.run_id)
+                     Filter: (status = 'active'::text)
+               SubPlan 1
+                 ->  Limit  (cost=0.28..0.38 rows=1 width=8) (actual time=0.008..0.009 rows=1 loops=50)
+                       ->  Index Only Scan using idx_auto_queue_entries_run_status_updated_at on auto_queue_entries e_1  (cost=0.28..5.28 rows=50 width=8) (actual time=0.008..0.008 rows=1 loops=50)
+                             Index Cond: ((run_id = r.id) AND (status = 'pending'::text))
+                             Heap Fetches: 0
+ Planning Time: 1.470 ms
+ Execution Time: 2.354 ms
+(20 rows)

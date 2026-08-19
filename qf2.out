@@ -1,0 +1,22 @@
+                                                                               QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=411.29..411.42 rows=50 width=14) (actual time=3.099..3.107 rows=50 loops=1)
+   ->  Sort  (cost=411.29..411.42 rows=50 width=14) (actual time=3.098..3.102 rows=50 loops=1)
+         Sort Key: (min(e.updated_at))
+         Sort Method: quicksort  Memory: 26kB
+         ->  HashAggregate  (cost=409.38..409.88 rows=50 width=14) (actual time=3.043..3.051 rows=50 loops=1)
+               Group Key: e.run_id
+               Batches: 1  Memory Usage: 24kB
+               ->  Nested Loop  (cost=0.43..396.88 rows=2500 width=14) (actual time=0.029..2.542 rows=2500 loops=1)
+                     ->  Seq Scan on auto_queue_entries e  (cost=0.00..67.25 rows=2500 width=14) (actual time=0.009..0.857 rows=2500 loops=1)
+                           Filter: (status = 'pending'::text)
+                     ->  Memoize  (cost=0.43..5.25 rows=1 width=10) (actual time=0.000..0.000 rows=1 loops=2500)
+                           Cache Key: e.run_id
+                           Cache Mode: logical
+                           Hits: 2450  Misses: 50  Evictions: 0  Overflows: 0  Memory Usage: 6kB
+                           ->  Index Scan using auto_queue_runs_pkey on auto_queue_runs r  (cost=0.42..5.24 rows=1 width=10) (actual time=0.013..0.013 rows=1 loops=50)
+                                 Index Cond: (id = e.run_id)
+                                 Filter: (status = 'active'::text)
+ Planning Time: 1.092 ms
+ Execution Time: 3.227 ms
+(19 rows)

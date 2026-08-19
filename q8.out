@@ -1,0 +1,12 @@
+                                                                                        QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..13.34 rows=1 width=32) (actual time=0.185..2.642 rows=50 loops=1)
+   ->  Nested Loop Semi Join  (cost=0.42..13.34 rows=1 width=32) (actual time=0.184..2.628 rows=50 loops=1)
+         ->  Seq Scan on auto_queue_runs r  (cost=0.00..12.75 rows=1 width=32) (actual time=0.027..0.061 rows=50 loops=1)
+               Filter: (status = 'active'::text)
+         ->  Index Only Scan using idx_auto_queue_entries_run_status_updated_at on auto_queue_entries e  (cost=0.42..112.42 rows=2000 width=6) (actual time=0.049..0.049 rows=1 loops=50)
+               Index Cond: ((run_id = r.id) AND (status = 'pending'::text))
+               Heap Fetches: 0
+ Planning Time: 2.237 ms
+ Execution Time: 2.772 ms
+(9 rows)
