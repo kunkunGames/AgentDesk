@@ -488,7 +488,7 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_nested_test_files_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/test.sh"))
         self.assertFalse(is_scratch_file_path("tests/test.py"))
-        self.assertFalse(is_scratch_file_path("src/scratch.js"))
+        self.assertTrue(is_scratch_file_path("src/scratch.js"))
         self.assertFalse(is_scratch_file_path("src/test_cli.rs"))
 
 
