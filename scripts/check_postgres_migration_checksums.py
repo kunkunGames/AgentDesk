@@ -186,6 +186,8 @@ def parse_manifest(data: Any, source: str) -> tuple[dict[str, Migration], list[s
     if not isinstance(data, dict):
         return {}, [f"{source}: manifest must be a JSON object"]
     entries = data.get("protected_migrations")
+    if entries is None:
+        entries = data.get("migrations")
     if not isinstance(entries, list):
         return {}, [f"{source}: protected_migrations must be a list"]
 
