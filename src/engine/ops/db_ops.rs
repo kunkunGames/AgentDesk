@@ -585,13 +585,19 @@ fn skip_ws_and_comments_backward(sql: &str, target: usize) -> Option<usize> {
         }
 
         if sql[idx..].starts_with("--") {
-            let line_end = sql[idx..].find('\n').map(|p| idx + p + 1).unwrap_or(sql.len());
+            let line_end = sql[idx..]
+                .find('\n')
+                .map(|p| idx + p + 1)
+                .unwrap_or(sql.len());
             idx = line_end;
             continue;
         }
 
         if sql[idx..].starts_with("/*") {
-            let block_end = sql[idx..].find("*/").map(|p| idx + p + 2).unwrap_or(sql.len());
+            let block_end = sql[idx..]
+                .find("*/")
+                .map(|p| idx + p + 2)
+                .unwrap_or(sql.len());
             idx = block_end;
             continue;
         }
@@ -1735,6 +1741,12 @@ mod tests {
         assert_eq!(
             translate_sqlite_rowid("ORDER BY -- stable\n rowid DESC"),
             "ORDER BY -- stable\n ctid DESC"
+        );
+
+        // Double dashes inside a string literal should not be treated as a line comment
+        assert_eq!(
+            translate_sqlite_rowid("SELECT '--' \n rowid FROM t"),
+            "SELECT '--' \n ctid FROM t"
         );
     }
 
