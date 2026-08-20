@@ -1745,8 +1745,8 @@ mod tests {
 
         // Double dashes inside a string literal should not be treated as a line comment
         assert_eq!(
-            translate_sqlite_rowid("SELECT '--' \n rowid FROM t"),
-            "SELECT '--' \n ctid FROM t"
+            translate_sqlite_rowid("SELECT '--', \n rowid FROM t"),
+            "SELECT '--', \n ctid FROM t"
         );
     }
 
