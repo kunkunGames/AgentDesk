@@ -591,7 +591,8 @@ src/
 │   │   │   ├── clear_store/
 │   │   │   │   ├── abandon.rs
 │   │   │   │   ├── identity.rs
-│   │   │   │   └── mod.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── reconcile_gate.rs
 │   │   │   ├── model/
 │   │   │   │   ├── identity.rs
 │   │   │   │   ├── serde_adapters.rs
@@ -747,6 +748,7 @@ src/
 │   │   │   ├── tests/
 │   │   │   │   └── circuit_breaker_apply.rs
 │   │   │   ├── apply.rs
+│   │   │   ├── cohort.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── idle_tmux.rs
 │   │   │   └── tests.rs
@@ -892,6 +894,10 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── ops.rs
 │   │   ├── tmux_watcher/
+│   │   │   ├── jsonl_rotation/
+│   │   │   │   ├── backstop.rs
+│   │   │   │   ├── backstop_tests.rs
+│   │   │   │   └── idle_gate.rs
 │   │   │   ├── streaming_status_tick/
 │   │   │   │   └── types.rs
 │   │   │   ├── turn_identity/
@@ -948,6 +954,8 @@ src/
 │   │   │   ├── two_message_panel_tests.rs
 │   │   │   ├── utf8_chunk_decoder.rs
 │   │   │   └── utf8_chunk_decoder_tests.rs
+│   │   ├── tmux_watcher_registry/
+│   │   │   └── fences.rs
 │   │   ├── tui_direct_abort_marker/
 │   │   │   ├── deferred_claim.rs
 │   │   │   ├── drain.rs
@@ -1143,6 +1151,7 @@ src/
 │   │   │   │   └── tests.rs
 │   │   │   ├── codex_tui_restore.rs
 │   │   │   ├── dispatched_origin_ghost.rs
+│   │   │   ├── dispatched_origin_ghost_tests.rs
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
 │   │   ├── abandon_request_store.rs

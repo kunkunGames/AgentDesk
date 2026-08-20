@@ -10,7 +10,11 @@ Tracking issue: [#1094](https://github.com/itismyfield-org/agentdesk/issues/1094
 
 Prerequisite context:
 
-- [#1091 / 909-2] Dynamic maintenance scheduler (`register_maintenance_job`).
+- [#1091 / 909-2] Dynamic maintenance scheduler (`register_maintenance_job` /
+  `spawn_maintenance_scheduler`) — **dead as of #5463**: it has zero registered
+  jobs and zero callers, so the dynamic slice of `/api/cron-jobs`
+  (`services::maintenance::list_maintenance_jobs`) is permanently empty. Every
+  job below actually runs on the leader-only `src/server/maintenance` registry.
 - [#1092 / 909-3] Storage maintenance jobs wired: `target_sweep`,
   `worktree_orphan_sweep`, `hang_dump_cleanup`.
 - [#1093 / 909-4] DB retention job wired: `db_retention`.
@@ -68,6 +72,10 @@ Job source locations under `src/services/maintenance/jobs/`:
 `target_sweep.rs`, `worktree_orphan_sweep.rs`, `hang_dump_cleanup.rs`,
 `db_retention.rs`.
 The `prompt_manifest_retention` job is registered directly in `src/server/maintenance/mod.rs` (it calls `src/db/prompt_manifests/retention.rs`; status API in `src/server/routes/prompt_manifest_retention.rs`).
+Job implementations live under `src/services/maintenance/jobs/`; the production
+leader-only wrappers are registered by `src/server/maintenance`. Prompt-manifest
+retention lives in `src/db/prompt_manifests/retention.rs` (status API in
+`src/server/routes/prompt_manifest_retention.rs`).
 
 Config knobs (all live in `Config::default_runtime()` per job):
 
@@ -163,6 +171,9 @@ If post-rebuild size exceeds **30 GB**, something is wrong — see §6.
 The scheduler starts registering jobs automatically via
 `static_registry_with_config` on server boot (`src/server/maintenance/mod.rs`). No
 operator action required beyond restarting `dcserver` after the deploy. Verify:
+The leader-only scheduler starts the jobs registered in
+`src/server/maintenance` on server boot. No operator action is required beyond
+restarting `dcserver` after the deploy. Verify:
 
 ```bash
 curl -s http://localhost:8791/api/cron-jobs | jq '.[] | select(.name | startswith("storage."))'

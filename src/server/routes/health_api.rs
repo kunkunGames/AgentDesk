@@ -508,6 +508,14 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             )
             .await
             .to_json();
+            // #5464 T5 S1: the registry branch gets this block from
+            // `DiscordHealthSnapshot`, which a standalone node never builds.
+            // Publish it here too so `/api/health/detail` answers the rollout
+            // question the same way on both assembly points — a node whose
+            // detail payload is silently missing the dial reads as "not rolled
+            // out" when it may be enrolled. The dial is process config, not
+            // Discord state, so it is well-defined with no registry mounted.
+            json["relay_authority_rollout"] = relay_authority_rollout_health_json();
         }
         if let Some(opencode_block) = opencode_warm_pool_json(detailed) {
             json["opencode"] = opencode_block;
@@ -619,6 +627,14 @@ fn ensure_startup_doctor_state_reason(
 
 fn delivery_record_rollout_health_json() -> serde_json::Value {
     outbound::delivery_record_rollout_health_json()
+}
+
+/// #5464 T5 S1: the standalone branch's copy of the relay-authority rollout
+/// block, built from the same producer the registry branch's snapshot uses so
+/// the two assembly points cannot drift into different shapes.
+fn relay_authority_rollout_health_json() -> serde_json::Value {
+    serde_json::to_value(crate::services::discord::relay_recovery::cohort::rollout_report())
+        .unwrap_or_else(|_| serde_json::json!({}))
 }
 
 /// Bare (argument-less) provider degraded-reason classifications emitted by
@@ -1895,7 +1911,8 @@ pub async fn senddm_handler(
 mod tests {
     use super::{
         RegistryPurgeDecision, discord_control_endpoints_allowed, discord_send_caller_class,
-        public_health_json, registry_purge_decision, stale_mailbox_repair_applied,
+        public_health_json, registry_purge_decision, relay_authority_rollout_health_json,
+        stale_mailbox_repair_applied,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1924,6 +1941,52 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-agentdesk-source", source.parse().expect("valid source"));
         headers
+    }
+
+    /// #5464 T5 S1: the standalone branch publishes the whole rollout block,
+    /// with the dormant dial, on a node that hosts no Discord registry.
+    ///
+    /// The cross-branch shape guarantee is structural and not observable from
+    /// here: `relay_authority_rollout_health_json` and the registry branch's
+    /// `DiscordHealthSnapshot::relay_authority_rollout` field serialize the same
+    /// `cohort::rollout_report` producer, so there is no second shape to drift
+    /// into — comparing this helper against that producer would only restate
+    /// this helper's own body. What is checkable here is that the standalone
+    /// branch forwards the producer's whole object rather than a subset (which
+    /// also catches its `{}` serialization fallback firing) and that the shipped
+    /// dial is dormant. The registry branch's own serialization is pinned by
+    /// `services::discord::health::snapshot`'s
+    /// `relay_authority_rollout_is_published_on_the_detail_build_only`.
+    #[test]
+    fn standalone_relay_authority_rollout_publishes_the_whole_dormant_block() {
+        let standalone = relay_authority_rollout_health_json();
+        let mut keys: Vec<&str> = standalone
+            .as_object()
+            .expect("the rollout block is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["cohort_fingerprint", "cohort_percent", "mode"],
+            "the standalone branch must forward the whole rollout report"
+        );
+        assert_eq!(
+            standalone.get("mode").and_then(|v| v.as_str()),
+            Some("legacy"),
+            "the shipped dial is dormant"
+        );
+        assert_eq!(
+            standalone.get("cohort_percent").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(
+            standalone
+                .get("cohort_fingerprint")
+                .and_then(|v| v.as_str())
+                .is_some_and(|fingerprint| fingerprint.len() == 16)
+        );
     }
 
     #[test]
@@ -2731,6 +2794,10 @@ mod tests {
                 "mode": "off",
                 "dedup_authority": "in_memory_committed_offset",
                 "same_turn_backward_write_enforcement": "observe_only",
+                "flag_source": {
+                    "shadow": "compiled_default",
+                    "authority": "env_override"
+                },
                 "warning_count": 1,
                 "configuration_warnings": [
                     "delivery_record_authority_disabled: durable frontiers are not the default committed-offset authority"
@@ -2739,6 +2806,10 @@ mod tests {
         }));
         assert_eq!(public["delivery_record_rollout"]["mode"], json!("off"));
         assert_eq!(public["delivery_record_rollout"]["warning_count"], json!(1));
+        assert_eq!(
+            public["delivery_record_rollout"]["flag_source"],
+            json!({"shadow": "compiled_default", "authority": "env_override"})
+        );
         assert_eq!(public["ok"], json!(true));
     }
 
@@ -2820,7 +2891,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
         std::fs::write(
             runtime_dir.join("release-source.json"),
-            r#"{"generated_at":"2026-08-12T00:00:00Z","repo_head":"0123456789abcdef0123456789abcdef01234567","latest_postgres_migration":"0104_example.sql"}"#,
+            r#"{"generated_at":"2026-08-12T00:00:00Z","repo_head":"0123456789abcdef0123456789abcdef01234567","latest_postgres_migration":"0104_example.sql","repo_dirty":"false"}"#,
         )
         .expect("write release source manifest");
 
@@ -2848,11 +2919,61 @@ mod tests {
                 body["release_source"]["deployed_latest_postgres_migration"],
                 "0104_example.sql"
             );
+            // #5071 T1 S8-1r2: the checkout-cleanliness verdict rides the same
+            // public whitelist entry as the head it qualifies.
+            assert_eq!(body["release_source"]["deployed_repo_dirty"], "false");
             assert!(body["release_source"].get("node_hostname").is_none());
         }
 
         let detail = runtime.block_on(health_body("/health/detail", None));
         assert!(detail["release_source"]["node_hostname"].is_string());
+    }
+
+    #[test]
+    fn public_health_exposes_rollout_flag_source_on_both_assembly_points() {
+        // #5071 T1 S8-1r2 gate (d): the peer-rollout comparison is run against the
+        // PUBLIC endpoint across two nodes, so provenance has to survive the public
+        // whitelist rather than live in the protected detail response — unlike
+        // `release_source.node_hostname`, which stays detail-only. `health_response`
+        // has mutually exclusive registry and standalone assembly branches; the URL
+        // selects the projection, not the assembly branch, so both axes are explicit.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let expected = crate::services::discord::outbound::delivery_record_rollout_health_json()
+            ["flag_source"]
+            .clone();
+        assert!(
+            expected["shadow"].is_string() && expected["authority"].is_string(),
+            "both rollout axes must report a provenance"
+        );
+
+        for registry in [
+            None,
+            Some(Arc::new(
+                crate::services::discord::health::HealthRegistry::new(),
+            )),
+        ] {
+            let assembly = if registry.is_some() {
+                "registry"
+            } else {
+                "standalone"
+            };
+            for path in ["/health", "/health/detail"] {
+                let body = runtime.block_on(health_body(path, registry.clone()));
+                assert_eq!(
+                    body["delivery_record_rollout"]["flag_source"], expected,
+                    "{path} must carry rollout provenance on the {assembly} assembly branch"
+                );
+                if path == "/health" {
+                    assert!(
+                        body["release_source"].get("node_hostname").is_none(),
+                        "{assembly} public health must keep node_hostname detail-only"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2869,7 +2990,7 @@ mod tests {
 
         std::fs::write(
             &manifest,
-            r#"{"generated_at":"2026-08-12T00:00:00Z","repo_head":"unknown","latest_postgres_migration":"0104_example.sql"}"#,
+            r#"{"generated_at":"2026-08-12T00:00:00Z","repo_head":"unknown","latest_postgres_migration":"0104_example.sql","repo_dirty":"true"}"#,
         )
         .expect("write release source manifest");
         let body = runtime.block_on(health_body("/health", None));
@@ -2878,6 +2999,8 @@ mod tests {
             body["release_source"]["observation_failures"],
             serde_json::json!(["repo_head_invalid"])
         );
+        // A dirty checkout is still an OBSERVED fact; only the head failed here.
+        assert_eq!(body["release_source"]["deployed_repo_dirty"], "true");
         assert_eq!(
             body["release_source"]["generated_at"],
             "2026-08-12T00:00:00Z"
@@ -2897,7 +3020,7 @@ mod tests {
         assert_eq!(body["release_source"]["observation_status"], "partial");
         assert_eq!(
             body["release_source"]["observation_failures"],
-            serde_json::json!(["latest_postgres_migration_missing"])
+            serde_json::json!(["latest_postgres_migration_missing", "repo_dirty_missing"])
         );
         assert_eq!(
             body["release_source"]["deployed_repo_head"],
@@ -2914,7 +3037,11 @@ mod tests {
         assert_eq!(body["release_source"]["observation_status"], "unobserved");
         assert_eq!(
             body["release_source"]["observation_failures"],
-            serde_json::json!(["repo_head_missing", "latest_postgres_migration_missing"])
+            serde_json::json!([
+                "repo_head_missing",
+                "latest_postgres_migration_missing",
+                "repo_dirty_missing"
+            ])
         );
     }
 

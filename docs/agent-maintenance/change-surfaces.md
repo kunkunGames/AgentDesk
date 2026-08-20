@@ -1914,9 +1914,10 @@ time for diagnostics; neither is a stored approval value.
   `.spawn_nonce` read model, mounted at
   `services::discord::tmux::execution_identity` by a `#[path]` declaration in
   `tmux.rs`, so it inherits that file's unix gate) and the
-  `WatcherIdentityFence` / `IdentityFencedRegistry` pair in
-  `tmux_watcher_registry.rs`, which is NOT unix-gated and carries its own
-  `#[cfg(not(unix))]` shim pair. Switch: `config::ExecutionIdentityMode` +
+  `WatcherIdentityFence` / `IdentityFencedRegistry` pair — since #5457 the fence
+  itself lives in the `tmux_watcher_registry/fences.rs` child module and the
+  fenced view stays in the registry root. Neither is unix-gated, and `fences.rs`
+  carries the `#[cfg(not(unix))]` shim pair. Switch: `config::ExecutionIdentityMode` +
   `RuntimeSettingsConfig.execution_identity_mode`, read live per decision by
   `tmux_watcher_registry::execution_identity_mode`.
 - converted call sites: exactly two, both keeping their unfenced helper NAMES so
@@ -1925,8 +1926,8 @@ time for diagnostics; neither is a stored approval value.
   `tui_direct_pending_start.rs` (`STALE_FOREIGN_CANCEL_IDENTITY_SITE`). The other
   14 production entries in the `registry_remove` category of
   `scripts/destructive_call_site_baseline.json` stay unfenced in every mode.
-- second conjunct (#5071 relay-tail S4, I-1): `TerminalDeliveryFence` in the same
-  `tmux_watcher_registry.rs`, chained onto the view by
+- second conjunct (#5071 relay-tail S4, I-1): `TerminalDeliveryFence`, beside
+  `WatcherIdentityFence` in `tmux_watcher_registry/fences.rs`, chained onto the view by
   `IdentityFencePendingDelivery::with_terminal_delivery_fence` at both converted
   call sites and consumed by `commit_under_delivery_fence` inside the same
   registry lock (the r2 repair below replaced the original bool probe). It answers a DIFFERENT question from the identity conjuncts: not "is this
@@ -1940,7 +1941,10 @@ time for diagnostics; neither is a stored approval value.
   this destruction's business) and it expires (a dead holder cannot latch it). It
   is NOT gated by `ExecutionIdentityMode` — a bounded, identity-matched refusal
   has no Observe-only stage to roll out through.
-- S4 r2 repairs to that conjunct, all three in the same two files:
+- S4 r2 repairs to that conjunct. They landed in two files at the time; since
+  #5457 split the fence layer out they span three — the fence implementation in
+  `tmux_watcher_registry/fences.rs`, the fenced view in the registry root, and
+  `scripts/check_destructive_call_site_ratchet.py`:
   - **judge/commit atomicity.** The r1 shape read the lease through
     `DeliveryLeaseCell::read`, which drops the cell's payload mutex on return,
     and answered `bool`; the registry lock the CAS core holds is a different
@@ -2210,8 +2214,9 @@ time for diagnostics; neither is a stored approval value.
 
 - canonical_modules: `src/config.rs`, `src/runtime_layout/mod.rs`,
   `src/server/mod.rs`, `src/kanban/state_machine.rs`, `src/receipt.rs`,
-  `src/github/sync.rs`, `src/reconcile.rs` (periodic stale-inflight + orphan
-  sweep), `src/high_risk_recovery.rs` (PG recovery harness for delivery
+  `src/github/sync.rs`, `src/reconcile.rs` (dispatch-delivery, auto-queue, and
+  queue-review reconciliation), `src/high_risk_recovery.rs` (PG recovery
+  harness for delivery
   outbox/notify), `src/server/task_dispatch_claims.rs` (cluster-aware
   task-dispatch claim coordination), `src/server/cluster.rs`
   (cluster role/leader-failover coordination), `src/server/worker_registry.rs`
@@ -2219,15 +2224,13 @@ time for diagnostics; neither is a stored approval value.
   `src/server/worker_recovery.rs` (worker-local restart budget/backoff execution).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (frozen giant surface; +25 net from #4553 global Claude gateway-proxy fields, defaults, resolver, parse coverage, and corrected retained cache-TTL docs; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease; +7 from #4305 channel recent-context injection config (limit + enable, live-reload); +114 from #5394 (#5071 T3-A0) `ExecutionIdentityMode` enum + `RuntimeSettingsConfig.execution_identity_mode` field, the two mode predicates, and their parse/round-trip coverage — measured on the landed commit `3df6de3ed`; a further +28 net from #5398 (T3-A1) re-documenting those variants for the converted CAS sites, measured at `5b7eb3524`; #5399 items 5/7 add the `consults_spawn_nonce` predicate that lets `Legacy` skip the marker read it used to discard, correct the `Legacy` variant docs to match, and fix two `services::discord::tmux_watcher` prose paths that drop the `#[path]` parent segment — the same defect class #5396 item 6 fixed for `execution_identity`).
+  - `src/config.rs` (frozen giant surface; +25 net from #4553 global Claude gateway-proxy fields, defaults, resolver, parse coverage, and corrected retained cache-TTL docs; +51 from #4130 shared TestEnvVarGuard + shared_test_env_lock — centralized env-pin guard for #3293-class test races; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface; #3736 documents the disabled remote-profile compatibility shim; #3749 adds the `cluster.intake_routing` config authority and parse coverage; +13 from #3870 ServerConfig.allow_insecure_nonloopback_bind escape-hatch field + Debug/Default wiring + doc; +10 from #3805 P2 PR-A two_message_panel_enabled PlaceholderConfig field (two-message model scaffolding, default OFF, restart-required; +18 from #4351 ClusterConfig.gateway_preferred_instance_id + gateway_yield_grace_secs fields, Default wiring, and the yield-grace default fn — the yield protocol lives in discord::runtime_bootstrap::gateway_lease; +7 from #4305 channel recent-context injection config (limit + enable, live-reload); +114 from #5394 (#5071 T3-A0) `ExecutionIdentityMode` enum + `RuntimeSettingsConfig.execution_identity_mode` field, the two mode predicates, and their parse/round-trip coverage — measured on the landed commit `3df6de3ed`; a further +28 net from #5398 (T3-A1) re-documenting those variants for the converted CAS sites, measured at `5b7eb3524`; #5399 items 5/7 add the `consults_spawn_nonce` predicate that lets `Legacy` skip the marker read it used to discard, correct the `Legacy` variant docs to match, and fix two `services::discord::tmux_watcher` prose paths that drop the `#[path]` parent segment — the same defect class #5396 item 6 fixed for `execution_identity`; +85 from #5464 (#5071 T5 S1) the `RelayAuthorityMode` enum and its three mode predicates (`records_authority_observations` / `governs_destructive_authority` / `consults_cohort`), the `RuntimeSettingsConfig.relay_authority_mode` and `relay_authority_cohort_percent` dial fields with the `is_legacy_relay_authority_mode` skip guard that keeps the dormant default out of the serialized config, and their dormant-default round-trip coverage — measured on the landed commit `667dec6a3`. The dial has no admission consumer in S1; its only readers are the detail-gated health rollout block built by `services::discord::relay_recovery::cohort::rollout_report`. #5464 §6.3 books this delta into the S9 pin-recovery plan, inventoried in `docs/agent-maintenance/t5-t6-removal-inventory.md`).
   - `src/server/mod.rs` (frozen giant surface; +42 from #4615 S3b worker delivery fence — the lease-guarded `fence_claimed_delivery` call site in `drain_message_outbox_batch_once` (re-validates circuit authority between claim and the Discord send; fence logic lives in `services::message_outbox_circuit_authority`); -22 from #4449 extracting actionable-alert announce→notify delivery into `src/server/outbox_actionable_delivery.rs`; -21 from #4465 moving stale outbox/expired-held GC ownership into `services::message_outbox`; #1122 extends that shared GC owner to preserve scheduled-message permanent dedupe sentinels; +140 from #4089 claude-accounts cswap surface — leader/forced rate-limit refresh serialization (shared async Mutex critical section), fire-and-forget switch refresh with 8s bound, and the sync_claude_rate_limit_cache_once extraction; follow-up decomposition candidate: move the claude rate-limit sync block into a sibling module; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review; #3740 adds the boot hook for token-analytics cache prewarm; #3722 removes duplicate startup reseed when callers already completed guarded startup initialization; +20 from #3870 fail-closed bind-security guard at the listener bind site — force-loopback when non-loopback host + no auth_token; +15 from #4260 the terminal outbox-failure alert call site in the message-outbox Fail arm (silent-loss vector 3) — the helper bodies (`note_terminal_outbox_delivery_failure` + snippet/target resolvers) live in the new sibling `src/server/outbox_delivery_alert.rs`, only the Fail-arm call + module wiring remain in root).
   - `src/receipt.rs` (frozen giant surface).
   - `src/github/sync.rs` (frozen giant surface).
-  - `src/reconcile.rs` (frozen giant surface; +39 from #4104 standardized inflight-row
-    removal logging at the `sweep_stale_inflight_files` site; #3685 rebind-origin
-    stale-inflight preservation review hardening; periodic reconcile loop
-    covering stale inflights, orphan uploads, dispatched-session drift, and
-    queue-review drift — split before adding non-bugfix behavior).
+  - `src/reconcile.rs` (frozen giant surface; dispatch-delivery, auto-queue,
+    dispatched-session, and queue-review reconciliation — split before adding
+    non-bugfix behavior).
   - `src/server/maintenance.rs` decomposed in #4710 into
     `src/server/maintenance/mod.rs` (registry + scheduler loop, now below the
     1000-line giant threshold) and `src/server/maintenance/storage_jobs.rs`
@@ -2524,7 +2527,21 @@ these contextual numbers to match ordinary LoC churn.
   from #3864 moving SIGTERM queue-restore merge inside the mailbox actor; +10
   from #4018 round-2 adding the distinct `MonitorAutoTurn` active-turn marker
   while keeping monitor turns background for queue-yield/cancel semantics).
-- `src/services/discord/tmux_watcher_registry.rs` (crossed the 1000-line production threshold at 1092 prod LoC via #5071 relay-tail S4 — the destructive-fence layer added there (`WatcherIdentityFence`/`TerminalDeliveryFence` and the `IdentityFencedRegistry` CAS cores) is the natural split seam; decompose scheduled per #5457, registry entry `shrink` with a 2026-10-31 deadline).
+- `src/services/discord/tmux_watcher_registry.rs` (below the giant threshold; crossed
+  the 1000-line production threshold at 1092 prod LoC via #5071 relay-tail S4 and came
+  back to 637 prod LoC in #5457, which moved the S4 conjunct layer verbatim into the
+  child module `tmux_watcher_registry/fences.rs` (489 prod LoC): `WatcherIdentityFence`
+  with its `PinnedWatcherBinding` and `#[cfg(not(unix))]` shims, `TerminalDeliveryFence`,
+  `commit_under_delivery_fence`, the live `execution_identity_mode` read, and the two
+  test hooks. The registry root deliberately KEEPS the four maps, both
+  `*_if_current_locked` CAS cores, `under_identity_fence` and the
+  `IdentityFencePendingDelivery`/`IdentityFencedRegistry` views: the destructive
+  call-site ratchet excludes exactly one owner FILE (`REGISTRY_OWNER` in
+  `scripts/check_destructive_call_site_ratchet.py`), so leaving every fenced spelling
+  and both `*_if_current` names in that file is what kept the ratchet counts and the
+  `identity_fence_bind`/`delivery_fence_bind` pairing pass unchanged with no baseline
+  repin. Moving the fenced view too would require teaching that script the owner is now
+  a module, not a file. The registry `[[entry]]` was removed as a ghost registration).
 - `src/services/discord/session_relay_sink.rs` (frozen giant surface; #5071 T0-S4
   moves the 100-physical-line sink-local terminal outcome fold and `RelaySink::deliver`
   implementation to `session_relay_sink/terminal_handoff.rs` with `continue 0`, one
