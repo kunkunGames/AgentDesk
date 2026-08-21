@@ -238,12 +238,14 @@ def is_scratch_file_path(path):
         "sql_test.rs",
     }
 
+    if re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename):
+        return True
+
     if not is_nested:
         if basename in root_scratch_files:
             return True
         return bool(
-            re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename)
-            or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
+            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
         )
 
     return False
