@@ -1,181 +1,16 @@
 use super::*;
 
-pub(super) struct DeferredRestartPermit;
-
-pub(super) fn restart_request_matches(root: &std::path::Path, name: &str, nonce: &str) -> bool {
-    std::fs::read_to_string(root.join(name))
-        .ok()
-        .and_then(|request| {
-            request
-                .lines()
-                .find_map(|line| line.strip_prefix("nonce="))
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some(nonce)
-}
-
-/// Rolls back a restart cycle if its request was cancelled or its task is
-/// dropped before its request has been superseded. The nonce prevents an old
-/// poller from restoring admission for a newer restart request.
-struct DeferredRestartCancellationGuard {
-    shared: Arc<SharedData>,
-    root: std::path::PathBuf,
-    nonce: String,
-    armed: bool,
-}
-
-impl DeferredRestartCancellationGuard {
-    fn new(shared: Arc<SharedData>, root: std::path::PathBuf, nonce: String) -> Self {
-        Self {
-            shared,
-            root,
-            nonce,
-            armed: true,
-        }
-    }
-
-    fn cancelled(&self) -> bool {
-        restart_request_matches(&self.root, "restart_cancelled", &self.nonce)
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DeferredRestartCancellationGuard {
-    fn drop(&mut self) {
-        if self.armed
-            && (self.cancelled()
-                || restart_request_matches(&self.root, "restart_pending", &self.nonce))
-        {
-            rollback_deferred_restart(&self.shared);
-        }
-    }
-}
-
-/// Publish the admission fence before health can acknowledge the marker. The
-/// per-provider CAS gives exactly one poller permission to wait, persist, and
-/// consume that provider's shutdown-barrier slot.
-pub(super) fn begin_deferred_restart(shared: &SharedData) -> Option<DeferredRestartPermit> {
-    shared.restart.intake_worker_lifecycle.fence_admission();
-    shared.restart.shutting_down.store(true, Ordering::SeqCst);
-    shared
-        .restart
-        .shutdown_counted
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .ok()
-        .map(|_| DeferredRestartPermit)
-}
-
-async fn prepare_deferred_restart(
-    shared: &Arc<SharedData>,
-    root: &std::path::Path,
-    nonce: String,
-) -> Option<(DeferredRestartPermit, DeferredRestartCancellationGuard)> {
-    let permit = begin_deferred_restart(shared)?;
-    let guard = DeferredRestartCancellationGuard::new(shared.clone(), root.to_path_buf(), nonce);
-    shared
-        .restart
-        .intake_worker_lifecycle
-        .wait_until_drained()
-        .await;
-    if guard.cancelled() {
-        return None;
-    }
-    // `restart_pending` is the health-visible acknowledgement consumed by the
-    // wrapper. Publish it only after an accepted tick has fully executed.
-    shared.restart.restart_pending.store(true, Ordering::SeqCst);
-    Some((permit, guard))
-}
-
-pub(super) fn finish_deferred_restart(shared: &SharedData, _permit: DeferredRestartPermit) -> bool {
-    let is_final = shared
-        .restart
-        .shutdown_remaining
-        .fetch_sub(1, Ordering::AcqRel)
-        == 1;
-    shared
-        .restart
-        .shutdown_slot_consumed
-        .store(true, Ordering::Release);
-    is_final
-}
-
-/// Write the durable sentinel, then make the final cancellation decision at
-/// the closest practical point before the atomic rename. A successful rename
-/// is the point of no return: cancellation observed afterwards is intentionally
-/// ignored so persistence and process exit remain a single durable outcome.
-pub(super) fn commit_deferred_restart_sentinel(
-    root: &std::path::Path,
-    provider: &ProviderKind,
-    nonce: &str,
-    guard: &DeferredRestartCancellationGuard,
-) -> std::io::Result<bool> {
-    let ack = root.join("restart_persisted");
-    let ack_tmp = root.join(format!("restart_persisted.{}.tmp", std::process::id()));
-    let ack_body = format!(
-        "nonce={nonce}\nprovider={}\ncommitted_at={}\n",
-        provider.as_str(),
-        chrono::Utc::now().to_rfc3339()
-    );
-    std::fs::write(&ack_tmp, ack_body)?;
-    if guard.cancelled() || !restart_request_matches(root, "restart_pending", nonce) {
-        let _ = std::fs::remove_file(&ack_tmp);
-        return Ok(false);
-    }
-    std::fs::rename(&ack_tmp, &ack)?;
-    // Compare-and-act again after the atomic acknowledgement publish. A newer
-    // request may have replaced the marker between the pre-rename check and the
-    // rename; never let a stale poller claim or remove that newer request.
-    if !restart_request_matches(root, "restart_pending", nonce) {
-        if restart_request_matches(root, "restart_persisted", nonce) {
-            let _ = std::fs::remove_file(&ack);
-        }
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-fn release_deferred_restart_ownership(shared: &SharedData) {
-    shared
-        .restart
-        .shutdown_counted
-        .store(false, Ordering::Release);
-    if shared
-        .restart
-        .shutdown_slot_consumed
-        .swap(false, Ordering::AcqRel)
-    {
-        shared
-            .restart
-            .shutdown_remaining
-            .fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-fn rollback_deferred_restart(shared: &SharedData) {
-    shared.restart.intake_worker_lifecycle.unfence_admission();
-    shared.restart.shutting_down.store(false, Ordering::SeqCst);
-    shared
-        .restart
-        .restart_pending
-        .store(false, Ordering::SeqCst);
-    release_deferred_restart_ownership(shared);
-}
-
-/// Release only the stale poller's per-provider barrier ownership. A newer
-/// restart nonce inherits the process-wide admission fence and restart flags;
-/// clearing those here would reopen intake underneath the new owner.
-pub(super) fn handoff_superseded_restart(shared: &SharedData) {
-    release_deferred_restart_ownership(shared);
-}
-
-fn restart_request_is_superseded(root: &std::path::Path, nonce: &str) -> bool {
-    let marker = root.join("restart_pending");
-    marker.exists() && !restart_request_matches(root, "restart_pending", nonce)
-}
+#[cfg(test)]
+use super::deferred_restart::{
+    DeferredRestartCancellationGuard, begin_deferred_restart, restore_foreign_disposed_marker,
+};
+use super::deferred_restart::{
+    commit_deferred_restart_sentinel, finish_deferred_restart, handoff_superseded_restart,
+    identity_safe_dispose_restart_marker, prepare_deferred_restart, restart_commit_is_proven,
+    restart_request_is_superseded, restart_request_matches, rollback_deferred_restart,
+};
+#[cfg(test)]
+use super::gateway_lease_recovery::{TerminalProof, terminal_proof};
 
 #[cfg(unix)]
 fn capture_reachability_watcher_incarnation(
@@ -367,11 +202,20 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
                         continue;
                     }
                     if restart_request_matches(&root, "restart_cancelled", &nonce) {
-                        rollback_deferred_restart(&shared_for_deferred);
-                        tracing::info!(
-                            provider = provider_for_deferred.as_str(),
-                            "restart request cancelled; intake admission restored"
-                        );
+                        // #5254 §E8.1/§E8.5: the second rollback site owes the
+                        // same check — an absent latch proves nothing.
+                        if !restart_commit_is_proven(&root, &nonce) {
+                            rollback_deferred_restart(&shared_for_deferred);
+                            tracing::info!(
+                                provider = provider_for_deferred.as_str(),
+                                "restart request cancelled; intake admission restored"
+                            );
+                        } else {
+                            tracing::debug!(
+                                provider = provider_for_deferred.as_str(),
+                                "restart cancellation is late for a committed nonce"
+                            );
+                        }
                         continue;
                     }
                     let Some((shutdown_permit, mut cancellation_guard)) =
@@ -460,18 +304,12 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
                             }
                             Ok(true) => {}
                         }
-                        if !restart_request_matches(&root, "restart_pending", &nonce) {
-                            // A newer nonce owns the marker. Preserve its shared
-                            // fence, release A's barrier slot, and keep this poller
-                            // alive so it can service B on the next iteration.
-                            if restart_request_is_superseded(&root, &nonce) {
-                                handoff_superseded_restart(&shared_for_deferred);
-                            }
-                            cancellation_guard.disarm();
-                            continue;
-                        }
+                        // #5254 D4③: past the rename there is exactly one path
+                        // out. Supersession is not re-checked — exit is what a
+                        // newer request wants, the next process reads its
+                        // marker, and disposal is identity-scoped.
                         cancellation_guard.disarm();
-                        let _ = std::fs::remove_file(&marker);
+                        identity_safe_dispose_restart_marker(&root, &nonce);
                         std::process::exit(0);
                     }
 
@@ -480,6 +318,13 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
                     // arrives. Returning here would strand its consumed slot.
                     loop {
                         tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
+                        // #5254 D4④: the latch first. Once the final provider
+                        // commits, a cancellation published afterwards is late
+                        // for the whole process (§11-4).
+                        if committed_nonce().as_deref() == Some(nonce.as_str()) {
+                            cancellation_guard.disarm();
+                            break;
+                        }
                         if cancellation_guard.cancelled() {
                             break;
                         }

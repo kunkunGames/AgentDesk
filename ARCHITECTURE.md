@@ -748,6 +748,7 @@ src/
 │   │   │   ├── tests/
 │   │   │   │   └── circuit_breaker_apply.rs
 │   │   │   ├── apply.rs
+│   │   │   ├── authority_observation.rs
 │   │   │   ├── cohort.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── idle_tmux.rs
@@ -818,6 +819,7 @@ src/
 │   │   │   │   └── tests.rs
 │   │   │   ├── intake_delivery_sweep/
 │   │   │   │   └── tests.rs
+│   │   │   ├── deferred_restart.rs
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
 │   │   │   ├── gateway_lease_recovery.rs
@@ -994,6 +996,7 @@ src/
 │   │   │   │   ├── completion_context.rs
 │   │   │   │   └── completion_postgres.rs
 │   │   │   ├── completion_postlude/
+│   │   │   │   ├── channel_episode_scope.rs
 │   │   │   │   ├── channel_writeback.rs
 │   │   │   │   └── contracts.rs
 │   │   │   ├── headless_delivery/
@@ -1027,7 +1030,8 @@ src/
 │   │   │   │   ├── tool_arms.rs
 │   │   │   │   └── types.rs
 │   │   │   ├── stream_tick/
-│   │   │   │   └── guarded_persist.rs
+│   │   │   │   ├── guarded_persist.rs
+│   │   │   │   └── guarded_persist_tests.rs
 │   │   │   ├── terminal_controller_cutover/
 │   │   │   │   └── unix_journal.rs
 │   │   │   ├── terminal_outcome_delivery/
