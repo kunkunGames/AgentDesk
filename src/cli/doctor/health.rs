@@ -73,15 +73,6 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("provider {provider} is disconnected"),
             next_step: format!("check {provider} Discord token, gateway status, and dcserver logs"),
         },
-        ["provider", provider, "gateway_standby"] => ClassifiedReason {
-            raw: raw.to_string(),
-            subsystem: "provider_runtime",
-            severity: Severity::Warning,
-            fix_safety: FixSafety::ReadOnly,
-            security_exposure: SecurityExposure::OperationalMetadata,
-            summary: format!("provider {provider} is in gateway standby mode"),
-            next_step: "verify primary gateway node is healthy".to_string(),
-        },
         ["provider", provider, "restart_pending"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_runtime",
@@ -480,11 +471,11 @@ mod health_classification_tests {
         );
         assert_eq!(
             provider_standby.summary,
-            "provider codex is in gateway standby mode"
+            "provider codex runs as standby without a gateway session"
         );
         assert_eq!(
             provider_standby.next_step,
-            "verify primary gateway node is healthy"
+            "confirm which node holds the codex gateway singleton lease"
         );
         assert_ne!(provider_standby.summary, provider_standby.raw);
 
