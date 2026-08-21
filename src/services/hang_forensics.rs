@@ -1151,7 +1151,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn the_beacon_records_the_runtime_worker_count() {
         let _serial = exclusive();
-        spawn_runtime_liveness_beacon();
+        let _ = spawn_runtime_liveness_beacon();
         let after = snapshot();
         assert_eq!(
             after.runtime_workers, 3,
@@ -1782,7 +1782,7 @@ mod tests {
     async fn the_spawned_beacon_keeps_ticking() {
         let _serial = exclusive();
         let before = snapshot();
-        spawn_runtime_liveness_beacon();
+        let _ = spawn_runtime_liveness_beacon();
         tokio::time::sleep(Duration::from_millis(5_100)).await;
         let after = snapshot();
         assert!(
