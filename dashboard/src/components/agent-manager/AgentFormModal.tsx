@@ -155,7 +155,7 @@ export default function AgentFormModal({
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
               aria-valuemax={40}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
+              aria-valuetext={spriteNum ? t({ ko: `스프라이트 ${spriteNum}`, en: `Sprite ${spriteNum}` }) : t({ ko: `아이콘 ${formValues.avatar_emoji || "🤖"}`, en: `Icon ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -328,7 +328,7 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `선택된 아이콘: ${formValues.avatar_emoji}, 아이콘 변경`, en: `Selected icon: ${formValues.avatar_emoji}, change icon` })
+                      ? t({ ko: `아이콘 ${formValues.avatar_emoji}, 아이콘 변경`, en: `Icon ${formValues.avatar_emoji}, change icon` })
                       : t({ ko: "아이콘 선택기 열기", en: "Open icon picker" })
                   }
                   dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
