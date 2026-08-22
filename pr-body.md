@@ -2,7 +2,7 @@ What changed:
 Renamed the `0110_auto_queue_cleanup_tasks_card_rollback.sql` migration to `0115` to resolve a duplicate migration version conflict with `0110_intake_outbox_dispatched_status.sql` and properly sequence it after `0114`. Updated the migration checksum manifest and SQL execution surface inventory baselines to account for the rename and updated schema. Made a minor fix to `scripts/check_postgres_migration_checksums.py` to handle both `"migrations"` and `"protected_migrations"` keys in `immutable-checksums.json` gracefully.
 
 Why:
-The duplicate version numbering `0110` caused `sqlx` and the migration checksum guards to fail, breaking CI checks. The rename resolves the collision and preserves the strict migration ledger. The checksum manifest generator logic required adjusting to use `"migrations"` instead of `"protected_migrations"` for serialization to avoid wiping out the file structure.
+The duplicate version numbering `0110` caused `sqlx` and the migration checksum guards to fail, breaking CI checks. The rename resolves the collision and preserves the strict migration ledger. The checksum manifest generator logic required adjusting to not erase old `immutable-checksums.json` structure during automated sync.
 
 WorkFingerprint:
 - Agent: Steward
