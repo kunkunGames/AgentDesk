@@ -408,14 +408,9 @@ def main():
                     print(f"  [!] EMPTY NO-CHANGE PR: No changed files. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
                     if not has_overlap_reference(body):
                         print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
-        elif files_data.get("files") is not None and len(files_data["files"]) == 0:
-            print(f"  [!] EMPTY PR MISSING NO-CHANGE INTENT: 0 changed files but title does not claim no-change. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
-            if not has_overlap_reference(body):
-                print("  [!] MISSING OVERLAP REFERENCE: Empty PR body must explicitly list the exact overlapping PR numbers and branches.")
 
         # PR #199/#200/#201 lesson: check for multiple inventory refreshes
-        is_inventory_refresh = ("inventory" in title.lower() and "refresh" in title.lower()) or (files_data.get("files") is not None and any(is_generated_inventory_path(f.get("path", "")) for f in files_data["files"]))
-        if is_inventory_refresh:
+        if "inventory" in title.lower() and "refresh" in title.lower():
             inventory_refresh_count += 1
             if not has_duplicate_guard_ack(body):
                 print("  [!] MISSING DUPLICATE PR GUARD: Inventory refresh PR body lacks a completed duplicate-pr guard acknowledgement.")
