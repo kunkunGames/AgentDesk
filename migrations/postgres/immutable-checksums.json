@@ -1,6 +1,5 @@
 {
-  "policy": "Numbered postgres migrations are immutable after merge. Add new migration files and append their checksum here. For intentional edits to an existing migration, keep this baseline unchanged and add migrations/postgres/checksum-repair-allowlist.json.",
-  "protected_migrations": [
+  "migrations": [
     {
       "path": "migrations/postgres/0001_initial_schema.sql",
       "sha256": "c044f9e24cfba51126a6176095c198f16ad1275fcee07ed468e6345e0d79a88b",
@@ -592,5 +591,6 @@
       "version": 115
     }
   ],
+  "policy": "Numbered postgres migrations are immutable after merge. Add new migration files and append their checksum here. For intentional edits to an existing migration, keep this baseline unchanged and add migrations/postgres/checksum-repair-allowlist.json.",
   "version": 1
 }

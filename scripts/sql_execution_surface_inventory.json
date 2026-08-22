@@ -1080,7 +1080,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:26117ef63816e608aced137175c1ebf052db0cdf659c1c804043af25909daa75"
+      "fingerprint": "sha256:5f6d2f6d41119c5ad43ca7c0c3d6858abd89e7e400d575c20c16d4c60edc1afb"
     },
     {
       "root": "policies",

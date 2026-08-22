@@ -165,7 +165,7 @@ def manifest_payload(migrations: dict[str, Migration]) -> dict[str, Any]:
             "For intentional edits to an existing migration, keep this baseline "
             "unchanged and add migrations/postgres/checksum-repair-allowlist.json."
         ),
-        "protected_migrations": [
+        "migrations": [
             {
                 "path": migration.path,
                 "version": migration.version,
