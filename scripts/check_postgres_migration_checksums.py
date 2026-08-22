@@ -500,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path = resolve_repo_path(root, args.manifest or DEFAULT_MANIFEST)
     allowlist_path = resolve_repo_path(root, args.allowlist or DEFAULT_ALLOWLIST)
     if args.base_ref is None:
-        base_ref = os.environ.get("AGENTDESK_MIGRATION_GUARD_BASE_REF") or "origin/main"
+        base_ref = os.environ.get("AGENTDESK_MIGRATION_GUARD_BASE_REF") or ""
     else:
         base_ref = args.base_ref
 
