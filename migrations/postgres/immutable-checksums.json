@@ -541,34 +541,24 @@
       "version": 109
     },
     {
-      "path": "migrations/postgres/0110_auto_queue_cleanup_tasks_card_rollback.sql",
-      "sha256": "4b68484f7062dc7ca71e21b777a4563a9254dd2f62855b9e0787e8346e96dc61",
+      "path": "migrations/postgres/0110_intake_outbox_dispatched_status.sql",
+      "sha256": "7b5475f60a5750d723f4b7a1118145dbb169baeeee53fec435afa92c254a7a24",
       "version": 110
     },
     {
-      "path": "migrations/postgres/0111_intake_outbox_dispatched_status.sql",
-      "sha256": "7b5475f60a5750d723f4b7a1118145dbb169baeeee53fec435afa92c254a7a24",
+      "path": "migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql",
+      "sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
       "version": 111
     },
     {
-      "path": "migrations/postgres/0112_intake_outbox_dispatched_status_swap.sql",
-      "sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
+      "path": "migrations/postgres/0112_intake_outbox_dispatched_clock.sql",
+      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
       "version": 112
     },
     {
-      "path": "migrations/postgres/0113_intake_outbox_dispatched_clock.sql",
-      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
-      "version": 113
-    },
-    {
-      "path": "migrations/postgres/0114_intake_outbox_stale_dispatched_index.sql",
+      "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
       "sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
-      "version": 114
-    },
-    {
-      "path": "migrations/postgres/0115_delivery_journal_intake_binding_index.sql",
-      "sha256": "82a85e4ffef3565574c8b671ba71e843666f7f2b9ca2e4c845d475ef8bb88647",
-      "version": 115
+      "version": 113
     }
   ],
   "version": 1
