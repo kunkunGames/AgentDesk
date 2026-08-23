@@ -136,6 +136,9 @@
       ],
       "files": [
         "src/services/kakao.rs"
+      ]
+    },
+    {
       "number": 5447,
       "state": "open",
       "title": "Decompose src/services/discord/health/snapshot.rs (prod-giant: 1022 LoC after T4-B6)",
