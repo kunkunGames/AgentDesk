@@ -751,6 +751,7 @@ src/
 │   │   │   ├── authority_observation.rs
 │   │   │   ├── cohort.rs
 │   │   │   ├── decision.rs
+│   │   │   ├── destructive_warrant.rs
 │   │   │   ├── idle_tmux.rs
 │   │   │   └── tests.rs
 │   │   ├── router/
@@ -1000,7 +1001,9 @@ src/
 │   │   │   │   ├── channel_writeback.rs
 │   │   │   │   └── contracts.rs
 │   │   │   ├── headless_delivery/
-│   │   │   │   └── intake_outbox_argument.rs
+│   │   │   │   ├── intake_outbox_argument.rs
+│   │   │   │   ├── outcome.rs
+│   │   │   │   └── production_seam_tests.rs
 │   │   │   ├── intake_settlement/
 │   │   │   │   └── tests.rs
 │   │   │   ├── runtime_handoff_loop/

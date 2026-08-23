@@ -2622,7 +2622,7 @@ services::discord::health::recovery::stall_watchdog_auto_heal_tests::idle_tmux_s
 services::discord::health::recovery::stall_watchdog_auto_heal_tests::idle_tmux_stale_turn_tail_recheck_preserves_mailbox_after_precheck_passed
 services::discord::health::recovery::stall_watchdog_auto_heal_tests::pre_backstop_capture_advance_has_defense_in_depth_suppression_pg
 services::discord::health::recovery::stall_watchdog_auto_heal_tests::pre_backstop_flat_capture_pages_genuine_stall_pg
-services::discord::health::recovery::stall_watchdog_auto_heal_tests::reachability_verdict_does_not_change_the_shipped_watchdog_branch
+services::discord::health::recovery::stall_watchdog_auto_heal_tests::reachability_warrant_vetoes_transport_unknown_watchdog_branch
 services::discord::health::recovery::stall_watchdog_auto_heal_tests::reuse_no_op_reattach_tick_still_skips_the_destructive_branches_5396
 services::discord::health::recovery::stall_watchdog_auto_heal_tests::stall_watchdog_cleanup_releases_residual_orphan_pending_token
 services::discord::health::recovery::stall_watchdog_pure_tests::chunk_ledger_growing_response_never_lowers_confirmed_prefix
@@ -2711,6 +2711,8 @@ services::discord::health::snapshot::tests::rebind_origin_idle_only_without_canc
 services::discord::health::snapshot::tests::relay_authority_observation_is_published_on_the_detail_build_only
 services::discord::health::snapshot::tests::relay_authority_rollout_is_published_on_the_detail_build_only
 services::discord::health::snapshot::tests::relay_verdict_probe_operands_preserve_process_start_and_pane_semantics
+services::discord::health::snapshot::tests::row_coordinate_divergence_wiring::reachability_operand_uses_the_canonical_ledger_path
+services::discord::health::snapshot::tests::row_coordinate_divergence_wiring::watcher_state_snapshot_abstains_when_reachability_ledger_is_absent
 services::discord::health::snapshot::tests::row_coordinate_divergence_wiring::watcher_state_snapshot_records_row_vs_registry_identity_divergence
 services::discord::health::snapshot::tests::stale_ownerless_external_input_inflight_is_not_foreground_even_with_cancel_token
 services::discord::health::stall_liveness::redrive_grace::tests::redrive_durable_baseline_rejects_same_second_synthetic_successor_4181
@@ -4155,9 +4157,11 @@ services::discord::relay_recovery::auto_heal_confirm::tests::relay_recovery_rest
 services::discord::relay_recovery::auto_heal_confirm::tests::relay_recovery_same_watcher_emission_in_flight_is_not_confirmation_failure
 services::discord::relay_recovery::auto_heal_confirm::tests::relay_recovery_same_watcher_without_emission_fails_at_deadline
 services::discord::relay_recovery::auto_heal_confirm::tests::relay_recovery_spawn_confirm_requires_stable_heartbeat_advance
+services::discord::relay_recovery::axis_b_tests::automatic_reattach_sources_keep_transport_unknown_recovery_eligible
+services::discord::relay_recovery::axis_b_tests::automatic_warrant_wiring_is_pinned_at_the_four_direct_consumers
 services::discord::relay_recovery::axis_b_tests::axis_b_append_path_uses_the_framing_lock
-services::discord::relay_recovery::axis_b_tests::axis_b_apply_site_mapping_matches_the_six_site_taxonomy
-services::discord::relay_recovery::axis_b_tests::axis_b_emit_covers_all_six_sites_without_turn_scope
+services::discord::relay_recovery::axis_b_tests::axis_b_apply_site_mapping_separates_operator_and_automatic_taxonomy
+services::discord::relay_recovery::axis_b_tests::axis_b_emit_covers_all_sites_without_turn_scope
 services::discord::relay_recovery::axis_b_tests::axis_b_observer_runs_every_verdict_without_returning_authority
 services::discord::relay_recovery::axis_b_tests::axis_b_writer_frames_concurrent_records
 services::discord::relay_recovery::axis_b_tests::destructive_consumers_cannot_read_reachability_for_routing
@@ -4190,6 +4194,11 @@ services::discord::relay_recovery::cohort::tests::rollout_report_without_a_live_
 services::discord::relay_recovery::cohort::tests::shipped_defaults_admit_no_channel_to_the_relay_authority_cohort
 services::discord::relay_recovery::decision::reachability_authority_tests::foreground_stream_with_unreachable_relay_reports_without_acting
 services::discord::relay_recovery::decision::reachability_authority_tests::reachability_never_selects_or_enables_a_destructive_action
+services::discord::relay_recovery::destructive_warrant::tests::clear_orphan_pending_token_requires_the_same_episode_when_both_operands_exist
+services::discord::relay_recovery::destructive_warrant::tests::exact_episode_distinguishes_match_mismatch_and_missing_operands
+services::discord::relay_recovery::destructive_warrant::tests::pinned_adoption_only_relaxes_transport_unknown_reattach
+services::discord::relay_recovery::destructive_warrant::tests::truth_table_is_explicit_for_every_destructive_action_and_verdict
+services::discord::relay_recovery::destructive_warrant::tests::warrant_is_monotone_and_abstains_when_its_operand_is_absent
 services::discord::relay_recovery::leaked_row_sweep::tests::discord_row_is_sweep_candidate_without_pending_start
 services::discord::relay_recovery::leaked_row_sweep::tests::sweep_rejects_rows_without_channel_or_tmux_identity
 services::discord::relay_recovery::relay_recovery_circuit_alert_producer::tests::activate_unknown_status_fails_safe_without_reopen_pg
@@ -6018,7 +6027,6 @@ services::discord::turn_bridge::followup_requeue::tests::pre_submit_retry_reacti
 services::discord::turn_bridge::followup_requeue::tests::retry_cap_preserves_entry_and_stops_auto_kickoff_4888
 services::discord::turn_bridge::followup_requeue::tests::uncapped_retry_arms_only_after_terminal_projection_settles_4888
 services::discord::turn_bridge::guards::tests::merged_id_zero_state_drives_guard_key_owner_and_cleanup_identity
-services::discord::turn_bridge::headless_delivery::headless_delivery_tests::direct_fallback_notify_http_preference_is_caller_supplied_only
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests::headless_cleanup_deletes_processing_with_codex_tool_log_block
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests::headless_cleanup_deletes_status_only_codex_placeholder
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests::headless_cleanup_edits_partial_answer_without_korean_processing_footer
@@ -6028,6 +6036,15 @@ services::discord::turn_bridge::headless_delivery::headless_delivery_tests::rout
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests::unregistered_provider_still_falls_back_to_the_notify_bot
 services::discord::turn_bridge::headless_delivery::headless_delivery_tests::user_turn_answer_posts_as_the_agent_bot_not_notify
 services::discord::turn_bridge::headless_delivery::intake_outbox_argument::tests::delivery_argument_carries_inflight_intake_outbox_identity
+services::discord::turn_bridge::headless_delivery::outcome::tests::direct_fallback_helper_keeps_cancel_and_success_contract
+services::discord::turn_bridge::headless_delivery::outcome::tests::no_row_and_visible_wait_failure_remain_ambiguous
+services::discord::turn_bridge::headless_delivery::outcome::tests::pg_error_cancel_suppresses_direct_fallback_and_is_cancelled
+services::discord::turn_bridge::headless_delivery::outcome::tests::pg_error_direct_fallback_failure_is_ambiguous_and_surfaces_error
+services::discord::turn_bridge::headless_delivery::outcome::tests::pg_error_direct_fallback_success_is_delivered
+services::discord::turn_bridge::headless_delivery::outcome::tests::typed_headless_outcomes_preserve_commit_dispositions
+services::discord::turn_bridge::headless_delivery::production_seam_tests::absent_outbox_pool_reaches_cancel_check_and_suppresses_direct_fallback
+services::discord::turn_bridge::headless_delivery::production_seam_tests::direct_fallback_notify_http_preference_is_caller_supplied_only
+services::discord::turn_bridge::headless_delivery::production_seam_tests::outbox_enqueue_error_reaches_cancel_check_then_direct_fallback
 services::discord::turn_bridge::intake_settlement::tests::cancel_prompt_replace_commit_closes_row_pg
 services::discord::turn_bridge::intake_settlement::tests::classify_preserve_precedes_every_terminal_receipt
 services::discord::turn_bridge::intake_settlement::tests::fresh_off_and_observe_leave_own_rows_for_worker_pg
@@ -6989,6 +7006,8 @@ services::message_outbox::postgres_source_contract_tests::enqueue_acceptance_mat
 services::message_outbox::postgres_source_contract_tests::every_enqueue_variant_rejects_forbidden_source_with_zero_rows_pg
 services::message_outbox::postgres_source_contract_tests::fixed_lifecycle_enqueue_uses_registered_source_pg
 services::message_outbox::postgres_source_contract_tests::persistent_dedupe_returns_old_row_and_distinct_slot_inserts_pg
+services::message_outbox::postgres_source_contract_tests::typed_outbox_core_preserves_cancel_at_the_observation_site
+services::message_outbox::postgres_source_contract_tests::typed_outbox_outcomes_fold_to_the_legacy_option_contract
 services::message_outbox::stop_turn_notify_removal_tests::control_arm_enqueue_produces_a_stop_turn_row
 services::message_outbox::stop_turn_notify_removal_tests::stop_turn_does_not_enqueue_user_visible_notify
 services::message_outbox::stop_turn_notify_removal_tests::stop_turn_reason_code_is_a_valid_reason_keyed_dedupe_identity
@@ -7623,6 +7642,7 @@ services::settings::tests::settings_write_response_serializes_ok_contract
 services::settings::tests::startup_pg_runtime_config_writer_keeps_blob_authority_without_mirror_reinsertion
 services::slo::avg_latency_tests::avg_latency_query_excludes_dispatch_noise_sources
 services::slo::avg_latency_tests::noisy_metrics_have_alerts_disabled
+services::stale_turn_reconciler::tests::automatic_sweep_abstains_without_registry_but_operator_stays_outside_warrant_pg
 services::stale_turn_reconciler::tests::keyed_reconcile_pg_never_idles_a_live_busy_session
 services::stale_turn_reconciler::tests::keyed_reconcile_pg_releases_busy_session_without_inflight
 services::stale_turn_reconciler::tests::keyed_unchanged_outcome_keeps_live_row_turn_active_pg
