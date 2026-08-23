@@ -1,5 +1,6 @@
 {
-  "migrations": [
+  "policy": "Numbered postgres migrations are immutable after merge. Add new migration files and append their checksum here. For intentional edits to an existing migration, keep this baseline unchanged and add migrations/postgres/checksum-repair-allowlist.json.",
+  "protected_migrations": [
     {
       "path": "migrations/postgres/0001_initial_schema.sql",
       "sha256": "c044f9e24cfba51126a6176095c198f16ad1275fcee07ed468e6345e0d79a88b",
@@ -63,6 +64,11 @@
     {
       "path": "migrations/postgres/0013_agent_quality_daily.down.sql",
       "sha256": "80e124b0a0ed61b727e463348eff78f5e64579f9c6a8fac67f2a7d9c912ead2f",
+      "version": 13
+    },
+    {
+      "path": "migrations/postgres/0013_agent_quality_daily.up.sql",
+      "sha256": "486a56ffe3fe335167cd09be649a61ef693c4af27b6d5e178a93a69f3bfa548b",
       "version": 13
     },
     {
@@ -286,13 +292,28 @@
       "version": 58
     },
     {
+      "path": "migrations/postgres/0058_sqlite_compat_json_extract_array.up.sql",
+      "sha256": "9202cb7cc664482eac6e897cd09d0b17330d78d969f85ccb190c202d8f83c6f4",
+      "version": 58
+    },
+    {
       "path": "migrations/postgres/0059_idempotency_keys.down.sql",
       "sha256": "3a7e603176082d28559294bbf1b6c0be10c08f420297db27f26e7210fb1f7b62",
       "version": 59
     },
     {
+      "path": "migrations/postgres/0059_idempotency_keys.up.sql",
+      "sha256": "26d2bd00c0a32205edd62a538d8f4dfcce72abec8d9ba6286c81eeb82a1d67b4",
+      "version": 59
+    },
+    {
       "path": "migrations/postgres/0060_voice_turn_link.down.sql",
       "sha256": "1806492df629e6edeca59dac63064a31e48afe3fa62d27d38d70a3bcfbda7c3b",
+      "version": 60
+    },
+    {
+      "path": "migrations/postgres/0060_voice_turn_link.up.sql",
+      "sha256": "9101cacca3ad66fb9cca11a543e773a1bcacab6a62b2ad6a4befded519e23c2a",
       "version": 60
     },
     {
@@ -546,19 +567,29 @@
       "version": 110
     },
     {
-      "path": "migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql",
-      "sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
+      "path": "migrations/postgres/0111_auto_queue_cleanup_tasks_card_rollback.sql",
+      "sha256": "c0162fce99a4d0d3d395ca46da42a0de809d877d827fb73fb689df2232be3308",
       "version": 111
     },
     {
-      "path": "migrations/postgres/0112_intake_outbox_dispatched_clock.sql",
-      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
+      "path": "migrations/postgres/0112_intake_outbox_dispatched_status_swap.sql",
+      "sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
       "version": 112
     },
     {
-      "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
-      "sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
+      "path": "migrations/postgres/0113_intake_outbox_dispatched_clock.sql",
+      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
       "version": 113
+    },
+    {
+      "path": "migrations/postgres/0114_intake_outbox_stale_dispatched_index.sql",
+      "sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
+      "version": 114
+    },
+    {
+      "path": "migrations/postgres/0115_delivery_journal_intake_binding_index.sql",
+      "sha256": "abb9fc39aff21ccdb037891a155979595660ed52d5b2b7c0abf3ecf8bceb2e2f",
+      "version": 115
     }
   ],
   "version": 1
