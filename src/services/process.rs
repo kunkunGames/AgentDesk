@@ -255,6 +255,7 @@ impl ProcessIdentity {
         ProcessIdentityProbe::ProbeError
     }
 
+    #[allow(unused_variables)]
     pub(crate) fn from_persisted(starttime: Option<u128>, macos_lstart_hash: Option<u128>) -> Self {
         Self {
             starttime,
