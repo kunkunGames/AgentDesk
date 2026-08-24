@@ -559,16 +559,6 @@
       "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
       "sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
       "version": 113
-    },
-    {
-      "path": "migrations/postgres/0114_delivery_journal_intake_binding_index.sql",
-      "sha256": "abb9fc39aff21ccdb037891a155979595660ed52d5b2b7c0abf3ecf8bceb2e2f",
-      "version": 114
-    },
-    {
-      "path": "migrations/postgres/0115_auto_queue_cleanup_tasks_card_rollback.sql",
-      "sha256": "c0162fce99a4d0d3d395ca46da42a0de809d877d827fb73fb689df2232be3308",
-      "version": 115
     }
   ],
   "version": 1
