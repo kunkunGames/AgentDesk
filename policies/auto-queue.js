@@ -549,9 +549,10 @@ var autoQueue = {
       "  WHERE e.run_id = r.id AND e.status = 'pending'" +
       ") " +
       "ORDER BY (" +
-      "  SELECT MIN(e.updated_at) " +
+      "  SELECT e.updated_at " +
       "  FROM auto_queue_entries e " +
-      "  WHERE e.run_id = r.id AND e.status = 'pending'" +
+      "  WHERE e.run_id = r.id AND e.status = 'pending' " +
+      "  ORDER BY e.updated_at ASC LIMIT 1" +
       ") ASC LIMIT 50",
       []
     );
