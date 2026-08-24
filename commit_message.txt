@@ -1,5 +1,0 @@
-Steward: Support Parity-Lite title prefix in PR analyzer
-
-Adds `parity-lite` to the `overrides` dictionary in `scripts/analyze_prs.py`
-so that it recognizes `Parity-Lite:` as the correct expected prefix for
-PR titles from the Parity-Lite agent, instead of the default titlecase `ParityLite:`.
