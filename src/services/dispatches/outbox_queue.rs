@@ -301,7 +301,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                             outbox_id = id,
                             dispatch_id = %dispatch_id,
                             %error,
-                            "[dispatch-outbox] post-notify dispatch bookkeeping failed after status may already be dispatched (non-atomic helper)"
+                            "[dispatch-outbox] post-notify bookkeeping: failed to mark dispatch as dispatched (it may already be dispatched)"
                         );
                     }
                 }
