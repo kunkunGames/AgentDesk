@@ -136,6 +136,7 @@ PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(
         "src/services/discord/inflight/invariant_test_capture.rs",
         "src/services/discord/inflight/stall_recovery_tests/flake_isolation_4361.rs",
         "src/services/discord/inflight/stall_recovery_tests/flake_isolation_4422.rs",
+        "src/services/discord/inflight/stall_recovery_tests/generation_fence_5462.rs",
         "src/services/discord/relay_recovery/tests/circuit_breaker_apply.rs",
         "src/services/discord/tui_prompt_relay/local_model_queue_wake_e2e.rs",
     }

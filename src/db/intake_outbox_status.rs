@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn all_exactly_matches_migration_status_check() {
-        let migration = repo_source("migrations/postgres/0112_intake_outbox_dispatched_clock.sql");
+        let migration = repo_source("migrations/postgres/0107_intake_outbox_dispatched_clock.sql");
         let check_values = migration
             .split_once("ADD CONSTRAINT intake_outbox_status_check CHECK (status IN (")
             .expect("migration must add intake_outbox_status_check")

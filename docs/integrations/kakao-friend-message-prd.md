@@ -42,7 +42,7 @@ v1은 AgentDesk 결과나 카드를 외부에 공개하지 않는다. 고정 랜
 | 예약 fan-out | 명시적으로 확인된 `push` 예약만 Discord + Kakao 동시 handoff | 기존 fire-slot/Discord outbox를 재사용하고 provider별 최종 전달·재시도 상태는 분리 |
 | 나에게 테스트 발송 | 연결한 운영자 본인의 카카오톡 나와의 채팅방 | 친구 목록 권한 없이 `talk_message` 동의와 명시 확인만으로 OAuth·템플릿을 검증 |
 | 기존 idempotency | fingerprint helper만 재사용 가능; claim/TTL 재claim은 사용 금지 | 현재 계약은 replay-safe mutation 전용 |
-| 기존 delivery journal | 개념만 참고; 테이블·writer 재사용 금지 | `0105_delivery_journal`은 Discord 전용 hot surface와 제약을 가짐. 예약 fan-out은 별도 `external_share_outbox`를 사용 |
+| 기존 delivery journal | 개념만 참고; 테이블·writer 재사용 금지 | `0103_delivery_journal`은 Discord 전용 hot surface와 제약을 가짐. 예약 fan-out은 별도 `external_share_outbox`를 사용 |
 | connector | 기존 Settings connector 표면을 DB-aware로 확장 | 새 Integrations 탭 없이 상태 원천을 하나로 유지 |
 | 채널 추상화 | v1에는 범용 `ExternalShareChannel` trait 없음 | 구현체 하나로 잘못된 공통 계약을 선고정하지 않음 |
 | 다중 노드 | DB unique fence와 refresh lease로 안전하게 처리 | process-local guard를 운영 보장으로 오인하지 않음 |
@@ -475,7 +475,7 @@ AGENTDESK_OAUTH_TOKEN_KEY_V1
 - 변경 표면: [change-surfaces.md](../agent-maintenance/change-surfaces.md)
 - 현재 idempotency 계약: [`src/db/idempotency.rs`](../../src/db/idempotency.rs)
 - 현재 connector 계약: [`src/services/operator_connectors.rs`](../../src/services/operator_connectors.rs)
-- 현재 Discord delivery journal schema: [`0105_delivery_journal.sql`](../../migrations/postgres/0105_delivery_journal.sql)
+- 현재 Discord delivery journal schema: [`0103_delivery_journal.sql`](../../migrations/postgres/0103_delivery_journal.sql)
 
 외부 Kakao·oauth2-rs 근거와 확인 상태는 Spec의 **Provider Evidence Gate**를 정본으로 사용한다.
 

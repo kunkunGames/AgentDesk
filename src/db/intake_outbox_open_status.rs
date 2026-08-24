@@ -2,9 +2,9 @@
 /// Shared between migration schema (index WHERE clause) and Rust query sites to prevent
 /// drift. Lifecycle: pending → claimed → accepted → spawned → dispatched → done.
 /// Keep synchronized with:
-///   - `migrations/postgres/0110_intake_outbox_dispatched_status.sql` (staged index WHERE)
-///   - `migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql` (CHECK and index swap)
-///   - `migrations/postgres/0112_intake_outbox_dispatched_clock.sql` (nine-state CHECK)
+///   - `migrations/postgres/0105_intake_outbox_dispatched_status.sql` (staged index WHERE)
+///   - `migrations/postgres/0106_intake_outbox_dispatched_status_swap.sql` (CHECK and index swap)
+///   - `migrations/postgres/0107_intake_outbox_dispatched_clock.sql` (nine-state CHECK)
 ///   - All usages in `src/db/intake_outbox.rs` and related services
 ///   - Partial unique index `intake_outbox_one_open_route_per_channel` predicate
 pub(crate) const INTAKE_OUTBOX_OPEN_STATUSES_SQL: &str =
@@ -61,15 +61,15 @@ mod tests {
         //   - The query-site test rejects only the exact legacy four-status set; an inline
         //     non-legacy tuple can bypass the shared-constant contract.
         let migration_0105 =
-            repo_source("migrations/postgres/0110_intake_outbox_dispatched_status.sql");
+            repo_source("migrations/postgres/0105_intake_outbox_dispatched_status.sql");
         let migration_0106 =
-            repo_source("migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql");
+            repo_source("migrations/postgres/0106_intake_outbox_dispatched_status_swap.sql");
         let migration_0107 =
-            repo_source("migrations/postgres/0112_intake_outbox_dispatched_clock.sql");
+            repo_source("migrations/postgres/0107_intake_outbox_dispatched_clock.sql");
         let migration_0108 =
-            repo_source("migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql");
+            repo_source("migrations/postgres/0108_intake_outbox_stale_dispatched_index.sql");
         let migration_0109 =
-            repo_source("migrations/postgres/0114_delivery_journal_intake_binding_index.sql");
+            repo_source("migrations/postgres/0109_delivery_journal_intake_binding_index.sql");
         assert_eq!(
             migration_0105.lines().next(),
             Some("-- no-transaction"),
@@ -195,7 +195,7 @@ mod tests {
         }
         assert!(
             normalize_sql(&repo_source(
-                "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql"
+                "migrations/postgres/0108_intake_outbox_stale_dispatched_index.sql"
             ))
             .contains(
                 "CREATE INDEX CONCURRENTLY idx_intake_outbox_stale_dispatched ON intake_outbox (dispatched_at) WHERE status='dispatched';"
@@ -204,7 +204,7 @@ mod tests {
         );
         assert!(
             normalize_sql(&repo_source(
-                "migrations/postgres/0114_delivery_journal_intake_binding_index.sql"
+                "migrations/postgres/0109_delivery_journal_intake_binding_index.sql"
             ))
             .contains(
                 "CREATE INDEX CONCURRENTLY idx_delivery_journal_intake_binding ON delivery_journal_events ((canonical_payload->>'intake_outbox_id')) WHERE event_kind='O';"

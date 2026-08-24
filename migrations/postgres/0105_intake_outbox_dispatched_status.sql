@@ -14,13 +14,13 @@
 -- Failure recovery follows 0095_intake_outbox_idempotency_key_index.sql.
 -- PostgreSQL can leave an INVALID index after a failed concurrent build, so
 -- IF NOT EXISTS is intentionally omitted: a rerun must fail closed rather than
--- silently let 0111 swap in an incomplete fence. Inspect pg_index.indisvalid for
+-- silently let 0106 swap in an incomplete fence. Inspect pg_index.indisvalid for
 -- intake_outbox_one_open_route_per_channel_t2m. If it is INVALID, run
 -- `DROP INDEX CONCURRENTLY intake_outbox_one_open_route_per_channel_t2m`
 -- (or `REINDEX INDEX CONCURRENTLY` when applicable), resolve the original
--- failure, and rerun 0110. If it is valid because the build completed but SQLx
--- did not record 0110, either keep it and mark 0110 applied, or drop it
--- concurrently and rerun. Do not run 0111 until 0110 is recorded successfully.
+-- failure, and rerun 0105. If it is valid because the build completed but SQLx
+-- did not record 0105, either keep it and mark 0105 applied, or drop it
+-- concurrently and rerun. Do not run 0106 until 0105 is recorded successfully.
 CREATE UNIQUE INDEX CONCURRENTLY intake_outbox_one_open_route_per_channel_t2m
     ON intake_outbox (channel_id)
     WHERE status IN ('pending', 'claimed', 'accepted', 'spawned', 'dispatched');

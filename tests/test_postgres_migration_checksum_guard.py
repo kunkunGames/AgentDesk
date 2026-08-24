@@ -152,6 +152,47 @@ class PostgresMigrationChecksumGuardTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("checksum manifest corrected", result.stderr)
 
+    def test_legacy_base_manifest_schema_can_be_repaired_without_weakening_current_schema(self):
+        current_payload = json.loads(self.manifest.read_text(encoding="utf-8"))
+        legacy_payload = {
+            "version": 1,
+            "migrations": current_payload["protected_migrations"],
+        }
+        self.manifest.write_text(json.dumps(legacy_payload, indent=2), encoding="utf-8")
+
+        subprocess.run(["git", "init"], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "checksum-guard@example.invalid"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "checksum-guard"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "legacy base"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+        )
+
+        self.manifest.write_text(json.dumps(current_payload, indent=2), encoding="utf-8")
+
+        result = self.run_guard("--base-ref", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("legacy migrations key cannot provide an immutable base", result.stderr)
+
+        self.manifest.write_text(json.dumps(legacy_payload, indent=2), encoding="utf-8")
+        current_result = self.run_guard("--base-ref", "")
+        self.assertNotEqual(current_result.returncode, 0)
+        self.assertIn("protected_migrations must be a list", current_result.stderr)
+
     def test_rejects_duplicate_simple_migration_versions(self):
         duplicate = self.migrations_dir / "0001_duplicate.sql"
         duplicate.write_bytes(b"CREATE TABLE duplicate_example (id BIGINT PRIMARY KEY);\n")

@@ -5,4 +5,4 @@
 /// T2-W adds no migration. Keep this list aligned with the existing journal,
 /// dispatched-state, clock, and index migrations instead of raising the
 /// forward-only binary floor.
-pub(crate) const INTAKE_DELIVERY_REQUIRED_MIGRATIONS: [i64; 6] = [103, 110, 111, 112, 113, 114];
+pub(crate) const INTAKE_DELIVERY_REQUIRED_MIGRATIONS: [i64; 6] = [103, 105, 106, 107, 108, 109];

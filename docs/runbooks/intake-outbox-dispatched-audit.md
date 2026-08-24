@@ -5,7 +5,7 @@ Use this procedure to inventory `intake_outbox` rows whose status is
 
 ## Run the audit
 
-This command requires migration `0112_intake_outbox_dispatched_clock.sql` to
+This command requires migration `0107_intake_outbox_dispatched_clock.sql` to
 be applied to the target database. Confirm it with:
 
 ```sql

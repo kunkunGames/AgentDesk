@@ -614,7 +614,8 @@ src/
 │   │   │   │   └── rebind_adoption.rs
 │   │   │   ├── stall_recovery_tests/
 │   │   │   │   ├── flake_isolation_4361.rs
-│   │   │   │   └── flake_isolation_4422.rs
+│   │   │   │   ├── flake_isolation_4422.rs
+│   │   │   │   └── generation_fence_5462.rs
 │   │   │   ├── anchor_repost.rs
 │   │   │   ├── budget.rs
 │   │   │   ├── destructive_commit.rs
@@ -1340,6 +1341,8 @@ src/
 │   │   ├── memento_throttle.rs
 │   │   ├── mod.rs
 │   │   └── runtime_state.rs
+│   ├── message_outbox/
+│   │   └── identity.rs
 │   ├── observability/
 │   │   ├── emit.rs
 │   │   ├── events.rs

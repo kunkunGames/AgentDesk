@@ -328,8 +328,18 @@ def load_base_manifest_from_git(
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         return None, [f"{show_ref}: invalid JSON: {exc}"], None
+    warning = None
+    if "protected_migrations" not in data and isinstance(data.get("migrations"), list):
+        data = dict(data)
+        data["protected_migrations"] = data["migrations"]
+        warning = (
+            f"{show_ref}: legacy migrations key cannot provide an immutable base; "
+            "the current manifest must use protected_migrations"
+        )
     manifest, errors = parse_manifest(data, show_ref)
-    return manifest, errors, None
+    if warning:
+        return None, errors, warning
+    return manifest, errors, warning
 
 
 def repair_for(

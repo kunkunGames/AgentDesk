@@ -1016,7 +1016,7 @@ class RawWriterAllowlistTests(unittest.TestCase):
             "`stream_epoch` now exists in src/; the coordinate system whose absence is the "
             "reason the family was deleted may have arrived -- revive the family (S6 block)",
         )
-        schema = (ROOT / "migrations/postgres/0105_delivery_journal.sql").read_text(encoding="utf-8")
+        schema = (ROOT / "migrations/postgres/0103_delivery_journal.sql").read_text(encoding="utf-8")
         for column in ("source_kind", "pipe_stream_epoch", "pipe_sequence"):
             self.assertNotIn(
                 column,

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "be70794ddb4b9c62b4d26e34fbb289e5b9bd91b4",
+  "measured_at_sha": "762842e2290f6ed5e2d11579f9c8a58026118e12",
   "records": [
     {
       "root": "migrations/postgres",
@@ -950,110 +950,65 @@
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0103_scheduled_message_image_attachments.sql",
+      "path": "migrations/postgres/0103_delivery_journal.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:87f68badd3633d4980de645c7e6cdcd718c7f74834e73ae2ebaaf65314cb457e"
+      "fingerprint": "sha256:dca4f82db2633bd087f7c40e906449377a11566d4a1685ee21f3b662dbef80e4"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0104_scheduled_image_consumer_floor.sql",
+      "path": "migrations/postgres/0104_auto_queue_run_cleanup_tasks.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:330fc63d5e991ea857f7ea5046c00598a34c47d2408a808946ddbe42fd639708"
+      "fingerprint": "sha256:7055070121519089503ea966612d8df84c77bbdfef0040b086f3359754e73b07"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0105_delivery_journal.sql",
+      "path": "migrations/postgres/0105_intake_outbox_dispatched_status.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:43f0ebd53311d24023025dcae6b15c7f7925e78dd5568210cb5b2c3b0222a801"
+      "fingerprint": "sha256:e2113b2adb7c97358a023e7ca0b4d1f8df8bb75e7395bd94b1cdff95756f1984"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0106_auto_queue_run_cleanup_tasks.sql",
+      "path": "migrations/postgres/0106_intake_outbox_dispatched_status_swap.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:f5106ff2dd06f7cd753452a2d69c973b1d7a93022f183d2c913dd823d407d0e7"
+      "fingerprint": "sha256:0740848dc098297c021cddab8182c8d31def07da8dbe3eb3e9f67af2b3354493"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0107_kakao_friend_share.sql",
+      "path": "migrations/postgres/0107_intake_outbox_dispatched_clock.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:fa593cc048fa611e71fda5ad4fd4b646ba3d665b215efe475eae88a3bf571d61"
+      "fingerprint": "sha256:53290fb0973b951613c2930e11c12497a9d26f24098b8030b734b94794b11640"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0108_scheduled_external_share_outbox.sql",
+      "path": "migrations/postgres/0108_intake_outbox_stale_dispatched_index.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:2aee8c18720beb29359caab5fa7ff61e9d82e9ca1345edde4d5c8040e0146151"
+      "fingerprint": "sha256:a185367a6db841a34a990beac025b8f99c8e0dfc946654f063be41643c2bd0cc"
     },
     {
       "root": "migrations/postgres",
       "kind": "MIGRATION",
-      "path": "migrations/postgres/0109_kakao_multi_accounts.sql",
+      "path": "migrations/postgres/0109_delivery_journal_intake_binding_index.sql",
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:913558a5514868c8343fd3c4046bccc5170a85809ec24eaa11a804787acb9b7b"
-    },
-    {
-      "root": "migrations/postgres",
-      "kind": "MIGRATION",
-      "path": "migrations/postgres/0110_intake_outbox_dispatched_status.sql",
-      "api": "migration.file",
-      "symbol": "file",
-      "classification": "STATIC_FILE",
-      "fingerprint": "sha256:d780351b9d3f7be8fee83bd766e7c1c174668c777e0130b0ee1fa2ca1ff602d4"
-    },
-    {
-      "root": "migrations/postgres",
-      "kind": "MIGRATION",
-      "path": "migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql",
-      "api": "migration.file",
-      "symbol": "file",
-      "classification": "STATIC_FILE",
-      "fingerprint": "sha256:b06a8fca2f1d192053a92894486514fd90d51d5f24eadb8ec6b16c0a6d33a3f9"
-    },
-    {
-      "root": "migrations/postgres",
-      "kind": "MIGRATION",
-      "path": "migrations/postgres/0112_intake_outbox_dispatched_clock.sql",
-      "api": "migration.file",
-      "symbol": "file",
-      "classification": "STATIC_FILE",
-      "fingerprint": "sha256:752c458efe3087726e42d4072663ac8e2f1889ea74107f962d1ea8880eb77ee6"
-    },
-    {
-      "root": "migrations/postgres",
-      "kind": "MIGRATION",
-      "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
-      "api": "migration.file",
-      "symbol": "file",
-      "classification": "STATIC_FILE",
-      "fingerprint": "sha256:13635ce3017a5719407e1d48001d32e0494da49d57c2b4c2f2ffca397dc55dd9"
-    },
-    {
-      "root": "migrations/postgres",
-      "kind": "MIGRATION",
-      "path": "migrations/postgres/0114_delivery_journal_intake_binding_index.sql",
-      "api": "migration.file",
-      "symbol": "file",
-      "classification": "STATIC_FILE",
-      "fingerprint": "sha256:198326828c2fa805775f3c6786ce8802c24fbb7251948a8a9408148127392fd0"
+      "fingerprint": "sha256:dd93a661535ba0b37844c97e83427db0b7888027c54252139fa0cd4a9d0ea266"
     },
     {
       "root": "migrations/postgres",
@@ -1063,6 +1018,51 @@
       "symbol": "file",
       "classification": "STATIC_FILE",
       "fingerprint": "sha256:aa9df9e6f1b866f08060d41654516e4152cd1c885b2f45804a8bd6675b2530cf"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0111_scheduled_message_image_attachments.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:155bca0499ac28e01b1d8fb2da01a549d32fda6f579506efa71272d1cc3e5f45"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0112_scheduled_image_consumer_floor.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:aebe9f6a603a361b2e8f90928c091198153d86b11f69c9a9b40eafdfd64d9672"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0113_kakao_friend_share.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:bc1447cd52dcb90763c76b2983be1952fa179b6969e14099139f34cf1cba4d3e"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0114_scheduled_external_share_outbox.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:6e8c42865a7cd59dce3adf1b48145d83d29f5f9e279cb1f55cdd23c0bf28f78f"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0115_kakao_multi_accounts.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:61f8a44eddcc91758c1bb0eda11b3e213e67c682460a40b0ba81d26aa1d70995"
     },
     {
       "root": "migrations/postgres",
@@ -1080,7 +1080,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:4717e04302b881dfc79108fe97992b991a069f9a6c2d6be0bbc24d12c050ac1e"
+      "fingerprint": "sha256:df14f528e04368d56dcd2908131b3148f7de0111f33988965c1bd3416f880eb1"
     },
     {
       "root": "policies",
