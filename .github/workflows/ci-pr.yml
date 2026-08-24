@@ -737,7 +737,11 @@ jobs:
           env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn
 
       - name: just test-postgres
-        timeout-minutes: 20
+        # Exact-head #1710 ran 796 selected tests successfully in 1189.32s
+        # before the recipe reached its explicit no-marker modules. The old 20m
+        # bound therefore terminated a green suite with no cleanup headroom.
+        # Match the measured nightly budget and retain 50% runtime headroom.
+        timeout-minutes: 30
         shell: bash
         env:
           BASH_ENV: /dev/null
@@ -1415,7 +1419,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=e32217629c135d5cbd16c8bb81eb58fe53e07cea0def203a5ce6380191f80263
+          expected=7a34eb0354c620e0396d7c82bf7b783158b3e96ad9d1cc43f1b0e68aca36dfa1
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -1522,7 +1526,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=e32217629c135d5cbd16c8bb81eb58fe53e07cea0def203a5ce6380191f80263
+          expected=7a34eb0354c620e0396d7c82bf7b783158b3e96ad9d1cc43f1b0e68aca36dfa1
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

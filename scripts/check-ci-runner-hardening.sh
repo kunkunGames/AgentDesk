@@ -792,7 +792,9 @@ targets = {
     # #5230 re-pins after replacing repeated PostgreSQL skip literals with the
     # shared non-pg-test-filter source; job names, conditions, and timeouts are
     # unchanged, and the exact commands below pin each source/use pair.
-    "job_sha256" => "1e10a6a98f3e9a9b1f89001ccc260f6759a36238bb4c36dda0d08f10fe17e406",
+    # #1710 re-pins the measured PostgreSQL step budget at 30 minutes after 796
+    # successful selected tests consumed 1189.32s before supplemental modules.
+    "job_sha256" => "f8f79a04d0b920a2c0d2ad6ea388a8939fac8da1482cb17a4ce3b991e6a06219",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -842,7 +844,7 @@ targets = {
       },
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
-        "timeout_minutes" => 20,
+        "timeout_minutes" => 30,
       },
     },
   },
