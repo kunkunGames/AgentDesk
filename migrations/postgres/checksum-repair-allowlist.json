@@ -1,4 +1,50 @@
 {
-  "repairs": [],
-  "version": 1
+  "version": 1,
+  "repairs": [
+    {
+      "path": "migrations/postgres/0110_intake_outbox_dispatched_status.sql",
+      "old_sha256": "81644f27821f6bb148c9ec682af365c91a91d0d62c81b311f215a2e59cf55fec",
+      "new_sha256": "7b5475f60a5750d723f4b7a1118145dbb169baeeee53fec435afa92c254a7a24",
+      "issue": "N/A",
+      "reason": "Merge drift from porting main",
+      "covered_by_migration": "true",
+      "repair_doc": "Drift from main port"
+    },
+    {
+      "path": "migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql",
+      "old_sha256": "9368c9354eb5f17660cc435e61962d110bfc8c849896481156f37a3a70feef00",
+      "new_sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
+      "issue": "N/A",
+      "reason": "Merge drift from porting main",
+      "covered_by_migration": "true",
+      "repair_doc": "Drift from main port"
+    },
+    {
+      "path": "migrations/postgres/0112_intake_outbox_dispatched_clock.sql",
+      "old_sha256": "a7d4afeef4099198b9b81524b95010ac4873619e667bf0023a8019e0010bc34d",
+      "new_sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
+      "issue": "N/A",
+      "reason": "Merge drift from porting main",
+      "covered_by_migration": "true",
+      "repair_doc": "Drift from main port"
+    },
+    {
+      "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
+      "old_sha256": "878ed2f67e4aadbe02d2db383ba1f405fc2bb7c253b68055920c61c93edbf5a8",
+      "new_sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
+      "issue": "N/A",
+      "reason": "Merge drift from porting main",
+      "covered_by_migration": "true",
+      "repair_doc": "Drift from main port"
+    },
+    {
+      "path": "migrations/postgres/0114_delivery_journal_intake_binding_index.sql",
+      "old_sha256": "36ec9e1cdf605d32011d03b24419ecfba6a439267ac425682f34c54408300a18",
+      "new_sha256": "abb9fc39aff21ccdb037891a155979595660ed52d5b2b7c0abf3ecf8bceb2e2f",
+      "issue": "N/A",
+      "reason": "Merge drift from porting main",
+      "covered_by_migration": "true",
+      "repair_doc": "Drift from main port"
+    }
+  ]
 }
