@@ -1172,6 +1172,7 @@ mod postgres_source_contract_tests {
             source: "headless_turn",
             reason_code: Some("headless.delivery"),
             session_key: Some("issue-5191"),
+            attachment: None,
         }
     }
 
