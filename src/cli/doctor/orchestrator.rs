@@ -3123,7 +3123,7 @@ fn check_mailbox_consistency(snapshot: &HealthSnapshot) -> Vec<Check> {
             };
             Check::fail(
                 finding.id,
-                CheckGroup::Core,
+                CheckGroup::ProviderRuntime,
                 "Turn Mailbox Consistency",
                 finding.detail,
                 if finding.live_work_present {
