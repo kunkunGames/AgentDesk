@@ -936,6 +936,7 @@ server::routes::discord::tests::snowflake_or_none_accepts_digits_only
 server::routes::discord::tests::snowflake_or_none_rejects_injection_attempts
 server::routes::discord::tests::thread_parent_id_extracts_discord_thread_parent
 server::routes::discord::tests::thread_parent_id_ignores_regular_channels
+server::routes::dispatched_sessions::tests::precondition_changed_handler_contract_is_conflict_and_retryable_pg
 server::routes::dispatches::crud::status_conflict_tests::dispatch_completion_status_conflict_message_allows_active_statuses
 server::routes::dispatches::crud::status_conflict_tests::dispatch_completion_status_conflict_message_rejects_terminal_statuses
 server::routes::dispatches::crud::tests::dispatch_api_pg_tests::dispatch_delivery_events_route_returns_typed_rows_newest_first
@@ -2933,6 +2934,7 @@ services::discord::inflight::model::turn_source_tests::relay_owner_kind_unknown_
 services::discord::inflight::model::turn_source_tests::relay_owner_kind_uses_legacy_bool_when_typed_field_absent
 services::discord::inflight::model::turn_source_tests::serde_round_trip_uses_snake_case
 services::discord::inflight::model::turn_source_tests::set_watcher_owner_channel_id_with_zero_channel_id_skips_record_without_panicking
+services::discord::inflight::model::turn_source_tests::source_message_ids_round_trip_and_default_for_legacy_rows
 services::discord::inflight::model::turn_source_tests::status_panel_generation_defaults_to_zero_for_legacy_rows
 services::discord::inflight::model::turn_source_tests::status_panel_generation_round_trips_when_present
 services::discord::inflight::model::turn_source_tests::watcher_owner_channel_id_defaults_absent_legacy_rows_to_none
@@ -3134,7 +3136,7 @@ services::discord::inflight::stall_recovery_tests::inflight_unknown_runtime_kind
 services::discord::inflight::stall_recovery_tests::inflight_unknown_runtime_kind_string_deserializes_as_none
 services::discord::inflight::stall_recovery_tests::inflight_v8_claude_tui_round_trips_with_fifo_for_rollback_compat
 services::discord::inflight::stall_recovery_tests::load_inflight_states_revalidates_malformed_row_under_lock
-services::discord::inflight::stall_recovery_tests::offset_monotonic_severity_downgrades_only_when_enforce_skips
+services::discord::inflight::stall_recovery_tests::offset_monotonic_severity_uses_warn_when_downgrade_selected
 services::discord::inflight::stall_recovery_tests::ownerless_external_input_stale_only_for_unowned_pre_placeholder_synthetic_rows
 services::discord::inflight::stall_recovery_tests::reanchor_bind_requires_old_panel_and_bumps_generation_from_disk
 services::discord::inflight::stall_recovery_tests::runtime_kind_round_trips_and_direct_tui_has_no_fifo_requirement
@@ -4285,6 +4287,7 @@ services::discord::router::intake_dispatch::attachment::tests::local_attachment_
 services::discord::router::intake_dispatch::attachment::tests::nonlocal_attachment_admission_never_runs_local_materialization
 services::discord::router::intake_dispatch::notice::tests::intake_dispatch_invariant_blocked_notice_is_throttled_atomically
 services::discord::router::intake_dispatch::queued::tests::actual_merge_persistence_restores_canonical_retry_lineage_4888
+services::discord::router::intake_dispatch::queued::tests::queued_admission_carries_every_absorbed_source_message_id
 services::discord::router::intake_dispatch::tests::dispatched_open_route_never_uses_stale_local_recovery_pg
 services::discord::router::intake_dispatch::tests::distinct_open_route_requeues_queued_successor_pg
 services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_direct_execution_body_has_no_external_producer_callsites
@@ -4384,6 +4387,7 @@ services::discord::router::message_handler::intake_turn::feedback_reminder_take_
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::bridge_handoff_stamp_call_site_is_adjacent_to_the_only_spawn_turn_bridge
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_adopts_worker_intake_outbox_identity
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_cannot_replace_an_already_adopted_intake_outbox_identity
+services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_persists_every_absorbed_source_message_id
 services::discord::router::message_handler::intake_turn::placeholder_handoff::tests::only_confirmed_missing_replaces_bound_busy_notice_4888
 services::discord::router::message_handler::intake_turn::queue_pending_reaction_clear_tests::cleared_set_covers_every_intake_gate_queue_reaction
 services::discord::router::message_handler::intake_turn::queue_pending_reaction_clear_tests::clears_every_queue_marker_reaction
@@ -6302,6 +6306,11 @@ services::discord::turn_bridge::terminal_delivery::tests::work_dispatch_completi
 services::discord::turn_bridge::terminal_outcome_delivery::busy_followup_retry::tests::capped_requeue_failure_preserves_inflight_without_false_queue_claim_4888
 services::discord::turn_bridge::terminal_outcome_delivery::contracts::tests::codex_tui_admitted_latch_does_not_narrow_the_exclusion_lease_5264
 services::discord::turn_bridge::terminal_outcome_delivery::contracts::tests::codex_tui_terminal_range_end_is_latch_only_5264
+services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::driver_drop_sweep_measures_the_current_marker_at_every_suspension_5191
+services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::driver_publish_panic_unwinds_and_leaves_the_watcher_unmarked_5191
+services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::driver_reaches_the_legacy_long_chunk_arm_with_an_unordered_range_5191
+services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::driver_terminal_publish_currently_starts_with_the_watcher_marker_unset_5191
+services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::driver_uncommitted_terminal_replace_leaves_the_watcher_unmarked_5191
 services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::terminal_delivery_epilogue_routes_identity_mismatch_to_warn
 services::discord::turn_bridge::terminal_outcome_delivery::empty_response_recovery::guidance::tests::completed_empty_response_explains_recovery_and_next_actions
 services::discord::turn_bridge::terminal_outcome_delivery::empty_response_recovery::guidance::tests::disconnected_empty_response_explains_recovery_and_next_actions
@@ -6686,8 +6695,11 @@ services::discord::watcher_lifecycle_decision::tests::normal_completion_waits_fo
 services::discord::watcher_lifecycle_decision::tests::stream_disconnect_with_dead_tmux_becomes_stop_signal
 services::discord::watcher_lifecycle_decision::tests::watcher_activity_heartbeat_falls_back_to_now_without_runtime_output
 services::discord::watcher_lifecycle_decision::tests::watcher_activity_heartbeat_uses_runtime_output_mtime
+services::discord::zombie_foreground_release::tests::fixtures::an_unlistable_store_is_unprobeable_rather_than_unclaimed
 services::discord::zombie_foreground_release::tests::fixtures::cancelled_turn_with_live_inflight_keeps_its_foreground_slot
+services::discord::zombie_foreground_release::tests::fixtures::episode_identity_is_extracted_from_the_stable_fields_only
 services::discord::zombie_foreground_release::tests::fixtures::uncancelled_live_turn_keeps_its_foreground_slot
+services::discord::zombie_foreground_release::tests::fixtures::unreadable_ambiguous_and_rebind_only_stores_are_not_reported_as_a_claim
 services::discord::zombie_foreground_release::tests::fixtures::zombie_foreground_turn_is_released_and_the_queue_survives
 services::discord::zombie_foreground_release::tests::idle_mailbox_is_a_hold_not_a_release
 services::discord::zombie_foreground_release::tests::issue_5176_zombie_shape_releases
@@ -7046,6 +7058,7 @@ services::oauth_connection::tests::token_vault_round_trips_and_binds_aad
 services::observability::cancellation_observability_tests::turn_cancelled_emit_records_normalized_payload_without_pg
 services::observability::emit::tests::every_emit_surface_records_one_recent_event
 services::observability::emit::tests::invariant_severity_routes_to_exact_log_level_and_suffix_4422
+services::observability::emit::tests::invariant_violation_persists_its_severity_5500
 services::observability::emit::tests::relay_delete_records_required_fields_and_outcome
 services::observability::emit::tests::relay_root_cause_metric_wrappers_record_persistent_events
 services::observability::emit::tests::warn_severity_invariant_still_emits_event_without_error_level
@@ -7134,6 +7147,7 @@ services::platform::tmux::target_safety_tests::blank_session_name_is_not_a_valid
 services::platform::tmux::target_safety_tests::tmux_command_enables_utf8_mode
 services::platform::tmux::timeout_tests::kill_session_timeout_reports_hung_tmux
 services::platform::tmux::timeout_tests::pane_liveness_does_not_classify_probe_failure_as_dead
+services::platform::tmux::timeout_tests::probe_failure_widens_to_live_or_ambiguous_readiness
 services::platform::tmux::timeout_tests::send_keys_timeout_preserves_tmux_stderr_on_fast_failure
 services::platform::tmux::timeout_tests::send_keys_timeout_reports_hung_tmux
 services::platform::tmux::timeout_tests::session_presence_distinguishes_missing_from_probe_failure
@@ -7648,15 +7662,25 @@ services::settings::tests::settings_write_response_serializes_ok_contract
 services::settings::tests::startup_pg_runtime_config_writer_keeps_blob_authority_without_mirror_reinsertion
 services::slo::avg_latency_tests::avg_latency_query_excludes_dispatch_noise_sources
 services::slo::avg_latency_tests::noisy_metrics_have_alerts_disabled
+services::stale_turn_reconciler::tests::apply_time_inflight_reprobe_holds_a_new_turn_without_denying_a_stable_orphan_pg
+services::stale_turn_reconciler::tests::apply_time_tmux_reprobe_holds_a_pane_that_came_back_pg
+services::stale_turn_reconciler::tests::automatic_cas_log_names_only_precondition_changed_pg
 services::stale_turn_reconciler::tests::automatic_sweep_abstains_without_registry_but_operator_stays_outside_warrant_pg
+services::stale_turn_reconciler::tests::idle_without_inflight_cas_rejects_heartbeat_move_pg
+services::stale_turn_reconciler::tests::inflight_baseline_is_captured_before_the_tmux_gate_pg
+services::stale_turn_reconciler::tests::inflight_identity_swap_holds_one_tick_then_self_resolves_pg
 services::stale_turn_reconciler::tests::keyed_reconcile_pg_never_idles_a_live_busy_session
 services::stale_turn_reconciler::tests::keyed_reconcile_pg_releases_busy_session_without_inflight
 services::stale_turn_reconciler::tests::keyed_unchanged_outcome_keeps_live_row_turn_active_pg
 services::stale_turn_reconciler::tests::periodic_sweep_pg_still_requires_an_expired_heartbeat
 services::stale_turn_reconciler::tests::preserved_live_tmux_evidence_keeps_stale_row_busy_pg
 services::stale_turn_reconciler::tests::probe_failure_spinner_and_provider_mismatch_preserve_rows_pg
+services::stale_turn_reconciler::tests::provider_only_interleaving_fails_the_candidate_cas_pg
+services::stale_turn_reconciler::tests::same_second_zero_id_turns_are_separated_by_the_start_offset_pg
 services::stale_turn_reconciler::tests::stale_busy_candidates_reconcile_only_after_terminal_liveness_pg
+services::stale_turn_reconciler::tests::stale_candidate_cas_rejects_heartbeat_move_and_is_non_latching_pg
 services::stale_turn_reconciler::tests::tmux_identity_rejects_provider_mismatch_and_spinner_is_busy
+services::stale_turn_reconciler::tests::unreadable_inflight_provider_maps_unknown_and_preserves_busy_session_pg
 services::stream_json_cli::codec::tests::agy_codec_does_not_duplicate_aggregate_after_delta
 services::stream_json_cli::codec::tests::grok_messages_codec_emits_init_and_done
 services::stream_json_cli::dialects::agy::tests::default_argv_uses_conversation_not_continue
