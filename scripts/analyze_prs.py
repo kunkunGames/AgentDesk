@@ -215,7 +215,7 @@ def is_scratch_file_path(path):
     basename = path.split("/")[-1]
     is_nested = "/" in path
 
-    if path.endswith(".diff") or path.endswith(".patch"):
+    if path.endswith(".diff") or path.endswith(".patch") or path.endswith(".log"):
         return True
 
     global_scratch_files = {
@@ -225,6 +225,9 @@ def is_scratch_file_path(path):
         "prs.json",
         "scratch.json",
         "scratchpad.json",
+        "cargo_out.txt",
+        "npm_output.log",
+        "bun_output.txt",
     }
     if basename in global_scratch_files:
         return True
@@ -238,12 +241,14 @@ def is_scratch_file_path(path):
         "sql_test.rs",
     }
 
+    if re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename):
+        return True
+
     if not is_nested:
         if basename in root_scratch_files:
             return True
         return bool(
-            re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename)
-            or re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
+            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
         )
 
     return False
@@ -347,6 +352,7 @@ def main():
                     "domainkeeper": "DomainKeeper:",
                     "api-routemaster": "ApiRoutemaster:",
                     "parity-lite": "Parity-Lite:",
+                    "supply-lite": "Supply-Lite:",
                 }
                 if agent_slug in overrides:
                     expected_prefix = overrides[agent_slug]
