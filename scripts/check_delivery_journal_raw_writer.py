@@ -189,7 +189,7 @@ FAMILY_REGISTRY = (
 # What was measured, and what each measurement rules out:
 #   - `grep -rn stream_epoch src/ scripts/ migrations/` returns nothing. The
 #     name exists only in the design draft.
-#   - the shipped schema `migrations/postgres/0105_delivery_journal.sql` has no
+#   - the shipped schema `migrations/postgres/0103_delivery_journal.sql` has no
 #     `source_kind`, no `pipe_stream_epoch` and no `pipe_sequence` column, so
 #     there is no durable row a pipe obligation could be keyed by. The journal
 #     facade has exactly one coordinate key, `TuiObligationKey` in journal.rs.

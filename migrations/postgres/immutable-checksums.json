@@ -1,5 +1,7 @@
 {
-  "migrations": [
+  "version": 1,
+  "policy": "Numbered postgres migrations are immutable after merge. Add new migration files and append their checksum here. For intentional edits to an existing migration, keep this baseline unchanged and add migrations/postgres/checksum-repair-allowlist.json.",
+  "protected_migrations": [
     {
       "path": "migrations/postgres/0001_initial_schema.sql",
       "sha256": "c044f9e24cfba51126a6176095c198f16ad1275fcee07ed468e6345e0d79a88b",
@@ -63,6 +65,11 @@
     {
       "path": "migrations/postgres/0013_agent_quality_daily.down.sql",
       "sha256": "80e124b0a0ed61b727e463348eff78f5e64579f9c6a8fac67f2a7d9c912ead2f",
+      "version": 13
+    },
+    {
+      "path": "migrations/postgres/0013_agent_quality_daily.up.sql",
+      "sha256": "486a56ffe3fe335167cd09be649a61ef693c4af27b6d5e178a93a69f3bfa548b",
       "version": 13
     },
     {
@@ -286,13 +293,28 @@
       "version": 58
     },
     {
+      "path": "migrations/postgres/0058_sqlite_compat_json_extract_array.up.sql",
+      "sha256": "9202cb7cc664482eac6e897cd09d0b17330d78d969f85ccb190c202d8f83c6f4",
+      "version": 58
+    },
+    {
       "path": "migrations/postgres/0059_idempotency_keys.down.sql",
       "sha256": "3a7e603176082d28559294bbf1b6c0be10c08f420297db27f26e7210fb1f7b62",
       "version": 59
     },
     {
+      "path": "migrations/postgres/0059_idempotency_keys.up.sql",
+      "sha256": "26d2bd00c0a32205edd62a538d8f4dfcce72abec8d9ba6286c81eeb82a1d67b4",
+      "version": 59
+    },
+    {
       "path": "migrations/postgres/0060_voice_turn_link.down.sql",
       "sha256": "1806492df629e6edeca59dac63064a31e48afe3fa62d27d38d70a3bcfbda7c3b",
+      "version": 60
+    },
+    {
+      "path": "migrations/postgres/0060_voice_turn_link.up.sql",
+      "sha256": "9101cacca3ad66fb9cca11a543e773a1bcacab6a62b2ad6a4befded519e23c2a",
       "version": 60
     },
     {
@@ -506,60 +528,69 @@
       "version": 102
     },
     {
-      "path": "migrations/postgres/0103_scheduled_message_image_attachments.sql",
-      "sha256": "444af31e3eef42dea9ff14815682a2f74028d7478525be9ff31f04ae43dd92ac",
+      "path": "migrations/postgres/0103_delivery_journal.sql",
+      "sha256": "a8b316673f275edc3636bc2cd1b94ca4ba6ef28e870e229c674022d7a4623b7c",
       "version": 103
     },
     {
-      "path": "migrations/postgres/0104_scheduled_image_consumer_floor.sql",
-      "sha256": "61a283ccc3d6fbba9fbf04f1a4a195bfe2b16e34d26c38cd05101f44005a2f42",
+      "path": "migrations/postgres/0104_auto_queue_run_cleanup_tasks.sql",
+      "sha256": "658c3e35c36fcaa06f868810b264882524f1a11a1acb4181c6ded003475115d8",
       "version": 104
     },
     {
-      "path": "migrations/postgres/0105_delivery_journal.sql",
-      "sha256": "a8b316673f275edc3636bc2cd1b94ca4ba6ef28e870e229c674022d7a4623b7c",
+      "path": "migrations/postgres/0105_intake_outbox_dispatched_status.sql",
+      "sha256": "91338d78295c3b9687c8399d45298c7e1ec5e4ee16df1a85ffdb6d832786abf1",
       "version": 105
     },
     {
-      "path": "migrations/postgres/0106_auto_queue_run_cleanup_tasks.sql",
-      "sha256": "658c3e35c36fcaa06f868810b264882524f1a11a1acb4181c6ded003475115d8",
+      "path": "migrations/postgres/0106_intake_outbox_dispatched_status_swap.sql",
+      "sha256": "d9bb0d020f31f348433d2efeac6cf4edbbfbdb255ef4adcaa95c5244fb9c9406",
       "version": 106
     },
     {
-      "path": "migrations/postgres/0107_kakao_friend_share.sql",
-      "sha256": "179b8896d8ff4cfa66307c71a4420d9c942a9256b7d58f2b4360e85f3b736bcd",
+      "path": "migrations/postgres/0107_intake_outbox_dispatched_clock.sql",
+      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
       "version": 107
     },
     {
-      "path": "migrations/postgres/0108_scheduled_external_share_outbox.sql",
-      "sha256": "13521e19395ef0832b0c14ec1d9b62221a60f79b79bf6a7bc617204768a51305",
+      "path": "migrations/postgres/0108_intake_outbox_stale_dispatched_index.sql",
+      "sha256": "1a1b919c2592a01797822b3fde4b3e221ef8e4afe1e9c1e0403878ba28348ffa",
       "version": 108
     },
     {
-      "path": "migrations/postgres/0109_kakao_multi_accounts.sql",
-      "sha256": "f8add07539a9698760361c90b043259d782148b095b98b6d11515056ee7f71cd",
+      "path": "migrations/postgres/0109_delivery_journal_intake_binding_index.sql",
+      "sha256": "30c0c161afa5c0ea8b42bdf6f839ee5482bcaf332bda3e7fffaf037eed6c24a6",
       "version": 109
     },
     {
-      "path": "migrations/postgres/0110_intake_outbox_dispatched_status.sql",
-      "sha256": "7b5475f60a5750d723f4b7a1118145dbb169baeeee53fec435afa92c254a7a24",
+      "path": "migrations/postgres/0110_auto_queue_cleanup_tasks_card_rollback.sql",
+      "sha256": "c0162fce99a4d0d3d395ca46da42a0de809d877d827fb73fb689df2232be3308",
       "version": 110
     },
     {
-      "path": "migrations/postgres/0111_intake_outbox_dispatched_status_swap.sql",
-      "sha256": "0f3ccc3c76e81d84d4344bbe884b09b156d9158087278940280eb9c5e1022c0b",
+      "path": "migrations/postgres/0111_scheduled_message_image_attachments.sql",
+      "sha256": "444af31e3eef42dea9ff14815682a2f74028d7478525be9ff31f04ae43dd92ac",
       "version": 111
     },
     {
-      "path": "migrations/postgres/0112_intake_outbox_dispatched_clock.sql",
-      "sha256": "688488b2f17fde64c6f6b1814a599660a23a2046d2280470fe64581849a59ce5",
+      "path": "migrations/postgres/0112_scheduled_image_consumer_floor.sql",
+      "sha256": "61a283ccc3d6fbba9fbf04f1a4a195bfe2b16e34d26c38cd05101f44005a2f42",
       "version": 112
     },
     {
-      "path": "migrations/postgres/0113_intake_outbox_stale_dispatched_index.sql",
-      "sha256": "05fbefda59a82fadb77906b3fca4cea4dd990979df50d898433c8a7fceaad37e",
+      "path": "migrations/postgres/0113_kakao_friend_share.sql",
+      "sha256": "179b8896d8ff4cfa66307c71a4420d9c942a9256b7d58f2b4360e85f3b736bcd",
       "version": 113
+    },
+    {
+      "path": "migrations/postgres/0114_scheduled_external_share_outbox.sql",
+      "sha256": "13521e19395ef0832b0c14ec1d9b62221a60f79b79bf6a7bc617204768a51305",
+      "version": 114
+    },
+    {
+      "path": "migrations/postgres/0115_kakao_multi_accounts.sql",
+      "sha256": "f8add07539a9698760361c90b043259d782148b095b98b6d11515056ee7f71cd",
+      "version": 115
     }
-  ],
-  "version": 1
+  ]
 }

@@ -53,8 +53,8 @@ recurring 자동화 전반은 `routines`의 영역이다. 이 테이블은 "이 
 
 Postgres 전용 (messages 라우트와 동일하게 pg pool 필수). 마이그레이션:
 `migrations/postgres/0082_scheduled_messages.sql`부터
-`0104_scheduled_image_consumer_floor.sql` 및 provider fan-out용
-`0108_scheduled_external_share_outbox.sql`까지
+`0112_scheduled_image_consumer_floor.sql` 및 provider fan-out용
+`0114_scheduled_external_share_outbox.sql`까지
 사용한다 (`0079`~`0081`은 최신 upstream 계열이 선점). 라이브에 적용된 0082와
 이어지는 0083의 원문은 immutable하게 유지하고, recurrence anchor 컬럼과 최종
 non-null invariant는 0084/0085에서 additive하게 적용한다. 0086은 agent launch의
@@ -568,7 +568,7 @@ receiver UUID, nickname, text, raw provider body는 노출하지 않는다.
 
 | 파일 | 내용 |
 |---|---|
-| `migrations/postgres/0082_scheduled_messages.sql` ~ `0108_scheduled_external_share_outbox.sql` | 예약 정의, Discord outbox, 암호화된 외부 provider target/outbox, rolling-upgrade consumer floor를 포함한 스키마 |
+| `migrations/postgres/0082_scheduled_messages.sql` ~ `0114_scheduled_external_share_outbox.sql` | 예약 정의, Discord outbox, 암호화된 외부 provider target/outbox, rolling-upgrade consumer floor를 포함한 스키마 |
 | `src/db/scheduled_messages.rs`, `src/db/scheduled_messages/{agent,external_delivery,outbox}.rs` | CRUD + due-claim + delivery/agent-poll/outbox 조회와 provider consumer floor |
 | `src/server/routes/scheduled_messages.rs`, `src/server/routes/scheduled_messages/provider_targets.rs` | 위 7개 핸들러 + provider target 요청 검증/암호화 계획 생성 |
 | `src/server/routes/mod.rs`, `domains/ops.rs` | 라우트 등록 (protected ops 도메인) |

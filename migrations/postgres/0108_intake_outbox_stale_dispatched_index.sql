@@ -9,7 +9,7 @@
 -- unusable index. Inspect pg_index.indisvalid. If INVALID, DROP INDEX
 -- CONCURRENTLY idx_intake_outbox_stale_dispatched (or REINDEX INDEX
 -- CONCURRENTLY when applicable), resolve the original failure, and rerun. If
--- valid but unrecorded, either keep it and mark 0113 applied or drop it
+-- valid but unrecorded, either keep it and mark 0108 applied or drop it
 -- concurrently and rerun.
 CREATE INDEX CONCURRENTLY idx_intake_outbox_stale_dispatched
     ON intake_outbox (dispatched_at) WHERE status='dispatched';

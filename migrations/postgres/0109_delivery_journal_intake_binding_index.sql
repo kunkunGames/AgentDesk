@@ -9,7 +9,7 @@
 -- unusable index. Inspect pg_index.indisvalid. If INVALID, DROP INDEX
 -- CONCURRENTLY idx_delivery_journal_intake_binding (or REINDEX INDEX
 -- CONCURRENTLY when applicable), resolve the original failure, and rerun. If
--- valid but unrecorded, either keep it and mark 0114 applied or drop it
+-- valid but unrecorded, either keep it and mark 0109 applied or drop it
 -- concurrently and rerun.
 CREATE INDEX CONCURRENTLY idx_delivery_journal_intake_binding
     ON delivery_journal_events ((canonical_payload->>'intake_outbox_id')) WHERE event_kind='O';

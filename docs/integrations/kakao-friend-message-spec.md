@@ -74,7 +74,7 @@ external_evidence_status: "official-contracts-verified-live-account-pending"
 |---|---|---|---|---|
 | L-001 | 현재 `idempotency_keys` consumer는 replay-safe phase-gate repair이며 만료 후 재실행은 replay-safe 경로만 허용 | [`idempotency.rs`](../../src/db/idempotency.rs), [`control_routes.rs`](../../src/services/auto_queue/control_routes.rs) | LOCAL-VERIFIED | Kakao send에 claim/TTL 재사용 금지 |
 | L-002 | `record_response`는 별도 외부 side-effect 원자성을 제공하지 않는 UPDATE | [`idempotency.rs`](../../src/db/idempotency.rs) | LOCAL-VERIFIED | POST 후 DB 실패 창을 별도 fence로 다룸 |
-| L-003 | `0105_delivery_journal`은 obligation/attempt/channel/message receipt 이벤트 schema | [`0105_delivery_journal.sql`](../../migrations/postgres/0105_delivery_journal.sql) | LOCAL-VERIFIED | Kakao용 범용 테이블로 재사용 금지 |
+| L-003 | `0103_delivery_journal`은 obligation/attempt/channel/message receipt 이벤트 schema | [`0103_delivery_journal.sql`](../../migrations/postgres/0103_delivery_journal.sql) | LOCAL-VERIFIED | Kakao용 범용 테이블로 재사용 금지 |
 | L-004 | delivery journal raw writer는 Discord journal 내부 한 곳으로 제한됨 | [`journal/pg_store.rs`](../../src/services/discord/session_relay_sink/journal/pg_store.rs), [`test_delivery_journal_raw_writer.py`](../../tests/test_delivery_journal_raw_writer.py) | LOCAL-VERIFIED | Discord hot surface 절연 |
 | L-005 | connector backend는 기존 filesystem 필드를 보존하면서 `kind`, `env_vars`, OAuth `connection`, `actions`를 투영함 | [`operator_connectors.rs`](../../src/services/operator_connectors.rs) | LOCAL-VERIFIED | 기존 소비자 호환 추가형 확장 |
 | L-006 | connector endpoint가 `AppState`를 받아 DB-aware async projection을 반환함 | [`settings.rs`](../../src/server/routes/settings.rs) | LOCAL-VERIFIED | 별도 Kakao status endpoint 불필요 |
@@ -85,7 +85,7 @@ external_evidence_status: "official-contracts-verified-live-account-pending"
 | L-011 | AppError body는 `{error, code, context}`이고 `Config`, `Conflict`, `Database`, `Dispatch`, `Internal`, `Policy`, `Validation`이 존재 | [`error.rs`](../../src/error.rs) | LOCAL-VERIFIED | 새 ErrorCode 없이 정확한 mapping 가능 |
 | L-012 | reqwest 0.12 + rustls를 재사용하고 oauth2 5.0.0, chacha20poly1305, zeroize만 추가함 | [`Cargo.toml`](../../Cargo.toml) | LOCAL-VERIFIED | 중복 HTTP/TLS stack 없음 |
 | L-013 | Config는 cluster/multi-node를 지원함 | [`config.rs`](../../src/config.rs), [`node_registry.rs`](../../src/services/cluster/node_registry.rs) | LOCAL-VERIFIED | process-local correctness guard 금지 |
-| L-014 | `0107_kakao_friend_share.sql`과 immutable checksum manifest가 추가됨 | [`0107_kakao_friend_share.sql`](../../migrations/postgres/0107_kakao_friend_share.sql), [`immutable-checksums.json`](../../migrations/postgres/immutable-checksums.json) | LOCAL-VERIFIED | OAuth·operation schema를 한 수직 migration으로 관리 |
+| L-014 | `0113_kakao_friend_share.sql`과 immutable checksum manifest가 추가됨 | [`0113_kakao_friend_share.sql`](../../migrations/postgres/0113_kakao_friend_share.sql), [`immutable-checksums.json`](../../migrations/postgres/immutable-checksums.json) | LOCAL-VERIFIED | OAuth·operation schema를 한 수직 migration으로 관리 |
 | L-015 | CI가 inventory를 생성하고 tracked route/worker docs의 drift를 거부 | [`ci-script-checks.sh`](../../scripts/ci-script-checks.sh) | LOCAL-VERIFIED | route 변경 PR마다 inventory 동시 갱신 |
 | L-016 | 결과별 public artifact/deep link 계약이 현재 없음 | [`access.rs`](../../src/server/routes/domains/access.rs) | LOCAL-VERIFIED | v1 landing link는 결과 공유가 아님 |
 
@@ -248,7 +248,7 @@ kakao/external_share/oauth_connection
 
 ## 5. Data Model
 
-구현 migration은 현재 HEAD의 next-free 번호인 [`0107_kakao_friend_share.sql`](../../migrations/postgres/0107_kakao_friend_share.sql)이며 immutable checksum manifest에 포함된다.
+구현 migration은 병합된 배포 계보 다음 번호인 [`0113_kakao_friend_share.sql`](../../migrations/postgres/0113_kakao_friend_share.sql)이며 immutable checksum manifest에 포함된다.
 
 ### 5.1 OAuth sessions
 
@@ -1319,7 +1319,7 @@ This document describes an implemented local slice, not an activated integration
 | “결과/카드 공유” | Settings text-only test send; fixed landing is not result sharing |
 | `idempotency_keys` + 24h reclaim | durable non-reclaiming `external_share_operations` fence |
 | crash 후 TTL 재POST 가능 | expired dispatch becomes sticky unknown; no re-POST |
-| Discord delivery concepts 미조사 | `0105_delivery_journal` explicitly isolated |
+| Discord delivery concepts 미조사 | `0103_delivery_journal` explicitly isolated |
 | connector vec에 row만 추가 | async DB-aware canonical projection + backward-compatible kind/env list/connection/actions |
 | `/api/kakao/status`와 connector status 병렬 | connector endpoint is the only UI status surface |
 | Kakao ID-specific row actions | generic row + one typed action adapter |
@@ -1341,7 +1341,7 @@ This document describes an implemented local slice, not an activated integration
 |---|---|
 | 2026-08-09 | Initial AgentDesk reuse survey and wire draft |
 | 2026-08-09 | Detailed OAuth/friends/send/idempotency/connectors draft |
-| 2026-08-09 | **Cohesion/ROI/safety rewrite**: added provider evidence and rollout gates; narrowed v1 to a Settings text-only pilot; replaced replay-safe idempotency reuse with a non-reclaiming external operation fence; isolated Discord `0105_delivery_journal`; made connector projection DB-aware; fixed crypto, refresh, disconnect, HTTP, privacy, cluster, test, and traceability contracts. |
+| 2026-08-09 | **Cohesion/ROI/safety rewrite**: added provider evidence and rollout gates; narrowed v1 to a Settings text-only pilot; replaced replay-safe idempotency reuse with a non-reclaiming external operation fence; isolated Discord `0103_delivery_journal`; made connector projection DB-aware; fixed crypto, refresh, disconnect, HTTP, privacy, cluster, test, and traceability contracts. |
 | 2026-08-09 | **Implementation synchronization**: aligned the Spec with the default-disabled OAuth/vault/friends/send slice, oauth2-rs 5.0.0, Kakao's comma-delimited scopes and refresh-token omission, bounded provider responses, the inline composer, one cohesive PR, and separate merge versus rollout gates. |
 | 2026-08-09 | **Ready-for-review hardening**: bound every new Kakao Dashboard response to a zod parser, inferred TypeScript types from the schemas, and added valid/invalid boundary tests before moving the PR out of Draft. |
 | 2026-08-09 | **Scheduled fan-out follow-up**: permitted one explicit automatic path—confirmed push reservations—and specified encrypted provider targets, atomic Discord/external outbox handoff, stable outbox-derived idempotency, provider-local retry/status, and terminal ciphertext scrubbing without introducing a Kakao-to-Discord dependency. |
