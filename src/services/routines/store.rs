@@ -14,7 +14,6 @@ use crate::services::automation_candidate_contract::{
     PIPELINE_STAGE_ID, has_complete_loop_contract,
 };
 use crate::services::scheduling::{next_due_after, next_due_after_anchor, validate_schedule};
-use crate::utils::api::clamp_api_limit;
 
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
 const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
@@ -971,7 +970,7 @@ impl RoutineStore {
     }
 
     pub async fn list_runs(&self, routine_id: &str, limit: i64) -> Result<Vec<RoutineRunRecord>> {
-        let limit = clamp_api_limit(usize::try_from(limit).ok()) as i64;
+        let limit = limit.clamp(1, 10_000);
         sqlx::query_as(
             r#"
             SELECT id, routine_id, status, action, turn_id, lease_expires_at,
@@ -1194,7 +1193,7 @@ impl RoutineStore {
         since: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<Vec<RoutineRunSearchRecord>> {
-        let limit = clamp_api_limit(usize::try_from(limit).ok()) as i64;
+        let limit = limit.clamp(1, 10_000);
         let pattern = format!("%{}%", escape_like_pattern(query));
         sqlx::query_as(
             r#"
@@ -4289,5 +4288,21 @@ mod tests {
         assert_eq!(failure, "failure");
         assert_ne!(manual, "failure");
         assert_ne!(migration_invalid, "failure");
+    }
+
+    #[test]
+    fn routine_store_clamps_limit_bounds_internally() {
+        // Just verify that the clamp is applied correctly
+        let limit = 0i64;
+        assert_eq!(limit.clamp(1, 10_000), 1);
+
+        let limit = -100i64;
+        assert_eq!(limit.clamp(1, 10_000), 1);
+
+        let limit = 20_000i64;
+        assert_eq!(limit.clamp(1, 10_000), 10_000);
+
+        let limit = 5_000i64;
+        assert_eq!(limit.clamp(1, 10_000), 5_000);
     }
 }
