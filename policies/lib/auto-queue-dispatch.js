@@ -47,14 +47,11 @@ function activationWasDeferred(result) {
 
 function rotateActiveRunSweepCursors(runIds) {
   if (!runIds || runIds.length === 0) return;
-  var batchSize = 100;
-  for (var i = 0; i < runIds.length; i += batchSize) {
-    var chunk = runIds.slice(i, i + batchSize);
-    var placeholders = chunk.map(function() { return "?"; }).join(",");
+  for (var i = 0; i < runIds.length; i++) {
     try {
       agentdesk.db.execute(
-        "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE status = 'pending' AND run_id IN (" + placeholders + ")",
-        chunk
+        "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE run_id = ? AND status = 'pending'",
+        [runIds[i]]
       );
     } catch (e) {
       autoQueueLog("warn", "failed to rotate active run sweep cursors: " + e, {});

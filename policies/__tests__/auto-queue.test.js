@@ -883,7 +883,7 @@ test("auto-queue rotates saturated active runs in bounded tick sweep", () => {
   assert.equal(state.executions.length, 1);
   assert.equal(
     state.executions[0].sql,
-    "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE status = 'pending' AND run_id IN (?)"
+    "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE run_id = ? AND status = 'pending'"
   );
   assert.deepEqual(Array.from(state.executions[0].params), ["run-saturated"]);
 });
