@@ -16,9 +16,10 @@ from scripts.analyze_prs import (
     is_scratch_file_path,
     _is_top_level_field_label,
 )
-from scripts.check_root_scratch_files import (
-    find_root_scratch_files,
-    main as check_root_scratch_files,
+import subprocess
+from scripts.check_scratch_files import (
+    find_scratch_files,
+    main as check_scratch_files,
 )
 
 
@@ -516,12 +517,13 @@ class CiScriptScratchGuardTests(unittest.TestCase):
     def test_ci_guard_uses_canonical_analyzer_policy(self):
         script = Path("scripts/ci-script-checks.sh").read_text()
 
-        self.assertIn('"$PYTHON" -m scripts.check_root_scratch_files', script)
+        self.assertIn('"$PYTHON" -m scripts.check_scratch_files', script)
         self.assertNotIn("for scratch_file in", script)
 
-    def test_root_guard_reuses_all_canonical_scratch_types(self):
+    def test_scratch_guard_reuses_all_canonical_scratch_types_recursively(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             scratch_names = {
                 "patch.diff",
                 "changes.patch",
@@ -530,22 +532,32 @@ class CiScriptScratchGuardTests(unittest.TestCase):
                 "test_payload.json",
                 "scratch.sql",
                 "test_cli.rs",
+                "src/nested_patch.diff",
+                "docs/plan.md",
+                "nested/scratchpad.py",
             }
-            for name in scratch_names | {"README.md"}:
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "nested").mkdir()
+
+            for name in scratch_names | {"README.md", "src/test_cli.rs"}:
                 (root / name).write_text("fixture\n", encoding="utf-8")
 
             self.assertEqual(
-                {path.name for path in find_root_scratch_files(root)}, scratch_names
+                set(find_scratch_files(root)), scratch_names
             )
-            self.assertEqual(check_root_scratch_files(root), 1)
+            self.assertEqual(check_scratch_files(root), 1)
 
-    def test_root_guard_accepts_a_clean_root(self):
+    def test_scratch_guard_accepts_a_clean_repo(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             (root / "README.md").write_text("fixture\n", encoding="utf-8")
+            (root / "src").mkdir()
+            (root / "src" / "test_cli.rs").write_text("fixture\n", encoding="utf-8")
 
-            self.assertEqual(find_root_scratch_files(root), [])
-            self.assertEqual(check_root_scratch_files(root), 0)
+            self.assertEqual(find_scratch_files(root), [])
+            self.assertEqual(check_scratch_files(root), 0)
 
 class PrAnalyzerRegexTests(unittest.TestCase):
     def test_bold_label_before_colon(self):
