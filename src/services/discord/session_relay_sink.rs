@@ -2390,7 +2390,7 @@ mod tests {
     fn idle_jsonl_user_event_consumption_clears_session_init_seen() {
         let session_name = "AgentDesk-claude-user-event-rearm";
         let mut session_init_seen = HashSet::from([session_name.to_string()]);
-        let mut offset = 128;
+        let offset = 128;
         let consumed_to = 256;
 
         idle_jsonl_consume_offset(
@@ -2503,7 +2503,7 @@ mod tests {
             "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"wake-y\"}\n",
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"wake answer from Y\"}]}}\n"
         );
-        let end = offset + wake_payload.len() as u64;
+        let _end = offset + wake_payload.len() as u64;
 
         let decision = idle_jsonl::idle_jsonl_apply_active_inflight_gate(
             &mut last_inflight_seen_at,
@@ -2558,12 +2558,12 @@ mod tests {
         inflight.tmux_session_name = None;
         let mut last_inflight_seen_at = HashMap::new();
         last_inflight_seen_at.insert(matched.expected_session_name.clone(), Instant::now());
-        let mut offset = 128;
+        let offset = 128;
         let wake_payload = concat!(
             "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"wake-none\"}\n",
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"wake answer\"}]}}\n"
         );
-        let end = offset + wake_payload.len() as u64;
+        let _end = offset + wake_payload.len() as u64;
 
         assert!(idle_jsonl::idle_jsonl_inflight_mismatches_session(
             &inflight,
@@ -3421,7 +3421,7 @@ mod tests {
         // REFUSES → NotDelivered AND the committed offset does NOT advance.
         // A mutation that hard-codes advance=`true` would advance here and Deliver.
         let shared2 = super::super::make_shared_data_for_tests();
-        let sink2 = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
+        let _sink2 = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
         let mismatched = inflight_with_identity_offset(
             channel.get(),
             session,

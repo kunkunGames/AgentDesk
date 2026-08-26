@@ -151,7 +151,7 @@ pub struct ProcessInfo {
 pub struct ProcessIdentity {
     starttime: Option<u128>,
     #[cfg(target_os = "macos")]
-    macos_lstart_hash: Option<u128>,
+    _macos_lstart_hash: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,7 +255,7 @@ impl ProcessIdentity {
         ProcessIdentityProbe::ProbeError
     }
 
-    pub(crate) fn from_persisted(starttime: Option<u128>, macos_lstart_hash: Option<u128>) -> Self {
+    pub(crate) fn from_persisted(starttime: Option<u128>, _macos_lstart_hash: Option<u128>) -> Self {
         Self {
             starttime,
             #[cfg(target_os = "macos")]

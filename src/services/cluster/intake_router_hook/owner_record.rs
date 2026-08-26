@@ -1598,7 +1598,7 @@ mod tests {
 
         let winner_pool = pool.clone();
         let winner_read = both_read.clone();
-        let mut winner = tokio::spawn(async move {
+        let winner = tokio::spawn(async move {
             let id = identity("claude", "rc");
             let mut tx = winner_pool.begin().await.unwrap();
             let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")

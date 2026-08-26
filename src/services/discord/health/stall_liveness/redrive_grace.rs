@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn redrive_no_progress_grace_is_monotonic_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_002);
         let tmux_session = "AgentDesk-codex-4181-mono-grace";
         super::super::clear_stall_watchdog_liveness_state(&provider, channel, Some(tmux_session));
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn redrive_ttl_gc_is_monotonic_and_survives_wall_jumps_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_003);
         let tmux_session = "AgentDesk-codex-4181-mono-gc";
         super::super::clear_stall_watchdog_liveness_state(&provider, channel, Some(tmux_session));
@@ -988,7 +988,7 @@ mod tests {
     #[test]
     fn redrive_rejects_stale_lower_offset_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_004);
         let tmux_session = "AgentDesk-codex-4181-stale-offset";
         super::super::clear_stall_watchdog_liveness_state(&provider, channel, Some(tmux_session));
@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn redrive_rotation_reset_rearms_grace_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_006);
         let tmux_session = "AgentDesk-codex-4181-rotation";
         super::super::clear_stall_watchdog_liveness_state(&provider, channel, Some(tmux_session));
@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     fn redrive_durable_baseline_survives_process_restart_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_007);
         let tmux_session = "AgentDesk-codex-4181-durable-baseline";
         let snap = frozen_backlog_snapshot(channel.get(), tmux_session, 10, 301_613);
@@ -1155,7 +1155,7 @@ mod tests {
     #[test]
     fn redrive_durable_baseline_rejects_successor_episode_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_008);
         let old = frozen_backlog_snapshot(
             channel.get(),
@@ -1192,7 +1192,7 @@ mod tests {
     #[test]
     fn redrive_durable_baseline_rejects_same_second_synthetic_successor_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_009);
         let snap = frozen_backlog_snapshot(channel.get(), "AgentDesk-codex-4181-synthetic", 10, 20);
         let mut successor = snap.clone();
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn stale_clear_preserves_successor_episode_baseline_4181() {
         let (_env, _root, _lock) = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_010);
         let old = frozen_backlog_snapshot(channel.get(), "AgentDesk-codex-4181-old-clear", 10, 20);
         let mut successor =
@@ -1286,7 +1286,7 @@ mod tests {
     #[test]
     fn stale_identity_persist_cannot_overwrite_successor_baseline_4181() {
         let (_env, _root, _lock) = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_011);
         let old = frozen_backlog_snapshot(channel.get(), "AgentDesk-codex-4181-shared", 10, 20);
         let mut successor = old.clone();
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn redrive_production_monotonic_clock_path_runs_4181() {
         let _runtime = isolated_runtime_root();
-        let provider = ProviderKind::Codex;
+        let _provider = ProviderKind::Codex;
         let channel = ChannelId::new(4_181_005);
         let tmux_session = "AgentDesk-codex-4181-prod-clock";
         super::super::clear_stall_watchdog_liveness_state(&provider, channel, Some(tmux_session));
