@@ -15,6 +15,7 @@ import {
   SurfaceSubsection,
 } from "./common/SurfacePrimitives";
 import { useFocusTrap } from "./common/overlay/useFocusTrap";
+import { useReturnFocus } from "./common/overlay/useReturnFocus";
 
 interface OfficeManagerModalProps {
   offices: Office[];
@@ -49,6 +50,7 @@ export default function OfficeManagerModal({
   } = useOfficeManager({ allAgents, onChanged });
 
   const containerRef = useFocusTrap(true);
+  useReturnFocus(true);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
