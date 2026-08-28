@@ -151,11 +151,11 @@ export default function AgentFormModal({
             <div
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
               role="spinbutton"
-              aria-label={tr("스프라이트 번호", "Sprite number")}
+              aria-label={tr("아이콘 번호", "Icon number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
               aria-valuemax={40}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 아이콘: ${spriteNum}`, en: `Selected icon: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -175,12 +175,12 @@ export default function AgentFormModal({
               <div
                 className="flex flex-col items-center gap-1"
                 role="group"
-                aria-label={tr("스프라이트 선택", "Sprite selection")}
+                aria-label={tr("아이콘 선택", "Icon selection")}
               >
                 <button
                   type="button"
                   tabIndex={-1}
-                  aria-label={tr("다음 스프라이트", "Next sprite")}
+                  aria-label={tr("다음 아이콘", "Next icon")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
@@ -218,7 +218,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   tabIndex={-1}
-                  aria-label={tr("이전 스프라이트", "Previous sprite")}
+                  aria-label={tr("이전 아이콘", "Previous icon")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
                     color: "var(--th-text-muted)",
