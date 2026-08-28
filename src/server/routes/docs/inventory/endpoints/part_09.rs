@@ -137,6 +137,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         )
         .with_params([
             ("content", body_param("string", true, "Message body to deliver")),
+            ("discordMentionUserIds", body_param("array", false, "Optional Discord-only positive user IDs rendered as <@id> mentions before content; provider deliveries keep the content unchanged")),
             ("scheduledAt", body_param("string", true, "RFC3339 fire time; past values require a schedule and are advanced to the next occurrence")),
             ("targetChannelId", body_param("string", false, "Discord channel id (required for push; agent falls back to its primary channel)")),
             ("deliveryKind", body_param("string", false, "push (default) or agent")),

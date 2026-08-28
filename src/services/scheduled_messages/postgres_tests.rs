@@ -61,6 +61,7 @@ async fn insert_agent_message(
         pool,
         &db::NewScheduledMessage {
             content: format!("scheduled agent payload for {agent_id}"),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "announce".to_string(),
@@ -107,6 +108,7 @@ async fn insert_due_push_message(pool: &PgPool) -> ScheduledMessageRow {
         pool,
         &db::NewScheduledMessage {
             content: "guarded push payload".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -300,6 +302,7 @@ async fn postgres_scheduled_push_handoff_copies_image_attachment_to_outbox() {
         &pool,
         &db::NewScheduledMessage {
             content: "image-bearing scheduled push".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -346,6 +349,63 @@ async fn postgres_scheduled_push_handoff_copies_image_attachment_to_outbox() {
     assert_eq!(attachment.0.as_deref(), Some("thumbnail.png"));
     assert_eq!(attachment.1.as_deref(), Some("image/png"));
     assert_eq!(attachment.2, Some(image_data));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_scheduled_push_renders_mentions_only_in_discord_outbox() {
+    let (pg_db, pool) = create_test_pool(
+        "agentdesk_smsg_discord_mentions",
+        "scheduled Discord-only mention rendering",
+    )
+    .await;
+    db::insert_scheduled_message_pg(
+        &pool,
+        &db::NewScheduledMessage {
+            content: "Kakao keeps this exact body".to_string(),
+            discord_mention_user_ids: vec![
+                "1469509284508340276".to_string(),
+                "1469961339920453675".to_string(),
+            ],
+            title: None,
+            target_channel_id: Some("123456789".to_string()),
+            bot: "notify".to_string(),
+            delivery_kind: db::KIND_PUSH.to_string(),
+            agent_id: None,
+            agent_instruction: None,
+            on_agent_failure: "fail".to_string(),
+            scheduled_at: Utc::now() - Duration::minutes(1),
+            schedule: None,
+            timezone: "UTC".to_string(),
+            expires_at: None,
+            source: "postgres_test".to_string(),
+            created_by: Some("postgres_test".to_string()),
+            dedupe_key: None,
+            image_attachment: None,
+            external_delivery_plan: None,
+            context_strategy: "fresh".to_string(),
+            context_snapshot_id: None,
+            on_context_failure: "fail".to_string(),
+        },
+    )
+    .await
+    .expect("insert scheduled mention push");
+
+    let fire = claim_one(&pool, "discord-mention-worker").await;
+    fire_claimed(&pool, None, fire, Utc::now()).await;
+    let discord_content: String = sqlx::query_scalar(
+        "SELECT content FROM message_outbox WHERE source = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(OUTBOX_SOURCE)
+    .fetch_one(&pool)
+    .await
+    .expect("load Discord outbox content");
+    assert_eq!(
+        discord_content,
+        "<@1469509284508340276> <@1469961339920453675>\nKakao keeps this exact body"
+    );
 
     pool.close().await;
     pg_db.drop().await;
@@ -723,6 +783,7 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
         &pool,
         &db::NewScheduledMessage {
             content: "trigger-now cadence payload".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "announce".to_string(),
@@ -810,6 +871,7 @@ async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_an
         &pool,
         &db::NewScheduledMessage {
             content: "legacy trigger-now cadence payload".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "announce".to_string(),
@@ -978,6 +1040,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
         &pool,
         &db::NewScheduledMessage {
             content: "agent trigger-now cadence payload".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "announce".to_string(),

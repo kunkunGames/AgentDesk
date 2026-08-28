@@ -63,6 +63,59 @@ fn scheduled_image_attachment_rejects_oversized_discord_content() {
 }
 
 #[test]
+fn discord_only_mentions_require_unique_push_user_ids_and_fit_the_rendered_message() {
+    let user_ids = validate_discord_mention_user_ids(
+        &[
+            "1469509284508340276".to_string(),
+            "1469961339920453675".to_string(),
+        ],
+        db::KIND_PUSH,
+    )
+    .expect("valid Discord user IDs");
+    assert_eq!(user_ids.len(), 2);
+    validate_discord_rendered_content_length("Kakao keeps this body", &user_ids)
+        .expect("Discord prefix fits separately from the canonical provider body");
+
+    assert!(
+        validate_discord_mention_user_ids(&["1".to_string(), "1".to_string()], db::KIND_PUSH,)
+            .is_err()
+    );
+    assert!(validate_discord_mention_user_ids(&["01".to_string()], db::KIND_PUSH).is_err());
+    assert!(validate_discord_mention_user_ids(&["1".to_string()], db::KIND_AGENT).is_err());
+    assert!(
+        validate_discord_rendered_content_length(
+            &"x".repeat(crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS),
+            &["1".to_string()],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn scheduled_message_accepts_null_discord_mentions_for_push_delivery() {
+    let body: CreateScheduledMessageBody = serde_json::from_value(serde_json::json!({
+        "content": "Discord receives this canonical body",
+        "discordMentionUserIds": null,
+        "targetChannelId": "123456789",
+        "deliveryKind": "push",
+        "scheduledAt": "2026-08-29T09:00:00Z"
+    }))
+    .expect("explicit null Discord mentions are accepted");
+
+    assert_eq!(body.discord_mention_user_ids, None);
+    assert_eq!(body.target_channel_id.as_deref(), Some("123456789"));
+    assert_eq!(body.delivery_kind.as_deref(), Some(db::KIND_PUSH));
+    assert!(
+        validate_discord_mention_user_ids(
+            body.discord_mention_user_ids.as_deref().unwrap_or_default(),
+            body.delivery_kind.as_deref().expect("delivery kind"),
+        )
+        .expect("null normalizes to an empty mention list")
+        .is_empty()
+    );
+}
+
+#[test]
 fn scheduled_message_bot_defaults_to_non_triggering_notify() {
     assert_eq!(scheduled_message_bot_or_default(None), "notify");
     assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
@@ -126,6 +179,7 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
     let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
     let body = CreateScheduledMessageBody {
         content: "trim explicit bot before persistence".to_string(),
+        discord_mention_user_ids: Some(vec!["1469509284508340276".to_string()]),
         title: None,
         target_channel_id: Some("123456789".to_string()),
         bot: Some(" notify ".to_string()),
@@ -155,10 +209,12 @@ async fn postgres_scheduled_message_create_persists_trimmed_explicit_bot() {
     .await
     .expect("validate explicit bot create");
     assert_eq!(new.bot, "notify");
+    assert_eq!(new.discord_mention_user_ids, ["1469509284508340276"]);
     let row = db::insert_scheduled_message_pg(&pool, &new)
         .await
         .expect("persist explicit bot create");
     assert_eq!(row.bot, "notify");
+    assert_eq!(row.discord_mention_user_ids, ["1469509284508340276"]);
 
     pool.close().await;
     pg_db.drop().await;
@@ -174,6 +230,7 @@ async fn postgres_scheduled_push_rejects_agent_id_before_foreign_key_insert() {
     let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
     let body = CreateScheduledMessageBody {
         content: "push must not persist an unused agent association".to_string(),
+        discord_mention_user_ids: None,
         title: None,
         target_channel_id: Some("123456789".to_string()),
         bot: None,
@@ -229,6 +286,7 @@ async fn postgres_scheduled_push_patch_distinguishes_values_from_null_clears() {
         &pool,
         &db::NewScheduledMessage {
             content: "ordinary push patch definition".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),

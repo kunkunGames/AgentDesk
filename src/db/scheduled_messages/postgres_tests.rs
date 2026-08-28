@@ -47,6 +47,7 @@ async fn insert_due_message(pool: &PgPool, delivery_kind: &str) -> ScheduledMess
         pool,
         &NewScheduledMessage {
             content: "scheduled test message".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: (delivery_kind == KIND_PUSH).then(|| "123456789".to_string()),
             bot: "announce".to_string(),
@@ -92,6 +93,7 @@ async fn postgres_list_scheduled_messages_keeps_image_blobs_out_of_memory() {
         &pool,
         &NewScheduledMessage {
             content: "image list projection".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -156,6 +158,7 @@ async fn postgres_scheduled_provider_plan_is_hidden_from_lists_and_scrubbed_on_t
         &pool,
         &NewScheduledMessage {
             content: "provider plan privacy lifecycle".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -392,6 +395,7 @@ async fn postgres_scheduled_image_floor_preflight_requires_upgraded_drained_flee
         &pool,
         &NewScheduledMessage {
             content: "preflight scheduled claim".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -527,6 +531,7 @@ async fn postgres_scheduled_image_consumer_floor_fences_legacy_claims() {
         &pool,
         &NewScheduledMessage {
             content: "image consumer floor".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: Some("123456789".to_string()),
             bot: "notify".to_string(),
@@ -1160,6 +1165,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
             &pool,
             &NewScheduledMessage {
                 content: format!("scheduled poll {label}"),
+                discord_mention_user_ids: Vec::new(),
                 title: None,
                 target_channel_id: Some("123456789".to_string()),
                 bot: "announce".to_string(),
@@ -1854,6 +1860,7 @@ async fn postgres_cancel_reports_committed_agent_handoff_not_intent() {
         &pool,
         &NewScheduledMessage {
             content: "already launched agent delivery".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: None,
             target_channel_id: None,
             bot: "notify".to_string(),

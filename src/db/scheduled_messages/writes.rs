@@ -29,7 +29,7 @@ pub async fn insert_scheduled_message_tx(
     let id = format!("smsg_{}", Uuid::new_v4());
     sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "INSERT INTO scheduled_messages
-            (id, content, title, target_channel_id, bot, delivery_kind, agent_id,
+            (id, content, discord_mention_user_ids, title, target_channel_id, bot, delivery_kind, agent_id,
              agent_instruction, on_agent_failure, scheduled_at, schedule, timezone,
              expires_at, source, created_by, dedupe_key, context_strategy,
              context_snapshot_id, on_context_failure, image_filename, image_content_type,
@@ -37,11 +37,12 @@ pub async fn insert_scheduled_message_tx(
              external_delivery_plan_nonce, external_delivery_plan_key_version,
              external_delivery_summary, external_delivery_account_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
          RETURNING {DEFINITION_COLUMNS}"
     ))
     .bind(&id)
     .bind(&new.content)
+    .bind(&new.discord_mention_user_ids)
     .bind(&new.title)
     .bind(&new.target_channel_id)
     .bind(&new.bot)

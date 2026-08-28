@@ -52,6 +52,18 @@ const AGENT_COMPLETION_TIMEOUT_SECS: i64 = 1800;
 const RUNTIME_DEFER_SECS: i64 = 15;
 const OUTBOX_SOURCE: &str = "scheduled_message";
 
+pub(crate) fn render_discord_push_content(content: &str, user_ids: &[String]) -> String {
+    if user_ids.is_empty() {
+        return content.to_string();
+    }
+    let mentions = user_ids
+        .iter()
+        .map(|user_id| format!("<@{user_id}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{mentions}\n{content}")
+}
+
 // ── Scheduler loop ──────────────────────────────────────────────────────────
 
 pub async fn scheduled_message_loop(
@@ -185,6 +197,8 @@ pub async fn fire_claimed(
 
 async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
     let message = &fire.message;
+    let discord_content =
+        render_discord_push_content(&message.content, &message.discord_mention_user_ids);
     let Some(channel_id) = message.target_channel_id.as_deref() else {
         // chk_smsg_push_target_required makes this unreachable; degrade safely.
         finish_terminal_failure(pool, fire, "push delivery has no target channel").await;
@@ -214,7 +228,7 @@ async fn fire_push(pool: &PgPool, fire: &ClaimedFire, now: DateTime<Utc>) {
         fire,
         OutboxMessage {
             target: &target,
-            content: &message.content,
+            content: &discord_content,
             bot: &message.bot,
             source: OUTBOX_SOURCE,
             reason_code: Some(&reason_code),
@@ -1221,6 +1235,7 @@ mod tests {
         let message = ScheduledMessageRow {
             id: "smsg_test".to_string(),
             content: "내일 배포 예정".to_string(),
+            discord_mention_user_ids: Vec::new(),
             title: Some("배포 공지".to_string()),
             target_channel_id: Some("123".to_string()),
             bot: "announce".to_string(),
@@ -1261,6 +1276,22 @@ mod tests {
         assert!(prompt.contains("3줄로 요약"));
         assert!(prompt.contains("내일 배포 예정"));
         assert!(prompt.contains("배포 공지"));
+    }
+
+    #[test]
+    fn discord_mentions_are_optional_for_discord_outbox_content() {
+        let user_ids = vec![
+            "1469509284508340276".to_string(),
+            "1469961339920453675".to_string(),
+        ];
+        assert_eq!(
+            render_discord_push_content("가온이 수유 기록", &user_ids),
+            "<@1469509284508340276> <@1469961339920453675>\n가온이 수유 기록"
+        );
+        assert_eq!(
+            render_discord_push_content("Discord 원문", &[]),
+            "Discord 원문"
+        );
     }
 
     #[test]

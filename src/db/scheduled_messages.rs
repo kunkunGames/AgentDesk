@@ -14,6 +14,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 mod agent;
+mod discord_mentions;
 mod external_delivery;
 mod outbox;
 mod writes;
@@ -23,6 +24,8 @@ pub use agent::{
     record_delivery_agent_turn_intent_pg, recover_expired_leases_pg,
     release_agent_delivery_to_poller_pg,
 };
+use discord_mentions::declare_discord_mention_consumer_v1_tx;
+pub use discord_mentions::discord_mentions_rollout_ready_pg;
 use external_delivery::declare_external_delivery_consumer_v1_tx;
 pub use external_delivery::external_delivery_rollout_ready_pg;
 pub use outbox::outbox_statuses_for_deliveries_pg;
@@ -44,7 +47,7 @@ pub const DELIVERY_INTERRUPTED: &str = "interrupted";
 pub const KIND_PUSH: &str = "push";
 pub const KIND_AGENT: &str = "agent";
 
-const DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, delivery_kind, \
+const DEFINITION_COLUMNS: &str = "id, content, discord_mention_user_ids, title, target_channel_id, bot, delivery_kind, \
      agent_id, agent_instruction, on_agent_failure, scheduled_at, schedule, timezone, \
      expires_at, status, in_flight_delivery_id, fire_count, last_fired_at, last_error, \
      source, created_by, dedupe_key, image_filename, image_content_type, image_data, \
@@ -56,7 +59,7 @@ const DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, de
 
 // The list endpoint only exposes attachment metadata. Do not select image_data
 // there: a valid page can otherwise retain up to 1.6 GiB of decoded blobs.
-const LIST_DEFINITION_COLUMNS: &str = "id, content, title, target_channel_id, bot, delivery_kind, \
+const LIST_DEFINITION_COLUMNS: &str = "id, content, discord_mention_user_ids, title, target_channel_id, bot, delivery_kind, \
      agent_id, agent_instruction, on_agent_failure, scheduled_at, schedule, timezone, \
      expires_at, status, in_flight_delivery_id, fire_count, last_fired_at, last_error, \
      source, created_by, dedupe_key, image_filename, image_content_type, \
@@ -79,6 +82,9 @@ pub const ON_CONTEXT_FAILURE_FRESH: &str = "fresh";
 pub struct ScheduledMessageRow {
     pub id: String,
     pub content: String,
+    /// Discord-only user mentions rendered immediately before the canonical
+    /// content. Provider deliveries deliberately never receive this prefix.
+    pub discord_mention_user_ids: Vec<String>,
     pub title: Option<String>,
     pub target_channel_id: Option<String>,
     pub bot: String,
@@ -128,6 +134,7 @@ impl ScheduledMessageRow {
         json!({
             "id": self.id,
             "content": self.content,
+            "discordMentionUserIds": self.discord_mention_user_ids,
             "title": self.title,
             "targetChannelId": self.target_channel_id,
             "bot": self.bot,
@@ -251,6 +258,7 @@ pub struct ClaimedFire {
 #[derive(Debug, Clone)]
 pub struct NewScheduledMessage {
     pub content: String,
+    pub discord_mention_user_ids: Vec<String>,
     pub title: Option<String>,
     pub target_channel_id: Option<String>,
     pub bot: String,
@@ -278,6 +286,7 @@ pub struct NewScheduledMessage {
 #[derive(Debug, Clone, Default)]
 pub struct ScheduledMessagePatch {
     pub content: Option<String>,
+    pub discord_mention_user_ids: Option<Vec<String>>,
     pub title: Option<Option<String>>,
     pub target_channel_id: Option<Option<String>>,
     pub bot: Option<String>,
@@ -429,6 +438,11 @@ pub async fn update_scheduled_message_pg(
     );
     if let Some(content) = &patch.content {
         builder.push(", content = ").push_bind(content);
+    }
+    if let Some(discord_mention_user_ids) = &patch.discord_mention_user_ids {
+        builder
+            .push(", discord_mention_user_ids = ")
+            .push_bind(discord_mention_user_ids);
     }
     if let Some(title) = &patch.title {
         builder.push(", title = ").push_bind(title);
@@ -689,6 +703,7 @@ async fn arm_delivery_slot_tx(
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
     declare_image_attachment_consumer_v1_tx(tx).await?;
+    declare_discord_mention_consumer_v1_tx(tx).await?;
     declare_external_delivery_consumer_v1_tx(tx).await?;
     let delivery_id = format!("smdel_{}", Uuid::new_v4());
     let claim_token = format!("smclaim_{}", Uuid::new_v4());
