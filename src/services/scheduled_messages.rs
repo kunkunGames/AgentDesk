@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn discord_mentions_are_rendered_only_for_discord_outbox_content() {
+    fn discord_mentions_are_optional_for_discord_outbox_content() {
         let user_ids = vec![
             "1469509284508340276".to_string(),
             "1469961339920453675".to_string(),
@@ -1289,8 +1289,8 @@ mod tests {
             "<@1469509284508340276> <@1469961339920453675>\n가온이 수유 기록"
         );
         assert_eq!(
-            render_discord_push_content("카카오 원문", &[]),
-            "카카오 원문"
+            render_discord_push_content("Discord 원문", &[]),
+            "Discord 원문"
         );
     }
 

@@ -92,6 +92,30 @@ fn discord_only_mentions_require_unique_push_user_ids_and_fit_the_rendered_messa
 }
 
 #[test]
+fn scheduled_message_accepts_null_discord_mentions_for_push_delivery() {
+    let body: CreateScheduledMessageBody = serde_json::from_value(serde_json::json!({
+        "content": "Discord receives this canonical body",
+        "discordMentionUserIds": null,
+        "targetChannelId": "123456789",
+        "deliveryKind": "push",
+        "scheduledAt": "2026-08-29T09:00:00Z"
+    }))
+    .expect("explicit null Discord mentions are accepted");
+
+    assert_eq!(body.discord_mention_user_ids, None);
+    assert_eq!(body.target_channel_id.as_deref(), Some("123456789"));
+    assert_eq!(body.delivery_kind.as_deref(), Some(db::KIND_PUSH));
+    assert!(
+        validate_discord_mention_user_ids(
+            body.discord_mention_user_ids.as_deref().unwrap_or_default(),
+            body.delivery_kind.as_deref().expect("delivery kind"),
+        )
+        .expect("null normalizes to an empty mention list")
+        .is_empty()
+    );
+}
+
+#[test]
 fn scheduled_message_bot_defaults_to_non_triggering_notify() {
     assert_eq!(scheduled_message_bot_or_default(None), "notify");
     assert_eq!(scheduled_message_bot_or_default(Some("   ")), "notify");
