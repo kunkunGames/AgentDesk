@@ -4,7 +4,7 @@
 //! `prompt_manifest_layers` tables plus the retention-policy snapshot from
 //! `agentdesk.yaml::prompt_manifest_retention`.
 //!
-//! See the storage retention guide at <https://github.com/kunkunGames/AgentDesk/blob/main/docs/storage-retention.md> for
+//! See the storage retention guide at <https://github.com/itismyfield-org/agentdesk/blob/main/docs/storage-retention.md> for
 //! the retention job schedule and operational cleanup guidance.
 //! `total_stored_bytes` and `total_original_bytes` are UTF-8 byte counts, not
 //! character counts.
