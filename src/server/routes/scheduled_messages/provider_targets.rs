@@ -380,6 +380,20 @@ mod tests {
             None,
         ));
 
+        let mut mention_patch = ScheduledMessagePatch::default();
+        mention_patch.discord_mention_user_ids = Some(vec!["1469509284508340276".to_string()]);
+        assert!(
+            !provider_delivery_intent_changed(
+                &mention_patch,
+                "hello",
+                scheduled_at,
+                Some("@every 1h"),
+                "UTC",
+                None,
+            ),
+            "Discord-only mentions must not require Kakao delivery reconfirmation"
+        );
+
         let mut cadence_patch = ScheduledMessagePatch::default();
         cadence_patch.schedule = Some(Some("@every 5m".to_string()));
         assert!(provider_delivery_intent_changed(

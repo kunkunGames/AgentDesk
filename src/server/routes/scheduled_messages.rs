@@ -91,6 +91,9 @@ fn scheduled_message_bot_or_default(bot: Option<&str>) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct CreateScheduledMessageBody {
     pub content: String,
+    /// Discord-only user IDs rendered as mentions immediately before content.
+    #[serde(default)]
+    pub discord_mention_user_ids: Option<Vec<String>>,
     pub title: Option<String>,
     pub target_channel_id: Option<String>,
     pub bot: Option<String>,
@@ -267,6 +270,13 @@ async fn validate_create(
         .as_deref()
         .unwrap_or(db::KIND_PUSH)
         .to_string();
+    let discord_mention_user_ids = validate_discord_mention_user_ids(
+        body.discord_mention_user_ids.as_deref().unwrap_or_default(),
+        &delivery_kind,
+    )?;
+    if !discord_mention_user_ids.is_empty() {
+        ensure_discord_mentions_rollout_ready(pool, cluster_enabled).await?;
+    }
     if delivery_kind != db::KIND_PUSH && delivery_kind != db::KIND_AGENT {
         return Err(app_error(
             StatusCode::BAD_REQUEST,
@@ -413,6 +423,7 @@ async fn validate_create(
         ));
     }
     validate_image_attachment_content_length(content, image_attachment.is_some())?;
+    validate_discord_rendered_content_length(content, &discord_mention_user_ids)?;
     if image_attachment.is_some() {
         ensure_image_attachment_rollout_ready(pool, cluster_enabled).await?;
     }
@@ -429,6 +440,7 @@ async fn validate_create(
 
     Ok(NewScheduledMessage {
         content: content.to_string(),
+        discord_mention_user_ids,
         title: body.title.clone().filter(|value| !value.trim().is_empty()),
         target_channel_id,
         bot: scheduled_message_bot_or_default(body.bot.as_deref()),
@@ -476,6 +488,97 @@ fn validate_image_attachment_content_length(
         ));
     }
     Ok(())
+}
+
+const MAX_DISCORD_MENTION_USER_IDS: usize = 20;
+
+fn validate_discord_mention_user_ids(
+    user_ids: &[String],
+    delivery_kind: &str,
+) -> Result<Vec<String>, AppError> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if delivery_kind != db::KIND_PUSH {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            "discordMentionUserIds is only valid for push delivery",
+        ));
+    }
+    if user_ids.len() > MAX_DISCORD_MENTION_USER_IDS {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "discordMentionUserIds must contain at most {MAX_DISCORD_MENTION_USER_IDS} IDs"
+            ),
+        ));
+    }
+    let mut normalized = Vec::with_capacity(user_ids.len());
+    for user_id in user_ids {
+        let user_id = user_id.trim();
+        if user_id.is_empty()
+            || user_id.starts_with('0')
+            || !user_id.bytes().all(|byte| byte.is_ascii_digit())
+            || user_id
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+            || normalized.iter().any(|existing| existing == user_id)
+        {
+            return Err(app_error(
+                StatusCode::BAD_REQUEST,
+                "discordMentionUserIds must contain unique positive Discord user IDs",
+            ));
+        }
+        normalized.push(user_id.to_string());
+    }
+    Ok(normalized)
+}
+
+fn validate_discord_rendered_content_length(
+    content: &str,
+    user_ids: &[String],
+) -> Result<(), AppError> {
+    if user_ids.is_empty() {
+        return Ok(());
+    }
+    // `<@id>` for every user, spaces between mentions, then one newline.
+    // For a non-empty list, the separators total exactly `user_ids.len()`.
+    let prefix_len = user_ids
+        .iter()
+        .map(|user_id| user_id.len() + 3)
+        .sum::<usize>()
+        + user_ids.len();
+    let total = content.chars().count() + prefix_len;
+    let hard_limit = crate::services::discord::outbound::DISCORD_HARD_LIMIT_CHARS;
+    if total > hard_limit {
+        return Err(app_error(
+            StatusCode::BAD_REQUEST,
+            format!("content plus Discord mentions must not exceed {hard_limit} characters"),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_discord_mentions_rollout_ready(
+    pool: &PgPool,
+    cluster_enabled: bool,
+) -> Result<(), AppError> {
+    if !cluster_enabled {
+        return Ok(());
+    }
+    match db::discord_mentions_rollout_ready_pg(pool).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(app_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "discordMentionUserIds requires every online worker to advertise discord_mention_consumer_v1",
+        )),
+        Err(error) => Err(app_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("check scheduled Discord-mention rollout readiness: {error}"),
+        )),
+    }
 }
 
 async fn ensure_image_attachment_rollout_ready(
@@ -880,6 +983,21 @@ async fn build_patch(
         let content = content.ok_or_else(|| bad_request("content must not be null".to_string()))?;
         patch.content = Some(content);
     }
+    if let Some(value) = body.get("discordMentionUserIds") {
+        let user_ids = if value.is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value::<Vec<String>>(value.clone()).map_err(|error| {
+                bad_request(format!(
+                    "discordMentionUserIds must be an array or null: {error}"
+                ))
+            })?
+        };
+        patch.discord_mention_user_ids = Some(validate_discord_mention_user_ids(
+            &user_ids,
+            &existing.delivery_kind,
+        )?);
+    }
     patch.title = patch_string(body, "title").map_err(|e| bad_request(e))?;
     patch.target_channel_id =
         match patch_string(body, "targetChannelId").map_err(|e| bad_request(e))? {
@@ -954,6 +1072,17 @@ async fn build_patch(
         ));
     }
     let effective_content = patch.content.as_deref().unwrap_or(&existing.content);
+    let effective_discord_mention_user_ids = patch
+        .discord_mention_user_ids
+        .as_deref()
+        .unwrap_or(&existing.discord_mention_user_ids);
+    if !effective_discord_mention_user_ids.is_empty() {
+        ensure_discord_mentions_rollout_ready(pool, cluster_enabled).await?;
+    }
+    validate_discord_rendered_content_length(
+        effective_content,
+        effective_discord_mention_user_ids,
+    )?;
     patch.external_delivery_plan =
         patch_provider_targets(body, effective_content, effective_kind, kakao_config)?;
     if let Some(plan) = patch
