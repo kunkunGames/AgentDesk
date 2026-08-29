@@ -30,7 +30,7 @@
 - Primary files:
 - Public API impact:
 - Docs impact:
-- Verification commands and results:
+- Verification commands and results: <!-- If docs-only, explicitly state 'docs-only' and list verification files/commands -->
 - Skipped checks with reasons:
 - Risk:
 - Rollback notes:
