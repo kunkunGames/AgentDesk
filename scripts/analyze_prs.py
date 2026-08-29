@@ -414,6 +414,8 @@ def main():
                     print(f"  [!] EMPTY NO-CHANGE PR: No changed files. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
                     if not has_overlap_reference(body):
                         print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
+        elif files_data.get("files") is not None and len(files_data["files"]) == 0:
+            print(f"  [!] UNLABELED EMPTY PR: PR modifies 0 files but title lacks 'no-change'. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
 
         # PR #199/#200/#201 lesson: check for multiple inventory refreshes
         if "inventory" in title.lower() and "refresh" in title.lower():
