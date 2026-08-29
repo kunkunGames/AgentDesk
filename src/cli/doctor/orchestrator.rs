@@ -3767,7 +3767,8 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
             .with_expected_actual(
                 "postgres check runtime initializes",
                 format!("runtime build failed: {error}"),
-            );
+            )
+            .with_next_steps(vec!["inspect tokio thread configuration".to_string()]);
         }
     };
 
@@ -3827,7 +3828,8 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 .with_expected_actual(
                     "applied migrations all exist in resolved migrations, succeeded, and checksum-matched",
                     "migration drift, checksum mismatch, or unsuccessful migration",
-                ),
+                )
+                .with_next_steps(vec!["inspect dcserver logs or migrate status".to_string()]),
                 (Err(error), _) => Check::fail(
                     "postgres_connection",
                     CheckGroup::Core,
@@ -3838,7 +3840,8 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 .with_subsystem("postgres")
                 .with_fix_safety(FixSafety::NotFixable)
                 .with_security_exposure(SecurityExposure::OperationalMetadata)
-                .with_expected_actual("read-only _sqlx_migrations query succeeds", error),
+                .with_expected_actual("read-only _sqlx_migrations query succeeds", error)
+                .with_next_steps(vec!["ensure migrate credentials have select access".to_string()]),
                 (_, Err(error)) => Check::fail(
                     "postgres_connection",
                     CheckGroup::Core,
@@ -3849,7 +3852,8 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 .with_subsystem("postgres")
                 .with_fix_safety(FixSafety::NotFixable)
                 .with_security_exposure(SecurityExposure::OperationalMetadata)
-                .with_expected_actual("read-only _sqlx_migrations checksum query succeeds", error),
+                .with_expected_actual("read-only _sqlx_migrations checksum query succeeds", error)
+                .with_next_steps(vec!["ensure migrate credentials have select access".to_string()]),
             }
         }
         Ok(None) => Check::ok(
