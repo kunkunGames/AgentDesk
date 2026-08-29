@@ -206,6 +206,13 @@ pub struct DiscordConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub owner_id: Option<u64>,
+    /// Discord user IDs automatically attached to every scheduled push.
+    ///
+    /// Keep this empty for the general default behavior. When configured, the
+    /// scheduled-message API uses this pair instead of caller-supplied values
+    /// so automation cannot accidentally omit the required recipients.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_message_mention_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -3415,7 +3422,38 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
 
 fn validate_config(config: &Config) -> Result<()> {
     validate_escalation_schedule(&config.escalation.schedule)?;
-    validate_kakao_friend_share_config(&config.integrations.kakao_friend_share)
+    validate_kakao_friend_share_config(&config.integrations.kakao_friend_share)?;
+    validate_scheduled_message_mention_user_ids(&config.discord.scheduled_message_mention_user_ids)
+}
+
+fn validate_scheduled_message_mention_user_ids(user_ids: &[String]) -> Result<()> {
+    if user_ids.is_empty() {
+        return Ok(());
+    }
+    if user_ids.len() != 2 {
+        bail!(
+            "discord.scheduled_message_mention_user_ids must contain exactly two unique positive Discord user IDs"
+        );
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(user_ids.len());
+    for user_id in user_ids {
+        if user_id.is_empty()
+            || user_id.starts_with('0')
+            || !user_id.bytes().all(|byte| byte.is_ascii_digit())
+            || user_id
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+            || !seen.insert(user_id)
+        {
+            bail!(
+                "discord.scheduled_message_mention_user_ids must contain exactly two unique positive Discord user IDs"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_kakao_friend_share_config(config: &KakaoFriendShareConfig) -> Result<()> {
@@ -3580,6 +3618,36 @@ mod kakao_friend_share_config_tests {
         assert!(validate_kakao_friend_share_config(&config).is_err());
         config.send_limit_per_hour = 1_001;
         assert!(validate_kakao_friend_share_config(&config).is_err());
+    }
+}
+
+#[cfg(test)]
+mod scheduled_message_mention_config_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_message_mentions_allow_empty_or_exactly_two_canonical_ids() {
+        assert!(validate_scheduled_message_mention_user_ids(&[]).is_ok());
+        assert!(
+            validate_scheduled_message_mention_user_ids(&[
+                "1469509284508340276".to_string(),
+                "1469961339920453675".to_string(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn scheduled_message_mentions_reject_invalid_or_non_pair_values() {
+        for user_ids in [
+            vec!["1".to_string()],
+            vec!["1".to_string(), "2".to_string(), "3".to_string()],
+            vec!["1".to_string(), "1".to_string()],
+            vec!["01".to_string(), "2".to_string()],
+            vec!["one".to_string(), "2".to_string()],
+        ] {
+            assert!(validate_scheduled_message_mention_user_ids(&user_ids).is_err());
+        }
     }
 }
 
