@@ -1136,6 +1136,7 @@ mod live_pane_tests {
         }
 
         let _ = kill_session(&session, "dead marker hook test trigger");
+        std::thread::sleep(Duration::from_millis(500));
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline && !std::path::Path::new(&marker_path).exists() {
             std::thread::sleep(Duration::from_millis(100));
