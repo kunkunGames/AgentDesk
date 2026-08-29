@@ -3630,8 +3630,8 @@ mod scheduled_message_mention_config_tests {
         assert!(validate_scheduled_message_mention_user_ids(&[]).is_ok());
         assert!(
             validate_scheduled_message_mention_user_ids(&[
-                "1469509284508340276".to_string(),
-                "1469961339920453675".to_string(),
+                "111111111111111111".to_string(),
+                "222222222222222222".to_string(),
             ])
             .is_ok()
         );

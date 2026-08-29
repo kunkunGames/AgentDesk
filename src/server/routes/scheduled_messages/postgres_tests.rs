@@ -118,8 +118,8 @@ fn scheduled_message_accepts_null_discord_mentions_for_push_delivery() {
 #[test]
 fn configured_scheduled_push_mentions_override_missing_or_requested_values() {
     let configured = vec![
-        "1469509284508340276".to_string(),
-        "1469961339920453675".to_string(),
+        "111111111111111111".to_string(),
+        "222222222222222222".to_string(),
     ];
 
     assert_eq!(
