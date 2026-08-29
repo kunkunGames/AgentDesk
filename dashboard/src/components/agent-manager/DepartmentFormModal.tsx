@@ -371,11 +371,7 @@ export default function DepartmentFormModal({
                       }}
                       type="button"
                       role="radio"
-                      aria-label={
-                        form.color === c
-                          ? t({ ko: `선택된 색상 ${c}`, en: `Selected color ${c}` })
-                          : t({ ko: `색상 ${c}`, en: `Color ${c}` })
-                      }
+                      aria-label={t({ ko: `색상 ${c}`, en: `Color ${c}` })}
                       aria-checked={form.color === c}
                       tabIndex={index === selectedColorIndex ? 0 : -1}
                       onKeyDown={(event) => handleColorKeyDown(event, index)}
