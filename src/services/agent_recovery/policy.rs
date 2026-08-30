@@ -162,6 +162,11 @@ pub enum PolicyError {
     MissingOwnerProvider {
         agent_id: String,
     },
+    SameProviderFallback {
+        agent_id: String,
+        fallback_agent_id: String,
+        provider: String,
+    },
     InvalidWorkspaceMode {
         value: String,
     },
@@ -194,6 +199,13 @@ impl PolicyError {
             Self::MissingOwnerProvider { agent_id } => {
                 format!("recovery-enabled agent '{agent_id}' requires a provider")
             }
+            Self::SameProviderFallback {
+                agent_id,
+                fallback_agent_id,
+                provider,
+            } => format!(
+                "recovery fallback_agent_id '{fallback_agent_id}' for '{agent_id}' must use a different provider than '{provider}' until provider-level channel ownership supports agent identity"
+            ),
             Self::InvalidWorkspaceMode { value } => {
                 format!("recovery workspace_mode '{value}' is not supported (P0: inherit only)")
             }
@@ -364,13 +376,26 @@ pub fn build_recovery_catalog(
                 });
             }
             let fallback_id = policy.as_ref().map(|item| item.fallback_agent_id.as_str());
-            if let Some(fallback_id) = fallback_id
-                && catalog.agent_provider(fallback_id).is_none()
-            {
-                return Err(PolicyError::UnknownFallback {
-                    agent_id: channel.agent.clone(),
-                    fallback_agent_id: fallback_id.to_string(),
-                });
+            if let Some(fallback_id) = fallback_id {
+                let fallback_provider = catalog.agent_provider(fallback_id).ok_or_else(|| {
+                    PolicyError::UnknownFallback {
+                        agent_id: channel.agent.clone(),
+                        fallback_agent_id: fallback_id.to_string(),
+                    }
+                })?;
+                let owner_provider = channel
+                    .provider
+                    .as_deref()
+                    .or(owner.provider.as_deref())
+                    .and_then(ProviderKind::from_str)
+                    .expect("recovery owner provider was validated above");
+                if fallback_provider == owner_provider {
+                    return Err(PolicyError::SameProviderFallback {
+                        agent_id: channel.agent.clone(),
+                        fallback_agent_id: fallback_id.to_string(),
+                        provider: owner_provider.as_str().to_string(),
+                    });
+                }
             }
         }
         let owner_provider = channel

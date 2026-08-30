@@ -267,6 +267,7 @@ impl RecoveryRuntime {
         state.status = ChannelRecoveryStatus::FallbackRunning;
         state.active_writer_agent_id = policy.fallback_agent_id.clone();
         state.primary_turn_id = Some(input.primary_turn_id.clone());
+        persist_state_in_background(state.clone());
         self.open_keys.insert(key);
         let events = self.last_n(&input.channel_id);
         let Some(spawn) = FallbackSpawnPlan::from_binding(&binding, fallback_provider, &events)
@@ -428,6 +429,7 @@ impl RecoveryRuntime {
         if let Some(state) = self.states.get_mut(channel_id) {
             state.status = ChannelRecoveryStatus::Restored;
             state.active_writer_agent_id = binding.owner_agent_id.clone();
+            persist_state_in_background(state.clone());
         }
         self.open_keys
             .retain(|(held_channel, _)| held_channel != channel_id);
@@ -444,6 +446,7 @@ impl RecoveryRuntime {
         if let Some(state) = self.states.get_mut(channel_id) {
             state.status = ChannelRecoveryStatus::Aborted;
             state.active_writer_agent_id = state.owner_agent_id.clone();
+            persist_state_in_background(state.clone());
         }
         self.open_keys
             .retain(|(held_channel, _)| held_channel != channel_id);
@@ -572,6 +575,10 @@ pub fn take_restore_packet(channel_id: &str) -> Option<String> {
     lock_runtime().take_restore_packet(channel_id)
 }
 
+pub fn abort(channel_id: &str) {
+    lock_runtime().abort(channel_id)
+}
+
 pub fn fallback_provider(channel_id: &str) -> Option<ProviderKind> {
     lock_runtime().fallback_provider(channel_id)
 }
@@ -696,6 +703,30 @@ fn persist_in_background(event: CheckpointEvent, state: ChannelState) {
                 channel_id = %event.channel_id,
                 error = %error,
                 "failed to persist agent recovery checkpoint event"
+            );
+        }
+    });
+}
+
+fn persist_state_in_background(state: ChannelState) {
+    let pool = {
+        let slot = pg_pool_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.clone()
+    };
+    let Some(pool) = pool else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = persist_channel_state(&pool, &state).await {
+            tracing::error!(
+                channel_id = %state.channel_id,
+                error = %error,
+                "failed to persist agent recovery channel state"
             );
         }
     });
