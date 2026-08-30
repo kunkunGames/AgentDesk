@@ -1,5 +1,3 @@
-Accessor: Add standard keyboard behaviors and selected-state semantics for modal icon selectors
-
 What changed:
 Added `Home`, `End`, `PageUp`, and `PageDown` keyboard handlers to the icon selector spinbutton in `dashboard/src/components/agent-manager/AgentFormModal.tsx` and bounded the value between 1 and 40. Also added `aria-selected` semantic attribute to the emoji picker in `dashboard/src/components/agent-manager/EmojiPickerLibraryPanel.tsx` to properly convey the selected state.
 
