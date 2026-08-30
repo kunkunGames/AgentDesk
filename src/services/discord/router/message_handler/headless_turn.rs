@@ -152,6 +152,7 @@ fn routine_metadata_role_binding(
         reasoning_effort: None,
         peer_agents_enabled: true,
         quality_feedback_injection_enabled: true,
+        auth_profile: "default".to_string(),
         memory: settings::resolve_memory_settings(None, None),
     })
 }
@@ -1264,6 +1265,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                                 remote_profile.clone(),
                                 std::time::Duration::from_secs(300),
                                 Some(cancel_token_clone),
+                                Some(channel_id.get()),
                             ),
                             tx.clone(),
                         ),
@@ -1486,6 +1488,7 @@ mod recovery_context_take_order_tests {
             reasoning_effort: None,
             peer_agents_enabled: false,
             quality_feedback_injection_enabled: false,
+            auth_profile: "default".to_string(),
             memory: Default::default(),
         };
         let built = build_system_prompt_with_manifest(

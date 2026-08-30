@@ -37,6 +37,7 @@ pub mod onboarding;
 pub mod pipeline;
 pub mod pr_summary;
 pub mod prompt_manifest_retention;
+pub mod provider_auth_profiles;
 pub mod provider_cli_api;
 pub mod providers_api;
 mod queue_api;

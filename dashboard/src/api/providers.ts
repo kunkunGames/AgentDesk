@@ -2,6 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { getProviderLabel } from "../app/providerTheme";
 import { request } from "./httpClient";
 import { CLI_PROVIDERS, LEGACY_ONLY_PROVIDERS } from "../components/agent-manager/constants";
+import type {
+  PendingProviderLogin,
+  ProviderAuthProfilesResponse,
+  ProviderLoginStartResponse,
+} from "../components/settings/SettingsProvidersModel";
+import { loginAttachInstruction } from "../components/settings/SettingsProvidersModel";
 
 export interface ProviderCatalogEntry {
   id: string;
@@ -23,6 +29,44 @@ const LEGACY_ONLY = new Set<string>(LEGACY_ONLY_PROVIDERS);
 export async function getProviderCatalog(): Promise<ProviderCatalogEntry[]> {
   const body = await request<{ providers: ProviderCatalogEntry[] }>("/api/providers");
   return body.providers ?? [];
+}
+
+export async function getProviderAuthProfiles(): Promise<ProviderAuthProfilesResponse> {
+  return request("/api/provider-auth-profiles");
+}
+
+export async function startProviderAuthLogin(
+  providerId: string,
+  profileId?: string,
+): Promise<PendingProviderLogin> {
+  const body = await request<ProviderLoginStartResponse>(
+    `/api/provider-auth-profiles/${encodeURIComponent(providerId)}/login-start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(profileId ? { profile_id: profileId } : {}),
+      maxRetries: 0,
+    },
+  );
+  return {
+    providerId,
+    profileId: body.profile_id,
+    home: body.home,
+    tmuxSession: body.tmux_session,
+    attach: body.attach || loginAttachInstruction(body.tmux_session),
+  };
+}
+
+export async function completeProviderAuthLogin(
+  providerId: string,
+  profileId: string,
+  home?: string,
+): Promise<{ ok: boolean; profile_id: string; home: string }> {
+  return request(`/api/provider-auth-profiles/${encodeURIComponent(providerId)}/login-complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile_id: profileId, home }),
+  });
 }
 
 export function selectableCatalogIds(
