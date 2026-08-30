@@ -45,7 +45,7 @@ describe("EmojiPicker", () => {
     const button = target.querySelector("button");
     expect(button).not.toBeNull();
     expect(button?.getAttribute("aria-expanded")).toBe("false");
-    expect(button?.getAttribute("aria-label")).toBe("Selected icon: 🤖, change icon");
+    expect(button?.getAttribute("aria-label")).toBe("Icon 🤖");
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
   });
 
@@ -53,7 +53,7 @@ describe("EmojiPicker", () => {
     const target = await render(<EmojiPicker value="" onChange={() => {}} />);
     const button = target.querySelector("button");
 
-    expect(button?.getAttribute("aria-label")).toBe("Open icon picker");
+    expect(button?.getAttribute("aria-label")).toBe("Choose icon");
   });
 
   it("renders the dialog with a translated accessible name", async () => {
