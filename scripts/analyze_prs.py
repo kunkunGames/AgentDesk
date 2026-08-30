@@ -143,15 +143,13 @@ def has_scratch_file_cleanup_ack(body):
     return has_non_empty_body_field(body, labels)
 
 def has_mergeability_status_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*mergeability status:\*\*", body):
+    labels = [
+        "mergeability status",
+        "mergeability-status",
+    ]
+    if _has_checked_template_ack(body, labels):
         return True
-    return has_non_empty_body_field(
-        body,
-        [
-            "mergeability status",
-            "mergeability-status",
-        ],
-    )
+    return has_non_empty_body_field(body, labels)
 
 def has_verification_grounding_ack(body):
     labels = [
@@ -237,18 +235,20 @@ def is_scratch_file_path(path):
         "test.sql",
         "test.py",
         "test.js",
+        "test.ts",
+        "test.mjs",
         "verify.sh",
         "sql_test.rs",
     }
 
-    if re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|json)$", basename):
+    if re.match(r"^(?:scratch|scratchpad|test_scratch)(?:[._-].+)?\.(?:md|txt|sh|sql|rs|py|js|ts|mjs|json)$", basename):
         return True
 
     if not is_nested:
         if basename in root_scratch_files:
             return True
         return bool(
-            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|json)$", basename)
+            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|ts|mjs|json)$", basename)
         )
 
     return False
