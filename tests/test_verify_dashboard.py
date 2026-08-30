@@ -77,17 +77,6 @@ class DashboardAuditWaiverTests(unittest.TestCase):
             fake_bin.mkdir()
 
             verifier = scripts_dir / "verify-dashboard.sh"
-            # Need to also create the helper scripts used by verify-dashboard.sh
-            (scripts_dir / "check-dashboard-toolchain.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            (scripts_dir / "check-dashboard-toolchain.sh").chmod(0o755)
-            (scripts_dir / "install-dashboard-dependencies.sh").write_text(
-                "#!/usr/bin/env bash\n"
-                "npm ci --no-audit --no-fund\n"
-                "exit 0\n",
-                encoding="utf-8"
-            )
-            (scripts_dir / "install-dashboard-dependencies.sh").chmod(0o755)
-
             verifier.write_text(
                 DASHBOARD_VERIFY_SCRIPT.read_text(encoding="utf-8"),
                 encoding="utf-8",
@@ -123,7 +112,6 @@ class DashboardAuditWaiverTests(unittest.TestCase):
             for case in cases:
                 with self.subTest(case["name"]):
                     npm_log.unlink(missing_ok=True)
-                    npm_log.touch()
                     env = os.environ.copy()
                     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
                     env["NPM_LOG"] = str(npm_log)
@@ -141,9 +129,7 @@ class DashboardAuditWaiverTests(unittest.TestCase):
                         capture_output=True,
                         check=False,
                     )
-                    calls = []
-                    if npm_log.exists():
-                        calls = npm_log.read_text(encoding="utf-8").splitlines()
+                    calls = npm_log.read_text(encoding="utf-8").splitlines()
 
                     self.assertEqual(result.returncode, case["returncode"])
                     self.assertEqual(

@@ -11,7 +11,7 @@ use super::super::{
     scheduled_messages, skills_api, termination_events,
 };
 
-// Category: ops
+// Category: dispatches, queue, and ops
 
 pub(crate) fn router(state: AppState) -> ApiRouter {
     let router = protected_api_domain(

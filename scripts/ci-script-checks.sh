@@ -313,7 +313,7 @@ echo "=== Scheduled-message PG path-filter wiring contract ==="
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
 
 echo "=== Scratch file guard ==="
-"$PYTHON" -m scripts.check_scratch_files
+"$PYTHON" -m scripts.check_root_scratch_files
 
 echo "=== Check hardcoded port/path drift ==="
 grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \

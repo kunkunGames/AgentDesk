@@ -70,11 +70,6 @@ cluster:
 discord:
   guild_id: "YOUR_GUILD_ID"
   owner_id: "YOUR_DISCORD_USER_ID"
-  # Optional: require these two Discord users on every scheduled push. The
-  # mentions are rendered for Discord only; Kakao retains the canonical body.
-  # scheduled_message_mention_user_ids:
-  #   - "123456789012345678"
-  #   - "234567890123456789"
   bots:
     command:
       token: "YOUR_COMMAND_BOT_TOKEN"

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "63b0e2b732cc54eda1d8453ecf99296cb4749f40",
+  "measured_at_sha": "969819d3e36f467f5873a3b7a4645a5b77f2cdab",
   "records": [
     {
       "root": "migrations/postgres",
@@ -2161,6 +2161,15 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:9e0b8944747443c87d00c220e02c38cd8e48ff46805113ab9e1cabb91ae34155"
+    },
+    {
+      "root": "policies",
+      "kind": "POLICY",
+      "path": "policies/review-automation.js",
+      "api": "agentdesk.db.query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b4f1051e993d59e85d92c4bb0ff60cbfb787ae4296ec06f5db8eb82785e5e9d8"
     },
     {
       "root": "policies",

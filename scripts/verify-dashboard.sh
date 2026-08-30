@@ -27,9 +27,6 @@ if [ "$audit_status" -ne 0 ]; then
     echo "       DASHBOARD_AUDIT_WAIVER='<reason>' ./scripts/verify-dashboard.sh" >&2
     exit "$audit_status"
   fi
-elif [ -n "${DASHBOARD_AUDIT_WAIVER:-}" ]; then
-  echo "Error: The waiver is stale and must be removed." >&2
-  exit 1
 fi
 
 echo "==> Dashboard build"

@@ -1314,14 +1314,16 @@ function processVerdict(cardId, verdict, result, options) {
   var initialState = agentdesk.pipeline.kickoffState(cfg);
   var inProgressState = agentdesk.pipeline.nextGatedTarget(initialState, cfg);
 
-  var card = agentdesk.cards.get(cardId);
-  if (card && agentdesk.pipeline.isTerminal(card.status, cfg)) {
+  var cardCheck = agentdesk.db.query(
+    "SELECT status FROM kanban_cards WHERE id = ?", [cardId]
+  );
+  if (cardCheck.length > 0 && agentdesk.pipeline.isTerminal(cardCheck[0].status, cfg)) {
     agentdesk.log.info("[review] processVerdict skipped — card " + cardId + " already terminal");
     return;
   }
 
   var fallbackReviewState = agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);
-  var currentState = card ? card.status : null;
+  var currentState = cardCheck.length > 0 ? cardCheck[0].status : null;
   var currentReviewPassTarget = currentState
     ? agentdesk.pipeline.nextGatedTargetWithGate(currentState, "review_passed", cfg)
     : null;

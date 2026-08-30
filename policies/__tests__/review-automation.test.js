@@ -204,6 +204,10 @@ test("review-automation noop verification passes go terminal without creating a 
     },
     dbQuery: createSqlRouter([
       {
+        match: "SELECT status FROM kanban_cards WHERE id = ?",
+        result: [{ status: "review" }]
+      },
+      {
         match: "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
         result: [{ context: JSON.stringify({ review_mode: "noop_verification" }) }]
       },
@@ -250,6 +254,10 @@ test("review-automation clears a completed pipeline stage after cards.get migrat
       }
     },
     dbQuery: createSqlRouter([
+      {
+        match: "SELECT status FROM kanban_cards WHERE id = ?",
+        result: [{ status: "review" }]
+      },
       {
         match: "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
         result: [{ context: JSON.stringify({ review_mode: "normal" }) }]
@@ -299,6 +307,10 @@ test("review-automation skips create-pr when reviewed work is already on origin 
       }
     ]),
     dbQuery: createSqlRouter([
+      {
+        match: "SELECT status FROM kanban_cards WHERE id = ?",
+        result: [{ status: "review" }]
+      },
       {
         match: "WHERE id = ? AND kanban_card_id = ? AND dispatch_type = 'review' LIMIT 1",
         result: [{ context: JSON.stringify({ review_mode: "normal" }) }]
