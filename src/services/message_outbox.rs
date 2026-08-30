@@ -333,6 +333,10 @@ async fn find_duplicate_outbox_message_pg(
     session_key: Option<&str>,
     dedupe_ttl_secs: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
+    if dedupe_ttl_secs <= 0 {
+        return Ok(None);
+    }
+
     let Some(session_key) = session_key else {
         return Ok(None);
     };
