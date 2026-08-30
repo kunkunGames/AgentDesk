@@ -675,6 +675,7 @@ async fn watcher_state_snapshot_for_shared(
         ),
     });
     let relay_stall_state = RelayStallClassifier::classify(&relay_health);
+    super::super::live_agent_recovery::observe_classified_stall(&relay_health, relay_stall_state);
     trace_relay_health_classification(&relay_health, relay_stall_state);
     // #4408 phase-2 (I1): resolve the relay tail's bound transcript/session. The
     // runtime binding is a sync single-shot lookup (its Mutex guard is released
@@ -953,6 +954,10 @@ async fn build_health_snapshot_with_options(
                     ),
                 });
                 let relay_stall_state = RelayStallClassifier::classify(&relay_health);
+                super::super::live_agent_recovery::observe_classified_stall(
+                    &relay_health,
+                    relay_stall_state,
+                );
                 trace_relay_health_classification(&relay_health, relay_stall_state);
                 let stall_shadow_verdict = stall_verdict::classify_health_snapshot_lossy(
                     provider_kind.as_ref(),
