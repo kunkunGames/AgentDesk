@@ -490,10 +490,10 @@ var autoQueue = {
     var terminalPending = agentdesk.db.query(
       "SELECT e.id, e.kanban_card_id, kc.status, e.run_id " +
       "FROM auto_queue_entries e " +
-      "JOIN auto_queue_runs r ON e.run_id = r.id " +
       "JOIN kanban_cards kc ON kc.id = e.kanban_card_id " +
-      "WHERE e.status = 'pending' AND r.status IN ('active', 'paused') " +
+      "WHERE e.status = 'pending' " +
       "AND kc.status IN (" + tickTerminalPlaceholders + ") " +
+      "AND e.run_id IN (SELECT id FROM auto_queue_runs WHERE status IN ('active', 'paused')) " +
       "ORDER BY e.updated_at ASC LIMIT 100",
       tickTerminalStates
     );

@@ -609,7 +609,7 @@ test("auto-queue onTick1min honors stale dispatched runtime config", () => {
     },
     dbQuery: createSqlRouter([
       {
-        match: "FROM auto_queue_entries e JOIN auto_queue_runs r ON e.run_id = r.id JOIN kanban_cards kc ON kc.id = e.kanban_card_id",
+        match: "FROM auto_queue_entries e JOIN kanban_cards kc ON kc.id = e.kanban_card_id",
         result: []
       },
       {
