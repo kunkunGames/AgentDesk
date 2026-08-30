@@ -71,6 +71,27 @@ fn enabled_runtime() -> RecoveryRuntime {
     runtime
 }
 
+#[test]
+fn recovery_catalog_rejects_fallback_on_the_owner_provider() {
+    let error = build_recovery_catalog(
+        &[
+            agent(
+                "claude",
+                "grok",
+                Some("/primary-workspace"),
+                Some(enabled_recovery("backup")),
+            ),
+            agent("backup", "grok", Some("/fallback-workspace"), None),
+        ],
+        &[channel("claude", Some(enabled_recovery("backup")))],
+    )
+    .expect_err("provider-level dispatch cannot fence two same-provider agents");
+    assert!(matches!(
+        error,
+        super::policy::PolicyError::SameProviderFallback { .. }
+    ));
+}
+
 fn compact(progress: &str) -> CheckpointPayload {
     CheckpointPayload::compact(
         "claude",
