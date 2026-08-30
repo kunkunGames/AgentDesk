@@ -32,19 +32,18 @@ pub(in crate::services::discord) async fn observe_and_execute(
         elapsed_secs,
         snapshot.mailbox_has_cancel_token,
     );
-    let spawn = mailbox_outcome
-        .spawn
-        .or_else(|| {
-            (snapshot.tmux_alive == Some(false) && snapshot.mailbox_has_cancel_token).then(|| {
-                agent_recovery::observe(ObserveInput {
-                    channel_id: channel_id.clone(),
-                    primary_turn_id: turn_id.clone(),
-                    signal: DetectorSignal::TmuxSessionDead,
-                })
-                .spawn
+    let spawn = mailbox_outcome.spawn.or_else(|| {
+        if snapshot.tmux_alive == Some(false) && snapshot.mailbox_has_cancel_token {
+            agent_recovery::observe(ObserveInput {
+                channel_id: channel_id.clone(),
+                primary_turn_id: turn_id.clone(),
+                signal: DetectorSignal::TmuxSessionDead,
             })
-        })
-        .flatten();
+            .spawn
+        } else {
+            None
+        }
+    });
     if let Some(spawn) = spawn {
         return execute_fallback(registry, snapshot, spawn).await;
     }
