@@ -1382,11 +1382,13 @@ async fn finalize_activate_run_and_build_response(
         }
     }
 
-    let active_group_count = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT COALESCE(thread_group, 0))::BIGINT
+    let (active_group_count, pending_group_count) = match sqlx::query_as::<_, (i64, i64)>(
+        "SELECT
+            COUNT(DISTINCT CASE WHEN status = 'dispatched' THEN COALESCE(thread_group, 0) END)::BIGINT,
+            COUNT(DISTINCT CASE WHEN status = 'pending' THEN COALESCE(thread_group, 0) END)::BIGINT
          FROM auto_queue_entries
          WHERE run_id = $1
-           AND status = 'dispatched'",
+           AND status IN ('dispatched', 'pending')",
     )
     .bind(run_id)
     .fetch_one(pool)
@@ -1397,27 +1399,7 @@ async fn finalize_activate_run_and_build_response(
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
-                    json!({"error": format!("count postgres active groups for {run_id}: {error}")}),
-                ),
-            ));
-        }
-    };
-    let pending_group_count = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT COALESCE(thread_group, 0))::BIGINT
-         FROM auto_queue_entries
-         WHERE run_id = $1
-           AND status = 'pending'",
-    )
-    .bind(run_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"error": format!("count postgres pending groups for {run_id}: {error}")}),
+                    json!({"error": format!("count postgres active and pending groups for {run_id}: {error}")}),
                 ),
             ));
         }
