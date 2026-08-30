@@ -634,10 +634,10 @@ test("auto-queue onTick1min honors stale dispatched runtime config", () => {
       {
         match(sql) {
           return sql.includes("SELECT r.id FROM auto_queue_runs r") &&
-            sql.includes("WHERE r.status = 'active' AND EXISTS (") &&
-            sql.includes("WHERE e.run_id = r.id AND e.status = 'pending'") &&
-            sql.includes("e.updated_at") &&
-            sql.includes(") ASC LIMIT 50");
+            sql.includes("JOIN auto_queue_entries e ON e.run_id = r.id") &&
+            sql.includes("WHERE r.status = 'active' AND e.status = 'pending'") &&
+            sql.includes("GROUP BY r.id") &&
+            sql.includes("ORDER BY MIN(e.updated_at) ASC LIMIT 50");
         },
         result: []
       },
@@ -739,10 +739,10 @@ test("auto-queue terminal cleanup uses pipeline terminal states", () => {
       {
         match(sql) {
           return sql.includes("SELECT r.id FROM auto_queue_runs r") &&
-            sql.includes("WHERE r.status = 'active' AND EXISTS (") &&
-            sql.includes("WHERE e.run_id = r.id AND e.status = 'pending'") &&
-            sql.includes("e.updated_at") &&
-            sql.includes(") ASC LIMIT 50");
+            sql.includes("JOIN auto_queue_entries e ON e.run_id = r.id") &&
+            sql.includes("WHERE r.status = 'active' AND e.status = 'pending'") &&
+            sql.includes("GROUP BY r.id") &&
+            sql.includes("ORDER BY MIN(e.updated_at) ASC LIMIT 50");
         },
         result: []
       },
@@ -799,10 +799,10 @@ test("auto-queue finalization sweep filters blocked runs before LIMIT", () => {
       {
         match(sql) {
           return sql.includes("SELECT r.id FROM auto_queue_runs r") &&
-            sql.includes("WHERE r.status = 'active' AND EXISTS (") &&
-            sql.includes("WHERE e.run_id = r.id AND e.status = 'pending'") &&
-            sql.includes("e.updated_at") &&
-            sql.includes(") ASC LIMIT 50");
+            sql.includes("JOIN auto_queue_entries e ON e.run_id = r.id") &&
+            sql.includes("WHERE r.status = 'active' AND e.status = 'pending'") &&
+            sql.includes("GROUP BY r.id") &&
+            sql.includes("ORDER BY MIN(e.updated_at) ASC LIMIT 50");
         },
         result: []
       },
@@ -862,10 +862,10 @@ test("auto-queue rotates saturated active runs in bounded tick sweep", () => {
       {
         match(sql) {
           return sql.includes("SELECT r.id FROM auto_queue_runs r") &&
-            sql.includes("WHERE r.status = 'active' AND EXISTS (") &&
-            sql.includes("WHERE e.run_id = r.id AND e.status = 'pending'") &&
-            sql.includes("e.updated_at") &&
-            sql.includes(") ASC LIMIT 50");
+            sql.includes("JOIN auto_queue_entries e ON e.run_id = r.id") &&
+            sql.includes("WHERE r.status = 'active' AND e.status = 'pending'") &&
+            sql.includes("GROUP BY r.id") &&
+            sql.includes("ORDER BY MIN(e.updated_at) ASC LIMIT 50");
         },
         result: [{ id: "run-saturated" }]
       },
@@ -883,7 +883,7 @@ test("auto-queue rotates saturated active runs in bounded tick sweep", () => {
   assert.equal(state.executions.length, 1);
   assert.equal(
     state.executions[0].sql,
-    "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE run_id = ? AND status = 'pending'"
+    "UPDATE auto_queue_entries SET updated_at = datetime('now') WHERE status = 'pending' AND run_id IN (?)"
   );
   assert.deepEqual(Array.from(state.executions[0].params), ["run-saturated"]);
 });
@@ -905,10 +905,10 @@ test("auto-queue does not rotate deferred active run activations", () => {
       {
         match(sql) {
           return sql.includes("SELECT r.id FROM auto_queue_runs r") &&
-            sql.includes("WHERE r.status = 'active' AND EXISTS (") &&
-            sql.includes("WHERE e.run_id = r.id AND e.status = 'pending'") &&
-            sql.includes("e.updated_at") &&
-            sql.includes(") ASC LIMIT 50");
+            sql.includes("JOIN auto_queue_entries e ON e.run_id = r.id") &&
+            sql.includes("WHERE r.status = 'active' AND e.status = 'pending'") &&
+            sql.includes("GROUP BY r.id") &&
+            sql.includes("ORDER BY MIN(e.updated_at) ASC LIMIT 50");
         },
         result: [{ id: "run-deferred" }]
       },

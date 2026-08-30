@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { ArrowDown, ArrowUp, Building2, Plus, Save, Trash2, UserPlus, Users } from "lucide-react";
 import type { Agent, Office } from "../types";
 import * as api from "../api/client";
@@ -33,6 +33,8 @@ export default function OfficeManagerView({
   isKo,
   onChanged,
 }: OfficeManagerViewProps) {
+  const iconLabelId = useId();
+  const colorLabelId = useId();
   const tr = useCallback((ko: string, en: string) => (isKo ? ko : en), [isKo]);
   const [order, setOrder] = useState<Office[]>(offices);
   const [orderDirty, setOrderDirty] = useState(false);
@@ -374,8 +376,8 @@ export default function OfficeManagerView({
                   description={tr("아이콘, 대표 색상, 미리보기를 한 곳에서 조정합니다.", "Adjust icon, accent color, and preview together.")}
                 >
                   <div className="space-y-3">
-                  <div role="radiogroup" aria-labelledby="office-view-icon-label">
-                    <div id="office-view-icon-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                  <div role="radiogroup" aria-labelledby={iconLabelId}>
+                    <div id={iconLabelId} className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("아이콘", "Icon")}
                     </div>
                     <div className="flex flex-wrap gap-2">
@@ -425,8 +427,8 @@ export default function OfficeManagerView({
                     </div>
                   </div>
 
-                  <div role="radiogroup" aria-labelledby="office-view-color-label">
-                    <div id="office-view-color-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                  <div role="radiogroup" aria-labelledby={colorLabelId}>
+                    <div id={colorLabelId} className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("대표 색상", "Accent Color")}
                     </div>
                     <div className="flex flex-wrap gap-2">

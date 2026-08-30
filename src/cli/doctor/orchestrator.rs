@@ -1036,7 +1036,11 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
         )
         .with_subsystem("health")
         .with_fix_safety(FixSafety::NotFixable)
-        .with_security_exposure(SecurityExposure::OperationalMetadata);
+        .with_security_exposure(SecurityExposure::OperationalMetadata)
+        .with_next_steps(vec![
+            format!("curl -s {}", health_detail_endpoint(&snapshot.base)),
+            format!("tail -n 200 {}", dcserver_log_hint()),
+        ]);
     };
 
     let db_ok = body.get("db").and_then(Value::as_bool);
@@ -1075,7 +1079,8 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
         .with_path(health_detail_endpoint(&snapshot.base))
         .with_expected_actual("db=true", detail)
         .with_evidence(evidence)
-        .with_security_exposure(SecurityExposure::OperationalMetadata),
+        .with_security_exposure(SecurityExposure::OperationalMetadata)
+        .with_next_steps(vec![format!("tail -n 200 {}", dcserver_log_hint())]),
         (_, Some(false)) => Check::warn(
             "health_db_dashboard",
             CheckGroup::Core,
@@ -1958,6 +1963,9 @@ fn print_group(title: &str, checks: &[Check]) {
             if !guidance.trim().is_empty() {
                 println!("      → {}", guidance);
             }
+        }
+        if !check.next_steps.is_empty() {
+            println!("      → try: {}", check.next_steps.join(" or "));
         }
     }
     println!();

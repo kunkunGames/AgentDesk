@@ -213,6 +213,7 @@ pub async fn create_scheduled_message(
         &body,
         state.config.cluster.enabled,
         &state.config.integrations.kakao_friend_share,
+        &state.config.discord.scheduled_message_mention_user_ids,
     )
     .await?;
 
@@ -256,6 +257,7 @@ async fn validate_create(
     body: &CreateScheduledMessageBody,
     cluster_enabled: bool,
     kakao_config: &crate::config::KakaoFriendShareConfig,
+    scheduled_message_mention_user_ids: &[String],
 ) -> Result<NewScheduledMessage, AppError> {
     let content = body.content.trim();
     if content.is_empty() {
@@ -270,18 +272,19 @@ async fn validate_create(
         .as_deref()
         .unwrap_or(db::KIND_PUSH)
         .to_string();
-    let discord_mention_user_ids = validate_discord_mention_user_ids(
-        body.discord_mention_user_ids.as_deref().unwrap_or_default(),
-        &delivery_kind,
-    )?;
-    if !discord_mention_user_ids.is_empty() {
-        ensure_discord_mentions_rollout_ready(pool, cluster_enabled).await?;
-    }
     if delivery_kind != db::KIND_PUSH && delivery_kind != db::KIND_AGENT {
         return Err(app_error(
             StatusCode::BAD_REQUEST,
             "deliveryKind must be 'push' or 'agent'",
         ));
+    }
+    let discord_mention_user_ids = effective_scheduled_discord_mention_user_ids(
+        body.discord_mention_user_ids.as_deref().unwrap_or_default(),
+        &delivery_kind,
+        scheduled_message_mention_user_ids,
+    )?;
+    if !discord_mention_user_ids.is_empty() {
+        ensure_discord_mentions_rollout_ready(pool, cluster_enabled).await?;
     }
     let on_agent_failure = body
         .on_agent_failure
@@ -534,6 +537,17 @@ fn validate_discord_mention_user_ids(
         normalized.push(user_id.to_string());
     }
     Ok(normalized)
+}
+
+fn effective_scheduled_discord_mention_user_ids(
+    requested_user_ids: &[String],
+    delivery_kind: &str,
+    configured_user_ids: &[String],
+) -> Result<Vec<String>, AppError> {
+    if delivery_kind == db::KIND_PUSH && !configured_user_ids.is_empty() {
+        return Ok(configured_user_ids.to_vec());
+    }
+    validate_discord_mention_user_ids(requested_user_ids, delivery_kind)
 }
 
 fn validate_discord_rendered_content_length(
@@ -858,6 +872,7 @@ pub async fn patch_scheduled_message(
         &existing,
         state.config.cluster.enabled,
         &state.config.integrations.kakao_friend_share,
+        &state.config.discord.scheduled_message_mention_user_ids,
     )
     .await?;
 
@@ -962,6 +977,7 @@ async fn build_patch(
     existing: &ScheduledMessageRow,
     cluster_enabled: bool,
     kakao_config: &crate::config::KakaoFriendShareConfig,
+    scheduled_message_mention_user_ids: &[String],
 ) -> Result<ScheduledMessagePatch, AppError> {
     let bad_request = |message: String| app_error(StatusCode::BAD_REQUEST, message);
     let mut patch = ScheduledMessagePatch::default();
@@ -983,7 +999,12 @@ async fn build_patch(
         let content = content.ok_or_else(|| bad_request("content must not be null".to_string()))?;
         patch.content = Some(content);
     }
-    if let Some(value) = body.get("discordMentionUserIds") {
+    if existing.delivery_kind == db::KIND_PUSH && !scheduled_message_mention_user_ids.is_empty() {
+        // This installation requires the configured pair on every scheduled
+        // push. Ignore request values, including null, so a PATCH cannot
+        // remove Discord-only recipients from an existing reservation.
+        patch.discord_mention_user_ids = Some(scheduled_message_mention_user_ids.to_vec());
+    } else if let Some(value) = body.get("discordMentionUserIds") {
         let user_ids = if value.is_null() {
             Vec::new()
         } else {

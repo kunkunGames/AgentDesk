@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "969819d3e36f467f5873a3b7a4645a5b77f2cdab",
+  "measured_at_sha": "fe7eba3062cc2ad6a097dd1886120039e496a206",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1215,6 +1215,15 @@
       "api": "agentdesk.db.query",
       "symbol": "query",
       "classification": "STATIC",
+      "fingerprint": "sha256:58c0487ac3485f6d42ab7ec45c08233e09f0c05d243fe4e21b64776ca529408c"
+    },
+    {
+      "root": "policies",
+      "kind": "POLICY",
+      "path": "policies/auto-queue.js",
+      "api": "agentdesk.db.query",
+      "symbol": "query",
+      "classification": "STATIC",
       "fingerprint": "sha256:94df9decfb20ef7b42945b02c762b187c614c09eff921ee0b8dc75054ab2ac8a"
     },
     {
@@ -1243,15 +1252,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:ceef1860901c1841ab29d78b5fe121a210b294000d64935ac0583d1bf7544763"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/auto-queue.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:f0eecafbfd32c9a93c504251d0fda1ca50676781f84a83fd3c5d49f5cc509c6f"
     },
     {
       "root": "policies",
@@ -1376,8 +1376,8 @@
       "path": "policies/lib/auto-queue-dispatch.js",
       "api": "agentdesk.db.execute",
       "symbol": "execute",
-      "classification": "STATIC",
-      "fingerprint": "sha256:1cba6639acdf32ec6713b94ed88c915ceb211b87727b0efd864613c9cf78354c"
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:09d90f86560c0a9a2cb9d3d63a74b37e73cba1b0cb9313914834574ca11802fa"
     },
     {
       "root": "policies",
@@ -2161,15 +2161,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:9e0b8944747443c87d00c220e02c38cd8e48ff46805113ab9e1cabb91ae34155"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/review-automation.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:b4f1051e993d59e85d92c4bb0ff60cbfb787ae4296ec06f5db8eb82785e5e9d8"
     },
     {
       "root": "policies",

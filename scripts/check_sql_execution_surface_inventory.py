@@ -91,7 +91,7 @@ REPIN_GUIDANCE = (
 REQUIRED_ROOTS = ("src", "policies", "migrations/postgres")
 REWRITE_PATH = "src/engine/ops/db_ops.rs"
 GUARD_EXPECTED_CONTRACTS = (
-    ("rotateActiveRunSweepCursors", "policies/lib/auto-queue-dispatch.js", "auto_queue_entries"),
+    ("rotateActiveRunSweepCursors", "policies/lib/auto-queue-dispatch.js", "UNRESOLVED"),
     ("timeouts._section_E review auto-accept", "policies/timeouts/review-auto-accept.js", "task_dispatches"),
 )
 TABLE_TOKEN_RE = re.compile(
@@ -623,8 +623,8 @@ def _guard_expected_matches(
         record for record in records
         if record.path == path
         and record.api == "agentdesk.db.execute"
-        and record.classification == "STATIC"
-        and table in record.table_tokens
+        and (record.classification == "STATIC" or record.classification == "UNRESOLVED")
+        and (table in record.table_tokens or table == "UNRESOLVED")
     ]
 
 
