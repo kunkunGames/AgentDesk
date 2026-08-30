@@ -1075,6 +1075,15 @@
     },
     {
       "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0117_rate_limit_cache_profile_id.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:1581ccdabcdf348cfbf73b9f12d12dd3278c7cede2374e20cfe84731d1a47978"
+    },
+    {
+      "root": "migrations/postgres",
       "kind": "MIGRATION_METADATA",
       "path": "migrations/postgres/checksum-repair-allowlist.json",
       "api": "migration.non_sql_tracked",
@@ -1089,7 +1098,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:7f09bcfc076eaa4918eb59a2a98ad1f290bcaf25f6abea67ca4a18e60c19f253"
+      "fingerprint": "sha256:47c669271c764ba25cf5e301658fb131bd57bc557690c4741b74d212cbf76af9"
     },
     {
       "root": "policies",
@@ -15984,15 +15993,6 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:2680542c442fa80de6f881dcd4b46bce8b018897ff774386caa7ac99e84806fa"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/server/mod.rs",
-      "api": "sqlx::query",
-      "symbol": "query",
-      "classification": "STATIC",
       "fingerprint": "sha256:31b40a05dcc4f5bdbcea434b8118130ce204fe83f598f2dc44cf0be36fb14fa7"
     },
     {
@@ -16048,6 +16048,15 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:959c2059bc13772520349f9c99340ed91e1a245b90ff7139cd40891a1309167d"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/mod.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:9b8a29b4266fdebd6646e354915eb6cc1ad54a01d92e6cff7d02ac08e5391ba0"
     },
     {
       "root": "src",
@@ -19116,7 +19125,7 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:5b40fc7e0e7e0e93b68fb0fda7f7a7aaa1c2db43090e7a4b03a67a7303c1a73c"
+      "fingerprint": "sha256:3c80b895d5f24b7ca8cdbb2f294acd531446505f084f145a55fe4a6ea9bc4862"
     },
     {
       "root": "src",
