@@ -238,6 +238,7 @@ export {
   getProviderAuthProfiles,
   startProviderAuthLogin,
   completeProviderAuthLogin,
+  removeProviderAuthProfile,
 } from "./providers";
 
 // ── Error type guard ──
