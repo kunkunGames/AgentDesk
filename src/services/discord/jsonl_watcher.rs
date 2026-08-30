@@ -222,7 +222,7 @@ mod tests {
         let notify = watcher.notify();
 
         // Give the notify backend a beat to register the watch.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let waiter = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(3), notify.notified())
@@ -257,7 +257,7 @@ mod tests {
         let watcher = JsonlWatcher::spawn(marker.clone());
         let notify = watcher.notify();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let waiter = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(3), notify.notified())

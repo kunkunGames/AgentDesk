@@ -8,7 +8,6 @@ pub(super) fn live_status_panel_shape(content: &str) -> bool {
         "🧬 workflow 실행 중",
         "💤 monitor 대기",
         "⏰ scheduled wakeup",
-        "🔧 마지막 도구",
     ];
     let first = content.lines().next().unwrap_or_default();
     PREFIXES.iter().any(|prefix| {
