@@ -30,6 +30,7 @@ mod inflight;
 mod inflight_heartbeat_sweeper;
 pub(crate) mod internal_api;
 mod jsonl_watcher;
+pub(in crate::services::discord) mod live_agent_recovery;
 mod mailbox_finish;
 mod mcp_credential_watcher;
 pub(crate) mod meeting_artifact_store;

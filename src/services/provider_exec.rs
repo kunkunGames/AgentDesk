@@ -54,18 +54,33 @@ pub async fn execute_simple_with_timeout_and_context(
 ) -> Result<String, String> {
     let cancel_for_timeout = Arc::new(CancelToken::new());
     let cancel_for_exec = Arc::clone(&cancel_for_timeout);
+    let recovery_channel = context
+        .as_ref()
+        .and_then(|context| context.channel_id.clone());
+    let recovery_turn = context
+        .as_ref()
+        .and_then(|context| context.session_key.clone())
+        .or_else(|| recovery_channel.clone());
     let mut handle = tokio::task::spawn_blocking(move || {
         execute_simple_blocking(provider, prompt, Some(cancel_for_exec), context)
     });
 
-    tokio::select! {
+    let result = tokio::select! {
         joined = &mut handle => joined.map_err(|e| format!("Task join error: {}", e))?,
         _ = tokio::time::sleep(timeout) => {
             cancel_for_timeout.cancel_with_tmux_cleanup();
             let _ = tokio::time::timeout(Duration::from_secs(3), &mut handle).await;
             Err(simple_timeout_error(&stage_label, timeout))
         }
+    };
+    if let (Err(error), Some(channel_id), Some(turn_id)) = (
+        &result,
+        recovery_channel.as_deref(),
+        recovery_turn.as_deref(),
+    ) {
+        crate::services::agent_recovery::note_provider_error(channel_id, turn_id, error);
     }
+    result
 }
 
 fn execute_simple_blocking(

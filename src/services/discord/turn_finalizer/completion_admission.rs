@@ -88,6 +88,35 @@ pub(super) fn publish_claimed_queue_eligible(shared: &SharedData, entry: &mut Le
         entry.turn_key.channel_id,
         Some(entry.turn_key.user_msg_id),
     );
+    let channel_id = entry.turn_key.channel_id.get().to_string();
+    if crate::services::agent_recovery::is_fallback_writer(&channel_id, &entry.provider) {
+        let _ = crate::services::agent_recovery::note_fallback_progress(
+            &channel_id,
+            crate::services::agent_recovery::CheckpointEventKind::Complete,
+            crate::services::agent_recovery::CheckpointPayload::compact(
+                "fallback",
+                "",
+                "fallback turn complete",
+                "",
+                Vec::new(),
+                "",
+                "",
+            ),
+        );
+    } else {
+        let _ = crate::services::agent_recovery::note_owner_progress(
+            &channel_id,
+            crate::services::agent_recovery::CheckpointPayload::compact(
+                "owner",
+                "",
+                "owner turn complete",
+                "",
+                Vec::new(),
+                "",
+                "",
+            ),
+        );
+    }
     true
 }
 

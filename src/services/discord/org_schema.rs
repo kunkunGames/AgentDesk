@@ -60,6 +60,8 @@ pub(super) struct AgentDef {
     pub peer_agents: Option<bool>,
     #[serde(default)]
     pub memory: Option<MemoryConfigOverride>,
+    #[serde(default)]
+    pub recovery: Option<crate::services::agent_recovery::RecoveryConfigWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +79,8 @@ pub(super) struct ChannelBinding {
     pub peer_agents: Option<bool>,
     #[serde(default)]
     pub memory: Option<MemoryConfigOverride>,
+    #[serde(default)]
+    pub recovery: Option<crate::services::agent_recovery::RecoveryConfigWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,7 +121,53 @@ pub(super) struct SummaryRuleDef {
 fn load_org_schema() -> Option<OrgSchema> {
     let path = org_schema_path()?;
     let content = fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&content).ok()
+    let schema: OrgSchema = serde_yaml::from_str(&content).ok()?;
+    if let Err(error) = install_org_recovery(&schema) {
+        tracing::error!(
+            error = %error,
+            "org.yaml recovery policy is invalid; refusing to load org schema"
+        );
+        return None;
+    }
+    Some(schema)
+}
+
+fn install_org_recovery(
+    schema: &OrgSchema,
+) -> Result<(), crate::services::agent_recovery::PolicyError> {
+    let agents: Vec<crate::services::agent_recovery::OrgAgentInput> = schema
+        .agents
+        .iter()
+        .map(|(id, def)| crate::services::agent_recovery::OrgAgentInput {
+            id: id.clone(),
+            provider: def.provider.clone(),
+            model: def.model.clone(),
+            workspace: def.workspace.clone(),
+            recovery: def.recovery.clone(),
+        })
+        .collect();
+    let channels: Vec<crate::services::agent_recovery::OrgChannelInput> = schema
+        .channels
+        .as_ref()
+        .and_then(|channels| channels.by_id.as_ref())
+        .map(|by_id| {
+            by_id
+                .iter()
+                .map(
+                    |(channel_id, binding)| crate::services::agent_recovery::OrgChannelInput {
+                        channel_id: channel_id.clone(),
+                        agent: binding.agent.clone(),
+                        provider: binding.provider.clone(),
+                        workspace: binding.workspace.clone(),
+                        recovery: binding.recovery.clone(),
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default();
+    let catalog = crate::services::agent_recovery::build_recovery_catalog(&agents, &channels)?;
+    crate::services::agent_recovery::install_catalog(catalog);
+    Ok(())
 }
 
 pub(super) fn org_schema_exists() -> bool {
