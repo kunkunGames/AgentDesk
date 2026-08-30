@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "63b0e2b732cc54eda1d8453ecf99296cb4749f40",
+  "measured_at_sha": "45b9cfa6f0ef59f18f66b4536f4356c15ef2b249",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1215,6 +1215,15 @@
       "api": "agentdesk.db.query",
       "symbol": "query",
       "classification": "STATIC",
+      "fingerprint": "sha256:58c0487ac3485f6d42ab7ec45c08233e09f0c05d243fe4e21b64776ca529408c"
+    },
+    {
+      "root": "policies",
+      "kind": "POLICY",
+      "path": "policies/auto-queue.js",
+      "api": "agentdesk.db.query",
+      "symbol": "query",
+      "classification": "STATIC",
       "fingerprint": "sha256:94df9decfb20ef7b42945b02c762b187c614c09eff921ee0b8dc75054ab2ac8a"
     },
     {
@@ -1243,15 +1252,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:ceef1860901c1841ab29d78b5fe121a210b294000d64935ac0583d1bf7544763"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/auto-queue.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:f0eecafbfd32c9a93c504251d0fda1ca50676781f84a83fd3c5d49f5cc509c6f"
     },
     {
       "root": "policies",
