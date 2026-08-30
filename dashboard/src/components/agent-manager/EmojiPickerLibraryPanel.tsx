@@ -45,8 +45,10 @@ export default function EmojiPickerLibraryPanel({
         const text = button.textContent ?? "";
         if (normalize(text) === target) {
           button.setAttribute("aria-pressed", "true");
+          button.setAttribute("aria-selected", "true");
         } else {
           button.setAttribute("aria-pressed", "false");
+          button.setAttribute("aria-selected", "false");
         }
         if (text && !button.hasAttribute("aria-label")) {
           button.setAttribute("aria-label", tr({ ko: `아이콘 ${text}`, en: `Icon ${text}` }));

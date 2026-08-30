@@ -169,6 +169,20 @@ export default function AgentFormModal({
                   e.preventDefault();
                   const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
                   setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "Home") {
+                  e.preventDefault();
+                  setValue("sprite_number", 1, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "End") {
+                  e.preventDefault();
+                  setValue("sprite_number", 40, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "PageUp") {
+                  e.preventDefault();
+                  const next = Math.min(40, Math.max(1, (spriteNum || 0) + 10));
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "PageDown") {
+                  e.preventDefault();
+                  const next = Math.max(1, (spriteNum || 0) - 10);
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                 }
               }}
             >
