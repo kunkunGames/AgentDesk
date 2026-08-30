@@ -147,7 +147,7 @@ export default function AgentFormModal({
             description={tr("이름, 이모지, 부서를 먼저 설정합니다.", "Set the identity, emoji, and department first.")}
           >
             <div className="space-y-4">
-            {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
+            {/* ── 아이콘 얼굴 미리보기 + 위/아래 변경 ── */}
             <div
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
               role="spinbutton"
@@ -180,8 +180,9 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   tabIndex={-1}
+                  disabled={spriteNum >= 40}
                   aria-label={tr("다음 아이콘", "Next icon")}
-                  className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
+                  className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
                     border: "1px solid var(--th-input-border)",
@@ -218,8 +219,9 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   tabIndex={-1}
+                  disabled={spriteNum <= 1}
                   aria-label={tr("이전 아이콘", "Previous icon")}
-                  className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
+                  className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
                     border: "1px solid var(--th-input-border)",
