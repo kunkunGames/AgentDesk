@@ -480,6 +480,8 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
         self.assertTrue(is_scratch_file_path("npm_output.log"))
         self.assertTrue(is_scratch_file_path("bun_output.txt"))
         self.assertTrue(is_scratch_file_path("test.log"))
+        self.assertTrue(is_scratch_file_path("test_helper.sh"))
+        self.assertTrue(is_scratch_file_path("test_query.sql"))
 
     def test_checked_in_scripts_and_migrations_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
