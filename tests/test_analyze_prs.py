@@ -66,9 +66,16 @@ Update analyzer hygiene checks.
 
         self.assertFalse(has_non_empty_body_field(body, labels))
         self.assertTrue(has_non_empty_body_field(body, labels, allow_none=True))
-        self.assertFalse(
+        self.assertTrue(
             has_non_empty_body_field(
                 "- Skipped checks with reasons: n/a",
+                labels,
+                allow_none=True,
+            )
+        )
+        self.assertTrue(
+            has_non_empty_body_field(
+                "- Skipped checks with reasons: NA",
                 labels,
                 allow_none=True,
             )
