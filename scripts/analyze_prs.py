@@ -249,7 +249,7 @@ def is_scratch_file_path(path):
         if basename in root_scratch_files:
             return True
         return bool(
-            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|ts|mjs|json)$", basename)
+            re.match(r"^test_[A-Za-z0-9._-]+\.(?:rs|py|js|ts|mjs|json|sh|sql)$", basename)
         )
 
     return False
@@ -364,6 +364,8 @@ def main():
 
                 if not title.startswith(expected_prefix):
                     print(f"  [!] INVALID TITLE PREFIX: Branch '{head_ref_name}' requires PR title to start with '{expected_prefix}'. Found: '{title}'.")
+            else:
+                print(f"  [!] INVALID BRANCH FORMAT: Branch '{head_ref_name}' lacks a <short-topic>. Format must be jules/<agent_name>/<short-topic>.")
 
         # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
         is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
