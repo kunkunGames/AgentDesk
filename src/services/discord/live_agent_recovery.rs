@@ -25,25 +25,26 @@ pub(in crate::services::discord) async fn observe_and_execute(
         .mailbox_turn_age_secs
         .unwrap_or(0)
         .min(u64::from(u32::MAX)) as u32;
-    let mailbox_outcome = agent_recovery::observe_mailbox_stall(
-        &channel_id,
-        &turn_id,
-        stall.as_str(),
-        elapsed_secs,
-        snapshot.mailbox_has_cancel_token,
-    );
-    let spawn = mailbox_outcome.spawn.or_else(|| {
-        if snapshot.tmux_alive == Some(false) && snapshot.mailbox_has_cancel_token {
-            agent_recovery::observe(ObserveInput {
-                channel_id: channel_id.clone(),
-                primary_turn_id: turn_id.clone(),
-                signal: DetectorSignal::TmuxSessionDead,
-            })
-            .spawn
-        } else {
-            None
-        }
-    });
+    let mailbox_outcome = agent_recovery::observe_durable(ObserveInput {
+        channel_id: channel_id.clone(),
+        primary_turn_id: turn_id.clone(),
+        signal: DetectorSignal::Mailbox {
+            kind: agent_recovery::mailbox_kind_from_name(stall.as_str()),
+            elapsed_secs,
+            claimed_turn: snapshot.mailbox_has_cancel_token,
+        },
+    })
+    .await;
+    let mut spawn = mailbox_outcome.spawn;
+    if spawn.is_none() && snapshot.tmux_alive == Some(false) && snapshot.mailbox_has_cancel_token {
+        spawn = agent_recovery::observe_durable(ObserveInput {
+            channel_id: channel_id.clone(),
+            primary_turn_id: turn_id.clone(),
+            signal: DetectorSignal::TmuxSessionDead,
+        })
+        .await
+        .spawn;
+    }
     if let Some(spawn) = spawn {
         return execute_fallback(registry, snapshot, spawn).await;
     }
@@ -62,8 +63,13 @@ pub(in crate::services::discord) async fn observe_and_execute(
         agent_recovery::fallback_provider(&channel_id).is_some_and(|fallback| {
             load_inflight_state_read_only(&fallback, snapshot.channel_id).is_some()
         });
-    if let Some(plan) =
-        agent_recovery::try_restore_owner(&channel_id, &provider, owner_healthy, fallback_inflight)
+    if let Some(plan) = agent_recovery::try_restore_owner_durable(
+        &channel_id,
+        &provider,
+        owner_healthy,
+        fallback_inflight,
+    )
+    .await
     {
         return execute_restore(registry, &provider, plan).await;
     }
@@ -96,7 +102,12 @@ async fn execute_fallback(
                 fallback_provider = %plan.fallback_provider.as_str(),
                 "agent recovery refused fallback start because owner mailbox was not fenced"
             );
-            agent_recovery::abort(&plan.channel_id);
+            agent_recovery::abort_takeover_durable(
+                &plan.channel_id,
+                plan.generation,
+                &plan.fallback_agent_id,
+            )
+            .await;
             return false;
         }
     }
@@ -135,7 +146,12 @@ async fn execute_fallback(
                 error = %error,
                 "agent recovery fallback turn could not start"
             );
-            agent_recovery::abort(&plan.channel_id);
+            agent_recovery::abort_takeover_durable(
+                &plan.channel_id,
+                plan.generation,
+                &plan.fallback_agent_id,
+            )
+            .await;
             false
         }
     }

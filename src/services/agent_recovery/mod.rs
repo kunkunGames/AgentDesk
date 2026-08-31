@@ -17,10 +17,12 @@ use crate::services::provider::ProviderKind;
 
 pub use checkpoint::{
     ChannelRecoveryStatus, ChannelState, CheckpointEvent, CheckpointEventKind, CheckpointPayload,
-    DEFAULT_MAX_CHECKPOINT_BYTES, DEFAULT_READ_EVENT_LIMIT, READ_BYTE_CAP,
+    DEFAULT_MAX_CHECKPOINT_BYTES, DEFAULT_READ_EVENT_LIMIT, READ_BYTE_CAP, RecoveryLease,
+    RecoveryStoreError, RecoveryTransition,
 };
 pub use detector::{
-    DetectorSignal, MailboxStallKind, classify_trigger, trigger_from_error_message,
+    DetectorSignal, MailboxStallKind, classify_trigger, mailbox_kind_from_name,
+    trigger_from_error_message,
 };
 pub use handoff::{FallbackSpawnPlan, RecoveryIntake, dual_processing, effective_handles};
 pub use policy::{
@@ -33,8 +35,8 @@ pub use restore::{
 };
 
 use checkpoint::{
-    last_n_events, load_checkpoint_events, load_locked_channel_states, persist_channel_state,
-    persist_checkpoint_event, prepare_event,
+    commit_recovery_transition, last_n_events, load_checkpoint_events, load_locked_channel_states,
+    prepare_event,
 };
 use policy::ChannelRecoveryBinding;
 use restore::build_restore_plan;
@@ -267,10 +269,16 @@ impl RecoveryRuntime {
         state.status = ChannelRecoveryStatus::FallbackRunning;
         state.active_writer_agent_id = policy.fallback_agent_id.clone();
         state.primary_turn_id = Some(input.primary_turn_id.clone());
-        persist_state_in_background(state.clone());
+        state.generation += 1;
         self.open_keys.insert(key);
         let events = self.last_n(&input.channel_id);
-        let Some(spawn) = FallbackSpawnPlan::from_binding(&binding, fallback_provider, &events)
+        let generation = self
+            .states
+            .get(&input.channel_id)
+            .map(|state| state.generation)
+            .unwrap_or_default();
+        let Some(spawn) =
+            FallbackSpawnPlan::from_binding(&binding, fallback_provider, &events, generation)
         else {
             return ObserveOutcome {
                 trigger: Some(trigger),
@@ -429,7 +437,7 @@ impl RecoveryRuntime {
         if let Some(state) = self.states.get_mut(channel_id) {
             state.status = ChannelRecoveryStatus::Restored;
             state.active_writer_agent_id = binding.owner_agent_id.clone();
-            persist_state_in_background(state.clone());
+            state.generation += 1;
         }
         self.open_keys
             .retain(|(held_channel, _)| held_channel != channel_id);
@@ -446,7 +454,7 @@ impl RecoveryRuntime {
         if let Some(state) = self.states.get_mut(channel_id) {
             state.status = ChannelRecoveryStatus::Aborted;
             state.active_writer_agent_id = state.owner_agent_id.clone();
-            persist_state_in_background(state.clone());
+            state.generation += 1;
         }
         self.open_keys
             .retain(|(held_channel, _)| held_channel != channel_id);
@@ -471,6 +479,7 @@ impl RecoveryRuntime {
                 ),
                 primary_turn_id: None,
                 next_seq: 0,
+                generation: 0,
             })
     }
 
@@ -510,12 +519,6 @@ impl RecoveryRuntime {
             .entry(channel_id.to_string())
             .or_default()
             .push(event.clone());
-        let persisted = self
-            .states
-            .get(channel_id)
-            .cloned()
-            .expect("channel recovery state exists after ensure_state");
-        persist_in_background(event.clone(), persisted);
         Ok(event)
     }
 }
@@ -535,6 +538,44 @@ static PG_POOL: OnceLock<Mutex<Option<PgPool>>> = OnceLock::new();
 
 fn pg_pool_slot() -> &'static Mutex<Option<PgPool>> {
     PG_POOL.get_or_init(|| Mutex::new(None))
+}
+
+fn current_pg_pool() -> Option<PgPool> {
+    pg_pool_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn restore_runtime_snapshot(
+    runtime: &mut RecoveryRuntime,
+    channel_id: &str,
+    state: Option<ChannelState>,
+    events: Option<Vec<CheckpointEvent>>,
+    open_key: Option<(&str, &str)>,
+) {
+    match state {
+        Some(state) => {
+            runtime.states.insert(channel_id.to_string(), state);
+        }
+        None => {
+            runtime.states.remove(channel_id);
+        }
+    }
+    match events {
+        Some(events) => {
+            runtime.events.insert(channel_id.to_string(), events);
+        }
+        None => {
+            runtime.events.remove(channel_id);
+        }
+    }
+    if let Some((channel_id, turn_id)) = open_key {
+        runtime
+            .open_keys
+            .remove(&(channel_id.to_string(), turn_id.to_string()));
+    }
+    runtime.spawned.retain(|plan| plan.channel_id != channel_id);
 }
 
 pub fn attach_pg_pool(pool: PgPool) {
@@ -587,6 +628,22 @@ pub fn is_fallback_writer(channel_id: &str, provider: &ProviderKind) -> bool {
     lock_runtime().is_fallback_writer(channel_id, provider)
 }
 
+pub fn fallback_lease_for_provider(
+    channel_id: &str,
+    provider: &ProviderKind,
+) -> Option<RecoveryLease> {
+    let runtime = lock_runtime();
+    runtime
+        .is_fallback_writer(channel_id, provider)
+        .then(|| {
+            runtime
+                .states
+                .get(channel_id)
+                .map(RecoveryLease::from_state)
+        })
+        .flatten()
+}
+
 pub fn try_restore_owner(
     channel_id: &str,
     observing_provider: &ProviderKind,
@@ -609,8 +666,256 @@ pub fn note_fallback_progress(
     lock_runtime().note_fallback_progress(channel_id, kind, payload)
 }
 
+/// Completes the fallback under its original fence. A completion from an older
+/// tmux process cannot mark a newer takeover done.
+pub async fn complete_fallback_durable(
+    lease: &RecoveryLease,
+    payload: CheckpointPayload,
+) -> Result<(), RecoveryStoreError> {
+    let pool = current_pg_pool().ok_or_else(|| {
+        RecoveryStoreError::Conflict("durable recovery store is unavailable".to_string())
+    })?;
+    let (before_state, before_events, state, event) = {
+        let mut runtime = lock_runtime();
+        let Some(before_state) = runtime.states.get(&lease.channel_id).cloned() else {
+            return Err(RecoveryStoreError::Conflict(
+                "recovery state is absent".to_string(),
+            ));
+        };
+        if before_state.generation != lease.generation
+            || before_state.active_writer_agent_id != lease.active_writer_agent_id
+            || before_state.status != ChannelRecoveryStatus::FallbackRunning
+        {
+            return Err(RecoveryStoreError::Conflict(
+                "fallback completion does not own the active lease".to_string(),
+            ));
+        }
+        let before_events = runtime.events.get(&lease.channel_id).cloned();
+        let Some(event) = runtime
+            .note_fallback_progress(&lease.channel_id, CheckpointEventKind::Complete, payload)
+            .map_err(|error| RecoveryStoreError::Conflict(error.message()))?
+        else {
+            return Err(RecoveryStoreError::Conflict(
+                "fallback completion was not accepted".to_string(),
+            ));
+        };
+        let state = runtime
+            .states
+            .get(&lease.channel_id)
+            .cloned()
+            .expect("recovery state remains after completion");
+        (before_state, before_events, state, event)
+    };
+    let allowed = [ChannelRecoveryStatus::FallbackRunning];
+    let committed = commit_recovery_transition(
+        &pool,
+        &state,
+        &[event],
+        RecoveryTransition {
+            expected_generation: lease.generation,
+            expected_writer_agent_id: Some(&lease.active_writer_agent_id),
+            allowed_statuses: &allowed,
+        },
+    )
+    .await;
+    if committed.is_ok() {
+        return Ok(());
+    }
+    let error = committed.expect_err("checked error");
+    let mut runtime = lock_runtime();
+    restore_runtime_snapshot(
+        &mut runtime,
+        &lease.channel_id,
+        Some(before_state),
+        before_events,
+        None,
+    );
+    Err(error)
+}
+
 pub fn observe(input: ObserveInput) -> ObserveOutcome {
     lock_runtime().observe(input)
+}
+
+/// Begins a fallback only after its lease and Stall WAL are durably committed.
+/// This is the production entry point; `observe` remains a pure synchronous
+/// state-machine seam for unit tests.
+pub async fn observe_durable(input: ObserveInput) -> ObserveOutcome {
+    const TAKEOVER_FROM: [ChannelRecoveryStatus; 3] = [
+        ChannelRecoveryStatus::Owner,
+        ChannelRecoveryStatus::Restored,
+        ChannelRecoveryStatus::Aborted,
+    ];
+    let pool = current_pg_pool();
+    let Some(pool) = pool else {
+        tracing::error!(channel_id = %input.channel_id, "agent recovery refuses fallback without durable PostgreSQL lease store");
+        return ObserveOutcome::default();
+    };
+
+    let (outcome, before_state, before_events, state, events) = {
+        let mut runtime = lock_runtime();
+        let before_state = runtime.states.get(&input.channel_id).cloned();
+        let before_events = runtime.events.get(&input.channel_id).cloned();
+        let before_seq = before_state.as_ref().map_or(0, |state| state.next_seq);
+        let outcome = runtime.observe(input.clone());
+        if outcome.spawn.is_none() {
+            return outcome;
+        }
+        let state = runtime.states.get(&input.channel_id).cloned();
+        let events = runtime
+            .events
+            .get(&input.channel_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.seq > before_seq)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (outcome, before_state, before_events, state, events)
+    };
+    let Some(state) = state else {
+        return ObserveOutcome::default();
+    };
+    let expected_writer = before_state
+        .as_ref()
+        .map(|state| state.active_writer_agent_id.as_str());
+    let expected_generation = before_state.as_ref().map_or(0, |state| state.generation);
+    let committed = commit_recovery_transition(
+        &pool,
+        &state,
+        &events,
+        RecoveryTransition {
+            expected_generation,
+            expected_writer_agent_id: expected_writer,
+            allowed_statuses: &TAKEOVER_FROM,
+        },
+    )
+    .await;
+    if committed.is_ok() {
+        return outcome;
+    }
+
+    let error = committed.expect_err("checked error");
+    tracing::warn!(channel_id = %input.channel_id, error = %error, "agent recovery takeover lost durable lease; suppressing fallback spawn");
+    let mut runtime = lock_runtime();
+    restore_runtime_snapshot(
+        &mut runtime,
+        &input.channel_id,
+        before_state,
+        before_events,
+        Some((&input.channel_id, &input.primary_turn_id)),
+    );
+    ObserveOutcome::default()
+}
+
+/// Commits the restore WAL and opens the owner only after the current fallback
+/// lease validates in PostgreSQL.
+pub async fn try_restore_owner_durable(
+    channel_id: &str,
+    observing_provider: &ProviderKind,
+    owner_healthy: bool,
+    fallback_inflight: bool,
+) -> Option<RestorePlan> {
+    let pool = current_pg_pool()?;
+    let (plan, before_state, before_events, state, events) = {
+        let mut runtime = lock_runtime();
+        let before_state = runtime.states.get(channel_id).cloned();
+        let before_events = runtime.events.get(channel_id).cloned();
+        let before_seq = before_state.as_ref().map_or(0, |state| state.next_seq);
+        let plan = runtime.try_restore_owner(
+            channel_id,
+            observing_provider,
+            owner_healthy,
+            fallback_inflight,
+        )?;
+        let state = runtime.states.get(channel_id).cloned()?;
+        let events = runtime
+            .events
+            .get(channel_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.seq > before_seq)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (plan, before_state, before_events, state, events)
+    };
+    let previous = before_state.as_ref()?;
+    let allowed = [previous.status];
+    let committed = commit_recovery_transition(
+        &pool,
+        &state,
+        &events,
+        RecoveryTransition {
+            expected_generation: previous.generation,
+            expected_writer_agent_id: Some(&previous.active_writer_agent_id),
+            allowed_statuses: &allowed,
+        },
+    )
+    .await;
+    if committed.is_ok() {
+        return Some(plan);
+    }
+    let error = committed.expect_err("checked error");
+    tracing::warn!(channel_id, error = %error, "agent recovery restore lost durable lease; owner remains fenced");
+    let mut runtime = lock_runtime();
+    restore_runtime_snapshot(&mut runtime, channel_id, before_state, before_events, None);
+    None
+}
+
+/// Compensates a committed takeover when the fallback process could not start.
+/// A stale spawn plan cannot release a newer lease because generation and
+/// fallback writer must still match.
+pub async fn abort_takeover_durable(channel_id: &str, generation: i64, fallback_agent_id: &str) {
+    let Some(pool) = current_pg_pool() else {
+        return;
+    };
+    let (before_state, before_events, state) = {
+        let mut runtime = lock_runtime();
+        let Some(before_state) = runtime.states.get(channel_id).cloned() else {
+            return;
+        };
+        if before_state.generation != generation
+            || before_state.active_writer_agent_id != fallback_agent_id
+            || !before_state.lock_held()
+        {
+            return;
+        }
+        let before_events = runtime.events.get(channel_id).cloned();
+        runtime.abort(channel_id);
+        let state = runtime.states.get(channel_id).cloned();
+        (before_state, before_events, state)
+    };
+    let Some(state) = state else {
+        return;
+    };
+    let allowed = [before_state.status];
+    if let Err(error) = commit_recovery_transition(
+        &pool,
+        &state,
+        &[],
+        RecoveryTransition {
+            expected_generation: before_state.generation,
+            expected_writer_agent_id: Some(&before_state.active_writer_agent_id),
+            allowed_statuses: &allowed,
+        },
+    )
+    .await
+    {
+        tracing::error!(channel_id, error = %error, "failed to persist fallback compensation; preserving local recovery fence");
+        let mut runtime = lock_runtime();
+        restore_runtime_snapshot(
+            &mut runtime,
+            channel_id,
+            Some(before_state),
+            before_events,
+            None,
+        );
+    }
 }
 
 pub fn note_owner_progress(
@@ -674,62 +979,6 @@ pub async fn hydrate_from_pg(pool: &PgPool) {
         }
         runtime.states.insert(channel_id, state);
     }
-}
-
-fn persist_in_background(event: CheckpointEvent, state: ChannelState) {
-    let pool = {
-        let slot = pg_pool_slot()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slot.clone()
-    };
-    let Some(pool) = pool else {
-        return;
-    };
-    if tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    tokio::spawn(async move {
-        if let Err(error) = persist_channel_state(&pool, &state).await {
-            tracing::error!(
-                channel_id = %state.channel_id,
-                error = %error,
-                "failed to persist agent recovery channel state"
-            );
-            return;
-        }
-        if let Err(error) = persist_checkpoint_event(&pool, &event).await {
-            tracing::error!(
-                channel_id = %event.channel_id,
-                error = %error,
-                "failed to persist agent recovery checkpoint event"
-            );
-        }
-    });
-}
-
-fn persist_state_in_background(state: ChannelState) {
-    let pool = {
-        let slot = pg_pool_slot()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slot.clone()
-    };
-    let Some(pool) = pool else {
-        return;
-    };
-    if tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    tokio::spawn(async move {
-        if let Err(error) = persist_channel_state(&pool, &state).await {
-            tracing::error!(
-                channel_id = %state.channel_id,
-                error = %error,
-                "failed to persist agent recovery channel state"
-            );
-        }
-    });
 }
 
 #[cfg(test)]

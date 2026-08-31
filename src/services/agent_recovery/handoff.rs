@@ -20,6 +20,7 @@ pub struct FallbackSpawnPlan {
     pub watcher_http_bot: String,
     pub prompt: String,
     pub mailbox_handoff_called: bool,
+    pub generation: i64,
 }
 
 impl FallbackSpawnPlan {
@@ -27,6 +28,7 @@ impl FallbackSpawnPlan {
         binding: &ChannelRecoveryBinding,
         fallback_provider: ProviderKind,
         events: &[CheckpointEvent],
+        generation: i64,
     ) -> Option<Self> {
         let policy = binding.policy.as_ref()?;
         Some(Self {
@@ -39,6 +41,7 @@ impl FallbackSpawnPlan {
             watcher_http_bot: fallback_provider.as_str().to_string(),
             prompt: format_fallback_prompt(binding, events),
             mailbox_handoff_called: false,
+            generation,
         })
     }
 }

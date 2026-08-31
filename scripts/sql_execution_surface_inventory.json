@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "1696a14380ea53bf45a24b5bf9f64670d7621fa4",
+  "measured_at_sha": "ebf8d251c2e8f9109427aef13e3d736565a8c2c0",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1048,6 +1048,15 @@
     },
     {
       "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0119_agent_recovery_fencing_generation.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:4c16529830fcb40073e1d8a8f9f97fa93f74419b86fe44291001be9338eab5d9"
+    },
+    {
+      "root": "migrations/postgres",
       "kind": "MIGRATION_METADATA",
       "path": "migrations/postgres/checksum-repair-allowlist.json",
       "api": "migration.non_sql_tracked",
@@ -1062,7 +1071,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:10e3614d219321e1d49a3ed3a5492f31654d7639a049aff6c74cd60cd6704de9"
+      "fingerprint": "sha256:462d7345d0918705e69c471f6bc8a4c9d50108a9332fd624466260dc5072088f"
     },
     {
       "root": "policies",
@@ -18882,7 +18891,34 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:342bb3dc26e61dba94e9dc5448b4d8a69b8820d9899e3cc339c9a6830fb9c6a3"
+      "fingerprint": "sha256:79873f6b4eac0a9678af22faded7e4f1f7c4df5839c6f64d3917030d871f719d"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:cc0df44689008e0dd9262d0ac1ef15f6361dda79f85e7fdd1877998258a9d688"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:ccff17f1611088c314825fcdb73746454c1f75d121f592ee5569946a605b6284"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:d65b2717d351bd71dde0785d18e7cf695f411ca1baf611447a3701fcb676f1db"
     },
     {
       "root": "src",
@@ -18891,7 +18927,25 @@
       "api": "sqlx::query_as",
       "symbol": "query_as",
       "classification": "STATIC",
-      "fingerprint": "sha256:011fdefcb3aa001f5d2bed8c67768db23ed5db697aeacd21faae75fb24094e85"
+      "fingerprint": "sha256:05001040bcc5007cfc6a32b281c3081a0952d8fdbf4bc2b40457d6759b987c1b"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:53cb8d344674974e99c78a05e7ed22f8ef2305b9275df9e5c92b8c2a87cf210f"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:62d7352257111f5b33579b27f33f3419c5f036e59c78557e7925247147b054da"
     },
     {
       "root": "src",
@@ -18901,15 +18955,6 @@
       "symbol": "query_as",
       "classification": "STATIC",
       "fingerprint": "sha256:6d5298bddb17e93b5789e539d27eb2217c0f90b7315847458deaabb8f69ab688"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/services/agent_recovery/checkpoint.rs",
-      "api": "sqlx::query_as",
-      "symbol": "query_as",
-      "classification": "STATIC",
-      "fingerprint": "sha256:a750afe9c5030eab60f4d0fc30ff4d0ee643d12ff17032aa0938f6ba6fa4ccc0"
     },
     {
       "root": "src",
