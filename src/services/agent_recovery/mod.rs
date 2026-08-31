@@ -663,7 +663,25 @@ pub fn note_fallback_progress(
     kind: CheckpointEventKind,
     payload: CheckpointPayload,
 ) -> Result<Option<CheckpointEvent>, checkpoint::CheckpointError> {
-    lock_runtime().note_fallback_progress(channel_id, kind, payload)
+    let (event, state, expected_status) = {
+        let mut runtime = lock_runtime();
+        let event = runtime.note_fallback_progress(channel_id, kind, payload)?;
+        let state = event
+            .as_ref()
+            .and_then(|_| runtime.states.get(channel_id).cloned());
+        let expected_status = match kind {
+            CheckpointEventKind::Complete => ChannelRecoveryStatus::FallbackRunning,
+            _ => state
+                .as_ref()
+                .map(|state| state.status)
+                .unwrap_or(ChannelRecoveryStatus::FallbackRunning),
+        };
+        (event, state, expected_status)
+    };
+    if let (Some(event), Some(state)) = (event.as_ref(), state) {
+        persist_checkpoint_event_best_effort(state, event.clone(), expected_status);
+    }
+    Ok(event)
 }
 
 /// Completes the fallback under its original fence. A completion from an older
@@ -922,7 +940,18 @@ pub fn note_owner_progress(
     channel_id: &str,
     payload: CheckpointPayload,
 ) -> Result<Option<CheckpointEvent>, checkpoint::CheckpointError> {
-    lock_runtime().note_owner_progress(channel_id, payload)
+    let (event, state) = {
+        let mut runtime = lock_runtime();
+        let event = runtime.note_owner_progress(channel_id, payload)?;
+        let state = event
+            .as_ref()
+            .and_then(|_| runtime.states.get(channel_id).cloned());
+        (event, state)
+    };
+    if let (Some(event), Some(state)) = (event.as_ref(), state) {
+        persist_checkpoint_event_best_effort(state, event.clone(), ChannelRecoveryStatus::Owner);
+    }
+    Ok(event)
 }
 
 pub fn note_provider_error(channel_id: &str, turn_id: &str, error: &str) -> ObserveOutcome {
@@ -952,6 +981,46 @@ pub fn observe_mailbox_stall(
             claimed_turn,
         },
     })
+}
+
+/// Progress WAL is advisory, unlike takeover/complete/restore transitions.
+/// It is still recorded atomically with its state snapshot, and a stale writer
+/// is rejected by the same generation/writer guard instead of overwriting a
+/// newer lease.
+fn persist_checkpoint_event_best_effort(
+    state: ChannelState,
+    event: CheckpointEvent,
+    expected_status: ChannelRecoveryStatus,
+) {
+    let Some(pool) = current_pg_pool() else {
+        return;
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let expected_writer = state.active_writer_agent_id.clone();
+    tokio::spawn(async move {
+        let allowed = [expected_status];
+        if let Err(error) = commit_recovery_transition(
+            &pool,
+            &state,
+            &[event],
+            RecoveryTransition {
+                expected_generation: state.generation,
+                expected_writer_agent_id: Some(&expected_writer),
+                allowed_statuses: &allowed,
+            },
+        )
+        .await
+        {
+            tracing::debug!(
+                channel_id = %state.channel_id,
+                generation = state.generation,
+                error = %error,
+                "agent recovery progress WAL write was superseded or unavailable"
+            );
+        }
+    });
 }
 
 pub async fn hydrate_from_pg(pool: &PgPool) {
