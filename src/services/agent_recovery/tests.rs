@@ -189,6 +189,33 @@ fn test_002_active_foreground_stream_does_not_start_fallback_tmux_alive_relay_de
 }
 
 #[test]
+fn recovery_takeover_issues_a_monotonic_generation_fence() {
+    let mut runtime = enabled_runtime();
+    runtime.claim_turn(CHANNEL, "turn-generation");
+    let first = runtime
+        .observe(ObserveInput {
+            channel_id: CHANNEL.to_string(),
+            primary_turn_id: "turn-generation".to_string(),
+            signal: DetectorSignal::StreamIdleTimeout,
+        })
+        .spawn
+        .expect("first fallback");
+    assert_eq!(first.generation, 1);
+
+    runtime.abort(CHANNEL);
+    runtime.claim_turn(CHANNEL, "turn-generation-2");
+    let second = runtime
+        .observe(ObserveInput {
+            channel_id: CHANNEL.to_string(),
+            primary_turn_id: "turn-generation-2".to_string(),
+            signal: DetectorSignal::StreamIdleTimeout,
+        })
+        .spawn
+        .expect("second fallback");
+    assert!(second.generation > first.generation);
+}
+
+#[test]
 fn test_003_wal_append_last_n_size_cap_and_redact() {
     register_known_secret(SECRET);
     let mut runtime = enabled_runtime().with_max_checkpoint_bytes(2048);

@@ -1151,6 +1151,7 @@ services::agent_quality::regression_alerts::explicit_decode_fallback_tests::regr
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::returns_value_on_success
 services::agent_recovery::tests::opencode_restore_is_always_fresh_packet
 services::agent_recovery::tests::recovery_catalog_rejects_fallback_on_the_owner_provider
+services::agent_recovery::tests::recovery_takeover_issues_a_monotonic_generation_fence
 services::agent_recovery::tests::test_001_recovery_off_timeout_writes_zero_wal_and_does_not_spawn_fallback
 services::agent_recovery::tests::test_002_active_foreground_stream_does_not_start_fallback_tmux_alive_relay_dead_after_stall_secs_does
 services::agent_recovery::tests::test_003_wal_append_last_n_size_cap_and_redact

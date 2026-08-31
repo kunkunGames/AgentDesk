@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::utils::redact::{contains_registered_secret, redact_known_secrets};
 
@@ -165,12 +166,215 @@ pub struct ChannelState {
     pub workspace: String,
     pub primary_turn_id: Option<String>,
     pub next_seq: i64,
+    /// Monotonic fencing token. A writer from an older takeover must never
+    /// mutate a later owner/fallback lease.
+    pub generation: i64,
 }
 
 impl ChannelState {
     pub fn lock_held(&self) -> bool {
         self.status.lock_held()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryLease {
+    pub channel_id: String,
+    pub generation: i64,
+    pub active_writer_agent_id: String,
+}
+
+impl RecoveryLease {
+    pub fn from_state(state: &ChannelState) -> Self {
+        Self {
+            channel_id: state.channel_id.clone(),
+            generation: state.generation,
+            active_writer_agent_id: state.active_writer_agent_id.clone(),
+        }
+    }
+}
+
+/// Preconditions evaluated while the state row is locked. Keeping them with
+/// the WAL append is what prevents a stale process from reopening a channel.
+#[derive(Clone, Debug)]
+pub struct RecoveryTransition<'a> {
+    pub expected_generation: i64,
+    pub expected_writer_agent_id: Option<&'a str>,
+    pub allowed_statuses: &'a [ChannelRecoveryStatus],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecoveryStoreError {
+    #[error("recovery lease conflict: {0}")]
+    Conflict(String),
+    #[error("recovery store database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Atomically appends a recovery WAL batch and advances the fenced channel
+/// state. Callers must not start a process or reopen intake until this returns
+/// its lease successfully.
+pub async fn commit_recovery_transition(
+    pool: &PgPool,
+    state: &ChannelState,
+    events: &[CheckpointEvent],
+    transition: RecoveryTransition<'_>,
+) -> Result<RecoveryLease, RecoveryStoreError> {
+    if events.is_empty() && state.status != ChannelRecoveryStatus::Aborted {
+        return Err(RecoveryStoreError::Conflict(
+            "a recovery transition requires at least one WAL event".to_string(),
+        ));
+    }
+    if events.iter().any(|event| {
+        event.channel_id != state.channel_id || event.seq <= 0 || event.seq > state.next_seq
+    }) {
+        return Err(RecoveryStoreError::Conflict(
+            "recovery transition contains an invalid WAL event".to_string(),
+        ));
+    }
+    if state.generation < transition.expected_generation {
+        return Err(RecoveryStoreError::Conflict(format!(
+            "transition regresses generation from {} to {}",
+            transition.expected_generation, state.generation
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let current = load_locked_state_for_transition(&mut tx, &state.channel_id).await?;
+    match current {
+        Some((status, generation, writer)) => {
+            if generation != transition.expected_generation {
+                return Err(RecoveryStoreError::Conflict(format!(
+                    "expected generation {}, found {generation}",
+                    transition.expected_generation
+                )));
+            }
+            if !transition.allowed_statuses.contains(&status) {
+                return Err(RecoveryStoreError::Conflict(format!(
+                    "status '{}' is not eligible for this transition",
+                    status.as_str()
+                )));
+            }
+            if transition
+                .expected_writer_agent_id
+                .is_some_and(|expected| expected != writer)
+            {
+                return Err(RecoveryStoreError::Conflict(
+                    "active writer does not own the recovery lease".to_string(),
+                ));
+            }
+            write_state_in_transaction(&mut tx, state).await?;
+        }
+        None => {
+            if transition.expected_generation != 0 {
+                return Err(RecoveryStoreError::Conflict(
+                    "cannot advance a missing recovery lease".to_string(),
+                ));
+            }
+            insert_state_in_transaction(&mut tx, state).await?;
+        }
+    }
+    for event in events {
+        insert_event_in_transaction(&mut tx, event).await?;
+    }
+    tx.commit().await?;
+    Ok(RecoveryLease::from_state(state))
+}
+
+async fn load_locked_state_for_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    channel_id: &str,
+) -> Result<Option<(ChannelRecoveryStatus, i64, String)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String, i64, String)>(
+        "SELECT status, generation, active_writer_agent_id
+           FROM agent_recovery_channel_state
+          WHERE channel_id = $1
+          FOR UPDATE",
+    )
+    .bind(channel_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.and_then(|(status, generation, writer)| {
+        ChannelRecoveryStatus::parse(&status).map(|status| (status, generation, writer))
+    }))
+}
+
+async fn insert_state_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &ChannelState,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO agent_recovery_channel_state (
+             channel_id, status, owner_agent_id, fallback_agent_id,
+             active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+    )
+    .bind(&state.channel_id)
+    .bind(state.status.as_str())
+    .bind(&state.owner_agent_id)
+    .bind(&state.fallback_agent_id)
+    .bind(&state.active_writer_agent_id)
+    .bind(&state.workspace)
+    .bind(state.primary_turn_id.as_deref())
+    .bind(state.next_seq)
+    .bind(state.generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn write_state_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    state: &ChannelState,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE agent_recovery_channel_state
+            SET status = $2,
+                owner_agent_id = $3,
+                fallback_agent_id = $4,
+                active_writer_agent_id = $5,
+                workspace = $6,
+                primary_turn_id = $7,
+                next_seq = $8,
+                generation = $9,
+                updated_at = NOW()
+          WHERE channel_id = $1",
+    )
+    .bind(&state.channel_id)
+    .bind(state.status.as_str())
+    .bind(&state.owner_agent_id)
+    .bind(&state.fallback_agent_id)
+    .bind(&state.active_writer_agent_id)
+    .bind(&state.workspace)
+    .bind(state.primary_turn_id.as_deref())
+    .bind(state.next_seq)
+    .bind(state.generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_event_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &CheckpointEvent,
+) -> Result<(), sqlx::Error> {
+    let payload = serde_json::to_value(&event.payload).unwrap_or(Value::Null);
+    sqlx::query(
+        "INSERT INTO agent_recovery_checkpoint_events (
+             id, channel_id, seq, at, writer_agent_id, kind, payload, payload_bytes
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&event.id)
+    .bind(&event.channel_id)
+    .bind(event.seq)
+    .bind(event.at)
+    .bind(&event.writer_agent_id)
+    .bind(event.kind.as_str())
+    .bind(payload)
+    .bind(event.payload_bytes as i32)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,8 +480,8 @@ pub async fn persist_channel_state(
     sqlx::query(
         "INSERT INTO agent_recovery_channel_state (
              channel_id, status, owner_agent_id, fallback_agent_id,
-             active_writer_agent_id, workspace, primary_turn_id, next_seq, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+             active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
          ON CONFLICT (channel_id) DO UPDATE SET
              status = EXCLUDED.status,
              owner_agent_id = EXCLUDED.owner_agent_id,
@@ -286,6 +490,7 @@ pub async fn persist_channel_state(
              workspace = EXCLUDED.workspace,
              primary_turn_id = EXCLUDED.primary_turn_id,
              next_seq = EXCLUDED.next_seq,
+             generation = EXCLUDED.generation,
              updated_at = NOW()",
     )
     .bind(&state.channel_id)
@@ -296,6 +501,7 @@ pub async fn persist_channel_state(
     .bind(&state.workspace)
     .bind(state.primary_turn_id.as_deref())
     .bind(state.next_seq)
+    .bind(state.generation)
     .execute(pool)
     .await?;
     Ok(())
@@ -339,10 +545,11 @@ pub async fn load_channel_state(
             String,
             Option<String>,
             i64,
+            i64,
         ),
     >(
         "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
-                active_writer_agent_id, workspace, primary_turn_id, next_seq
+                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation
            FROM agent_recovery_channel_state
           WHERE channel_id = $1",
     )
@@ -359,6 +566,7 @@ pub async fn load_channel_state(
             workspace,
             primary_turn_id,
             next_seq,
+            generation,
         )| {
             Some(ChannelState {
                 channel_id,
@@ -369,6 +577,7 @@ pub async fn load_channel_state(
                 workspace,
                 primary_turn_id,
                 next_seq,
+                generation,
             })
         },
     ))
@@ -388,10 +597,11 @@ pub async fn load_locked_channel_states(
             String,
             Option<String>,
             i64,
+            i64,
         ),
     >(
         "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
-                active_writer_agent_id, workspace, primary_turn_id, next_seq
+                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation
            FROM agent_recovery_channel_state
           WHERE status IN ('fallback_running', 'fallback_done')",
     )
@@ -409,6 +619,7 @@ pub async fn load_locked_channel_states(
                 workspace,
                 primary_turn_id,
                 next_seq,
+                generation,
             )| {
                 Some(ChannelState {
                     channel_id,
@@ -419,6 +630,7 @@ pub async fn load_locked_channel_states(
                     workspace,
                     primary_turn_id,
                     next_seq,
+                    generation,
                 })
             },
         )

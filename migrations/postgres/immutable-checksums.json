@@ -600,6 +600,11 @@
       "path": "migrations/postgres/0118_agent_recovery_channel_state.sql",
       "sha256": "305c25cc7b2d51a74b6ee1bafc88f636c6780aed7f3c6c3eac5d39cdbf003e0e",
       "version": 118
+    },
+    {
+      "path": "migrations/postgres/0119_agent_recovery_fencing_generation.sql",
+      "sha256": "1b176ae9c8978264007b05a19cad9b1077db7f0557cd6d0e2d430c8cda4558b9",
+      "version": 119
     }
   ],
   "version": 1

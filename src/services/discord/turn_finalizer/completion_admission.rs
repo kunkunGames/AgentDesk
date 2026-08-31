@@ -89,20 +89,30 @@ pub(super) fn publish_claimed_queue_eligible(shared: &SharedData, entry: &mut Le
         Some(entry.turn_key.user_msg_id),
     );
     let channel_id = entry.turn_key.channel_id.get().to_string();
-    if crate::services::agent_recovery::is_fallback_writer(&channel_id, &entry.provider) {
-        let _ = crate::services::agent_recovery::note_fallback_progress(
-            &channel_id,
-            crate::services::agent_recovery::CheckpointEventKind::Complete,
-            crate::services::agent_recovery::CheckpointPayload::compact(
-                "fallback",
-                "",
-                "fallback turn complete",
-                "",
-                Vec::new(),
-                "",
-                "",
-            ),
+    if let Some(lease) =
+        crate::services::agent_recovery::fallback_lease_for_provider(&channel_id, &entry.provider)
+    {
+        let payload = crate::services::agent_recovery::CheckpointPayload::compact(
+            "fallback",
+            "",
+            "fallback turn complete",
+            "",
+            Vec::new(),
+            "",
+            "",
         );
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::services::agent_recovery::complete_fallback_durable(&lease, payload).await
+            {
+                tracing::warn!(
+                    channel_id = %lease.channel_id,
+                    generation = lease.generation,
+                    error = %error,
+                    "agent recovery fallback completion was not durably committed"
+                );
+            }
+        });
     } else {
         let _ = crate::services::agent_recovery::note_owner_progress(
             &channel_id,
