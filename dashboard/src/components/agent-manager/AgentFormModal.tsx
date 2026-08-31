@@ -147,15 +147,15 @@ export default function AgentFormModal({
             description={tr("이름, 이모지, 부서를 먼저 설정합니다.", "Set the identity, emoji, and department first.")}
           >
             <div className="space-y-4">
-            {/* ── 아이콘 얼굴 미리보기 + 위/아래 변경 ── */}
+            {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
             <div
               className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
               role="spinbutton"
-              aria-label={tr("아이콘 번호", "Icon number")}
+              aria-label={tr("스프라이트 번호", "Sprite number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
               aria-valuemax={40}
-              aria-valuetext={spriteNum ? t({ ko: `아이콘 ${spriteNum}`, en: `Icon ${spriteNum}` }) : t({ ko: `아이콘 ${formValues.avatar_emoji || "🤖"}`, en: `Icon ${formValues.avatar_emoji || "🤖"}` })}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -189,13 +189,13 @@ export default function AgentFormModal({
               <div
                 className="flex flex-col items-center gap-1"
                 role="group"
-                aria-label={tr("아이콘 선택", "Icon selection")}
+                aria-label={tr("스프라이트 선택", "Sprite selection")}
               >
                 <button
                   type="button"
                   tabIndex={-1}
                   disabled={spriteNum >= 40}
-                  aria-label={tr("다음 아이콘", "Next icon")}
+                  aria-label={tr("다음 스프라이트", "Next sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
@@ -234,7 +234,7 @@ export default function AgentFormModal({
                   type="button"
                   tabIndex={-1}
                   disabled={spriteNum <= 1}
-                  aria-label={tr("이전 아이콘", "Previous icon")}
+                  aria-label={tr("이전 스프라이트", "Previous sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
@@ -342,11 +342,6 @@ export default function AgentFormModal({
                   id={emojiBtnId}
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
-                  aria-label={
-                    formValues.avatar_emoji
-                      ? t({ ko: `아이콘 ${formValues.avatar_emoji}`, en: `Icon ${formValues.avatar_emoji}` })
-                      : t({ ko: "아이콘 선택", en: "Choose icon" })
-                  }
                   dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
                 />
               </div>
