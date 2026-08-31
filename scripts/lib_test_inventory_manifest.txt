@@ -1150,6 +1150,7 @@ services::agent_quality::regression_alerts::explicit_decode_fallback_tests::qual
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::regression_outbox_and_cooldown_commit_or_roll_back_together_pg
 services::agent_quality::regression_alerts::explicit_decode_fallback_tests::returns_value_on_success
 services::agent_recovery::tests::opencode_restore_is_always_fresh_packet
+services::agent_recovery::tests::recovery_catalog_rejects_fallback_on_the_owner_provider
 services::agent_recovery::tests::test_001_recovery_off_timeout_writes_zero_wal_and_does_not_spawn_fallback
 services::agent_recovery::tests::test_002_active_foreground_stream_does_not_start_fallback_tmux_alive_relay_dead_after_stall_secs_does
 services::agent_recovery::tests::test_003_wal_append_last_n_size_cap_and_redact
@@ -1159,6 +1160,7 @@ services::agent_recovery::tests::test_006_fallback_cwd_is_primary_workspace
 services::agent_recovery::tests::test_007_fallback_prompt_last_n_seq_order_restore_uses_latest_owner_retakes
 services::agent_recovery::tests::test_008_fallback_equals_primary_or_missing_agent_fails_org_load
 services::agent_recovery::tests::test_009_dual_processing_fails
+services::agent_recovery::tests::test_010_owner_healthy_without_fallback_inflight_restores_from_wal
 services::agents::query::tests::dispatched_session_service_maps_empty_rows
 services::agents::query::tests::dispatched_session_service_maps_happy_row
 services::agents::query::tests::timeline_service_maps_empty_rows
@@ -3207,6 +3209,7 @@ services::discord::jsonl_watcher::tests::jsonl_watcher_notifies_on_dead_marker_c
 services::discord::jsonl_watcher::tests::notify_fires_when_file_modified
 services::discord::jsonl_watcher::tests::notify_is_inert_when_parent_missing_but_does_not_panic
 services::discord::last_message_checkpoint_tests::advance_last_message_checkpoint_interleaved_advances_keep_max
+services::discord::live_agent_recovery::tests::recovery_metadata_is_a_role_bound_persistent_routine_when_requested
 services::discord::mailbox_finish::relay_state_contract_refs::contract_symbols_exist
 services::discord::mcp_credential_watcher::tests::added_mcp_server_is_reported
 services::discord::mcp_credential_watcher::tests::changed_mcp_server_config_is_reported

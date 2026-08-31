@@ -1080,7 +1080,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:305c25cc7b2d51a74b6ee1bafc88f636c6780aed7f3c6c3eac5d39cdbf003e0e"
+      "fingerprint": "sha256:3e78a64b8d88aa8704bb8bc2f6482ea9d72848befae6944b225dec79bfe5fc65"
     },
     {
       "root": "migrations/postgres",
@@ -1098,7 +1098,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:7f09bcfc076eaa4918eb59a2a98ad1f290bcaf25f6abea67ca4a18e60c19f253"
+      "fingerprint": "sha256:2e9f7383763403da9b3bca62486ef1a72937b0c2559112c11ee2449ec56da3b1"
     },
     {
       "root": "policies",
@@ -19000,6 +19000,51 @@
       "symbol": "query_scalar",
       "classification": "STATIC",
       "fingerprint": "sha256:7141cef951ad68279509b4c0847dc9f1e0f762cfd5cb06c0b38341b7e0adb287"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:064e7bbf326b94d35c928d4e683e4e8169f0d9959539cd3bd09beabe857ac0a8"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:342bb3dc26e61dba94e9dc5448b4d8a69b8820d9899e3cc339c9a6830fb9c6a3"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:011fdefcb3aa001f5d2bed8c67768db23ed5db697aeacd21faae75fb24094e85"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:6d5298bddb17e93b5789e539d27eb2217c0f90b7315847458deaabb8f69ab688"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:a750afe9c5030eab60f4d0fc30ff4d0ee643d12ff17032aa0938f6ba6fa4ccc0"
     },
     {
       "root": "src",
