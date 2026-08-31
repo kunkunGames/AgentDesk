@@ -130,7 +130,7 @@ function authoritativePhaseGateContext(runId, phase, context) {
 
   var declaration = agentdesk.pipeline.resolvePhaseGateDeclaration("pr-confirm");
   if (!declaration || declaration.available !== true) return null;
-  var normalized = JSON.parse(JSON.stringify(context));
+  var normalized = Object.assign({}, context, { phase_gate: Object.assign({}, context.phase_gate) });
   var fields = [
     "kind",
     "declaration_version",
