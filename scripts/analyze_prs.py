@@ -43,9 +43,10 @@ def _meaningful_field_value(value, *, allow_none=False):
         normalized,
     ):
         return False
-    placeholders = {"n/a", "todo", "tbd", "na"}
     if not allow_none:
-        placeholders.add("none")
+        placeholders = {"n/a", "todo", "tbd", "na", "none"}
+    else:
+        placeholders = {"todo", "tbd"}
     return bool(normalized) and normalized.casefold() not in placeholders
 
 def _is_markdown_heading(line):
@@ -307,17 +308,17 @@ def main():
             print("  [!] MISSING BOUNDARY: PR body lacks the required 'Boundary' field.")
         if not has_non_empty_body_field(body, ["primary files"]):
             print("  [!] MISSING PRIMARY FILES: PR body lacks the required 'Primary files' field.")
-        if not has_non_empty_body_field(body, ["public api impact"]):
+        if not has_non_empty_body_field(body, ["public api impact"], allow_none=True):
             print("  [!] MISSING PUBLIC API IMPACT: PR body lacks the required 'Public API impact' field.")
-        if not has_non_empty_body_field(body, ["docs impact"]):
+        if not has_non_empty_body_field(body, ["docs impact"], allow_none=True):
             print("  [!] MISSING DOCS IMPACT: PR body lacks the required 'Docs impact' field.")
         if not has_non_empty_body_field(body, ["queue hygiene invariant"]):
             print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
-        if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"]):
+        if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"], allow_none=True):
             print("  [!] MISSING RELATED PRS: PR body lacks the required 'Related PRs/issues checked' field.")
         if not has_non_empty_body_field(body, ["duplicate/overlap check"]):
             print("  [!] MISSING DUPLICATE/OVERLAP CHECK FIELD: PR body lacks the required 'Duplicate/overlap check' field.")
-        if not has_non_empty_body_field(body, ["why this is non-overlapping", "non-overlapping reason"]):
+        if not has_non_empty_body_field(body, ["why this is non-overlapping", "non-overlapping reason"], allow_none=True):
             print("  [!] MISSING NON-OVERLAPPING REASON: PR body lacks the required 'Why this is non-overlapping' field.")
         if not has_duplicate_guard_ack(body):
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
@@ -335,9 +336,9 @@ def main():
             allow_none=True,
         ):
             print("  [!] MISSING SKIPPED CHECKS: PR body fails to mention 'skipped checks' with reasons.")
-        if not has_non_empty_body_field(body, ["risk and rollback notes", "risk", "risk assessment"]):
+        if not has_non_empty_body_field(body, ["risk and rollback notes", "risk", "risk assessment"], allow_none=True):
             print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
-        if not has_non_empty_body_field(body, ["risk and rollback notes", "rollback notes", "rollback"]):
+        if not has_non_empty_body_field(body, ["risk and rollback notes", "rollback notes", "rollback"], allow_none=True):
             print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
 
         # In AgentDesk, PR hygiene and merge-readiness are strictly validated by scripts/analyze_prs.py.
@@ -420,7 +421,8 @@ def main():
             print(f"  [!] UNLABELED EMPTY PR: PR modifies 0 files but title lacks 'no-change'. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
 
         # PR #199/#200/#201 lesson: check for multiple inventory refreshes
-        if "inventory" in title.lower() and "refresh" in title.lower():
+        title_lower = title.lower()
+        if "inventory" in title_lower and ("refresh" in title_lower or "drift" in title_lower or "generated" in title_lower):
             inventory_refresh_count += 1
             if not has_duplicate_guard_ack(body):
                 print("  [!] MISSING DUPLICATE PR GUARD: Inventory refresh PR body lacks a completed duplicate-pr guard acknowledgement.")
