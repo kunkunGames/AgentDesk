@@ -155,7 +155,7 @@ export default function AgentFormModal({
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
               aria-valuemax={40}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 아이콘: ${spriteNum}`, en: `Selected icon: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
+              aria-valuetext={spriteNum ? t({ ko: `아이콘 ${spriteNum}`, en: `Icon ${spriteNum}` }) : t({ ko: `아이콘 ${formValues.avatar_emoji || "🤖"}`, en: `Icon ${formValues.avatar_emoji || "🤖"}` })}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -169,6 +169,20 @@ export default function AgentFormModal({
                   e.preventDefault();
                   const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
                   setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "PageUp") {
+                  e.preventDefault();
+                  const next = Math.min(40, Math.max(1, spriteNum || 0) + 10);
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "PageDown") {
+                  e.preventDefault();
+                  const next = Math.max(1, Math.min(40, spriteNum || 1) - 10);
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "Home") {
+                  e.preventDefault();
+                  setValue("sprite_number", 1, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "End") {
+                  e.preventDefault();
+                  setValue("sprite_number", 40, { shouldDirty: true, shouldValidate: true });
                 }
               }}
             >
@@ -330,8 +344,8 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `선택된 아이콘: ${formValues.avatar_emoji}, 아이콘 변경`, en: `Selected icon: ${formValues.avatar_emoji}, change icon` })
-                      : t({ ko: "아이콘 선택기 열기", en: "Open icon picker" })
+                      ? t({ ko: `아이콘 ${formValues.avatar_emoji}`, en: `Icon ${formValues.avatar_emoji}` })
+                      : t({ ko: "아이콘 선택", en: "Choose icon" })
                   }
                   dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
                 />
