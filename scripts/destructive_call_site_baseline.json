@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "5d59338d07c224dc5e8d389027539dd5baa0961e",
+  "measured_at_sha": "47ed31981265c95451b2d0f367293a7c290d056d",
   "comment": "These counts are a growth-blocking baseline, not proof of safety.",
   "categories": {
     "tmux_kill": {
@@ -8,6 +8,7 @@
         "src/cli/dcserver.rs": 1,
         "src/cli/utils.rs": 1,
         "src/engine/ops/exec_ops.rs": 2,
+        "src/server/routes/provider_auth_profiles.rs": 2,
         "src/services/claude.rs": 6,
         "src/services/claude_tui/hosting/warm_followup.rs": 4,
         "src/services/codex.rs": 4,

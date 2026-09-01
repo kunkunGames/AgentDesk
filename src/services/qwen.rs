@@ -1192,6 +1192,16 @@ fn execute_streaming_local_tmux(
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
 ) -> Result<(), String> {
+    let auth_overlay =
+        crate::services::discord::overlay_from_tmux_session(ProviderKind::Qwen, tmux_session_name)?;
+    let auth_env_lines =
+        crate::services::provider_auth_profile::overlay_shell_env_lines(&auth_overlay);
+    let session_exists = tmux_session_exists(tmux_session_name);
+    let profile_matches = crate::services::tmux_common::tmux_session_auth_profile_matches(
+        tmux_session_name,
+        &auth_overlay.profile_id,
+    ) || !session_exists;
+    let session_id = profile_matches.then_some(session_id).flatten();
     let resume_session_id = validated_resume_session_id(session_id)?;
     let output_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "jsonl");
     let input_fifo_path =
@@ -1201,12 +1211,11 @@ fn execute_streaming_local_tmux(
     // Accept either the new persistent location or the legacy /tmp location
     // so that dcserver restarts that lost /tmp files still re-attach to a
     // live tmux pane owned by an older wrapper. See issue #892.
-    let session_exists = tmux_session_exists(tmux_session_name);
     let resolved_output =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
-    let has_live_pane = tmux_session_has_live_pane(tmux_session_name);
+    let has_live_pane = tmux_session_has_live_pane(tmux_session_name) && profile_matches;
     let session_usable = has_live_pane && resolved_output.is_some() && resolved_input.is_some();
 
     if session_usable {
@@ -1318,6 +1327,7 @@ fn execute_streaming_local_tmux(
             provider.as_str()
         ));
     }
+    env_lines.push_str(&auth_env_lines);
 
     let script_content = format!(
         "#!/bin/bash\n\
@@ -1381,6 +1391,11 @@ fn execute_streaming_local_tmux(
         );
         return Err(format!("tmux error: {}", stderr));
     }
+
+    crate::services::tmux_common::write_tmux_session_auth_profile(
+        tmux_session_name,
+        &auth_overlay.profile_id,
+    )?;
 
     crate::services::platform::tmux::set_option(tmux_session_name, "remain-on-exit", "on");
 
@@ -1687,6 +1702,8 @@ fn execute_streaming_local_process(
         .ok_or_else(|| "Qwen CLI not found".to_string())?;
     let exe =
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let overlay =
+        crate::services::discord::overlay_from_tmux_session(ProviderKind::Qwen, session_name)?;
 
     let config = SessionConfig {
         session_name: session_name.to_string(),
@@ -1713,11 +1730,15 @@ fn execute_streaming_local_process(
             }
             args
         },
-        env_vars: qwen_resolution
-            .exec_path
-            .as_ref()
-            .map(|exec_path| vec![("PATH".to_string(), exec_path.clone())])
-            .unwrap_or_default(),
+        env_vars: crate::services::provider_auth_profile::merge_overlay_env(
+            qwen_resolution
+                .exec_path
+                .as_ref()
+                .map(|exec_path| vec![("PATH".to_string(), exec_path.clone())])
+                .unwrap_or_default(),
+            &overlay,
+        ),
+        unset_env: crate::services::provider_auth_profile::overlay_unset_keys(&overlay),
     };
 
     let backend = ProcessBackend::new();

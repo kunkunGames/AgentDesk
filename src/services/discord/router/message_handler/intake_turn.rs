@@ -2540,7 +2540,8 @@ pub(super) async fn handle_text_message(
                                 remote_profile.clone(),
                                 std::time::Duration::from_secs(300),
                                 Some(cancel_token_clone),
-                            ),
+                                Some(channel_id.get()),
+                            )?,
                             tx.clone(),
                         ),
                         None => {

@@ -596,6 +596,11 @@
       "path": "migrations/postgres/0116_scheduled_discord_mentions.sql",
       "sha256": "272fa56cf0346ee71bbe37ac9173ca10ce23568fa8b72e6db990374824c135f7",
       "version": 116
+    },
+    {
+      "path": "migrations/postgres/0117_rate_limit_cache_profile_id.sql",
+      "sha256": "8e4f72f0055c69b72f346bcfb25d0e06ecf2effa28e783e3008aa370d772990b",
+      "version": 117
     }
   ]
 }
