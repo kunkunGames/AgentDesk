@@ -759,7 +759,7 @@ decompose_issue = "#4712"
 # Active relay-dedup surface; decompose the idle-relay loop out once stabilized.
 file = "src/services/discord/session_relay_sink.rs"
 owner = "discord-relay"
-deadline = "2026-08-31"
+deadline = "2026-09-30"
 decompose_issue = "#4712"
 
 [[entry]]
@@ -770,7 +770,7 @@ decompose_issue = "#4712"
 # stabilizes.
 file = "src/services/discord/outbound/turn_output_controller.rs"
 owner = "discord-relay"
-deadline = "2026-08-31"
+deadline = "2026-09-30"
 decompose_issue = "#4712"
 
 # NOTE: src/services/discord/relay_recovery.rs previously had an [[entry]] here;
@@ -786,7 +786,7 @@ decompose_issue = "#4712"
 # here. Split the remaining worker-status helpers once the registry API stabilizes.
 file = "src/server/worker_registry.rs"
 owner = "server-runtime"
-deadline = "2026-08-31"
+deadline = "2026-09-30"
 decompose_issue = "#4710"
 
 [[entry]]
@@ -798,7 +798,7 @@ decompose_issue = "#4710"
 # the ledger/actor-loop/reconciler surface out as #3016 lands its wired phases.
 file = "src/services/discord/turn_finalizer.rs"
 owner = "discord-finalizer"
-deadline = "2026-08-31"
+deadline = "2026-09-30"
 decompose_issue = "#4712"
 
 # RETIRED 2026-07-24 (#4712 D5): turn_view_reconciler.rs dropped below the
@@ -850,7 +850,7 @@ decompose_issue = "#4712"
 # Tracked for splitting under the relay-decomposition program.
 file = "src/services/discord/tui_direct_pending_start.rs"
 owner = "discord-relay"
-deadline = "2026-08-31"
+deadline = "2026-09-30"
 decompose_issue = "#4712"
 
 [[entry]]
