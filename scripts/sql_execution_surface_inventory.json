@@ -1075,6 +1075,24 @@
     },
     {
       "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0118_agent_recovery_channel_state.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:3e78a64b8d88aa8704bb8bc2f6482ea9d72848befae6944b225dec79bfe5fc65"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0119_agent_recovery_fencing_generation.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:3901db046f331af29112b09ba11fe3d04a0ee4d7b16c719c6dba0a6c6bf3883c"
+    },
+    {
+      "root": "migrations/postgres",
       "kind": "MIGRATION_METADATA",
       "path": "migrations/postgres/checksum-repair-allowlist.json",
       "api": "migration.non_sql_tracked",
@@ -1089,7 +1107,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:7f09bcfc076eaa4918eb59a2a98ad1f290bcaf25f6abea67ca4a18e60c19f253"
+      "fingerprint": "sha256:2437cf815216bc71683eff0b8d955897b42055d875777168b3e12a3b1d1973e1"
     },
     {
       "root": "policies",
@@ -18991,6 +19009,87 @@
       "symbol": "query_scalar",
       "classification": "STATIC",
       "fingerprint": "sha256:7141cef951ad68279509b4c0847dc9f1e0f762cfd5cb06c0b38341b7e0adb287"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:064e7bbf326b94d35c928d4e683e4e8169f0d9959539cd3bd09beabe857ac0a8"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:79873f6b4eac0a9678af22faded7e4f1f7c4df5839c6f64d3917030d871f719d"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:cc0df44689008e0dd9262d0ac1ef15f6361dda79f85e7fdd1877998258a9d688"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:ccff17f1611088c314825fcdb73746454c1f75d121f592ee5569946a605b6284"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:d65b2717d351bd71dde0785d18e7cf695f411ca1baf611447a3701fcb676f1db"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:05001040bcc5007cfc6a32b281c3081a0952d8fdbf4bc2b40457d6759b987c1b"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:53cb8d344674974e99c78a05e7ed22f8ef2305b9275df9e5c92b8c2a87cf210f"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:62d7352257111f5b33579b27f33f3419c5f036e59c78557e7925247147b054da"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/agent_recovery/checkpoint.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:6d5298bddb17e93b5789e539d27eb2217c0f90b7315847458deaabb8f69ab688"
     },
     {
       "root": "src",

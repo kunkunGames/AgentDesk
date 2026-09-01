@@ -1717,6 +1717,19 @@ pub(crate) async fn run_stall_watchdog_pass(
             Some(snapshot) => snapshot,
             None => continue,
         };
+        // Recovery is driven by the periodic watchdog, never a read-only
+        // health/dashboard request. A successful takeover owns this tick: the
+        // snapshot describes the cancelled primary, so running the older
+        // cleanup branches against it could race the new fallback turn.
+        if crate::services::discord::live_agent_recovery::observe_and_execute(
+            registry,
+            &snapshot.relay_health,
+            snapshot.relay_stall_state,
+        )
+        .await
+        {
+            continue;
+        }
         let now_mono_secs = super::liveness_authority::monotonic_now_secs();
         let tick_inflight = discord::inflight::load_inflight_state(provider, channel_id.get());
         let capture_assessment = super::liveness_authority::observe_and_publish_from_tick(
