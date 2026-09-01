@@ -1266,7 +1266,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                                 std::time::Duration::from_secs(300),
                                 Some(cancel_token_clone),
                                 Some(channel_id.get()),
-                            ),
+                            )?,
                             tx.clone(),
                         ),
                         None => {
