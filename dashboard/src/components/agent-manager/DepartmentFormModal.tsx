@@ -324,11 +324,6 @@ export default function DepartmentFormModal({
                     id={iconBtnId}
                     value={form.icon}
                     onChange={(emoji) => setValue("icon", emoji, { shouldDirty: true, shouldValidate: true })}
-                    aria-label={
-                      form.icon
-                        ? t({ ko: `아이콘 ${form.icon}`, en: `Icon ${form.icon}` })
-                        : t({ ko: "아이콘 선택", en: "Choose icon" })
-                    }
                     dialogLabel={t({ ko: "아이콘 선택", en: "Choose an icon" })}
                   />
                 </div>

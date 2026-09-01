@@ -99,8 +99,8 @@ export default function EmojiPicker({
         aria-label={
           ariaLabel ||
           (value
-            ? tr({ ko: `아이콘 ${value}`, en: `Icon ${value}` })
-            : tr({ ko: "아이콘 선택", en: "Choose icon" }))
+            ? tr({ ko: `선택된 아이콘: ${value}, 아이콘 변경`, en: `Selected icon: ${value}, change icon` })
+            : tr({ ko: "아이콘 선택기 열기", en: "Open icon picker" }))
         }
       >
         {value || "❓"}
