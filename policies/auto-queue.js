@@ -476,11 +476,6 @@ var autoQueue = {
   // Uses 1min tick instead of 5min for faster recovery.
   onTick1min: function() {
     var tickCfg = agentdesk.pipeline.getConfig();
-    var tickKickoff = agentdesk.pipeline.kickoffState(tickCfg);
-    var tickInProgress = agentdesk.pipeline.nextGatedTarget(tickKickoff, tickCfg);
-    var tickReview = agentdesk.pipeline.nextGatedTarget(tickInProgress, tickCfg);
-    var tickActiveStates = [tickKickoff, tickInProgress, tickReview].filter(function(s) { return s; });
-    var tickPlaceholders = tickActiveStates.map(function() { return "?"; }).join(",");
     var tickTerminalStates = terminalStatesFromConfig(tickCfg);
     var tickTerminalPlaceholders = tickTerminalStates.map(function() { return "?"; }).join(",");
 
