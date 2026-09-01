@@ -196,7 +196,6 @@ export function OnboardingWizardLayout(props: OnboardingWizardLayoutProps) {
 
       {error && (
         <div
-          role="alert"
           className="rounded-xl px-4 py-3 text-sm border"
           style={{
             borderColor: "rgba(248,113,113,0.4)",
