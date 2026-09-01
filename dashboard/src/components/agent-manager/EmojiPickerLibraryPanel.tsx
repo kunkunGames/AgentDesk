@@ -48,8 +48,12 @@ export default function EmojiPickerLibraryPanel({
         } else {
           button.setAttribute("aria-pressed", "false");
         }
-        if (text && !button.hasAttribute("aria-label")) {
-          button.setAttribute("aria-label", tr({ ko: `아이콘 ${text}`, en: `Icon ${text}` }));
+        if (text) {
+          if (normalize(text) === target) {
+            button.setAttribute("aria-label", tr({ ko: `선택된 아이콘: ${text}`, en: `Selected icon: ${text}` }));
+          } else if (!button.hasAttribute("aria-label") || button.getAttribute("aria-label")?.startsWith("선택된 아이콘:") || button.getAttribute("aria-label")?.startsWith("Selected icon:")) {
+            button.setAttribute("aria-label", tr({ ko: `아이콘 ${text}`, en: `Icon ${text}` }));
+          }
         }
       });
     };

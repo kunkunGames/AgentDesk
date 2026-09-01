@@ -149,42 +149,7 @@ export default function AgentFormModal({
             <div className="space-y-4">
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
             <div
-              className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
-              role="spinbutton"
-              aria-label={tr("스프라이트 번호", "Sprite number")}
-              aria-valuenow={spriteNum || 0}
-              aria-valuemin={0}
-              aria-valuemax={40}
-              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.currentTarget !== e.target) {
-                  return;
-                }
-                if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  const next = Math.min(40, Math.max(1, spriteNum || 0) + 1);
-                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
-                } else if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
-                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
-                } else if (e.key === "PageUp") {
-                  e.preventDefault();
-                  const next = Math.min(40, Math.max(1, spriteNum || 0) + 10);
-                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
-                } else if (e.key === "PageDown") {
-                  e.preventDefault();
-                  const next = Math.max(1, Math.min(40, spriteNum || 1) - 10);
-                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
-                } else if (e.key === "Home") {
-                  e.preventDefault();
-                  setValue("sprite_number", 1, { shouldDirty: true, shouldValidate: true });
-                } else if (e.key === "End") {
-                  e.preventDefault();
-                  setValue("sprite_number", 40, { shouldDirty: true, shouldValidate: true });
-                }
-              }}
+              className="flex items-center gap-3"
             >
               <div
                 className="flex flex-col items-center gap-1"
@@ -195,7 +160,7 @@ export default function AgentFormModal({
                   type="button"
                   tabIndex={-1}
                   disabled={spriteNum >= 40}
-                  aria-label={tr("다음 스프라이트", "Next sprite")}
+                  aria-label={tr("다음 아이콘", "Next icon")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
@@ -210,7 +175,42 @@ export default function AgentFormModal({
                   ▲
                 </button>
                 <div
-                  className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0"
+                  role="spinbutton"
+                  aria-label={tr("스프라이트 아이콘 번호", "Sprite icon number")}
+                  aria-valuenow={spriteNum || 0}
+                  aria-valuemin={0}
+                  aria-valuemax={40}
+                  aria-valuetext={spriteNum ? t({ ko: `선택된 아이콘: 스프라이트 ${spriteNum}`, en: `Selected icon: sprite ${spriteNum}` }) : t({ ko: `선택된 아이콘: ${formValues.avatar_emoji || "🤖"}`, en: `Selected icon: ${formValues.avatar_emoji || "🤖"}` })}
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.currentTarget !== e.target) {
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const next = Math.min(40, Math.max(1, spriteNum || 0) + 1);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      const next = Math.max(1, Math.min(40, spriteNum || 1) - 1);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "PageUp") {
+                      e.preventDefault();
+                      const next = Math.min(40, Math.max(1, spriteNum || 0) + 10);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "PageDown") {
+                      e.preventDefault();
+                      const next = Math.max(1, Math.min(40, spriteNum || 1) - 10);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "Home") {
+                      e.preventDefault();
+                      setValue("sprite_number", 1, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "End") {
+                      e.preventDefault();
+                      setValue("sprite_number", 40, { shouldDirty: true, shouldValidate: true });
+                    }
+                  }}
+                  className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{ border: "2px solid var(--th-input-border)" }}
                 >
                   {spriteNum > 0 ? (
@@ -234,7 +234,7 @@ export default function AgentFormModal({
                   type="button"
                   tabIndex={-1}
                   disabled={spriteNum <= 1}
-                  aria-label={tr("이전 스프라이트", "Previous sprite")}
+                  aria-label={tr("이전 아이콘", "Previous icon")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
                     color: "var(--th-text-muted)",
