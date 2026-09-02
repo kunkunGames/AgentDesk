@@ -442,6 +442,9 @@ fi
 echo "=== Agent maintenance freshness tests ==="
 "$PYTHON" -m unittest tests.test_agent_maintenance_docs
 
+echo "=== Maintainability allowlist guard ==="
+"$PYTHON" scripts/check_stale_allowlist.py
+
 echo "=== Maintainability audit tests ==="
 "$PYTHON" -m unittest tests.test_audit_maintainability.FooterViewWritesCheck
 
