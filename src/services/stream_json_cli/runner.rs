@@ -93,6 +93,7 @@ pub fn run_prepared(
     let mut silent = Duration::ZERO;
     let mut startup_silent = Duration::ZERO;
     let mut saw_progress = false;
+    let mut stdout_line_count = 0_u64;
 
     loop {
         if cancel_requested(cancel.as_deref()) {
@@ -103,6 +104,7 @@ pub fn run_prepared(
         }
         match line_rx.recv_timeout(poll) {
             Ok(Some(line)) => {
+                stdout_line_count += 1;
                 silent = Duration::ZERO;
                 startup_silent = Duration::ZERO;
                 saw_progress = true;
@@ -150,6 +152,22 @@ pub fn run_prepared(
     let stderr = stderr_handle.join().unwrap_or_default();
     if cancel_requested(cancel.as_deref()) {
         return Ok(());
+    }
+    let stderr_present = !stderr.trim().is_empty();
+    tracing::debug!(
+        exit_code = ?status.code(),
+        stdout_line_count,
+        stderr_len = stderr.len(),
+        stderr_present,
+        "stream_json_cli child finished"
+    );
+    if stderr_present && status.success() {
+        tracing::warn!(
+            exit_code = ?status.code(),
+            stdout_line_count,
+            stderr_len = stderr.len(),
+            "stream_json_cli child exited successfully with stderr"
+        );
     }
     for message in codec.finish(status.code(), &stderr)? {
         let _ = sender.send(message);

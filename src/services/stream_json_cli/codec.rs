@@ -107,6 +107,9 @@ pub struct AgyCodec {
     saw_text_delta: bool,
     emitted_text: String,
     usage_steps: std::collections::BTreeSet<i64>,
+    last_step_error: Option<String>,
+    terminal_error: Option<String>,
+    terminal_empty_success: bool,
     finished: bool,
 }
 
@@ -117,6 +120,9 @@ impl AgyCodec {
             saw_text_delta: false,
             emitted_text: String::new(),
             usage_steps: std::collections::BTreeSet::new(),
+            last_step_error: None,
+            terminal_error: None,
+            terminal_empty_success: false,
             finished: false,
         }
     }
@@ -154,6 +160,7 @@ impl StreamJsonCodec for AgyCodec {
             }
             "step_update" => {
                 let step_type = json.get("step_type").and_then(Value::as_str).unwrap_or("");
+                self.remember_step_error(&json, step_type);
                 let mut out = Vec::new();
                 if step_type == "agent_response" {
                     if let Some(delta) = json.get("text_delta").and_then(Value::as_str) {
@@ -193,17 +200,12 @@ impl StreamJsonCodec for AgyCodec {
                 self.session_id = id.clone();
                 let status = json.get("status").and_then(Value::as_str).unwrap_or("");
                 if !status.is_empty() && !status.eq_ignore_ascii_case("SUCCESS") {
-                    self.finished = true;
-                    return Ok(vec![StreamMessage::Error {
-                        message: json
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or(status)
-                            .to_string(),
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: None,
-                    }]);
+                    self.terminal_error = Some(
+                        json_error_detail(&json)
+                            .or_else(|| self.last_step_error.clone())
+                            .unwrap_or_else(|| status.to_string()),
+                    );
+                    return Ok(Vec::new());
                 }
                 let mut out = Vec::new();
                 if !self.saw_text_delta {
@@ -219,6 +221,10 @@ impl StreamJsonCodec for AgyCodec {
                 let session_id = id.ok_or_else(|| {
                     "terminal success without a valid conversation id".to_string()
                 })?;
+                if self.emitted_text.is_empty() {
+                    self.terminal_empty_success = true;
+                    return Ok(Vec::new());
+                }
                 self.finished = true;
                 out.push(StreamMessage::Done {
                     result: self.emitted_text.clone(),
@@ -250,6 +256,7 @@ impl StreamJsonCodec for AgyCodec {
             return Ok(Vec::new());
         }
         if exit_code.unwrap_or(0) != 0 {
+            self.finished = true;
             return Ok(vec![StreamMessage::Error {
                 message: if stderr.trim().is_empty() {
                     format!("agy exited with status {exit_code:?}")
@@ -261,8 +268,106 @@ impl StreamJsonCodec for AgyCodec {
                 exit_code,
             }]);
         }
+        if let Some(message) = self.terminal_error.take() {
+            self.finished = true;
+            return Ok(vec![StreamMessage::Error {
+                message,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                exit_code,
+            }]);
+        }
+        if self.terminal_empty_success {
+            self.finished = true;
+            let stderr_detail = stderr.trim();
+            let (provider_detail, include_detail) = if stderr_detail.is_empty() {
+                (self.last_step_error.as_deref(), true)
+            } else {
+                (Some(stderr_detail), false)
+            };
+            return Ok(vec![StreamMessage::Error {
+                message: empty_success_message(provider_detail, include_detail),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                exit_code,
+            }]);
+        }
         Err("AGY stream ended without a terminal result".into())
     }
+}
+
+impl AgyCodec {
+    fn remember_step_error(&mut self, json: &Value, step_type: &str) {
+        let state = json
+            .get("status")
+            .or_else(|| json.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let is_failure = matches!(
+            state.to_ascii_lowercase().as_str(),
+            "error" | "failed" | "failure" | "denied"
+        );
+        let detail = ["error", "error_message", "reason"]
+            .into_iter()
+            .find_map(|key| {
+                json.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                is_failure
+                    .then(|| json.get("message").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                is_failure.then(|| format!("AGY step {step_type} ended with status {state}"))
+            });
+        if let Some(detail) = detail {
+            self.last_step_error = Some(detail);
+        }
+    }
+}
+
+fn json_error_detail(json: &Value) -> Option<String> {
+    ["error", "error_message", "reason", "message"]
+        .into_iter()
+        .find_map(|key| {
+            json.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn empty_success_message(provider_detail: Option<&str>, include_detail: bool) -> String {
+    let mut message = if provider_detail.map(is_permission_denial).unwrap_or(false) {
+        "AGY returned an empty response because a tool permission was denied in headless mode. Configure a narrowly scoped permissions.allow rule for the AGY project; do not use --dangerously-skip-permissions.".to_string()
+    } else {
+        "AGY returned SUCCESS without any response text; no usable assistant response was produced."
+            .to_string()
+    };
+    if include_detail {
+        if let Some(detail) = provider_detail {
+            message.push_str("\nProvider detail: ");
+            message.push_str(detail);
+        }
+    }
+    message
+}
+
+fn is_permission_denial(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("permission")
+        && (lower.contains("denied")
+            || lower.contains("headless")
+            || lower.contains("approval")
+            || lower.contains("request-review"))
 }
 
 #[cfg(test)]
@@ -325,5 +430,69 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, StreamMessage::Done { .. }))
         );
+    }
+
+    #[test]
+    fn agy_codec_turns_empty_success_into_permission_error_with_stderr() {
+        let mut codec = AgyCodec::new();
+        let _ = codec
+            .push_stdout_line(
+                r#"{"event":"init","conversation_id":"01234567-89ab-cdef-0123-456789abcdef"}"#,
+            )
+            .unwrap();
+        let result = codec
+            .push_stdout_line(
+                r#"{"event":"result","status":"SUCCESS","conversation_id":"01234567-89ab-cdef-0123-456789abcdef","response":""}"#,
+            )
+            .unwrap();
+        assert!(result.is_empty(), "empty success must wait for stderr");
+
+        let messages = codec
+            .finish(
+                Some(0),
+                "a tool required the command permission that headless mode cannot prompt for; it was auto-denied",
+            )
+            .unwrap();
+        let Some(StreamMessage::Error {
+            message, stderr, ..
+        }) = messages.first()
+        else {
+            panic!("expected an explicit AGY error, got {messages:?}");
+        };
+        assert!(message.contains("permission was denied"));
+        assert!(message.contains("permissions.allow"));
+        assert!(stderr.contains("headless mode"));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
+    fn agy_codec_preserves_step_failure_when_stderr_is_empty() {
+        let mut codec = AgyCodec::new();
+        let _ = codec
+            .push_stdout_line(
+                r#"{"event":"init","conversation_id":"01234567-89ab-cdef-0123-456789abcdef"}"#,
+            )
+            .unwrap();
+        let _ = codec
+            .push_stdout_line(
+                r#"{"event":"step_update","step_type":"run_command","state":"ERROR","message":"command permission denied"}"#,
+            )
+            .unwrap();
+        let _ = codec
+            .push_stdout_line(
+                r#"{"event":"result","status":"SUCCESS","conversation_id":"01234567-89ab-cdef-0123-456789abcdef","response":""}"#,
+            )
+            .unwrap();
+
+        let messages = codec.finish(Some(0), "").unwrap();
+        let Some(StreamMessage::Error { message, .. }) = messages.first() else {
+            panic!("expected an explicit AGY error, got {messages:?}");
+        };
+        assert!(message.contains("permission was denied"));
+        assert!(message.contains("command permission denied"));
     }
 }
