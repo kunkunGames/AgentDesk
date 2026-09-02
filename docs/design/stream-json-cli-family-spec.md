@@ -580,7 +580,7 @@ Mapping rules:
 - A terminal aggregate `result.response` MUST be emitted only as fallback when no response delta was observed. Re-emitting it after deltas is a duplicate-output defect.
 - `step_update.usage` MUST be counted once per terminal/DONE `step_index` for the current process attempt.
 - `result.usage` is treated as conversation aggregate telemetry and MUST NOT be added to step usage. If step usage is absent, an explicitly tested fallback/delta policy is required.
-- `result.status=SUCCESS` yields Done only after session identity validation. Error status maps to Error plus terminal Done/error semantics consistent with existing `StreamMessage` consumers.
+- `result.status=SUCCESS` yields Done only after session identity validation and a non-empty assistant response is available. A successful terminal event with no response text MUST become an explicit `Error` after bounded stderr is collected; the error MUST preserve a provider/tool failure detail when available. Error status maps to Error plus terminal Done/error semantics consistent with existing `StreamMessage` consumers.
 - Unknown event/step types MUST be bounded and observable. They MUST NOT crash the process reader or be silently treated as text.
 - Tool-call/result mapping and `supports_tool_stream=true` require a sanitized real tool fixture. Until then lifecycle steps may be status-only and the registry capability remains false.
 - `--json-schema` and structured-output capability require a separate real fixture. Until then explicit structured requests fail before spawn.
@@ -1004,4 +1004,3 @@ An implementer MAY start from this document without inventing product policy. If
 
 **Usable means:** an operator can assign a Discord agent to `grok` or `antigravity`, send a normal channel message, get a streamed reply, and resume the next message on the same session/conversation id. It does **not** mean TUI, meeting (AGY), or restricted-tool AGY.
 ---
-
