@@ -96,6 +96,7 @@ export default function EmojiPicker({
         style={{ background: "var(--th-input-bg)", borderColor: "var(--th-input-border)" }}
         aria-haspopup="dialog"
         aria-expanded={open}
+        aria-pressed={!!value}
         aria-label={
           ariaLabel ||
           (value

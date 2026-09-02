@@ -47,6 +47,7 @@ describe("EmojiPicker", () => {
     expect(button?.getAttribute("aria-expanded")).toBe("false");
     expect(button?.getAttribute("aria-label")).toBe("Selected icon: 🤖, change icon");
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
+    expect(button?.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("uses the icon-picker accessible name when no value is selected", async () => {
@@ -54,6 +55,7 @@ describe("EmojiPicker", () => {
     const button = target.querySelector("button");
 
     expect(button?.getAttribute("aria-label")).toBe("Open icon picker");
+    expect(button?.getAttribute("aria-pressed")).toBe("false");
   });
 
   it("renders the dialog with a translated accessible name", async () => {
