@@ -989,7 +989,7 @@ class RegistryValidationTest(unittest.TestCase):
         entry = {
             "file": "src/a.rs",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1006,7 +1006,7 @@ class RegistryValidationTest(unittest.TestCase):
             "file": "src/a.rs",
             "decision": "shrink",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1038,7 +1038,7 @@ class RegistryValidationTest(unittest.TestCase):
         entry = {
             "file": "src/a.rs",
             "decision": "shrink",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1072,7 +1072,7 @@ class RegistryValidationTest(unittest.TestCase):
             "file": "src/a.rs",
             "decision": "shrink",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
             "keep_reason": "not applicable",
         }
@@ -1109,7 +1109,7 @@ class RegistryValidationTest(unittest.TestCase):
             "decision": "keep",
             "owner": "team",
             "keep_reason": "TBD",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1152,7 +1152,7 @@ class RegistryValidationTest(unittest.TestCase):
                 "file": "src/a.rs",
                 "decision": "shrink",
                 "owner": "team",
-                "deadline": "2026-08-31",
+                "deadline": "2027-02-28",
                 "decompose_issue": "#1",
             }
             GEN.load_giant_file_registry = self._patch_registry([], [same_day])
@@ -1175,7 +1175,7 @@ class RegistryValidationTest(unittest.TestCase):
                     "file": "src/a.rs",
                     "decision": "shrink",
                     "owner": "team",
-                    "deadline": "2026-08-31",
+                    "deadline": "2027-02-28",
                     "decompose_issue": issue,
                 }
                 GEN.load_giant_file_registry = self._patch_registry([], [entry])
@@ -1191,7 +1191,7 @@ class RegistryValidationTest(unittest.TestCase):
             "file": "src/a.rs",
             "decision": "shrink",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#999",
         }
         orig = GEN.load_giant_file_registry
@@ -1209,7 +1209,7 @@ class RegistryValidationTest(unittest.TestCase):
             "file": "src/a.rs",
             "decision": "shrink",
             "owner": "voice-runtime",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1227,7 +1227,7 @@ class RegistryValidationTest(unittest.TestCase):
             "file": "src/not-listed.rs",
             "decision": "shrink",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         orig = GEN.load_giant_file_registry
@@ -1249,7 +1249,7 @@ class RegistryValidationTest(unittest.TestCase):
             {
                 "file": path,
                 "owner": "team",
-                "deadline": "2026-08-31",
+                "deadline": "2027-02-28",
                 "decompose_issue": "#1",
             }
             for path in ("src/a.rs", "src/first.rs")
@@ -1297,7 +1297,7 @@ class RegistryValidationTest(unittest.TestCase):
         entry = {
             "file": "src/a.rs",
             "owner": "team",
-            "deadline": "2026-08-31",
+            "deadline": "2027-02-28",
             "decompose_issue": "#1",
         }
         GEN.load_giant_file_issue_metadata = lambda: {
@@ -1380,7 +1380,7 @@ class RegistryValidationTest(unittest.TestCase):
             {
                 "file": "src/tracked.rs",
                 "owner": "team",
-                "deadline": "2026-08-31",
+                "deadline": "2027-02-28",
                 "decompose_issue": "#3036",
             },
         ]
@@ -1392,7 +1392,7 @@ class RegistryValidationTest(unittest.TestCase):
             GEN.load_giant_file_registry = orig
         by_path = {r.file_path: r for r in regs}
         self.assertEqual(by_path["src/first.rs"].decision, "keep")
-        self.assertEqual(by_path["src/tracked.rs"].deadline, "2026-08-31")
+        self.assertEqual(by_path["src/tracked.rs"].deadline, "2027-02-28")
         self.assertEqual(by_path["src/tracked.rs"].owner, "team")
 
 
