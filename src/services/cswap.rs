@@ -177,7 +177,11 @@ pub(crate) trait CswapAdapter: Send + Sync {
 struct CswapCliAdapter;
 
 fn normalize_override_path(raw: &str) -> Option<PathBuf> {
-    let expanded = expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw));
+    let expanded = if raw.starts_with('~') {
+        expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
     let absolute = if expanded.is_absolute() {
         expanded
     } else {
