@@ -757,7 +757,11 @@ fn translate_sqlite_rowid(sql: &str) -> String {
                 }
                 if bytes[idx] == b'"' {
                     if let Some((raw, ident, next_idx)) = scan_double_quoted_identifier(sql, idx) {
-                        if ident.eq_ignore_ascii_case("rowid") && !is_identifier_alias(sql, idx) {
+                        if (ident.eq_ignore_ascii_case("rowid")
+                            || ident.eq_ignore_ascii_case("_rowid_")
+                            || ident.eq_ignore_ascii_case("oid"))
+                            && !is_identifier_alias(sql, idx)
+                        {
                             result.push_str("ctid");
                         } else {
                             result.push_str(raw);
@@ -799,7 +803,10 @@ fn translate_sqlite_rowid(sql: &str) -> String {
                     }
 
                     let token = &sql[start..idx];
-                    if token.eq_ignore_ascii_case("rowid") {
+                    if token.eq_ignore_ascii_case("rowid")
+                        || token.eq_ignore_ascii_case("_rowid_")
+                        || token.eq_ignore_ascii_case("oid")
+                    {
                         if !is_identifier_alias(sql, start) {
                             result.push_str("ctid");
                         } else {
@@ -809,7 +816,11 @@ fn translate_sqlite_rowid(sql: &str) -> String {
                     }
 
                     let lower = token.to_ascii_lowercase();
-                    if let Some(prefix) = lower.strip_suffix(".rowid") {
+                    if let Some(prefix) = lower
+                        .strip_suffix(".rowid")
+                        .or_else(|| lower.strip_suffix("._rowid_"))
+                        .or_else(|| lower.strip_suffix(".oid"))
+                    {
                         result.push_str(&token[..prefix.len()]);
                         result.push_str(".ctid");
                         continue;
@@ -1747,6 +1758,32 @@ mod tests {
         assert_eq!(
             translate_sqlite_rowid("SELECT '--', \n rowid FROM t"),
             "SELECT '--', \n ctid FROM t"
+        );
+
+        // Variants `_rowid_` and `oid` behave exactly like `rowid`
+        assert_eq!(
+            translate_sqlite_rowid("SELECT _rowid_ FROM t"),
+            "SELECT ctid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT oid FROM t"),
+            "SELECT ctid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT t._rowid_ FROM t"),
+            "SELECT t.ctid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT t.oid FROM t"),
+            "SELECT t.ctid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT oid AS oid FROM t"),
+            "SELECT ctid AS oid FROM t"
+        );
+        assert_eq!(
+            translate_sqlite_rowid("SELECT _rowid_ \"oid\" FROM t"),
+            "SELECT ctid \"oid\" FROM t"
         );
     }
 
