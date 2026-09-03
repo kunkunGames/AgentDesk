@@ -252,7 +252,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::NotFixable,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
-            next_step: "check Postgres availability and server logs".to_string(),
+            next_step: "check Postgres connection settings and verify database server is running".to_string(),
         },
         // #4515 PR2: worker-local recovery circuit reasons.
         ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
@@ -511,7 +511,7 @@ mod health_classification_tests {
                     "severity": "error",
                     "fix_safety": "not_fixable",
                     "summary": "database is unavailable",
-                    "next_step": "check Postgres availability and server logs",
+                    "next_step": "check Postgres connection settings and verify database server is running",
                 }]
             })
         );
