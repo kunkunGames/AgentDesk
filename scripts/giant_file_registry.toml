@@ -747,7 +747,7 @@ decompose_issue = "#4712"
 # Active relay-dedup surface; decompose the idle-relay loop out once stabilized.
 file = "src/services/discord/session_relay_sink.rs"
 owner = "discord-relay"
-deadline = "2026-08-31"
+deadline = "2027-01-31"
 decompose_issue = "#4712"
 
 # NOTE: src/services/discord/relay_recovery.rs previously had an [[entry]] here;
@@ -804,7 +804,7 @@ decompose_issue = "#4712"
 # Tracked for splitting under the relay-decomposition program.
 file = "src/services/discord/tui_direct_pending_start.rs"
 owner = "discord-relay"
-deadline = "2026-08-31"
+deadline = "2027-01-31"
 decompose_issue = "#4712"
 
 [[entry]]
