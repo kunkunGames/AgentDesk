@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "07dcdd4322bd6898ac3c7c151253b2d616a71bd7",
+  "measured_at_sha": "fb0bf0fd71997ea68abd990bbb5a926341554907",
   "records": [
     {
       "root": "migrations/postgres",
@@ -2404,15 +2404,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:4635a035964c1d5f8e8ebc9ab2c82ee3280d7f3b19e9734c557c25ce5546a522"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/timeouts/reconciliation.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:8a30fa644ed0da8435e50aeffa0d170327a6ad2417f4ce384d802261613de2c9"
     },
     {
       "root": "policies",
