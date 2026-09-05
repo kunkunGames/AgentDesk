@@ -2,7 +2,7 @@
 
 This document pins down which kinds of facts belong in `scope: permanent` vs `scope: workspace` (a.k.a. session) in the Memento MCP store, and what must never be written to Memento at all.
 
-It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder under issue 910-6).
+It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row).
 
 This contract applies to MCP-backed Memento data. The PostgreSQL `local_memory`
 fallback documented in [`docs/source-of-truth.md`](source-of-truth.md) stores
