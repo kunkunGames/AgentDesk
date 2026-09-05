@@ -1391,14 +1391,11 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let _ = crate::services::platform::tmux::kill_session(tmux_session);
         assert!(
-            std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", tmux_session])
-                .status()
+            crate::services::platform::tmux::create_session(tmux_session, None, "sleep 60")
                 .expect("start tmux fixture")
+                .status
                 .success(),
             "production snapshot must observe a live producer tmux session"
         );
@@ -1751,14 +1748,11 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", tmux_session])
-            .status();
+        let _ = crate::services::platform::tmux::kill_session(tmux_session);
         assert!(
-            std::process::Command::new("tmux")
-                .args(["new-session", "-d", "-s", tmux_session])
-                .status()
+            crate::services::platform::tmux::create_session(tmux_session, None, "sleep 60")
                 .expect("start tmux fixture")
+                .status
                 .success(),
             "production snapshot must observe a live producer tmux session"
         );
