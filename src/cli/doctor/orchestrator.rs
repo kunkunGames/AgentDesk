@@ -918,6 +918,7 @@ fn build_provider_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec
     let configured = configured_provider_names(cfg, snapshot);
     let opencode_configured = configured.contains("opencode");
     let qwen_configured = configured.contains("qwen");
+    let grok_configured = configured.contains("grok");
     vec![
         check_runtime_path(),
         check_provider_cli(
@@ -938,6 +939,7 @@ fn build_provider_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec
         check_qwen_settings_files(qwen_configured),
         check_qwen_auth_hints(qwen_configured),
         check_qwen_runtime_artifacts(qwen_configured),
+        check_provider_cli(ProviderKind::Grok, grok_configured, snapshot),
         check_provider_bindings(cfg, snapshot),
         check_credential_permissions(cfg),
     ]
