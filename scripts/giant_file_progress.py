@@ -413,7 +413,7 @@ def main() -> int:
             candidate = inventory.giant_file_snapshot(candidate_root, evaluation_date=today)
             if event == "pull_request":
                 selector = "pr_strict_progress"
-                if repository != "itismyfield/AgentDesk" or env.get("GFP_HEAD_REPOSITORY") != repository:
+                if env.get("GFP_HEAD_REPOSITORY") != repository:
                     raise RuntimeError("progress requires an exact same-repository PR")
                 git("fetch", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
                 base_sha, head_sha = oid(env.get("GFP_BASE_SHA", "")), oid(env.get("GFP_HEAD_SHA", ""))
@@ -467,7 +467,7 @@ def main() -> int:
                     "pr_ordinary_no_regression": "ordinary PR preserves giant-file debt",
                     "pr_strict_progress": "retirement or 200-line partial progress",
                 }[selector]
-            elif event == "push" and repository == "itismyfield/AgentDesk":
+            elif event == "push":
                 selector = "main_no_regression_record"
                 payload.update(main_record(candidate))
                 reason = "main records current giant-file debt"

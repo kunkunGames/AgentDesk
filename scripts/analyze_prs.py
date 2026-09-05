@@ -227,6 +227,14 @@ def is_scratch_file_path(path):
 
     return False
 
+def is_generated_inventory_path(path):
+    generated_inventory_files = {
+        "docs/generated/module-inventory.md",
+        "docs/generated/route-inventory.md",
+        "docs/generated/worker-inventory.md",
+    }
+    return path in generated_inventory_files
+
 def main():
     repo = _detect_repo()
     print("Fetching PRs...")
@@ -310,12 +318,21 @@ def main():
         # Scratch file detection
         if files_data.get("files") is not None:
             scratch_files = []
+            generated_inventory_files = []
+            other_files = []
             for f in files_data["files"]:
                 path = f.get("path", "")
                 if is_scratch_file_path(path):
                     scratch_files.append(path)
+                if is_generated_inventory_path(path):
+                    generated_inventory_files.append(path)
+                else:
+                    other_files.append(path)
+
             if scratch_files:
                 print(f"  [!] SCRATCH FILE DETECTED: PR includes scratch files like pr-body.md, plan.md, or test scripts ({', '.join(scratch_files)}).")
+            if generated_inventory_files and not other_files:
+                print(f"  [!] GENERATED INVENTORY DRIFT ONLY: PR's entire diff is regenerated inventory docs ({', '.join(generated_inventory_files)}). Re-run scripts/generate_inventory_docs.py on main and file a no-change report instead of a PR.")
 
         if is_stale:
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
@@ -323,14 +340,14 @@ def main():
                 print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
-        if "no-change" in title.lower():
+        if "no-change" in title.lower() or "no change" in title.lower():
             if not has_no_change_verification_ack(body):
                 print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
             if files_data.get("files") is not None:
                 if len(files_data["files"]) > 0:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
                 else:
-                    print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
+                    print(f"  [!] EMPTY NO-CHANGE PR: No changed files. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
                     if not has_overlap_reference(body):
                         print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
 

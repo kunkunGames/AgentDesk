@@ -1,0 +1,25 @@
+<<<<<<< SEARCH
+        # PR #214/#215 lesson: no-change PRs must have 0 changed files
+        if "no-change" in title.lower():
+            if not has_no_change_verification_ack(body):
+                print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
+            if files_data.get("files") is not None:
+                if len(files_data["files"]) > 0:
+                    print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
+                else:
+                    print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
+                    if not has_overlap_reference(body):
+                        print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
+=======
+        # PR #214/#215 lesson: no-change PRs must have 0 changed files
+        if "no-change" in title.lower() or "no change" in title.lower():
+            if not has_no_change_verification_ack(body):
+                print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
+            if files_data.get("files") is not None:
+                if len(files_data["files"]) > 0:
+                    print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
+                else:
+                    print(f"  [!] EMPTY NO-CHANGE PR: No changed files. A no-change result should not become a PR unless it explicitly changes a queue-hygiene artifact. Consider closing.")
+                    if not has_overlap_reference(body):
+                        print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
+>>>>>>> REPLACE
