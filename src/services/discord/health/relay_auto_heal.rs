@@ -1382,6 +1382,10 @@ mod tests {
             "AGENTDESK_ROOT_DIR",
             tmp.path(),
         );
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping test: tmux unavailable");
+            return;
+        }
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(5_396_001);
         let tmux_session = "AgentDesk-codex-5396-redrive-noop";
@@ -1554,7 +1558,7 @@ mod tests {
             tmp.path(),
         );
         if !crate::services::platform::tmux::is_available() {
-            eprintln!("skipping #5396 reuse-no-op redrive: tmux unavailable");
+            eprintln!("skipping test: tmux unavailable");
             return;
         }
         let provider = ProviderKind::Claude;
@@ -1742,6 +1746,10 @@ mod tests {
             "AGENTDESK_ROOT_DIR",
             tmp.path(),
         );
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping test: tmux unavailable");
+            return;
+        }
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_615_302);
         let tmux_session = "AgentDesk-codex-4615-cap";
@@ -2174,6 +2182,10 @@ mod tests {
             "AGENTDESK_ROOT_DIR",
             tmp.path(),
         );
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping test: tmux unavailable");
+            return;
+        }
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_299_002);
         let tmux_session = "AgentDesk-codex-4299-reset";
@@ -2481,6 +2493,10 @@ mod tests {
             "AGENTDESK_ROOT_DIR",
             tmp.path(),
         );
+        if !crate::services::platform::tmux::is_available() {
+            eprintln!("skipping test: tmux unavailable");
+            return;
+        }
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_299_005);
         let owner_channel_id = ChannelId::new(4_299_006);
