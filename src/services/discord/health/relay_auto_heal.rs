@@ -1373,6 +1373,7 @@ mod tests {
     /// the pass takes the reattach arm this test is about; the recovery lane
     /// itself is the production one.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires tmux"]
     async fn redrive_planner_refused_reattach_response_cools_down_instead_of_committing() {
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
@@ -1733,6 +1734,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires tmux"]
     async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
