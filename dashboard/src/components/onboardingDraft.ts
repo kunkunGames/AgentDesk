@@ -168,6 +168,7 @@ export interface ServerOnboardingDraftResponse {
 }
 
 export const ONBOARDING_DRAFT_STORAGE_KEY = STORAGE_KEYS.onboardingDraft;
+export const MAX_ONBOARDING_DRAFT_AGENTS = 64;
 
 function normalizeBotInfo(parsed: ServerOnboardingDraftBotInfo | BotInfo | null | undefined): BotInfo | null {
   if (!parsed) return null;
