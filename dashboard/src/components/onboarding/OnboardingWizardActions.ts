@@ -1,6 +1,7 @@
 import { useCallback, type Dispatch, type SetStateAction } from "react";
 import {
   clearOnboardingDraft,
+  MAX_ONBOARDING_DRAFT_AGENTS,
   type AgentDef,
   type BotInfo,
   type ChannelAssignment,
@@ -242,6 +243,15 @@ export function useOnboardingWizardActions({
 
   const addCustomAgent = useCallback(() => {
     if (!customName.trim()) return;
+    if (agents.length >= MAX_ONBOARDING_DRAFT_AGENTS) {
+      setError(
+        tr(
+          `최대 ${MAX_ONBOARDING_DRAFT_AGENTS}개의 에이전트만 추가할 수 있습니다.`,
+          `Maximum ${MAX_ONBOARDING_DRAFT_AGENTS} agents can be added.`,
+        ),
+      );
+      return;
+    }
     const name = customName.trim();
     const desc = customDesc.trim();
     const nameEn = customNameEn.trim() || name;

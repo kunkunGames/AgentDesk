@@ -1,6 +1,7 @@
 import type { Dispatch, RefObject, SetStateAction } from "react";
 
 import type { AgentDef } from "../onboardingDraft";
+import { MAX_ONBOARDING_DRAFT_AGENTS } from "../onboardingDraft";
 import { TEMPLATES } from "./templates";
 import {
   ChecklistPanel,
@@ -240,7 +241,7 @@ export function Step3AgentSelection({
           />
           <button type="button"
             onClick={addCustomAgent}
-            disabled={!customName.trim()}
+            disabled={!customName.trim() || agents.length >= MAX_ONBOARDING_DRAFT_AGENTS}
             className="w-full sm:w-auto px-4 py-2 rounded-lg text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40 transition-colors whitespace-nowrap"
           >
             + {tr("추가", "Add")}
