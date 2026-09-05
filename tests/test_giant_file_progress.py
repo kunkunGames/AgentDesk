@@ -632,8 +632,8 @@ class GuardRepinTest(unittest.TestCase):
             if args[0] == "diff" and binary: return patch
             raise AssertionError(args)
         def snapshot(root, evaluation_date=None): return candidate if root.name == "candidate" else base
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
-               "GFP_HEAD_REPOSITORY": "itismyfield/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
+        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "kunkunGames/AgentDesk",
+               "GFP_HEAD_REPOSITORY": "kunkunGames/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
                "GFP_BASE_SHA": "base", "GFP_HEAD_SHA": "head"}
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence.json"
