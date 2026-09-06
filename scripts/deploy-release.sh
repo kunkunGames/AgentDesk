@@ -3669,7 +3669,7 @@ durable record coverage: ${POST_DEPLOY_SMOKE_DURABLE_COVERAGE:-unevaluable: E-35
             if tmp_issue_stdout=$(mktemp "${TMPDIR:-/tmp}/agentdesk-issue-stdout.XXXXXX") \
                 && tmp_issue_stderr=$(mktemp "${TMPDIR:-/tmp}/agentdesk-issue-stderr.XXXXXX"); then
                 if python3 "$SCRIPT_DIR/ci-timeout.py" 10 gh issue create \
-                    --repo kunkunGames/AgentDesk \
+                    --repo itismyfield/AgentDesk \
                     --title "ops: post-deploy functional smoke regression (${node_name})" \
                     --body-file "$draft_path" > "$tmp_issue_stdout" 2> "$tmp_issue_stderr"; then
                     rc=0
@@ -3686,7 +3686,7 @@ durable record coverage: ${POST_DEPLOY_SMOKE_DURABLE_COVERAGE:-unevaluable: E-35
                         echo "⚠ Post-deploy smoke issue creation returned truncated stdout; draft retained: $draft_path"
                     elif issue_url=${issue_url%$'\n'}; [ -z "$issue_url" ]; then
                         echo "⚠ Post-deploy smoke issue creation returned empty stdout; draft retained: $draft_path"
-                    elif [[ "$issue_url" =~ ^https://github\.com/kunkunGames/AgentDesk/issues/[0-9]+$ ]]; then
+                    elif [[ "$issue_url" =~ ^https://github\.com/itismyfield/AgentDesk/issues/[0-9]+$ ]]; then
                         echo "⚠ Post-deploy smoke issue created (confirmed mode): $issue_url"
                     else
                         echo "⚠ Post-deploy smoke issue creation returned invalid stdout; draft retained: $draft_path"

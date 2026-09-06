@@ -3,7 +3,7 @@
 # install.sh — AgentDesk installer bootstrap
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/kunkunGames/AgentDesk/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/itismyfield/AgentDesk/main/scripts/install.sh | bash
 #
 # What it does on macOS:
 #   1. Downloads the latest release from GitHub
@@ -16,7 +16,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-REPO="${AGENTDESK_INSTALL_REPO:-kunkunGames/AgentDesk}"
+REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"
 DEFAULT_INSTALL_DIR="${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}"
 INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"
