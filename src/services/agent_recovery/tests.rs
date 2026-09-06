@@ -14,7 +14,7 @@ use super::policy::{
 use super::restore::{RestoreSessionMode, format_restore_packet, session_mode_for_provider};
 use super::{ObserveInput, RecoveryRuntime};
 
-const CHANNEL: &str = "1486723324259340408";
+pub(super) const CHANNEL: &str = "1486723324259340408";
 const SECRET: &str = "live-recovery-secret-token";
 
 fn enabled_recovery(fallback: &str) -> RecoveryConfigWire {
@@ -52,7 +52,7 @@ fn channel(owner: &str, recovery: Option<RecoveryConfigWire>) -> OrgChannelInput
     }
 }
 
-fn enabled_runtime() -> RecoveryRuntime {
+pub(super) fn enabled_runtime() -> RecoveryRuntime {
     let catalog = build_recovery_catalog(
         &[
             agent(
@@ -102,6 +102,18 @@ fn compact(progress: &str) -> CheckpointPayload {
         "continue from Next",
         "please keep going",
     )
+}
+
+#[test]
+fn rejected_checkpoint_does_not_advance_the_wal_frontier() {
+    let mut runtime = enabled_runtime().with_max_checkpoint_bytes(1);
+    assert!(
+        runtime
+            .note_owner_progress(CHANNEL, compact("oversized"))
+            .is_err()
+    );
+    assert!(runtime.events(CHANNEL).is_empty());
+    assert_eq!(runtime.states.get(CHANNEL).unwrap().next_seq, 0);
 }
 
 #[test]

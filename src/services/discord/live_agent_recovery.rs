@@ -168,7 +168,6 @@ async fn execute_restore(
             owner_agent_id = %plan.owner_agent_id,
             "agent recovery restore refused invalid channel id"
         );
-        agent_recovery::abort(&plan.channel_id);
         return false;
     };
     let strategy = match plan.session_mode {
@@ -208,7 +207,6 @@ async fn execute_restore(
                 error = %error,
                 "agent recovery owner restore turn could not start"
             );
-            agent_recovery::abort(&plan.channel_id);
             false
         }
     }
