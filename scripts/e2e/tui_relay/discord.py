@@ -5,13 +5,66 @@ Uses stdlib urllib so the driver runs on a vanilla Python 3 with no pip install.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
+from email.utils import parsedate_to_datetime
 from typing import Any
+
+from .assertions import relay_body
+
+
+MESSAGE_FETCH_MAX_ATTEMPTS = 3
+MESSAGE_FETCH_RETRY_BUDGET_S = 15.0
+MESSAGE_FETCH_MIN_RETRY_DELAY_S = 0.1
+MESSAGE_FETCH_BODY_LIMIT = 512
+
+
+def _fetch_error(status: int | str, payload: str, reason: str) -> RuntimeError:
+    excerpt = repr(payload[:MESSAGE_FETCH_BODY_LIMIT])[:MESSAGE_FETCH_BODY_LIMIT]
+    if len(payload) > MESSAGE_FETCH_BODY_LIMIT:
+        excerpt += "..."
+    return RuntimeError(f"fetch_messages observed HTTP {status}: {reason}; body={excerpt}")
+
+
+def _fetch_retry_delay(headers, body: Any) -> float:
+    values = [
+        (name, headers.get(name))
+        for name in ("X-RateLimit-Reset-After", "Retry-After")
+        if headers.get(name) is not None
+    ]
+    if isinstance(body, dict) and "retry_after" in body:
+        values.append(("retry_after", body["retry_after"]))
+    if not values:
+        raise ValueError("missing rate-limit delay")
+    delays = []
+    for name, value in values:
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise ValueError
+            try:
+                delay = float(value)
+            except ValueError:
+                if name != "Retry-After":
+                    raise
+                reset_at = parsedate_to_datetime(value)
+                if reset_at.tzinfo is None:
+                    raise ValueError
+                delay = max(0.0, reset_at.timestamp() - time.time())
+            if not math.isfinite(delay) or delay < 0:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"invalid {name} delay") from None
+        delays.append(delay)
+    # Honor every supplied delay, including a longer bucket reset. The floor
+    # prevents repeated zero-delay responses from causing a tight retry loop.
+    return max(MESSAGE_FETCH_MIN_RETRY_DELAY_S, *delays)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -23,6 +76,9 @@ class DiscordClient:
     # worker even when the provider bot is not currently watching the channel.
     handoff_to_agent: str | None = None
     handoff_from_agent: str | None = None
+    captures: list[dict[str, Any]] | None = None
+    capture_after_id: str | None = None
+    body_observations: dict[str, float] | None = None
 
     def send(self, channel_id: int | str, content: str) -> dict[str, Any]:
         body = json.dumps({"channel_id": str(channel_id), "content": content}).encode("utf-8")
@@ -211,38 +267,86 @@ class DiscordClient:
         limit: int = 50,
         after_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        requested_after = after_id
+        if self.captures is not None:
+            after_id = self.capture_after_id
         params: dict[str, Any] = {"limit": limit}
         if after_id:
             params["after"] = after_id
         query = urllib.parse.urlencode(params)
         url = f"{self.base_url}/api/discord/channels/{channel_id}/messages?{query}"
-        # `Connection: close` prevents urllib's default HTTP/1.1 keep-alive
-        # from reusing the same socket for back-to-back polls. The reused
-        # connection could serve a cached response and the driver would
-        # observe a stale window — exactly the symptom in #2718 where the
-        # response landed in the channel within seconds but the polling
-        # loop kept seeing the earlier snapshot until it timed out.
+        # Preserve the existing explicit connection-close request for polls.
         request = urllib.request.Request(
             url,
             method="GET",
             headers={"Connection": "close"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                payload = response.read().decode("utf-8")
-        except urllib.error.HTTPError as error:
-            raise RuntimeError(
-                f"fetch_messages HTTP {error.code}: "
-                f"{error.read().decode('utf-8', 'replace')}"
-            ) from error
-        except urllib.error.URLError as error:
-            # Bubble up transport-level failures instead of silently
-            # returning [] from a swallowed exception further up the stack.
-            raise RuntimeError(f"fetch_messages URL error: {error}") from error
-        body = json.loads(payload) if payload else []
-        if isinstance(body, list):
-            return body
-        return body.get("messages", [])
+        deadline = time.monotonic() + MESSAGE_FETCH_RETRY_BUDGET_S
+        waited = 0.0
+        status: int | str = "unavailable"
+        payload = ""
+        for attempt in range(1, MESSAGE_FETCH_MAX_ATTEMPTS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _fetch_error(status, payload, "retry budget exhausted")
+            try:
+                with urllib.request.urlopen(request, timeout=min(self.timeout_s, remaining)) as response:
+                    status, headers, raw = response.status, response.headers, response.read()
+            except urllib.error.HTTPError as error:
+                with error:
+                    status, headers, raw = error.code, error.headers, error.read()
+            except urllib.error.URLError as error:
+                raise RuntimeError(f"fetch_messages URL error: {error}") from error
+            payload = raw.decode("utf-8", "replace")
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                if status != 429:
+                    raise _fetch_error(status, payload, "invalid JSON response") from None
+                # An observed 429 may provide its delay only in HTTP headers.
+                body = None
+
+            messages = body.get("messages") if isinstance(body, dict) else body
+            # The current API can hide an upstream error inside HTTP 200.
+            # Infer rate limiting only from structured retry metadata, not text.
+            wrapped_rate_limit = (
+                status == 200 and isinstance(messages, dict) and "retry_after" in messages
+            )
+            if status != 429 and not wrapped_rate_limit:
+                if not 200 <= status < 300:
+                    raise _fetch_error(status, payload, "unsuccessful response")
+                if not isinstance(messages, list):
+                    raise _fetch_error(status, payload, "expected message array or messages envelope")
+                if not all(isinstance(message, Mapping) for message in messages):
+                    raise _fetch_error(status, payload, "message array contains a non-object element")
+                if self.body_observations is not None:
+                    for message in messages:
+                        if (body := relay_body(message)) is not None:
+                            self.body_observations.setdefault(body, time.monotonic())
+                if self.captures is not None:
+                    self.captures.append({"pages": [{"channel_id": str(channel_id),
+                        "after_id": after_id, "limit": limit, "observed_at": time.time(),
+                        "messages": copy.deepcopy(messages)}]})
+                    # Capture includes setup; normal assertion windows still start
+                    # at their original cursor. No extra request or wait is added.
+                    return [message for message in messages if requested_after is None
+                            or int(message["id"]) > int(requested_after)]
+                return messages
+
+            reason = "rate limit inferred from wrapped retry_after" if wrapped_rate_limit else "rate limit"
+            try:
+                delay = _fetch_retry_delay(headers, messages if wrapped_rate_limit else body)
+            except ValueError as error:
+                raise _fetch_error(status, payload, f"{reason}: {error}") from None
+            if attempt == MESSAGE_FETCH_MAX_ATTEMPTS:
+                raise _fetch_error(status, payload, f"{reason}: attempt limit exhausted")
+            # Both elapsed request time and cumulative waits consume the budget.
+            # Socket timeouts above are capped too; urllib has no total-read deadline.
+            remaining = min(deadline - time.monotonic(), MESSAGE_FETCH_RETRY_BUDGET_S - waited)
+            if delay >= remaining:
+                raise _fetch_error(status, payload, f"{reason}: retry delay exceeds remaining budget")
+            time.sleep(delay)
+            waited += delay
 
     def wait_for_message(
         self,
@@ -276,8 +380,8 @@ class DiscordClient:
         # not yet be visible on the first poll right after a send_prompt,
         # only the user message that arrived after the marker can show up
         # later — and once `last_id` slides past the marker's id we would
-        # never query for it again. `observed_ids` keeps duplicate handling
-        # cheap so re-fetching the same window every poll is safe.
+        # never query for it again. `observed_by_id` tracks seen values while
+        # still allowing same-ID edits to be observed in the fixed window.
         # See #2718 driver follow-up.
         deadline = time.monotonic() + timeout_s
         observed: list[dict[str, Any]] = []

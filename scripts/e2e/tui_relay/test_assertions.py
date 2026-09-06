@@ -7,6 +7,7 @@ primitives that close the presence-only blind spot of the legacy contract.
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import subprocess
@@ -15,8 +16,9 @@ import tempfile
 import unittest
 import datetime as dt
 from argparse import Namespace
+from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts" / "e2e"))
@@ -24,6 +26,13 @@ sys.path.insert(0, str(ROOT / "scripts" / "e2e"))
 import run_tui_relay as driver  # noqa: E402
 import run_multi_provider_matrix as matrix  # noqa: E402
 from tui_relay import assertions  # noqa: E402
+from tui_relay.test_driver_health import (  # noqa: E402
+    _busy_mailbox, _fake_urlopen_for, _health_detail, _idle_mailbox,
+    HarnessOutcomeContract, PhasePartialEvidenceContract,  # noqa: F401
+)
+# ci-script-checks.sh runs this module; expose the offline fetch regressions too.
+from tui_relay.test_discord_client import DiscordClientFetchMessages, _Response  # noqa: E402, F401
+from tui_relay.test_known_gap import E22KnownGapContract  # noqa: E402, F401
 
 
 def _relay_msg(msg_id: int, content: str, ts: str | None = None) -> dict:
@@ -865,7 +874,7 @@ class RunAssertionDispatch(unittest.TestCase):
 
 class ScenarioFilterFailClosed(unittest.TestCase):
     def test_direct_main_rejects_invalid_filters_before_side_effects(self):
-        for raw in ("E-999", "E-1,E-999", "E-1-extra", " , "):
+        for raw in ("E-999", "E-1,E-999", "E-1-extra", " , ", "E-29", "E-1,E-29"):
             with self.subTest(raw=raw):
                 args = Namespace(
                     base_url="http://agentdesk.test", cell="claude-tui", channel_id="222",
@@ -898,7 +907,7 @@ class ScenarioFilterFailClosed(unittest.TestCase):
 
     def test_matrix_main_rejects_invalid_filters_before_side_effects(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for raw in ("E-999", "E-1,E-999", "E-1-extra", " , "):
+            for raw in ("E-999", "E-1,E-999", "E-1-extra", " , ", "E-29", "E-1,E-29"):
                 with self.subTest(raw=raw):
                     args = Namespace(
                         base_url="http://agentdesk.test", config="/unused/config.yaml",
@@ -933,7 +942,7 @@ class ScenarioFilterFailClosed(unittest.TestCase):
             root = Path(tmp)
             config = root / "agentdesk.yaml"
             agents = (("claude-pipe", "claude", "111"), ("claude-tui", "claude", "222"),
-                      ("claude-e", "claude", "333"), ("codex-pipe", "codex", "444"),
+                      ("codex-pipe", "codex", "444"),
                       ("codex-tui", "codex", "555"))
             config.write_text("agents:\n" + "".join(
                 f"  - {{id: adk-{cell}-e2e, channels: {{{provider}: {{id: '{channel}'}}}}}}\n"
@@ -962,6 +971,504 @@ class ScenarioFilterFailClosed(unittest.TestCase):
         restart = [row for row in report["results"] if row["kind"] == "foreign_active_restart_guard"]
         self.assertEqual([(row["id"], row["status"], row["ok"]) for row in restart],
                          [("E-17", "pass", True)])
+
+
+class TargetHealthContract(unittest.TestCase):
+    """Loaded by the existing CI assertion entry, including the real step caller."""
+
+    def probe(self, mailboxes=None, *, options=None, health=None, counters=None, **target):
+        detail = _health_detail(*(mailboxes if mailboxes is not None else [_idle_mailbox()]))
+        detail.update(counters or {"global_active": 1, "global_finalizing": 1})
+        public = {"status": "healthy", "ok": True, "fully_recovered": True, **(health or {})}
+        params = {"global_active_max": 0, "global_finalizing_max": 0, **(options or {})}
+        binding = {"channel_id": "42", "cell": "codex-tui", **target}
+        with patch.object(driver.urllib.request, "urlopen", _fake_urlopen_for({
+            "/api/health": [(200, public)], "/api/health/detail": [(200, detail)],
+        })):
+            return driver.assert_health("http://agentdesk.test", params, **binding)
+
+    def test_foreign_occupancy_preserves_global_evidence(self):
+        result = self.probe([_idle_mailbox(), _busy_mailbox()])
+        self.assertEqual((result["global_active"], result["global_finalizing"]), (1, 1))
+        self.assertEqual(result["target_mailbox_idle"]["channel_id"], "42")
+        self.assertEqual(result["target_mailbox_idle"]["provider"], "codex")
+
+    def test_target_busy_witnesses_refuse(self):
+        mutations = [
+            ("agent_turn_status", value) for value in ("active", "residual", "residual_held")
+        ] + [(key, True) for key in (
+            "has_cancel_token", "inflight_state_present", "recovery_started", "active_dispatch_present",
+        )] + [("queue_depth", 1), ("active_user_message_id", 7), ("relay_stall_state", "tmux_alive_relay_dead")]
+        relay_mutations = [("active_turn", "foreground"), ("active_turn", "explicit_background")]
+        relay_mutations += [(key, True) for key in (
+            "bridge_inflight_present", "mailbox_has_cancel_token", "pending_thread_proof", "stale_thread_proof", "desynced",
+        )] + [("queue_depth", 1), ("mailbox_active_user_msg_id", 7), ("pending_discord_callback_msg_id", 7)]
+        for nested, changes in ((False, mutations), (True, relay_mutations)):
+            for key, value in changes:
+                with self.subTest(relay=nested, key=key, value=value):
+                    box = _idle_mailbox()
+                    (box["relay_health"] if nested else box)[key] = value
+                    with self.assertRaisesRegex(assertions.AssertionError, "target .* busy"):
+                        self.probe([box, _busy_mailbox()])
+
+    def test_every_required_witness_rejects_missing_or_malformed_values(self):
+        for nested in (False, True):
+            fields = _idle_mailbox()["relay_health"] if nested else _idle_mailbox()
+            for key, value in fields.items():
+                if key in {"provider", "channel_id", "relay_health"}:
+                    continue
+                for missing in (False, True):
+                    with self.subTest(relay=nested, key=key, missing=missing):
+                        box = _idle_mailbox()
+                        payload = box["relay_health"] if nested else box
+                        if missing:
+                            del payload[key]
+                        else:
+                            payload[key] = "false" if type(value) is bool else {}
+                        with self.assertRaisesRegex(assertions.AssertionError, "missing/invalid witnesses"):
+                            self.probe([box])
+
+    def test_missing_duplicate_malformed_and_wrong_target_refuse(self):
+        for boxes in ([], [_idle_mailbox(), _idle_mailbox()], [None],
+                      [_idle_mailbox("84")], [_idle_mailbox(provider="claude")],
+                      [{**_idle_mailbox(), "relay_health": None}]):
+            with self.subTest(boxes=boxes), self.assertRaises(assertions.AssertionError):
+                self.probe(boxes)
+        for binding in ({"channel_id": None}, {"channel_id": ""}, {"channel_id": "0"},
+                        {"channel_id": "٤٢"}, {"cell": None}, {"cell": "invalid"}):
+            with self.subTest(binding=binding), self.assertRaises(assertions.AssertionError):
+                self.probe(**binding)
+        with patch.object(driver, "_read_health_detail", return_value={"mailboxes": {}}):
+            with self.assertRaisesRegex(assertions.AssertionError, "list of objects"):
+                self.probe()
+
+    def test_public_health_recovery_and_forbidden_reasons_remain_guards(self):
+        for health in ({"status": "unhealthy"}, {"ok": False}, {"fully_recovered": False},
+                       {"degraded": True}, {"degraded_reasons": ["global_active_counter_out_of_bounds"]}):
+            with self.subTest(health=health), self.assertRaises(assertions.AssertionError):
+                self.probe(health=health, options={"forbid_degraded_reasons": ["global_active_counter_out_of_bounds"]})
+
+    def test_positive_and_mixed_global_bounds_keep_numeric_limits(self):
+        positive = {"global_active_max": 1, "global_finalizing_max": 1}
+        result = self.probe([], options=positive, channel_id=None, cell=None)
+        self.assertNotIn("target_mailbox_idle", result)
+        for active_bound, final_bound in ((1, 1), (0, 1), (1, 0)):
+            options = {"global_active_max": active_bound, "global_finalizing_max": final_bound}
+            self.probe(options=options)
+            counters = {"global_active": 2 if active_bound else 1,
+                        "global_finalizing": 2 if final_bound else 1}
+            with self.subTest(options=options), self.assertRaisesRegex(assertions.AssertionError, "> 1"):
+                self.probe(options=options, counters=counters)
+
+    def test_all_nine_zero_bound_consumers_bind_thread_and_provider_in_real_runner(self):
+        consumers = []
+        for path in (ROOT / "tests/e2e/tui_relay/scenarios").glob("*.yaml"):
+            scenario = driver.yaml.safe_load(path.read_text(encoding="utf-8"))
+            for step in scenario.get("steps", []):
+                params = step.get("assert_health", {})
+                if params.get("global_active_max") == params.get("global_finalizing_max") == 0:
+                    consumers.append((scenario["id"], step))
+        self.assertEqual({sid for sid, _ in consumers}, {"E-8", "E-9", "E-10", "E-12", "E-14", "E-16", "E-18", "E-19", "E-20"})
+        self.assertEqual(len(consumers), 9)
+        for sid, step in consumers:
+            for cell in driver.SUPPORTED_CELLS:
+                with self.subTest(scenario=sid, cell=cell):
+                    provider = driver.cell_provider(cell)
+                    foreign = "claude" if provider == "codex" else "codex"
+                    detail = _health_detail(_idle_mailbox("84", provider),
+                                           _busy_mailbox("42", provider), _busy_mailbox("84", foreign))
+                    detail.update(global_active=1, global_finalizing=1)
+                    client = MagicMock(base_url="http://agentdesk.test")
+                    client.send_control.return_value = {"id": "1"}
+                    client.fetch_messages.return_value = []
+                    args = Namespace(cell=cell, channel_id="42", thread_channel_id="84", dry_run=False,
+                                     reset_before_each=False, allow_destructive=False, queue_runtime_root="unused")
+                    scenario = {"id": sid, "agent_mode": "controlled", "coverage_class": "live",
+                                "requires_thread_channel": True, "steps": [step], "assertions": []}
+                    with patch.object(driver.urllib.request, "urlopen", _fake_urlopen_for({
+                        "/api/health": [(200, {"status": "healthy", "ok": True, "fully_recovered": True})],
+                        "/api/health/detail": [(200, detail)],
+                    })), patch.object(driver.time, "sleep"), patch.object(driver, "assert_cell_idle", return_value={"status": "idle"}):
+                        result = driver.run_scenario(scenario, args=args, run_id="target-binding", client=client)
+                    self.assertEqual(result["status"], "pass", result)
+                    evidence = result["health_assertions"][0]
+                    self.assertEqual((evidence["global_active"], evidence["global_finalizing"]), (1, 1))
+                    self.assertEqual((evidence["target_mailbox_idle"]["channel_id"], evidence["target_mailbox_idle"]["provider"]), ("84", provider))
+
+
+class TargetHealthR2Contract(unittest.TestCase):
+    def run_health(self, options, *, mutation=None):
+        box = _idle_mailbox("84")
+        if mutation:
+            key, value = mutation
+            if value == "<missing>":
+                del box["relay_health"][key]
+            else:
+                box["relay_health"][key] = value
+        detail = _health_detail(box, _busy_mailbox("42", "codex"), _busy_mailbox("84", "claude"))
+        detail.update(global_active=1, global_finalizing=1)
+        client = MagicMock(base_url="http://agentdesk.test")
+        client.send_control.return_value = {"id": "1"}
+        client.fetch_messages.return_value = []
+        scenario = {"id": "offline-health-r2", "agent_mode": "controlled", "coverage_class": "live",
+                    "requires_thread_channel": True, "steps": [{"assert_health": options}], "assertions": []}
+        args = Namespace(cell="codex-tui", channel_id="42", thread_channel_id="84", dry_run=False,
+                         reset_before_each=False, allow_destructive=False, queue_runtime_root="unused")
+        with patch.object(driver.urllib.request, "urlopen", _fake_urlopen_for({
+            "/api/health": [(200, {"status": "healthy", "ok": True, "fully_recovered": True})],
+            "/api/health/detail": [(200, detail)],
+        })), patch.object(driver.time, "sleep"), patch.object(driver, "_runtime_queue_violations", return_value=[]):
+            # Keep the real post-scenario assert_cell_idle, as in the independent counterexample.
+            return driver.run_scenario(scenario, args=args, run_id="identity-and-bounds", client=client)
+
+    def test_nested_serialized_identity_must_match_resolved_thread_and_provider(self):
+        options = {"global_active_max": 0, "global_finalizing_max": 0}
+        valid = self.run_health(options)
+        self.assertEqual(valid["status"], "pass", valid["reason"])
+        self.assertEqual(valid["post_scenario_idle"]["channel_id"], "84")
+        for mutation in (("provider", "claude"), ("provider", []), ("provider", None),
+                         ("channel_id", 42), ("channel_id", "84"), ("channel_id", 84.0),
+                         ("channel_id", True), ("channel_id", {}),
+                         ("provider", "<missing>"), ("channel_id", "<missing>")):
+            with self.subTest(mutation=mutation):
+                result = self.run_health(options, mutation=mutation)
+                self.assertEqual(result["status"], "fail", result["reason"])
+                self.assertIn("target relay identity", result["reason"])
+
+    def test_only_original_integer_zero_selects_target_policy(self):
+        for key, other in (("global_active_max", "global_finalizing_max"),
+                           ("global_finalizing_max", "global_active_max")):
+            for value in (0.5, 0.0, False, "0"):
+                for other_bound in (None, 0, 1):
+                    with self.subTest(key=key, value=value, other=other_bound):
+                        options = {key: value}
+                        if other_bound is not None:
+                            options[other] = other_bound
+                        result = self.run_health(options)
+                        self.assertEqual(result["status"], "fail", result["reason"])
+                        self.assertIn(f"{key.removesuffix('_max')}=1 > 0", result["reason"])
+            for value in (0, 1, 1.5):
+                result = self.run_health({key: value, other: 0})
+                self.assertEqual(result["status"], "pass", result["reason"])
+                observed = result["health_assertions"][0]
+                self.assertEqual((observed["global_active"], observed["global_finalizing"]), (1, 1))
+
+
+class E35CurrentRunContract(unittest.TestCase):
+    def test_actual_yaml_through_real_runner_checks_final_body_and_completion(self):
+        path = ROOT / "tests/e2e/tui_relay/scenarios/E-35-durable-delivery-record.yaml"
+        scenario = driver.yaml.safe_load(path.read_text(encoding="utf-8"))
+        original = copy.deepcopy(scenario)
+        marker = "[E2E:E35:current-run:OK]"
+        body, completion = _relay_msg(3, marker), _raw_bot_msg(6, "✅ 응답 완료")
+        cases = {
+            "current": ([body, completion], "pass"),
+            "stale": ([_relay_msg(3, "[E2E:E35:old-run:OK]"), completion], "fail"),
+            "missing": ([_relay_msg(3, "unrelated response"), completion], "fail"),
+            "duplicate marker": ([body, _relay_msg(4, marker + " resent"), completion], "fail"),
+            "duplicate content": ([body, _relay_msg(4, "same body"), _relay_msg(5, "same body"), completion], "fail"),
+            "missing completion": ([body], "fail"),
+            "early completion": ([_raw_bot_msg(2, "✅ 응답 완료"), body], "fail"),
+        }
+        for cell in scenario["cells"]:
+            for label, (messages, expected) in cases.items():
+                with self.subTest(cell=cell, case=label):
+                    client = MagicMock(base_url="http://agentdesk.test")
+                    client.send_control.return_value = {"id": "1"}
+                    client.send.return_value = {"id": "2"}
+                    # The real wait first sees the current marker; final edits must still pass assertions.
+                    client.fetch_messages.side_effect = [[], [body], messages]
+                    args = Namespace(base_url=client.base_url, cell=cell, channel_id="42", thread_channel_id=None,
+                                     dry_run=False, reset_before_each=True, hard_reset_session_each=True,
+                                     allow_destructive=False, queue_runtime_root="unused", final_refetches=1)
+                    with patch.object(driver, "durable_probe_safety_gate", return_value={"status": "idle"}) as safety, \
+                         patch.object(driver.durable_delivery, "poll_records", return_value={"status": "evaluated"}) as receipt, \
+                         patch.object(driver, "assert_cell_idle", return_value={"status": "idle"}), \
+                         patch.object(driver, "reset_channel_state") as reset, \
+                         patch.object(driver, "hard_reset_provider_session") as hard_reset, patch.object(driver.time, "sleep"):
+                        result = driver.run_scenario(scenario, args=args, run_id="current-run", client=client)
+                    self.assertEqual(result["status"], expected, result)
+                    if expected == "fail":
+                        self.assertEqual(result["failure_attribution"]["source"], "assertion")
+                    client.send.assert_called_once_with("42", original["steps"][0]["send_discord_prompt"].replace("{run_id}", "current-run"))
+                    client.send_prompt.assert_not_called()
+                    receipt.assert_called_once_with(Path("unused"), provider="claude", channel_id="42", message_id="3")
+                    self.assertEqual(safety.call_count, 2)
+                    reset.assert_not_called()
+                    hard_reset.assert_not_called()
+        self.assertEqual(scenario, original)
+
+
+class RetiredCellAdmission(unittest.TestCase):
+    def test_direct_cli_rejects_retired_cell_before_side_effects(self):
+        stderr = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["driver", "--cell", "claude-e", "--channel-id", "333"]),
+            patch.object(driver, "load_scenarios") as scenarios,
+            patch("pathlib.Path.mkdir") as mkdir,
+            patch("pathlib.Path.write_text") as report,
+            patch.object(driver.discord, "DiscordClient") as client,
+            patch.object(driver.subprocess, "run") as child,
+            patch.object(driver.lease, "acquire") as acquire,
+            patch.object(driver, "run_scenario") as run,
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as error:
+                driver.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("invalid choice: 'claude-e'", stderr.getvalue())
+        for side_effect in (scenarios, mkdir, report, client, child, acquire, run):
+            side_effect.assert_not_called()
+
+    def test_matrix_cli_rejects_retired_cell_before_side_effects(self):
+        for cells in ("claude-e", "claude-tui,claude-e"):
+            with (
+                self.subTest(cells=cells),
+                patch.object(sys, "argv", ["matrix", "--cells", cells, "--scenarios",
+                                          str(ROOT / "tests/e2e/tui_relay/scenarios")]),
+                patch.object(matrix, "load_channel_ids") as config,
+                patch.object(matrix, "load_cross_channel_scenarios") as cross,
+                patch.object(matrix, "load_restart_guard_scenarios") as restart,
+                patch("pathlib.Path.mkdir") as mkdir,
+                patch("pathlib.Path.write_text") as report,
+                patch.object(matrix.cell_driver.discord, "DiscordClient") as client,
+                patch.object(matrix.subprocess, "run") as child,
+                patch.object(matrix, "run_cell") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "claude-e"):
+                    matrix.main()
+            for side_effect in (config, cross, restart, mkdir, report, client, child, run):
+                side_effect.assert_not_called()
+
+
+class RequiredCompletionWait(unittest.TestCase):
+    """Real E35 driver/client/primitive composition with inert transport/clocks."""
+
+    RUN = "offline-c6"
+    MARKER = "[E2E:E35:offline-c6:OK]"
+
+    def _run(self, *, arrival=4.649, initial_delay=0, return_delay=0, retry_after=None,
+             before=False, optional=False, mutation=None, other_failure=False, client_kind="default"):
+        scenario = driver.yaml.safe_load((ROOT / "tests/e2e/tui_relay/scenarios/"
+                                         "E-35-durable-delivery-record.yaml").read_text())
+        scenario["assertions"][-1]["completion_chrome_after_body"]["required"] = not optional
+        if mutation == "raw_count":
+            scenario["assertions"].insert(0, {"raw_message_count_between_markers": {"min": 1, "max": 36}})
+        if other_failure:
+            scenario["assertions"].insert(0, {"text_present": "[MISSING]"})
+        clock, requests, sleeps = [90.0], [], []
+        def fetch(request, **kwargs):
+            index = len(requests)
+            requests.append((clock[0], kwargs["timeout"]))
+            if index == 0:
+                return _Response([_our_msg(109, self.MARKER)])
+            if index == 1:
+                clock[0] = 100.0
+            if index == 4 and retry_after is not None:
+                return _Response({"retry_after": retry_after}, status=429)
+            if index >= 4:
+                clock[0] += return_delay
+            rows = [_raw_bot_msg(201, self.MARKER, "2026-01-01T00:00:01Z")]
+            content = "-# ✅ 완료" if arrival is not None and clock[0] - 100 >= arrival else "-# 🔧 마지막 도구 (아직 없음)"
+            rows.append(_raw_bot_msg(202, content, "2026-01-01T00:00:00Z" if before else "2026-01-01T00:00:02Z"))
+            if mutation == "raw_count" and index >= 4:
+                rows.extend(_raw_bot_msg(mid, f"ordinary filler {mid}") for mid in range(203, 239))
+            if mutation == "body" and index >= 4:
+                rows[0]["content"] = "body overwritten"
+            return _Response(rows)
+        def sleep(seconds):
+            if len(requests) >= 2:
+                sleeps.append(seconds)
+                clock[0] += seconds
+        def receipt(*args, **kwargs):
+            clock[0] += initial_delay
+            return {"status": "evaluated"}
+        client = driver.discord.DiscordClient("http://offline.invalid")
+        original_client = client
+        class FixedConstructorClient(driver.discord.DiscordClient):
+            def __init__(self):
+                super().__init__("http://offline.invalid")
+        @dataclass
+        class DataclassAdapter:
+            base_url: str = "http://offline.invalid"
+            def send_control(self, *args, **kwargs):
+                return original_client.send_control(*args, **kwargs)
+            def send(self, *args, **kwargs):
+                return original_client.send(*args, **kwargs)
+            def fetch_messages(self, *args, **kwargs):
+                return original_client.fetch_messages(*args, **kwargs)
+        if client_kind == "fixed_constructor":
+            client = FixedConstructorClient()
+        elif client_kind == "dataclass_adapter":
+            client = DataclassAdapter()
+        with (
+            patch("socket.socket", side_effect=AssertionError("network forbidden")),
+            patch("subprocess.Popen", side_effect=AssertionError("process forbidden")),
+            patch("urllib.request.urlopen", side_effect=fetch),
+            patch.object(driver.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(driver.time, "time", side_effect=lambda: 1767225600 + clock[0]),
+            patch.object(driver.time, "sleep", side_effect=sleep),
+            patch.object(driver.discord.DiscordClient, "send_control", return_value={"id": "100"}),
+            patch.object(driver.discord.DiscordClient, "send", return_value={"id": "110"}),
+            patch.object(driver, "durable_probe_safety_gate", return_value={"status": "idle"}),
+            patch.object(driver.durable_delivery, "poll_records", side_effect=receipt),
+            patch.object(driver, "assert_cell_idle", return_value={"status": "idle"}),
+            patch.object(driver, "_raise_if_tui_prompt_stuck_while_idle", side_effect=AssertionError("unexpected idle probe")),
+        ):
+            try:
+                record = driver.run_one_cell(scenario=scenario, cell="claude-tui", channel_id="offline",
+                    client=client, run_id=self.RUN, dry_run=False,
+                    args=Namespace(base_url=client.base_url, queue_runtime_root="/offline-denied"))
+            except driver.ScenarioStepAssertionError as error:
+                return error.record, error, requests, sleeps
+        return record, None, requests, sleeps
+
+    def test_observed_4649ms_lag_passes_without_resetting_body_anchor(self):
+        record, error, requests, _ = self._run()
+        self.assertIsNone(error, str(error))
+        self.assertEqual(len(requests), 6)
+        trace = record["completion_rechecks"][0]
+        self.assertEqual(trace, {"refetches": 2, "deadline_at": 110, "elapsed_s": 5, "outcome": "PASS"})
+        self.assertEqual(record["_body_observations"][self.MARKER], 100)
+        self.assertEqual(record["durable_record_probe"]["status"], "evaluated")
+        revalidated = record["revalidated_after_recheck"]
+        self.assertEqual(len(revalidated), 2)
+        self.assertTrue(all(item["passed"] and len(item["assertions"]) == 3 for item in revalidated))
+        result = {"assertions": []}
+        driver._merge_record_into_result(result, record)
+        self.assertEqual(result["completion_rechecks"], [trace])
+        self.assertEqual(result["revalidated_after_recheck"], revalidated)
+        self.assertNotIn("_body_observations", result)
+
+    def test_exhaustion_uses_at_most_three_additional_fetches(self):
+        record, error, requests, _ = self._run(arrival=None)
+        self.assertIn("completion chrome not found", str(error))
+        self.assertEqual(len(requests), 7)
+        self.assertEqual(record.get("completion_rechecks"), [
+            {"refetches": 3, "deadline_at": 110, "elapsed_s": 7, "outcome": "EXHAUSTED"}])
+
+    def test_same_clock_late_response_boundary_and_retry_wait_are_not_accepted(self):
+        for delay, passed in ((6.999, True), (7.0, False), (8.0, False)):
+            with self.subTest(return_delay=delay):
+                record, error, requests, _ = self._run(return_delay=delay)
+                self.assertEqual(error is None, passed)
+                self.assertEqual(len(requests), 5)
+                self.assertEqual(record["completion_rechecks"][0]["refetches"], 1)
+                self.assertEqual(record["completion_rechecks"][0]["outcome"], "PASS" if passed else "EXHAUSTED")
+        record, error, requests, _ = self._run(retry_after=8)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(requests), 6)  # One fetch call includes the existing HTTP429 retry.
+        self.assertEqual(record["completion_rechecks"][0],
+                         {"refetches": 1, "deadline_at": 110, "elapsed_s": 11, "outcome": "EXHAUSTED"})
+
+    def test_expired_first_observation_does_not_reset_at_assertion_start(self):
+        record, error, requests, _ = self._run(arrival=None, initial_delay=10)
+        self.assertIsNotNone(error)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(record.get("completion_rechecks"), [
+            {"refetches": 0, "deadline_at": 110, "elapsed_s": 11, "outcome": "EXHAUSTED"}])
+
+    def test_pre_body_completion_and_missing_body_fail_without_wait(self):
+        for arrival in (0, 4.649):
+            with self.subTest(arrival=arrival):
+                record, error, requests, _ = self._run(arrival=arrival, before=True)
+                self.assertIn("completion chrome appeared before body", str(error))
+                self.assertEqual(len(requests), 4 if arrival == 0 else 6)
+        callback = MagicMock()
+        with self.assertRaisesRegex(assertions.AssertionError, "body marker.*not found"):
+            driver.run_assertion({"completion_chrome_after_body": {"body_marker": "missing", "required": True}},
+                                 window=assertions.Window("100"), record={}, pending_refetch=callback)
+        callback.assert_not_called()
+
+    def test_recheck_invalidates_prior_count_and_body_guards(self):
+        for mutation, owner, reason in (("raw_count", "raw_message_count_between_markers", "raw message count 38 outside"),
+                                        ("body", "text_present", "expected to find")):
+            with self.subTest(mutation=mutation):
+                record, error, requests, _ = self._run(mutation=mutation)
+                self.assertIsNotNone(error)
+                self.assertIn(reason, str(error))
+                self.assertEqual(len(requests), 5)
+                self.assertEqual(record["completion_rechecks"][0]["outcome"], "FAIL")
+                self.assertEqual(record["completion_rechecks"][0]["elapsed_s"], 3)
+                self.assertEqual(record["revalidated_after_recheck"][-1]["failed_assertion"], owner)
+                self.assertFalse(record["revalidated_after_recheck"][-1]["passed"])
+
+    def test_optional_initially_complete_and_other_assertions_preserve_fetches(self):
+        for options in ({"optional": True, "arrival": None}, {"arrival": 0}, {"other_failure": True}):
+            with self.subTest(options=options):
+                record, error, requests, _ = self._run(**options)
+                self.assertEqual(error is not None, bool(options.get("other_failure")))
+                self.assertEqual(len(requests), 4)
+                self.assertNotIn("completion_rechecks", record)
+                self.assertNotIn("revalidated_after_recheck", record)
+        callback = MagicMock()
+        with self.assertRaisesRegex(assertions.AssertionError, "unknown assertion"):
+            driver.run_assertion({"unknown_completion_wait": True}, window=assertions.Window("100"),
+                                 pending_refetch=callback)
+        callback.assert_not_called()
+
+    def _check_unsupported_client(self, **options):
+        for kind in ("fixed_constructor", "dataclass_adapter"):
+            with self.subTest(client_kind=kind, options=options):
+                try:
+                    record, error, requests, sleeps = self._run(client_kind=kind, **options)
+                except TypeError as error:
+                    self.fail(f"client reconstruction escaped: {error}")
+                missing = options.get("arrival") is None and not options.get("optional", False)
+                self.assertEqual(error is not None, missing)
+                if missing:
+                    self.assertIsInstance(error, driver.ScenarioStepAssertionError)
+                    self.assertIn("completion chrome not found", str(error))
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(sleeps, [1.0])
+                self.assertNotIn("completion_rechecks", record)
+                self.assertNotIn("revalidated_after_recheck", record)
+                result = {"assertions": []}
+                driver._merge_record_into_result(result, record)
+                json.dumps(result, allow_nan=False)
+
+    def test_unsupported_constructors_preserve_completed_required_scenario(self):
+        self._check_unsupported_client(arrival=0)
+
+    def test_unsupported_constructors_preserve_optional_scenario(self):
+        self._check_unsupported_client(arrival=None, optional=True)
+
+    def test_unsupported_constructors_refuse_unanchored_required_without_refetch(self):
+        self._check_unsupported_client(arrival=None)
+
+    def test_missing_matching_anchor_never_emits_nonfinite_trace(self):
+        for record in (None, {}, {"_body_observations": {}}, {"_body_observations": {"other body": 100}}):
+            with self.subTest(record=record):
+                callback = MagicMock()
+                try:
+                    driver.run_assertion({"completion_chrome_after_body": {
+                        "body_marker": self.MARKER, "required": True}},
+                        window=_window(_relay_msg(201, self.MARKER)), record=record, pending_refetch=callback)
+                except assertions.AssertionError as error:
+                    self.assertIn("completion chrome not found", str(error))
+                except Exception as error:
+                    self.fail(f"unexpected unanchored error: {type(error).__name__}: {error}")
+                else:
+                    self.fail("missing required completion was accepted")
+                callback.assert_not_called()
+                self.assertNotIn("completion_rechecks", record or {})
+                json.dumps(record or {}, allow_nan=False)
+
+    def test_immediate_paths_evaluate_completion_once(self):
+        for options in ({"arrival": 0}, {"arrival": None, "optional": True}):
+            with self.subTest(options=options), patch.object(
+                assertions, "completion_chrome_after_body", wraps=assertions.completion_chrome_after_body
+            ) as primitive:
+                record, error, requests, _ = self._run(**options)
+                self.assertIsNone(error, str(error))
+                self.assertEqual(primitive.call_count, 1)
+                self.assertEqual(len(requests), 4)
+                self.assertNotIn("completion_rechecks", record)
+
+    def test_non_typeerror_reconstruction_failure_is_not_swallowed(self):
+        with patch.object(driver, "replace", side_effect=ValueError("unrelated reconstruction error")):
+            with self.assertRaisesRegex(ValueError, "unrelated reconstruction error"):
+                self._run(arrival=0)
 
 
 if __name__ == "__main__":

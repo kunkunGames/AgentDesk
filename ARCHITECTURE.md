@@ -890,6 +890,7 @@ src/
 │   │   │   ├── short_controller.rs
 │   │   │   ├── task_notification_context.rs
 │   │   │   ├── terminal_handoff.rs
+│   │   │   ├── tests.rs
 │   │   │   └── turn_parser.rs
 │   │   ├── session_runtime/
 │   │   │   ├── channel_routing.rs
@@ -999,6 +1000,8 @@ src/
 │   │   │   ├── tombstone.rs
 │   │   │   └── warning_tests.rs
 │   │   ├── tui_direct_pending_start/
+│   │   │   ├── state.rs
+│   │   │   ├── tests.rs
 │   │   │   └── watcher_cancel.rs
 │   │   ├── tui_prompt_relay/
 │   │   │   ├── synthetic_start/
@@ -1515,6 +1518,7 @@ src/
 │   │   └── turn_finished_signal.rs
 │   ├── writer_protocol/
 │   │   ├── namespace/
+│   │   │   ├── catalog.rs
 │   │   │   └── lexical.rs
 │   │   ├── authority.rs
 │   │   └── namespace.rs

@@ -185,12 +185,12 @@ node --test policies/__tests__/merge-automation.test.js
 echo "=== Timeout shadow aggregation gate tests (#3950) ==="
 node --test scripts/__tests__/timeout-shadow-gate.test.mjs
 
-echo "=== Daily log-digest routine tests (#4263) ==="
-node --test policies/__tests__/daily-log-digest.test.js
-"$PYTHON" -m unittest tests.test_daily_log_digest
-
-echo "=== Weekly regression-churn audit tests (#4265) ==="
-"$PYTHON" -m unittest tests.test_weekly_churn_audit
+echo "=== Operator routine scripts must stay out of git (docs/source-of-truth.md) ==="
+if tracked_routines="$(git ls-files routines)" && [ -n "$tracked_routines" ]; then
+  echo "✗ routines/ is operator-private and must not be tracked; found:" >&2
+  printf '  %s\n' $tracked_routines >&2
+  exit 1
+fi
 
 echo "=== External toolchain draft/approval/smoke tests (#4555) ==="
 "$PYTHON" -m unittest tests.test_toolchain_update
@@ -335,7 +335,7 @@ for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; 
     FAIL=1
   fi
 done
-for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs; do
+for scratch_file in scratch[._-]*.md scratchpad[._-]*.md test_scratch[._-]*.md scratch[._-]*.txt scratchpad[._-]*.txt test_scratch[._-]*.txt scratch[._-]*.rs scratchpad[._-]*.rs test_scratch[._-]*.rs test_*.rs test_*.py test_*.js test_*.json; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
@@ -413,7 +413,21 @@ echo "=== Generate inventory docs (refresh workspace; gate source-of-truth invar
 # Giant deadlines have one selector/evaluator. It refreshes inventories only
 # after its fail-closed main or strict PR-progress verdict succeeds.
 GFP_REFRESH_DOCS=1 "$PYTHON" scripts/giant_file_progress.py
-git diff --exit-code -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
+
+echo "=== Generate env + CLI reference docs (README source-of-truth tables) ==="
+# README links to these instead of carrying hand-written tables. Both
+# generators are pure source parsers (no cargo build), so they run on every
+# pass and share the tracked-doc drift gate below: regenerate, then fail the
+# PR when the committed docs/generated/*.md differ from the regenerated view.
+"$PYTHON" scripts/generate_env_reference.py
+"$PYTHON" scripts/generate_cli_reference.py
+"$PYTHON" -m unittest tests.test_generate_env_reference tests.test_generate_cli_reference
+git diff --exit-code -- \
+  ARCHITECTURE.md \
+  docs/generated/route-inventory.md \
+  docs/generated/worker-inventory.md \
+  docs/generated/env-reference.md \
+  docs/generated/cli-reference.md
 
 echo "=== Inventory prod/test split regression tests (#4394) ==="
 "$PYTHON" -m unittest tests.test_giant_file_progress tests.test_inventory_giant_split
