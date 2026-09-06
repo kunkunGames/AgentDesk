@@ -46,6 +46,7 @@ pub enum ProviderKind {
     OpenCode,
     Qwen,
     Grok,
+    Antigravity,
     Unsupported(String),
 }
 
@@ -56,6 +57,7 @@ pub(crate) enum LegacyDispatchKind {
     Gemini,
     OpenCode,
     Qwen,
+    StreamJsonCli(StreamJsonDialectId),
     Unsupported(String),
 }
 
@@ -101,6 +103,7 @@ impl ProviderKind {
             Self::OpenCode => "opencode",
             Self::Qwen => "qwen",
             Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
             Self::Unsupported(s) => s.as_str(),
         }
     }
@@ -113,6 +116,7 @@ impl ProviderKind {
             Self::OpenCode => "provider_opencode",
             Self::Qwen => "provider_qwen",
             Self::Grok => "provider_grok",
+            Self::Antigravity => "provider_antigravity",
             Self::Unsupported(_) => "provider_unsupported",
         }
     }
@@ -199,17 +203,7 @@ impl ProviderKind {
 
     #[allow(dead_code)]
     pub(crate) fn resolve_runtime_path(&self) -> Option<String> {
-        match self {
-            Self::Claude => {
-                crate::services::platform::resolve_provider_binary("claude").resolved_path
-            }
-            Self::Codex => crate::services::codex::resolve_codex_path(),
-            Self::Gemini => crate::services::gemini::resolve_gemini_path(),
-            Self::OpenCode => crate::services::opencode::resolve_opencode_path(),
-            Self::Qwen => crate::services::qwen::resolve_qwen_path(),
-            Self::Grok => crate::services::stream_json_cli::dialects::grok::resolve_grok_path(),
-            Self::Unsupported(_) => None,
-        }
+        registry::resolve_kind_runtime_path(self)
     }
 
     pub fn probe_runtime(&self) -> Option<ProviderRuntimeProbe> {
@@ -259,6 +253,7 @@ impl ProviderKind {
             Self::Gemini => LegacyDispatchKind::Gemini,
             Self::OpenCode | Self::Grok => LegacyDispatchKind::OpenCode,
             Self::Qwen => LegacyDispatchKind::Qwen,
+            Self::Antigravity => LegacyDispatchKind::StreamJsonCli(StreamJsonDialectId::Agy),
             Self::Unsupported(name) => LegacyDispatchKind::Unsupported(name.clone()),
         }
     }
@@ -322,7 +317,7 @@ impl ProviderKind {
             | ProviderCompactionAdapter::GeminiDisabled
             | ProviderCompactionAdapter::OpenCodeDisabled
             | ProviderCompactionAdapter::QwenDisabled
-            | ProviderCompactionAdapter::StreamJsonDisabled => Vec::new(),
+            | ProviderCompactionAdapter::StreamJsonDisabled(_) => Vec::new(),
         }
     }
 
@@ -380,7 +375,7 @@ impl ProviderKind {
             | ProviderCompactionAdapter::GeminiDisabled
             | ProviderCompactionAdapter::OpenCodeDisabled
             | ProviderCompactionAdapter::QwenDisabled
-            | ProviderCompactionAdapter::StreamJsonDisabled => Vec::new(),
+            | ProviderCompactionAdapter::StreamJsonDisabled(_) => Vec::new(),
         }
     }
 
@@ -1250,7 +1245,7 @@ pub(crate) fn tmux_capture_indicates_ready_for_input(
             crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
                 || tmux_capture_contains_wrapper_ready_marker(capture, provider)
         }
-        ProviderReadinessAdapter::GenericBanner => {
+        ProviderReadinessAdapter::GenericBanner(_) => {
             crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
                 || tmux_capture_contains_wrapper_ready_marker(capture, provider)
         }
