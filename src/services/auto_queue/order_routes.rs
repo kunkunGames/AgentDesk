@@ -88,7 +88,7 @@ pub(super) async fn submit_order_with_pg(
     run_id: &str,
     headers: &HeaderMap,
     principal: Option<&RequestPrincipal>,
-    body: &OrderBody,
+    mut body: OrderBody,
     pool: &sqlx::PgPool,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let caller_agent_id =
@@ -205,8 +205,7 @@ pub(super) async fn submit_order_with_pg(
 
     let rationale = body
         .rationale
-        .clone()
-        .or(body.reasoning.clone())
+        .or(body.reasoning)
         .unwrap_or_else(|| {
             caller_agent_id
                 .as_deref()
@@ -288,7 +287,7 @@ pub async fn submit_order(
         &run_id,
         &headers,
         principal.as_ref().map(|Extension(principal)| principal),
-        &body,
+        body,
         &pg_pool,
     )
     .await
