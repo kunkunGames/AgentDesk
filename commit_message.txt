@@ -1,5 +1,0 @@
-fix(ci): fix giant-file registry drift and repository check
-
-- Fixed giant-file registry drift by extending the deadline for `session_relay_sink.rs` and `tui_direct_pending_start.rs` to 2026-10-31.
-- Updated baseline ratchets in `scripts/giant_file_issue_metadata.json` and removed orphaned entries in `scripts/giant_file_closed_issue_transition_list.txt`.
-- Changed the repository name from `itismyfield/AgentDesk` to `kunkunGames/AgentDesk` in `scripts/giant_file_progress.py`, `scripts/refresh_giant_file_issue_metadata.py`, and `tests/test_giant_file_progress.py` to allow the GitHub Actions check runner to pass on the current organization.
