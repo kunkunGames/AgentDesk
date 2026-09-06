@@ -551,6 +551,23 @@ pub fn intern_provider_id(raw: &str) -> Option<&'static str> {
         .map(|entry| entry.id)
 }
 
+pub(super) fn resolve_kind_runtime_path(kind: &ProviderKind) -> Option<String> {
+    match kind {
+        ProviderKind::Claude => {
+            crate::services::platform::resolve_provider_binary("claude").resolved_path
+        }
+        ProviderKind::Codex => crate::services::codex::resolve_codex_path(),
+        ProviderKind::Gemini => crate::services::gemini::resolve_gemini_path(),
+        ProviderKind::OpenCode => crate::services::opencode::resolve_opencode_path(),
+        ProviderKind::Qwen => crate::services::qwen::resolve_qwen_path(),
+        ProviderKind::Grok => crate::services::stream_json_cli::dialects::grok::resolve_grok_path(),
+        ProviderKind::Antigravity => {
+            crate::services::stream_json_cli::dialects::agy::resolve_agy_path()
+        }
+        ProviderKind::Unsupported(_) => None,
+    }
+}
+
 impl ProviderRegistryEntry {
     pub fn matches_id_or_alias(&self, normalized: &str) -> bool {
         self.id == normalized || self.aliases.iter().any(|alias| *alias == normalized)

@@ -203,20 +203,7 @@ impl ProviderKind {
 
     #[allow(dead_code)]
     pub(crate) fn resolve_runtime_path(&self) -> Option<String> {
-        match self {
-            Self::Claude => {
-                crate::services::platform::resolve_provider_binary("claude").resolved_path
-            }
-            Self::Codex => crate::services::codex::resolve_codex_path(),
-            Self::Gemini => crate::services::gemini::resolve_gemini_path(),
-            Self::OpenCode => crate::services::opencode::resolve_opencode_path(),
-            Self::Qwen => crate::services::qwen::resolve_qwen_path(),
-            Self::Grok => crate::services::stream_json_cli::dialects::grok::resolve_grok_path(),
-            Self::Antigravity => {
-                crate::services::stream_json_cli::dialects::agy::resolve_agy_path()
-            }
-            Self::Unsupported(_) => None,
-        }
+        registry::resolve_kind_runtime_path(self)
     }
 
     pub fn probe_runtime(&self) -> Option<ProviderRuntimeProbe> {
