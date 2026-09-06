@@ -4332,7 +4332,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn modern_tmux_rollout_does_not_done_while_pane_still_working() {
-        if !std::process::Command::new("tmux")
+        if !crate::services::platform::tmux::tmux_command()
             .arg("-V")
             .status()
             .is_ok_and(|status| status.success())
@@ -4344,7 +4344,7 @@ mod tests {
             "agentdesk-codex-rollout-busy-{}",
             uuid::Uuid::new_v4().simple()
         );
-        let started = std::process::Command::new("tmux")
+        let started = crate::services::platform::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -4361,7 +4361,7 @@ mod tests {
         struct KillTmuxSession(String);
         impl Drop for KillTmuxSession {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("tmux")
+                let _ = crate::services::platform::tmux::tmux_command()
                     .args(["kill-session", "-t", &self.0])
                     .status();
             }

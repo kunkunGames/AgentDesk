@@ -30,7 +30,7 @@ fn is_blank_session_name(session_name: &str) -> bool {
     session_name.trim().is_empty()
 }
 
-fn tmux_command() -> Command {
+pub fn tmux_command() -> Command {
     let mut cmd = Command::new("tmux");
     // -u forces UTF-8 mode so non-ASCII session names are not masked in output.
     cmd.arg("-u");
@@ -997,7 +997,7 @@ mod target_safety_tests {
     use super::*;
 
     #[test]
-    fn tmux_command_enables_utf8_mode() {
+    pub fn tmux_command_enables_utf8_mode() {
         assert_eq!(
             tmux_command().get_args().next(),
             Some(std::ffi::OsStr::new("-u")),
