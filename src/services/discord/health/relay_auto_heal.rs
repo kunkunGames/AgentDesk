@@ -1391,11 +1391,11 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = crate::services::platform::tmux::tmux_command()
+        let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
         assert!(
-            crate::services::platform::tmux::tmux_command()
+            std::process::Command::new("tmux")
                 .args(["new-session", "-d", "-s", tmux_session])
                 .status()
                 .expect("start tmux fixture")
@@ -1515,7 +1515,7 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        let _ = crate::services::platform::tmux::tmux_command()
+        let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
     }
@@ -1751,11 +1751,11 @@ mod tests {
             .set_len(301_613)
             .expect("size capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
-        let _ = crate::services::platform::tmux::tmux_command()
+        let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
         assert!(
-            crate::services::platform::tmux::tmux_command()
+            std::process::Command::new("tmux")
                 .args(["new-session", "-d", "-s", tmux_session])
                 .status()
                 .expect("start tmux fixture")
@@ -1881,7 +1881,7 @@ mod tests {
 
         crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
         clear_redrive_test_state(&shared, &provider, channel_id, tmux_session);
-        let _ = crate::services::platform::tmux::tmux_command()
+        let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", tmux_session])
             .status();
     }
