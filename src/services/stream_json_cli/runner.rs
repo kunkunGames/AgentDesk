@@ -83,15 +83,7 @@ pub fn run_prepared(
         }
         let _ = line_tx.send(None);
     });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stderr);
-        let _ = reader.read_to_string(&mut buf);
-        if buf.len() > 16 * 1024 {
-            buf.truncate(16 * 1024);
-        }
-        buf
-    });
+    let stderr_handle = std::thread::spawn(move || collect_stderr(stderr));
 
     let mut codec = prepared.codec;
     let poll = Duration::from_secs(5);
@@ -204,6 +196,27 @@ fn mark_no_output_error(saw_progress: bool, error: String) -> String {
     }
 }
 
+/// Keep a bounded diagnostic prefix while draining the pipe to avoid blocking
+/// the child. Decode after collection so arbitrary bytes and a UTF-8 character
+/// crossing the cap cannot panic or discard the whole diagnostic.
+fn collect_stderr(mut reader: impl Read) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut captured = Vec::with_capacity(MAX_BYTES);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                let keep = count.min(MAX_BYTES - captured.len());
+                captured.extend_from_slice(&chunk[..keep]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
 /// `Duration::ZERO` means the caller permits an unbounded *turn* duration. It
 /// must not disable stream liveness detection: an outputless process has made
 /// no progress and cannot be distinguished from a poisoned `--resume` token.
@@ -227,6 +240,24 @@ fn no_output_watchdogs(timeout: Duration) -> (Option<Duration>, Option<Duration>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_capture_is_bounded_and_drains_the_pipe() {
+        let mut source = std::io::Cursor::new(vec![b'x'; 128 * 1024]);
+        let captured = collect_stderr(&mut source);
+        assert_eq!(captured.len(), 16 * 1024);
+        assert_eq!(source.position(), 128 * 1024);
+    }
+
+    #[test]
+    fn stderr_capture_preserves_invalid_utf8_and_partial_characters() {
+        assert_eq!(collect_stderr(&b"denied: \xff"[..]), "denied: \u{fffd}");
+        let mut source = vec![b'x'; 16 * 1024 - 1];
+        source.extend_from_slice("한글".as_bytes());
+        let captured = collect_stderr(source.as_slice());
+        assert!(captured.starts_with(&"x".repeat(16 * 1024 - 1)));
+        assert!(captured.ends_with('\u{fffd}'));
+    }
 
     #[test]
     fn zero_timeout_keeps_liveness_watchdogs_for_unbounded_turns() {

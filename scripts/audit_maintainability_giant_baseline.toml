@@ -501,7 +501,7 @@
 # #4743: behavior-preserving decomposition moves the worker-facing IntakeRequest
 # and execute_intake_turn_core entry into `intake_turn/worker_entry.rs`; root source
 # assertions follow the already-extracted busy_retry helper. 2706 -> 2622.
-"src/services/discord/router/message_handler/intake_turn.rs" = 2622
+"src/services/discord/router/message_handler/intake_turn.rs" = 2436
 "src/services/discord/meeting_orchestrator.rs" = 3227
 # #3293: +3 for the `registry_purge` child-module declaration (peek +
 # operator-gated idle-entry purge live outside the frozen root); lowered
@@ -750,7 +750,7 @@
 # layers (in-memory, DB, Codex wrapper, Claude TUI runtime-binding recovery)
 # codex review P1/R2/R3. Bugfix wiring at the existing session-load/restore/
 # launch site; splitting headless_turn.rs is out of scope.
-"src/services/discord/router/message_handler/headless_turn.rs" = 1543
+"src/services/discord/router/message_handler/headless_turn.rs" = 1226
 # #3038 S2: lowered 1054 -> 954 (-100) as the session-override bookkeeping
 # helpers (fast-mode reset-entry codec + reset-pending probes/clears +
 # enablement probes + sync_session_reset_pending) moved verbatim to the

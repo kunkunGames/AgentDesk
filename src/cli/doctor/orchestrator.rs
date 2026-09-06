@@ -2651,6 +2651,7 @@ fn check_provider_cli(
         ProviderKind::OpenCode => "opencode CLI",
         ProviderKind::Qwen => "qwen CLI",
         ProviderKind::Grok => "grok CLI",
+        ProviderKind::Antigravity => "agy CLI",
         ProviderKind::Unsupported(_) => "provider CLI",
     };
     let capability_summary = provider_capability_summary(&provider);

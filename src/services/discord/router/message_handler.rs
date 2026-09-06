@@ -35,7 +35,7 @@ use crate::services::agent_protocol::RuntimeHandoffKind;
 use crate::services::discord::tmux_reaper::heal_stale_busy_mailbox;
 #[cfg(test)]
 use crate::services::observability::turn_lifecycle::TurnEvent;
-use crate::services::provider::{CancelToken, LegacyDispatchKind};
+use crate::services::provider::CancelToken;
 use std::future::Future;
 use std::sync::Arc;
 use url::Url;
@@ -46,6 +46,7 @@ mod goal_lifecycle;
 mod headless_turn;
 mod intake_turn;
 mod latency_spans;
+mod provider_dispatch;
 mod provider_isolation;
 mod tui_followup;
 mod turn_lifecycle;
