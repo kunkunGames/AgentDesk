@@ -2,8 +2,8 @@
   "schema_version": 2,
   "refreshed_at": "2026-09-02T11:41:35Z",
   "ratchets": {
-    "closed_deadline_entries": 79,
-    "transition_list_entries": 79
+    "closed_deadline_entries": 76,
+    "transition_list_entries": 76
   },
   "issues": [
     {
@@ -112,9 +112,7 @@
         "src/services/discord/tmux.rs",
         "src/services/codex_tui/rollout_tail.rs",
         "src/services/discord/session_relay_sink.rs",
-        "src/services/discord/outbound/turn_output_controller.rs",
         "src/services/discord/relay_recovery.rs",
-        "src/services/discord/turn_finalizer.rs",
         "src/services/discord/turn_bridge/stream_tick.rs",
         "src/services/discord/turn_view_reconciler.rs",
         "src/services/discord/idle_recap.rs",
