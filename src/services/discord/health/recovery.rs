@@ -23,6 +23,7 @@ mod leak_recovery_ledger;
 // of this file verbatim. `recovery.rs` recovers channels; this force-exits the
 // process, and the two share no state. Public so a later change can assert the
 // constants by importing them.
+mod live_agent_recovery;
 pub(crate) mod self_watchdog;
 mod stall_alert;
 mod watchdog_decisions;
@@ -186,18 +187,6 @@ async fn owning_runtime_http_for_channel(
         .and_then(|shared| shared.serenity_http_or_token_fallback())
 }
 
-fn idle_tmux_repair_ready_for_input(
-    provider: &ProviderKind,
-    channel_id: u64,
-    tmux_session: &str,
-) -> bool {
-    super::super::relay_recovery::idle_tmux_repair_ready_for_input(
-        provider,
-        channel_id,
-        tmux_session,
-    )
-}
-
 #[cfg(test)]
 type IdleTmuxStaleTurnInflightCandidateHook =
     Arc<dyn Fn(&discord::inflight::InflightTurnState) + Send + Sync>;
@@ -327,8 +316,11 @@ fn preserve_cancel_can_skip_provider_interrupt_for_idle_tui(
     let Some(tmux_session) = cancel_token_tmux_session(token) else {
         return false;
     };
-    let tmux_ready_for_input =
-        idle_tmux_repair_ready_for_input(provider, channel_id.get(), &tmux_session);
+    let tmux_ready_for_input = watchdog_decisions::idle_tmux_repair_ready_for_input(
+        provider,
+        channel_id.get(),
+        &tmux_session,
+    );
     let inflight_safe_to_clear =
         discord::inflight_state_allows_idle_tmux_repair_for_channel(provider, channel_id.get())
             .unwrap_or(false);
@@ -1717,17 +1709,8 @@ pub(crate) async fn run_stall_watchdog_pass(
             Some(snapshot) => snapshot,
             None => continue,
         };
-        // Recovery is driven by the periodic watchdog, never a read-only
-        // health/dashboard request. A successful takeover owns this tick: the
-        // snapshot describes the cancelled primary, so running the older
-        // cleanup branches against it could race the new fallback turn.
-        if crate::services::discord::live_agent_recovery::observe_and_execute(
-            registry,
-            &snapshot.relay_health,
-            snapshot.relay_stall_state,
-        )
-        .await
-        {
+        // A successful takeover owns this tick; the snapshot is now stale.
+        if live_agent_recovery::observe_and_execute(registry, &snapshot).await {
             continue;
         }
         let now_mono_secs = super::liveness_authority::monotonic_now_secs();
@@ -1790,7 +1773,11 @@ pub(crate) async fn run_stall_watchdog_pass(
                 now_unix_secs,
                 STALL_WATCHDOG_LIVENESS_FRESHNESS_SECS,
             )
-            && idle_tmux_repair_ready_for_input(provider, channel_id.get(), &tmux_session)
+            && watchdog_decisions::idle_tmux_repair_ready_for_input(
+                provider,
+                channel_id.get(),
+                &tmux_session,
+            )
             && discord::inflight_state_allows_idle_tmux_repair_for_channel(
                 provider,
                 channel_id.get(),

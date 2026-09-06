@@ -1,5 +1,5 @@
-use super::inflight::load_inflight_state_read_only;
-use super::relay_health::{RelayHealthSnapshot, RelayStallState};
+use super::super::super::inflight::load_inflight_state_read_only;
+use super::super::super::relay_health::{RelayHealthSnapshot, RelayStallState};
 use crate::services::agent_recovery::{self, DetectorSignal, ObserveInput};
 use crate::services::discord::health::{self, HealthRegistry};
 use crate::services::provider::ProviderKind;
@@ -13,15 +13,15 @@ use serde_json::json;
 /// that lock.
 pub(in crate::services::discord) async fn observe_and_execute(
     registry: &HealthRegistry,
-    snapshot: &RelayHealthSnapshot,
-    stall: RelayStallState,
+    snapshot: &super::WatcherStateSnapshot,
 ) -> bool {
-    let channel_id = snapshot.channel_id.to_string();
-    let turn_id = snapshot
+    let relay_health = &snapshot.relay_health;
+    let channel_id = relay_health.channel_id.to_string();
+    let turn_id = relay_health
         .mailbox_active_user_msg_id
-        .unwrap_or(snapshot.channel_id)
+        .unwrap_or(relay_health.channel_id)
         .to_string();
-    let elapsed_secs = snapshot
+    let elapsed_secs = relay_health
         .mailbox_turn_age_secs
         .unwrap_or(0)
         .min(u64::from(u32::MAX)) as u32;
@@ -29,14 +29,17 @@ pub(in crate::services::discord) async fn observe_and_execute(
         channel_id: channel_id.clone(),
         primary_turn_id: turn_id.clone(),
         signal: DetectorSignal::Mailbox {
-            kind: agent_recovery::mailbox_kind_from_name(stall.as_str()),
+            kind: agent_recovery::mailbox_kind_from_name(snapshot.relay_stall_state.as_str()),
             elapsed_secs,
-            claimed_turn: snapshot.mailbox_has_cancel_token,
+            claimed_turn: relay_health.mailbox_has_cancel_token,
         },
     })
     .await;
     let mut spawn = mailbox_outcome.spawn;
-    if spawn.is_none() && snapshot.tmux_alive == Some(false) && snapshot.mailbox_has_cancel_token {
+    if spawn.is_none()
+        && relay_health.tmux_alive == Some(false)
+        && relay_health.mailbox_has_cancel_token
+    {
         spawn = agent_recovery::observe_durable(ObserveInput {
             channel_id: channel_id.clone(),
             primary_turn_id: turn_id.clone(),
@@ -46,22 +49,22 @@ pub(in crate::services::discord) async fn observe_and_execute(
         .spawn;
     }
     if let Some(spawn) = spawn {
-        return execute_fallback(registry, snapshot, spawn).await;
+        return execute_fallback(registry, relay_health, spawn).await;
     }
 
-    let Some(provider) = ProviderKind::from_str(&snapshot.provider) else {
+    let Some(provider) = ProviderKind::from_str(&relay_health.provider) else {
         return false;
     };
-    let owner_healthy = snapshot.tmux_alive == Some(true)
+    let owner_healthy = relay_health.tmux_alive == Some(true)
         && matches!(
-            stall,
+            snapshot.relay_stall_state,
             RelayStallState::Healthy
                 | RelayStallState::ActiveForegroundStream
                 | RelayStallState::ExplicitBackgroundWork
         );
     let fallback_inflight =
         agent_recovery::fallback_provider(&channel_id).is_some_and(|fallback| {
-            load_inflight_state_read_only(&fallback, snapshot.channel_id).is_some()
+            load_inflight_state_read_only(&fallback, relay_health.channel_id).is_some()
         });
     if let Some(plan) = agent_recovery::try_restore_owner_durable(
         &channel_id,
