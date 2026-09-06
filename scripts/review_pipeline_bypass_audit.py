@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ID = "itismyfield/AgentDesk"
+REPO_ID = "kunkunGames/AgentDesk"
 REPO_OWNER = "itismyfield"
 REPO_NAME = "AgentDesk"
 DB_PATH = Path.home() / ".adk/release/data/agentdesk.sqlite"

@@ -12,7 +12,7 @@ def _detect_repo():
     # Repo-agnostic: derive the owner/name from the checked-out repo so this runs
     # against whatever fork/origin it lives in, not a hardcoded one.
     out, code = run("gh repo view --json nameWithOwner --jq .nameWithOwner")
-    return out if code == 0 and out else "itismyfield/AgentDesk"
+    return out if code == 0 and out else "kunkunGames/AgentDesk"
 
 def parse_github_timestamp(value):
     if not value:

@@ -253,7 +253,7 @@ def record_intervention(
             result = runner(
                 [
                     "gh", "issue", "create",
-                    "--repo", "itismyfield/AgentDesk",
+                    "--repo", "kunkunGames/AgentDesk",
                     "--title",
                     f"ops: repeated manual intervention ({type}, count {event.count})",
                     "--body-file", str(draft_path),
