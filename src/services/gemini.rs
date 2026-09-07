@@ -832,11 +832,10 @@ fn resolve_gemini_working_dir(working_dir: &str) -> Result<PathBuf, String> {
 }
 
 fn expand_gemini_working_dir(raw: &str) -> PathBuf {
-    let raw = raw.trim();
-    if raw.is_empty() {
+    if raw.trim().is_empty() {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     }
-    crate::runtime_layout::expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw))
+    crate::utils::format::expand_tilde_path(raw)
 }
 
 fn gemini_trust_rules() -> Vec<GeminiTrustRule> {
@@ -1364,10 +1363,10 @@ mod path_expansion_tests {
     use std::path::PathBuf;
 
     #[test]
-    fn expand_gemini_working_dir_keeps_existing_trimmed_relative_behavior() {
+    fn expand_gemini_working_dir_preserves_non_tilde_whitespace() {
         assert_eq!(
             expand_gemini_working_dir("  relative/project  "),
-            PathBuf::from("relative/project")
+            PathBuf::from("  relative/project  ")
         );
     }
 
