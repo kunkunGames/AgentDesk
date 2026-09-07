@@ -88,11 +88,9 @@ src/services/discord/recovery_engine/restore_inflight.rs
 src/services/discord/router/intake_gate.rs
 src/services/discord/router/message_handler/headless_turn.rs
 src/services/discord/router/message_handler/intake_turn.rs
-src/services/discord/session_relay_sink.rs
 src/services/discord/tmux.rs
 src/services/discord/tmux_watcher.rs
 src/services/discord/tmux_watcher/turn_stream_collector.rs
-src/services/discord/tui_direct_pending_start.rs
 src/services/discord/tui_prompt_relay/synthetic_start.rs
 src/services/discord/turn_bridge/stream_tick.rs
 src/services/discord_config_audit.rs
