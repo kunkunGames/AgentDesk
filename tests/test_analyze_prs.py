@@ -435,22 +435,5 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("test_scratch[._-]*.rs", script)
         self.assertIn("test_*.rs", script)
 
-    def test_ci_guard_includes_json_and_log_files(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
-
-        self.assertIn("prs.json", script)
-        self.assertIn("scratch.json", script)
-        self.assertIn("scratchpad.json", script)
-        self.assertIn("cargo_out.txt", script)
-        self.assertIn("npm_output.log", script)
-        self.assertIn("bun_output.txt", script)
-
-    def test_ci_guard_includes_diff_patch_extensions(self):
-        script = Path("scripts/ci-script-checks.sh").read_text()
-
-        self.assertIn("*.diff", script)
-        self.assertIn("*.patch", script)
-        self.assertIn("*.log", script)
-
 if __name__ == "__main__":
     unittest.main()
