@@ -91,6 +91,10 @@ impl RecoveryRuntime {
             return;
         }
         self.catalog = catalog;
+        self.clear_volatile_state();
+    }
+
+    fn clear_volatile_state(&mut self) {
         self.states.clear();
         self.events.clear();
         self.claimed_turns.clear();
@@ -101,12 +105,7 @@ impl RecoveryRuntime {
 
     pub fn clear_catalog(&mut self) {
         self.catalog = RecoveryCatalog::default();
-        self.states.clear();
-        self.events.clear();
-        self.claimed_turns.clear();
-        self.open_keys.clear();
-        self.spawned.clear();
-        self.pending_restore.clear();
+        self.clear_volatile_state();
     }
 
     pub fn catalog(&self) -> &RecoveryCatalog {
