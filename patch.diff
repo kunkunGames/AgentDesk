@@ -1,0 +1,38 @@
+--- src/services/onboarding/channel.rs
++++ src/services/onboarding/channel.rs
+@@ -19,7 +19,7 @@
+     let client = reqwest::Client::new();
+     let resp = client
+         .get("https://discord.com/api/v10/users/@me")
+-        .header("Authorization", format!("Bot {}", body.token))
++        .header("Authorization", format!("Bot {}", body.token.trim()))
+         .send()
+         .await;
+
+@@ -59,7 +59,7 @@
+ ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+     // Use provided token or saved token
+     let token = match token {
+-        Some(token) => Some(token),
++        Some(token) => Some(token.trim().to_string()),
+         None if state.pg_pool_ref().is_some() => {
+             match pg_kv_value(
+                 state.pg_pool_ref().expect("checked pg_pool_ref"),
+@@ -82,7 +82,7 @@
+     // Fetch guilds
+     let guilds: Vec<serde_json::Value> = match client
+         .get("https://discord.com/api/v10/users/@me/guilds")
+-        .header("Authorization", format!("Bot {}", token))
++        .header("Authorization", format!("Bot {}", token.trim()))
+         .send()
+         .await
+     {
+@@ -104,7 +104,7 @@
+             .get(format!(
+                 "https://discord.com/api/v10/guilds/{guild_id}/channels"
+             ))
+-            .header("Authorization", format!("Bot {}", token))
++            .header("Authorization", format!("Bot {}", token.trim()))
+             .send()
+             .await
+         {
