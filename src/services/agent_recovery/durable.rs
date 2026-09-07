@@ -171,6 +171,10 @@ pub fn install_catalog(catalog: RecoveryCatalog) {
     lock(&coordinator().runtime).install_catalog(catalog);
 }
 
+pub fn clear_catalog() {
+    lock(&coordinator().runtime).clear_catalog();
+}
+
 pub async fn channel_recovery_intake(
     provider: &ProviderKind,
     channel_id: &str,

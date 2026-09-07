@@ -87,7 +87,26 @@ impl RecoveryRuntime {
     }
 
     pub fn install_catalog(&mut self, catalog: RecoveryCatalog) {
+        if self.catalog == catalog {
+            return;
+        }
         self.catalog = catalog;
+        self.states.clear();
+        self.events.clear();
+        self.claimed_turns.clear();
+        self.open_keys.clear();
+        self.spawned.clear();
+        self.pending_restore.clear();
+    }
+
+    pub fn clear_catalog(&mut self) {
+        self.catalog = RecoveryCatalog::default();
+        self.states.clear();
+        self.events.clear();
+        self.claimed_turns.clear();
+        self.open_keys.clear();
+        self.spawned.clear();
+        self.pending_restore.clear();
     }
 
     pub fn catalog(&self) -> &RecoveryCatalog {
@@ -516,9 +535,9 @@ impl RecoveryRuntime {
 mod durable;
 pub use durable::{
     abort_takeover_durable, allows_cli_turn, allows_cli_turn_for_provider, attach_pg_pool,
-    channel_recovery_intake, complete_turn_durable, fallback_prompt_prefix, fallback_provider,
-    hydrate_from_pg, inherit_workspace, install_catalog, lease_for_provider, observe_durable,
-    take_restore_packet, try_restore_owner_durable,
+    channel_recovery_intake, clear_catalog, complete_turn_durable, fallback_prompt_prefix,
+    fallback_provider, hydrate_from_pg, inherit_workspace, install_catalog, lease_for_provider,
+    observe_durable, take_restore_packet, try_restore_owner_durable,
 };
 
 #[cfg(test)]

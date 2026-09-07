@@ -72,6 +72,87 @@ pub(super) fn enabled_runtime() -> RecoveryRuntime {
 }
 
 #[test]
+fn reloading_the_same_catalog_preserves_active_recovery_state() {
+    let mut runtime = enabled_runtime();
+    runtime.claim_turn(CHANNEL, "turn-preserve");
+    runtime
+        .observe(ObserveInput {
+            channel_id: CHANNEL.to_string(),
+            primary_turn_id: "turn-preserve".to_string(),
+            signal: DetectorSignal::StreamIdleTimeout,
+        })
+        .spawn
+        .expect("fallback spawn");
+    let catalog = runtime.catalog().clone();
+
+    runtime.install_catalog(catalog);
+
+    assert_eq!(runtime.spawned().len(), 1);
+    assert_eq!(
+        runtime.channel_recovery_intake(&ProviderKind::Codex, CHANNEL),
+        Some(RecoveryIntake::Allow)
+    );
+    assert!(!runtime.allows_cli_turn(CHANNEL, "claude"));
+}
+
+#[test]
+fn replacing_or_clearing_catalog_drops_stale_in_memory_recovery_state() {
+    let mut runtime = enabled_runtime();
+    runtime.claim_turn(CHANNEL, "turn-clear");
+    runtime
+        .observe(ObserveInput {
+            channel_id: CHANNEL.to_string(),
+            primary_turn_id: "turn-clear".to_string(),
+            signal: DetectorSignal::StreamIdleTimeout,
+        })
+        .spawn
+        .expect("fallback spawn");
+
+    runtime.install_catalog(super::policy::RecoveryCatalog::default());
+
+    assert!(runtime.catalog().channels.is_empty());
+    assert!(runtime.events(CHANNEL).is_empty());
+    assert!(runtime.spawned().is_empty());
+    assert_eq!(
+        runtime.channel_recovery_intake(&ProviderKind::Codex, CHANNEL),
+        None
+    );
+    assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
+
+    runtime.install_catalog(
+        build_recovery_catalog(
+            &[
+                agent(
+                    "claude",
+                    "grok",
+                    Some("/primary-workspace"),
+                    Some(enabled_recovery("monitoring")),
+                ),
+                agent("monitoring", "codex", Some("/fallback-workspace"), None),
+            ],
+            &[channel("claude", Some(enabled_recovery("monitoring")))],
+        )
+        .expect("valid recovery catalog"),
+    );
+    runtime.claim_turn(CHANNEL, "turn-clear-again");
+    runtime
+        .observe(ObserveInput {
+            channel_id: CHANNEL.to_string(),
+            primary_turn_id: "turn-clear-again".to_string(),
+            signal: DetectorSignal::StreamIdleTimeout,
+        })
+        .spawn
+        .expect("fallback spawn after reconfiguration");
+
+    runtime.clear_catalog();
+
+    assert!(runtime.catalog().channels.is_empty());
+    assert!(runtime.events(CHANNEL).is_empty());
+    assert!(runtime.spawned().is_empty());
+    assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
+}
+
+#[test]
 fn recovery_catalog_rejects_fallback_on_the_owner_provider() {
     let error = build_recovery_catalog(
         &[

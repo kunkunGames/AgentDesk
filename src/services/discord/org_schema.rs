@@ -119,14 +119,24 @@ pub(super) struct SummaryRuleDef {
 // ─── Loading ────────────────────────────────────────────────────────────────
 
 fn load_org_schema() -> Option<OrgSchema> {
-    let path = org_schema_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    let schema: OrgSchema = serde_yaml::from_str(&content).ok()?;
+    let Some(path) = org_schema_path() else {
+        crate::services::agent_recovery::clear_catalog();
+        return None;
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        crate::services::agent_recovery::clear_catalog();
+        return None;
+    };
+    let Ok(schema) = serde_yaml::from_str(&content) else {
+        crate::services::agent_recovery::clear_catalog();
+        return None;
+    };
     if let Err(error) = install_org_recovery(&schema) {
         tracing::error!(
             error = %error,
             "org.yaml recovery policy is invalid; refusing to load org schema"
         );
+        crate::services::agent_recovery::clear_catalog();
         return None;
     }
     Some(schema)
