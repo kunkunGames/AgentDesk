@@ -127,6 +127,7 @@ src/
 │   │   ├── outbox.rs
 │   │   ├── postgres_tests.rs
 │   │   └── writes.rs
+│   ├── agent_read.rs
 │   ├── agents.rs
 │   ├── automation_candidate_card_program.rs
 │   ├── automation_candidates.rs
