@@ -430,6 +430,7 @@ src/
 │   ├── claude/
 │   │   ├── active_usage.rs
 │   │   ├── backend_routing.rs
+│   │   ├── process_session_launch.rs
 │   │   └── tui_session_launch.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
@@ -491,6 +492,7 @@ src/
 │   │   ├── stream_relay.rs
 │   │   └── watcher_supervisor.rs
 │   ├── codex/
+│   │   ├── process_session_launch.rs
 │   │   └── tui_session_launch.rs
 │   ├── codex_tui/
 │   │   ├── rollout_tail/
@@ -1489,6 +1491,7 @@ src/
 │   │   ├── push_handoff.rs
 │   │   └── timing.rs
 │   ├── session_backend/
+│   │   ├── auth_profiles.rs
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
 │   ├── session_forwarding/
