@@ -375,10 +375,10 @@ export default function OfficeManagerView({
                 >
                   <div className="space-y-3">
                   <div>
-                    <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                    <div id="office-view-icon-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("아이콘", "Icon")}
                     </div>
-                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("아이콘", "Icon")}>
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-labelledby="office-view-icon-label">
                       {OFFICE_ICONS.map((icon, idx) => (
                         <button
                           key={icon}
@@ -426,10 +426,10 @@ export default function OfficeManagerView({
                   </div>
 
                   <div>
-                    <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                    <div id="office-view-color-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("대표 색상", "Accent Color")}
                     </div>
-                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("대표 색상", "Accent Color")}>
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-labelledby="office-view-color-label">
                       {OFFICE_COLORS.map((color, idx) => (
                         <button
                           key={color}
