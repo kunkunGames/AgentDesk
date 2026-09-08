@@ -101,6 +101,7 @@ pub(crate) enum ObservedIntakeOutcome {
     },
     WouldAssignNoOwnerToTarget {
         target_instance_id: String,
+        basis: IntakeRoutingBasis,
     },
     WouldKeepNoOwnerLocal {
         reason: RanLocalReason,
@@ -765,6 +766,11 @@ async fn route_to_instance(
             ObserveTargetKind::NodeOverride | ObserveTargetKind::PreferredLabels => {
                 ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                     target_instance_id: target.to_string(),
+                    basis: match observe_target_kind {
+                        ObserveTargetKind::NodeOverride => IntakeRoutingBasis::NodeOverride,
+                        ObserveTargetKind::PreferredLabels => IntakeRoutingBasis::PreferredLabels,
+                        _ => unreachable!(),
+                    },
                 }
             }
         };
@@ -1159,7 +1165,8 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
-                    target_instance_id: "worker-mac".to_string()
+                    target_instance_id: "worker-mac".to_string(),
+                    basis: IntakeRoutingBasis::NodeOverride,
                 }
             }
         );

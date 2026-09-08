@@ -237,12 +237,15 @@ pub(crate) fn telemetry_for_decision(
                     preferred_label_match: PreferredLabelMatchCode::NotEvaluated,
                 }
             }
-            ObservedIntakeOutcome::WouldAssignNoOwnerToTarget { target_instance_id } => {
+            ObservedIntakeOutcome::WouldAssignNoOwnerToTarget { target_instance_id, basis } => {
                 IntakeRoutingTelemetry {
                     reason_code: IntakeRoutingReasonCode::NoOwnerTargetSelected,
                     would_assign_target: Some(target_instance_id),
                     owner_resolution: OwnerResolutionCode::NoOwner,
-                    preferred_label_match: PreferredLabelMatchCode::MatchedWorker,
+                    preferred_label_match: match basis {
+                        IntakeRoutingBasis::PreferredLabels => PreferredLabelMatchCode::MatchedWorker,
+                        _ => PreferredLabelMatchCode::NotEvaluated,
+                    },
                 }
             }
             ObservedIntakeOutcome::WouldKeepNoOwnerLocal { reason } => ran_local_telemetry(reason),
@@ -405,6 +408,7 @@ mod tests {
         let decision = IntakeRouterDecision::Observed {
             outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                 target_instance_id: "worker-mac".to_string(),
+                basis: IntakeRoutingBasis::PreferredLabels,
             },
         };
         let telemetry = telemetry_for_decision(&decision);
@@ -432,6 +436,7 @@ mod tests {
         let decision = IntakeRouterDecision::Observed {
             outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                 target_instance_id: "worker-mac".to_string(),
+                basis: IntakeRoutingBasis::PreferredLabels,
             },
         };
 
