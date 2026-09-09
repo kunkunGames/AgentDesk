@@ -47,8 +47,10 @@ impl CheckpointEventKind {
 #[serde(rename_all = "snake_case")]
 pub enum ChannelRecoveryStatus {
     Owner,
+    TakeoverPending,
     FallbackRunning,
     FallbackDone,
+    RestorePending,
     Restored,
     Aborted,
 }
@@ -57,22 +59,32 @@ impl ChannelRecoveryStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            Self::TakeoverPending => "takeover_pending",
             Self::FallbackRunning => "fallback_running",
             Self::FallbackDone => "fallback_done",
+            Self::RestorePending => "restore_pending",
             Self::Restored => "restored",
             Self::Aborted => "aborted",
         }
     }
 
     pub fn lock_held(self) -> bool {
-        matches!(self, Self::FallbackRunning | Self::FallbackDone)
+        matches!(
+            self,
+            Self::TakeoverPending
+                | Self::FallbackRunning
+                | Self::FallbackDone
+                | Self::RestorePending
+        )
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "owner" => Some(Self::Owner),
+            "takeover_pending" => Some(Self::TakeoverPending),
             "fallback_running" => Some(Self::FallbackRunning),
             "fallback_done" => Some(Self::FallbackDone),
+            "restore_pending" => Some(Self::RestorePending),
             "restored" => Some(Self::Restored),
             "aborted" => Some(Self::Aborted),
             _ => None,
@@ -169,6 +181,8 @@ pub struct ChannelState {
     /// Monotonic fencing token. A writer from an older takeover must never
     /// mutate a later owner/fallback lease.
     pub generation: i64,
+    /// Immutable launch context for a live lease, independent of config reloads.
+    pub context: Option<super::context::RecoveryContext>,
 }
 
 impl ChannelState {
@@ -247,6 +261,7 @@ pub async fn commit_recovery_transition(
     }
 
     let mut tx = pool.begin().await?;
+    lock_admission(&mut tx, &state.channel_id).await?;
     let current = load_locked_state_for_transition(&mut tx, &state.channel_id).await?;
     match current {
         Some((status, generation, writer, next_seq)) => {
@@ -323,8 +338,8 @@ async fn insert_state_in_transaction(
     sqlx::query(
         "INSERT INTO agent_recovery_channel_state (
              channel_id, status, owner_agent_id, fallback_agent_id,
-             active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())",
+             active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, recovery_context, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
     )
     .bind(&state.channel_id)
     .bind(state.status.as_str())
@@ -335,6 +350,7 @@ async fn insert_state_in_transaction(
     .bind(state.primary_turn_id.as_deref())
     .bind(state.next_seq)
     .bind(state.generation)
+    .bind(state.context.as_ref().map(sqlx::types::Json))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -354,6 +370,7 @@ async fn write_state_in_transaction(
                 primary_turn_id = $7,
                 next_seq = $8,
                 generation = $9,
+                recovery_context = $10,
                 updated_at = NOW()
           WHERE channel_id = $1",
     )
@@ -366,6 +383,7 @@ async fn write_state_in_transaction(
     .bind(state.primary_turn_id.as_deref())
     .bind(state.next_seq)
     .bind(state.generation)
+    .bind(state.context.as_ref().map(sqlx::types::Json))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -490,108 +508,84 @@ fn contains_unredacted_secret_pattern(text: &str) -> bool {
     upper.contains("BEGIN PRIVATE KEY") || upper.contains("BEGIN RSA PRIVATE KEY")
 }
 
-pub async fn load_channel_state(
-    pool: &sqlx::PgPool,
-    channel_id: &str,
-) -> Result<Option<ChannelState>, sqlx::Error> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            i64,
-            i64,
-        ),
-    >(
-        "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
-                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation
-           FROM agent_recovery_channel_state
-          WHERE channel_id = $1",
-    )
-    .bind(channel_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(
-        |(
-            channel_id,
-            status,
-            owner_agent_id,
-            fallback_agent_id,
-            active_writer_agent_id,
-            workspace,
-            primary_turn_id,
-            next_seq,
-            generation,
-        )| {
-            Some(ChannelState {
-                channel_id,
-                status: ChannelRecoveryStatus::parse(&status)?,
-                owner_agent_id,
-                fallback_agent_id,
-                active_writer_agent_id,
-                workspace,
-                primary_turn_id,
-                next_seq,
-                generation,
-            })
-        },
-    ))
+#[derive(sqlx::FromRow)]
+struct RecoveryStateRow {
+    channel_id: String,
+    status: String,
+    owner_agent_id: String,
+    fallback_agent_id: String,
+    active_writer_agent_id: String,
+    workspace: String,
+    primary_turn_id: Option<String>,
+    next_seq: i64,
+    generation: i64,
+    recovery_context: Option<sqlx::types::Json<super::context::RecoveryContext>>,
 }
 
-pub async fn load_channel_states(pool: &sqlx::PgPool) -> Result<Vec<ChannelState>, sqlx::Error> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            i64,
-            i64,
-        ),
-    >(
+impl RecoveryStateRow {
+    fn decode(self) -> Result<ChannelState, sqlx::Error> {
+        let status = ChannelRecoveryStatus::parse(&self.status).ok_or_else(|| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unknown recovery status",
+            )))
+        })?;
+        Ok(ChannelState {
+            channel_id: self.channel_id,
+            status,
+            owner_agent_id: self.owner_agent_id,
+            fallback_agent_id: self.fallback_agent_id,
+            active_writer_agent_id: self.active_writer_agent_id,
+            workspace: self.workspace,
+            primary_turn_id: self.primary_turn_id,
+            next_seq: self.next_seq,
+            generation: self.generation,
+            context: self.recovery_context.map(|context| context.0),
+        })
+    }
+}
+
+pub async fn load_channel_state(
+    pool: &PgPool,
+    channel_id: &str,
+) -> Result<Option<ChannelState>, sqlx::Error> {
+    sqlx::query_as::<_, RecoveryStateRow>(
         "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
-                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation
+                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, recovery_context
+           FROM agent_recovery_channel_state WHERE channel_id = $1",
+    ).bind(channel_id).fetch_optional(pool).await?.map(RecoveryStateRow::decode).transpose()
+}
+
+/// Serialize durable ownership changes with mailbox reservation, including a
+/// channel whose state row has not yet been inserted.
+pub(super) async fn lock_admission(
+    tx: &mut Transaction<'_, Postgres>,
+    channel: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(1894, hashtext($1))")
+        .bind(channel)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn load_channel_state_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    channel: &str,
+) -> Result<Option<ChannelState>, sqlx::Error> {
+    sqlx::query_as::<_, RecoveryStateRow>(
+        "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
+                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, recovery_context
+           FROM agent_recovery_channel_state WHERE channel_id = $1",
+    ).bind(channel).fetch_optional(&mut **tx).await?.map(RecoveryStateRow::decode).transpose()
+}
+
+pub async fn load_channel_states(pool: &PgPool) -> Result<Vec<ChannelState>, sqlx::Error> {
+    sqlx::query_as::<_, RecoveryStateRow>(
+        "SELECT channel_id, status, owner_agent_id, fallback_agent_id,
+                active_writer_agent_id, workspace, primary_turn_id, next_seq, generation, recovery_context
            FROM agent_recovery_channel_state",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .filter_map(
-            |(
-                channel_id,
-                status,
-                owner_agent_id,
-                fallback_agent_id,
-                active_writer_agent_id,
-                workspace,
-                primary_turn_id,
-                next_seq,
-                generation,
-            )| {
-                Some(ChannelState {
-                    channel_id,
-                    status: ChannelRecoveryStatus::parse(&status)?,
-                    owner_agent_id,
-                    fallback_agent_id,
-                    active_writer_agent_id,
-                    workspace,
-                    primary_turn_id,
-                    next_seq,
-                    generation,
-                })
-            },
-        )
-        .collect())
+    ).fetch_all(pool).await?.into_iter().map(RecoveryStateRow::decode).collect()
 }
 
 pub async fn load_checkpoint_events(

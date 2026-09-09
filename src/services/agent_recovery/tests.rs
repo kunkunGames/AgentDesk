@@ -86,6 +86,7 @@ fn reloading_the_same_catalog_preserves_active_recovery_state() {
     let catalog = runtime.catalog().clone();
 
     runtime.install_catalog(catalog);
+    acknowledge(&mut runtime);
 
     assert_eq!(runtime.spawned().len(), 1);
     assert_eq!(
@@ -96,60 +97,52 @@ fn reloading_the_same_catalog_preserves_active_recovery_state() {
 }
 
 #[test]
-fn replacing_or_clearing_catalog_drops_stale_in_memory_recovery_state() {
+fn replacing_or_clearing_catalog_preserves_the_active_lease_until_restore_ack() {
     let mut runtime = enabled_runtime();
-    runtime.claim_turn(CHANNEL, "turn-clear");
+    runtime.observe(ObserveInput {
+        channel_id: CHANNEL.into(),
+        primary_turn_id: "turn-clear".into(),
+        signal: DetectorSignal::StreamIdleTimeout,
+    });
+    let before = runtime.states[CHANNEL].clone();
+    for clear in [false, true] {
+        if clear {
+            runtime.clear_catalog();
+        } else {
+            runtime.install_catalog(super::policy::RecoveryCatalog::default());
+        }
+        assert_eq!(runtime.states[CHANNEL], before);
+        assert!(!runtime.events(CHANNEL).is_empty());
+        assert!(!runtime.allows_cli_turn(CHANNEL, "claude"));
+        assert_eq!(
+            runtime.inherit_workspace(CHANNEL).as_deref(),
+            Some("/primary-workspace")
+        );
+        assert_eq!(
+            runtime.channel_recovery_intake(&ProviderKind::Codex, CHANNEL),
+            Some(RecoveryIntake::Skip)
+        );
+    }
+    acknowledge(&mut runtime);
     runtime
-        .observe(ObserveInput {
-            channel_id: CHANNEL.to_string(),
-            primary_turn_id: "turn-clear".to_string(),
-            signal: DetectorSignal::StreamIdleTimeout,
-        })
-        .spawn
-        .expect("fallback spawn");
-
-    runtime.install_catalog(super::policy::RecoveryCatalog::default());
-
-    assert!(runtime.catalog().channels.is_empty());
-    assert!(runtime.events(CHANNEL).is_empty());
-    assert!(runtime.spawned().is_empty());
+        .note_fallback_progress(CHANNEL, CheckpointEventKind::Complete, compact("done"))
+        .unwrap();
+    runtime
+        .try_restore_owner(CHANNEL, &ProviderKind::Grok, true, false)
+        .unwrap();
+    assert!(!runtime.allows_cli_turn(CHANNEL, "claude"));
+    assert!(runtime.fallback_prompt_prefix(CHANNEL).is_none());
+    acknowledge(&mut runtime);
+    assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
     assert_eq!(
         runtime.channel_recovery_intake(&ProviderKind::Codex, CHANNEL),
         None
     );
-    assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
+}
 
-    runtime.install_catalog(
-        build_recovery_catalog(
-            &[
-                agent(
-                    "claude",
-                    "grok",
-                    Some("/primary-workspace"),
-                    Some(enabled_recovery("monitoring")),
-                ),
-                agent("monitoring", "codex", Some("/fallback-workspace"), None),
-            ],
-            &[channel("claude", Some(enabled_recovery("monitoring")))],
-        )
-        .expect("valid recovery catalog"),
-    );
-    runtime.claim_turn(CHANNEL, "turn-clear-again");
-    runtime
-        .observe(ObserveInput {
-            channel_id: CHANNEL.to_string(),
-            primary_turn_id: "turn-clear-again".to_string(),
-            signal: DetectorSignal::StreamIdleTimeout,
-        })
-        .spawn
-        .expect("fallback spawn after reconfiguration");
-
-    runtime.clear_catalog();
-
-    assert!(runtime.catalog().channels.is_empty());
-    assert!(runtime.events(CHANNEL).is_empty());
-    assert!(runtime.spawned().is_empty());
-    assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
+fn acknowledge(runtime: &mut RecoveryRuntime) {
+    let lease = super::RecoveryLease::from_state(&runtime.states[CHANNEL]);
+    runtime.acknowledge_start(&lease).unwrap();
 }
 
 #[test]
@@ -409,6 +402,7 @@ fn test_004_lock_gives_fallback_allow_owner_skip_fallback_http_no_mailbox_handof
         })
         .spawn
         .expect("fallback spawn");
+    acknowledge(&mut runtime);
     assert_eq!(
         runtime.channel_recovery_intake(&ProviderKind::Grok, CHANNEL),
         Some(RecoveryIntake::Skip)
@@ -437,6 +431,7 @@ fn test_005_owner_cli_is_not_given_a_new_turn_while_fallback_holds_lock() {
         })
         .spawn
         .expect("spawn");
+    acknowledge(&mut runtime);
     assert!(!runtime.allows_cli_turn(CHANNEL, "claude"));
     assert!(runtime.allows_cli_turn(CHANNEL, "monitoring"));
 }
@@ -523,6 +518,9 @@ fn test_007_fallback_prompt_last_n_seq_order_restore_uses_latest_owner_retakes()
     assert!(plan.packet.contains(
         "You are the primary agent restored as a checkpoint. Do not redo completed Files. Continue from Next."
     ));
+    assert_eq!(plan.owner_intake, Some(RecoveryIntake::Skip));
+    assert!(!runtime.allows_cli_turn(CHANNEL, "claude"));
+    acknowledge(&mut runtime);
     assert_eq!(
         runtime.channel_recovery_intake(&ProviderKind::Grok, CHANNEL),
         None
@@ -531,7 +529,6 @@ fn test_007_fallback_prompt_last_n_seq_order_restore_uses_latest_owner_retakes()
         runtime.channel_recovery_intake(&ProviderKind::Codex, CHANNEL),
         None
     );
-    assert!(super::effective_handles(true, plan.owner_intake));
     assert!(!super::effective_handles(false, plan.fallback_intake));
     assert!(runtime.allows_cli_turn(CHANNEL, "claude"));
 }
@@ -588,6 +585,7 @@ fn test_010_owner_healthy_without_fallback_inflight_restores_from_wal() {
         })
         .spawn
         .expect("spawn");
+    acknowledge(&mut runtime);
     assert!(
         runtime
             .try_restore_owner(CHANNEL, &ProviderKind::Grok, true, true)
@@ -609,11 +607,20 @@ fn test_010_owner_healthy_without_fallback_inflight_restores_from_wal() {
             .try_restore_owner(CHANNEL, &ProviderKind::Grok, false, false)
             .is_none()
     );
+    assert!(
+        runtime
+            .try_restore_owner(CHANNEL, &ProviderKind::Grok, true, false)
+            .is_none()
+    );
+    runtime
+        .note_fallback_progress(CHANNEL, CheckpointEventKind::Complete, compact("done"))
+        .unwrap();
     let plan = runtime
         .try_restore_owner(CHANNEL, &ProviderKind::Grok, true, false)
         .expect("owner healthy restore");
     assert!(plan.packet.contains("to=claude"));
     assert!(plan.packet.contains("Goal:"));
+    acknowledge(&mut runtime);
     assert_eq!(
         runtime.channel_recovery_intake(&ProviderKind::Grok, CHANNEL),
         None
@@ -682,6 +689,7 @@ fn test_009_dual_processing_fails() {
         })
         .spawn
         .expect("spawn");
+    acknowledge(&mut runtime);
     let owner_overlay = runtime.channel_recovery_intake(&owner, CHANNEL);
     let fallback_overlay = runtime.channel_recovery_intake(&fallback, CHANNEL);
     assert_eq!(owner_overlay, Some(RecoveryIntake::Skip));

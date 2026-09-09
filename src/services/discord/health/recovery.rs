@@ -46,27 +46,8 @@ pub(crate) use watchdog_decisions::{
     stall_watchdog_should_force_clean_orphan_explicit_background_work,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeTurnStopResult {
-    pub lifecycle_path: &'static str,
-    pub had_active_turn: bool,
-    pub queue_depth: usize,
-    pub persistent_inflight_cleared: bool,
-    pub termination_recorded: bool,
-    /// #5176 — whether this stop actually took the mailbox foreground anchor.
-    /// `true` also covers "the mailbox was already free when we checked": the
-    /// contract this field reports is *ownership released*, and the caller only
-    /// needs to know whether the channel is still locked.
-    pub mailbox_foreground_free: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IdleTmuxStaleTurnRepairResult {
-    pub had_active_turn: bool,
-    pub has_pending_queue: bool,
-    pub persistent_inflight_cleared: bool,
-    pub runtime_session_cleared: bool,
-}
+mod stop_result;
+pub use stop_result::{IdleTmuxStaleTurnRepairResult, RuntimeTurnStopResult};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IdleTmuxStaleTurnInflightPin {
@@ -1671,6 +1652,7 @@ pub(crate) async fn run_stall_watchdog_pass(
     let now_unix_secs = chrono::Utc::now().timestamp();
     stall_liveness::gc_stall_watchdog_liveness_state(now_unix_secs);
     watcher_respawn::gc_watcher_absence_state(now_unix_secs);
+    let recovering = live_agent_recovery::reconcile_provider(registry, provider).await;
 
     // Sweep every same-provider runtime; name-only lookup would miss later
     // bots, so keep the runtime that exposed each watcher.
@@ -1710,7 +1692,9 @@ pub(crate) async fn run_stall_watchdog_pass(
             None => continue,
         };
         // A successful takeover owns this tick; the snapshot is now stale.
-        if live_agent_recovery::observe_and_execute(registry, &snapshot).await {
+        if recovering.contains(&channel_id.get())
+            || live_agent_recovery::observe_and_execute(registry, &snapshot).await
+        {
             continue;
         }
         let now_mono_secs = super::liveness_authority::monotonic_now_secs();

@@ -15,23 +15,29 @@ use super::checkpoint::{
 };
 use super::*;
 
+mod operations;
+pub(crate) use operations::{
+    OperationPlan, PendingOperation, acknowledge_start_durable, active_channels, owner_provider,
+    pending_operation, recovery_state, retry_interrupted_durable, try_execution,
+};
+
 #[cfg(test)]
 mod postgres_tests;
 
 #[derive(Default)]
 pub(super) struct Coordinator {
-    runtime: Mutex<RecoveryRuntime>,
-    pool: Mutex<Option<PgPool>>,
+    pub(super) runtime: Mutex<RecoveryRuntime>,
+    pub(super) pool: Mutex<Option<PgPool>>,
     channels: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
-fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn coordinator() -> &'static Coordinator {
+pub(super) fn coordinator() -> &'static Coordinator {
     static COORDINATOR: OnceLock<Coordinator> = OnceLock::new();
     COORDINATOR.get_or_init(Coordinator::default)
 }
@@ -179,7 +185,7 @@ pub async fn channel_recovery_intake(
     provider: &ProviderKind,
     channel_id: &str,
 ) -> Option<RecoveryIntake> {
-    if !recovery_enabled(channel_id) {
+    if lock(&coordinator().pool).is_none() && !recovery_enabled(channel_id) {
         return None;
     }
     if let Err(error) = coordinator().refresh(channel_id).await {
@@ -223,20 +229,29 @@ pub fn fallback_provider(channel_id: &str) -> Option<ProviderKind> {
 /// Capture when registering a turn, not when its completion arrives.
 pub fn lease_for_provider(channel_id: &str, provider: &ProviderKind) -> Option<RecoveryLease> {
     let runtime = lock(&coordinator().runtime);
-    let binding = runtime.catalog.channels.get(channel_id)?;
-    if !binding.policy.as_ref().is_some_and(|policy| policy.enabled) {
-        return None;
-    }
     if let Some(state) = runtime.states.get(channel_id) {
+        if !state.lock_held()
+            && runtime
+                .binding_for_channel(channel_id)
+                .is_none_or(|binding| {
+                    !binding.policy.as_ref().is_some_and(|policy| policy.enabled)
+                        || binding.owner_agent_id != state.owner_agent_id
+                })
+        {
+            return None;
+        }
         if runtime
-            .catalog
-            .agent_provider(&state.active_writer_agent_id)
+            .writer_provider(state, &state.active_writer_agent_id)
             .as_ref()
             != Some(provider)
         {
             return None;
         }
         return Some(RecoveryLease::from_state(state));
+    }
+    let binding = runtime.binding_for_channel(channel_id)?;
+    if !binding.policy.as_ref().is_some_and(|policy| policy.enabled) {
+        return None;
     }
     (binding.owner_provider == *provider).then(|| RecoveryLease {
         channel_id: channel_id.to_string(),
@@ -260,14 +275,33 @@ pub async fn complete_turn_durable(
 fn apply_completion(
     runtime: &mut RecoveryRuntime,
     lease: &RecoveryLease,
-    payload: CheckpointPayload,
+    mut payload: CheckpointPayload,
 ) -> Result<Option<()>, RecoveryStoreError> {
+    if let Some(previous) =
+        super::restore::latest_progress_or_complete(runtime.events(&lease.channel_id))
+    {
+        if payload.goal.is_empty() {
+            payload.goal = previous.payload.goal.clone();
+        }
+        if payload.next.is_empty() {
+            payload.next = previous.payload.next.clone();
+        }
+        if payload.files.is_empty() {
+            payload.files = previous.payload.files.clone();
+        }
+        if payload.decisions.is_empty() {
+            payload.decisions = previous.payload.decisions.clone();
+        }
+        if payload.last_user_message.is_empty() {
+            payload.last_user_message = previous.payload.last_user_message.clone();
+        }
+        if payload.progress == "agent turn complete" && !previous.payload.progress.is_empty() {
+            payload.progress = format!("{}\nAgent turn complete.", previous.payload.progress);
+        }
+    }
     let binding = runtime
-        .catalog
-        .channels
-        .get(&lease.channel_id)
-        .ok_or_else(|| conflict("recovery channel is not configured"))?
-        .clone();
+        .binding_for_channel(&lease.channel_id)
+        .ok_or_else(|| conflict("recovery binding is unavailable"))?;
     let fallback = binding
         .policy
         .as_ref()
@@ -284,22 +318,56 @@ fn apply_completion(
     }
     let event = if state.active_writer_agent_id == state.owner_agent_id {
         runtime.note_owner_progress(&lease.channel_id, payload)
-    } else if state.status == ChannelRecoveryStatus::FallbackRunning {
+    } else if matches!(
+        state.status,
+        ChannelRecoveryStatus::TakeoverPending | ChannelRecoveryStatus::FallbackRunning
+    ) {
         runtime.note_fallback_progress(&lease.channel_id, CheckpointEventKind::Complete, payload)
     } else {
         return Err(conflict("fallback completion is not running"));
     }
     .map_err(|error| conflict(error.message()))?;
+    if event.is_some()
+        && let Some(state) = runtime.states.get_mut(&lease.channel_id)
+        && state.status == ChannelRecoveryStatus::RestorePending
+    {
+        state.status = ChannelRecoveryStatus::Restored;
+        runtime
+            .open_keys
+            .retain(|(channel, _)| channel != &lease.channel_id);
+    }
     Ok(event.map(|_| ()))
 }
 
 pub async fn observe_durable(input: ObserveInput) -> ObserveOutcome {
+    observe_with_checkpoint_durable(input, None, None).await
+}
+pub async fn observe_with_checkpoint_durable(
+    input: ObserveInput,
+    checkpoint: Option<CheckpointPayload>,
+    workspace: Option<String>,
+) -> ObserveOutcome {
     if !recovery_enabled(&input.channel_id) {
         return ObserveOutcome::default();
     }
     let result = coordinator()
         .transition(&input.channel_id, |runtime| {
-            let outcome = runtime.observe(input.clone());
+            if let Some(payload) = checkpoint {
+                runtime
+                    .note_owner_progress(&input.channel_id, payload)
+                    .map_err(|error| conflict(error.message()))?;
+            }
+            let mut outcome = runtime.observe(input.clone());
+            if let (Some(spawn), Some(workspace)) = (outcome.spawn.as_mut(), workspace) {
+                spawn.cwd = workspace.clone();
+                if let Some(context) = runtime
+                    .states
+                    .get_mut(&input.channel_id)
+                    .and_then(|state| state.context.as_mut())
+                {
+                    context.workspace = workspace;
+                }
+            }
             Ok(outcome.spawn.is_some().then_some(outcome))
         })
         .await;
@@ -320,7 +388,7 @@ pub async fn try_restore_owner_durable(
     owner_healthy: bool,
     fallback_inflight: bool,
 ) -> Option<RestorePlan> {
-    if !recovery_enabled(channel_id) || !owner_healthy || fallback_inflight {
+    if !owner_healthy || fallback_inflight {
         return None;
     }
     match coordinator()
@@ -390,6 +458,14 @@ pub async fn hydrate_from_pg(pool: &PgPool) {
         }
     };
     for state in states {
+        if let Err(error) = coordinator()
+            .transition(&state.channel_id, |runtime| {
+                runtime.retry_interrupted_launch(&state.channel_id)
+            })
+            .await
+        {
+            tracing::warn!(channel_id = %state.channel_id, error = %error, "restart recovery intent remains fenced");
+        }
         if let Err(error) = coordinator().refresh(&state.channel_id).await {
             tracing::warn!(channel_id = %state.channel_id, error = %error,
                 "failed to hydrate recovery channel");

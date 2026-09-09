@@ -2,9 +2,12 @@
 //!
 //! Same-channel exclusive intake. Mailbox handoff is never used.
 
+pub(crate) mod admission;
 pub mod checkpoint;
+pub mod context;
 pub mod detector;
 pub mod handoff;
+mod lifecycle;
 pub mod policy;
 pub mod restore;
 
@@ -91,21 +94,10 @@ impl RecoveryRuntime {
             return;
         }
         self.catalog = catalog;
-        self.clear_volatile_state();
-    }
-
-    fn clear_volatile_state(&mut self) {
-        self.states.clear();
-        self.events.clear();
-        self.claimed_turns.clear();
-        self.open_keys.clear();
-        self.spawned.clear();
-        self.pending_restore.clear();
     }
 
     pub fn clear_catalog(&mut self) {
         self.catalog = RecoveryCatalog::default();
-        self.clear_volatile_state();
     }
 
     pub fn catalog(&self) -> &RecoveryCatalog {
@@ -141,10 +133,11 @@ impl RecoveryRuntime {
     }
 
     pub fn inherit_workspace(&self, channel_id: &str) -> Option<String> {
-        self.catalog
-            .channels
+        self.states
             .get(channel_id)
-            .map(|binding| binding.workspace.clone())
+            .filter(|state| state.lock_held())?;
+        self.binding_for_channel(channel_id)
+            .map(|binding| binding.workspace)
     }
 
     pub fn channel_recovery_intake(
@@ -156,7 +149,13 @@ impl RecoveryRuntime {
         if !state.lock_held() {
             return None;
         }
-        let holder_provider = self.catalog.agent_provider(&state.active_writer_agent_id)?;
+        if state.status != ChannelRecoveryStatus::FallbackRunning {
+            return Some(RecoveryIntake::Skip);
+        }
+        let Some(holder_provider) = self.writer_provider(state, &state.active_writer_agent_id)
+        else {
+            return Some(RecoveryIntake::Skip);
+        };
         if provider == &holder_provider {
             Some(RecoveryIntake::Allow)
         } else {
@@ -166,7 +165,10 @@ impl RecoveryRuntime {
 
     pub fn allows_cli_turn(&self, channel_id: &str, agent_id: &str) -> bool {
         match self.states.get(channel_id) {
-            Some(state) if state.lock_held() => state.active_writer_agent_id == agent_id,
+            Some(state) if state.lock_held() => {
+                state.status == ChannelRecoveryStatus::FallbackRunning
+                    && state.active_writer_agent_id == agent_id
+            }
             _ => true,
         }
     }
@@ -174,10 +176,11 @@ impl RecoveryRuntime {
     pub fn allows_cli_turn_for_provider(&self, channel_id: &str, provider: &ProviderKind) -> bool {
         match self.states.get(channel_id) {
             Some(state) if state.lock_held() => {
-                self.catalog
-                    .agent_provider(&state.active_writer_agent_id)
-                    .as_ref()
-                    == Some(provider)
+                state.status == ChannelRecoveryStatus::FallbackRunning
+                    && self
+                        .writer_provider(state, &state.active_writer_agent_id)
+                        .as_ref()
+                        == Some(provider)
             }
             _ => true,
         }
@@ -185,12 +188,12 @@ impl RecoveryRuntime {
 
     pub fn fallback_prompt_prefix(&self, channel_id: &str) -> Option<String> {
         let state = self.states.get(channel_id)?;
-        if !state.lock_held() {
+        if !state.lock_held() || state.active_writer_agent_id != state.fallback_agent_id {
             return None;
         }
-        let binding = self.catalog.channels.get(channel_id)?;
+        let binding = self.binding_for_channel(channel_id)?;
         Some(handoff::format_fallback_prompt(
-            binding,
+            &binding,
             &self.last_n(channel_id),
         ))
     }
@@ -204,7 +207,7 @@ impl RecoveryRuntime {
         channel_id: &str,
         payload: CheckpointPayload,
     ) -> Result<Option<CheckpointEvent>, checkpoint::CheckpointError> {
-        let Some(binding) = self.catalog.channels.get(channel_id).cloned() else {
+        let Some(binding) = self.binding_for_channel(channel_id) else {
             return Ok(None);
         };
         if binding.policy.as_ref().is_none_or(|policy| !policy.enabled) {
@@ -276,8 +279,12 @@ impl RecoveryRuntime {
                 spawn: None,
             };
         }
+        let context = context::RecoveryContext::capture(&binding, &self.catalog);
         let state = self.ensure_state(&binding, &policy.fallback_agent_id);
-        state.status = ChannelRecoveryStatus::FallbackRunning;
+        state.owner_agent_id = binding.owner_agent_id.clone();
+        state.fallback_agent_id = policy.fallback_agent_id.clone();
+        state.context = context;
+        state.status = ChannelRecoveryStatus::TakeoverPending;
         state.active_writer_agent_id = policy.fallback_agent_id.clone();
         state.primary_turn_id = Some(input.primary_turn_id.clone());
         state.generation += 1;
@@ -326,9 +333,16 @@ impl RecoveryRuntime {
     }
 
     pub fn fallback_provider(&self, channel_id: &str) -> Option<ProviderKind> {
+        if let Some(state) = self
+            .states
+            .get(channel_id)
+            .filter(|state| state.lock_held())
+        {
+            return self.writer_provider(state, &state.fallback_agent_id);
+        }
         let binding = self.catalog.channels.get(channel_id)?;
-        let policy = binding.policy.as_ref()?;
-        self.catalog.agent_provider(&policy.fallback_agent_id)
+        self.catalog
+            .agent_provider(&binding.policy.as_ref()?.fallback_agent_id)
     }
 
     pub fn is_fallback_writer(&self, channel_id: &str, provider: &ProviderKind) -> bool {
@@ -338,15 +352,11 @@ impl RecoveryRuntime {
         if !state.lock_held() {
             return false;
         }
-        self.catalog
-            .agent_provider(&state.active_writer_agent_id)
-            .as_ref()
-            == Some(provider)
+        state.active_writer_agent_id == state.fallback_agent_id
             && self
-                .catalog
-                .channels
-                .get(channel_id)
-                .is_some_and(|binding| binding.owner_provider != *provider)
+                .writer_provider(state, &state.active_writer_agent_id)
+                .as_ref()
+                == Some(provider)
     }
 
     pub fn owner_may_retake(&self, channel_id: &str) -> bool {
@@ -356,14 +366,7 @@ impl RecoveryRuntime {
         if !state.lock_held() {
             return false;
         }
-        if state.status == ChannelRecoveryStatus::FallbackDone {
-            return true;
-        }
-        self.events(channel_id)
-            .iter()
-            .rev()
-            .find(|event| event.kind == CheckpointEventKind::Stall)
-            .is_some_and(|event| event.payload.progress.contains("process_death"))
+        state.status == ChannelRecoveryStatus::FallbackDone
     }
 
     pub fn try_restore_owner(
@@ -373,7 +376,7 @@ impl RecoveryRuntime {
         owner_healthy: bool,
         fallback_inflight: bool,
     ) -> Option<RestorePlan> {
-        let binding = self.catalog.channels.get(channel_id)?;
+        let binding = self.binding_for_channel(channel_id)?;
         if binding.owner_provider != *observing_provider {
             return None;
         }
@@ -396,7 +399,7 @@ impl RecoveryRuntime {
         fallback_succeeded: bool,
         summary: &str,
     ) -> Option<RestorePlan> {
-        let binding = self.catalog.channels.get(channel_id)?.clone();
+        let binding = self.binding_for_channel(channel_id)?;
         let policy = binding.policy.as_ref()?;
         if self
             .events(channel_id)
@@ -446,7 +449,7 @@ impl RecoveryRuntime {
             restore_payload,
         );
         if let Some(state) = self.states.get_mut(channel_id) {
-            state.status = ChannelRecoveryStatus::Restored;
+            state.status = ChannelRecoveryStatus::RestorePending;
             state.active_writer_agent_id = binding.owner_agent_id.clone();
             state.generation += 1;
         }
@@ -455,7 +458,7 @@ impl RecoveryRuntime {
         self.pending_restore
             .insert(channel_id.to_string(), plan.packet.clone());
         plan.owner_intake = self.channel_recovery_intake(&binding.owner_provider, channel_id);
-        if let Some(fallback_provider) = self.catalog.agent_provider(&policy.fallback_agent_id) {
+        if let Some(fallback_provider) = self.fallback_provider(channel_id) {
             plan.fallback_intake = self.channel_recovery_intake(&fallback_provider, channel_id);
         }
         Some(plan)
@@ -476,6 +479,7 @@ impl RecoveryRuntime {
         binding: &ChannelRecoveryBinding,
         fallback_agent_id: &str,
     ) -> &mut ChannelState {
+        let context = context::RecoveryContext::capture(binding, &self.catalog);
         self.states
             .entry(binding.channel_id.clone())
             .or_insert_with(|| ChannelState {
@@ -491,6 +495,7 @@ impl RecoveryRuntime {
                 primary_turn_id: None,
                 next_seq: 0,
                 generation: 0,
+                context,
             })
     }
 
@@ -502,10 +507,7 @@ impl RecoveryRuntime {
         payload: CheckpointPayload,
     ) -> Result<CheckpointEvent, checkpoint::CheckpointError> {
         let binding = self
-            .catalog
-            .channels
-            .get(channel_id)
-            .cloned()
+            .binding_for_channel(channel_id)
             .ok_or_else(|| checkpoint::CheckpointError::Serialize("unknown channel".to_string()))?;
         let fallback_agent_id = binding
             .policy
@@ -532,11 +534,16 @@ impl RecoveryRuntime {
 }
 
 mod durable;
+pub(crate) use durable::{
+    OperationPlan, PendingOperation, acknowledge_start_durable, active_channels, owner_provider,
+    pending_operation, recovery_state, retry_interrupted_durable, try_execution,
+};
 pub use durable::{
     abort_takeover_durable, allows_cli_turn, allows_cli_turn_for_provider, attach_pg_pool,
     channel_recovery_intake, clear_catalog, complete_turn_durable, fallback_prompt_prefix,
     fallback_provider, hydrate_from_pg, inherit_workspace, install_catalog, lease_for_provider,
-    observe_durable, take_restore_packet, try_restore_owner_durable,
+    observe_durable, observe_with_checkpoint_durable, take_restore_packet,
+    try_restore_owner_durable,
 };
 
 #[cfg(test)]

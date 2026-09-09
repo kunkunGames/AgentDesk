@@ -95,7 +95,7 @@ async fn postgres_takeover_is_invisible_until_commit() {
     assert!(outcome.spawn.is_some());
     assert_eq!(
         cached_state(&coordinator).status,
-        ChannelRecoveryStatus::FallbackRunning
+        ChannelRecoveryStatus::TakeoverPending
     );
     assert_eq!(
         load_channel_state(&pool, CHANNEL).await.unwrap().unwrap(),
@@ -195,6 +195,11 @@ async fn postgres_stale_completion_cannot_claim_a_restarted_takeover() {
         .unwrap()
         .unwrap();
     assert_eq!(cached_state(&first).generation, 2);
+    let restore_lease = RecoveryLease::from_state(&cached_state(&first));
+    first
+        .transition(CHANNEL, |runtime| runtime.acknowledge_start(&restore_lease))
+        .await
+        .unwrap();
     // Start with an empty cache, simulating a restart after a non-locked state.
     let restarted = runtime(&pool);
     restarted
@@ -260,6 +265,285 @@ async fn postgres_wal_frontier_rejects_same_generation_stale_progress() {
             .unwrap()
             .len(),
         2
+    );
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_mailbox_admission_serializes_takeover_before_a_state_row_exists() {
+    use crate::services::agent_recovery::admission::admit_on;
+    let (db, pool, first) = fixture().await;
+    let guard = admit_on(&first, CHANNEL, &ProviderKind::Grok, None, None)
+        .await
+        .unwrap();
+    let second = runtime(&pool);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        second
+            .transition(CHANNEL, |runtime| {
+                ready_tx.send(()).unwrap();
+                takeover(runtime, "racing-turn")
+            })
+            .await
+    });
+    ready_rx.await.unwrap();
+    assert!(load_channel_state(&pool, CHANNEL).await.unwrap().is_none());
+    assert!(!worker.is_finished());
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        admit_on(&first, CHANNEL, &ProviderKind::Grok, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        admit_on(&first, CHANNEL, &ProviderKind::Codex, None, None)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_pending_launch_and_restore_require_the_exact_internal_lease() {
+    use crate::services::agent_recovery::admission::admit_on;
+    let (db, pool, coordinator) = fixture().await;
+    coordinator
+        .transition(CHANNEL, |runtime| takeover(runtime, "turn"))
+        .await
+        .unwrap()
+        .unwrap();
+    let fallback = RecoveryLease::from_state(&cached_state(&coordinator));
+    assert!(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Grok,
+            None,
+            Some(&fallback)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Codex,
+            Some("another-agent"),
+            Some(&fallback)
+        )
+        .await
+        .is_err()
+    );
+    drop(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Codex,
+            Some("monitoring"),
+            Some(&fallback),
+        )
+        .await
+        .unwrap(),
+    );
+    coordinator
+        .transition(CHANNEL, |runtime| runtime.acknowledge_start(&fallback))
+        .await
+        .unwrap();
+    drop(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Codex,
+            Some("monitoring"),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    coordinator
+        .transition(CHANNEL, |runtime| {
+            apply_completion(runtime, &fallback, payload("fallback done"))
+        })
+        .await
+        .unwrap();
+    assert!(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Codex,
+            None,
+            Some(&fallback)
+        )
+        .await
+        .is_err()
+    );
+    coordinator
+        .transition(CHANNEL, |runtime| {
+            Ok(runtime.try_restore_owner(CHANNEL, &ProviderKind::Grok, true, false))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = RecoveryLease::from_state(&cached_state(&coordinator));
+    assert_eq!(
+        cached_state(&coordinator).status,
+        ChannelRecoveryStatus::RestorePending
+    );
+    assert!(
+        admit_on(&coordinator, CHANNEL, &ProviderKind::Grok, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Codex,
+            None,
+            Some(&fallback)
+        )
+        .await
+        .is_err()
+    );
+    drop(
+        admit_on(
+            &coordinator,
+            CHANNEL,
+            &ProviderKind::Grok,
+            Some("claude"),
+            Some(&owner),
+        )
+        .await
+        .unwrap(),
+    );
+    coordinator
+        .transition(CHANNEL, |runtime| runtime.acknowledge_start(&owner))
+        .await
+        .unwrap();
+    assert_eq!(
+        cached_state(&coordinator).status,
+        ChannelRecoveryStatus::Restored
+    );
+    drop(
+        admit_on(&coordinator, CHANNEL, &ProviderKind::Grok, None, None)
+            .await
+            .unwrap(),
+    );
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_restart_and_catalog_removal_preserve_the_frozen_recovery_fence() {
+    use crate::services::agent_recovery::admission::admit_on;
+    let (db, pool, first) = fixture().await;
+    first
+        .transition(CHANNEL, |runtime| takeover(runtime, "turn"))
+        .await
+        .unwrap()
+        .unwrap();
+    let old = RecoveryLease::from_state(&cached_state(&first));
+    first
+        .transition(CHANNEL, |runtime| runtime.acknowledge_start(&old))
+        .await
+        .unwrap();
+    let restarted = runtime(&pool);
+    lock(&restarted.runtime).clear_catalog();
+    restarted
+        .transition(CHANNEL, |runtime| runtime.retry_interrupted_launch(CHANNEL))
+        .await
+        .unwrap()
+        .unwrap();
+    let state = cached_state(&restarted);
+    assert_eq!(state.status, ChannelRecoveryStatus::TakeoverPending);
+    assert!(state.generation > old.generation);
+    assert_eq!(
+        lock(&restarted.runtime)
+            .inherit_workspace(CHANNEL)
+            .as_deref(),
+        Some("/primary-workspace")
+    );
+    assert_eq!(
+        lock(&restarted.runtime).fallback_provider(CHANNEL),
+        Some(ProviderKind::Codex)
+    );
+    assert!(
+        admit_on(&restarted, CHANNEL, &ProviderKind::Grok, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        admit_on(&restarted, CHANNEL, &ProviderKind::Codex, None, Some(&old))
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .transition(CHANNEL, |runtime| apply_completion(
+                runtime,
+                &old,
+                payload("late")
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        load_channel_state(&pool, CHANNEL).await.unwrap().unwrap(),
+        state
+    );
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn postgres_failed_launch_ack_keeps_a_retryable_pending_intent() {
+    let (db, pool, coordinator) = fixture().await;
+    coordinator
+        .transition(CHANNEL, |runtime| takeover(runtime, "turn"))
+        .await
+        .unwrap()
+        .unwrap();
+    let before = cached_state(&coordinator);
+    let lease = RecoveryLease::from_state(&before);
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_launch_ack() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected acknowledgement failure'; END $$;
+         CREATE TRIGGER reject_launch_ack BEFORE INSERT ON agent_recovery_checkpoint_events
+         FOR EACH ROW WHEN (NEW.payload->>'progress' = 'runtime start acknowledged')
+         EXECUTE FUNCTION reject_launch_ack();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        coordinator
+            .transition(CHANNEL, |runtime| runtime.acknowledge_start(&lease))
+            .await
+            .is_err()
+    );
+    assert_eq!(cached_state(&coordinator), before);
+    assert_eq!(
+        load_channel_state(&pool, CHANNEL).await.unwrap().unwrap(),
+        before
+    );
+    coordinator
+        .transition(CHANNEL, |runtime| runtime.retry_interrupted_launch(CHANNEL))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cached_state(&coordinator).generation > lease.generation);
+    assert_eq!(
+        cached_state(&coordinator).status,
+        ChannelRecoveryStatus::TakeoverPending
     );
     pool.close().await;
     db.drop().await;
