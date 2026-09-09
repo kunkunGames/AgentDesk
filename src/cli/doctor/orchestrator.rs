@@ -3175,7 +3175,7 @@ fn check_data_dir(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Data Directory",
             format!("{} — missing", cfg.data.dir.display()),
-            "you can create the data directory and DB with agentdesk doctor --fix.",
+            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
         )
         .with_path(cfg.data.dir.display().to_string())
         .with_expected_actual("data directory exists", "data directory missing")
