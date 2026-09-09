@@ -375,6 +375,21 @@ src/
 │   ├── agent_quality/
 │   │   ├── mod.rs
 │   │   └── regression_alerts.rs
+│   ├── agent_recovery/
+│   │   ├── durable/
+│   │   │   ├── operations.rs
+│   │   │   └── postgres_tests.rs
+│   │   ├── admission.rs
+│   │   ├── checkpoint.rs
+│   │   ├── context.rs
+│   │   ├── detector.rs
+│   │   ├── durable.rs
+│   │   ├── handoff.rs
+│   │   ├── lifecycle.rs
+│   │   ├── mod.rs
+│   │   ├── policy.rs
+│   │   ├── restore.rs
+│   │   └── tests.rs
 │   ├── agents/
 │   │   ├── mod.rs
 │   │   ├── query.rs
@@ -584,8 +599,10 @@ src/
 │   │   │   │   └── verdict.rs
 │   │   │   ├── recovery/
 │   │   │   │   ├── leak_recovery_ledger.rs
+│   │   │   │   ├── live_agent_recovery.rs
 │   │   │   │   ├── self_watchdog.rs
 │   │   │   │   ├── stall_alert.rs
+│   │   │   │   ├── stop_result.rs
 │   │   │   │   └── watchdog_decisions.rs
 │   │   │   ├── stall_liveness/
 │   │   │   │   └── redrive_grace.rs
@@ -735,6 +752,8 @@ src/
 │   │   │   ├── memory_guidance.rs
 │   │   │   ├── mod.rs
 │   │   │   └── section_dedupe.rs
+│   │   ├── queue_io/
+│   │   │   └── turn_admission.rs
 │   │   ├── recovery_engine/
 │   │   │   ├── manual_rebind/
 │   │   │   │   ├── adoption.rs
@@ -746,6 +765,8 @@ src/
 │   │   │   │   └── watcher_claim.rs
 │   │   │   ├── rebind_runtime/
 │   │   │   │   └── codex_relay_generation.rs
+│   │   │   ├── restore_inflight/
+│   │   │   │   └── output_paths.rs
 │   │   │   ├── analytics_transcript.rs
 │   │   │   ├── completion_delivery.rs
 │   │   │   ├── crash_resume_guard.rs
