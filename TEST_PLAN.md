@@ -2,9 +2,14 @@
 
 ## Queue Hygiene & Merge-Readiness
 - **Duplicate Checks:** Before starting work, check open PRs for duplicates. If your generated inventory refresh or PR overlaps with existing open PRs, stop and report a no-change overlap.
-- **Strict No-Change Verification:** A "no-change" report MUST have exactly zero changed files. Verify using `gh pr view --json files`. If a PR claims "no change" but modifies files (e.g. migrations, routines), it is unsafe. If an empty no-change PR is unavoidably created, its body must explicitly list the exact overlapping PR numbers and branches.
+- **Strict No-Change Verification:** A "no-change" report MUST have exactly zero changed files. Verify using `gh pr view --json files`. If a PR claims "no change" but modifies files (e.g. migrations, routines), it is unsafe. To guarantee exactly zero changed files after running test or generator scripts, execute `git reset --hard` before running pre-commit verifications like `git diff --check`. If an empty no-change PR is unavoidably created, its body must explicitly list the exact overlapping PR numbers and branches.
 - **Stale Branch Cleanup:** Treat low-signal or stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place. A no-change result should NOT become a PR unless it explicitly changes a queue-hygiene artifact.
 - **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
+- **Merge Readiness State:** Do not claim merge-ready from partial check status; pending or UNKNOWN mergeability must be explicitly called out.
+
+## Planning Requirements
+- Execution plans must include a specific verification step before pre-commit that explicitly lists commands to run all relevant tests (e.g., `cargo check --all-targets`, `cargo test`) and verify git state (e.g., `git diff --check`), even for no-change reports.
+- The pre-commit step description in the plan must exactly read: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.'
 
 ## PR Body Requirements
 Every PR must include:
