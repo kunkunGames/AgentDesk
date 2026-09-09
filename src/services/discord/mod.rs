@@ -158,6 +158,7 @@ mod tui_task_card;
 mod turn_bridge;
 #[allow(clippy::too_many_arguments)]
 mod turn_finalizer;
+pub(crate) mod turn_lease;
 mod turn_view_reconciler;
 mod voice_acknowledgement;
 mod voice_background_driver;
@@ -1171,12 +1172,6 @@ impl SharedData {
         self.mailboxes.handle(channel_id)
     }
 
-    /// #3293: non-creating mailbox lookup for probes — `mailbox()` mints a
-    /// permanent registry entry for any channel id it is asked about.
-    fn mailbox_peek(&self, channel_id: ChannelId) -> Option<ChannelMailboxHandle> {
-        self.mailboxes.peek(channel_id)
-    }
-
     fn health_registry(&self) -> Option<Arc<health::HealthRegistry>> {
         self.health_registry.upgrade()
     }
@@ -2182,7 +2177,7 @@ async fn apply_queue_exit_feedback(
     // #5035: the edit-or-delete pair is now `teardown_exit_body`, reachable
     // only with a gate-issued token.
     for (card, teardown) in released_cards {
-        queued_card_gate::teardown_exit_body(&http, shared, teardown, card.kind).await;
+        queued_card_gate::teardown_exit_body(&http, shared, teardown, card).await;
     }
 
     queue_marker::drain_queue_exit_markers(shared, &http, channel_id, &queue_exit_events).await;

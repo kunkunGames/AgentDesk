@@ -171,4 +171,40 @@ mod tests {
             None
         ));
     }
+
+    #[test]
+    fn same_provider_fallback_never_admits_owner_or_unscoped_turns() {
+        let mut runtime = enabled_runtime();
+        runtime.observe(ObserveInput {
+            channel_id: CHANNEL.into(),
+            primary_turn_id: "turn".into(),
+            signal: DetectorSignal::TurnRateLimit,
+        });
+        let state = runtime.states.get_mut(CHANNEL).unwrap();
+        state.context.as_mut().unwrap().owner_provider = "codex".into();
+        let lease = RecoveryLease::from_state(state);
+        assert!(!allows(state, &ProviderKind::Codex, None, Some(&lease)));
+        assert!(!allows(
+            state,
+            &ProviderKind::Codex,
+            Some("claude"),
+            Some(&lease)
+        ));
+        assert!(allows(
+            state,
+            &ProviderKind::Codex,
+            Some("monitoring"),
+            Some(&lease)
+        ));
+        runtime.acknowledge_start(&lease).unwrap();
+        let state = &runtime.states[CHANNEL];
+        assert!(!allows(state, &ProviderKind::Codex, None, None));
+        assert!(!allows(state, &ProviderKind::Codex, Some("claude"), None));
+        assert!(allows(
+            state,
+            &ProviderKind::Codex,
+            Some("monitoring"),
+            None
+        ));
+    }
 }

@@ -55,6 +55,44 @@
 
 ## Read This First
 
+- Giant ledger repair (#5745): `pr_ledger_repair` accepts changes confined to
+  the registry, issue metadata, closed-issue transition list, and giant pin
+  baseline. Production measurements and registrations stay identical except
+  for forward `shrink` deadlines. Each extension is at most 92 days; the number
+  of distinct shrink deadlines cannot increase (a singleton date may move).
+  Put `# DEADLINE RESET <old> -> <new> on <date> (#<issue>)` inside `[[entry]]`,
+  in the continuous comment run immediately before its unique `file =` line.
+  Dates must be calendar-valid and the issue number positive; trailing prose
+  is allowed. Each moved path appends exactly one record, up to two total.
+  Preserve each existing record's order, owning path, and complete comment
+  text through the next marker or `file =`; use `#`, not blank physical lines.
+  Unmoved paths preserve their records too. Real entry retirement removes its
+  comments using the existing exact-deletion rule.
+  Transition deletion requires measured retirement in both snapshots:
+  unregistered, present, and below 1000 production lines, regardless of issue
+  state. Issue ratchets cannot rise; pins cannot rise or disappear, and new
+  pins equal measured production LoC. Existing inventory/audit checks remain.
+  Both archived pin files must strictly parse to nonempty maps equal to the
+  actual audit loader's interpretation, including keys and values. Malformed,
+  duplicate, missing, empty, or differently interpreted input rejects repair;
+  even canonicalizing a divergent base needs separate diagnosis. A reviewed
+  consumer-source repair can preserve frozen blobs and restore interpretation;
+  it must assess existing authority and newly exposed overruns before landing.
+  This is not an automatic corrupt-base recovery or a freshness exception.
+  The running candidate consumer reads both explicit archive paths. Its imports
+  remain reviewed source: the evaluator digest does not cover that whole chain.
+  Agreement covers interpretation; audit allowlists and the >=1000 production
+  threshold still control enforcement. Below-threshold files are not audited
+  merely because their pin is lower. Main's record path is not an agreement
+  scan; verify main's pin agreement before landing. Separate #5745 follow-up
+  for the CI maintenance owner: harden the audit's empty-baseline return.
+  Refresh metadata with `scripts/refresh_giant_file_issue_metadata.py` and land
+  it before the base snapshot exceeds 30 days; a fresh candidate cannot repair
+  a stale base. Refresh before A+B when feasible: after landing, metadata-only
+  updates use this ledger mode and require valid pin interpretation too.
+  Two resets permit at most 184 additional deadline days for the
+  same surviving registration. They do not permit `keep` reclassification or
+  guarantee decomposition: after the final deadline, overdue blocking remains.
 - "giant-file" = `>= 1000` **production** lines per
   `scripts/generate_inventory_docs.py` (lines inside `#[cfg(test)] mod` blocks
   are excluded; see the `Prod` column in `module-inventory.md`). Frozen giant
@@ -172,6 +210,20 @@ time for diagnostics; neither is a stored approval value.
   symlinks, perform I/O, or define a global path catalog. This surface changes
   no open, append, rotate, truncate, cleanup, configuration, or cutover caller.
 
+
+### `restart_shutdown_transport`
+
+- canonical_modules: `services::discord::shared_state` owns `ShutdownReader`
+  (`load` + `Clone` only; `RestartLifecycle::shutdown_reader` is its one
+  constructor) and the seven `legacy_*` restart-flag writer adapters. Shutdown
+  observers take a reader; the four `runtime_bootstrap` writers call an adapter.
+- invariants: each adapter stores exactly the flags its original call site
+  stored, in the same order and with the same `SeqCst` ordering.
+- non_guarantees: #5485 S2a preserves behaviour and does NOT close #5485.
+  `legacy_*` is convention, not owner enforcement — the raw fields stay
+  `pub(in crate::services)` and ownerless rollback remains until S2b. Its only
+  enforcement is `TransportLegacyInventoryTests` in
+  `tests/test_intake_outbox_done_writer_call_sites.py` (#5485).
 
 ### `writer_gate_ci_wiring`
 
@@ -1023,8 +1075,12 @@ time for diagnostics; neither is a stored approval value.
     helper additionally fires the Claude-only AgentDesk-side `/compact` injection
     when exact token usage crosses the model-aware threshold formed from
     `context_compact_percent_claude` and
-    `context_compact_lower_bound_tokens` (default 300,000). Claude launch scripts
-    use `CLAUDE_CODE_AUTO_COMPACT_WINDOW` only when that absolute window is valid;
+    `context_compact_lower_bound_tokens` (default 300,000). New Claude TUI launch
+    scripts always unset then export `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the
+    YAML-only `runtime.context_compact_window_claude` setting (default 700,000,
+    clamped at launch to 100,000..=1,000,000), independently of model. Existing
+    panes are unchanged; AgentDesk-side automatic injection remains until native
+    compaction and continuation are demonstrated (#5172 R2);
     see `src/services/claude_compact_trigger.rs` and
     `src/services/claude_compact_context.rs`.
     +19 from #3296: the aborted-anchor reconcile chokepoint — on a body-visible

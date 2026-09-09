@@ -1,6 +1,3 @@
-mod rate_limit_sync;
-use rate_limit_sync::{rate_limit_sync_loop, upsert_rate_limit_cache_entry};
-
 pub(crate) mod cluster;
 pub(crate) mod cluster_session_routing;
 pub(crate) mod cron_catalog;
@@ -13,8 +10,10 @@ pub(crate) mod maintenance;
 pub(crate) mod multinode_regression;
 mod outbox_actionable_delivery;
 mod outbox_delivery_alert;
+mod rate_limit_sync;
 pub(crate) mod resource_locks;
 pub mod routes;
+mod routine_script_audit;
 mod startup_preflight;
 pub(crate) mod task_dispatch_claims;
 pub(crate) mod test_phase_runs;
@@ -969,6 +968,39 @@ async fn record_periodic_job_execution_pg(
     upsert_kv_meta_pg_ignore(pg_pool, &key_duration, &elapsed_ms).await;
 }
 
+/// Background task that periodically fetches rate-limit data from external providers
+/// and caches it in the `rate_limit_cache` table for the dashboard API.
+async fn upsert_rate_limit_cache_entry(
+    pg_pool: &PgPool,
+    provider: &str,
+    profile_id: &str,
+    data: &str,
+    fetched_at: i64,
+) {
+    let profile_id = if profile_id.trim().is_empty() {
+        "default"
+    } else {
+        profile_id
+    };
+    if let Err(error) = sqlx::query(
+        "INSERT INTO rate_limit_cache (provider, profile_id, data, fetched_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (provider, profile_id)
+         DO UPDATE SET data = EXCLUDED.data, fetched_at = EXCLUDED.fetched_at",
+    )
+    .bind(provider)
+    .bind(profile_id)
+    .bind(data)
+    .bind(fetched_at)
+    .execute(pg_pool)
+    .await
+    {
+        tracing::warn!(
+            "[rate-limit-sync] failed to upsert rate_limit_cache row for {provider}: {error}"
+        );
+    }
+}
+
 fn rate_limit_upsert_conflict_target() -> &'static str {
     "(provider, profile_id)"
 }
@@ -976,7 +1008,7 @@ fn rate_limit_upsert_conflict_target() -> &'static str {
 #[cfg(test)]
 mod rate_limit_profile_tests {
     #[test]
-    fn test_011_upsert_conflict_is_provider_and_profile() {
+    fn upsert_conflict_is_provider_and_profile() {
         assert_eq!(
             super::rate_limit_upsert_conflict_target(),
             "(provider, profile_id)"
@@ -1075,7 +1107,11 @@ pub(crate) async fn trigger_claude_rate_limit_refresh_if_leader(
         return ClaudeRateLimitRefreshOutcome::skipped("rate_limit_sync_not_active_on_this_node");
     }
 
-    match sync_claude_rate_limit_cache_once_and_refresh_dispatch_gate_serialized(pg_pool).await {
+    match rate_limit_sync::sync_claude_rate_limit_cache_once_and_refresh_dispatch_gate_serialized(
+        pg_pool,
+    )
+    .await
+    {
         Ok(_) => ClaudeRateLimitRefreshOutcome {
             triggered: true,
             dispatch_gate_refreshed: true,
@@ -1084,54 +1120,6 @@ pub(crate) async fn trigger_claude_rate_limit_refresh_if_leader(
             error: None,
         },
         Err(error) => ClaudeRateLimitRefreshOutcome::failed(error),
-    }
-}
-
-async fn sync_claude_rate_limit_cache_once_serialized(
-    pg_pool: &PgPool,
-) -> Result<usize, anyhow::Error> {
-    let _guard = claude_rate_limit_refresh_lock().lock().await;
-    sync_claude_rate_limit_cache_once(pg_pool).await
-}
-
-async fn sync_claude_rate_limit_cache_once_and_refresh_dispatch_gate_serialized(
-    pg_pool: &PgPool,
-) -> Result<usize, anyhow::Error> {
-    let _guard = claude_rate_limit_refresh_lock().lock().await;
-    let bucket_count = sync_claude_rate_limit_cache_once(pg_pool).await?;
-    refresh_dispatch_gate_snapshots(pg_pool).await;
-    Ok(bucket_count)
-}
-
-async fn refresh_dispatch_gate_snapshots_serialized(pg_pool: &PgPool) {
-    let _guard = claude_rate_limit_refresh_lock().lock().await;
-    refresh_dispatch_gate_snapshots(pg_pool).await;
-}
-
-async fn sync_claude_rate_limit_cache_once(pg_pool: &PgPool) -> Result<usize, anyhow::Error> {
-    // Priority: 1) OAuth token (Claude Code subscription), 2) ANTHROPIC_API_KEY.
-    let claude_result =
-        if let Some(token) = crate::services::provider_auth::claude_oauth_token_blocking().await {
-            fetch_claude_oauth_usage(&token).await
-        } else if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            fetch_anthropic_rate_limits(&api_key).await
-        } else {
-            Err(anyhow::anyhow!("no Claude credentials found"))
-        };
-
-    match claude_result {
-        Ok(buckets) => {
-            let bucket_count = buckets.len();
-            let data = serde_json::json!({ "buckets": buckets }).to_string();
-            let now = chrono::Utc::now().timestamp();
-            upsert_rate_limit_cache_entry(pg_pool, "claude", "default", &data, now).await;
-            tracing::info!("[rate-limit-sync] Claude: {} buckets cached", bucket_count);
-            Ok(bucket_count)
-        }
-        Err(e) => {
-            tracing::warn!("[rate-limit-sync] Claude rate_limit fetch failed: {e}");
-            Err(e)
-        }
     }
 }
 
@@ -1182,58 +1170,6 @@ mod policy_tick_schedule_tests {
         assert!(is_five_min_policy_tick(10));
         assert!(is_five_min_policy_tick(20));
     }
-}
-
-/// Fetch rate limits from the Anthropic API via the count_tokens endpoint (free, no token cost).
-/// Parses `anthropic-ratelimit-*` response headers into bucket format.
-async fn fetch_anthropic_rate_limits(
-    api_key: &str,
-) -> Result<Vec<serde_json::Value>, anyhow::Error> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages/count_tokens")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": "claude-haiku-4-5-20251001",
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .send()
-        .await?;
-
-    let headers = resp.headers().clone();
-    let mut buckets = Vec::new();
-
-    // Parse requests bucket
-    if let Some(limit) = parse_header_i64(&headers, "anthropic-ratelimit-requests-limit") {
-        let remaining =
-            parse_header_i64(&headers, "anthropic-ratelimit-requests-remaining").unwrap_or(limit);
-        let reset = parse_header_reset(&headers, "anthropic-ratelimit-requests-reset");
-        buckets.push(serde_json::json!({
-            "name": "requests",
-            "limit": limit,
-            "used": limit - remaining,
-            "remaining": remaining,
-            "reset": reset,
-        }));
-    }
-
-    // Parse tokens bucket
-    if let Some(limit) = parse_header_i64(&headers, "anthropic-ratelimit-tokens-limit") {
-        let remaining =
-            parse_header_i64(&headers, "anthropic-ratelimit-tokens-remaining").unwrap_or(limit);
-        let reset = parse_header_reset(&headers, "anthropic-ratelimit-tokens-reset");
-        buckets.push(serde_json::json!({
-            "name": "tokens",
-            "limit": limit,
-            "used": limit - remaining,
-            "remaining": remaining,
-            "reset": reset,
-        }));
-    }
-
-    Ok(buckets)
 }
 
 /// Fetch rate limits from the OpenAI API via the models endpoint (free, read-only).
@@ -1370,35 +1306,6 @@ mod rate_limit_header_tests {
             Some(1_781_654_400)
         );
     }
-}
-
-/// Fetch Claude usage via OAuth API (subscription-based, no API key needed).
-/// Returns utilization-based buckets (5h, 7d).
-async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
-    let client = reqwest::Client::builder()
-        .timeout(CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT)
-        .build()?;
-    let resp = client
-        .get("https://api.anthropic.com/api/oauth/usage")
-        .header("accept", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", "agentdesk/1.0.0")
-        .send()
-        .await?;
-
-    if resp.status() == 429 {
-        return Err(anyhow::anyhow!("Claude OAuth usage API rate limited (429)"));
-    }
-    if !resp.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Claude OAuth usage API returned {}",
-            resp.status()
-        ));
-    }
-
-    let data: serde_json::Value = resp.json().await?;
-    Ok(parse_claude_oauth_usage_buckets(&data))
 }
 
 fn push_claude_oauth_usage_bucket(
@@ -1543,6 +1450,7 @@ mod claude_oauth_usage_tests {
     }
 }
 
+/// Fetch Codex usage via chatgpt.com backend API (subscription-based, no API key needed).
 async fn fetch_codex_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let client = reqwest::Client::new();
     let resp = client
@@ -2947,7 +2855,7 @@ where
             }
         } else {
             let error_text = format!("{status}: {err_text}");
-            let action = message_outbox_failure_action(row.retry_count);
+            let action = outbox_actionable_delivery::failure_action(row);
             match action {
                 MessageOutboxFailureAction::Fail { retry_count } => {
                     let failed_update = mark_message_outbox_failed_pg(
@@ -3123,8 +3031,8 @@ async fn routine_runtime_loop(
     tick_interval_secs: u64,
 ) {
     use crate::services::routines::{
-        RoutineAction, RoutineAgentExecutor, RoutineDiscordLogger, RoutineScriptLoader,
-        RoutineStore, poll_agent_turns, run_due_tick,
+        RoutineAction, RoutineAgentExecutor, RoutineDiscordLogger, RoutineStore, poll_agent_turns,
+        run_due_tick,
     };
     let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
         tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
@@ -3137,9 +3045,7 @@ async fn routine_runtime_loop(
     let routine_script_dirs = routines_config.script_dirs();
     let initial_script_dirs = routine_script_dirs.clone();
     let script_loader = match tokio::task::spawn_blocking(move || {
-        let loader = Arc::new(RoutineScriptLoader::new_shared(&initial_script_dirs)?);
-        let count = loader.load_dirs(&initial_script_dirs)?;
-        Ok::<_, anyhow::Error>((loader, count))
+        routine_script_audit::load_registry(&initial_script_dirs)
     })
     .await
     {
@@ -3162,6 +3068,7 @@ async fn routine_runtime_loop(
         routines_config.default_timezone.clone(),
         routines_config.max_checkpoint_bytes,
     );
+    routine_script_audit::warn_once_unregistered(pg_pool.as_ref(), &routine_script_dirs).await;
     let discord_logger = RoutineDiscordLogger::new_with_health_registry(
         pg_pool.clone(),
         health_registry.clone(),

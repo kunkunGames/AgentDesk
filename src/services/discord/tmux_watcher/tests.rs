@@ -1291,7 +1291,8 @@ fn pre_panel_release_decrements_before_same_channel_followup_claims() {
             .insert(channel_id, ChannelId::new(555_4106));
         assert!(
             super::release_restored_watcher_active_turn_before_panel_edit(
-                &shared, &provider, channel_id, turn_a,
+                &shared, &provider, Some(crate::services::discord::turn_finalizer::TurnKey::new(
+                    channel_id, turn_a, shared.restart.current_generation)),
             )
             .await,
             "the pre-panel hoist must release and decrement turn A before the awaited edit"
@@ -2718,6 +2719,30 @@ fn orphan_turn_placeholder_reclaim_decision() {
         false,
         "⠸ 계속 처리 중"
     ));
+}
+
+#[test]
+fn orphan_reclaim_preserves_actual_panel_footer_answers() {
+    use crate::services::discord::single_message_panel::compose_footer_status_block as compose;
+    let multiline =
+        crate::services::discord::placeholder_live_events::multiline_panels_for_probe_tests()
+            .into_iter()
+            .map(|panel| format!("실제 답변\n{}", compose("⠸", &panel)));
+    for answer in
+        crate::services::discord::placeholder_live_events::rendered_answers_for_probe_tests()
+            .into_iter()
+            .chain(multiline)
+    {
+        assert!(
+            !watcher_should_reclaim_orphan_turn_placeholder(
+                true,
+                Some(MessageId::new(5305)),
+                false,
+                &answer
+            ),
+            "real answer must not authorize placeholder deletion: {answer:?}"
+        );
+    }
 }
 
 #[test]

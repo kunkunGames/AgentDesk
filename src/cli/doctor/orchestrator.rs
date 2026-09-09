@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use super::contract::{DoctorProfile, FixSafety, RunContext, SecurityExposure, Severity};
 use super::{health, mailbox};
+
+mod config_dir_checks;
+mod relay_notifications;
 use crate::cli::dcserver;
 use crate::config;
 use crate::services::operator_connectors::{
@@ -458,7 +461,6 @@ fn provider_connected(snapshot: &HealthSnapshot, provider: &ProviderKind) -> Opt
 
 fn configured_provider_names(cfg: &config::Config, snapshot: &HealthSnapshot) -> BTreeSet<String> {
     let mut configured = BTreeSet::new();
-
     for agent in &cfg.agents {
         if let Some(provider) = ProviderKind::from_str(&agent.provider) {
             configured.insert(provider.as_str().to_string());
@@ -548,7 +550,6 @@ fn check_qwen_settings_files(configured: bool) -> Check {
         ("project settings", qwen_project_settings_path()),
         ("system settings", qwen_system_settings_path()),
     ];
-
     let found: Vec<String> = candidates
         .iter()
         .filter_map(|(label, path)| {
@@ -900,9 +901,11 @@ fn build_core_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Che
         check_health_db_dashboard(snapshot),
         check_dispatch_outbox(snapshot),
         check_config_audit(snapshot),
+        relay_notifications::check(cfg),
         check_runtime_root(),
-        check_data_dir(cfg),
-        check_policies_dir(cfg),
+        config_dir_checks::check_data_dir(cfg),
+        config_dir_checks::check_policies_dir(cfg),
+        config_dir_checks::check_routine_script_registration(cfg),
         check_tmux(),
         check_service_manager(),
         check_postgres_connection(cfg),
@@ -3033,53 +3036,6 @@ fn check_mailbox_consistency(snapshot: &HealthSnapshot) -> Vec<Check> {
             ])
         })
         .collect()
-}
-
-fn check_policies_dir(cfg: &config::Config) -> Check {
-    if cfg.policies.dir.exists() && cfg.policies.dir.is_dir() {
-        Check::ok(
-            "policies_directory",
-            CheckGroup::Core,
-            "Policies Directory",
-            format!("{}", cfg.policies.dir.display()),
-        )
-        .with_path(cfg.policies.dir.display().to_string())
-        .with_expected_actual("policies directory exists", "policies directory exists")
-    } else {
-        Check::fail(
-            "policies_directory",
-            CheckGroup::Core,
-            "Policies Directory",
-            format!("{} — missing", cfg.policies.dir.display()),
-            "Create a policies folder at this path or correct the policies.dir path in agentdesk.yaml.",
-        )
-        .with_path(cfg.policies.dir.display().to_string())
-        .with_expected_actual("policies directory exists", "policies directory missing")
-    }
-}
-
-fn check_data_dir(cfg: &config::Config) -> Check {
-    if cfg.data.dir.exists() && cfg.data.dir.is_dir() {
-        Check::ok(
-            "data_directory",
-            CheckGroup::Core,
-            "Data Directory",
-            format!("{}", cfg.data.dir.display()),
-        )
-        .with_path(cfg.data.dir.display().to_string())
-        .with_expected_actual("data directory exists", "data directory exists")
-    } else {
-        Check::fail(
-            "data_directory",
-            CheckGroup::Core,
-            "Data Directory",
-            format!("{} — missing", cfg.data.dir.display()),
-            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
-        )
-        .with_path(cfg.data.dir.display().to_string())
-        .with_expected_actual("data directory exists", "data directory missing")
-        .with_next_steps(vec!["agentdesk doctor --fix".to_string()])
-    }
 }
 
 #[cfg(target_os = "macos")]

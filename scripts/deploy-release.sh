@@ -1850,10 +1850,12 @@ fi
 if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     if [ "$DEPLOY_BUILD_PROFILE" = "release" ]; then
         echo "▸ Building release binary..."
-        (cd "$REPO" && cargo build --release --bin agentdesk)
+        # Serialized behind the build token (#5663).
+        (cd "$REPO" && python3 scripts/build_token.py -- cargo build --release --bin agentdesk)
     else
         echo "▸ Building ${DEPLOY_BUILD_PROFILE} binary (opt-in fast deploy profile)..."
-        (cd "$REPO" && cargo build --profile "$DEPLOY_BUILD_PROFILE" --bin agentdesk)
+        (cd "$REPO" && python3 scripts/build_token.py -- \
+            cargo build --profile "$DEPLOY_BUILD_PROFILE" --bin agentdesk)
     fi
     # Cargo tracks embedded migration inputs via build.rs. The freshness gate
     # below is mtime-based, and a successful current-HEAD cargo build can still
@@ -1879,7 +1881,6 @@ rm -rf "$DIST_STAGED"
 cp -r "$DASHBOARD_SOURCE" "$DIST_STAGED"
 
 # Stage agent prompt files atomically (source-of-truth: Obsidian vault, private).
-# Agent prompts contain operator-specific content and are NOT tracked in this repo.
 # See docs/source-of-truth.md.
 OBSIDIAN_DEFAULT_VAULT_ROOT="$HOME/ObsidianVault"
 if [ -d "$ADK_REL/ObsidianVault" ]; then
@@ -1892,6 +1893,7 @@ if [ -d "$OBSIDIAN_AGENTS_SRC" ]; then
     rm -rf "$PROMPTS_STAGED"
     mkdir -p "$PROMPTS_STAGED"
     rsync -a "$OBSIDIAN_AGENTS_SRC/" "$PROMPTS_STAGED/"
+    if ! python3 "$REPO/scripts/check_prompt_api_routes.py" --repo "$REPO" --prompts "$PROMPTS_STAGED"; then echo "⚠ Prompt API route inspection warning; core release deploy will continue."; fi
 else
     if [ -n "${AGENTDESK_OBSIDIAN_AGENTS_SRC:-}" ]; then
         echo "⚠ Optional connector obsidian_agent_prompts invalid: $OBSIDIAN_AGENTS_SRC"

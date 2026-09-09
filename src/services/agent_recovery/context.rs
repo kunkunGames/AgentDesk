@@ -32,13 +32,13 @@ impl RecoveryContext {
             fallback_provider: fallback.as_str().to_string(),
             owner_model: binding.owner_model.clone(),
             owner_auth_profile: Some(binding.owner_auth_profile.clone()),
-            fallback_auth_profile: Some(
-                catalog
+            fallback_auth_profile: Some(super::policy::effective_auth_profile(
+                None,
+                &catalog
                     .agents
                     .get(&binding.policy.as_ref()?.fallback_agent_id)?
-                    .auth_profile
-                    .clone(),
-            ),
+                    .auth_profile,
+            )),
             last_provider_error_at: None,
             workspace: binding.workspace.clone(),
         })

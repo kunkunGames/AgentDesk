@@ -392,11 +392,10 @@ pub fn build_recovery_catalog(
                     .or(owner.provider.as_deref())
                     .and_then(ProviderKind::from_str)
                     .expect("recovery owner provider was validated above");
-                let owner_profile = channel
-                    .auth_profile
-                    .as_deref()
-                    .unwrap_or(&owner.auth_profile);
-                let fallback_profile = &agent_map[fallback_id].auth_profile;
+                let owner_profile =
+                    effective_auth_profile(channel.auth_profile.as_deref(), &owner.auth_profile);
+                let fallback_profile =
+                    effective_auth_profile(None, &agent_map[fallback_id].auth_profile);
                 if fallback_provider == owner_provider
                     && (owner_profile == fallback_profile
                         || !crate::services::provider_auth_profile::extra_account_login_supported(
@@ -432,10 +431,10 @@ pub fn build_recovery_catalog(
                 owner_agent_id: channel.agent.clone(),
                 owner_provider,
                 owner_model: owner.model.clone(),
-                owner_auth_profile: channel
-                    .auth_profile
-                    .clone()
-                    .unwrap_or_else(|| owner.auth_profile.clone()),
+                owner_auth_profile: effective_auth_profile(
+                    channel.auth_profile.as_deref(),
+                    &owner.auth_profile,
+                ),
                 workspace,
                 policy,
             },
@@ -543,4 +542,13 @@ fn first_non_empty(primary: Option<String>, secondary: Option<String>) -> Option
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+}
+
+pub(super) fn effective_auth_profile(channel: Option<&str>, agent: &str) -> String {
+    channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(agent.trim()).filter(|value| !value.is_empty()))
+        .unwrap_or("default")
+        .to_string()
 }

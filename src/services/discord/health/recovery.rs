@@ -2113,7 +2113,7 @@ pub(crate) async fn run_stall_watchdog_pass(
         if !stall_alert::should_page_suspected_stall(liveness_decision.as_ref()) {
             continue;
         }
-        stall_liveness::log_stall_watchdog_force_cleanup_judgment(
+        stall_liveness::log_stall_watchdog_page_judgment(
             provider,
             channel_id,
             &snapshot,
@@ -2483,8 +2483,7 @@ async fn maybe_recover_completed_stale_leak(
         discord::inflight::persist_leak_recovery_response_offset_if_matches_identity_locked(
             provider,
             channel_id.get(),
-            &discord::inflight::InflightTurnIdentity::from_state(&state),
-            state.current_msg_id,
+            &state,
             end,
         );
     if matches!(
@@ -3148,7 +3147,6 @@ mod stall_watchdog_pure_tests {
         snapshot.full_response = "already relayed plus recovered tail".to_string();
         snapshot.response_sent_offset = 7;
         inflight::save_inflight_state(&snapshot).expect("seed leak snapshot row");
-        let identity = InflightTurnIdentity::from_state(&snapshot);
         let delivered_offset = snapshot.full_response.len();
 
         let mut concurrent = inflight::load_inflight_state(&provider, channel_id.get())
@@ -3161,8 +3159,7 @@ mod stall_watchdog_pure_tests {
         let outcome = inflight::persist_leak_recovery_response_offset_if_matches_identity_locked(
             &provider,
             channel_id.get(),
-            &identity,
-            snapshot.current_msg_id,
+            &snapshot,
             delivered_offset,
         );
 
@@ -4667,6 +4664,7 @@ mod stall_watchdog_auto_heal_tests {
                 output_len,
                 "axis-b-watchdog-session",
             );
+            state.turn_nonce = token.turn_nonce().map(str::to_owned);
             let stale_at = (chrono::Local::now() - chrono::Duration::minutes(30))
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();
