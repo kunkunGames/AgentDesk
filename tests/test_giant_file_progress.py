@@ -950,8 +950,8 @@ class GiantFileLedgerIntegrationTest(unittest.TestCase):
                     G.giant_file_snapshot(root)
 
     def run_main(self, before, after, now):
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
-               "GFP_HEAD_REPOSITORY": "itismyfield/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
+        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "kunkunGames/AgentDesk",
+               "GFP_HEAD_REPOSITORY": "kunkunGames/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
                "GFP_BASE_SHA": "base", "GFP_HEAD_SHA": "head"}
         def git(*args, **kwargs):
             if args[0] in {"status", "fetch"}:
