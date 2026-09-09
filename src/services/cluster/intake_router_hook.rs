@@ -101,6 +101,7 @@ pub(crate) enum ObservedIntakeOutcome {
     },
     WouldAssignNoOwnerToTarget {
         target_instance_id: String,
+        basis: IntakeRoutingBasis,
     },
     WouldKeepNoOwnerLocal {
         reason: RanLocalReason,
@@ -765,6 +766,11 @@ async fn route_to_instance(
             ObserveTargetKind::NodeOverride | ObserveTargetKind::PreferredLabels => {
                 ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                     target_instance_id: target.to_string(),
+                    basis: match observe_target_kind {
+                        ObserveTargetKind::NodeOverride => IntakeRoutingBasis::NodeOverride,
+                        ObserveTargetKind::PreferredLabels => IntakeRoutingBasis::PreferredLabels,
+                        _ => unreachable!(),
+                    },
                 }
             }
         };
@@ -827,10 +833,15 @@ async fn route_to_instance(
                 }
             }
             Some(IntakeInsertConflict::DuplicateMessageAttempt) => {
+                let kind_str = match observe_target_kind {
+                    ObserveTargetKind::LiveForeignOwner => "live foreign owner",
+                    ObserveTargetKind::NodeOverride => "node override",
+                    ObserveTargetKind::PreferredLabels => "preferred labels",
+                };
                 tracing::info!(
                     channel_id = ctx.channel_id,
                     user_msg_id = ctx.user_msg_id,
-                    "[intake_router] duplicate Discord message (node override) — existing row already covers it; skipping local execution"
+                    "[intake_router] duplicate Discord message ({kind_str}) — existing row already covers it; skipping local execution"
                 );
                 IntakeRouterDecision::SkippedDuplicate { resolved_owner }
             }
@@ -1159,7 +1170,8 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
-                    target_instance_id: "worker-mac".to_string()
+                    target_instance_id: "worker-mac".to_string(),
+                    basis: IntakeRoutingBasis::NodeOverride,
                 }
             }
         );
