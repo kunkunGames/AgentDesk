@@ -2111,7 +2111,7 @@ pub(crate) async fn run_stall_watchdog_pass(
         if !stall_alert::should_page_suspected_stall(liveness_decision.as_ref()) {
             continue;
         }
-        stall_liveness::log_stall_watchdog_force_cleanup_judgment(
+        stall_liveness::log_stall_watchdog_page_judgment(
             provider,
             channel_id,
             &snapshot,
@@ -4690,6 +4690,7 @@ mod stall_watchdog_auto_heal_tests {
                 output_len,
                 "axis-b-watchdog-session",
             );
+            state.turn_nonce = token.turn_nonce().map(str::to_owned);
             let stale_at = (chrono::Local::now() - chrono::Duration::minutes(30))
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string();

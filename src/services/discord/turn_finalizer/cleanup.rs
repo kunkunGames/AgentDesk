@@ -258,6 +258,7 @@ pub(super) fn enqueue_terminal_status_panel_reconcile(
         return;
     }
     let terminal_status = match event {
+        TerminalEvent::OperatorRelease(_) => return,
         TerminalEvent::Complete => {
             crate::services::discord::abandon_request_store::TerminalCardStatus::Completed
         }
@@ -430,19 +431,28 @@ pub(super) async fn already_finalized_active_state(
     }
 
     let owned_role_override = snapshot_role_override(shared, key.channel_id);
-    let _ = crate::services::discord::inflight::clear_inflight_state_if_matches(
-        provider,
-        key.channel_id.get(),
-        key.user_msg_id,
-    );
+    let captured = match super::episode::claim_normal_episode(shared, provider, key, true).await {
+        Ok(captured) => captured,
+        Err(()) => return,
+    };
+    let finish = if let Some(capture) = captured {
+        capture.publish_release(shared, key);
+        capture.finish
+    } else {
+        let _ = crate::services::discord::inflight::clear_inflight_state_if_matches(
+            provider,
+            key.channel_id.get(),
+            key.user_msg_id,
+        );
 
-    let finish = super::super::mailbox_finish_turn_if_matches(
-        shared,
-        provider,
-        key.channel_id,
-        serenity::model::id::MessageId::new(key.user_msg_id),
-    )
-    .await;
+        super::super::mailbox_finish_turn_if_matches(
+            shared,
+            provider,
+            key.channel_id,
+            serenity::model::id::MessageId::new(key.user_msg_id),
+        )
+        .await
+    };
     let Some(token) = finish.removed_token.as_ref() else {
         return;
     };
@@ -1214,6 +1224,7 @@ mod tests {
                     None,
                     0,
                 );
+                row.turn_nonce = _token.turn_nonce().map(str::to_owned);
                 row.turn_source = TurnSource::ExternalInput;
                 row.set_relay_owner_kind(RelayOwnerKind::Watcher);
                 row.injected_prompt_message_id = Some(tid);
@@ -1727,6 +1738,7 @@ mod tests {
                     None,
                     0,
                 );
+                row.turn_nonce = _token.turn_nonce().map(str::to_owned);
                 row.turn_source = TurnSource::ExternalInput;
                 row.set_relay_owner_kind(RelayOwnerKind::Watcher);
                 row.injected_prompt_message_id = Some(tid);
