@@ -138,11 +138,7 @@ def has_external_dependency_verification_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*external dependency verification:\*\*", body):
         return True
     return has_non_empty_body_field(
-        body,
-        [
-            "external dependency verification",
-            "external-dependency verification",
-        ],
+        body, ["external dependency verification", "external-dependency verification"]
     )
 
 def has_overlap_reference(body):
