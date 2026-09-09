@@ -395,7 +395,9 @@ src/
 │   ├── agent_recovery/
 │   │   ├── durable/
 │   │   │   ├── operations.rs
-│   │   │   └── postgres_tests.rs
+│   │   │   ├── postgres_tests.rs
+│   │   │   └── provider_errors.rs
+│   │   ├── accounts.rs
 │   │   ├── admission.rs
 │   │   ├── checkpoint.rs
 │   │   ├── context.rs
@@ -406,7 +408,8 @@ src/
 │   │   ├── mod.rs
 │   │   ├── policy.rs
 │   │   ├── restore.rs
-│   │   └── tests.rs
+│   │   ├── tests.rs
+│   │   └── wakeup.rs
 │   ├── agents/
 │   │   ├── mod.rs
 │   │   ├── query.rs
@@ -632,6 +635,7 @@ src/
 │   │   │   │   ├── live_agent_recovery.rs
 │   │   │   │   ├── self_watchdog.rs
 │   │   │   │   ├── stall_alert.rs
+│   │   │   │   ├── stall_watchdog_task.rs
 │   │   │   │   ├── stop_result.rs
 │   │   │   │   └── watchdog_decisions.rs
 │   │   │   ├── stall_liveness/
@@ -1150,6 +1154,7 @@ src/
 │   │   │   │   ├── expected_identity.rs
 │   │   │   │   ├── expected_identity_tests.rs
 │   │   │   │   ├── message_conversion.rs
+│   │   │   │   ├── provider_recovery.rs
 │   │   │   │   ├── tool_arms.rs
 │   │   │   │   └── types.rs
 │   │   │   ├── stream_tick/
