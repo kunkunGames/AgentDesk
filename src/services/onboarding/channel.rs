@@ -25,7 +25,7 @@ pub async fn validate_token(body: ValidateTokenBody) -> (StatusCode, Json<serde_
     let client = reqwest::Client::new();
     let resp = client
         .get("https://discord.com/api/v10/users/@me")
-        .header("Authorization", format!("Bot {}", body.token.trim()))
+        .header("Authorization", format!("Bot {}", body.token.trim())) // dummy
         .send()
         .await;
 
