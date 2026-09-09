@@ -76,7 +76,7 @@
 | `src/services/dispatched_sessions.rs` | 1879 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/services/dispatches/discord_delivery/orchestration.rs` | 1502 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/services/dispatches/outbox_route.rs` | 1178 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
-| `src/services/gemini.rs` | 1360 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/services/gemini.rs` | 1359 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/memory/memento.rs` | 1511 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/onboarding/mod.rs` | 2858 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/opencode.rs` | 2768 | shrink | server-runtime | 2027-01-31 | #4710 |  |

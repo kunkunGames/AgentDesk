@@ -469,12 +469,12 @@
 | `services::cluster` | `src/services/cluster/mod.rs` | 35 | 35 | 0 |  |
 | `services::cluster::capability_routing` | `src/services/cluster/capability_routing.rs` | 261 | 261 | 0 |  |
 | `services::cluster::intake_preflight` | `src/services/cluster/intake_preflight.rs` | 838 | 423 | 415 |  |
-| `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 2874 | 927 | 1947 |  |
+| `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 2886 | 938 | 1948 |  |
 | `services::cluster::intake_router_hook::owner_record` | `src/services/cluster/intake_router_hook/owner_record.rs` | 2439 | 944 | 1495 |  |
 | `services::cluster::intake_router_hook::session_owner` | `src/services/cluster/intake_router_hook/session_owner.rs` | 134 | 134 | 0 |  |
 | `services::cluster::intake_routing` | `src/services/cluster/intake_routing.rs` | 351 | 149 | 202 |  |
 | `services::cluster::intake_routing_config` | `src/services/cluster/intake_routing_config.rs` | 317 | 247 | 70 |  |
-| `services::cluster::intake_routing_telemetry` | `src/services/cluster/intake_routing_telemetry.rs` | 479 | 371 | 108 |  |
+| `services::cluster::intake_routing_telemetry` | `src/services/cluster/intake_routing_telemetry.rs` | 485 | 375 | 110 |  |
 | `services::cluster::intake_worker` | `src/services/cluster/intake_worker.rs` | 824 | 585 | 239 |  |
 | `services::cluster::intake_worker_capabilities` | `src/services/cluster/intake_worker_capabilities.rs` | 250 | 191 | 59 |  |
 | `services::cluster::node_registry` | `src/services/cluster/node_registry.rs` | 1091 | 804 | 287 |  |
@@ -1167,7 +1167,7 @@
 | `services::discord::voice_barge_in::stt` | `src/services/discord/voice_barge_in/stt.rs` | 326 | 326 | 0 |  |
 | `services::discord::voice_barge_in::tts_pipeline` | `src/services/discord/voice_barge_in/tts_pipeline.rs` | 86 | 86 | 0 |  |
 | `services::discord::voice_barge_in::turn_dispatch` | `src/services/discord/voice_barge_in/turn_dispatch.rs` | 905 | 905 | 0 |  |
-| `services::discord::voice_barge_in::utility` | `src/services/discord/voice_barge_in/utility.rs` | 92 | 92 | 0 |  |
+| `services::discord::voice_barge_in::utility` | `src/services/discord/voice_barge_in/utility.rs` | 81 | 81 | 0 |  |
 | `services::discord::voice_barge_in::utterance_pipeline` | `src/services/discord/voice_barge_in/utterance_pipeline.rs` | 258 | 258 | 0 |  |
 | `services::discord::voice_config_cache` | `src/services/discord/voice_config_cache.rs` | 79 | 79 | 0 |  |
 | `services::discord::voice_id_sequences` | `src/services/discord/voice_id_sequences.rs` | 69 | 69 | 0 |  |
@@ -1212,7 +1212,7 @@
 | `services::dispatches::wait_queue` | `src/services/dispatches/wait_queue.rs` | 561 | 376 | 185 |  |
 | `services::dispatches_followup` | `src/services/dispatches_followup.rs` | 66 | 66 | 0 |  |
 | `services::escalation_settings` | `src/services/escalation_settings.rs` | 165 | 134 | 31 |  |
-| `services::gemini` | `src/services/gemini.rs` | 1391 | 1360 | 31 | giant-file |
+| `services::gemini` | `src/services/gemini.rs` | 1390 | 1359 | 31 | giant-file |
 | `services::git` | `src/services/git/mod.rs` | 33 | 33 | 0 |  |
 | `services::git::branch_resolver` | `src/services/git/branch_resolver.rs` | 123 | 123 | 0 |  |
 | `services::git::commit_resolver` | `src/services/git/commit_resolver.rs` | 378 | 357 | 21 |  |
