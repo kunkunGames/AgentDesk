@@ -120,12 +120,7 @@
     {
       "path": "src/services/claude.rs",
       "lint": "too_many_arguments",
-      "count": 6
-    },
-    {
-      "path": "src/services/claude/tui_session_launch.rs",
-      "lint": "too_many_arguments",
-      "count": 1
+      "count": 7
     },
     {
       "path": "src/services/claude_e/process.rs",
@@ -180,12 +175,7 @@
     {
       "path": "src/services/codex.rs",
       "lint": "too_many_arguments",
-      "count": 7
-    },
-    {
-      "path": "src/services/codex/process_session_launch.rs",
-      "lint": "too_many_arguments",
-      "count": 1
+      "count": 8
     },
     {
       "path": "src/services/codex_tmux_wrapper.rs",

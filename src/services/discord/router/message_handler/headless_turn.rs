@@ -6,7 +6,26 @@ use routine_metadata::{
     scheduled_snapshot_session_label, session_key_basis_override, valid_routine_metadata,
 };
 
-use routine_metadata::persist_boundary_before_provider_clear;
+async fn persist_boundary_before_provider_clear<B, BFut, C, CFut, E>(
+    persist_boundary: bool,
+    clear_provider: bool,
+    boundary: B,
+    clear: C,
+) -> Result<(), E>
+where
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    if persist_boundary {
+        boundary().await?;
+    }
+    if clear_provider {
+        clear().await;
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn start_headless_turn(
@@ -229,18 +248,12 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             ))
         })?;
     let cancel_token = Arc::new(CancelToken::new());
-    let started = crate::services::agent_recovery::admission::with_turn_identity(
-        early_provider.clone(),
-        early_role_binding
-            .as_ref()
-            .map(|binding| binding.role_id.clone()),
-        super::super::super::mailbox_try_start_turn(
-            shared,
-            channel_id,
-            cancel_token.clone(),
-            request_owner,
-            user_msg_id,
-        ),
+    let started = super::super::super::mailbox_try_start_turn(
+        shared,
+        channel_id,
+        cancel_token.clone(),
+        request_owner,
+        user_msg_id,
     )
     .await;
     if !started {
@@ -1332,7 +1345,6 @@ mod recovery_context_take_order_tests {
             reasoning_effort: None,
             peer_agents_enabled: false,
             quality_feedback_injection_enabled: false,
-            auth_profile: "default".to_string(),
             memory: Default::default(),
         };
         let built = build_system_prompt_with_manifest(

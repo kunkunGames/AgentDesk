@@ -87,7 +87,6 @@ mod role_prompt_cache_tests {
             reasoning_effort: None,
             peer_agents_enabled: false,
             quality_feedback_injection_enabled: false,
-            auth_profile: "default".to_string(),
             memory: ResolvedMemorySettings::default(),
         }
     }
@@ -662,12 +661,10 @@ pub(in crate::services::discord) fn render_peer_agent_guidance(
             let short = peer.keywords.iter().take(4).cloned().collect::<Vec<_>>();
             format!(" — best for: {}", short.join(", "))
         };
-        let label = if peer.identity_label.is_empty() {
-            peer.role_id.clone()
-        } else {
-            peer.identity_label.clone()
-        };
-        lines.push(format!("- {} ({}){}", label, peer.display_name, keywords));
+        lines.push(format!(
+            "- {} ({}){}",
+            peer.role_id, peer.display_name, keywords
+        ));
     }
 
     let rendered = lines.join("\n");

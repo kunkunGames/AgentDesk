@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(recovery.matches(&spawn).count(), 1);
         assert_eq!(tui_direct.matches(&spawn).count(), 2);
         assert!(intake.contains("cancel_token.clone(),\n            request_owner"));
-        assert!(headless.contains("cancel_token.clone(),\n            request_owner"));
+        assert!(headless.contains("cancel_token.clone(),\n        request_owner"));
         assert!(recovery.contains("mailbox_recovery_kickoff(\n            shared,\n            channel_id,\n            cancel_token.clone(),"));
         assert_eq!(
             tui_direct
