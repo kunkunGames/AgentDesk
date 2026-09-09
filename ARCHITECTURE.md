@@ -24,10 +24,13 @@ src/
 │   ├── client/
 │   │   └── runtime_config.rs
 │   ├── doctor/
+│   │   ├── orchestrator/
+│   │   │   └── provider_credentials.rs
 │   │   ├── contract.rs
 │   │   ├── health.rs
 │   │   ├── mailbox.rs
 │   │   ├── orchestrator.rs
+│   │   ├── provider_cli_name.rs
 │   │   └── startup.rs
 │   ├── migrate/
 │   │   ├── apply.rs
@@ -124,6 +127,7 @@ src/
 │   │   ├── outbox.rs
 │   │   ├── postgres_tests.rs
 │   │   └── writes.rs
+│   ├── agent_read.rs
 │   ├── agents.rs
 │   ├── automation_candidate_card_program.rs
 │   ├── automation_candidates.rs
@@ -231,6 +235,8 @@ src/
 │   │   ├── mod.rs
 │   │   └── storage_jobs.rs
 │   ├── routes/
+│   │   ├── agents_crud/
+│   │   │   └── agent_read.rs
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
 │   │   │   ├── discord_delivery.rs
@@ -286,6 +292,8 @@ src/
 │   │   │   │   ├── types.rs
 │   │   │   │   └── validation.rs
 │   │   │   └── auto_queue_preflight_harness_tests.rs
+│   │   ├── v1/
+│   │   │   └── agent_read.rs
 │   │   ├── agents.rs
 │   │   ├── agents_crud.rs
 │   │   ├── agents_setup.rs
@@ -325,6 +333,7 @@ src/
 │   │   ├── pipeline.rs
 │   │   ├── pr_summary.rs
 │   │   ├── prompt_manifest_retention.rs
+│   │   ├── provider_auth_profiles.rs
 │   │   ├── provider_cli_api.rs
 │   │   ├── queue_api.rs
 │   │   ├── receipt.rs
@@ -353,6 +362,7 @@ src/
 │   ├── multinode_regression.rs
 │   ├── outbox_actionable_delivery.rs
 │   ├── outbox_delivery_alert.rs
+│   ├── rate_limit_sync.rs
 │   ├── resource_locks.rs
 │   ├── startup_preflight.rs
 │   ├── state.rs
@@ -420,7 +430,9 @@ src/
 │   │   └── iteration_result_tests.rs
 │   ├── claude/
 │   │   ├── active_usage.rs
-│   │   └── backend_routing.rs
+│   │   ├── backend_routing.rs
+│   │   ├── process_session_launch.rs
+│   │   └── tui_session_launch.rs
 │   ├── claude_e/
 │   │   ├── cancellation.rs
 │   │   ├── jsonl_parser.rs
@@ -480,6 +492,9 @@ src/
 │   │   ├── session_routing.rs
 │   │   ├── stream_relay.rs
 │   │   └── watcher_supervisor.rs
+│   ├── codex/
+│   │   ├── process_session_launch.rs
+│   │   └── tui_session_launch.rs
 │   ├── codex_tui/
 │   │   ├── rollout_tail/
 │   │   │   └── parser.rs
@@ -826,6 +841,7 @@ src/
 │   │   │   │   ├── headless_turn.rs
 │   │   │   │   ├── intake_turn.rs
 │   │   │   │   ├── latency_spans.rs
+│   │   │   │   ├── provider_dispatch.rs
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
@@ -1334,6 +1350,8 @@ src/
 │   │   ├── voice_routing.rs
 │   │   ├── voice_sensitivity.rs
 │   │   └── zombie_foreground_release.rs
+│   ├── dispatch_gate/
+│   │   └── auth_profiles.rs
 │   ├── dispatched_sessions/
 │   │   └── canonical_identity.rs
 │   ├── dispatches/
@@ -1399,6 +1417,7 @@ src/
 │   │   ├── mod.rs
 │   │   └── provider.rs
 │   ├── opencode/
+│   │   ├── server_launch.rs
 │   │   └── streaming_entry.rs
 │   ├── platform/
 │   │   ├── binary_resolver/
@@ -1473,6 +1492,7 @@ src/
 │   │   ├── push_handoff.rs
 │   │   └── timing.rs
 │   ├── session_backend/
+│   │   ├── auth_profiles.rs
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
 │   ├── session_forwarding/
@@ -1494,6 +1514,8 @@ src/
 │   │   ├── request.rs
 │   │   ├── runner.rs
 │   │   └── session.rs
+│   ├── tmux_common/
+│   │   └── session_markers.rs
 │   ├── tui_prompt_dedupe/
 │   │   ├── extract.rs
 │   │   ├── observation.rs
@@ -1522,6 +1544,7 @@ src/
 │   │   │   └── lexical.rs
 │   │   ├── authority.rs
 │   │   └── namespace.rs
+│   ├── agent_identity.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
 │   ├── auto_queue.rs
@@ -1572,6 +1595,7 @@ src/
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_auth.rs
+│   ├── provider_auth_profile.rs
 │   ├── provider_error_transcript.rs
 │   ├── provider_exec.rs
 │   ├── provider_hosting.rs

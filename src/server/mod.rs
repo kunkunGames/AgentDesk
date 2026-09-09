@@ -1,3 +1,6 @@
+mod rate_limit_sync;
+use rate_limit_sync::{rate_limit_sync_loop, upsert_rate_limit_cache_entry};
+
 pub(crate) mod cluster;
 pub(crate) mod cluster_session_routing;
 pub(crate) mod cron_catalog;
@@ -966,117 +969,18 @@ async fn record_periodic_job_execution_pg(
     upsert_kv_meta_pg_ignore(pg_pool, &key_duration, &elapsed_ms).await;
 }
 
-/// Background task that periodically fetches rate-limit data from external providers
-/// and caches it in the `rate_limit_cache` table for the dashboard API.
-async fn upsert_rate_limit_cache_entry(
-    pg_pool: &PgPool,
-    provider: &str,
-    data: &str,
-    fetched_at: i64,
-) {
-    if let Err(error) = sqlx::query(
-        "INSERT INTO rate_limit_cache (provider, data, fetched_at)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (provider)
-         DO UPDATE SET data = EXCLUDED.data, fetched_at = EXCLUDED.fetched_at",
-    )
-    .bind(provider)
-    .bind(data)
-    .bind(fetched_at)
-    .execute(pg_pool)
-    .await
-    {
-        tracing::warn!(
-            "[rate-limit-sync] failed to upsert rate_limit_cache row for {provider}: {error}"
-        );
-    }
+fn rate_limit_upsert_conflict_target() -> &'static str {
+    "(provider, profile_id)"
 }
 
-async fn rate_limit_sync_loop(pg_pool: Arc<PgPool>) {
-    use std::time::Duration;
-
-    let interval = Duration::from_secs(120);
-    // Run immediately on startup, then every 2 minutes
-    let mut first = true;
-
-    loop {
-        if !first {
-            tokio::time::sleep(interval).await;
-        }
-        first = false;
-
-        let _ = sync_claude_rate_limit_cache_once_serialized(pg_pool.as_ref()).await;
-
-        // --- Codex rate limits ---
-        // Priority: 1) ~/.codex/auth.json (Codex CLI subscription), 2) OPENAI_API_KEY
-        let codex_result = if let Some(token) = crate::services::provider_auth::codex_access_token()
-        {
-            fetch_codex_oauth_usage(&token).await
-        } else if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            fetch_openai_rate_limits(&api_key).await
-        } else {
-            Err(anyhow::anyhow!("no Codex credentials found"))
-        };
-        match codex_result {
-            Ok(buckets) => {
-                let data = serde_json::json!({ "buckets": buckets }).to_string();
-                let now = chrono::Utc::now().timestamp();
-                upsert_rate_limit_cache_entry(pg_pool.as_ref(), "codex", &data, now).await;
-                tracing::info!("[rate-limit-sync] Codex: {} buckets cached", buckets.len());
-            }
-            Err(e) => {
-                tracing::warn!("[rate-limit-sync] Codex rate_limit fetch failed: {e}");
-            }
-        }
-
-        // --- Gemini rate limits ---
-        // Uses OAuth2 creds from ~/.gemini/oauth_creds.json.
-        // Returns RPM/RPD buckets with known quota limits; usage fields are -1 (unavailable).
-        match fetch_gemini_rate_limits().await {
-            Ok(buckets) => {
-                let n = buckets.len();
-                let data = serde_json::json!({ "buckets": buckets }).to_string();
-                let now = chrono::Utc::now().timestamp();
-                upsert_rate_limit_cache_entry(pg_pool.as_ref(), "gemini", &data, now).await;
-                tracing::info!("[rate-limit-sync] Gemini: {} buckets cached", n);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Only suppress the genuine "not configured / file missing" case,
-                // classified at the source (provider_auth) by `io::ErrorKind`:
-                //   - "no home dir"            (no $HOME)
-                //   - NotFound                 (oauth_creds.json does not exist)
-                // PermissionDenied / IsADirectory / transient I/O are tagged
-                // differently and corrupt/partial creds ("no access_token" /
-                // "no refresh_token") are separate problems — all keep WARNing,
-                // so we deliberately do NOT match on "oauth_creds.json" broadly
-                // here (#3566 over-suppress fix, codex r2).
-                let creds_missing =
-                    crate::services::provider_auth::is_gemini_unconfigured_error(&e);
-                if creds_missing {
-                    // Gemini simply isn't configured — log once, then drop to DEBUG
-                    // so the 2-minute sync loop doesn't spam an identical WARN (#3566).
-                    if !GEMINI_CREDS_MISSING_WARNED.swap(true, Ordering::AcqRel) {
-                        tracing::warn!(
-                            "[rate-limit-sync] Gemini credentials not configured ({msg}); suppressing further repeats"
-                        );
-                    } else {
-                        tracing::debug!(
-                            "[rate-limit-sync] Gemini credentials absent; skipping (suppressed)"
-                        );
-                    }
-                } else {
-                    // Transient errors (network/API/token refresh) and corrupt/partial
-                    // credentials keep WARNing.
-                    tracing::warn!("[rate-limit-sync] Gemini rate_limit fetch failed: {e}");
-                }
-            }
-        }
-
-        // feature: rate-limit-aware-dispatch-gate — refresh the process-wide
-        // in-memory pressure + agent→provider snapshots that the auto-queue
-        // dispatch gate reads O(1) off the hot path (no DB on dispatch).
-        refresh_dispatch_gate_snapshots_serialized(pg_pool.as_ref()).await;
+#[cfg(test)]
+mod rate_limit_profile_tests {
+    #[test]
+    fn test_011_upsert_conflict_is_provider_and_profile() {
+        assert_eq!(
+            super::rate_limit_upsert_conflict_target(),
+            "(provider, profile_id)"
+        );
     }
 }
 
@@ -1220,7 +1124,7 @@ async fn sync_claude_rate_limit_cache_once(pg_pool: &PgPool) -> Result<usize, an
             let bucket_count = buckets.len();
             let data = serde_json::json!({ "buckets": buckets }).to_string();
             let now = chrono::Utc::now().timestamp();
-            upsert_rate_limit_cache_entry(pg_pool, "claude", &data, now).await;
+            upsert_rate_limit_cache_entry(pg_pool, "claude", "default", &data, now).await;
             tracing::info!("[rate-limit-sync] Claude: {} buckets cached", bucket_count);
             Ok(bucket_count)
         }
@@ -1639,7 +1543,6 @@ mod claude_oauth_usage_tests {
     }
 }
 
-/// Fetch Codex usage via chatgpt.com backend API (subscription-based, no API key needed).
 async fn fetch_codex_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>, anyhow::Error> {
     let client = reqwest::Client::new();
     let resp = client
