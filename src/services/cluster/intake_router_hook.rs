@@ -1171,7 +1171,7 @@ mod pg_tests {
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                     target_instance_id: "worker-mac".to_string(),
-                    basis: IntakeRoutingBasis::NodeOverride,
+                    basis: IntakeRoutingBasis::PreferredLabels,
                 }
             }
         );
