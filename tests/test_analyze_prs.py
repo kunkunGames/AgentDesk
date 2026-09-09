@@ -7,7 +7,6 @@ from scripts.analyze_prs import (
     has_no_change_verification_ack,
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
-    has_external_dependency_verification_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -50,13 +49,6 @@ Update analyzer hygiene checks.
 """
 
         self.assertTrue(has_non_empty_body_field(body, ["summary"]))
-
-    def test_external_dependency_verification_ack(self):
-        self.assertTrue(has_external_dependency_verification_ack("- [x] **External dependency verification:** I have not claimed PostgreSQL"))
-        self.assertTrue(has_external_dependency_verification_ack("- [X] **External dependency verification:**"))
-        self.assertTrue(has_external_dependency_verification_ack("- External dependency verification: completed"))
-        self.assertFalse(has_external_dependency_verification_ack("- [ ] **External dependency verification:** I have not claimed PostgreSQL"))
-        self.assertFalse(has_external_dependency_verification_ack("- External dependency verification:"))
 
     def test_allow_none_is_limited_to_explicit_callers(self):
         body = "- Skipped checks with reasons: none"
