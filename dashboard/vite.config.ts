@@ -6,7 +6,7 @@ import path from "path";
 import { readFileSync } from "fs";
 
 // Single source of truth for port/host defaults (shared with Rust backend & scripts)
-const defaults = JSON.parse(readFileSync(path.resolve(__dirname, "../defaults.json"), "utf-8"));
+const defaults = JSON.parse(readFileSync(path.resolve(import.meta.dirname, "../defaults.json"), "utf-8"));
 
 function manualChunks(id: string) {
   if (!id.includes("node_modules")) return undefined;
@@ -66,7 +66,7 @@ export default defineConfig({
   },
   plugins: [react(), tailwindcss()],
   resolve: {
-    alias: { "@": path.resolve(__dirname, "src") },
+    alias: { "@": path.resolve(import.meta.dirname, "src") },
   },
   server: {
     port: 5173,
