@@ -38,6 +38,7 @@ fn agent(
         provider: Some(provider.to_string()),
         model: Some("grok-4.6".to_string()),
         workspace: workspace.map(ToOwned::to_owned),
+        auth_profile: "default".into(),
         recovery,
     }
 }
@@ -48,6 +49,7 @@ fn channel(owner: &str, recovery: Option<RecoveryConfigWire>) -> OrgChannelInput
         agent: owner.to_string(),
         provider: None,
         workspace: None,
+        auth_profile: None,
         recovery,
     }
 }

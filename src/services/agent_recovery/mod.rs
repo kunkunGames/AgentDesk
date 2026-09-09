@@ -3,6 +3,8 @@
 //! Same-channel exclusive intake. Mailbox handoff is never used.
 
 pub(crate) mod admission;
+mod accounts;
+pub(crate) use accounts::pinned_auth_profile;
 pub mod checkpoint;
 pub mod context;
 pub mod detector;

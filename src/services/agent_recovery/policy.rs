@@ -102,6 +102,7 @@ pub struct OrgAgentInput {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub workspace: Option<String>,
+    pub auth_profile: String,
     pub recovery: Option<RecoveryConfigWire>,
 }
 
@@ -111,6 +112,7 @@ pub struct OrgChannelInput {
     pub agent: String,
     pub provider: Option<String>,
     pub workspace: Option<String>,
+    pub auth_profile: Option<String>,
     pub recovery: Option<RecoveryConfigWire>,
 }
 
@@ -120,6 +122,7 @@ pub struct ChannelRecoveryBinding {
     pub owner_agent_id: String,
     pub owner_provider: ProviderKind,
     pub owner_model: Option<String>,
+    pub owner_auth_profile: String,
     pub workspace: String,
     pub policy: Option<RecoveryPolicy>,
 }
@@ -204,7 +207,7 @@ impl PolicyError {
                 fallback_agent_id,
                 provider,
             } => format!(
-                "recovery fallback_agent_id '{fallback_agent_id}' for '{agent_id}' must use a different provider than '{provider}' until provider-level channel ownership supports agent identity"
+                "recovery fallback_agent_id '{fallback_agent_id}' for '{agent_id}' must use a distinct auth_profile and an account-isolating provider ('{provider}')"
             ),
             Self::InvalidWorkspaceMode { value } => {
                 format!("recovery workspace_mode '{value}' is not supported (P0: inherit only)")
@@ -389,7 +392,12 @@ pub fn build_recovery_catalog(
                     .or(owner.provider.as_deref())
                     .and_then(ProviderKind::from_str)
                     .expect("recovery owner provider was validated above");
-                if fallback_provider == owner_provider {
+                let owner_profile = channel.auth_profile.as_deref().unwrap_or(&owner.auth_profile);
+                let fallback_profile = &agent_map[fallback_id].auth_profile;
+                if fallback_provider == owner_provider
+                    && (owner_profile == fallback_profile
+                        || !crate::services::provider_auth_profile::extra_account_login_supported(&owner_provider))
+                {
                     return Err(PolicyError::SameProviderFallback {
                         agent_id: channel.agent.clone(),
                         fallback_agent_id: fallback_id.to_string(),
@@ -419,6 +427,7 @@ pub fn build_recovery_catalog(
                 owner_agent_id: channel.agent.clone(),
                 owner_provider,
                 owner_model: owner.model.clone(),
+                owner_auth_profile: channel.auth_profile.clone().unwrap_or_else(|| owner.auth_profile.clone()),
                 workspace,
                 policy,
             },
@@ -430,6 +439,8 @@ pub fn build_recovery_catalog(
 #[derive(Debug, Deserialize)]
 struct OrgRecoveryDocument {
     #[serde(default)]
+    provider_auth_primary_profiles: BTreeMap<String, String>,
+    #[serde(default)]
     agents: BTreeMap<String, OrgRecoveryAgentWire>,
     #[serde(default)]
     channels: Option<OrgRecoveryChannelsWire>,
@@ -437,6 +448,8 @@ struct OrgRecoveryDocument {
 
 #[derive(Debug, Deserialize)]
 struct OrgRecoveryAgentWire {
+    #[serde(default)]
+    auth_profile: Option<String>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
@@ -455,6 +468,8 @@ struct OrgRecoveryChannelsWire {
 
 #[derive(Debug, Deserialize)]
 struct OrgRecoveryChannelWire {
+    #[serde(default)]
+    auth_profile: Option<String>,
     agent: String,
     #[serde(default)]
     provider: Option<String>,
@@ -474,6 +489,7 @@ pub fn load_org_recovery_catalog_from_yaml(yaml: &str) -> Result<RecoveryCatalog
         .into_iter()
         .map(|(id, wire)| OrgAgentInput {
             id,
+            auth_profile: wire.auth_profile.or_else(|| wire.provider.as_deref().and_then(ProviderKind::from_str).and_then(|provider| document.provider_auth_primary_profiles.get(provider.as_str()).cloned())).unwrap_or_else(|| "default".into()),
             provider: wire.provider,
             model: wire.model,
             workspace: wire.workspace,
@@ -488,6 +504,7 @@ pub fn load_org_recovery_catalog_from_yaml(yaml: &str) -> Result<RecoveryCatalog
         .map(|(channel_id, wire)| OrgChannelInput {
             channel_id,
             agent: wire.agent,
+            auth_profile: wire.auth_profile,
             provider: wire.provider,
             workspace: wire.workspace,
             recovery: wire.recovery,

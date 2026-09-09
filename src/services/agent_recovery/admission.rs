@@ -44,6 +44,8 @@ fn allows(
         .as_ref()
         != Some(provider)
         || agent.is_some_and(|agent| agent != state.active_writer_agent_id)
+        // Provider identity alone cannot distinguish two accounts.
+        || (agent.is_none() && state.context.as_ref().is_some_and(|context| context.owner_provider == context.fallback_provider))
     {
         return false;
     }
