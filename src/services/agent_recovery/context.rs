@@ -32,7 +32,13 @@ impl RecoveryContext {
             fallback_provider: fallback.as_str().to_string(),
             owner_model: binding.owner_model.clone(),
             owner_auth_profile: Some(binding.owner_auth_profile.clone()),
-            fallback_auth_profile: Some(catalog.agents.get(&binding.policy.as_ref()?.fallback_agent_id)?.auth_profile.clone()),
+            fallback_auth_profile: Some(
+                catalog
+                    .agents
+                    .get(&binding.policy.as_ref()?.fallback_agent_id)?
+                    .auth_profile
+                    .clone(),
+            ),
             last_provider_error_at: None,
             workspace: binding.workspace.clone(),
         })
@@ -44,7 +50,10 @@ impl RecoveryContext {
             owner_agent_id: state.owner_agent_id.clone(),
             owner_provider: ProviderKind::from_str(&self.owner_provider)?,
             owner_model: self.owner_model.clone(),
-            owner_auth_profile: self.owner_auth_profile.clone().unwrap_or_else(|| "default".into()),
+            owner_auth_profile: self
+                .owner_auth_profile
+                .clone()
+                .unwrap_or_else(|| "default".into()),
             workspace: self.workspace.clone(),
             policy: Some(RecoveryPolicy {
                 enabled: true,
