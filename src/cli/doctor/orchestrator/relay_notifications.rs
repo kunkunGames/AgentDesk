@@ -69,7 +69,13 @@ mod tests {
                 "circuit_state": "not_checked"
             }))
         );
-        assert!(check.guidance.as_ref().unwrap().contains("separate read-only"));
+        assert!(
+            check
+                .guidance
+                .as_ref()
+                .unwrap()
+                .contains("separate read-only")
+        );
         assert_eq!(
             check.label(),
             if status == "warn" { "WARN" } else { "PASS" }
