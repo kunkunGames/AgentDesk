@@ -122,7 +122,7 @@ pub(super) fn check_credential_permissions(cfg: &config::Config) -> Check {
             CheckGroup::ProviderRuntime,
             "Credential Permissions",
             format!("{detail}; {}", risks.join("; ")),
-            "credential/config 파일 내용은 읽거나 출력하지 않고 권한/owner metadata만 점검했습니다.",
+            "Credential/config file contents were not read or output; only permission/owner metadata was checked.",
         )
         .with_subsystem("security")
         .with_expected_actual("credential files owned by current user with private permissions", detail)

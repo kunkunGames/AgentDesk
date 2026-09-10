@@ -285,7 +285,7 @@ mod tests {
         })
     }
 
-    /// #5071 relay-tail S1 (I-4), design §2.3's "어디서" clause: the two
+    /// #5071 relay-tail S1 (I-4), design §2.3's "where" clause: the two
     /// witnesses and the hypothesis reach `cli/doctor`. Before this the CLI
     /// named none of them (r1 review, legA P1-2).
     #[test]
