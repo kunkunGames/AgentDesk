@@ -19,7 +19,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "7fa70ddb0835f1ed37add3bf415576350cf3adebfc8a98d8d97edf5f6efe5c09"
+    "2fdb9a5a42730d6d97b5997d6b3b9cd47f2df704a807dec867b49bcb27aa4710"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 CROSS_OS_CONSUMER_SCRIPT = REPO_ROOT / "scripts/cross_os_consumer_paths.py"
@@ -738,6 +738,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"        run: \|\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1\n"
+            r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it -- --test-threads=1\n"
+            r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1$",
         )
         self.assertRegex(
