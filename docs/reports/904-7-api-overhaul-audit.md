@@ -83,10 +83,6 @@ paths, so they remain canonical. **No prompt edits required.**
 - `src/cli/client.rs::cmd_dispatch` migration to `/generate` + `/dispatch-next`
   (deferred from #1064 due to body-shape mismatch). Tracked in the campaign
   backlog.
-- Re-run `python3 scripts/generate_inventory_docs.py` once the unrelated
-  `top-level architecture map drift: missing descriptions for compat/` failure
-  is fixed; this will refresh `docs/generated/route-inventory.md` to drop the
-  legacy rows from the rendered table.
 
 ## Categories — file count summary
 
