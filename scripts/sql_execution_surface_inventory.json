@@ -26699,6 +26699,15 @@
     {
       "root": "src",
       "kind": "RUST",
+      "path": "src/services/discord/turn_bridge/resume_pin_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:2c58fc1362c983f58fe6755ae85c27a131c98f31a10b4907f5ba3cbb5ca77111"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
       "path": "src/services/discord/turn_bridge/skill_usage.rs",
       "api": "sqlx::query",
       "symbol": "query",
