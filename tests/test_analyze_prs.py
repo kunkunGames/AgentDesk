@@ -418,6 +418,16 @@ class CiScriptScratchGuardTests(unittest.TestCase):
         self.assertIn("test.sql", script)
         self.assertIn("scratch[._-]*.sql", script)
 
+    def test_ci_guard_includes_root_json_and_log_scratch_files(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("prs.json", script)
+        self.assertIn("scratch.json", script)
+        self.assertIn("scratchpad.json", script)
+        self.assertIn("cargo_out.txt", script)
+        self.assertIn("npm_output.log", script)
+        self.assertIn("bun_output.txt", script)
+
     def test_ci_guard_includes_root_shell_scratch_globs(self):
         script = Path("scripts/ci-script-checks.sh").read_text()
 

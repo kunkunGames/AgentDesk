@@ -352,7 +352,7 @@ banner "Scheduled-message PG path-filter wiring contract"
 
 banner "Scratch file guard"
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh; do
+for scratch_file in plan.md scratch.md scratch.txt scratch.sh scratchpad.md scratchpad.txt scratchpad.sh sql_test.rs test_scratch.rs plan.txt pr-body.md test.sh test.sql verify.sh prs.json scratch.json scratchpad.json cargo_out.txt npm_output.log bun_output.txt; do
   if [ -f "$scratch_file" ]; then
     echo "ERROR: Scratch file detected in repository root: $scratch_file"
     FAIL=1
