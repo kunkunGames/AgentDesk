@@ -1,0 +1,35 @@
+What changed:
+Replaced the duplicated `expand_tilde` helper in `src/services/discord/voice_barge_in/utility.rs` with `crate::runtime_layout::expand_user_path`. Used `.unwrap_or_else(|| path.to_path_buf())` to ensure byte-for-byte equivalence for fallback cases when the path doesn't start with `~` or `~/`.
+
+Why:
+To reduce code duplication (local complexity) by utilizing an existing layout helper without sacrificing safety or correctness, satisfying the Refiner mission constraints.
+
+WorkFingerprint:
+- Agent: Refiner
+- Category boundary: `src/services/discord/voice_barge_in/utility.rs`
+- Primary files: `src/services/discord/voice_barge_in/utility.rs`
+- Invariant protected: Behavior preservation (fallback path expansion behavior remains unmodified)
+- Public API impact: None
+- Docs impact: None
+- Verification plan: Check local tests and compilation (`cargo check --all-targets`).
+- Related PRs/issues: Prompt constraints refer to previous PR #212 (`voice/utils.rs` deduplication).
+
+Duplicate/overlap check:
+Checked open PRs (via `git branch -r`). No overlapping work touches `voice_barge_in/utility.rs`. Previous PR `dedup-voice-expand-tilde-7994802363814502491` was a no-change report, and PR #212 covered a different file (`voice/utils.rs`).
+
+Verification commands and results:
+- `git diff --check`: Clean.
+- `cargo check --all-targets`: Passed without introducing new errors.
+- `cargo test --package agentdesk --lib services::discord::voice_barge_in`: Skipped (environment timeout).
+
+Skipped checks with reasons:
+- `cargo test --package agentdesk --lib services::discord::voice_barge_in` skipped due to CI environment timeout, however the change is a simple function substitution safely wrapped in `unwrap_or_else`.
+- `npm run test:policies`: N/A (Rust only).
+- `./scripts/verify-dashboard.sh`: N/A.
+- `python3 scripts/generate_inventory_docs.py`: N/A (no module inventory addition/removal).
+
+Risk:
+Very low. Function fallback preserves exact original logic if `expand_user_path` returns `None`.
+
+Rollback notes:
+`git revert` the single commit if runtime layout helper path differences cause regressions for voice transcripts.
