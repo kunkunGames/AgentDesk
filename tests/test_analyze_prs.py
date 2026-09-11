@@ -7,6 +7,7 @@ from scripts.analyze_prs import (
     has_no_change_verification_ack,
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
+    has_pr_size_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -201,6 +202,23 @@ class PrAnalyzerStaleBranchCleanupGuardTests(unittest.TestCase):
         body = "- stale branch cleanup: closed stale branch and recreated."
 
         self.assertTrue(has_stale_branch_cleanup_ack(body))
+
+
+class PrAnalyzerPrSizeGuardTests(unittest.TestCase):
+    def test_unchecked_template_pr_size_guard_is_not_acknowledgement(self):
+        body = "- [ ] **PR size:** I ran `scripts/pr_cap_check.sh` on this PR head"
+
+        self.assertFalse(has_pr_size_ack(body))
+
+    def test_checked_template_pr_size_guard_is_acknowledgement(self):
+        body = "- [x] **PR size:** I ran `scripts/pr_cap_check.sh` on this PR head"
+
+        self.assertTrue(has_pr_size_ack(body))
+
+    def test_filled_pr_size_field_is_acknowledgement(self):
+        body = "- pr size: PASS (remaining 15 files/+400)"
+
+        self.assertTrue(has_pr_size_ack(body))
 
 
 class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
