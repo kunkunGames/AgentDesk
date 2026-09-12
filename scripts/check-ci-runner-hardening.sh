@@ -1127,6 +1127,7 @@ RUBY
 trusted_workflow=".github/workflows/ci-macos-trusted.yml"
 pr_workflow=".github/workflows/ci-pr.yml"
 main_workflow=".github/workflows/ci-main.yml"
+# shellcheck disable=SC2016
 ruby -ryaml -e 'j=YAML.load_file(ARGV[0]).fetch("jobs").fetch("scripts"); r=j.fetch("steps").find{|s|s["name"]=="Run script checks"}; u=j.fetch("steps").find{|s|s["name"]=="Upload giant-file progress evidence"}; abort unless r.fetch("env")=={"GFP_EVENT_NAME"=>"${{ github.event_name }}","GFP_REPOSITORY"=>"${{ github.repository }}","GFP_CANDIDATE_SHA"=>"${{ github.sha }}","TEST_LANE_BASELINE_REF"=>"HEAD"} && u=={"name"=>"Upload giant-file progress evidence","if"=>"always()","uses"=>"actions/upload-artifact@v4","with"=>{"path"=>"target/giant-file-progress/evidence.json"}}' "$main_workflow" || error "$main_workflow must preserve fail-closed giant-file selector and evidence wiring"
 
 workflow_files() {
