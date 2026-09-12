@@ -3192,6 +3192,131 @@ fn s3t5_codex_abort_and_recv_error_use_shared_fail_closed_completion() {
     );
 }
 
+// #5464 S2 — the completion ACK partition, pinned by BEHAVIOR.
+//
+// `finish_idle_bridge_completion` takes four dispositions and EXACTLY ONE —
+// `Finalized` — is an acknowledgement: only it may return `Ok`, and only it
+// may clear the prompt anchor. Three were already pinned (s3t1/s3t5 for
+// `EntryAborted`/`RecvError`, s3t4 for `Finalized`); `Err(Elapsed)` had no
+// behavioral coverage, so `docs/relay-state-contract.md:41` — "Never use
+// `>= N`, another turn's ACK, timeout-as-success, blind skip, or blind
+// resend" — rested on nothing executable for the timeout case. Driving all
+// four against ONE anchor and COUNTING the acks makes a promoted non-ACK
+// (two `Ok`) or a lost ACK (zero `Ok`) RED on the count, not on one message.
+#[cfg(unix)]
+#[test]
+fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
+    let temp = tempfile::tempdir().unwrap();
+    let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+    // Same environment -> dedupe order as `s3_completion_fixture`; held across
+    // `block_on`, never across an `.await`, so no suppression is needed.
+    let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use crate::services::discord::turn_bridge::BridgeCompletionSignal;
+            use crate::services::tui_prompt_dedupe::{
+                prompt_anchor_for_response, record_prompt_anchor,
+            };
+            let provider = ProviderKind::Claude;
+            let channel = ChannelId::new(880_101);
+            let user = MessageId::new(880_102);
+            let current = MessageId::new(880_103);
+            let tmux = "s2-completion-ack-partition";
+            let lease = ExternalInputRelayLease::unassigned(Some(channel.get()));
+            let gateway = Arc::new(S3Gateway::default());
+
+            record_prompt_anchor(provider.as_str(), tmux, channel.get(), user.get());
+            let anchor = prompt_anchor_for_response(provider.as_str(), tmux, channel.get());
+            // PREMISE: without a recorded anchor every survival check below
+            // would be `None == None` and this test would assert nothing.
+            assert!(
+                anchor.is_some(),
+                "premise: the prompt anchor must exist before any disposition runs"
+            );
+
+            // A live sender keeps the receiver pending, so the zero deadline is
+            // what resolves the timeout rather than a completion racing it.
+            let (never_sent, pending_rx) = tokio::sync::oneshot::channel::<BridgeCompletionSignal>();
+            let timed_out = tokio::time::timeout(Duration::ZERO, pending_rx).await;
+            drop(never_sent);
+            assert!(
+                timed_out.is_err(),
+                "premise: the fixture must produce a real Elapsed, not a completion"
+            );
+            let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<BridgeCompletionSignal>();
+            drop(dropped_tx);
+            let recv_error = dropped_rx.await;
+            assert!(
+                recv_error.is_err(),
+                "premise: the dropped sender must produce a real RecvError"
+            );
+
+            // The ACK runs LAST: every non-ACK is checked against a live anchor.
+            let mut acknowledgements = 0usize;
+            for (label, completion, expected) in [
+                (
+                    "Err(Elapsed)",
+                    timed_out,
+                    Err(format!(
+                        "TUI-direct bridge adapter timed out waiting for completion for provider {}",
+                        provider.as_str()
+                    )),
+                ),
+                (
+                    "Ok(Ok(EntryAborted))",
+                    Ok(Ok(BridgeCompletionSignal::EntryAborted)),
+                    Err("TUI-direct bridge entry aborted before authority".to_string()),
+                ),
+                (
+                    "Ok(Err(RecvError))",
+                    Ok(recv_error),
+                    Err("TUI-direct bridge entry aborted before authority".to_string()),
+                ),
+                (
+                    "Ok(Ok(Finalized))",
+                    Ok(Ok(BridgeCompletionSignal::Finalized)),
+                    Ok(()),
+                ),
+            ] {
+                let is_ack = expected.is_ok();
+                let result = super::claude_idle_bridge::finish_idle_bridge_completion(
+                    completion,
+                    gateway.as_ref(),
+                    &provider,
+                    (channel, user, current),
+                    None,
+                    (tmux, &lease, anchor),
+                    true,
+                )
+                .await;
+                assert_eq!(result, expected, "{label}: wrong completion disposition");
+                if result.is_ok() {
+                    acknowledgements += 1;
+                }
+                assert_eq!(
+                    prompt_anchor_for_response(provider.as_str(), tmux, channel.get()),
+                    if is_ack { None } else { anchor },
+                    "{label}: only the acknowledgement may clear the prompt anchor"
+                );
+            }
+            assert_eq!(
+                acknowledgements, 1,
+                "EXACTLY ONE disposition may acknowledge delivery: two means a \
+                 non-ACK was promoted (timeout-as-success, forbidden by \
+                 relay-state-contract.md:41); zero means the ACK was lost"
+            );
+            assert!(
+                gateway.deleted.lock().unwrap().is_empty(),
+                "no disposition may delete a placeholder this adapter never created"
+            );
+        });
+}
+
 #[cfg(unix)]
 fn drain_forwarded_idle_stream(
     prefix: Vec<StreamMessage>,
@@ -5924,5 +6049,170 @@ fn synthetic_start_offset_carry_forward_never_regresses() {
         synthetic_start_offset_carry_forward(900, Some(300)),
         900,
         "a lagging committed frontier must never drag the synthetic start backwards"
+    );
+}
+
+/// #5833 DoD 4 — CONTENDING TURN IDENTITIES keep EXACTLY ONE relay owner.
+///
+/// Two identities race for one execution of `(claude, <tmux>)`: the EXTERNAL
+/// SYNTHETIC turn, keyed `external:<provider>:<channel>:<tmux>:<epoch_ms>` by
+/// `external_input_turn_id`, and the DISCORD ANCHOR turn for the same pane,
+/// which mints its own key from a later observation timestamp. #5838 persisted
+/// `lease.turn_id` as the same-execution key, so the store can now answer which
+/// identity owns this execution's relay; this fixture asks it under contention.
+///
+/// The invariant is a relayer count of EXACTLY ONE — never zero (a GAP), never
+/// two (a DUPLICATE) — pinned on three axes: (1) each production resolution
+/// names one owner, and that owner yields one relayer under the production
+/// spawn predicates; (2) the REGISTRY, not the identity's vantage point,
+/// decides that owner, so the two cannot split it; (3) the single
+/// `(provider, tmux)` lease slot then
+/// names exactly one key, leaving the superseded identity unreadable as a
+/// second live owner.
+#[cfg(unix)]
+#[test]
+fn contending_turn_identities_keep_exactly_one_relay_owner() {
+    let root = tempfile::tempdir().expect("isolated runtime root");
+    let _env = crate::config::set_agentdesk_root_for_test(root.path());
+    let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let shared = super::super::make_shared_data_for_tests();
+    let channel = ChannelId::new(5_833_540_000_001);
+    let tmux = "AgentDesk-5833-contending-identity";
+    let output_path = root.path().join("transcript.jsonl");
+
+    // The LIVE watcher covering this output is the registry state BOTH
+    // contending identities observe; without it every resolution is trivially
+    // BridgeAdapter and the contention has nothing it could split.
+    shared
+        .tmux_watchers
+        .insert(channel, test_watcher_handle(tmux, &output_path));
+
+    let observed_at = chrono::DateTime::from_timestamp_millis(1_788_000_000_000).unwrap();
+    let turn_id = |at| {
+        super::relay_ownership::external_input_turn_id(
+            ProviderKind::Claude.as_str(),
+            channel,
+            tmux,
+            at,
+        )
+    };
+    let synthetic_turn_id = turn_id(observed_at);
+    let anchor_turn_id = turn_id(observed_at + chrono::Duration::milliseconds(1));
+    assert_ne!(
+        synthetic_turn_id, anchor_turn_id,
+        "the fixture must actually contend: two distinct identities, not one repeated"
+    );
+
+    // Relayers a resolved owner produces on the non-deferred path: the
+    // observer's BridgeAdapter idle tail, plus the watcher when it owns.
+    let live_relayer_count = |owner: ExternalInputRelayOwner| -> usize {
+        usize::from(observer_should_spawn_bridge_tail(false, owner))
+            + usize::from(owner == ExternalInputRelayOwner::TmuxWatcher)
+    };
+
+    // Axis 1: both production resolutions, on both sides of the session-bound
+    // delivery switch, name one owner and leave exactly one relayer.
+    //
+    // Axis 2: the two identities meet that ONE registry from DIFFERENT vantage
+    // points. The synthetic turn carries the transcript path its observation
+    // resolved; the anchor turn contends before that resolution, and production
+    // passes the absent path straight through (`relay_output_path.as_deref()`,
+    // `record_observed_external_turn_lease`). The registry, not the vantage
+    // point, must decide — a split IS the DUPLICATE, one identity standing the
+    // watcher down while the other spawns a bridge tail beside it.
+    let uncovered_path = root.path().join("superseded-transcript.jsonl");
+    for session_bound in [false, true] {
+        let owner = external_input_relay_owner_for_watchers(
+            &shared.tmux_watchers,
+            tmux,
+            Some(&output_path),
+            session_bound,
+        );
+        assert_eq!(
+            live_relayer_count(owner),
+            1,
+            "session_bound={session_bound}: a resolved owner must leave exactly one relayer"
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &shared.tmux_watchers,
+                tmux,
+                None,
+                session_bound,
+            ),
+            owner,
+            "session_bound={session_bound}: an identity contending before its transcript \
+             path resolves reads the same registry and must not split the owner"
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &shared.tmux_watchers,
+                tmux,
+                Some(&uncovered_path),
+                session_bound,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter,
+            "session_bound={session_bound}: control — the resolution really reads the \
+             registry, so an output this live watcher does not cover is not its to relay"
+        );
+    }
+    let resolved = super::relay_ownership::external_input_relay_owner_for_output(
+        &shared,
+        tmux,
+        Some(&output_path),
+    );
+    assert_eq!(
+        live_relayer_count(resolved),
+        1,
+        "external_input_relay_owner_for_output must resolve to exactly one relayer"
+    );
+
+    // Axis 3: both identities record into the ONE `(provider, tmux)` slot.
+    let contending_lease = |turn_id: &str| ExternalInputRelayLease {
+        channel_id: Some(channel.get()),
+        turn_id: Some(turn_id.to_string()),
+        session_key: Some(format!("token:{tmux}")),
+        relay_owner: resolved,
+        runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
+        generation:
+            crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+    };
+    let synthetic_lease = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+        ProviderKind::Claude.as_str(),
+        tmux,
+        contending_lease(&synthetic_turn_id),
+    );
+    let anchor_lease = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+        ProviderKind::Claude.as_str(),
+        tmux,
+        contending_lease(&anchor_turn_id),
+    );
+    assert_ne!(
+        synthetic_lease.generation, anchor_lease.generation,
+        "each record must be a distinguishable identity, not a value-equal reuse"
+    );
+
+    let live = crate::services::tui_prompt_dedupe::external_input_relay_lease(
+        ProviderKind::Claude.as_str(),
+        tmux,
+        channel.get(),
+    )
+    .expect("the contended execution must still hold a lease (zero owners is the GAP)");
+    assert_eq!(
+        live.generation, anchor_lease.generation,
+        "one slot, one live lease: the superseded identity is not separately readable"
+    );
+    assert_eq!(
+        live.turn_id.as_deref(),
+        Some(anchor_turn_id.as_str()),
+        "the surviving same-execution key names exactly one contending identity"
+    );
+    assert_eq!(
+        live_relayer_count(live.relay_owner),
+        1,
+        "the surviving lease must still name exactly one relayer"
     );
 }

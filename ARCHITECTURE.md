@@ -839,6 +839,7 @@ src/
 │   │   │   │   └── circuit_breaker_apply.rs
 │   │   │   ├── apply.rs
 │   │   │   ├── authority_observation.rs
+│   │   │   ├── authority_retention.rs
 │   │   │   ├── cohort.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── destructive_warrant.rs
@@ -1018,6 +1019,8 @@ src/
 │   │   │   │   ├── backstop.rs
 │   │   │   │   ├── backstop_tests.rs
 │   │   │   │   └── idle_gate.rs
+│   │   │   ├── loop_poll_prologue/
+│   │   │   │   └── post_terminal_disposal_tests.rs
 │   │   │   ├── streaming_status_tick/
 │   │   │   │   ├── committed_progress_tests.rs
 │   │   │   │   ├── existing_panel_update.rs
@@ -1047,6 +1050,7 @@ src/
 │   │   │   ├── prompt_observe.rs
 │   │   │   ├── provider_output_guard.rs
 │   │   │   ├── provider_session_persistence.rs
+│   │   │   ├── rowless_delivery_authority.rs
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
@@ -1122,7 +1126,8 @@ src/
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
 │   │   │   │   ├── completion_context.rs
-│   │   │   │   └── completion_postgres.rs
+│   │   │   │   ├── completion_postgres.rs
+│   │   │   │   └── span_tests.rs
 │   │   │   ├── completion_postlude/
 │   │   │   │   ├── channel_episode_scope.rs
 │   │   │   │   ├── channel_writeback.rs
