@@ -369,6 +369,10 @@ while IFS= read -r -d '' tracked_file; do
           ;;
       esac
       ;;
+    *.patch|*.diff|*.log)
+      echo "ERROR: Scratch file detected: $tracked_file"
+      FAIL=1
+      ;;
   esac
 done < <(git ls-files -z)
 for scratch_file in scratch.sql scratchpad.sql scratch[._-]*.sql scratchpad[._-]*.sql test_scratch[._-]*.sql; do
