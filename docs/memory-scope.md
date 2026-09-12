@@ -2,7 +2,7 @@
 
 This document pins down which kinds of facts belong in `scope: permanent` vs `scope: workspace` (a.k.a. session) in the Memento MCP store, and what must never be written to Memento at all.
 
-It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder under issue 910-6).
+It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder).
 
 This contract applies to MCP-backed Memento data. The PostgreSQL `local_memory`
 fallback documented in [`docs/source-of-truth.md`](source-of-truth.md) stores
@@ -86,7 +86,7 @@ When deciding where (or whether) to call `remember`, walk this checklist:
 
 Promotion (`workspace → permanent`) is explicit, never automatic. Use `amend` after the fact has been validated across at least one additional session.
 
-## Permanent-Scope Audit (issue #1100)
+## Permanent-Scope Audit
 
 A fragment-level audit of existing `scope: permanent` entries was NOT performed inline in this commit (no Memento fetch was issued). The audit categories below are the candidate buckets that future audit passes should sweep, ordered by likely yield. They are derived from the forbidden table above and from observed past patterns:
 
