@@ -6,19 +6,19 @@ pub(super) fn check(cfg: &config::Config) -> Check {
             "local_target_unset",
             CheckStatus::Warn,
             Severity::Warning,
-            "Operational alert target is not declared in local config. Runtime effective KV settings and alert delivery status were not checked.",
+            "로컬 구성에 운영 알림 대상이 선언되지 않았습니다. 실행 서버의 실효 KV 설정과 알림 배달 상태는 확인하지 않았습니다.",
         ),
         Some(value) if value.trim().is_empty() => (
             "local_target_blank",
             CheckStatus::Warn,
             Severity::Warning,
-            "Operational alert target in local config is empty. Runtime effective KV settings and alert delivery status were not checked.",
+            "로컬 구성의 운영 알림 대상이 비어 있습니다. 실행 서버의 실효 KV 설정과 알림 배달 상태는 확인하지 않았습니다.",
         ),
         Some(_) => (
             "local_target_declared_unverified",
             CheckStatus::Pass,
             Severity::Info,
-            "Operational alert target string is declared in local config. Target validity, effective KV reflection, permissions, and delivery were not verified.",
+            "로컬 구성에 운영 알림 대상 문자열이 선언되어 있습니다. 대상 유효성·실효 KV 반영·권한·배달은 검증하지 않았습니다.",
         ),
     };
     let mut check = Check::ok(
@@ -39,7 +39,7 @@ pub(super) fn check(cfg: &config::Config) -> Check {
         "circuit_state": "not_checked"
     }));
     check.status = status;
-    check.guidance = Some("When reviewing alert settings, verify the effective kanban_human_alert_channel_id on the runtime server through a separate read-only procedure. This diagnostic does not activate or recover alerts. CIRCUIT_STAMP=1 is not provided as a solution.".into());
+    check.guidance = Some("알림 설정 검토 시 실행 서버의 kanban_human_alert_channel_id 실효 설정을 별도 읽기 전용 절차로 확인하십시오. 이 진단은 알림 활성화나 복구를 수행하지 않습니다. CIRCUIT_STAMP=1 설정을 해결책으로 제시하지 않습니다.".into());
     check
 }
 
@@ -69,13 +69,7 @@ mod tests {
                 "circuit_state": "not_checked"
             }))
         );
-        assert!(
-            check
-                .guidance
-                .as_ref()
-                .unwrap()
-                .contains("separate read-only")
-        );
+        assert!(check.guidance.as_ref().unwrap().contains("별도 읽기 전용"));
         assert_eq!(
             check.label(),
             if status == "warn" { "WARN" } else { "PASS" }
