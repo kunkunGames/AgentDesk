@@ -12,7 +12,7 @@ const ROUTINE_SCRIPT_REGISTRATION_CHECK_ID: &str = "routine_scripts_registered";
 const ROUTINE_SCRIPT_REGISTRATION_CHECK_NAME: &str = "Routine Scripts";
 
 /// Pure builder for the routine-script registration finding so the message
-/// contract ("N unregistered in folder: …") is unit-testable without a DB.
+/// contract ("폴더에 있으나 미등록 N개: …") is unit-testable without a DB.
 fn routine_script_registration_check(
     dirs: &[PathBuf],
     discovered_count: usize,
@@ -29,7 +29,7 @@ fn routine_script_registration_check(
             ROUTINE_SCRIPT_REGISTRATION_CHECK_ID,
             CheckGroup::Core,
             ROUTINE_SCRIPT_REGISTRATION_CHECK_NAME,
-            format!("{dirs_display} — all {discovered_count} scripts registered in routines table"),
+            format!("{dirs_display} — 스크립트 {discovered_count}개 모두 routines 테이블에 등록됨"),
         )
         .with_subsystem("routines")
         .with_path(dirs_display)
@@ -48,11 +48,11 @@ fn routine_script_registration_check(
         CheckGroup::Core,
         ROUTINE_SCRIPT_REGISTRATION_CHECK_NAME,
         format!(
-            "{} unregistered in folder: {}",
+            "폴더에 있으나 미등록 {}개: {}",
             unregistered.len(),
             unregistered.join(", ")
         ),
-        "*.js in routines.dir are not attached to routines table. Register via POST /api/routines or remove the files.",
+        "routines.dir 의 *.js 가 routines 테이블에 attach 되지 않았습니다. POST /api/routines 로 등록하거나 파일을 제거하세요.",
     )
     .with_subsystem("routines")
     .with_path(dirs_display)
@@ -128,7 +128,7 @@ pub(super) fn check_routine_script_registration(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 ROUTINE_SCRIPT_REGISTRATION_CHECK_NAME,
                 format!("{dirs_display} — runtime init failed"),
-                "Failed to create async runtime for routines table query.",
+                "routines 테이블 조회용 async runtime 생성에 실패했습니다.",
             )
             .with_subsystem("routines")
             .with_path(dirs_display)
@@ -158,8 +158,8 @@ pub(super) fn check_routine_script_registration(cfg: &config::Config) -> Check {
             ROUTINE_SCRIPT_REGISTRATION_CHECK_ID,
             CheckGroup::Core,
             ROUTINE_SCRIPT_REGISTRATION_CHECK_NAME,
-            format!("{dirs_display} — failed to query routines table"),
-            "Failed to determine unregistered scripts due to Postgres connection or routines table query failure.",
+            format!("{dirs_display} — routines 테이블 조회 실패"),
+            "Postgres 연결 또는 routines 테이블 조회에 실패해 미등록 스크립트를 판정하지 못했습니다.",
         )
         .with_subsystem("routines")
         .with_path(dirs_display)
@@ -206,7 +206,7 @@ pub(super) fn check_data_dir(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Data Directory",
             format!("{} — missing", cfg.data.dir.display()),
-            "You can create data directory and DB with agentdesk doctor --fix.",
+            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
         )
         .with_path(cfg.data.dir.display().to_string())
         .with_expected_actual("data directory exists", "data directory missing")
@@ -238,7 +238,7 @@ mod routine_script_registration_tests {
         assert_eq!(check.subsystem, "routines");
         assert_eq!(
             check.detail,
-            "2 unregistered in folder: dependency-update-watcher.js, nested/x.js"
+            "폴더에 있으나 미등록 2개: dependency-update-watcher.js, nested/x.js"
         );
         assert_eq!(check.path.as_deref(), Some("/opt/adk/routines"));
         assert_eq!(check.actual.as_deref(), Some("discovered=5 unregistered=2"));
@@ -268,7 +268,7 @@ mod routine_script_registration_tests {
         let check = routine_script_registration_check(&dirs, 3, &[]);
 
         assert_eq!(check.status, CheckStatus::Pass);
-        assert!(check.detail.contains("all 3"));
+        assert!(check.detail.contains("3개 모두"));
         assert_eq!(
             check.path.as_deref(),
             Some("/opt/adk/routines, /opt/adk/routines-extra")
