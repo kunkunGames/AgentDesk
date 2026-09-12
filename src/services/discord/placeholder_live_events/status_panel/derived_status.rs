@@ -21,30 +21,22 @@ macro_rules! define_derived_status {
             )+
         }
 
+        #[cfg(test)]
         impl DerivedStatus {
-            pub(in crate::services::discord::placeholder_live_events) fn is_terminal(&self) -> bool {
-                match self {
-                    $(Self::$variant
-                        $(( $(define_derived_status!(@ignore $tuple_type)),* ))?
-                        $({ $($field: _),* })? => $terminal,)+
-                }
-            }
-
-            /// Every variant supplies samples; tests assert an independent,
-            /// exhaustive expectation rather than trusting terminal metadata.
-            #[cfg(test)]
-            pub(in crate::services::discord::placeholder_live_events) fn panel_shape_test_variants() -> Vec<Self> {
+            /// The enum declaration, classifier expectation, and representative
+            /// samples share this macro invocation. A new variant therefore cannot
+            /// compile without declaring its contract-test samples here.
+            pub(in crate::services::discord::placeholder_live_events) fn panel_shape_test_variants() -> Vec<(Self, bool)> {
                 let mut variants = Vec::new();
                 $(
                     variants.extend([
-                        $($sample),+
+                        $(($sample, $terminal)),+
                     ]);
                 )+
                 variants
             }
         }
     };
-    (@ignore $tuple_type:ty) => { _ };
 }
 
 define_derived_status! {

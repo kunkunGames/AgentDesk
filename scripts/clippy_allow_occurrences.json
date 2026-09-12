@@ -120,12 +120,7 @@
     {
       "path": "src/services/claude.rs",
       "lint": "too_many_arguments",
-      "count": 6
-    },
-    {
-      "path": "src/services/claude/tui_session_launch.rs",
-      "lint": "too_many_arguments",
-      "count": 1
+      "count": 7
     },
     {
       "path": "src/services/claude_e/process.rs",
@@ -180,12 +175,7 @@
     {
       "path": "src/services/codex.rs",
       "lint": "too_many_arguments",
-      "count": 7
-    },
-    {
-      "path": "src/services/codex/process_session_launch.rs",
-      "lint": "too_many_arguments",
-      "count": 1
+      "count": 8
     },
     {
       "path": "src/services/codex_tmux_wrapper.rs",
@@ -500,12 +490,7 @@
     {
       "path": "src/services/discord/tmux.rs",
       "lint": "too_many_arguments",
-      "count": 4
-    },
-    {
-      "path": "src/services/discord/tmux/monitor_auto_turn_inflight.rs",
-      "lint": "too_many_arguments",
-      "count": 1
+      "count": 5
     },
     {
       "path": "src/services/discord/tmux_overload_retry.rs",
@@ -633,7 +618,7 @@
       "count": 3
     },
     {
-      "path": "src/services/discord/tui_prompt_relay/synthetic_start/claim.rs",
+      "path": "src/services/discord/tui_prompt_relay/synthetic_start.rs",
       "lint": "too_many_arguments",
       "count": 1
     },

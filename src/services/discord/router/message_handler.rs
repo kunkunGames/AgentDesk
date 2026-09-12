@@ -46,7 +46,6 @@ mod goal_lifecycle;
 mod headless_turn;
 mod intake_turn;
 mod latency_spans;
-mod pre_admission_control;
 mod provider_dispatch;
 mod provider_isolation;
 mod tui_followup;

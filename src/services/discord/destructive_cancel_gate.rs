@@ -54,7 +54,6 @@ const DESTRUCTIVE_FENCE_LEASE_SITE: &str = "destructive_fence";
 
 #[derive(Clone, Debug)]
 pub(in crate::services::discord) struct DestructiveCancelProbeSnapshot {
-    pub finalizer_claim_snapshot: super::turn_finalizer::SyntheticClaimSnapshot,
     pub pin: DestructiveCancelIdentityPin,
     pub inflight_identity: inflight::InflightTurnIdentity,
     pub updated_at: String,
@@ -110,9 +109,6 @@ impl DestructiveCancelProbeSnapshot {
         );
         Self {
             pin,
-            finalizer_claim_snapshot: super::turn_finalizer::SyntheticClaimSnapshot::from_row(
-                state,
-            ),
             inflight_identity: inflight::InflightTurnIdentity::from_state(state),
             updated_at: state.updated_at.clone(),
             save_generation: state.save_generation,

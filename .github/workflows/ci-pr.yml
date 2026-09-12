@@ -159,7 +159,6 @@ jobs:
               - 'src/server/worker_registry.rs'
               - 'src/services/auto_queue.rs'
               - 'src/services/auto_queue/**'
-              - 'src/services/agent_recovery/**'
               - 'src/services/automation_candidate_materializer/**'
               - 'src/services/dispatches/**'
               - 'src/services/queue.rs'
@@ -178,9 +177,6 @@ jobs:
               - 'src/services/discord/watchers/dispatched_origin_ghost.rs'
               - 'src/services/discord/watchers/dispatched_origin_ghost_tests.rs'
               - 'src/services/maintenance/jobs/worktree_orphan_sweep.rs'
-              # #5320 slice 2: maintenance jobs reach the database, so select the
-              # whole directory and stop leaving new siblings out of the PG lane.
-              - 'src/services/maintenance/jobs/**'
               - 'src/services/pipeline_override.rs'
               # #5025: terminal-delivery evidence routing and every local
               # producer/epilogue sibling run in `test_fast`, whose registered
@@ -203,7 +199,6 @@ jobs:
               - 'src/services/discord/turn_bridge/headless_delivery.rs'
               - 'src/services/discord/turn_bridge/headless_delivery/**'
               - 'src/services/discord/turn_bridge/intake_settlement/**'
-              - 'src/services/discord/turn_bridge/**'
               - 'src/services/discord/turn_bridge/voice_completion_tests.rs'
               - 'src/services/scheduled_messages.rs'
               - 'src/services/scheduled_messages/**'
@@ -350,60 +345,16 @@ jobs:
               - 'src/services/cluster/**'
               - 'src/services/codex_tui/**'
               - 'src/services/dispatches/**'
-              # DERIVED BLOCK (#5832) -- do not hand-edit. cross_os_rust does
-              # not select 'src/services/discord/**' wholesale, so every file in
-              # that subtree that carries a platform cfg shim (or names a
-              # unix-gated module) is selected here instead. #5828 broke the
-              # required Windows lane from exactly one such file, and hand
-              # enumeration is what left its 21 siblings unselected. Regenerate
-              # with `python3 scripts/cross_os_consumer_paths.py --format globs`;
-              # tests/test_fast_check_ci_wiring.py fails when a derived consumer
-              # stops matching. Unix-only trees (tmux.rs and its tmux_watcher/
-              # watchers subtrees) are deliberately absent -- Windows never
-              # compiles them, so they cannot break the lane. This block also
-              # covers the inflight std::fs::File advisory-lock owners and the
-              # restart-v2 per-platform fs backend, listed by hand until now.
-              - 'src/services/discord/commands/**'
-              - 'src/services/discord/delivery_lease_cell.rs'
-              - 'src/services/discord/destructive_cancel_gate.rs'
-              - 'src/services/discord/health.rs'
-              - 'src/services/discord/health/**'
-              - 'src/services/discord/idle_recap.rs'
-              - 'src/services/discord/idle_recap_interaction.rs'
-              - 'src/services/discord/idle_relay_drift.rs'
-              - 'src/services/discord/inflight.rs'
-              - 'src/services/discord/inflight/**'
-              - 'src/services/discord/mod.rs'
-              - 'src/services/discord/model_catalog/**'
-              - 'src/services/discord/outbound/**'
-              - 'src/services/discord/placeholder_live_events/**'
-              - 'src/services/discord/placeholder_sweeper/**'
-              - 'src/services/discord/recovery_engine.rs'
-              - 'src/services/discord/recovery_engine/**'
-              - 'src/services/discord/recovery_paths/**'
-              - 'src/services/discord/relay_health.rs'
-              - 'src/services/discord/relay_recovery.rs'
-              - 'src/services/discord/relay_recovery/**'
-              - 'src/services/discord/relay_recovery_circuit_breaker.rs'
-              - 'src/services/discord/replace_outcome_policy.rs'
-              - 'src/services/discord/restart_mode/**'
-              - 'src/services/discord/router/**'
-              - 'src/services/discord/runtime_bootstrap.rs'
-              - 'src/services/discord/runtime_bootstrap/**'
-              - 'src/services/discord/runtime_store.rs'
-              - 'src/services/discord/settings/**'
-              - 'src/services/discord/terminal_ui_obligation.rs'
-              - 'src/services/discord/tmux_watcher_registry.rs'
-              - 'src/services/discord/tmux_watcher_registry/**'
-              - 'src/services/discord/tmux_watcher_registry_restore_tests.rs'
-              - 'src/services/discord/tui_direct_abort_marker/**'
-              - 'src/services/discord/tui_direct_pending_start/**'
-              - 'src/services/discord/tui_prompt_relay.rs'
-              - 'src/services/discord/tui_prompt_relay/**'
-              - 'src/services/discord/turn_bridge/**'
-              - 'src/services/discord/turn_finalizer.rs'
-              - 'src/services/discord/turn_finalizer/**'
-              - 'src/services/discord/voice_barge_in/**'
+              # The inflight sidecar primitive uses the cross-platform
+              # std::fs::File advisory-lock API. Changes to its owners must
+              # compile all targets in the required native Windows lane.
+              - 'src/services/discord/inflight/store.rs'
+              - 'src/services/discord/inflight/save_store.rs'
+              # The restart-v2 fs backend has per-platform implementations
+              # (unix + unsupported). Changes must compile in the native
+              # Windows lane before merge.
+              - 'src/services/discord/restart_mode/protocol_v2/fs.rs'
+              - 'src/services/discord/restart_mode/protocol_v2/fs/**'
               - 'src/services/git/**'
               - 'src/services/maintenance/**'
               - 'src/services/memory/**'
@@ -1526,7 +1477,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=2fdb9a5a42730d6d97b5997d6b3b9cd47f2df704a807dec867b49bcb27aa4710
+          expected=7fa70ddb0835f1ed37add3bf415576350cf3adebfc8a98d8d97edf5f6efe5c09
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -1602,8 +1553,6 @@ jobs:
         run: |
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
-          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it -- --test-threads=1
-          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1
 
       - name: Require relay-authority mutations to be killed
@@ -1635,7 +1584,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=2fdb9a5a42730d6d97b5997d6b3b9cd47f2df704a807dec867b49bcb27aa4710
+          expected=7fa70ddb0835f1ed37add3bf415576350cf3adebfc8a98d8d97edf5f6efe5c09
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

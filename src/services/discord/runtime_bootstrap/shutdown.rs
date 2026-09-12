@@ -19,7 +19,17 @@ pub(super) fn run_bot_spawn_sigterm_handler(
                 tracing::info!("  [{ts}] 🛑 SIGTERM received — graceful shutdown");
 
                 // Set global shutdown flag
-                shared_for_signal.restart.legacy_sigterm();
+                shared_for_signal
+                    .restart
+                    .shutting_down
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                // Block dequeue and put router into drain mode so no new
+                // queue/checkpoint mutations occur during shutdown.
+                shared_for_signal
+                    .restart
+                    .restart_pending
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
 
                 // ── Critical state persistence (MUST run before any I/O) ──
                 // Save pending queues and last_message_ids FIRST, before any

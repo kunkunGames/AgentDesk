@@ -40,7 +40,6 @@ from scripts.relay_watchdog import (
     PG_UNCLASSIFIED_DOWN,
     PG_UNKNOWN,
     PG_UPSTREAM_DOWN,
-    RUNTIME_HEALTH_STATE_KEY,
     SELECTOR_DIVERGED,
     SELECTED_TRANSCRIPT_KEY,
     SELECTOR_SYNCED,
@@ -2288,7 +2287,6 @@ class FakePgRuntime(Runtime):
         super().__init__(cfg, Path(self._tmp.name))
         self.verdict = verdict
         self.dcserver_recent = False
-        self.alert_ok = True
         self.alerts: list[tuple[str, bool]] = []
         self.log_lines: list[str] = []
 
@@ -2306,7 +2304,7 @@ class FakePgRuntime(Runtime):
 
     def alert(self, ch, body: str, trigger_turn: bool = True) -> bool:
         self.alerts.append((body, trigger_turn))
-        return self.alert_ok
+        return True
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -2416,226 +2414,6 @@ class TickPgTunnelTests(unittest.TestCase):
         tick_pg_tunnel(rt, active, self.NOW)
         self.assertTrue(active[PG_STATE_KEY]["alerting"])
         self.assertEqual(rt.alerts, [])
-
-
-class TripwirePgRuntime(FakePgRuntime):
-    """Proves the unobservable circuit needs no transcript/tmux evidence.
-
-    #5484 08-21: the runtime was gone, so every transcript- and tmux-derived
-    signal was absent too. A detector that first asks "which channel is active"
-    would have stayed silent for the same seven hours.
-    """
-
-    def live_tmux_sessions(self):
-        raise AssertionError("tmux probe consulted by the unobservable circuit")
-
-    def watcher_state(self, channel_id: str):
-        raise AssertionError("watcher-state probe consulted")
-
-
-class TickRuntimeObservabilityTests(unittest.TestCase):
-    """#5484 S1: `db` that is never readable is its own reported incident.
-
-    It rides the PG circuit's 300s persistence / 900s re-alert thresholds but
-    keeps a separate state key, separate wording, and no PG claim whatsoever.
-    """
-
-    NOW = 10_000.0
-
-    def make_rt(self, verdict, cls=FakePgRuntime, **kwargs) -> FakePgRuntime:
-        rt = cls(verdict, **kwargs)
-        self.addCleanup(rt.cleanup)
-        return rt
-
-    def test_runtime_unobservable_without_transcript(self):
-        rt = self.make_rt(evaluate_pg_health(None, None), cls=TripwirePgRuntime)
-        state: dict = {PG_STATE_KEY: {"unhealthy_since": self.NOW - 299}}
-        tick_pg_tunnel(rt, state, self.NOW)
-        # The PG circuit's own unknown contract is untouched (#4378/#5484).
-        self.assertNotIn("unhealthy_since", state[PG_STATE_KEY])
-        tick_pg_tunnel(rt, state, self.NOW + 299)
-        self.assertEqual(rt.alerts, [], "must not alert before 300s of unknown")
-        tick_pg_tunnel(rt, state, self.NOW + 300)
-        self.assertEqual(len(rt.alerts), 1)
-        body, trigger_turn = rt.alerts[0]
-        self.assertIn("관측 불가", body)
-        self.assertIn("5분", body)
-        self.assertFalse(trigger_turn, "direct send only: send-to-agent needs PG")
-        obs = state[RUNTIME_HEALTH_STATE_KEY]
-        self.assertEqual(obs["since"], self.NOW, "first observation is preserved")
-        self.assertEqual(obs["last_alert"], self.NOW + 300)
-        tick_pg_tunnel(rt, state, self.NOW + 301)
-        self.assertEqual(len(rt.alerts), 1, "cooldown holds the second tick")
-
-    def test_unobservable_retry_and_recovery(self):
-        rt = self.make_rt(evaluate_pg_health(None, None))
-        rt.alert_ok = False
-        state: dict = {RUNTIME_HEALTH_STATE_KEY: {"since": self.NOW - 300}}
-        tick_pg_tunnel(rt, state, self.NOW)
-        obs = state[RUNTIME_HEALTH_STATE_KEY]
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertNotIn("last_alert", obs, "a failed send must not spend cooldown")
-        self.assertNotIn("alerting", obs)
-        self.assertEqual(obs["attempts"], 1)
-        tick_pg_tunnel(rt, state, self.NOW + 59)
-        self.assertEqual(len(rt.alerts), 1, "retry is bounded, not every tick")
-        rt.alert_ok = True
-        tick_pg_tunnel(rt, state, self.NOW + 60)
-        self.assertEqual(len(rt.alerts), 2)
-        self.assertEqual(obs["last_alert"], self.NOW + 60)
-        self.assertEqual(obs["attempts"], 0)
-
-        # Survives a watchdog restart through the on-disk state, timer intact.
-        (rt.state_path.parent).mkdir(parents=True, exist_ok=True)
-        save_state(rt.state_path, state)
-        reloaded = load_state(rt.state_path)
-        rt2 = self.make_rt(evaluate_pg_health(None, None))
-        tick_pg_tunnel(rt2, reloaded, self.NOW + 959)
-        self.assertEqual(rt2.alerts, [])
-        tick_pg_tunnel(rt2, reloaded, self.NOW + 960)
-        self.assertEqual(len(rt2.alerts), 1)
-        self.assertIn("21분", rt2.alerts[0][0], "since must not restart per tick")
-
-        # A valid db bool ends the incident and is reported as exactly that.
-        rt2.verdict = evaluate_pg_health(False, False)
-        tick_pg_tunnel(rt2, reloaded, self.NOW + 961)
-        self.assertEqual(len(rt2.alerts), 2, "PG timer only starts here, no PG alert")
-        recovery = rt2.alerts[1][0]
-        self.assertIn("관측 재개", recovery)
-        self.assertIn("릴레이 복구를 의미하지 않습니다", recovery)
-        self.assertIn("db=false", recovery)
-        obs2 = reloaded[RUNTIME_HEALTH_STATE_KEY]
-        self.assertNotIn("since", obs2)
-        self.assertNotIn("alerting", obs2)
-        self.assertEqual(obs2["last_alert"], self.NOW + 960, "cooldown outlives it")
-
-        # Flap back plus a corrupt future stamp: clamped, quiet, no spam.
-        rt2.verdict = evaluate_pg_health(None, None)
-        obs2["since"] = self.NOW + 10_000
-        tick_pg_tunnel(rt2, reloaded, self.NOW + 962)
-        self.assertEqual(len(rt2.alerts), 2)
-        self.assertEqual(obs2["since"], self.NOW + 962)
-
-    def test_malformed_or_auth_response_is_not_pg_down(self):
-        cases = {
-            "curl_timeout": subprocess.TimeoutExpired(["curl"], 10),
-            "connection_refused": subprocess.CompletedProcess(["curl"], 7, "", ""),
-            "auth_html_body": subprocess.CompletedProcess(
-                ["curl"], 0, "<html>401 Unauthorized</html>", ""
-            ),
-            "db_field_absent": subprocess.CompletedProcess(
-                ["curl"], 0, '{"ok": true}', ""
-            ),
-        }
-        for name, outcome in cases.items():
-            with self.subTest(case=name):
-                calls: list[list[str]] = []
-
-                def fake_run(argv, _outcome=outcome, **kwargs):
-                    calls.append(list(argv))
-                    if isinstance(_outcome, Exception):
-                        raise _outcome
-                    return _outcome
-
-                with tempfile.TemporaryDirectory() as tmp:
-                    probe = Runtime(Config(channels=(TICK_CHANNEL,)), Path(tmp))
-                    with mock.patch.object(
-                        relay_watchdog.subprocess, "run", side_effect=fake_run
-                    ):
-                        verdict = probe.pg_health()
-                self.assertEqual(verdict.state, PG_UNKNOWN)
-                self.assertEqual(len(calls), 1, "nc must not be consulted")
-
-                rt = self.make_rt(verdict)
-                state = {RUNTIME_HEALTH_STATE_KEY: {"since": self.NOW - 300}}
-                tick_pg_tunnel(rt, state, self.NOW)
-                self.assertEqual(len(rt.alerts), 1)
-                body = rt.alerts[0][0]
-                self.assertIn("관측 불가", body)
-                self.assertIn("PG 장애로 단정하지 않습니다", body)
-                for forbidden in ("db=false", "재기동", "재시작합니다", "복구"):
-                    self.assertNotIn(forbidden, body)
-                self.assertEqual(state[PG_STATE_KEY], {}, "no PG verdict recorded")
-
-    def test_recent_dcserver_boot_alert_defers_exactly_one_tick(self):
-        """#4379 shares the 900s cadence: hold one tick, then say so."""
-        rt = self.make_rt(evaluate_pg_health(None, None))
-        rt.dcserver_recent = True
-        state: dict = {RUNTIME_HEALTH_STATE_KEY: {"since": self.NOW - 300}}
-        tick_pg_tunnel(rt, state, self.NOW)
-        obs = state[RUNTIME_HEALTH_STATE_KEY]
-        self.assertEqual(rt.alerts, [], "must not double dcserver's boot alert")
-        self.assertTrue(obs["dedup_deferred"])
-        self.assertNotIn("last_alert", obs, "a deferral must not spend the cooldown")
-        self.assertEqual(state[PG_STATE_KEY], {}, "PG dedup keys stay untouched")
-
-        # The very next tick sends anyway: de-duplication can never be silence.
-        tick_pg_tunnel(rt, state, self.NOW + rt.cfg.poll_secs)
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("관측 불가", rt.alerts[0][0])
-        self.assertIn("1 tick 보류", rt.alerts[0][0])
-        self.assertNotIn("dedup_deferred", obs, "cleared once the alert landed")
-
-        # A re-alert after the cooldown is not a first alert: no second hold.
-        tick_pg_tunnel(rt, state, self.NOW + rt.cfg.poll_secs + rt.cfg.pg_realert_secs)
-        self.assertEqual(len(rt.alerts), 2)
-        self.assertNotIn("1 tick 보류", rt.alerts[1][0])
-
-    def test_recovery_notice_retries_until_it_is_delivered(self):
-        """A dropped close leaves the incident open on the operator's screen."""
-        rt = self.make_rt(evaluate_pg_health(None, None))
-        state: dict = {RUNTIME_HEALTH_STATE_KEY: {"since": self.NOW - 300}}
-        tick_pg_tunnel(rt, state, self.NOW)
-        obs = state[RUNTIME_HEALTH_STATE_KEY]
-        self.assertTrue(obs["alerting"])
-
-        rt.verdict = evaluate_pg_health(True, None)
-        rt.alert_ok = False
-        tick_pg_tunnel(rt, state, self.NOW + 1)
-        self.assertEqual(len(rt.alerts), 2)
-        self.assertIn("관측 재개", rt.alerts[1][0])
-        self.assertTrue(obs["alerting"], "incident stays open until the close lands")
-        self.assertEqual(obs["since"], self.NOW - 300, "duration must not be lost")
-        self.assertEqual(obs["attempts"], 1)
-
-        tick_pg_tunnel(rt, state, self.NOW + 2)
-        self.assertEqual(len(rt.alerts), 2, "the resend rides the 60s backoff")
-        rt.alert_ok = True
-        tick_pg_tunnel(rt, state, self.NOW + 61)
-        self.assertEqual(len(rt.alerts), 3)
-        self.assertIn("관측 재개", rt.alerts[2][0])
-        self.assertNotIn("alerting", obs)
-        self.assertNotIn("since", obs)
-        self.assertEqual(obs["last_alert"], self.NOW, "cooldown still outlives it")
-
-    def test_observable_clears_state_even_inside_a_send_backoff(self):
-        """The resend backoff holds a resend, never a close that is not owed."""
-        rt = self.make_rt(evaluate_pg_health(None, None))
-        rt.alert_ok = False
-        state: dict = {RUNTIME_HEALTH_STATE_KEY: {"since": self.NOW - 300}}
-        tick_pg_tunnel(rt, state, self.NOW)
-        obs = state[RUNTIME_HEALTH_STATE_KEY]
-        self.assertEqual(obs["attempts"], 1, "the outage alert was never delivered")
-
-        rt.verdict = evaluate_pg_health(True, None)
-        tick_pg_tunnel(rt, state, self.NOW + 1)
-        self.assertEqual(len(rt.alerts), 1, "no close is owed for an unsent alert")
-        self.assertNotIn("since", obs, "a stale timer must not survive recovery")
-        self.assertNotIn("attempts", obs)
-
-    def test_corrupt_state_value_does_not_disarm_the_circuit(self):
-        """A non-dict `_runtime_health` must not become permanent silence."""
-        rt = self.make_rt(evaluate_pg_health(None, None))
-        state: dict = {RUNTIME_HEALTH_STATE_KEY: "corrupt"}
-        tick_pg_tunnel(rt, state, self.NOW)
-        self.assertEqual(rt.alerts, [], "the persistence clock restarts here")
-        self.assertEqual(state[RUNTIME_HEALTH_STATE_KEY]["since"], self.NOW)
-        tick_pg_tunnel(rt, state, self.NOW + 300)
-        self.assertEqual(len(rt.alerts), 1)
-        self.assertIn("관측 불가", rt.alerts[0][0])
-        self.assertNotIn(
-            "tick error", "\n".join(rt.log_lines), "not swallowed as a tick error"
-        )
 
 
 class TickChannelTests(unittest.TestCase):
@@ -5027,7 +4805,7 @@ class TickChannelTests(unittest.TestCase):
         )
         self.assertFalse(any("릴레이 갭 해소" in body for body, _ in rt.alerts))
 
-    def test_invariant_4435_same_reason_retirement_alerts_share_realert_cooldown(self):
+    def test_invariant_4435_retirement_alerts_share_realert_cooldown(self):
         current = self.proj_dir / "retirement-current.jsonl"
         current.write_text(
             json.dumps(
@@ -5088,128 +4866,6 @@ class TickChannelTests(unittest.TestCase):
         self.assertEqual(
             len([body for body, _ in rt.alerts if "평가 권한 만료" in body]), 2
         )
-
-    def _5205_assert_retirement_notice_log(self, reason: str, event: str) -> None:
-        for notice in ("sent", "cooldown", "undelivered"):
-            with self.subTest(reason=reason, notice=notice):
-                rt = self.make_rt(read_fail_alert_after=3)
-                chs: dict = {}
-                if notice == "cooldown":
-                    self.assertEqual(
-                        relay_watchdog._alert_pending_retirement(
-                            rt, TICK_CHANNEL, chs, ["/prior.jsonl"],
-                            self.now - 1, reason=reason,
-                        ),
-                        "sent",
-                    )
-                rt.alert_succeeds = notice != "undelivered"
-                rt.alerts.clear()
-                rt.log_lines.clear()
-                paths = []
-                for index in range(2):
-                    path = self.proj_dir / f"retire-{index}.jsonl"
-                    path.write_bytes(b"{}\n" if reason == "idle" else b"\xff\n")
-                    os.utime(path, (self.now, self.now))
-                    paths.append(str(path))
-                chs.update({
-                    "transcript_sizes": {path: Path(path).stat().st_size for path in paths},
-                    "transcript_seen_at": {path: self.now for path in paths},
-                    "transcript_known_at": {path: self.now for path in paths},
-                    "pending_transcripts": paths[:],
-                    "pending_transcript_since": {
-                        path: self.now - rt.cfg.idle_quiet_secs - 1
-                        if reason == "idle" else self.now
-                        for path in paths
-                    },
-                    "pending_transcript_failures": {path: 2 for path in paths},
-                })
-                tick_channel(rt, TICK_CHANNEL, {"999": chs}, self.now)
-                for path in paths:
-                    self.assertIn(path, chs[relay_watchdog.RETIRED_TRANSCRIPTS_KEY])
-                    self.assertNotIn(path, chs[relay_watchdog.PENDING_TRANSCRIPTS_KEY])
-                    self.assertNotIn(
-                        path, chs.get(relay_watchdog.PENDING_TRANSCRIPT_FAILURES_KEY, {})
-                    )
-                self.assertEqual(len(rt.alerts), 0 if notice == "cooldown" else 1)
-                unannounced = [line for line in rt.log_lines if "-unannounced " in line]
-                self.assertEqual(
-                    unannounced,
-                    [] if notice == "sent" else [
-                        f"[999] transcript-pending-{event}-unannounced "
-                        f"notice={notice} count=2"
-                    ],
-                    rt.log_lines,
-                )
-
-    def test_5205_expired_unannounced_log_reports_actual_notice(self):
-        self._5205_assert_retirement_notice_log("idle", "expired")
-
-    def test_5205_escalated_unannounced_log_reports_actual_notice(self):
-        self._5205_assert_retirement_notice_log("read_failure", "escalated")
-
-    def test_5205_retirement_cooldown_is_independent_for_every_reason_pair(self):
-        reasons = (
-            "idle", "read_failure",
-            relay_watchdog.ORPHAN_STRANDED_RETIREMENT_REASON,
-            relay_watchdog.DEAD_WORKTREE_RETIREMENT_REASON,
-        )
-        for first in reasons:
-            for second in reasons:
-                with self.subTest(first=first, second=second):
-                    rt = self.make_rt()
-                    chs: dict = {}
-                    self.assertEqual(
-                        relay_watchdog._alert_pending_retirement(
-                            rt, TICK_CHANNEL, chs, ["/first.jsonl"],
-                            self.now, reason=first,
-                        ),
-                        "sent",
-                    )
-                    self.assertEqual(
-                        relay_watchdog._alert_pending_retirement(
-                            rt, TICK_CHANNEL, chs, ["/second.jsonl"],
-                            self.now + 1, reason=second,
-                        ),
-                        "cooldown" if first == second else "sent",
-                    )
-                    self.assertEqual(len(rt.alerts), 1 if first == second else 2)
-
-    def test_5205_reason_cooldown_persists_and_failed_notice_can_retry(self):
-        rt = self.make_rt()
-        base_key = relay_watchdog.LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY
-        # The legacy shared key has no reason provenance and cannot suppress
-        # any reason after upgrade. It stays inert until normal state cleanup.
-        chs = {base_key: self.now}
-        reason = relay_watchdog.ORPHAN_STRANDED_RETIREMENT_REASON
-        key = f"{base_key}:{reason}"
-
-        def alert(at: float, paths=None) -> str:
-            return relay_watchdog._alert_pending_retirement(
-                rt, TICK_CHANNEL, chs,
-                ["/orphan.jsonl"] if paths is None else paths, at, reason=reason,
-            )
-
-        self.assertEqual(alert(self.now, []), "empty")
-        self.assertNotIn(key, chs)
-        rt.alert_succeeds = False
-        self.assertEqual(alert(self.now), "undelivered")
-        self.assertNotIn(key, chs)
-        rt.alert_succeeds = True
-        self.assertEqual(alert(self.now), "sent")
-        state_file = self.root / "cooldown-state.json"
-        relay_watchdog.save_state(state_file, {"999": chs})
-        chs = relay_watchdog.load_state(state_file)["999"]
-        self.assertEqual(chs[key], self.now)
-        boundary = self.now + rt.cfg.realert_secs
-        self.assertEqual(alert(boundary - 1), "cooldown")
-        self.assertEqual(chs[key], self.now)
-        rt.alert_succeeds = False
-        self.assertEqual(alert(boundary), "undelivered")
-        self.assertEqual(chs[key], self.now)
-        rt.alert_succeeds = True
-        self.assertEqual(alert(boundary), "sent")
-        self.assertEqual(chs[key], boundary)
-        self.assertEqual(chs[base_key], self.now)
 
     def test_invariant_4435_unrelated_pending_retirement_preserves_live_gap(self):
         rt = self.gap_rt()
@@ -6406,8 +6062,9 @@ class TickChannelTests(unittest.TestCase):
     ):
         """#5190 R3 P2-E: "nothing went out" has two causes, not one.
 
-        A prior retirement notice of the same reason within `realert_secs`
-        suppresses this one. The old code answered a bare bool
+        The retirement notice shares ONE cooldown key across every reason, so
+        an unrelated idle/read_failure/dead_worktree notice within
+        `realert_secs` suppresses this one. The old code answered a bare bool
         and the caller logged `notice=undelivered` for both — a false statement
         about the relay written into the record every time the real cause was a
         cooldown.
@@ -6428,7 +6085,7 @@ class TickChannelTests(unittest.TestCase):
             ),
             "sent",
         )
-        # The same reason, moments later, must still be rate-limited.
+        # A DIFFERENT reason, moments later, on the shared key.
         self.assertEqual(
             relay_watchdog._alert_pending_retirement(
                 rt,
@@ -6436,7 +6093,7 @@ class TickChannelTests(unittest.TestCase):
                 chs,
                 ["/b.jsonl"],
                 now + 60,
-                reason="idle",
+                reason=relay_watchdog.ORPHAN_STRANDED_RETIREMENT_REASON,
             ),
             "cooldown",
         )
@@ -6478,9 +6135,8 @@ class TickChannelTests(unittest.TestCase):
             discovered_at + relay_watchdog.ORPHAN_STRANDED_CONFIRM_SECS
         )
         self._5190_live_delivery(rt, live, retire_at, "live block three")
-        # Another orphan notice just consumed this reason's cooldown.
-        reason = relay_watchdog.ORPHAN_STRANDED_RETIREMENT_REASON
-        chs[f"{relay_watchdog.LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY}:{reason}"] = (
+        # An unrelated retirement notice went out moments ago on the shared key.
+        chs[relay_watchdog.LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY] = (
             retire_at - 10
         )
         tick_channel(rt, TICK_CHANNEL, state, retire_at)
@@ -9540,8 +9196,9 @@ class DeadWorktreeRetirementTests(unittest.TestCase):
     def test_termination_defers_while_the_notice_is_swallowed_by_cooldown(self):
         """P1-B: loss-state never terminates in silence.
 
-        A previous dead-worktree retirement within the same reason's cooldown
-        must not swallow this notice while the incident closes anyway.
+        `_alert_pending_retirement` shares ONE cooldown key across every reason,
+        so an idle/read-failure retirement seconds earlier would otherwise
+        swallow the dead-session notice while the incident closed anyway.
         """
         self.write_stale_transcript(4.9 * 86400)
         rt = self.make_rt()
@@ -9549,9 +9206,8 @@ class DeadWorktreeRetirementTests(unittest.TestCase):
         chs = state["999"]
         self.tick(rt, state, self.now)
         retire_at = self.now + relay_watchdog.DEAD_WORKTREE_CONFIRM_SECS + 1
-        # Another dead-worktree retirement 10s ago burned this reason's cooldown.
-        reason = relay_watchdog.DEAD_WORKTREE_RETIREMENT_REASON
-        chs[f"{relay_watchdog.LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY}:{reason}"] = (
+        # An unrelated retirement 10s ago burned the shared cooldown.
+        chs[relay_watchdog.LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY] = (
             retire_at - 10
         )
         self.tick(rt, state, retire_at)

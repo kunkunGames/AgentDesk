@@ -52,7 +52,6 @@ use super::{
 // `cfg(unix)`/`cfg(not(unix))` shim pair.
 #[path = "execution_identity.rs"]
 pub(in crate::services::discord) mod execution_identity;
-mod monitor_auto_turn_inflight;
 #[path = "tmux_placeholder_suppression/mod.rs"]
 mod placeholder_suppression;
 #[path = "tmux_reattach_offsets.rs"]
@@ -62,7 +61,6 @@ mod tmux_session_files;
 #[path = "watchers/lifecycle.rs"]
 mod watcher_lifecycle;
 
-use self::monitor_auto_turn_inflight::ensure_monitor_auto_turn_inflight;
 use self::placeholder_suppression::*;
 use self::tmux_reattach_offsets::matching_recent_watcher_reattach_offset;
 pub(in crate::services::discord) use self::tmux_session_files::committed_frontier_for_current_generation;
@@ -1073,7 +1071,7 @@ async fn start_monitor_auto_turn_when_available(
         let started = super::mailbox_try_start_turn_kinded(
             shared,
             channel_id,
-            token.clone(),
+            token,
             UserId::new(1),
             synthetic_message_id,
             crate::services::turn_orchestrator::ActiveTurnKind::MonitorAutoTurn,
@@ -1095,8 +1093,7 @@ async fn start_monitor_auto_turn_when_available(
                     channel_id,
                     synthetic_message_id.get(),
                     ledger_generation,
-                )
-                .with_episode_nonce(token.turn_nonce()),
+                ),
                 provider.clone(),
                 crate::services::discord::inflight::RelayOwnerKind::Watcher,
                 // #3016 phase-5a: prime the reconcile cache at register time so
@@ -1214,6 +1211,72 @@ pub(in crate::services::discord) fn build_monitor_triggered_inflight_state(
     state.turn_source = super::inflight::TurnSource::MonitorTriggered;
     state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
     state
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_monitor_auto_turn_inflight(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    output_path: &str,
+    input_fifo_path: &str,
+    session_id: Option<&str>,
+    turn_start_offset: u64,
+    last_offset: u64,
+) {
+    if super::inflight::load_inflight_state(provider, channel_id.get()).is_some() {
+        return;
+    }
+
+    let channel_name = parse_provider_and_channel_from_tmux_name(tmux_session_name)
+        .map(|(_, channel_name)| channel_name);
+    let mut synthetic = super::inflight::InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        channel_name,
+        0,
+        0,
+        0,
+        "Monitor auto-turn".to_string(),
+        session_id.map(str::to_string),
+        Some(tmux_session_name.to_string()),
+        Some(output_path.to_string()),
+        Some(input_fifo_path.to_string()),
+        last_offset,
+    );
+    synthetic.turn_nonce = super::mailbox_snapshot(shared, channel_id)
+        .await
+        .active_turn_nonce;
+    synthetic.turn_start_offset = Some(turn_start_offset);
+    synthetic = build_monitor_triggered_inflight_state(synthetic);
+    // #2285 audit trail: monitor pattern fired this turn without an
+    // originating Discord message. The session-bound relay does NOT branch
+    // on this — recorded for diagnostics only.
+    // status-panel-v2: make this watcher-owned so the panel-eligibility
+    // predicate (watcher_inflight_is_panel_eligible_for_session) recognises the
+    // synthetic monitor/self-paced-loop turn and the watcher can create/update/
+    // clean up a live status panel for it. The shared external-input predicate
+    // (lease + ⏳ anchor lifecycle, #3164/#3174) stays untouched.
+
+    match super::inflight::save_inflight_state_create_new(&synthetic) {
+        Ok(()) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 👁 Registered synthetic inflight for monitor auto-turn in channel {}",
+                channel_id.get()
+            );
+        }
+        Err(super::inflight::CreateNewInflightError::AlreadyExists) => {}
+        Err(super::inflight::CreateNewInflightError::Internal(error)) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ Failed to register synthetic monitor inflight for channel {}: {}",
+                channel_id.get(),
+                error
+            );
+        }
+    }
 }
 
 /// Monotonic-CAS advance of the channel's `confirmed_end_offset` watermark to
@@ -1711,7 +1774,7 @@ mod monitor_auto_turn_signal_tests {
             .await
         );
 
-        let _ = ensure_monitor_auto_turn_inflight(
+        ensure_monitor_auto_turn_inflight(
             &shared,
             &provider,
             channel_id,
@@ -2248,7 +2311,7 @@ fn persist_watcher_stream_progress(
     // #3871: the frozen streamed rollover-prefix ids accumulated this invocation,
     // persisted so a later-iteration / post-restart terminal fallback can delete them.
     streaming_rollover_frozen_msg_ids: &[MessageId],
-) -> super::inflight::WatcherProgressOutcome {
+) {
     if full_response.len() < response_sent_offset {
         tracing::debug!(
             provider = %provider.as_str(),
@@ -2258,7 +2321,7 @@ fn persist_watcher_stream_progress(
             full_response_len = full_response.len(),
             "watcher: skipping stream-progress persistence until parsed body catches up"
         );
-        return super::inflight::WatcherProgressOutcome::Skipped;
+        return;
     }
 
     // #3558: pre-emit the in-bounds telemetry against the caller's snapshot for
@@ -2291,7 +2354,7 @@ fn persist_watcher_stream_progress(
     // — the helper preserves whatever the in-lock disk reload carries, so a
     // concurrent owner-gated `refresh_inflight_last_offset_*` advance can no
     // longer be clobbered backward by this previously-unlocked load→save TOCTOU.
-    super::inflight::persist_watcher_stream_progress_locked(
+    let _ = super::inflight::persist_watcher_stream_progress_locked(
         provider,
         channel_id.get(),
         require_identity,
@@ -2310,7 +2373,7 @@ fn persist_watcher_stream_progress(
                 .map(|id| id.get())
                 .collect(),
         },
-    )
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2450,12 +2513,85 @@ async fn finish_restored_watcher_active_turn_with_ctx(
     true
 }
 
+async fn release_restored_watcher_active_turn_before_panel_edit(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finalizer_turn_id: u64,
+) -> bool {
+    if finalizer_turn_id == 0 {
+        return false;
+    }
+
+    // #4106 review-fix (codex): snapshot the channel role override THIS turn owns
+    // BEFORE any await. The removal below runs after awaits (mailbox finish +
+    // clear_watchdog_deadline_override), during which a fresh same-channel
+    // counter-model follow-up can insert its OWN override (intake_turn.rs) even
+    // before it claims the slot. A bare channel-keyed remove would clobber that;
+    // remove_owned_role_override only drops the value we still own.
+    let pre_release_role_override =
+        super::turn_finalizer::cleanup::snapshot_role_override(shared, channel_id);
+
+    let finish = super::mailbox_finish_turn_if_matches(
+        shared,
+        provider,
+        channel_id,
+        MessageId::new(finalizer_turn_id),
+    )
+    .await;
+    let Some(token) = finish.removed_token.as_ref() else {
+        return false;
+    };
+    shared.turn_finalizer.note_mailbox_released(
+        super::turn_finalizer::TurnKey::new(
+            channel_id,
+            finalizer_turn_id,
+            shared.restart.current_generation,
+        ),
+        shared.clone(),
+    );
+
+    // #4106 review-fix: cancel the removed token, decrement the counter, AND run
+    // the finalizer's D-side channel cleanup here. Hoisting the release ahead of
+    // the awaited panel edit makes the LATE do_finalize see removed_token=None
+    // and take the guarded-miss SKIP branch (finalize.rs), so without this the
+    // cleanup would be dropped on every normal completion. Running it here is
+    // safe: we release turn A into a still-idle channel (no newer turn has
+    // claimed yet, since a follow-up needs cancel_token.is_none() which this
+    // release just produced), so it cannot clobber a follow-up's channel state.
+    // Mirrors the finalizer non-miss branch (finalize.rs D-section) and the
+    // recovery release bundle (health/recovery.rs); voice drain is omitted
+    // because the watcher finalize path sets drain_voice=false.
+    token.cancelled.store(true, Ordering::Relaxed);
+    super::saturating_decrement_global_active(shared);
+
+    super::turn_finalizer::cleanup::clear_watchdog_and_kick_thread_parents_after_turn_release(
+        shared, provider, channel_id,
+    )
+    .await;
+    super::turn_finalizer::cleanup::rearm_queue_backstop_after_mailbox_release(
+        shared,
+        provider,
+        channel_id,
+        finish.has_pending,
+        "watcher_pre_panel_mailbox_release",
+    )
+    .await;
+    if !finish.has_pending {
+        super::turn_finalizer::cleanup::remove_owned_role_override(
+            shared,
+            channel_id,
+            pre_release_role_override,
+        );
+    }
+    true
+}
+
 /// Background watcher that continuously tails a tmux output file.
 /// When Claude produces output from terminal input (not Discord), relay it to Discord.
 #[path = "tmux_watcher.rs"]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) mod tmux_watcher;
-use self::tmux_watcher::completion_producer::release_restored_watcher_active_turn_before_panel_edit;
 #[cfg(test)]
 pub(in crate::services::discord) use self::tmux_watcher::pinned_delivery_lease_key_for_test;
 pub(super) use self::tmux_watcher::{

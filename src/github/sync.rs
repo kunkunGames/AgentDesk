@@ -6,10 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-mod card_state;
-#[cfg(test)]
-mod warning_tests;
-
 const ISSUE_JSON_FIELDS: &str =
     "number,state,title,labels,body,url,closedAt,closedByPullRequestsReferences";
 const PRIMARY_FETCH_LIMIT: u32 = 100;
@@ -317,7 +313,7 @@ async fn sync_loaded_github_issues_for_repo_pg(
                 agent_overrides,
             )
             .await?;
-            let is_terminal = card_state::observe(repo, issue, &card, &pipeline);
+            let is_terminal = pipeline.is_terminal(&card.status);
 
             if issue.state == "CLOSED" && !is_terminal {
                 close_pg_card_for_issue(pool, &card, &pipeline).await?;
@@ -329,6 +325,11 @@ async fn sync_loaded_github_issues_for_repo_pg(
                 );
             } else if issue.state == "OPEN" && is_terminal {
                 result.inconsistency_count += 1;
+                tracing::warn!(
+                    "[github-sync] {repo}#{}: card {} is terminal but issue is OPEN",
+                    issue.number,
+                    card.id
+                );
                 // #1946 (codex C — observability promotion): the OPEN/terminal
                 // mismatch was previously only counted in the result and
                 // emitted as a tracing warning, so production retros for the
@@ -873,7 +874,11 @@ fn apply_stale_reconcile_fetch_report(
     result.stale_card_issue_error_count += report.error_count;
 
     if report.error_count > 0 {
-        super::warn_dedupe::stale_reconcile(repo, report.error_count, &report.errors);
+        tracing::warn!(
+            "[github-sync] {repo}: stale card reconcile had {} non-fatal GraphQL error(s): {}",
+            report.error_count,
+            report.errors.join("; ")
+        );
     }
 
     let stale_closed_issue_count = report

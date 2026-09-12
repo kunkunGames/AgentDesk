@@ -343,16 +343,12 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/queue/reset",
             "auto-queue",
-            "Reset one auto-queue run and clear that run's queue entries",
+            "Reset one agent queue and clear its queue entries",
         )
-        .with_params([
-            ("run_id", body_param("string", true, "Run ID to reset")),
-            ("agent_id", body_param("string", false, "Optional agent scope")),
-            ("repo", body_param("string", false, "Optional repo scope")),
-        ])
+        .with_params([("agent_id", body_param("string", true, "Agent ID for the queue reset"))])
         .with_example(
-            json!({"body": {"run_id": "run-1", "agent_id": "agent-1", "repo": "owner/repo"}}),
-            json!({"ok": true, "run_id": "run-1", "deleted_entries": 4, "completed_runs": 1}),
+            json!({"body": {"agent_id": "agent-1"}}),
+            json!({"ok": true, "deleted_entries": 4, "completed_runs": 1, "protected_active_runs": 0}),
         ),
         ep(
             "POST",

@@ -6,48 +6,9 @@ pub(super) async fn handle_terminal(
     provider: ProviderKind,
     event: TerminalEvent,
     ctx: FinalizeContext,
-    evidence: TerminalEvidence,
+    claim_snapshot: Option<SyntheticClaimSnapshot>,
     shared: &Arc<SharedData>,
 ) -> FinalizeOutcome {
-    // Monitor producers carry an existing per-turn generation. Resolve only
-    // its registered episode; a late/collected generation owns no current slot.
-    let key = if key.episode.is_none() && key.generation != shared.restart.current_generation {
-        let mut matches = ledger.values().filter(|entry| {
-            entry.turn_key.channel_id == key.channel_id
-                && entry.turn_key.user_msg_id == key.user_msg_id
-                && entry.turn_key.generation == key.generation
-        });
-        let Some(entry) = matches.next() else {
-            return FinalizeOutcome::AlreadyFinalized;
-        };
-        if matches.next().is_some() || entry.phase == Phase::Finalized {
-            return FinalizeOutcome::AlreadyFinalized;
-        }
-        entry.turn_key
-    } else {
-        key
-    };
-    let released = if let TerminalEvent::OperatorRelease(release) = &event {
-        let Some(finish) = release.claim(shared, &provider, key).await else {
-            return FinalizeOutcome::AlreadyFinalized;
-        };
-        Some(finish)
-    } else {
-        None
-    };
-    // A producer lacking episode evidence cannot borrow a known successor's
-    // ledger, nor enter the legacy AlreadyFinalized repair path.
-    if key.episode.is_none()
-        && ledger.keys().any(|known| {
-            known.channel_id == key.channel_id
-                && known.generation == key.generation
-                && known.user_msg_id == key.user_msg_id
-                && known.episode.is_some()
-        })
-    {
-        return FinalizeOutcome::Deferred;
-    }
-    let claim_snapshot = evidence.claim_snapshot;
     // #3866: test-only injection point — lets a test drive a real finalize
     // side-effect panic through the live actor loop to prove the catch_unwind
     // guard keeps the loop alive. No effect in production builds.
@@ -79,8 +40,6 @@ pub(super) async fn handle_terminal(
 
     let pending = take_exact_pending_completion_admission(pending_admission, ledger_key);
     let entry = ledger.entry(ledger_key).or_insert(LedgerEntry {
-        // An orphan completion cannot borrow the current takeover's lease.
-        recovery_lease: None,
         phase: Phase::Pending,
         relay_owner: RelayOwnerKind::None,
         provider,
@@ -96,12 +55,6 @@ pub(super) async fn handle_terminal(
         finalized_at: None,
     });
     apply_pending_completion_admission(entry, pending);
-
-    // A newly CAS-released lease may share a previously finalized episode.
-    // Reopen only its phase; retain its delivery evidence and admission plan.
-    if released.is_some() {
-        entry.phase = Phase::Pending;
-    }
 
     match entry.phase {
         Phase::Finalizing | Phase::Finalized => {
@@ -190,23 +143,18 @@ pub(super) async fn handle_terminal(
     // poison `ledger_has_live_watcher_pending` / `resolve_channel_only` for this
     // channel+generation. Resetting it to `Finalized` (the normal post-finalize
     // flip) lets GC reap it and frees the channel for the next turn.
-    let outcome = match AssertUnwindSafe(super::finalize::do_finalize_with_release(
+    let outcome = match AssertUnwindSafe(do_finalize(
         finalize_key,
         provider,
         &event,
         effective_ctx,
         claim_snapshot.as_ref(),
         shared,
-        released,
     ))
     .catch_unwind()
     .await
     {
         Ok(outcome) => {
-            if matches!(event, TerminalEvent::OperatorRelease(_)) {
-                entry.completion_admission.operator_released = true;
-                entry.completion_admission.queue_eligible_published = false;
-            }
             note_mailbox_release_after_finalize(&outcome, entry, shared);
             outcome
         }

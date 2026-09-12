@@ -13,7 +13,6 @@
 mod abandon;
 mod identity;
 mod reconcile_gate;
-pub(in crate::services::discord) use identity::clear_inflight_state_for_captured_episode;
 
 pub(crate) use self::abandon::{
     request_inflight_abandon_if_matches, request_inflight_abandon_if_matches_zero_owned,

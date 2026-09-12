@@ -25,38 +25,6 @@ pub(super) async fn do_finalize(
     submit_snapshot: Option<&super::cleanup::SyntheticClaimSnapshot>,
     shared: &Arc<SharedData>,
 ) -> FinalizeOutcome {
-    do_finalize_with_release(key, provider, event, ctx, submit_snapshot, shared, None).await
-}
-
-pub(in crate::services::discord) async fn do_finalize_with_release(
-    key: TurnKey,
-    provider: ProviderKind,
-    event: &TerminalEvent,
-    ctx: FinalizeContext,
-    submit_snapshot: Option<&super::cleanup::SyntheticClaimSnapshot>,
-    shared: &Arc<SharedData>,
-    released: Option<crate::services::turn_orchestrator::FinishTurnResult>,
-) -> FinalizeOutcome {
-    let operator_release = matches!(event, TerminalEvent::OperatorRelease(_));
-    #[cfg(test)]
-    super::test_panic_hook::maybe_panic_in_finalize();
-    let owned_role_override = super::cleanup::snapshot_role_override(shared, key.channel_id);
-    let captured = if let Some(finish) = released {
-        Some(super::episode::CapturedFinish {
-            finish,
-            snapshot: None,
-        })
-    } else {
-        match super::episode::claim_normal_episode(shared, &provider, key, ctx.clear_inflight).await
-        {
-            Ok(captured) => captured,
-            Err(()) => return FinalizeOutcome::AlreadyFinalized,
-        }
-    };
-    let owned_snapshot = captured
-        .as_ref()
-        .and_then(|capture| capture.snapshot.clone());
-    let submit_snapshot = submit_snapshot.or(owned_snapshot.as_ref());
     let channel_id = key.channel_id;
     // Capture the terminal episode before any caller-owned/in-function inflight
     // clear can erase it. Watcher submitters provide the pre-clear snapshot;
@@ -66,10 +34,7 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
         .and_then(|snapshot| snapshot.turn_nonce.clone())
         .or_else(|| {
             crate::services::discord::inflight::load_inflight_state(&provider, channel_id.get())
-                .filter(|state| {
-                    state.effective_finalizer_turn_id() == key.user_msg_id
-                        && key.matches_episode_nonce(state.turn_nonce.as_deref())
-                })
+                .filter(|state| state.effective_finalizer_turn_id() == key.user_msg_id)
                 .and_then(|state| state.turn_nonce)
         });
 
@@ -79,6 +44,8 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
     // caught-panic path still resets the entry to `Finalized` (never stuck
     // Finalizing) on BOTH the terminal and reconcile/backstop paths. No-op in
     // production builds.
+    #[cfg(test)]
+    super::test_panic_hook::maybe_panic_in_finalize();
 
     // #3866 residual (KNOWN, intentionally NOT fixed in this panic-guard pass —
     // tracked for a follow-up): (1) a poisoned mutex anywhere in the finalize
@@ -97,24 +64,18 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
     // submitters cleared the row pre-submit, so for them this row re-load proves
     // nothing — their guarantee runs at submit time from the pre-clear snapshot
     // (`submit_terminal_with_claim_snapshot`); rationale/gates: cleanup.rs.
-    let metadata_known = key.episode.is_none() || submit_snapshot.is_some();
-    if metadata_known {
-        super::cleanup::ensure_synthetic_claim_marker_before_clear(key, &provider, submit_snapshot);
-        super::cleanup::enqueue_terminal_status_panel_reconcile(
-            key,
-            &provider,
-            event,
-            submit_snapshot,
-            shared.as_ref(),
-        );
-    }
-    let skip_completion_reaction = !metadata_known
-        || super::cleanup::relay_ownership_only_for_finalize(key, &provider, submit_snapshot);
-    let relay_owner_kind = if metadata_known {
-        super::cleanup::relay_owner_kind_for_finalize(key, &provider, submit_snapshot)
-    } else {
-        RelayOwnerKind::None
-    };
+    super::cleanup::ensure_synthetic_claim_marker_before_clear(key, &provider, submit_snapshot);
+    super::cleanup::enqueue_terminal_status_panel_reconcile(
+        key,
+        &provider,
+        event,
+        submit_snapshot,
+        shared.as_ref(),
+    );
+    let skip_completion_reaction =
+        super::cleanup::relay_ownership_only_for_finalize(key, &provider, submit_snapshot);
+    let relay_owner_kind =
+        super::cleanup::relay_owner_kind_for_finalize(key, &provider, submit_snapshot);
 
     // (A) inflight clear. Only the gate-timeout backstop and the immediate
     //     no-owner restored-watcher path set `clear_inflight` (live bridge /
@@ -123,7 +84,7 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
     //     `clear_inflight_state_if_matches` — never a newer turn's inflight,
     //     preserving `PlannedRestartSkipped` / `RebindOriginSkipped`; a true
     //     orphan (id-0, nothing to authenticate) keeps the unguarded clear.
-    if ctx.clear_inflight && captured.is_none() {
+    if ctx.clear_inflight {
         if key.user_msg_id != 0 {
             let _ = crate::services::discord::inflight::clear_inflight_state_if_matches(
                 &provider,
@@ -142,10 +103,8 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
     //     terminal post-finalize/ledger-GC must not release the NEWER turn's
     //     token or decrement `global_active`. Ambiguous id-0 (recovery/orphan)
     //     keeps the channel-scoped finish (ledger gate + id-0 no-op bound it).
-    let finish = if let Some(capture) = captured {
-        capture.publish_release(shared, key);
-        capture.finish
-    } else if key.user_msg_id != 0 {
+    let owned_role_override = super::cleanup::snapshot_role_override(shared, channel_id);
+    let finish = if key.user_msg_id != 0 {
         crate::services::discord::mailbox_finish_turn_if_matches(
             shared,
             &provider,
@@ -168,11 +127,9 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
         }
         // Stop any lingering watchdog timer from firing on a newer turn's
         // token.
-        if !operator_release {
-            token
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // (C) #3019 active-counter — decrement ONLY here, ONLY when this submission
@@ -208,8 +165,8 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
     // skip the channel cleanup entirely — exactly as we already skip the token
     // release and counter decrement. (An id-0 orphan keeps today's behaviour.)
     let guarded_finish_missed = key.user_msg_id != 0 && finish.removed_token.is_none();
-    if guarded_finish_missed && let Some(mailbox) = shared.mailbox_peek(channel_id) {
-        let active_snapshot = mailbox.snapshot().await;
+    if guarded_finish_missed {
+        let active_snapshot = crate::services::discord::mailbox_snapshot(shared, channel_id).await;
         let active_user_message_id = active_snapshot.active_user_message_id.map(|id| id.get());
         let residue_recorded = if let Some(active_user_msg_id) = active_user_message_id
             && active_snapshot.cancel_token.is_some()
@@ -268,11 +225,7 @@ pub(in crate::services::discord) async fn do_finalize_with_release(
         relay_owner_kind,
     );
 
-    let has_pending_after_voice = if operator_release {
-        // A successor can be admitted after the operator CAS. Preserve its
-        // channel-scoped routing, watchdog and voice state.
-        finish.has_pending
-    } else if guarded_finish_missed {
+    let has_pending_after_voice = if guarded_finish_missed {
         // No-op finalize on a stale terminal: leave the live newer turn's
         // channel state untouched. Report NO backlog (Codex P2): the newer turn
         // is still active and owns its queue. Surfacing `finish.has_pending`

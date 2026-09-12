@@ -528,7 +528,7 @@ impl VoiceBargeInRuntime {
 
     pub(in crate::services::discord) fn spawn_sensitivity_ttl_reset(
         self: &Arc<Self>,
-        shutdown_flag: crate::services::discord::shared_state::ShutdownReader,
+        shutdown_flag: Arc<AtomicBool>,
     ) {
         if !self.barge_in_enabled {
             return;

@@ -19,14 +19,10 @@ pub(in crate::services::discord::turn_bridge) struct CompletionPostludeContext {
     pub(in crate::services::discord::turn_bridge) is_external_input_tui_direct: bool,
     pub(in crate::services::discord::turn_bridge) context_window_tokens: u64,
     pub(in crate::services::discord::turn_bridge) context_compact_percent: u64,
-    pub(in crate::services::discord::turn_bridge) clear_fence:
-        crate::db::session_transcripts::ChannelClearFence,
     pub(in crate::services::discord::turn_bridge) turn_start: std::time::Instant,
 }
 
 pub(in crate::services::discord::turn_bridge) struct CompletionPostludeState {
-    pub(in crate::services::discord::turn_bridge) watcher_delivery_pin:
-        Option<WatcherClaimIncarnation>,
     pub(in crate::services::discord::turn_bridge) full_response: String,
     pub(in crate::services::discord::turn_bridge) user_text_owned: String,
     pub(in crate::services::discord::turn_bridge) role_binding: Option<RoleBinding>,

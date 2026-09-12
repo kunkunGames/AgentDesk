@@ -53,7 +53,7 @@ export type PendingDangerousConfigSave = {
   edits: Record<string, ConfigEditValue>;
   keys: string[];
 };
-export type SettingsPanel = "general" | "runtime" | "pipeline" | "connectors" | "onboarding" | "voice" | "providers";
+export type SettingsPanel = "general" | "runtime" | "pipeline" | "connectors" | "onboarding" | "voice";
 export type SettingsNotificationType = "info" | "success" | "warning" | "error";
 
 /**
@@ -84,7 +84,7 @@ export type ValidationState =
   | { ok: true }
   | { ok: false; messageKo: string; messageEn: string };
 
-export type SettingGroupId = "pipeline" | "runtime" | "connectors" | "onboarding" | "general" | "voice" | "providers";
+export type SettingGroupId = "pipeline" | "runtime" | "connectors" | "onboarding" | "general" | "voice";
 
 /**
  * Canonical metadata that drives every SettingRow rendered in the settings page.
@@ -123,6 +123,7 @@ export const GENERAL_FIELD_KEYS = ["companyName", "ceoName", "language", "theme"
 export const BOOLEAN_CONFIG_KEYS = new Set([
   "review_enabled",
   "pm_decision_gate_enabled",
+  "merge_automation_enabled",
 ]);
 
 export const NUMERIC_CONFIG_KEYS = new Set([
@@ -167,6 +168,22 @@ export const SYSTEM_CONFIG_DESCRIPTIONS: Record<string, { ko: string; en: string
   pm_decision_gate_enabled: {
     ko: "PM 판단 게이트를 거쳐야 다음 단계로 전환됩니다.",
     en: "Requires PM decision gate approval before the next transition.",
+  },
+  merge_automation_enabled: {
+    ko: "허용된 작성자의 PR을 조건 충족 시 자동 머지합니다.",
+    en: "Automatically merges eligible PRs from allowed authors when checks pass.",
+  },
+  merge_strategy: {
+    ko: "자동 머지 시 사용할 GitHub 머지 전략입니다.",
+    en: "GitHub merge strategy used by merge automation.",
+  },
+  merge_strategy_mode: {
+    ko: "터미널 카드에서 direct merge를 먼저 시도할지, 항상 PR을 만들지 결정합니다.",
+    en: "Chooses whether terminal cards try direct merge first or always open a PR.",
+  },
+  merge_allowed_authors: {
+    ko: "자동 머지를 허용할 작성자 목록입니다. 쉼표로 구분합니다.",
+    en: "Comma-separated list of authors allowed for automated merge.",
   },
   requested_timeout_min: {
     ko: "requested 상태에서 오래 머무는 카드를 경고하는 기준입니다.",
@@ -237,7 +254,7 @@ export const PRIMARY_PIPELINE_CATEGORIES: Array<keyof typeof SYSTEM_CATEGORY_MET
 export const ADVANCED_PIPELINE_CATEGORIES: Array<keyof typeof SYSTEM_CATEGORY_META> = ["context", "system"];
 
 export function isSettingsPanel(value: string | null): value is SettingsPanel {
-  return value === "general" || value === "runtime" || value === "pipeline" || value === "connectors" || value === "onboarding" || value === "voice" || value === "providers";
+  return value === "general" || value === "runtime" || value === "pipeline" || value === "connectors" || value === "onboarding" || value === "voice";
 }
 
 export function isRuntimeCategoryId(value: string | null): value is string {
@@ -507,13 +524,6 @@ export const SETTING_GROUPS: SettingGroupMeta[] = [
     nameEn: "Runtime",
     descKo: "실행 환경과 리소스 제어, 컨텍스트 정책을 다룹니다.",
     descEn: "Execution environment, resource controls, and context policy.",
-  },
-  {
-    id: "providers",
-    nameKo: "프로바이더",
-    nameEn: "Providers",
-    descKo: "시스템 기본 로그인과 extra 계정을 누적하고 사용량을 확인합니다.",
-    descEn: "Accumulate extra CLI accounts next to the system default home and inspect usage.",
   },
   {
     id: "voice",

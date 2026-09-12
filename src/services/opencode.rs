@@ -3,9 +3,6 @@
 //! Architecture: keeps a loopback `opencode serve` warm per workspace/runtime key,
 //! drives the HTTP REST + SSE API, and normalizes events to AgentDesk `StreamMessage`.
 
-mod server_launch;
-use server_launch::spawn_server;
-
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
@@ -104,14 +101,11 @@ impl Drop for OpenCodeServerProcess {
 struct OpenCodeServerKey {
     bin: String,
     working_dir: String,
-    profile_id: String,
 }
 
 impl PartialEq for OpenCodeServerKey {
     fn eq(&self, other: &Self) -> bool {
-        self.bin == other.bin
-            && self.working_dir == other.working_dir
-            && self.profile_id == other.profile_id
+        self.bin == other.bin && self.working_dir == other.working_dir
     }
 }
 
@@ -119,7 +113,6 @@ impl Hash for OpenCodeServerKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.bin.hash(state);
         self.working_dir.hash(state);
-        self.profile_id.hash(state);
     }
 }
 
@@ -564,16 +557,7 @@ pub fn probe_serve_health(working_dir: &str) -> Result<String, String> {
     let password = generate_password();
     let auth = build_auth_header(&password);
     let base_url = format!("http://127.0.0.1:{port}");
-    let mut server = spawn_server(
-        &bin,
-        &resolution,
-        port,
-        &password,
-        working_dir,
-        &crate::services::provider_auth_profile::ProviderAuthOverlay::default_for(
-            ProviderKind::OpenCode,
-        ),
-    )?;
+    let mut server = spawn_server(&bin, &resolution, port, &password, working_dir)?;
     let result = wait_for_health(&base_url, &auth, Some(&server.startup_output))
         .map(|_| format!("serve health ok at {base_url}"));
     shutdown_server(&mut server, &base_url, &auth);
@@ -673,11 +657,7 @@ fn execute_command_streaming_inner(
         "OpenCode CLI not found — install with: npm install -g opencode-ai".to_string()
     })?;
 
-    let overlay = crate::services::discord::org_schema::spawn_auth_overlay(
-        ProviderKind::OpenCode,
-        _report_channel_id,
-    )?;
-    let server = acquire_warm_server(&bin, &resolution, working_dir, &overlay)?;
+    let server = acquire_warm_server(&bin, &resolution, working_dir)?;
     // The shared `opencode serve` PID is deliberately NOT registered on the
     // caller's CancelToken. Every generic cancel/timeout sink kills
     // `CancelToken.child_pid` *unconditionally* — the provider_exec timeout
@@ -723,15 +703,10 @@ fn pool_working_dir(working_dir: &str) -> String {
         .unwrap_or_else(|_| working_dir.to_string())
 }
 
-fn warm_server_key(bin: &str, working_dir: &str, profile_id: &str) -> OpenCodeServerKey {
+fn warm_server_key(bin: &str, working_dir: &str) -> OpenCodeServerKey {
     OpenCodeServerKey {
         bin: bin.to_string(),
         working_dir: pool_working_dir(working_dir),
-        profile_id: if profile_id.trim().is_empty() {
-            crate::services::provider_auth_profile::DEFAULT_PROFILE_ID.to_string()
-        } else {
-            profile_id.to_string()
-        },
     }
 }
 
@@ -853,9 +828,8 @@ fn acquire_warm_server(
     bin: &str,
     resolution: &crate::services::platform::BinaryResolution,
     working_dir: &str,
-    overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
 ) -> Result<OpenCodeWarmServerLease, String> {
-    let key = warm_server_key(bin, working_dir, &overlay.profile_id);
+    let key = warm_server_key(bin, working_dir);
     let pool = opencode_server_pool();
     let mut pool = pool.lock().unwrap_or_else(|e| {
         tracing::warn!("Recovered poisoned lock for OpenCode server pool");
@@ -953,7 +927,7 @@ fn acquire_warm_server(
     let password = generate_password();
     let auth = build_auth_header(&password);
     let base_url = format!("http://127.0.0.1:{port}");
-    let server_process = spawn_server(bin, resolution, port, &password, working_dir, overlay)?;
+    let server_process = spawn_server(bin, resolution, port, &password, working_dir)?;
     let startup_output = server_process.startup_output.clone();
 
     if let Err(error) = wait_for_health(&base_url, &auth, Some(&startup_output)) {
@@ -1024,9 +998,74 @@ fn acquire_warm_server(
     }
 }
 
+fn spawn_server(
+    bin: &str,
+    resolution: &crate::services::platform::BinaryResolution,
+    port: u16,
+    password: &str,
+    working_dir: &str,
+) -> Result<OpenCodeServerProcess, String> {
+    let mut cmd = Command::new(bin);
+    crate::services::platform::apply_binary_resolution(&mut cmd, resolution);
+    configure_child_process_group(&mut cmd);
+    cmd.arg("serve")
+        .arg("--hostname")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env("OPENCODE_SERVER_PASSWORD", password)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn opencode serve: {e}"))?;
+    let startup_output = Arc::new(Mutex::new(OpenCodeStartupOutput::default()));
+    if let Some(stdout) = child.stdout.take() {
+        drain_startup_output(stdout, startup_output.clone(), StartupStream::Stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain_startup_output(stderr, startup_output.clone(), StartupStream::Stderr);
+    }
+    Ok(OpenCodeServerProcess {
+        child,
+        startup_output,
+    })
+}
+
 enum StartupStream {
     Stdout,
     Stderr,
+}
+
+fn drain_startup_output<R>(
+    mut reader: R,
+    output: Arc<Mutex<OpenCodeStartupOutput>>,
+    stream: StartupStream,
+) where
+    R: Read + Send + 'static,
+{
+    let _ = thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(_) => break,
+            };
+            let chunk = String::from_utf8_lossy(&buffer[..read]);
+            let mut output = output.lock().unwrap_or_else(|e| {
+                tracing::warn!("Recovered poisoned lock for OpenCodeStartupOutput");
+                e.into_inner()
+            });
+            match stream {
+                StartupStream::Stdout => append_bounded(&mut output.stdout, &chunk),
+                StartupStream::Stderr => append_bounded(&mut output.stderr, &chunk),
+            }
+        }
+    });
 }
 
 fn append_bounded(target: &mut String, chunk: &str) {
@@ -2865,8 +2904,8 @@ mod tests {
     #[test]
     fn opencode_warm_server_key_canonicalizes_equivalent_working_dirs() {
         let cwd = std::env::current_dir().expect("current dir");
-        let key_from_dot = warm_server_key("opencode", ".", "default");
-        let key_from_cwd = warm_server_key("opencode", &cwd.to_string_lossy(), "default");
+        let key_from_dot = warm_server_key("opencode", ".");
+        let key_from_cwd = warm_server_key("opencode", &cwd.to_string_lossy());
 
         assert_eq!(key_from_dot, key_from_cwd);
     }
@@ -2882,27 +2921,12 @@ mod tests {
         std::fs::create_dir_all(&first).expect("create first temp dir");
         std::fs::create_dir_all(&second).expect("create second temp dir");
 
-        let first_key = warm_server_key("opencode", &first.to_string_lossy(), "default");
-        let second_key = warm_server_key("opencode", &second.to_string_lossy(), "default");
+        let first_key = warm_server_key("opencode", &first.to_string_lossy());
+        let second_key = warm_server_key("opencode", &second.to_string_lossy());
 
         assert_ne!(first_key, second_key);
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn test_005_opencode_warm_server_key_separates_profile_id() {
-        use std::hash::{Hash, Hasher};
-        let cwd = std::env::current_dir().expect("current dir");
-        let cwd = cwd.to_string_lossy();
-        let default_key = warm_server_key("opencode", &cwd, "default");
-        let work_key = warm_server_key("opencode", &cwd, "work");
-        assert_ne!(default_key, work_key);
-        let mut hasher_a = std::collections::hash_map::DefaultHasher::new();
-        let mut hasher_b = std::collections::hash_map::DefaultHasher::new();
-        default_key.hash(&mut hasher_a);
-        work_key.hash(&mut hasher_b);
-        assert_ne!(hasher_a.finish(), hasher_b.finish());
     }
 
     // -----------------------------------------------------------------------

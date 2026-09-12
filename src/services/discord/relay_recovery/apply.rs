@@ -361,7 +361,6 @@ pub(super) async fn apply_relay_recovery_decision(
                                                 provider,
                                                 decision,
                                                 owner_channel_id,
-                                                &probe,
                                             )
                                             .await;
                                         let lifecycle_clear_outcome =

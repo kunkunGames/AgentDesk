@@ -1,52 +1,4 @@
 use super::*;
-use std::sync::atomic::AtomicUsize;
-
-struct OpenAlertRecorder {
-    channel_id: u64,
-    enqueues: AtomicUsize,
-    activations: AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl circuit_breaker::CircuitAlertEnqueue for OpenAlertRecorder {
-    async fn enqueue(
-        &self,
-        pool: Option<&sqlx::PgPool>,
-        request: &circuit_breaker::CircuitAlertRequest,
-    ) -> Result<i64, String> {
-        assert!(pool.is_none(), "offline fixture must not use PostgreSQL");
-        assert_eq!(request.channel_id, self.channel_id);
-        assert_eq!(request.target, format!("channel:{}", self.channel_id));
-        assert_eq!(request.provider, "codex");
-        assert!(
-            request
-                .reason_code
-                .starts_with("relay_reattach_circuit_open:")
-        );
-        self.enqueues.fetch_add(1, Ordering::SeqCst);
-        Ok(5715)
-    }
-
-    async fn activate(&self, pool: Option<&sqlx::PgPool>, id: i64) -> Result<bool, String> {
-        assert!(pool.is_none());
-        assert_eq!(id, 5715);
-        self.activations.fetch_add(1, Ordering::SeqCst);
-        Ok(true)
-    }
-
-    async fn cancel(&self, _pool: Option<&sqlx::PgPool>, _id: i64) -> Result<(), String> {
-        panic!("unchanged OPEN episode must not cancel its alert");
-    }
-}
-
-struct UnexpectedReattachBoundary;
-
-#[async_trait::async_trait]
-impl super::super::auto_heal_apply::ReservedEpisodeApplyBoundary for UnexpectedReattachBoundary {
-    async fn after_reserve(&self, _episode: &circuit_breaker::RelayReattachEpisode) {
-        panic!("OPEN circuit must return before reattach application");
-    }
-}
 
 #[tokio::test]
 async fn durable_reattach_circuit_open_preserves_every_live_turn_authority() {
@@ -129,33 +81,15 @@ async fn durable_reattach_circuit_open_preserves_every_live_turn_authority() {
             .expect("inflight before"),
     )
     .expect("serialize inflight before");
-    let recorder = OpenAlertRecorder {
-        channel_id: channel.get(),
-        enqueues: AtomicUsize::new(0),
-        activations: AtomicUsize::new(0),
-    };
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    for tick in 0..3 {
-        let response = super::super::auto_heal_apply::apply_relay_recovery_plan_with_seams(
-            &registry,
-            &shared,
-            &provider,
-            decision.clone(),
-            now_ms + tick * 30_000,
-            RelayRecoveryApplySource::StallWatchdog,
-            &recorder,
-            &UnexpectedReattachBoundary,
-        )
-        .await;
-        assert!(response.skipped);
-        assert!(!response.applied);
-        assert_eq!(
-            response.decision.auto_heal.skipped_reason,
-            Some("durable_reattach_circuit_open")
-        );
-        assert_eq!(recorder.enqueues.load(Ordering::SeqCst), 1);
-        assert_eq!(recorder.activations.load(Ordering::SeqCst), 1);
-    }
+    let response = apply_relay_recovery_plan(
+        &registry,
+        &shared,
+        &provider,
+        decision,
+        chrono::Utc::now().timestamp_millis(),
+        RelayRecoveryApplySource::StallWatchdog,
+    )
+    .await;
     let mailbox_after = super::super::super::mailbox_snapshot(&shared, channel).await;
     let inflight_after = serde_json::to_value(
         super::super::super::inflight::load_inflight_state_read_only(&provider, channel.get())
@@ -163,6 +97,12 @@ async fn durable_reattach_circuit_open_preserves_every_live_turn_authority() {
     )
     .expect("serialize inflight after");
 
+    assert!(response.skipped);
+    assert!(!response.applied);
+    assert_eq!(
+        response.decision.auto_heal.skipped_reason,
+        Some("durable_reattach_circuit_open")
+    );
     assert!(Arc::ptr_eq(
         mailbox_before.cancel_token.as_ref().expect("token before"),
         mailbox_after.cancel_token.as_ref().expect("token after")
@@ -348,7 +288,7 @@ async fn first_reserved_dead_frontier_apply_preserves_episode_and_reattaches_wat
         0,
     );
     state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
-    state.turn_nonce = token.turn_nonce().map(str::to_owned);
+    state.turn_nonce = Some("nonce-4465-first".to_string());
     state.set_relay_owner_kind(super::super::super::inflight::RelayOwnerKind::Watcher);
     super::super::super::inflight::save_inflight_state_create_new(&state).expect("seed inflight");
     let (watcher, old_cancel) = test_watcher_handle(&tmux_session, &output_path);

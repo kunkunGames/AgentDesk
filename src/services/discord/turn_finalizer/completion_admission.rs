@@ -11,7 +11,6 @@ pub(in crate::services::discord) enum CompletionAdmissionPlan {
 pub(super) struct CompletionAdmission {
     pub(super) plan: CompletionAdmissionPlan,
     pub(super) mailbox_released: bool,
-    pub(super) operator_released: bool,
     pub(super) terminal_projection_settled: bool,
     pub(super) terminal_projection_allows_queue: bool,
     pub(super) terminal_disposition_settled: bool,
@@ -24,7 +23,6 @@ impl CompletionAdmission {
         Self {
             plan,
             mailbox_released: false,
-            operator_released: false,
             terminal_projection_settled: false,
             terminal_projection_allows_queue: false,
             terminal_disposition_settled: false,
@@ -73,8 +71,7 @@ impl CompletionAdmission {
                         && self.terminal_disposition_allows_queue
                 }
             };
-        let authorized_release = self.mailbox_released && self.operator_released;
-        if !(barrier_satisfied || authorized_release) || self.queue_eligible_published {
+        if !barrier_satisfied || self.queue_eligible_published {
             return false;
         }
         self.queue_eligible_published = true;
@@ -91,53 +88,12 @@ pub(super) fn publish_claimed_queue_eligible(shared: &SharedData, entry: &mut Le
         entry.turn_key.channel_id,
         Some(entry.turn_key.user_msg_id),
     );
-    if let Some(lease) = entry.recovery_lease.clone() {
-        let payload = crate::services::agent_recovery::CheckpointPayload::compact(
-            &lease.active_writer_agent_id,
-            "",
-            "agent turn complete",
-            "",
-            Vec::new(),
-            "",
-            "",
-        );
-        tokio::spawn(async move {
-            if let Err(error) =
-                crate::services::agent_recovery::complete_turn_durable(&lease, payload).await
-            {
-                tracing::warn!(
-                    channel_id = %lease.channel_id,
-                    generation = lease.generation,
-                    error = %error,
-                    "agent recovery turn completion was not durably committed"
-                );
-            }
-        });
-    }
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn operator_permission_preserves_negative_delivery_evidence() {
-        let plan = CompletionAdmissionPlan::AfterTerminalProjectionAndDispositionSettled;
-        let mut admission = CompletionAdmission::new(plan);
-        admission.note_mailbox_released();
-        admission.note_terminal_projection_settled(false);
-        admission.note_terminal_disposition_settled(false);
-        assert!(!admission.claim_queue_eligible());
-        admission.operator_released = true;
-        assert!(admission.claim_queue_eligible());
-        assert_eq!(admission.plan, plan);
-        assert!(admission.terminal_projection_settled);
-        assert!(admission.terminal_disposition_settled);
-        assert!(!admission.terminal_projection_allows_queue);
-        assert!(!admission.terminal_disposition_allows_queue);
-        assert!(!admission.claim_queue_eligible());
-    }
 
     #[test]
     fn deferred_candidate_releases_without_busy_outcome_after_projection_settles_4888() {

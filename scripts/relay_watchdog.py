@@ -81,17 +81,6 @@ PG_UNCLASSIFIED_DOWN = "db_down_tunnel_unknown"
 PG_UNKNOWN = "unknown"
 PG_STATE_KEY = "_pg_tunnel"
 
-# #5484: `/api/health/detail` that never yields a usable `db` is PG_UNKNOWN —
-# no evidence about Postgres, deliberately not a PG alert. But a runtime that
-# stopped booting emits exactly that forever, which is how 2026-08-21 went
-# unreported for ~7h. Its own incident, on the PG circuit's thresholds and its
-# #4379 de-duplication contract, never a PG verdict.
-RUNTIME_HEALTH_STATE_KEY = "_runtime_health"
-RUNTIME_UNOBSERVABLE_RETRY_SECS = 60
-RUNTIME_UNOBSERVABLE_MAX_RETRIES = 5
-# Both circuits defer one tick behind #4379 and then say so, in one wording.
-DCSERVER_DEDUP_NOTE = "\n\n참고: dcserver 부트 PG 알림이 먼저 발화해 이 알림을 1 tick 보류했습니다."
-
 # Independent watcher-coverage states (#4408 phase 1).  Coverage is evaluated
 # in parallel with transcript-vs-Discord gap judgment; these states must never
 # suppress or replace STATE_GAP.
@@ -3911,116 +3900,6 @@ class Runtime:
 # ── Per-channel tick ───────────────────────────────────────────────────────────
 
 
-def _sanitized_stamp(value: object, now: float) -> float:
-    """Clamp a persisted past-stamp into ``[0, now]``.
-
-    A corrupt or clock-skewed FUTURE value read back from disk must neither
-    manufacture an alert storm (a negative age clears every threshold) nor
-    silence the circuit forever. Clamping is quiet either way.
-    """
-    if not _is_finite_nonnegative_number(value):
-        return now
-    return min(float(value), now)
-
-
-def tick_runtime_observability(
-    rt: Runtime,
-    ch: ChannelConfig,
-    state: dict[str, Any],
-    now: float,
-    verdict: PgHealthVerdict,
-) -> None:
-    """Report a runtime whose health view has been unreadable for too long.
-
-    PG_UNKNOWN means dcserver never returned a usable ``db``: curl failed, the
-    body was not JSON, or the field was absent. :func:`tick_pg_tunnel` rightly
-    refuses to read that as a PG failure — and a runtime that never boots again
-    leaves a channel too quiet for the transcript-gap circuit to report either
-    (#5484, 2026-08-21). Purely time-based: no transcript or tmux evidence,
-    no reclassification of unknown, and nothing is ever restarted.
-    """
-    obs: dict[str, Any] = state.setdefault(RUNTIME_HEALTH_STATE_KEY, {})
-    if not isinstance(obs, dict):
-        # Corrupt on-disk state would otherwise raise every tick, and the
-        # caller's except would disarm this circuit behind a log line forever.
-        obs = state[RUNTIME_HEALTH_STATE_KEY] = {}
-    attempts = obs.get("attempts", 0)
-    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
-        attempts = 0
-    # A failed send must NOT spend the 900s re-alert cooldown: one transport
-    # blip would buy the outage a full cooldown of silence. The recovery notice
-    # rides the same bounded backoff, so it cannot be dropped either.
-    resend = attempts and (obs.get("alerting") or verdict.state == PG_UNKNOWN)
-    if resend and now - _sanitized_stamp(obs.get("last_attempt", 0.0), now) < (
-        RUNTIME_UNOBSERVABLE_RETRY_SECS
-        if attempts < RUNTIME_UNOBSERVABLE_MAX_RETRIES
-        else rt.cfg.pg_realert_secs
-    ):
-        rt.log(f"[runtime-health] send retry backoff (attempts={attempts})")
-        return
-
-    if verdict.state != PG_UNKNOWN:
-        if obs.get("alerting"):
-            mins = max(1, int((now - _sanitized_stamp(obs.get("since"), now)) // 60))
-            obs["last_attempt"] = now
-            if not rt.alert(
-                ch,
-                "ℹ️ **런타임 health 관측 재개 (relay watchdog)**\n\n"
-                f"`/api/health/detail`이 약 **{mins}분** 만에 다시 "
-                f"`db={str(bool(verdict.db)).lower()}`를 반환했습니다. 이것은 관측 "
-                "재개일 뿐이며 릴레이 복구를 의미하지 않습니다 — PG 판정과 릴레이 "
-                "갭은 각자의 회로가 따로 보고합니다.",
-                trigger_turn=False,
-            ):
-                obs["attempts"] = attempts + 1
-                rt.log(f"[runtime-health] close send failed ({attempts + 1})")
-                return
-            obs.pop("alerting")
-            rt.log("[runtime-health] OBSERVABLE — unobservable incident closed")
-        # `last_alert` outlives the incident so a flapping endpoint cannot
-        # re-alert inside the cooldown; everything incident-local is dropped.
-        for key in ("since", "attempts", "last_attempt", "dedup_deferred"):
-            obs.pop(key, None)
-        return
-
-    since = obs["since"] = _sanitized_stamp(obs.get("since"), now)
-    unobservable_for = now - since
-    if unobservable_for < rt.cfg.pg_alert_after_secs:
-        rt.log(f"[runtime-health] db unobservable {int(unobservable_for)}s (< thr)")
-        return
-    if now - _sanitized_stamp(obs.get("last_alert", 0.0), now) < rt.cfg.pg_realert_secs:
-        rt.log("[runtime-health] db unobservable persists (suppressed, cooldown)")
-        return
-    # #4379's dcserver boot alert is PG-independent, rate-limited to the same
-    # 900s, and would run a second stream through a PG-boot crash loop. Ride its
-    # contract (see below): defer only the FIRST alert of an incident by exactly
-    # one tick, then send with the note — de-duplication cannot become silence.
-    if not obs.get("alerting") and not obs.get("dedup_deferred"):
-        if rt.recent_dcserver_pg_alert(now):
-            obs["dedup_deferred"] = True
-            rt.log("[runtime-health] dcserver boot alert recent — defer one tick")
-            return
-    delivered = rt.alert(
-        ch,
-        "\U0001f6a8 **런타임 health 관측 불가 (relay watchdog)**\n\n"
-        f"`/api/health/detail`에서 `db` 값을 **{max(1, int(unobservable_for // 60))}분**"
-        " 동안 한 번도 읽지 못했습니다(무응답·비정상 JSON·`db` 필드 부재). 이는 "
-        "**관측 불가**이며 PG 장애로 단정하지 않습니다. watchdog은 런타임을 "
-        "재시작하지 않으므로 런타임 프로세스와 launchd 상태를 직접 확인해 주세요."
-        f"\n\n런타임: {rt.dcserver_snapshot()}"
-        + (DCSERVER_DEDUP_NOTE if obs.get("dedup_deferred") else ""),
-        trigger_turn=False,
-    )
-    obs["last_attempt"] = now
-    if not delivered:
-        obs["attempts"] = attempts + 1
-        rt.log(f"[runtime-health] ALERT send failed (attempt {attempts + 1})")
-        return
-    obs.update(alerting=True, last_alert=now, attempts=0)
-    obs.pop("dedup_deferred", None)
-    rt.log(f"[runtime-health] ALERT unobservable duration={int(unobservable_for)}s")
-
-
 def tick_pg_tunnel(rt: Runtime, state: dict[str, Any], now: float) -> None:
     """Independently monitor the end-to-end PG path once per watchdog tick."""
     if not rt.cfg.channels:
@@ -4028,10 +3907,6 @@ def tick_pg_tunnel(rt: Runtime, state: dict[str, Any], now: float) -> None:
     ch = rt.cfg.channels[0]
     pgs: dict[str, Any] = state.setdefault(PG_STATE_KEY, {})
     verdict = rt.pg_health()
-    try:
-        tick_runtime_observability(rt, ch, state, now, verdict)
-    except Exception as e:  # noqa: BLE001 — must never disarm the PG circuit
-        rt.log(f"[runtime-health] tick error: {type(e).__name__}: {e}")
 
     if verdict.state == PG_UNKNOWN:
         # Unknown is not recovery from an already-alerting incident, but it
@@ -4123,7 +3998,11 @@ def tick_pg_tunnel(rt: Runtime, state: dict[str, Any], now: float) -> None:
             )
             return
 
-    correlation = DCSERVER_DEDUP_NOTE if pgs.get("dcserver_alert_seen") else ""
+    correlation = (
+        "\n\n참고: dcserver 부트 PG 알림이 먼저 발화해 이 알림을 1 tick 보류했습니다."
+        if pgs.get("dcserver_alert_seen")
+        else ""
+    )
     minutes = max(1, int(unhealthy_for // 60))
     rt.alert(
         ch,
@@ -4468,7 +4347,8 @@ def _alert_pending_retirement(
     #5190 R3 P2-E: this used to answer a bare bool, and every caller read the
     False as "nobody could be told". Two very different things produce it. A
     send failure means the notice never left the box. A cooldown hit means the
-    box is fine and another retirement of the SAME reason spoke within
+    box is fine and something else — possibly an unrelated `idle` or
+    `read_failure` retirement on the SAME shared cooldown key — spoke within
     `realert_secs`. Callers gate identically on both (neither is a notice about
     THESE paths), but the log line must not call a cooldown an undelivered
     message: that is a false statement about the relay's health, which is the
@@ -4479,9 +4359,9 @@ def _alert_pending_retirement(
     """
     if not paths:
         return "empty"
-    # The legacy shared timestamp has no reason provenance; leave it inert.
-    alert_key = f"{LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY}:{reason}"
-    raw_last_alert = channel_state.get(alert_key, 0.0)
+    raw_last_alert = channel_state.get(
+        LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY, 0.0
+    )
     last_alert = (
         float(raw_last_alert)
         if _is_finite_nonnegative_number(raw_last_alert)
@@ -4540,7 +4420,7 @@ def _alert_pending_retirement(
             f"reason={reason} count={len(paths)}"
         )
         return "undelivered"
-    channel_state[alert_key] = now
+    channel_state[LAST_PENDING_TRANSCRIPT_RETIREMENT_ALERT_KEY] = now
     return "sent"
 
 
@@ -4748,11 +4628,9 @@ def _retire_dead_worktree_authorities(
 
     # Terminating a dead session's loss-state is the LAST point at which anyone
     # can learn those blocks are gone, so termination is gated on the notice
-    # actually going out. The retirement cooldown key is per reason (#5205),
-    # so an idle/read-failure retirement a few seconds earlier can no longer
-    # swallow this notice; only an earlier dead_worktree notice for the same
-    # channel within `realert_secs` still suppresses it, and closing the
-    # incident in silence on that path is exactly what this gate forbids.
+    # actually going out. The retirement notice shares ONE cooldown key across
+    # every reason, so an idle/read-failure retirement a few seconds earlier
+    # would otherwise swallow this one and close the incident in total silence.
     # Nothing below has mutated state yet, so deferring simply retries next tick
     # with the absence window intact.
     dead_notice = _alert_pending_retirement(
@@ -5983,10 +5861,9 @@ def tick_channel(rt: Runtime, ch: ChannelConfig, state: dict[str, Any], now: flo
             #
             # #5190 R3 P2-E: `notice=` reports WHICH of those happened.
             # `undelivered` means the message never left the box; `cooldown`
-            # means it was suppressed by the per-reason retirement cooldown
-            # key (#5205): only an earlier orphan notice for this channel
-            # within `realert_secs` delays this one; idle/read_failure/
-            # dead_worktree notices no longer do.
+            # means it was suppressed by the retirement cooldown key that all
+            # reasons share, so an unrelated idle/read_failure/dead_worktree
+            # notice within `realert_secs` delays this one by up to that long.
             # The old line said `notice=undelivered` for both, which made the
             # log lie about the relay in the cooldown case.
             rt.log(

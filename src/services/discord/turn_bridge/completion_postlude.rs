@@ -63,7 +63,6 @@ pub(super) async fn run_completion_postlude(
     let status_panel_generation = state.status_panel_generation;
     let preserve_inflight_for_cleanup_retry = state.preserve_inflight_for_cleanup_retry;
     let tmux_last_offset = state.tmux_last_offset;
-    let watcher_delivery_pin = state.watcher_delivery_pin;
     let watcher_owner_channel_id = state.watcher_owner_channel_id;
     let bridge_relay_delegated_to_watcher = state.bridge_relay_delegated_to_watcher;
     let is_prompt_too_long = state.is_prompt_too_long;
@@ -238,12 +237,15 @@ pub(super) async fn run_completion_postlude(
             can_chain_locally,
         )
         && let Some(offset) = tmux_last_offset
+        && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
     {
-        finalize_epilogue::resume_pinned_watcher(
-            &shared_owned.tmux_watchers,
-            watcher_delivery_pin.as_ref(),
-            offset,
-        );
+        if let Ok(mut guard) = watcher.resume_offset.lock() {
+            *guard = Some(offset);
+        }
+        // NOTE: turn_delivered is NOT cleared here — the watcher clears it
+        // when it consumes resume_offset, ensuring the flag stays active
+        // until the watcher actually starts reading from the new offset.
+        watcher.paused.store(false, Ordering::Relaxed);
     }
 
     let should_record_final_turn = should_record_final_turn_transcript(
@@ -265,16 +267,29 @@ pub(super) async fn run_completion_postlude(
     let mut reflect_request = None;
     let mut clear_provider_session = false;
     let capture_memory_settings = settings::memory_settings_for_binding(role_binding.as_ref());
-    let (isolated_from_channel, routine_attempt_owns_turn) =
-        channel_writeback::resolve_completion_scope(
-            &shared_owned,
-            channel_id,
-            &provider,
-            adk_session_key.as_deref(),
-            turn_id.as_str(),
-        )
-        .await;
-    let routine_attempt_owns_turn = routine_attempt_owns_turn && !cancelled;
+    // #4658 F1 completion-side isolation: detect a scheduled-snapshot turn by its
+    // ISOLATED session_key. A snapshot turn derives its `session_key` from the
+    // reservation label (AC-2), so it differs from the channel's canonical
+    // (channel-name-basis) key. Recompute the canonical key with the same
+    // production helper (`build_adk_session_key(.., None)`) — which normal intake
+    // and headless turns already use verbatim — and compare. When the turn's key
+    // is present and differs, the turn does NOT own the channel's live session and
+    // must produce ZERO channel-scoped side-effects a later LIVE turn can observe.
+    // The full isolation invariant (the enumerated gated effects and the F-2
+    // mid-turn-rebind recompute limitation) lives in the `channel_writeback`
+    // module doc — the single source of truth for the combined suppression gate
+    // below. (#4634 bug class, completion side.)
+    let channel_canonical_session_key = super::super::adk_session::build_adk_session_key(
+        &shared_owned,
+        channel_id,
+        &provider,
+        None,
+    )
+    .await;
+    let isolated_from_channel = match adk_session_key.as_deref() {
+        Some(turn_key) => channel_canonical_session_key.as_deref() != Some(turn_key),
+        None => false,
+    };
     let completion_r2 = ownership.read("completion_r2").await;
     let channel_effects_suppressed =
         isolated_from_channel || !completion_r2.permits_channel_effects();
@@ -299,7 +314,6 @@ pub(super) async fn run_completion_postlude(
                 let writeback = channel_writeback::apply_channel_turn_writeback(
                     session,
                     channel_effects_suppressed,
-                    routine_attempt_owns_turn,
                     &memory_plan,
                     &user_text_owned,
                     &full_response,
@@ -494,13 +508,9 @@ pub(super) async fn run_completion_postlude(
         }),
     );
 
-    if should_persist_transcript
-        && shared_owned.pg_pool.is_some()
-        && (!routine_attempt_owns_turn
-            || !should_suppress_headless_delivery_for_cancel(Some(&cancel_token)))
-    {
+    if should_persist_transcript && shared_owned.pg_pool.is_some() {
         let channel_id_text = channel_id.get().to_string();
-        if let Err(e) = crate::db::session_transcripts::persist_turn_db_with_clear_fence(
+        if let Err(e) = crate::db::session_transcripts::persist_turn_db(
             shared_owned.pg_pool.as_ref(),
             crate::db::session_transcripts::PersistSessionTranscript {
                 turn_id: turn_id.as_str(),
@@ -518,7 +528,6 @@ pub(super) async fn run_completion_postlude(
                 turn_started_at_millis:
                     crate::db::session_transcripts::discord_message_started_at_millis(user_msg_id),
             },
-            routine_attempt_owns_turn.then_some(ctx.clear_fence),
         )
         .await
         {
@@ -980,7 +989,7 @@ pub(super) async fn run_completion_postlude(
         provider,
         request_owner_name,
         tmux_last_offset,
-        watcher_delivery_pin,
+        watcher_owner_channel_id,
         completion_r4.permits_channel_effects(),
     )
     .await;

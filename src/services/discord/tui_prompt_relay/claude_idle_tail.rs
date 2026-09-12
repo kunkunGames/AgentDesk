@@ -1,4 +1,5 @@
 use super::*;
+
 #[cfg(unix)]
 pub(super) async fn maybe_spawn_claude_idle_response_tail(
     shared: Arc<SharedData>,
@@ -450,7 +451,15 @@ pub(super) async fn run_claude_idle_response_tail(
     )
     .await;
     if delivery_result.is_err() {
-        tracing::warn!(error = ?delivery_result, "Claude TUI-direct delivery failed; preserving successor and cursor");
+        finish_tui_direct_synthetic_turn_if_current(
+            &shared,
+            &ProviderKind::Claude,
+            channel_id,
+            &tmux_session_name,
+            lease.session_key.as_deref(),
+            "claude_tui_direct_delivery_failed",
+        )
+        .await;
     }
     // #3041 / #3256: advance the runtime-binding offset on successful delivery so
     // the watcher / idle paths never double-send this turn's bytes. The reader

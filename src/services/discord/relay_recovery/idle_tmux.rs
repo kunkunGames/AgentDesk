@@ -159,7 +159,6 @@ pub(super) async fn finalize_cancelled_watcher_owner_turn(
     provider: &ProviderKind,
     decision: &RelayRecoveryDecision,
     owner_channel_id: ChannelId,
-    probe: &super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
 ) -> Option<super::turn_finalizer::FinalizeOutcome> {
     let finalizer_turn_id = decision.affected.finalizer_turn_id?;
     if finalizer_turn_id == 0 {
@@ -168,7 +167,7 @@ pub(super) async fn finalize_cancelled_watcher_owner_turn(
     Some(
         shared
             .turn_finalizer
-            .submit_terminal_with_claim_snapshot(
+            .submit_terminal(
                 super::turn_finalizer::TurnKey::new(
                     owner_channel_id,
                     finalizer_turn_id,
@@ -177,7 +176,6 @@ pub(super) async fn finalize_cancelled_watcher_owner_turn(
                 provider.clone(),
                 super::turn_finalizer::TerminalEvent::Cancel,
                 relay_recovery_cancel_finalize_context(),
-                Some(probe.finalizer_claim_snapshot.clone()),
                 shared.clone(),
             )
             .await,

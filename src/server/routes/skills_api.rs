@@ -13,7 +13,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::skills_manifest_audit::{audit_skill_manifest_agents, manifest_audit_request};
 use super::{
     AppState,
     skill_usage_analytics::{
@@ -59,7 +58,7 @@ struct DiscoveredSkill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SkillRootKind {
+enum SkillRootKind {
     Directory,
     MarkdownFile,
 }
@@ -81,13 +80,11 @@ struct DiscoveryResult {
     any_root_errored: bool,
 }
 
-pub(super) fn skill_roots(
-    runtime_root: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> Vec<(PathBuf, SkillRootKind)> {
+fn discover_skills_from_disk() -> DiscoveryResult {
     let mut roots = Vec::new();
     let mut seen_roots = HashSet::new();
-    if let Some(runtime_root) = runtime_root {
+    if let Some(runtime_root) = crate::config::runtime_root() {
+        let _ = crate::runtime_layout::sync_managed_skills(&runtime_root);
         push_skill_root(
             &mut roots,
             &mut seen_roots,
@@ -95,7 +92,7 @@ pub(super) fn skill_roots(
             SkillRootKind::Directory,
         );
     }
-    if let Some(home) = home {
+    if let Some(home) = dirs::home_dir() {
         push_skill_root(
             &mut roots,
             &mut seen_roots,
@@ -123,18 +120,11 @@ pub(super) fn skill_roots(
             SkillRootKind::MarkdownFile,
         );
     }
-    roots
-}
 
-fn discover_skills_from_disk() -> DiscoveryResult {
-    let runtime_root = crate::config::runtime_root();
-    if let Some(root) = runtime_root.as_deref() {
-        let _ = crate::runtime_layout::sync_managed_skills(root);
-    }
     let mut discovered = Vec::new();
     let mut any_root_errored = false;
     let mut seen_ids = HashSet::new();
-    for (root, kind) in skill_roots(runtime_root, dirs::home_dir()) {
+    for (root, kind) in roots {
         if !root.is_dir() {
             continue;
         }
@@ -636,13 +626,6 @@ pub async fn prune(
                 .with_code(ErrorCode::Database)
         })?;
 
-    // Stale rows are only half the drift: a manifest also pins skills to agent
-    // ids, and an id no agent answers to leaves an assignment that reaches
-    // nobody (#5720). Fail closed - `audited` is false whenever any premise
-    // went unconfirmed, so `findings: []` is never a clean verdict.
-    let manifest_audit =
-        audit_skill_manifest_agents(manifest_audit_request(&state.config, pool).await);
-
     Ok((
         StatusCode::OK,
         Json(json!({
@@ -652,7 +635,6 @@ pub async fn prune(
             "stale_count": stale_skill_ids.len(),
             "soft_deleted_from_skills": if dry_run { 0 } else { stale_skill_ids.len() },
             "skill_usage_policy": "preserved",
-            "manifest_agents_audit": manifest_audit.to_json(),
         })),
     ))
 }

@@ -4,9 +4,7 @@ use serenity::MessageId;
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::provider::ProviderKind;
 
-use super::super::formatting::{
-    build_streaming_placeholder_text, byte_index_at_discord_message_units, discord_message_units,
-};
+use super::super::formatting::{build_streaming_placeholder_text, truncate_str};
 use crate::services::discord;
 
 #[cfg(test)]
@@ -18,8 +16,6 @@ use serenity::ChannelId;
 
 mod evidence;
 mod ops;
-#[cfg(test)]
-mod unicode_units_tests;
 
 pub(super) use self::evidence::{
     GuardedDeliveredElsewhereSignal, GuardedNonterminalDeleteDecision,
@@ -68,31 +64,29 @@ pub(super) fn rewrite_placeholder_as_terminal_suppressed(
     let cleaned = discord::single_message_panel::strip_placeholder_terminal_status(text, provider);
     let trimmed = cleaned.trim_end();
     if trimmed.ends_with(label) {
-        return trimmed[..byte_index_at_discord_message_units(trimmed, discord::DISCORD_MSG_LIMIT)]
-            .to_string();
+        return trimmed.to_string();
     }
     if trimmed.is_empty() {
         // #1009: label itself may exceed DISCORD_MSG_LIMIT when monitor entries
         // balloon — guard here too (the with-body branch below already guards).
         let limit = discord::DISCORD_MSG_LIMIT;
-        if discord_message_units(label) > limit {
-            return label[..byte_index_at_discord_message_units(label, limit)].to_string();
+        if label.len() > limit {
+            return truncate_str(label, limit);
         }
         return label.to_string();
     }
 
     let suffix = format!("\n\n{label}");
-    let max_base_len = discord::DISCORD_MSG_LIMIT.saturating_sub(discord_message_units(&suffix));
-    let base = if discord_message_units(trimmed) > max_base_len {
-        trimmed[..byte_index_at_discord_message_units(trimmed, max_base_len)].to_string()
+    let max_base_len = discord::DISCORD_MSG_LIMIT.saturating_sub(suffix.len());
+    let base = if trimmed.len() > max_base_len {
+        truncate_str(trimmed, max_base_len)
     } else {
         trimmed.to_string()
     };
     let composed = format!("{base}{suffix}");
-    // Final guard also bounds a suffix that alone exhausts the unit budget.
-    if discord_message_units(&composed) > discord::DISCORD_MSG_LIMIT {
-        composed[..byte_index_at_discord_message_units(&composed, discord::DISCORD_MSG_LIMIT)]
-            .to_string()
+    // Final belt-and-suspenders guard (rare: suffix.len() ≥ DISCORD_MSG_LIMIT).
+    if composed.len() > discord::DISCORD_MSG_LIMIT {
+        truncate_str(&composed, discord::DISCORD_MSG_LIMIT)
     } else {
         composed
     }

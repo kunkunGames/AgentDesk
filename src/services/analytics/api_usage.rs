@@ -33,9 +33,9 @@ pub async fn build_rate_limit_provider_payloads_pg(pool: &PgPool, now: i64) -> V
             .unwrap_or(600);
 
     let rows = match sqlx::query(
-        "SELECT provider, COALESCE(profile_id, 'default') AS profile_id, data, fetched_at
+        "SELECT provider, data, fetched_at
          FROM rate_limit_cache
-         ORDER BY provider, profile_id",
+         ORDER BY provider",
     )
     .fetch_all(pool)
     .await
@@ -60,8 +60,6 @@ pub async fn build_rate_limit_provider_payloads_pg(pool: &PgPool, now: i64) -> V
             Ok(fetched_at) => fetched_at,
             Err(_) => continue,
         };
-        let profile_id =
-            normalize_profile_id(row.try_get::<String, _>("profile_id").ok().as_deref());
 
         let parsed: Value = match serde_json::from_str(&data) {
             Ok(parsed) => parsed,
@@ -84,7 +82,6 @@ pub async fn build_rate_limit_provider_payloads_pg(pool: &PgPool, now: i64) -> V
         seen.insert(provider.to_lowercase());
         providers.push(json!({
             "provider": provider,
-            "profile_id": profile_id,
             "buckets": buckets,
             "fetched_at": fetched_at,
             "stale": stale,
@@ -142,7 +139,6 @@ async fn build_unsupported_rate_limit_entries_pg(pool: &PgPool, now: i64) -> Vec
 fn unsupported_provider_entry(provider: &str, reason: &str, now: i64) -> Value {
     json!({
         "provider": provider,
-        "profile_id": "default",
         "buckets": [],
         "fetched_at": now,
         "stale": false,
@@ -151,37 +147,15 @@ fn unsupported_provider_entry(provider: &str, reason: &str, now: i64) -> Value {
     })
 }
 
-pub(crate) fn normalize_profile_id(value: Option<&str>) -> String {
-    match value.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => value.to_string(),
-        None => "default".to_string(),
-    }
-}
-
 fn sort_provider_payloads(providers: &mut [Value]) {
-    providers.sort_by(|left, right| {
+    providers.sort_by_key(|entry| {
         provider_sort_key(
-            left.get("provider")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default(),
-        )
-        .cmp(&provider_sort_key(
-            right
+            entry
                 .get("provider")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default(),
-        ))
-        .then_with(|| profile_sort_key(left).cmp(&profile_sort_key(right)))
+        )
     });
-}
-
-fn profile_sort_key(entry: &Value) -> (u8, String) {
-    let profile_id = normalize_profile_id(entry.get("profile_id").and_then(Value::as_str));
-    if profile_id == "default" {
-        (0, profile_id)
-    } else {
-        (1, profile_id)
-    }
 }
 
 fn provider_sort_key(provider: &str) -> u8 {
@@ -220,20 +194,5 @@ mod tests {
             order,
             vec!["claude", "codex", "gemini", "opencode", "qwen", "other"]
         );
-    }
-
-    #[test]
-    fn test_011_missing_profile_id_reads_as_default() {
-        assert_eq!(normalize_profile_id(None), "default");
-        assert_eq!(normalize_profile_id(Some("")), "default");
-        assert_eq!(normalize_profile_id(Some("  ")), "default");
-        assert_eq!(normalize_profile_id(Some("work")), "work");
-        let mut providers = vec![
-            json!({"provider": "claude", "profile_id": "work"}),
-            json!({"provider": "claude", "profile_id": "default"}),
-        ];
-        sort_provider_payloads(&mut providers);
-        assert_eq!(providers[0]["profile_id"], "default");
-        assert_eq!(providers[1]["profile_id"], "work");
     }
 }

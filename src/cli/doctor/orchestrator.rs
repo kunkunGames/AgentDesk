@@ -1,6 +1,3 @@
-mod provider_credentials;
-use provider_credentials::{check_claude_cswap_global_conflict, check_credential_permissions};
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,9 +5,6 @@ use std::time::Duration;
 
 use super::contract::{DoctorProfile, FixSafety, RunContext, SecurityExposure, Severity};
 use super::{health, mailbox};
-
-mod config_dir_checks;
-mod relay_notifications;
 use crate::cli::dcserver;
 use crate::config;
 use crate::services::operator_connectors::{
@@ -461,6 +455,7 @@ fn provider_connected(snapshot: &HealthSnapshot, provider: &ProviderKind) -> Opt
 
 fn configured_provider_names(cfg: &config::Config, snapshot: &HealthSnapshot) -> BTreeSet<String> {
     let mut configured = BTreeSet::new();
+
     for agent in &cfg.agents {
         if let Some(provider) = ProviderKind::from_str(&agent.provider) {
             configured.insert(provider.as_str().to_string());
@@ -550,6 +545,7 @@ fn check_qwen_settings_files(configured: bool) -> Check {
         ("project settings", qwen_project_settings_path()),
         ("system settings", qwen_system_settings_path()),
     ];
+
     let found: Vec<String> = candidates
         .iter()
         .filter_map(|(label, path)| {
@@ -901,11 +897,9 @@ fn build_core_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Che
         check_health_db_dashboard(snapshot),
         check_dispatch_outbox(snapshot),
         check_config_audit(snapshot),
-        relay_notifications::check(cfg),
         check_runtime_root(),
-        config_dir_checks::check_data_dir(cfg),
-        config_dir_checks::check_policies_dir(cfg),
-        config_dir_checks::check_routine_script_registration(cfg),
+        check_data_dir(cfg),
+        check_policies_dir(cfg),
         check_tmux(),
         check_service_manager(),
         check_postgres_connection(cfg),
@@ -945,7 +939,6 @@ fn build_provider_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec
         check_qwen_auth_hints(qwen_configured),
         check_qwen_runtime_artifacts(qwen_configured),
         check_provider_bindings(cfg, snapshot),
-        check_claude_cswap_global_conflict(),
         check_credential_permissions(cfg),
     ]
 }
@@ -1463,6 +1456,111 @@ fn permission_finding(label: &'static str, path: &Path, _sensitive: bool) -> Per
             owner_is_current: None,
             risk: None,
         }
+    }
+}
+
+fn check_credential_permissions(cfg: &config::Config) -> Check {
+    let mut candidates: Vec<(&'static str, PathBuf, bool)> = Vec::new();
+    if let Some(root) = config::runtime_root() {
+        candidates.push((
+            "agentdesk_yaml",
+            crate::runtime_layout::config_file_path(&root),
+            cfg.server
+                .auth_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+        ));
+        candidates.push((
+            "discord_credential_dir",
+            crate::runtime_layout::credential_dir(&root),
+            true,
+        ));
+        let mut bot_names = cfg.discord.bots.keys().cloned().collect::<Vec<_>>();
+        bot_names.sort();
+        for bot_name in bot_names {
+            let label = match bot_name.as_str() {
+                "command" => "discord_command_token",
+                "announce" => "discord_announce_token",
+                "notify" => "discord_notify_token",
+                _ => "discord_bot_token",
+            };
+            candidates.push((
+                label,
+                crate::runtime_layout::credential_token_path(&root, &bot_name),
+                true,
+            ));
+        }
+    }
+    if let Some(home) = qwen_home_dir() {
+        candidates.push((
+            "qwen_oauth_cache",
+            home.join(".qwen").join("oauth_creds.json"),
+            true,
+        ));
+    }
+    if let Some(project) = qwen_project_dir() {
+        candidates.push(("qwen_project_env", project.join(".qwen").join(".env"), true));
+        candidates.push(("project_env", project.join(".env"), true));
+    }
+
+    let findings = candidates
+        .iter()
+        .map(|(label, path, sensitive)| permission_finding(label, path, *sensitive))
+        .collect::<Vec<_>>();
+    let risks = findings
+        .iter()
+        .filter_map(|finding| {
+            finding
+                .risk
+                .as_ref()
+                .map(|risk| format!("{}: {risk}", finding.label))
+        })
+        .collect::<Vec<_>>();
+    let existing = findings.iter().filter(|finding| finding.exists).count();
+    let evidence = json!({
+        "checked": findings.iter().map(|finding| json!({
+            "label": finding.label,
+            "path": finding.path.clone(),
+            "exists": finding.exists,
+            "mode": finding.mode.clone(),
+            "owner_is_current": finding.owner_is_current,
+            "risk": finding.risk.clone(),
+        })).collect::<Vec<_>>(),
+        "risk_count": risks.len(),
+    });
+    let detail = format!(
+        "checked={} existing={} risks={}",
+        findings.len(),
+        existing,
+        risks.len()
+    );
+    if risks.is_empty() {
+        Check::ok(
+            "credential_permissions",
+            CheckGroup::ProviderRuntime,
+            "Credential Permissions",
+            detail.clone(),
+        )
+        .with_subsystem("security")
+        .with_expected_actual("no credential permission risks", detail)
+        .with_evidence(evidence)
+        .with_security_exposure(SecurityExposure::CredentialMetadata)
+    } else {
+        Check::warn(
+            "credential_permissions",
+            CheckGroup::ProviderRuntime,
+            "Credential Permissions",
+            format!("{detail}; {}", risks.join("; ")),
+            "credential/config 파일 내용은 읽거나 출력하지 않고 권한/owner metadata만 점검했습니다.",
+        )
+        .with_subsystem("security")
+        .with_expected_actual("credential files owned by current user with private permissions", detail)
+        .with_evidence(evidence)
+        .with_security_exposure(SecurityExposure::CredentialMetadata)
+        .with_next_steps(vec![
+            "chmod 700 ~/.adk/release/credential".to_string(),
+            "chmod 600 <credential-file>".to_string(),
+        ])
     }
 }
 
@@ -3036,6 +3134,53 @@ fn check_mailbox_consistency(snapshot: &HealthSnapshot) -> Vec<Check> {
             ])
         })
         .collect()
+}
+
+fn check_policies_dir(cfg: &config::Config) -> Check {
+    if cfg.policies.dir.exists() && cfg.policies.dir.is_dir() {
+        Check::ok(
+            "policies_directory",
+            CheckGroup::Core,
+            "Policies Directory",
+            format!("{}", cfg.policies.dir.display()),
+        )
+        .with_path(cfg.policies.dir.display().to_string())
+        .with_expected_actual("policies directory exists", "policies directory exists")
+    } else {
+        Check::fail(
+            "policies_directory",
+            CheckGroup::Core,
+            "Policies Directory",
+            format!("{} — missing", cfg.policies.dir.display()),
+            "Create a policies folder at this path or correct the policies.dir path in agentdesk.yaml.",
+        )
+        .with_path(cfg.policies.dir.display().to_string())
+        .with_expected_actual("policies directory exists", "policies directory missing")
+    }
+}
+
+fn check_data_dir(cfg: &config::Config) -> Check {
+    if cfg.data.dir.exists() && cfg.data.dir.is_dir() {
+        Check::ok(
+            "data_directory",
+            CheckGroup::Core,
+            "Data Directory",
+            format!("{}", cfg.data.dir.display()),
+        )
+        .with_path(cfg.data.dir.display().to_string())
+        .with_expected_actual("data directory exists", "data directory exists")
+    } else {
+        Check::fail(
+            "data_directory",
+            CheckGroup::Core,
+            "Data Directory",
+            format!("{} — missing", cfg.data.dir.display()),
+            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
+        )
+        .with_path(cfg.data.dir.display().to_string())
+        .with_expected_actual("data directory exists", "data directory missing")
+        .with_next_steps(vec!["agentdesk doctor --fix".to_string()])
+    }
 }
 
 #[cfg(target_os = "macos")]

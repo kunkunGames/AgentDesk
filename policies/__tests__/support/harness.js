@@ -4,23 +4,6 @@ const vm = require("node:vm");
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
-// Match the inflight.list projection in src/engine/ops/exec_ops.rs:249-265.
-const INFLIGHT_PROJECTION_DEFAULTS = Object.freeze({
-  channel_id: "", provider: "", started_at: "", updated_at: "", channel_name: "",
-  tmux_session_name: "", session_id: null, request_owner_user_id: 0, user_msg_id: 0,
-  any_tool_used: false, has_post_tool_text: false, rebind_origin: false,
-  turn_source: null, session_key: "", dispatch_id: ""
-});
-
-function projectInflight(row) {
-  return Object.fromEntries(Object.entries(INFLIGHT_PROJECTION_DEFAULTS).map(([key, fallback]) => {
-    const value = row[key];
-    return [key, typeof fallback === "string"
-      ? (typeof value === "string" ? value : fallback)
-      : (value === undefined ? fallback : value)];
-  }));
-}
-
 function clone(value) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value));
@@ -174,7 +157,6 @@ function createAgentdeskMock(options) {
     retrospectiveCalls: [],
     runtimeSignals: [],
     httpPosts: [],
-    httpGets: [],
     deadlockAlerts: [],
     escalations: [],
     manualInterventions: [],
@@ -424,13 +406,6 @@ function createAgentdeskMock(options) {
       }
     },
     http: {
-      get(url) {
-        state.httpGets.push({ url });
-        if (typeof settings.httpGet === "function") {
-          return clone(settings.httpGet(url, state));
-        }
-        return { cluster: { local_instance_id: null, configured_forward_owner_ids: [], lease_ttl_secs: 30 }, nodes: [] };
-      },
       post(url, body) {
         state.httpPosts.push({ url, body: clone(body || null) });
         if (typeof settings.httpPost === "function") {
@@ -441,9 +416,10 @@ function createAgentdeskMock(options) {
     },
     inflight: {
       list() {
-        const rows = typeof settings.inflightList === "function"
-          ? settings.inflightList(state) : (settings.inflights || []);
-        return clone(rows.map(projectInflight));
+        if (typeof settings.inflightList === "function") {
+          return clone(settings.inflightList(state));
+        }
+        return clone(settings.inflights || []);
       }
     },
     kv: {

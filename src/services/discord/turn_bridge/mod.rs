@@ -56,7 +56,6 @@ use crate::db::session_observability::{
     BackgroundChildSpawn, close_background_child_pg, insert_background_child_pg,
     mark_session_tool_use_pg,
 };
-use crate::db::session_transcripts::ChannelClearFence;
 use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
 use crate::db::turns::TurnTokenUsage;
 use crate::services::agent_protocol::{StatusEvent, TaskNotificationKind};
@@ -204,9 +203,46 @@ use voice_completion::{
     json_any_true_flag, resolve_voice_turn_link_for_playback, voice_background_completion_target,
 };
 use watcher_handoff::{live_watcher_registered_for_relay, should_delegate_bridge_relay_to_watcher};
-mod context;
-use super::tmux_watcher_registry::WatcherClaimIncarnation;
-pub(super) use context::{BridgeCompletionSignal, TurnBridgeContext};
+pub(super) struct TurnBridgeContext {
+    pub(super) provider: ProviderKind,
+    pub(super) gateway: Arc<dyn TurnGateway>,
+    pub(super) channel_id: ChannelId,
+    /// `None` for a recovery turn with no anchored Discord user message
+    /// (user_msg_id == 0, e.g. a TUI-direct turn). All Discord-message side
+    /// effects keyed on it (reactions, analytics row, voice link) are skipped.
+    pub(super) user_msg_id: Option<MessageId>,
+    pub(super) user_text_owned: String,
+    pub(super) request_owner_name: String,
+    pub(super) role_binding: Option<RoleBinding>,
+    pub(super) adk_session_key: Option<String>,
+    pub(super) adk_session_name: Option<String>,
+    pub(super) adk_session_info: Option<String>,
+    pub(super) adk_cwd: Option<String>,
+    pub(super) dispatch_id: Option<String>,
+    pub(super) dispatch_kind: Option<String>,
+    pub(super) memory_recall_usage: TokenUsage,
+    pub(super) context_window_tokens: u64,
+    pub(super) context_compact_percent: u64,
+    /// `None` for a recovery turn that never anchored a Discord placeholder
+    /// (current_msg_id == 0, e.g. a TUI-direct turn). The bridge then creates a
+    /// fresh placeholder on first output instead of editing a nonexistent one.
+    pub(super) current_msg_id: Option<MessageId>,
+    pub(super) response_sent_offset: usize,
+    pub(super) full_response: String,
+    pub(super) tmux_last_offset: Option<u64>,
+    pub(super) new_session_id: Option<String>,
+    pub(super) defer_watcher_resume: bool,
+    /// Reuse the persisted V2 status panel only when resuming the same
+    /// in-flight turn. Fresh turns must allocate a new panel near the new
+    /// response instead of editing an old panel buried in scrollback.
+    pub(super) reuse_status_panel_message: bool,
+    pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// `true` ONLY at the two TUI external-input idle callers. Default `false`
+    /// for every other bridge caller; used by footer/chrome decisions that need
+    /// the origin without a `request_owner_name` string compare.
+    pub(super) is_external_input_tui_direct: bool,
+    pub(super) inflight_state: InflightTurnState,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WatcherHandoffClaimOutcome {
     None,
@@ -217,37 +253,11 @@ pub(super) enum WatcherHandoffClaimOutcome {
 // (#4230 S6) — must live at module scope so both resolve them.
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LIVE_LONG_RUN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-// The non-Clone receiver is the phase witness: capture consumes it before stream processing.
-async fn capture_bridge_clear_fence(
-    shared: &SharedData,
-    channel: ChannelId,
-    rx: mpsc::Receiver<StreamMessage>,
-    fence: &tokio::sync::OnceCell<ChannelClearFence>,
-) -> StreamMessageReceiverAdapter {
-    #[cfg(all(test, unix))]
-    let channel = resume_pin_tests::capture_channel(channel);
-    crate::db::session_transcripts::observe_channel_clear_fence_once(
-        fence,
-        shared.pg_pool.as_ref(),
-        &channel.get().to_string(),
-    )
-    .await;
-    spawn_stream_message_receiver_adapter(rx)
-}
 pub(super) fn spawn_turn_bridge(
     shared_owned: Arc<SharedData>,
     cancel_token: Arc<CancelToken>,
     rx: mpsc::Receiver<StreamMessage>,
-    bridge: TurnBridgeContext,
-) {
-    spawn_turn_bridge_with_pin(shared_owned, cancel_token, rx, bridge, None);
-}
-pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
-    shared_owned: Arc<SharedData>,
-    cancel_token: Arc<CancelToken>,
-    rx: mpsc::Receiver<StreamMessage>,
     mut bridge: TurnBridgeContext,
-    initial_watcher_delivery_pin: Option<WatcherClaimIncarnation>,
 ) {
     use tracing::Instrument;
     intake_settlement::bind_bridge_turn_snapshot(&shared_owned, &mut bridge);
@@ -272,6 +282,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         turn_id = %bridge_turn_id,
     );
     super::task_supervisor::spawn_observed("discord_turn_bridge", async move {
+        let mut rx = spawn_stream_message_receiver_adapter(rx);
         let channel_id = bridge.channel_id;
         let provider = bridge.provider.clone();
         let gateway = bridge.gateway.clone();
@@ -352,7 +363,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         let mut watcher_owns_assistant_relay =
             matches!(initial_relay_owner_kind, super::inflight::RelayOwnerKind::Watcher);
         let mut watcher_relay_available_for_turn = false;
-        let mut watcher_delivery_pin = initial_watcher_delivery_pin;
+        let mut watcher_delivery_pin = None;
         let mut watcher_handoff_claim_outcome = WatcherHandoffClaimOutcome::None;
         // Durable recovery must honor typed non-bridge owners too. `Unknown`
         // is treated like a live external owner so future relay variants do
@@ -453,11 +464,6 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
         let turn_start = std::time::Instant::now();
-        // #5707: observe after own clear; the unbounded prior window can overlap provider work.
-        let clear_fence = tokio::sync::OnceCell::new();
-        let mut rx = capture_bridge_clear_fence(shared_owned.as_ref(), channel_id, rx, &clear_fence).await;
-        #[cfg(all(test, unix))]
-        resume_pin_tests::after_bridge_capture(channel_id).await;
         // #3813: observation-only bridge latency spans share `turn_start`.
         let mut bridge_spans = BridgeLatencySpans::starting_at(turn_start);
         // #3805: pinned panel epoch; create bumps it and completion proves it.
@@ -784,7 +790,6 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         let terminal_outcome_delivery_output =
             terminal_outcome_delivery::run_terminal_outcome_delivery(
                 terminal_outcome_delivery::TerminalOutcomeDeliveryContext {
-                    watcher_delivery_pin: watcher_delivery_pin.clone(),
                     channel_id,
                     user_msg_id,
                     current_msg_id,
@@ -905,11 +910,9 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
                 is_external_input_tui_direct,
                 context_window_tokens,
                 context_compact_percent,
-                clear_fence: clear_fence.into_inner().expect("bridge captured fence"),
                 turn_start,
             },
             completion_postlude::CompletionPostludeState {
-                watcher_delivery_pin,
                 full_response,
                 user_text_owned,
                 role_binding,
@@ -963,6 +966,3 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         // completion_tx is sent automatically by CompletionGuard on drop
     }.instrument(bridge_span));
 }
-
-#[cfg(all(test, unix))]
-mod resume_pin_tests;

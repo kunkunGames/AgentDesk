@@ -792,7 +792,7 @@ pub(super) async fn run_terminal_outcome_delivery(
                 should_complete_work_dispatch_after_delivery,
                 should_fail_dispatch_after_delivery,
                 bridge_relay_delegated_to_watcher,
-                watcher_delivery_pin: ctx.watcher_delivery_pin.as_ref(),
+                watcher_owner_channel_id,
                 can_chain_locally,
                 inflight_generation,
             },

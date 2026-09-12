@@ -49,7 +49,7 @@ class SourceContractTests(unittest.TestCase):
             },
         )
         comment = self.payload["categories"]["registry_remove"]["comment"]
-        self.assertIn("3/5/4/2 (total 14)", comment)
+        self.assertIn("8/3/3/2 (total 16)", comment)
         self.assertIn("10/2/3/2=17", comment)
         self.assertIn("health/recovery.rs remove_locked", comment)
         watcher_backstop = ROOT / "src/services/discord/turn_finalizer/watcher_backstop.rs"

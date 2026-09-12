@@ -376,15 +376,10 @@ pub(in crate::services::discord) fn completion_footer_edit_for_registered_target
     let metadata = completion_footer_metadata::completion_footer_metadata_from_block(
         target.last_completion_block.as_deref(),
     );
-    let completion_block = rendered.block.clone().map(|block| {
+    let completion_block = rendered.block.map(|block| {
         completion_footer_metadata::append_completion_footer_metadata(block, &metadata)
     });
-    let mut surviving_prefix = 0;
-    let text = smp::compose_completion_footer_text_tracked(
-        &target.base_body,
-        completion_block.as_deref(),
-        &mut surviving_prefix,
-    );
+    let text = smp::compose_completion_footer_text(&target.base_body, completion_block.as_deref());
     let remove_after_edit = idle_expired || !rendered.has_unfinished_entries;
     if text.trim().is_empty() {
         if idle_expired {
@@ -423,7 +418,7 @@ pub(in crate::services::discord) fn completion_footer_edit_for_registered_target
         remove_after_edit,
         owner: target.owner,
         completion_block,
-        delivered_terminal_ids: rendered.surviving_terminal_ids(surviving_prefix),
+        delivered_terminal_ids: rendered.delivered_terminal_ids,
     })
 }
 

@@ -39,7 +39,7 @@ mod metrics;
 mod model_catalog;
 mod model_picker_interaction;
 pub(crate) mod monitoring_status;
-pub(crate) mod org_schema;
+mod org_schema;
 pub(crate) mod org_writer;
 pub(crate) mod outbound;
 mod placeholder_cleanup;
@@ -158,7 +158,6 @@ mod tui_task_card;
 mod turn_bridge;
 #[allow(clippy::too_many_arguments)]
 mod turn_finalizer;
-pub(crate) mod turn_lease;
 mod turn_view_reconciler;
 mod voice_acknowledgement;
 mod voice_background_driver;
@@ -1172,6 +1171,12 @@ impl SharedData {
         self.mailboxes.handle(channel_id)
     }
 
+    /// #3293: non-creating mailbox lookup for probes — `mailbox()` mints a
+    /// permanent registry entry for any channel id it is asked about.
+    fn mailbox_peek(&self, channel_id: ChannelId) -> Option<ChannelMailboxHandle> {
+        self.mailboxes.peek(channel_id)
+    }
+
     fn health_registry(&self) -> Option<Arc<health::HealthRegistry>> {
         self.health_registry.upgrade()
     }
@@ -1795,7 +1800,34 @@ async fn mailbox_restore_active_turn(
         .await;
 }
 
-use queue_io::mailbox_recovery_kickoff;
+async fn mailbox_recovery_kickoff(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    cancel_token: Arc<CancelToken>,
+    request_owner: UserId,
+    // `None` when the recovery turn has no anchored user message
+    // (user_msg_id == 0, e.g. a TUI-direct turn).
+    user_message_id: Option<MessageId>,
+) -> RecoveryKickoffResult {
+    // #2443 — reset the per-channel `recovery_done` latch BEFORE recovery
+    // starts; a stale "done" flag would let `watchers/lifecycle.rs` graduate
+    // its skip early and race the ongoing recovery. Idempotent and cheap.
+    shared.mailboxes.recovery_done(channel_id).reset();
+    // #3297 r3 — tombstone refusal ⇒ retry on a fresh registered actor.
+    let result = shared
+        .mailboxes
+        .recovery_kickoff_with_closed_retry(
+            channel_id,
+            cancel_token,
+            request_owner,
+            user_message_id,
+        )
+        .await;
+    if result.activated_turn {
+        increment_global_active(shared, "recovery_kickoff");
+    }
+    result
+}
 
 fn ensure_cancel_token_bound_from_inflight_state(
     provider: &ProviderKind,
@@ -2177,7 +2209,7 @@ async fn apply_queue_exit_feedback(
     // #5035: the edit-or-delete pair is now `teardown_exit_body`, reachable
     // only with a gate-issued token.
     for (card, teardown) in released_cards {
-        queued_card_gate::teardown_exit_body(&http, shared, teardown, card).await;
+        queued_card_gate::teardown_exit_body(&http, shared, teardown, card.kind).await;
     }
 
     queue_marker::drain_queue_exit_markers(shared, &http, channel_id, &queue_exit_events).await;

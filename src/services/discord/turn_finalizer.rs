@@ -40,7 +40,6 @@ mod completion_admission;
 mod completion_admission_actor;
 pub(in crate::services::discord) mod completion_signal;
 mod delivery_lease;
-mod episode;
 mod finalize;
 mod finalize_context;
 mod guarded_finish_residue;
@@ -62,8 +61,6 @@ use self::completion_admission_actor::{
 pub(in crate::services::discord) use self::completion_signal::{
     CompletionSignal, completion_signal_from_transcript,
 };
-use self::episode::TerminalEvidence;
-pub(in crate::services::discord) use self::episode::claim_normal_episode;
 pub(in crate::services::discord) use self::guarded_finish_residue::GuardedFinishResidue;
 pub(in crate::services::discord) use self::guarded_finish_residue::handle_idle_queue_guard_skip;
 // #3479 r9: dormant delivery-lease handlers extracted to the child module; the
@@ -85,8 +82,6 @@ pub(in crate::services::discord) use self::finalize_context::FinalizeContext;
 // #3894: the finalize side-effect chokepoint extracted; re-imported so
 // `handle_terminal` + the reconcile/backstop child call it byte-identically.
 use self::finalize::do_finalize;
-#[cfg(test)]
-pub(in crate::services::discord) use self::finalize::do_finalize_with_release as do_finalize_with_release_for_test;
 // #3894: the timer-driven reconcile/backstop cluster extracted; re-imported so
 // the actor loop's reconcile `select!` arm stays byte-identical.
 use self::reconcile::reconcile;
@@ -126,7 +121,6 @@ const COMPLETION_ADMISSION_TTL: Duration = Duration::from_secs(10 * 60);
 /// channel's single live entry (see `resolve_ledger_key`), never a literal 0.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::services::discord) struct TurnKey {
-    pub(in crate::services::discord) episode: Option<[u8; 32]>,
     pub(in crate::services::discord) channel_id: ChannelId,
     /// 0 == "unknown identity" (recovery/orphan paths): resolved to the
     /// channel's single live entry instead of a literal-0 key.
@@ -141,22 +135,10 @@ impl TurnKey {
         generation: u64,
     ) -> Self {
         Self {
-            episode: None,
             channel_id,
             user_msg_id,
             generation,
         }
-    }
-
-    /// Bind only identity captured by this producer, never a later live turn.
-    pub(in crate::services::discord) fn with_episode_nonce(mut self, nonce: Option<&str>) -> Self {
-        self.episode = Some(episode::episode_fingerprint(nonce));
-        self
-    }
-
-    pub(in crate::services::discord) fn matches_episode_nonce(self, nonce: Option<&str>) -> bool {
-        self.episode
-            .is_none_or(|expected| expected == episode::episode_fingerprint(nonce))
     }
 
     /// The literal full-identity key for this turn. The finalize ledger keys on
@@ -164,7 +146,6 @@ impl TurnKey {
     /// terminals collapse onto the same live entry.
     pub(in crate::services::discord) fn exact_key(&self) -> LedgerKey {
         LedgerKey {
-            episode: self.episode,
             channel_id: self.channel_id,
             generation: self.generation,
             user_msg_id: self.user_msg_id,
@@ -176,7 +157,6 @@ impl TurnKey {
 /// Full identity so sequential same-channel turns never collide.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(in crate::services::discord) struct LedgerKey {
-    pub(in crate::services::discord) episode: Option<[u8; 32]>,
     pub(in crate::services::discord) channel_id: ChannelId,
     pub(in crate::services::discord) generation: u64,
     pub(in crate::services::discord) user_msg_id: u64,
@@ -235,23 +215,13 @@ pub(in crate::services::discord) fn resolve_channel_only<'a>(
         return key.exact_key();
     }
     let channel_has_terminal = candidates.clone().any(|(lk, is_terminal)| {
-        lk.channel_id == key.channel_id
-            && lk.generation == key.generation
-            && is_terminal
-            && key
-                .episode
-                .is_none_or(|episode| lk.episode == Some(episode))
+        lk.channel_id == key.channel_id && lk.generation == key.generation && is_terminal
     });
     if channel_has_terminal {
         return key.exact_key();
     }
     let mut live_matches = candidates.into_iter().filter(|(lk, is_terminal)| {
-        lk.channel_id == key.channel_id
-            && lk.generation == key.generation
-            && !*is_terminal
-            && key
-                .episode
-                .is_none_or(|episode| lk.episode == Some(episode))
+        lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
     });
     let Some((only_live, _)) = live_matches.next() else {
         return key.exact_key();
@@ -268,8 +238,6 @@ pub(in crate::services::discord) fn resolve_channel_only<'a>(
 /// in Phase 4 and are listed here so the matrix is explicit.
 #[derive(Clone, Debug)]
 pub(in crate::services::discord) enum TerminalEvent {
-    /// Explicit lease recovery; not evidence that provider output was delivered.
-    OperatorRelease(Box<super::turn_lease::OperatorRelease>),
     /// Normal completion — bridge or watcher relayed (or intentionally
     /// suppressed) terminal output and the turn is done.
     Complete,
@@ -294,7 +262,6 @@ pub(in crate::services::discord) enum TerminalEvent {
 /// into the payload via `Debug`).
 fn terminal_event_kind_str(event: &TerminalEvent) -> &'static str {
     match event {
-        TerminalEvent::OperatorRelease(_) => "operator_lease_release",
         TerminalEvent::Complete => "complete",
         TerminalEvent::Cancel => "cancel",
         TerminalEvent::GateTimeout { .. } => "gate_timeout",
@@ -346,6 +313,44 @@ impl TurnFinalizer {
             tx,
             guarded_finish_residues: Default::default(),
         })
+    }
+
+    /// #3018 — register a turn so the ledger knows it exists before any
+    /// terminal can arrive. Idempotent: a second `Start` for a key already in
+    /// the ledger only refreshes the relay owner. #3016 phase-5a: `shared` is
+    /// downgraded to a `Weak` carried on the `Start` so the actor primes its
+    /// `cached_shared` from the first register (see `FinalizeMsg::Start`).
+    pub(in crate::services::discord) fn register_start(
+        &self,
+        key: TurnKey,
+        provider: ProviderKind,
+        relay_owner: RelayOwnerKind,
+        shared: &Arc<SharedData>,
+    ) {
+        self.register_start_with_completion_admission(
+            key,
+            provider,
+            relay_owner,
+            CompletionAdmissionPlan::Immediate,
+            shared,
+        );
+    }
+
+    pub(in crate::services::discord) fn register_start_with_completion_admission(
+        &self,
+        key: TurnKey,
+        provider: ProviderKind,
+        relay_owner: RelayOwnerKind,
+        completion_admission_plan: CompletionAdmissionPlan,
+        shared: &Arc<SharedData>,
+    ) {
+        let _ = self.tx.send(FinalizeMsg::Start {
+            key,
+            provider,
+            relay_owner,
+            completion_admission_plan,
+            shared: Arc::downgrade(shared),
+        });
     }
 
     pub(in crate::services::discord) fn note_mailbox_released(
@@ -412,15 +417,33 @@ impl TurnFinalizer {
         claim_snapshot: Option<SyntheticClaimSnapshot>,
         shared: Arc<SharedData>,
     ) -> FinalizeOutcome {
-        self.submit_terminal_evidence(
-            key,
-            provider,
-            event,
-            ctx,
-            TerminalEvidence::from_snapshot(claim_snapshot),
-            shared,
-        )
-        .await
+        if let Some(snapshot) = claim_snapshot.as_ref() {
+            cleanup::ensure_synthetic_claim_marker_before_clear(key, &provider, Some(snapshot));
+        }
+        let (ack, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(FinalizeMsg::Terminal {
+                key,
+                provider: provider.clone(),
+                event: event.clone(),
+                ctx,
+                claim_snapshot,
+                shared: shared.clone(),
+                ack,
+            })
+            .is_err()
+        {
+            // Actor task gone: stop submitter-side bookkeeping.
+            return FinalizeOutcome::AlreadyFinalized;
+        }
+        let Ok(out) = rx.await else {
+            return FinalizeOutcome::AlreadyFinalized;
+        };
+        if matches!(out, FinalizeOutcome::AlreadyFinalized) {
+            cleanup::already_finalized_active_state(key, &provider, &event, ctx, &shared).await;
+        }
+        out
     }
 
     /// #3041: route a three-way `CommitDelivery` through the actor so the lease
@@ -599,7 +622,6 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                 match msg {
                     FinalizeMsg::Start {
                         key,
-                        recovery_lease,
                         provider,
                         relay_owner,
                         completion_admission_plan,
@@ -630,7 +652,6 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                             exact_key,
                         );
                         let entry = ledger.entry(exact_key).or_insert(LedgerEntry {
-                            recovery_lease,
                             phase: Phase::Pending,
                             relay_owner,
                             provider: provider.clone(),
@@ -683,7 +704,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                         provider,
                         event,
                         ctx,
-                        evidence,
+                        claim_snapshot,
                         shared,
                         ack,
                     } => {
@@ -706,7 +727,7 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                             provider,
                             event,
                             ctx,
-                            evidence,
+                            claim_snapshot,
                             &shared,
                         ))
                         .catch_unwind()
@@ -881,7 +902,7 @@ mod test_panic_hook {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
@@ -912,7 +933,7 @@ pub(super) mod tests {
     // env-dir Mutex is intentionally held across the test awaits (current-thread
     // runtime, serialization is the whole point). Test-only.
     #[allow(clippy::await_holding_lock)]
-    pub(in crate::services::discord) async fn with_isolated_runtime_root<F, Fut>(f: F)
+    pub(super) async fn with_isolated_runtime_root<F, Fut>(f: F)
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -3056,7 +3077,6 @@ pub(super) mod tests {
         // The single LIVE (non-finalized) entry belongs to the NEWER turn
         // (user_msg_id 999). No terminal/finalized entry exists for the channel.
         let newer_live = LedgerKey {
-            episode: None,
             channel_id: ch,
             generation,
             user_msg_id: 999,
@@ -3090,7 +3110,6 @@ pub(super) mod tests {
         // literal orphan key) — the cross-turn safety net. Included so the test
         // documents the full id-0 resolution matrix the guard reasons about.
         let finalized_old = LedgerKey {
-            episode: None,
             channel_id: ch,
             generation,
             user_msg_id: 100,
@@ -3113,14 +3132,14 @@ pub(super) mod tests {
         let ch = ChannelId::new(4243);
         let generation = 0u64;
         let live_a = LedgerKey {
-            episode: None,
             channel_id: ch,
             generation,
             user_msg_id: 1001,
         };
         let live_b = LedgerKey {
+            channel_id: ch,
+            generation,
             user_msg_id: 1002,
-            ..live_a
         };
         let zero_key = TurnKey::new(ch, 0, generation);
         let candidates = [

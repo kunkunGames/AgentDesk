@@ -372,18 +372,6 @@ impl RoutineScriptLoader {
                         continue;
                     }
                 };
-                if let Some(script) = existing_scripts
-                    .get(&script_ref)
-                    .filter(|script| script.file == candidate.path && script.source == source)
-                {
-                    self.state
-                        .failed_scripts
-                        .lock()
-                        .unwrap_or_else(recover_poisoned_lock)
-                        .remove(&candidate_key);
-                    selected = Some((script.clone(), false));
-                    break;
-                }
                 let source_version = full_source_version(&source);
                 #[cfg(test)]
                 if let Some(hook) = self
@@ -622,46 +610,6 @@ impl RoutineScriptLoader {
         scripts.retain(|script_ref, _| seen_refs.contains(script_ref));
         Ok(before.saturating_sub(scripts.len()))
     }
-}
-
-/// Script refs (root-relative `*.js` paths, `/`-separated) present on disk
-/// under `roots`, using the same walk and bundled-helper exclusion as
-/// `RoutineScriptLoader::load_dirs` but without evaluating anything. Missing
-/// or unreadable roots contribute nothing. Sorted and de-duplicated.
-pub fn discover_routine_script_refs(roots: &[PathBuf]) -> Vec<String> {
-    let primary_root_identity = roots.first().and_then(|root| root.canonicalize().ok());
-    let mut refs = std::collections::BTreeSet::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        let exclude_bundled_node_helpers = root
-            .canonicalize()
-            .ok()
-            .is_some_and(|identity| primary_root_identity.as_ref() == Some(&identity));
-        let mut entries = Vec::new();
-        if collect_routine_script_paths(root, exclude_bundled_node_helpers, &mut entries).is_err() {
-            continue;
-        }
-        for path in entries {
-            refs.insert(script_ref(root, &path));
-        }
-    }
-    refs.into_iter().collect()
-}
-
-/// Discovered script refs that have no `routines` row (any status) — files
-/// an operator dropped into `routines.dir` but never attached via
-/// `POST /api/routines`. Preserves the (sorted) discovery order.
-pub fn unregistered_routine_script_refs(
-    discovered: &[String],
-    registered: &HashSet<String>,
-) -> Vec<String> {
-    discovered
-        .iter()
-        .filter(|script_ref| !registered.contains(script_ref.as_str()))
-        .cloned()
-        .collect()
 }
 
 pub fn load_single_routine_script(root: &Path, path: &Path) -> Result<LoadedRoutineScript> {
@@ -987,63 +935,6 @@ mod tests {
     use std::thread;
     use tracing_subscriber::fmt::writer::MakeWriter;
 
-    #[test]
-    fn discover_routine_script_refs_walks_roots_and_skips_non_js() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("routines");
-        std::fs::create_dir_all(root.join("nested")).unwrap();
-        std::fs::write(root.join("b.js"), "x").unwrap();
-        std::fs::write(root.join("a.js"), "x").unwrap();
-        std::fs::write(root.join("nested").join("c.js"), "x").unwrap();
-        std::fs::write(root.join("README.md"), "x").unwrap();
-        let extra = temp.path().join("extra");
-        std::fs::create_dir_all(&extra).unwrap();
-        std::fs::write(extra.join("a.js"), "override").unwrap();
-        std::fs::write(extra.join("d.js"), "x").unwrap();
-
-        let refs = discover_routine_script_refs(&[
-            root.clone(),
-            extra,
-            temp.path().join("does-not-exist"),
-        ]);
-        assert_eq!(refs, vec!["a.js", "b.js", "d.js", "nested/c.js"]);
-    }
-
-    #[test]
-    fn discover_routine_script_refs_excludes_bundled_node_helper_in_primary_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("routines");
-        std::fs::create_dir_all(root.join("monitoring")).unwrap();
-        std::fs::write(
-            root.join("monitoring").join("local_worktree_inventory.js"),
-            "x",
-        )
-        .unwrap();
-        std::fs::write(root.join("local-worktree-gc.js"), "x").unwrap();
-
-        assert_eq!(
-            discover_routine_script_refs(&[root]),
-            vec!["local-worktree-gc.js"]
-        );
-    }
-
-    #[test]
-    fn unregistered_routine_script_refs_reports_only_missing_rows() {
-        let discovered = vec![
-            "a.js".to_string(),
-            "b.js".to_string(),
-            "nested/c.js".to_string(),
-        ];
-        let registered: HashSet<String> = ["b.js".to_string()].into_iter().collect();
-        assert_eq!(
-            unregistered_routine_script_refs(&discovered, &registered),
-            vec!["a.js", "nested/c.js"]
-        );
-        let all: HashSet<String> = discovered.iter().cloned().collect();
-        assert!(unregistered_routine_script_refs(&discovered, &all).is_empty());
-        assert!(unregistered_routine_script_refs(&[], &registered).is_empty());
-    }
-
     #[derive(Clone)]
     struct CapturingWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
@@ -1240,53 +1131,6 @@ mod tests {
         assert_eq!(loader.load_dir(dir.path()).unwrap(), 1);
         assert_eq!(loader.script_refs().unwrap(), vec!["ops/daily/summary.js"]);
         assert!(loader.has_script("ops/daily/summary.js").unwrap());
-        use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 1);
-        let logs = capture_debug_logs(|| {
-            assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-            assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        });
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 1);
-        assert!(!logs.contains("loaded routine script"), "logs={logs}");
-
-        // Equal-length source changes must not be mistaken for unchanged content.
-        let source = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, source.replace("Nested", "수정")).unwrap();
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 1);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 2);
-        assert_eq!(
-            loader
-                .get_script("ops/daily/summary.js")
-                .unwrap()
-                .unwrap()
-                .name,
-            "수정"
-        );
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 2);
-
-        // Restoring the last good bytes clears failure state without evaluation.
-        std::fs::write(&path, "throw new Error('broken');").unwrap();
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 3);
-        std::fs::write(&path, source.replace("Nested", "수정")).unwrap();
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 3);
-        assert!(loader.state.failed_scripts.lock().unwrap().is_empty());
-
-        *loader.source_reader.lock().unwrap() = Some(Arc::new(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "read failure",
-            ))
-        }));
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 3);
-        assert!(!loader.state.failed_scripts.lock().unwrap().is_empty());
-        *loader.source_reader.lock().unwrap() = None;
-        assert_eq!(loader.load_dir(dir.path()).unwrap(), 0);
-        assert!(loader.state.failed_scripts.lock().unwrap().is_empty());
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 3);
     }
 
     #[test]
@@ -1776,45 +1620,6 @@ mod tests {
         let shared = loader.get_script("ops/shared.js").unwrap().unwrap();
         assert_eq!(shared.name, "Operator Shared");
         assert!(shared.file.starts_with(operator.path()));
-        use std::sync::atomic::Ordering::Relaxed;
-        let roots = [bundled.path().to_path_buf(), operator.path().to_path_buf()];
-        assert_eq!(loader.load_dirs(&roots).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 3);
-
-        // The selected path changes even when both files have identical bytes.
-        let source = std::fs::read_to_string(operator_nested.join("shared.js")).unwrap();
-        std::fs::write(bundled_nested.join("shared.js"), &source).unwrap();
-        std::fs::remove_file(operator_nested.join("shared.js")).unwrap();
-        assert_eq!(loader.load_dirs(&roots).unwrap(), 1);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 4);
-        assert_eq!(
-            loader.get_script("ops/shared.js").unwrap().unwrap().file,
-            bundled_nested.join("shared.js")
-        );
-        assert_eq!(loader.load_dirs(&roots).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 4);
-
-        std::fs::write(operator_nested.join("shared.js"), &source).unwrap();
-        assert_eq!(loader.load_dirs(&roots).unwrap(), 1);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 5);
-        assert_eq!(
-            loader.get_script("ops/shared.js").unwrap().unwrap().file,
-            operator_nested.join("shared.js")
-        );
-        assert_eq!(loader.load_dirs(&roots).unwrap(), 0);
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 5);
-
-        assert_eq!(
-            loader
-                .load_dirs(&[roots[1].clone(), roots[0].clone()])
-                .unwrap(),
-            1
-        );
-        assert_eq!(loader.state.evaluation_attempts.load(Relaxed), 6);
-        assert_eq!(
-            loader.get_script("ops/shared.js").unwrap().unwrap().file,
-            bundled_nested.join("shared.js")
-        );
     }
 
     #[test]

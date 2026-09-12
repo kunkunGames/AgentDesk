@@ -276,8 +276,7 @@ pub async fn submit_order(
     Json(body): Json<OrderBody>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if let Err(response) =
-        crate::services::explicit_auth_route::ExplicitAuthMutationRoute::AUTO_QUEUE_SUBMIT_ORDER
-            .require(&headers)
+        crate::services::kanban::require_explicit_bearer_token(&headers, "submit_order")
     {
         return Err(auto_queue_tuple_error(response));
     }

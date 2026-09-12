@@ -375,8 +375,7 @@ pub(super) async fn finalize_abandoned_mailbox(
             channel,
             state.effective_finalizer_turn_id(),
             shared.restart.current_generation,
-        )
-        .with_episode_nonce(state.turn_nonce.as_deref());
+        );
         shared
             .turn_finalizer
             .note_mailbox_released(key, shared.clone());
@@ -871,8 +870,7 @@ mod tests {
         let state = sweep_state();
         let channel_id = serenity::ChannelId::new(state.channel_id);
         let turn_id = state.effective_finalizer_turn_id();
-        let key = TurnKey::new(channel_id, turn_id, shared.restart.current_generation)
-            .with_episode_nonce(state.turn_nonce.as_deref());
+        let key = TurnKey::new(channel_id, turn_id, shared.restart.current_generation);
         shared
             .turn_finalizer
             .register_start_with_completion_admission(

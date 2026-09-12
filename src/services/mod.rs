@@ -1,7 +1,5 @@
-pub mod agent_identity;
 pub mod agent_protocol;
 pub mod agent_quality;
-pub mod agent_recovery;
 pub mod agents;
 pub mod analytics;
 pub mod api_friction;
@@ -39,7 +37,6 @@ pub mod dispatches;
 #[allow(dead_code)]
 pub mod dispatches_followup;
 pub mod escalation_settings;
-pub mod explicit_auth_route;
 pub mod gemini;
 pub mod git;
 pub mod github_issue_creation;
@@ -92,7 +89,6 @@ pub mod process;
 #[allow(dead_code)]
 pub mod provider;
 pub mod provider_auth;
-pub mod provider_auth_profile;
 pub mod provider_cli;
 pub(crate) mod provider_error_transcript;
 pub mod provider_exec;

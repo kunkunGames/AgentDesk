@@ -305,7 +305,7 @@ pub(in crate::services::discord::turn_bridge) struct StreamLoopState<'a> {
     pub(in crate::services::discord::turn_bridge) watcher_owns_assistant_relay: &'a mut bool,
     pub(in crate::services::discord::turn_bridge) watcher_relay_available_for_turn: &'a mut bool,
     pub(in crate::services::discord::turn_bridge) watcher_delivery_pin:
-        &'a mut Option<WatcherClaimIncarnation>,
+        &'a mut Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(in crate::services::discord::turn_bridge) watcher_handoff_claim_outcome:
         &'a mut WatcherHandoffClaimOutcome,
     pub(in crate::services::discord::turn_bridge) standby_relay_owns_output: &'a mut bool,
@@ -375,24 +375,4 @@ pub(in crate::services::discord::turn_bridge) struct StreamLoopOutput {
         PendingLongRunningOpenAfterStateSave,
     pub(in crate::services::discord::turn_bridge) pending_long_running_retarget_after_state_save:
         PendingLongRunningRetargetAfterStateSave,
-}
-impl StreamLoopContext {
-    pub(super) fn capture_recovery_lease(
-        &self,
-    ) -> Option<crate::services::agent_recovery::RecoveryLease> {
-        crate::services::agent_recovery::lease_for_provider(
-            &self.channel_id.get().to_string(),
-            &self.provider,
-        )
-        .filter(|lease| {
-            self.role_binding
-                .as_ref()
-                .is_none_or(|role| role.role_id == lease.active_writer_agent_id)
-        })
-    }
-    pub(super) async fn compact_lower_bound_tokens(&self) -> u64 {
-        crate::services::discord::adk_session::fetch_context_thresholds(self.shared_owned.api_port)
-            .await
-            .compact_lower_bound_tokens
-    }
 }

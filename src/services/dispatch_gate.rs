@@ -36,8 +36,6 @@
 //!   codes — never string parsing in route handlers, never the terminal
 //!   auto-queue `skipped` status.
 
-mod auth_profiles;
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -224,32 +222,6 @@ pub fn set_provider_pressure_snapshot(snapshot: HashMap<String, ProviderPressure
     *lock.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 }
 
-/// Whether `provider`'s cached telemetry defers dispatch right now, at the caller's effective
-/// `danger_pct` (a parameter, not `danger_pct()`, so an off-activation caller cannot drift from
-/// the gate; `None` when that read failed). Read by the rate-limit sync loop, which must not poll
-/// below its base cadence while such pressure stands (#5727); staleness is excluded (`i64::MAX`)
-/// because an aged-out row is exactly what has to be re-observed.
-pub fn is_deferring(provider: &str, danger_pct: Option<u64>, now: i64) -> bool {
-    let lock = pressure_map();
-    let map = lock.read().unwrap_or_else(|p| p.into_inner());
-    is_deferring_snapshot(provider, map.get(provider), danger_pct, now)
-}
-
-/// Pure half of [`is_deferring`], so callers can pin the contract. An unknown threshold defers: a
-/// failed config read may not decide to fail open.
-pub fn is_deferring_snapshot(
-    provider: &str,
-    snapshot: Option<&ProviderPressureSnapshot>,
-    danger_pct: Option<u64>,
-    now: i64,
-) -> bool {
-    danger_pct.is_none_or(|danger_pct| {
-        evaluate_provider_pressure(provider, snapshot, danger_pct, i64::MAX, now)
-            .verdict
-            .is_defer()
-    })
-}
-
 /// Replace the in-memory agent_id -> provider snapshot. Called off the hot path
 /// by the rate-limit sync loop.
 pub fn set_agent_provider_snapshot(snapshot: HashMap<String, String>) {
@@ -262,7 +234,6 @@ pub fn set_agent_provider_snapshot(snapshot: HashMap<String, String>) {
 /// fails OPEN (unresolved provider -> allow) instead of gating on a stale
 /// mapping. (P2 review fix — server/mod.rs:1047.)
 pub fn clear_agent_provider_snapshot() {
-    auth_profiles::clear_profiles();
     let lock = agent_provider_map();
     lock.write().unwrap_or_else(|p| p.into_inner()).clear();
 }
@@ -301,7 +272,6 @@ pub async fn refresh_snapshots_from_db(pg_pool: &sqlx::PgPool, now: i64) {
 pub async fn refresh_agent_provider_snapshot_from_db(pg_pool: &sqlx::PgPool) {
     match crate::db::agents::load_all_agent_channel_bindings_pg(pg_pool).await {
         Ok(bindings) => {
-            auth_profiles::refresh_profiles(&bindings);
             let mut agent_provider = HashMap::new();
             for (agent_id, binding) in bindings {
                 if let Some(provider) = binding.resolved_primary_provider_kind() {
@@ -491,11 +461,7 @@ pub fn pressure_snapshot_from_payloads(
     let mut map = HashMap::new();
     for payload in payloads {
         if let Some((provider, snapshot)) = snapshot_from_provider_payload(payload) {
-            let profile_id = payload
-                .get("profile_id")
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            map.insert(auth_profiles::account_key(&provider, profile_id), snapshot);
+            map.insert(provider, snapshot);
         }
     }
     map
@@ -742,7 +708,7 @@ pub fn evaluate_agent_provider_pressure_with_overrides(
         let map = lock.read().unwrap_or_else(|p| p.into_inner());
         evaluate_provider_pressure(
             &provider,
-            map.get(&auth_profiles::agent_account_key(agent_id, &provider)),
+            map.get(&provider),
             danger,
             stale_override.unwrap_or_else(stale_sec),
             now,
@@ -780,24 +746,6 @@ pub fn persisted_runtime_overrides(
         danger_pct(),
         stale_sec(),
     )
-}
-
-/// The gate's effective danger threshold for an async caller holding a pool: persisted
-/// runtime-config first (same `kv_meta` row, same [`persisted_runtime_overrides`] parser the
-/// activation path uses), then YAML, then the default. `None` is the read failing; the enable
-/// flag and stale window come back from the same parser, unused (see [`is_deferring`]).
-pub async fn effective_danger_pct_pg(pg_pool: &sqlx::PgPool) -> Option<u64> {
-    let raw = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM kv_meta WHERE key = 'runtime-config' \
-         AND (expires_at IS NULL OR expires_at > NOW()) LIMIT 1",
-    )
-    .fetch_optional(pg_pool)
-    .await
-    .inspect_err(|error| tracing::warn!(%error, "[dispatch-gate] runtime-config unreadable"))
-    .ok()?;
-    let parsed = raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    let (_enabled, danger, _stale) = persisted_runtime_overrides(parsed.as_ref());
-    Some(danger.unwrap_or_else(danger_pct))
 }
 
 fn persisted_runtime_overrides_with_fallbacks(
