@@ -30,11 +30,8 @@ function emitQualityEvent(event) {
 function emitReviewVerdictQualityEvent(cardId, verdict, result, options, eventType) {
   if (!(agentdesk.quality && typeof agentdesk.quality.emit === "function")) return;
   var opts = options || {};
-  var rows = agentdesk.db.query(
-    "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?",
-    [cardId]
-  );
-  var agentId = rows.length > 0 ? (rows[0].assigned_agent_id || null) : null;
+  var card = agentdesk.cards.get(cardId);
+  var agentId = card ? (card.assigned_agent_id || null) : null;
   var dispatchId = opts.review_dispatch_id || null;
   emitQualityEvent({
     event_type: eventType,
@@ -1632,8 +1629,8 @@ function processVerdict(cardId, verdict, result, options) {
         else {
           var stageAgent = nextStage.agent_override_id;
           if (!stageAgent) {
-            var cardAgent = agentdesk.db.query("SELECT assigned_agent_id FROM kanban_cards WHERE id = ?", [cardId]);
-            stageAgent = (cardAgent.length > 0 && cardAgent[0].assigned_agent_id) ? cardAgent[0].assigned_agent_id : null;
+            var cAgent = agentdesk.cards.get(cardId);
+            stageAgent = cAgent ? (cAgent.assigned_agent_id || null) : null;
           }
           if (stageAgent) {
             try {

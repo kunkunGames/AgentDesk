@@ -142,13 +142,10 @@ var autoQueue = {
   // #140: Group-aware continuation — dispatches next entry in same group,
   //       and starts new groups when slots become available.
   onCardTerminal: function(payload) {
-    var cards = agentdesk.db.query(
-      "SELECT assigned_agent_id FROM kanban_cards WHERE id = ?",
-      [payload.card_id]
-    );
-    if (cards.length === 0 || !cards[0].assigned_agent_id) return;
+    var card = agentdesk.cards.get(payload.card_id);
+    if (!card || !card.assigned_agent_id) return;
 
-    var agentId = cards[0].assigned_agent_id;
+    var agentId = card.assigned_agent_id;
 
     // #145/#295: Prefer the just-finished `done` entry for continuation. Sibling
     // runs may also be auto-skipped for the same card, but they must not steal
