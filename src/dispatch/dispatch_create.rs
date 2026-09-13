@@ -740,13 +740,19 @@ async fn create_dispatch_core_internal(
 
         if let Some((wt_path, wt_branch, managed_created)) = worktree_target {
             if let Some(obj) = context_with_session_strategy.as_object_mut() {
-                obj.insert("worktree_path".to_string(), serde_json::json!(wt_path.clone()));
+                obj.insert(
+                    "worktree_path".to_string(),
+                    serde_json::json!(wt_path.clone()),
+                );
                 if let Some(wt_branch) = wt_branch {
                     obj.insert("worktree_branch".to_string(), serde_json::json!(wt_branch));
                 }
                 if managed_created {
                     obj.insert("managed_worktree".to_string(), serde_json::json!(true));
-                    obj.insert("managed_worktree_cleanup".to_string(), serde_json::json!("terminal"));
+                    obj.insert(
+                        "managed_worktree_cleanup".to_string(),
+                        serde_json::json!("terminal"),
+                    );
                 }
             }
             tracing::info!(
