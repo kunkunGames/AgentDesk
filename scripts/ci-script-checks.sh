@@ -370,8 +370,14 @@ while IFS= read -r -d '' tracked_file; do
       esac
       ;;
     *.patch|*.diff|*.log)
-      echo "ERROR: Scratch file detected: $tracked_file"
-      FAIL=1
+      case "$tracked_file" in
+        docs/operator-patches/*)
+          ;;
+        *)
+          echo "ERROR: Scratch file detected: $tracked_file"
+          FAIL=1
+          ;;
+      esac
       ;;
   esac
 done < <(git ls-files -z)
