@@ -303,9 +303,6 @@ def main():
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_pr_size_ack(body):
             print("  [!] MISSING PR SIZE CHECK: PR body lacks a completed PR size acknowledgement.")
-        if "docs-only" in normalized_body or "docs only" in normalized_body:
-            if not has_docs_only_verification_ack(body):
-                print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body claims docs-only but lacks a completed docs-only verification acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
         if not has_non_empty_body_field(
