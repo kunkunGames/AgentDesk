@@ -699,7 +699,6 @@ async fn create_dispatch_core_internal(
         )
         .await?
     } else {
-        let mut base = serde_json::to_string(&context_with_session_strategy)?;
         let phase_gate_sidecar = context_with_session_strategy
             .get("phase_gate")
             .and_then(|value| value.as_object())
