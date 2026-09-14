@@ -1,0 +1,10 @@
+--- src/dispatch/dispatch_create.rs
++++ src/dispatch/dispatch_create.rs
+@@ -700,7 +700,6 @@
+         .await?
+     } else {
+-        let mut base = serde_json::to_string(&context_with_session_strategy)?;
+         let phase_gate_sidecar = context_with_session_strategy
+             .get("phase_gate")
+             .and_then(|value| value.as_object())
+             .is_some();

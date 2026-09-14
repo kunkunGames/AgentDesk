@@ -1,0 +1,1135 @@
+    Checking cfg-if v1.0.4
+    Checking libc v0.2.183
+    Checking zeroize v1.8.2
+    Checking serde_core v1.0.228
+    Checking subtle v2.6.1
+    Checking typenum v1.19.0
+    Checking log v0.4.29
+    Checking const-oid v0.9.6
+    Checking memchr v2.8.0
+    Checking getrandom v0.2.17
+    Checking generic-array v0.14.7
+    Checking rand_core v0.6.4
+    Checking pin-project-lite v0.2.17
+    Checking itoa v1.0.17
+    Checking futures-core v0.3.32
+    Checking scopeguard v1.2.0
+    Checking lock_api v0.4.14
+    Checking cpufeatures v0.2.17
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking bytes v1.11.1
+    Checking digest v0.10.7
+    Checking futures-sink v0.3.32
+    Checking once_cell v1.21.4
+    Checking zerofrom v0.1.6
+    Checking serde v1.0.228
+    Checking stable_deref_trait v1.2.1
+    Checking yoke v0.8.1
+    Checking smallvec v1.15.1
+    Checking futures-channel v0.3.32
+    Checking parking_lot_core v0.9.12
+    Checking zerocopy v0.8.42
+    Checking futures-io v0.3.32
+    Checking futures-task v0.3.32
+    Checking slab v0.4.12
+    Checking parking_lot v0.12.5
+    Checking futures-util v0.3.32
+    Checking zerovec v0.11.5
+    Checking mio v1.1.1
+    Checking errno v0.3.14
+    Checking num-traits v0.2.19
+    Checking signal-hook-registry v1.4.8
+    Checking socket2 v0.6.3
+    Checking rustls-pki-types v1.14.0
+    Checking tokio v1.50.0
+    Checking untrusted v0.9.0
+    Checking ring v0.17.14
+    Checking tinystr v0.8.2
+    Checking ppv-lite86 v0.2.21
+    Checking litemap v0.8.1
+    Checking writeable v0.6.2
+    Checking percent-encoding v2.3.2
+    Checking icu_locale_core v2.1.1
+    Checking potential_utf v0.1.4
+    Checking zerotrie v0.2.3
+    Checking http v1.4.0
+    Checking tracing-core v0.1.36
+    Checking icu_collections v2.1.1
+    Checking crossbeam-utils v0.8.21
+    Checking icu_provider v2.1.1
+    Checking getrandom v0.3.4
+    Checking tracing v0.1.44
+    Checking hmac v0.12.1
+    Checking icu_normalizer_data v2.1.1
+    Checking icu_properties_data v2.1.2
+    Checking icu_normalizer v2.1.1
+    Checking form_urlencoded v1.2.2
+    Checking zmij v1.0.21
+    Checking base64ct v1.8.3
+    Checking pem-rfc7468 v0.7.0
+    Checking icu_properties v2.1.2
+    Checking serde_json v1.0.149
+    Checking httparse v1.10.1
+    Checking rand_core v0.9.5
+    Checking utf8_iter v1.0.4
+    Checking der v0.7.10
+    Checking rustls-webpki v0.103.13
+    Checking idna_adapter v1.2.1
+    Checking hkdf v0.12.4
+    Checking idna v1.1.0
+    Checking rustls v0.23.37
+    Checking thiserror v2.0.18
+    Checking url v2.5.8
+    Checking spki v0.7.3
+    Checking webpki-roots v1.0.8
+   Compiling either v1.15.0
+    Checking pkcs8 v0.10.2
+    Checking rand_chacha v0.9.0
+    Checking http-body v1.0.1
+    Checking rand_chacha v0.3.1
+    Checking inout v0.1.4
+    Checking ff v0.13.1
+    Checking pin-utils v0.1.0
+   Compiling bitflags v2.11.0
+    Checking base16ct v0.2.0
+    Checking base64 v0.22.1
+    Checking sec1 v0.7.3
+    Checking group v0.13.0
+    Checking cipher v0.4.4
+    Checking rand v0.8.5
+    Checking rand v0.9.2
+   Compiling aho-corasick v1.1.4
+    Checking sha2 v0.10.9
+    Checking crypto-bigint v0.5.5
+    Checking tower-service v0.3.3
+   Compiling regex-syntax v0.8.10
+   Compiling home v0.5.12
+    Checking elliptic-curve v0.13.8
+    Checking sha1 v0.10.6
+   Compiling glob v0.3.3
+    Checking iana-time-zone v0.1.65
+    Checking data-encoding v2.10.0
+    Checking httpdate v1.0.3
+    Checking try-lock v0.2.5
+    Checking utf-8 v0.7.6
+    Checking want v0.3.1
+   Compiling clang-sys v1.8.1
+    Checking chrono v0.4.44
+   Compiling regex-automata v0.4.14
+    Checking webpki-roots v0.26.11
+    Checking signature v2.2.0
+    Checking universal-hash v0.5.1
+    Checking sync_wrapper v1.0.2
+    Checking atomic-waker v1.1.2
+   Compiling unicase v2.9.0
+   Compiling strsim v0.11.1
+    Checking opaque-debug v0.3.1
+    Checking tower-layer v0.3.3
+    Checking mime v0.3.17
+   Compiling mime_guess v2.0.5
+   Compiling darling_core v0.20.11
+   Compiling regex v1.12.3
+    Checking hyper v1.8.1
+    Checking tls_codec v0.4.2
+    Checking hax-lib v0.3.6
+    Checking http-body-util v0.1.3
+    Checking futures-executor v0.3.32
+    Checking arrayvec v0.7.6
+    Checking instant v0.1.13
+    Checking ryu v1.0.23
+   Compiling equivalent v1.0.2
+    Checking ipnet v2.12.0
+   Compiling rustix v0.38.44
+    Checking hyper-util v0.1.20
+   Compiling darling_macro v0.20.11
+   Compiling nom v7.1.3
+    Checking thiserror v1.0.69
+    Checking curve25519-dalek v4.1.3
+    Checking futures v0.3.32
+    Checking tower v0.5.3
+    Checking primeorder v0.13.6
+    Checking tokio-rustls v0.26.4
+    Checking rfc6979 v0.4.0
+    Checking rustls-webpki v0.102.8
+   Compiling libloading v0.8.9
+   Compiling tinyvec_macros v0.1.1
+    Checking lazy_static v1.5.0
+    Checking bitflags v1.3.2
+    Checking byteorder v1.5.0
+   Compiling foldhash v0.1.5
+   Compiling allocator-api2 v0.2.21
+   Compiling bindgen v0.69.5
+   Compiling hashbrown v0.15.5
+   Compiling tinyvec v1.11.0
+   Compiling cexpr v0.6.0
+    Checking rustls v0.22.4
+    Checking ecdsa v0.16.9
+   Compiling which v4.4.2
+   Compiling darling v0.20.11
+    Checking serde_urlencoded v0.7.1
+   Compiling concurrent-queue v2.5.0
+    Checking openmls_traits v0.5.0
+    Checking libcrux-secrets v0.0.5
+    Checking polyval v0.6.2
+   Compiling itertools v0.12.1
+    Checking tokio-util v0.7.18
+    Checking crossbeam-epoch v0.9.18
+    Checking num-integer v0.1.46
+    Checking aead v0.5.2
+    Checking http-range-header v0.4.2
+   Compiling crc-catalog v2.4.0
+    Checking adler2 v2.0.1
+    Checking iri-string v0.7.10
+   Compiling hashbrown v0.16.1
+   Compiling parking v2.2.1
+    Checking simd-adler32 v0.3.8
+   Compiling indexmap v2.13.0
+    Checking miniz_oxide v0.8.9
+    Checking tower-http v0.6.8
+   Compiling event-listener v5.4.1
+   Compiling crc v3.4.0
+    Checking crossbeam-deque v0.8.6
+    Checking ghash v0.5.1
+    Checking libcrux-traits v0.0.6
+   Compiling tokio-stream v0.1.18
+   Compiling futures-intrusive v0.5.0
+    Checking p256 v0.13.2
+   Compiling unicode-normalization v0.1.25
+   Compiling hashlink v0.10.0
+    Checking getrandom v0.4.2
+    Checking crc32fast v1.5.0
+    Checking libcrux-intrinsics v0.0.6
+    Checking parking_lot_core v0.8.6
+    Checking hyper-rustls v0.27.7
+   Compiling crossbeam-queue v0.3.12
+    Checking poly1305 v0.8.0
+    Checking ed25519 v2.2.3
+    Checking ctr v0.9.2
+    Checking aes v0.8.4
+    Checking chacha20 v0.9.1
+    Checking hpke-rs-crypto v0.6.1
+    Checking libcrux-platform v0.0.3
+   Compiling ucd-trie v0.1.7
+    Checking strength_reduce v0.2.4
+    Checking hex v0.4.3
+    Checking powerfmt v0.2.0
+    Checking bytemuck v1.25.0
+    Checking sha1_smol v1.0.1
+    Checking hashbrown v0.14.5
+   Compiling unicode-properties v0.1.4
+   Compiling unicode-bidi v0.3.18
+   Compiling sqlx-core v0.8.6
+   Compiling stringprep v0.1.5
+    Checking symphonia-core v0.5.5
+    Checking uuid v1.22.0
+    Checking deranged v0.5.8
+   Compiling rquickjs-sys v0.9.0
+    Checking transpose v0.2.3
+   Compiling pest v2.8.6
+    Checking libcrux-sha3 v0.0.8
+    Checking aes-gcm v0.10.3
+    Checking chacha20poly1305 v0.10.1
+    Checking ed25519-dalek v2.2.0
+    Checking reqwest v0.12.28
+    Checking parking_lot v0.11.2
+    Checking flate2 v1.1.9
+    Checking rayon-core v1.13.0
+    Checking primal-check v0.3.4
+    Checking tokio-rustls v0.25.0
+    Checking tungstenite v0.21.0
+    Checking x25519-dalek v2.0.1
+    Checking p384 v0.13.1
+   Compiling atoi v2.0.0
+   Compiling md-5 v0.10.6
+    Checking k256 v0.13.4
+    Checking num-complex v0.4.6
+    Checking encoding_rs v0.8.35
+    Checking rand_core v0.10.1
+    Checking no-std-net v0.6.0
+    Checking utf8parse v0.2.2
+   Compiling dotenvy v0.15.7
+   Compiling whoami v1.6.1
+    Checking time-core v0.1.8
+    Checking num-conv v0.2.0
+   Compiling sqlx-postgres v0.8.6
+    Checking time v0.3.47
+    Checking pnet_base v0.34.0
+    Checking anstyle-parse v1.0.0
+    Checking symphonia-metadata v0.5.5
+    Checking rustfft v6.4.1
+    Checking hpke-rs-rust-crypto v0.6.1
+    Checking tokio-tungstenite v0.21.0
+   Compiling pest_meta v2.8.6
+    Checking strum v0.17.1
+    Checking rayon v1.12.0
+    Checking fluvio-wasm-timer v0.2.5
+    Checking hpke-rs v0.6.1
+    Checking dashmap v5.5.3
+    Checking openmls_memory_storage v0.5.0
+   Compiling derive_builder_core v0.20.2
+    Checking salsa20 v0.10.2
+    Checking pbkdf2 v0.12.2
+    Checking ordered-float v2.10.1
+    Checking secrecy v0.8.0
+    Checking serde_cow v0.1.2
+    Checking serde_bytes v0.11.19
+    Checking anstyle v1.0.14
+    Checking unicode-width v0.2.2
+    Checking stable-vec v0.4.2
+    Checking rustc-hash v2.1.1
+    Checking is_terminal_polyfill v1.70.2
+    Checking colorchoice v1.0.5
+    Checking anstyle-query v1.1.5
+    Checking typemap_rev v0.3.0
+    Checking siphasher v1.0.2
+    Checking serenity v0.12.5
+    Checking phf_shared v0.12.1
+    Checking anstream v1.0.0
+    Checking hls_m3u8 v0.4.2
+    Checking openmls v0.8.1
+    Checking pin-project v1.1.12
+   Compiling derive_builder_macro v0.20.2
+    Checking serde-value v0.7.0
+    Checking scrypt v0.11.0
+    Checking openmls_rust_crypto v0.5.1
+    Checking realfft v3.5.0
+   Compiling sqlx-macros-core v0.8.6
+    Checking libopus_sys v0.3.3
+   Compiling pest_generator v2.8.6
+    Checking symphonia-bundle-mp3 v0.5.5
+    Checking pnet_macros_support v0.34.0
+    Checking openmls_basic_credential v0.5.0
+   Compiling pnet_macros v0.34.0
+    Checking tungstenite v0.26.2
+    Checking tungstenite v0.28.0
+    Checking patricia_tree v0.8.0
+    Checking crossbeam-channel v0.5.15
+    Checking spin v0.9.8
+    Checking nanorand v0.7.0
+    Checking inotify-sys v0.1.5
+    Checking num_cpus v1.17.0
+    Checking same-file v1.0.6
+    Checking clap_lex v1.1.0
+    Checking option-ext v0.2.0
+    Checking davey v0.1.3
+    Checking dirs-sys v0.5.0
+    Checking clap_builder v4.6.0
+    Checking walkdir v2.5.0
+    Checking rusty_pool v0.7.0
+    Checking serenity-voice-model v0.3.0
+    Checking enum-map v2.7.3
+    Checking flume v0.11.1
+    Checking inotify v0.10.2
+    Checking stream_lib v0.5.2
+    Checking tokio-tungstenite v0.28.0
+    Checking discortp v0.6.0
+    Checking tokio-tungstenite v0.26.2
+   Compiling pest_derive v2.8.6
+    Checking strum v0.27.2
+    Checking symphonia v0.5.5
+    Checking opus2 v0.4.0
+   Compiling sqlx-macros v0.8.6
+    Checking rubato v0.16.2
+    Checking serde-aux v4.7.0
+    Checking derive_builder v0.20.2
+    Checking tracing-futures v0.2.5
+    Checking phf v0.12.1
+    Checking getopts v0.2.24
+    Checking matchers v0.2.0
+    Checking dashmap v6.1.0
+   Compiling poise_macros v0.6.1
+    Checking sharded-slab v0.1.7
+    Checking notify-types v1.0.1
+    Checking axum-core v0.5.6
+    Checking ringbuf v0.4.8
+    Checking streamcatcher v1.0.1
+    Checking tracing-log v0.2.0
+    Checking serde_path_to_error v0.1.20
+    Checking filetime v0.2.27
+    Checking socket2 v0.5.10
+    Checking rquickjs-core v0.9.0
+    Checking thread_local v1.1.9
+    Checking nohash-hasher v0.2.0
+    Checking nonmax v0.5.5
+    Checking smawk v0.3.2
+    Checking nu-ansi-term v0.50.3
+    Checking unicode-linebreak v0.1.5
+    Checking cpufeatures v0.3.0
+    Checking constant_time_eq v0.4.2
+    Checking unsafe-libyaml v0.2.11
+    Checking arrayref v0.3.9
+    Checking matchit v0.8.4
+    Checking axum v0.8.8
+    Checking serde_yaml v0.9.34+deprecated
+    Checking rquickjs v0.9.0
+    Checking blake3 v1.8.5
+    Checking textwrap v0.16.2
+    Checking tracing-subscriber v0.3.23
+    Checking notify v7.0.0
+    Checking clap v4.6.0
+    Checking sqlx v0.8.6
+    Checking pulldown-cmark v0.9.6
+    Checking chrono-tz v0.10.4
+    Checking croner v3.0.1
+    Checking json5 v0.4.1
+    Checking poise v0.6.1
+    Checking songbird v0.6.0
+    Checking dirs v6.0.0
+    Checking anyhow v1.0.102
+    Checking ureq v2.12.1
+    Checking which v8.0.2
+    Checking hound v3.5.1
+    Checking agentdesk v0.1.3 (/app)
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:743:85
+    |
+743 | ...erde_json::Value>>(&base)
+    |                        ^^^^ not found in this scope
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:759:13
+    |
+759 | ...   base = serde_json::to_string(&serde_json::Value::Object(obj)).unw...
+    |       ^^^^
+    |
+help: you might have meant to introduce a new binding
+    |
+759 |             let base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
+    |             +++
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:759:85
+    |
+759 | ...ect(obj)).unwrap_or(base);
+    |                        ^^^^ not found in this scope
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:763:85
+    |
+763 | ...erde_json::Value>>(&base)
+    |                        ^^^^ not found in this scope
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:767:13
+    |
+767 | ...   base = serde_json::to_string(&serde_json::Value::Object(obj)).unw...
+    |       ^^^^
+    |
+help: you might have meant to introduce a new binding
+    |
+767 |             let base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
+    |             +++
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:767:85
+    |
+767 | ...ect(obj)).unwrap_or(base);
+    |                        ^^^^ not found in this scope
+
+error[E0425]: cannot find value `base` in this scope
+   --> src/dispatch/dispatch_create.rs:769:9
+    |
+769 |         base
+    |         ^^^^ not found in this scope
+
+warning: unused import: `LaunchdPlistFlavorArg`
+ --> src/cli/init.rs:9:34
+  |
+9 |     args::{EmitLaunchdPlistArgs, LaunchdPlistFlavorArg},
+  |                                  ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `create_child_candidate_card_pg`, `load_card_final_gate_pg`, `load_card_repo_dir_pg`, `transition_card_status_pg`, and `update_card_program_current_iteration_pg`
+  --> src/db/automation_candidates.rs:8:32
+   |
+ 8 |     approve_candidate_card_pg, create_child_candidate_card_pg, load_active_...
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 9 |     load_card_final_gate_pg, load_card_program_pg, load_card_repo_dir_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^                        ^^^^^^^^^^^^^^^^^^^^^
+10 |     transition_card_status_pg, update_card_program_current_iteration_pg,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ExternalDeliveryRow`
+  --> src/db/scheduled_messages.rs:31:54
+   |
+31 | ... ExternalDeliveryFinish, ExternalDeliveryRow, NewExternalDelivery,
+   |                             ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::dispatches::outbox_route::parse_channel_id`
+ --> src/server/routes/dispatches/mod.rs:6:16
+  |
+6 | pub(crate) use crate::services::dispatches::outbox_route::parse_channel_id;
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `outbox::use_counter_model_channel`
+  --> src/server/routes/dispatches/mod.rs:23:16
+   |
+23 | pub(crate) use outbox::use_counter_model_channel;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `validate_user_ids as validate_discord_mention_user_ids`
+  --> src/server/routes/scheduled_messages.rs:33:5
+   |
+33 |     validate_user_ids as validate_discord_mention_user_ids,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Mutex` and `OnceLock`
+ --> src/server/worker_registry.rs:4:22
+  |
+4 | use std::sync::{Arc, Mutex, OnceLock};
+  |                      ^^^^^  ^^^^^^^^
+
+warning: unused import: `MailboxStallKind`
+  --> src/services/agent_recovery/mod.rs:28:21
+   |
+28 |     DetectorSignal, MailboxStallKind, classify_trigger, mailbox_kind_fro...
+   |                     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `dual_processing` and `effective_handles`
+  --> src/services/agent_recovery/mod.rs:31:54
+   |
+31 | ... RecoveryIntake, dual_processing, effective_handles};
+   |                     ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `RecoveryPolicy`, `WorkspaceMode`, and `load_org_recovery_catalog_from_yaml`
+  --> src/services/agent_recovery/mod.rs:34:5
+   |
+34 |     RecoveryPolicy, TriggerKind, WorkspaceMode, build_recovery_catalog,
+   |     ^^^^^^^^^^^^^^               ^^^^^^^^^^^^^
+35 |     load_org_recovery_catalog_from_yaml, validate_distinct_fallback_agent,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `RestoreSessionMode`, `format_restore_packet`, and `session_mode_for_provider`
+  --> src/services/agent_recovery/mod.rs:38:18
+   |
+38 | ...n, RestoreSessionMode, format_restore_packet, session_mode_for_provider,
+   |       ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `abort_takeover_durable`, `allows_cli_turn`, `attach_pg_pool`, and `observe_durable`
+   --> src/services/agent_recovery/mod.rs:547:5
+    |
+547 |     abort_takeover_durable, allows_cli_turn, allows_cli_turn_for_provider, attach_pg_pool,
+    |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^                                ^^^^^^^^^^^^^^
+...
+550 |     observe_durable, observe_with_checkpoint_durable, take_restore_packet,
+    |     ^^^^^^^^^^^^^^^
+
+warning: unused import: `serde_json::json`
+  --> src/services/auto_queue/phase_gate_violations.rs:22:5
+   |
+22 | use serde_json::json;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `classify_catch_up_message`
+   --> src/services/discord/catch_up.rs:232:5
+    |
+232 |     classify_catch_up_message, classify_catch_up_message_with_utility_r...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS` and `catch_up_too_old_snippet`
+   --> src/services/discord/catch_up.rs:243:5
+    |
+243 |     CATCH_UP_TOO_OLD_NOTICE_MAX_ITEMS, CatchUpTooOldDrop, CatchUpTooOldOu...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+244 |     actionable_drop as catch_up_too_old_drop, catch_up_too_old_snippet,
+    |                                               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::long_send_rollback::send_long_message_raw_with_reference_rollback`
+  --> src/services/discord/formatting.rs:44:38
+   |
+44 | ...se self::long_send_rollback::send_long_message_raw_with_reference_rollback;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RelayVerdict`
+  --> src/services/discord/health/snapshot.rs:15:5
+   |
+15 |     RelayVerdict, RelayVerdictProbe, RelayVerdictReport, apply_relay_ver...
+   |     ^^^^^^^^^^^^
+
+warning: unused imports: `RecordedRecapCard` and `lookup_recorded_recaps_for_channel`
+  --> src/services/discord/idle_recap.rs:36:52
+   |
+36 |     PersistRecapMessageIdResult, RecapCardActions, RecordedRecapCard, co...
+   |                                                    ^^^^^^^^^^^^^^^^^
+37 |     delete_older_recorded_recaps_for_channel, delete_previous_card,
+38 |     lookup_recorded_recaps_for_channel, persist_recap_message_id, post_r...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `InflightTurnState`
+ --> src/services/discord/inflight/model/turn_kinds.rs:1:26
+  |
+1 | use super::{Deserialize, InflightTurnState, Serialize};
+  |                          ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CommitError` and `DestructiveCancelPinField`
+  --> src/services/discord/inflight.rs:46:5
+   |
+46 |     CommitError, CommitEvidence, DestructiveCancelCommitOutcome, DestructiveCancelPinField,
+   |     ^^^^^^^^^^^                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `InflightEpisodeLockError`
+  --> src/services/discord/inflight.rs:50:5
+   |
+50 |     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `WatcherRelayWatermarkOutcome`
+   --> src/services/discord/inflight.rs:100:29
+    |
+100 |     WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayW...
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `clear_inflight_state_if_matches_identity_in_root` and `turn_nonce_matches`
+  --> src/services/discord/inflight/clear_store/mod.rs:27:5
+   |
+27 |     clear_inflight_state_if_matches_identity_in_root,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+30 |     clear_rebind_origin_inflight_state_if_matches_identity_in_root, turn_nonce_matches,
+   |                                                                     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `delete_inflight_state_file`
+  --> src/services/discord/placeholder_sweeper.rs:33:24
+   |
+33 |     InflightTurnState, delete_inflight_state_file, emit_reap_abandoned_r...
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: glob import doesn't reexport anything with visibility `pub(in crate::services::discord)` because no imported item is public enough
+  --> src/services/discord/relay_recovery.rs:83:16
+   |
+83 | pub(super) use apply::*;
+   |                ^^^^^^^^
+   |
+note: the most public imported item is `pub(self)`
+  --> src/services/discord/relay_recovery.rs:83:16
+   |
+83 | pub(super) use apply::*;
+   |                ^^^^^^^^
+   = help: reduce the glob import's visibility or increase visibility of imported items
+
+warning: unused imports: `RelaySinkOutcome` and `RelaySink`
+  --> src/services/discord/session_relay_sink.rs:26:5
+   |
+26 |     RelaySink, RelaySinkError, RelaySinkOutcome, StreamFrame,
+   |     ^^^^^^^^^                  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `SessionRelayDelivery`
+ --> src/services/discord/session_relay_sink/terminal_handoff.rs:3:43
+  |
+3 | use super::{SessionBoundDiscordRelaySink, SessionRelayDelivery, delivery_...
+  |                                           ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `idle_jsonl_payload_contains_init_event`
+  --> src/services/discord/session_relay_sink.rs:49:29
+   |
+49 |     idle_jsonl_current_eof, idle_jsonl_payload_contains_init_event,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `rebind_initial_offset_with_floor` and `rebind_output_paths_same`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:38:58
+   |
+38 | ...ter_runtime_binding, rebind_initial_offset_with_floor,
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+39 | ..._unless_forced, rebind_output_paths_same,
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `codex_tui_existing_inflight_raw_cursor`
+  --> src/services/discord/recovery_engine/manual_rebind/mod.rs:43:56
+   |
+43 | ...s_raw_rollout, codex_tui_existing_inflight_raw_cursor,
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `claude_rebind_transcript_path`
+   --> src/services/discord/recovery_engine.rs:153:5
+    |
+153 |     claude_rebind_transcript_path, resolve_rebind_runtime_state,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_try_start_turn_with_terminal_marker_cleanup`
+  --> src/services/discord/router/mod.rs:24:5
+   |
+24 |     mailbox_try_start_turn_with_terminal_marker_cleanup, start_headless_...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `HeadlessTurnStartStatus`
+  --> src/services/discord/router/mod.rs:32:5
+   |
+32 |     HeadlessTurnStartStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TaskNotificationContext`
+ --> src/services/discord/task_notification_delivery/footer_only_marker.rs:3:28
+  |
+3 | use super::{TaskCardEvent, TaskNotificationContext};
+  |                            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `guarded_cleanup_delivered_elsewhere_signal` and `guarded_nonterminal_delete_decision`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:26:5
+   |
+26 |     guarded_cleanup_delivered_elsewhere_signal, guarded_nonterminal_delete_decision,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_rollover_prefixes_to_delete_on_terminal`
+  --> src/services/discord/tmux_placeholder_suppression/mod.rs:34:33
+   |
+34 | ...r_cleanup, watcher_rollover_prefixes_to_delete_on_terminal,
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+ --> src/services/discord/watchers/lifecycle/tests.rs:1:5
+  |
+1 | use super::*;
+  |     ^^^^^^^^
+
+warning: unused import: `self::tests::*`
+  --> src/services/discord/watchers/lifecycle.rs:59:16
+   |
+59 | pub(super) use self::tests::*;
+   |                ^^^^^^^^^^^^^^
+
+warning: unused import: `self::ready_failure::*`
+  --> src/services/discord/watchers/lifecycle.rs:64:16
+   |
+64 | pub(super) use self::ready_failure::*;
+   |                ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::restore::*`
+  --> src/services/discord/watchers/lifecycle.rs:92:16
+   |
+92 | pub(super) use self::restore::*;
+   |                ^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::*`
+  --> src/services/discord/watchers/lifecycle/restore_tests.rs:1:5
+   |
+ 1 | use super::*;
+   |     ^^^^^^^^
+   |
+help: if this is a test module, consider adding a `#[cfg(test)]` to the containing module
+  --> src/services/discord/watchers/lifecycle.rs:98:1
+   |
+98 | mod restore_tests;
+   | ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::restore_tests::*`
+  --> src/services/discord/watchers/lifecycle.rs:99:16
+   |
+99 | pub(super) use self::restore_tests::*;
+   |                ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `claim_or_replace_watcher`, `claim_or_reuse_watcher`, and `try_claim_watcher_with_thread_parent`
+  --> src/services/discord/tmux.rs:83:52
+   |
+83 |     ThreadFollowUpParent, WatcherClaimIncarnation, claim_or_replace_watcher,
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+84 |     claim_or_replace_watcher_with_thread_parent, claim_or_reuse_watcher,
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^
+...
+89 |     try_claim_watcher_with_thread_parent,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `edit_channel_message` and `send_channel_message`
+ --> src/services/discord/tmux_watcher.rs:3:38
+  |
+3 | ...scord::http::{edit_channel_message, send_channel_message};
+  |                  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `watcher_send_failure_retry_plan`
+ --> src/services/discord/tmux_watcher.rs:7:41
+  |
+7 |     watcher_rewind_attempt_disposition, watcher_send_failure_retry_plan,
+  |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `replace_long_message_raw_deferred`
+  --> src/services/discord/tmux_watcher/terminal_direct_fallback.rs:15:40
+   |
+15 |     DeferredReplaceLongMessageOutcome, replace_long_message_raw_deferred,
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::tmux_watcher::completion_producer::release_restored_watcher_active_turn_before_panel_edit`
+    --> src/services/discord/tmux.rs:2458:5
+     |
+2458 | use self::tmux_watcher::completion_producer::release_restored_watcher_active_turn_before_panel_edit;
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `write_spawn_nonce`
+   --> src/services/discord/mod.rs:135:44
+    |
+135 | pub(crate) use tmux::{stamp_spawn_markers, write_spawn_nonce};
+    |                                            ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `LiveInflightProbe`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:221:5
+    |
+221 |     LiveInflightProbe, ensure_marker_for_own_synthetic_turn, record_for...
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `drain_on_terminal_commit_with_applier_and_offset`, `drain_on_terminal_commit_with_applier`, `drain_on_terminal_commit_with_offset`, and `drain_on_terminal_commit`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:226:5
+    |
+226 |     drain_on_terminal_commit, drain_on_terminal_commit_with_applier,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+227 |     drain_on_terminal_commit_with_applier_and_offset, drain_on_terminal_commit_with_offset,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `load_commit_tombstones` and `record_commit_tombstone`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:238:70
+    |
+238 | ..., gc_expired_commit_tombstones, load_all, load_commit_tombstones,
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^
+239 | ...d, record_commit_tombstone, record_commit_tombstone_with_offset,
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sweep_expired_with_applier`
+   --> src/services/discord/tui_direct_abort_marker/mod.rs:244:61
+    |
+244 | ...eep::{sweep_expired, sweep_expired_with_applier};
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_requeue_intervention_front`
+ --> src/services/discord/tui_prompt_relay/bridge_gateway.rs:4:5
+  |
+4 |     mailbox_requeue_intervention_front, schedule_deferred_idle_queue_kick...
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::atomic::Ordering`
+ --> src/services/discord/turn_bridge/completion_postlude.rs:9:5
+  |
+9 | use std::sync::atomic::Ordering;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `fail_dispatch_auth_expired`
+  --> src/services/discord/turn_bridge/mod.rs:92:5
+   |
+92 |     fail_dispatch_auth_expired, fail_dispatch_tmux_session_died, fail_di...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `mailbox_cancel_active_turn_if_handoff_user_message_with_reason` and `record_voice_handoff_cancel_tombstone`
+  --> src/services/discord/voice_barge_in.rs:48:5
+   |
+48 |     mailbox_cancel_active_turn_if_handoff_user_message_with_reason,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+49 |     mailbox_cancel_active_turn_with_reason, mailbox_has_active_t...
+50 |     record_voice_handoff_cancel_tombstone, settings,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `turn_dispatch::voice_background_handoff_ack`
+  --> src/services/discord/voice_barge_in.rs:92:5
+   |
+92 | use turn_dispatch::voice_background_handoff_ack;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::codex`
+   --> src/services/discord/mod.rs:242:5
+    |
+242 | use crate::services::codex;
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::gemini`
+   --> src/services/discord/mod.rs:243:5
+    |
+243 | use crate::services::gemini;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::opencode`
+   --> src/services/discord/mod.rs:244:5
+    |
+244 | use crate::services::opencode;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::services::qwen`
+   --> src/services/discord/mod.rs:246:5
+    |
+246 | use crate::services::qwen;
+    |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `lock_inflight_state_path`
+   --> src/services/discord/mod.rs:261:49
+    |
+261 | pub(crate) use inflight::{clear_inflight_state, lock_inflight_state_path};
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mailbox_take_next_soft_intervention`
+   --> src/services/discord/mod.rs:271:5
+    |
+271 |     mailbox_take_next_soft_intervention,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `QueuePersistenceContext` and `RequeueInterventionResult`
+   --> src/services/discord/mod.rs:307:5
+    |
+307 |     QueuePersistenceContext, RecoveryKickoffResult, RequeueInterventionResult, T...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `resolve_notify_bot_user_id`
+   --> src/services/discord/mod.rs:321:5
+    |
+321 |     resolve_notify_bot_user_id, should_phase2_recover_message,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SYNTHETIC_HEADLESS_MESSAGE_ID_FLOOR`
+   --> src/services/discord/mod.rs:337:5
+    |
+337 |     SYNTHETIC_HEADLESS_MESSAGE_ID_FLOOR, is_synthetic_headless_message_...
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MementoToolFeedbackRequest`
+  --> src/services/memory/mod.rs:17:45
+   |
+17 | ...entoRememberRequest, MementoToolFeedbackRequest, resolve_memento_agen...
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `LazyLock` and `Mutex`
+  --> src/services/platform/tmux.rs:11:17
+   |
+11 | use std::sync::{LazyLock, Mutex};
+   |                 ^^^^^^^^  ^^^^^
+
+warning: unused import: `Instant`
+  --> src/services/platform/tmux.rs:12:27
+   |
+12 | use std::time::{Duration, Instant};
+   |                           ^^^^^^^
+
+warning: unused import: `crate::services::provider_auth::ProviderAuthSpec`
+ --> src/services/provider.rs:3:5
+  |
+3 | use crate::services::provider_auth::ProviderAuthSpec;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `CancelSource`
+ --> src/services/provider/cancel_watchdog.rs:2:13
+  |
+2 | use super::{CancelSource, CancelToken};
+  |             ^^^^^^^^^^^^
+
+warning: unused import: `CancelWatchdog`
+  --> src/services/provider.rs:13:27
+   |
+13 | pub use cancel_watchdog::{CancelWatchdog, spawn_cancel_watchdog};
+   |                           ^^^^^^^^^^^^^^
+
+warning: unused import: `frozen_first_counterpart_id`
+  --> src/services/provider.rs:18:5
+   |
+18 |     frozen_first_counterpart_id, intern_provider_id, provider_registry, ...
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `normalize_resume_strategy`
+  --> src/services/qwen.rs:18:29
+   |
+18 |     build_stream_exec_args, normalize_resume_strategy, normalize_resume_...
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `AgentTool` and `ToolPolicy`
+  --> src/services/stream_json_cli/mod.rs:15:18
+   |
+15 | pub use policy::{AgentTool, ConfiguredToolPolicy, ToolPolicy};
+   |                  ^^^^^^^^^                        ^^^^^^^^^^
+
+warning: unused import: `session::ProviderSessionToken`
+  --> src/services/stream_json_cli/mod.rs:17:9
+   |
+17 | pub use session::ProviderSessionToken;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `drain_head_overflow`
+ --> src/services/turn_orchestrator/front_requeue.rs:7:36
+  |
+7 |     QueueExitEvent, QueueExitKind, drain_head_overflow, ensure_source_mes...
+  |                                    ^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/tmux_runtime/claude_stop_delivery.rs:340:14
+    |
+340 |     let Some(mut reservation) = ClaudeStopDeliveryReservation::claim(to...
+    |              ----^^^^^^^^^^^
+    |              |
+    |              help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:363:9
+    |
+363 |     let mut monitor_auto_turn_finished = false;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/tmux_watcher/turn_stream_collector.rs:364:9
+    |
+364 |     let mut completion_footer_terminal_target = None;
+    |         ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/stream_loop/tool_arms/authority.rs:234:5
+    |
+234 |     mut context: StreamToolAuthorityContext<'_>,
+    |     ----^^^^^^^
+    |     |
+    |     help: remove this `mut`
+
+warning: unused import: `std::fmt::Write`
+ --> src/cli/init.rs:3:5
+  |
+3 | use std::fmt::Write as FmtWrite;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused variable: `reservation`
+   --> src/services/discord/turn_bridge/tmux_runtime/claude_stop_delivery.rs:340:14
+    |
+340 |     let Some(mut reservation) = ClaudeStopDeliveryReservation::claim(to...
+    |              ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_reservation`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `now_unix_secs`
+   --> src/services/discord/health/relay_auto_heal.rs:588:5
+    |
+588 |     now_unix_secs: i64,
+    |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_now_unix_secs`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/restart_mode/protocol_v2/fs/unix.rs:361:13
+    |
+361 |         let mut offered = (bytes.len() - offset).min(i32::MAX as usize);
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: value assigned to `last_status_update` is never read
+  --> src/services/discord/tmux_watcher/streaming_status_tick.rs:53:38
+   |
+53 |         let mut last_status_update = *render.last_status_update;
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `guard`
+   --> src/services/discord/tmux_watcher_registry.rs:866:13
+    |
+866 |         let guard = lock_tmux_watcher_registry();
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_guard`
+
+warning: unused variable: `binding`
+  --> src/services/discord/tui_prompt_relay/codex_idle_rollout.rs:50:37
+   |
+50 |             for (tmux_session_name, binding) in
+   |                                     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_binding`
+
+warning: unused variable: `watcher_owner_channel_id`
+  --> src/services/discord/turn_bridge/completion_postlude.rs:67:9
+   |
+67 |     let watcher_owner_channel_id = state.watcher_owner_channel_id;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_watcher_owner_channel_id`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/stream_loop/tool_arms/authority.rs:160:5
+    |
+160 |     mut context: StreamToolAuthorityContext<'_>,
+    |     ----^^^^^^^
+    |     |
+    |     help: remove this `mut`
+
+warning: unused variable: `request_owner_name`
+  --> src/services/discord/turn_bridge/stream_loop/tool_arms.rs:34:9
+   |
+34 |     let request_owner_name = ctx.request_owner_name;
+   |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_request_owner_name`
+
+warning: value assigned to `bridge_should_emit_completion` is never read
+   --> src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue.rs:103:45
+    |
+103 | ...it_completion = *state.bridge_should_emit_completion;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `status_panel_terminal_committed` is never read
+   --> src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue.rs:104:47
+    |
+104 | ...al_committed = *state.status_panel_terminal_committed;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `full_response` is never read
+  --> src/services/discord/turn_bridge/terminal_outcome_delivery/recovery_retry.rs:49:29
+   |
+49 |     let mut full_response = std::mem::take(state.full_response);
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:314:13
+    |
+314 |         let mut terminal_empty_response_notice: Option<String> = None;
+    |             ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:327:13
+    |
+327 | ...   let mut accumulated_memory_input_tokens: u64 = bridge.memory_reca...
+    |           ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |           |
+    |           help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:328:13
+    |
+328 | ...   let mut accumulated_memory_output_tokens: u64 = bridge.memory_rec...
+    |           ----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |           |
+    |           help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/services/discord/turn_bridge/mod.rs:388:13
+    |
+388 |         let mut api_friction_reports = Vec::new();
+    |             ----^^^^^^^^^^^^^^^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: unused variable: `active_background_child_session_ids`
+   --> src/services/discord/turn_bridge/mod.rs:860:13
+    |
+860 |         let active_background_child_session_ids =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_active_background_child_session_ids`
+
+warning: unused variable: `pending_long_running_open_after_state_save`
+   --> src/services/discord/turn_bridge/mod.rs:862:13
+    |
+862 |         let pending_long_running_open_after_state_save =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pending_long_running_open_after_state_save`
+
+warning: unused variable: `pending_long_running_retarget_after_state_save`
+   --> src/services/discord/turn_bridge/mod.rs:864:13
+    |
+864 |         let pending_long_running_retarget_after_state_save =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pending_long_running_retarget_after_state_save`
+
+warning: unused variable: `long_running_placeholder_active`
+   --> src/services/discord/turn_bridge/mod.rs:866:13
+    |
+866 |         let long_running_placeholder_active =
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_long_running_placeholder_active`
+
+warning: unused variable: `macos_lstart_hash`
+   --> src/services/process.rs:258:59
+    |
+258 | ...ttime: Option<u128>, macos_lstart_hash: Option<u128>) -> Self {
+    |                         ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_macos_lstart_hash`
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `agentdesk` (lib) generated 103 warnings
+error: could not compile `agentdesk` (lib) due to 7 previous errors; 103 warnings emitted
