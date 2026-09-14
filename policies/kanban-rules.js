@@ -161,22 +161,24 @@ var rules = {
       }
     }
 
-    // Get all cards with this dispatch ID to preserve the #2051 Finding 5 drift check
-    var rows = agentdesk.db.query(
-      "SELECT id FROM kanban_cards WHERE latest_dispatch_id = ?",
+    var cards = agentdesk.db.query(
+      "SELECT id, status FROM kanban_cards WHERE latest_dispatch_id = ?",
       [payload.dispatch_id]
     );
-    if (rows.length === 0) return;
-    if (rows.length > 1) {
+    if (cards.length === 0) return;
+    // #2051 Finding 5 (P2): a single dispatch_id should map to at most one
+    // card, but reopen/race paths can violate this invariant. Log every
+    // additional card so operators can spot drift without breaking the existing
+    // first-card semantics.
+    if (cards.length > 1) {
       agentdesk.log.warn(
         "[kanban] onSessionStatusChange dispatch " + payload.dispatch_id +
-        " matched " + rows.length + " cards — only " + rows[0].id +
+        " matched " + cards.length + " cards — only " + cards[0].id +
         " will be advanced; remaining card_ids=" +
-        rows.slice(1).map(function (c) { return c.id; }).join(",")
+        cards.slice(1).map(function (c) { return c.id; }).join(",")
       );
     }
-    var card = agentdesk.cards.get(rows[0].id);
-    if (!card) return;
+    var card = cards[0];
     var cfg = agentdesk.pipeline.resolveForCard(card.id);
     var initialState = agentdesk.pipeline.kickoffState(cfg);
     var nextFromInitial = agentdesk.pipeline.nextGatedTarget(initialState, cfg);
