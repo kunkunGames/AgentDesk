@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::discord::session_relay_sink::journal::watcher as journal_watcher;
+use crate::services::discord::tmux::tmux_output_stream::watcher_source_witness;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -293,10 +294,7 @@ pub(super) async fn poll_watcher_output_or_continue(
         commit_poll_state!();
         return PollOutcome::ContinueWatcherLoop;
     };
-    let source_witness =
-        crate::services::discord::delivery_lease_cell::source_epoch_observer::marker_if_enabled(
-            tmux_session_name,
-        );
+    let source_witness = watcher_source_witness(watcher_provider, tmux_session_name, output_path);
     let source_generation_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
 
     let read_result = tokio::time::timeout(
@@ -565,7 +563,7 @@ pub(super) async fn poll_watcher_output_or_continue(
             watcher_provider.as_str(),
             channel_id.get(),
         );
-    let post_terminal_no_inflight_should_suppress =
+    let post_terminal_no_inflight_suppression_candidate =
         should_suppress_post_terminal_output_without_inflight(
             turn_result_relayed,
             post_terminal_inflight_missing,
@@ -584,6 +582,27 @@ pub(super) async fn poll_watcher_output_or_continue(
             "watcher allowed post-terminal no-inflight JSONL init payload for external relay"
         );
     }
+    // Structural late-output signals nominate a duplicate; they are not a
+    // delivery receipt. Only discard this read when a current-generation
+    // durable commit covers its ENTIRE nonempty range. Carried text/UTF-8 has
+    // independent read provenance, so let the ordinary decoder/retry path keep
+    // it. The local last_relayed_offset is consumption, never delivery proof.
+    let post_terminal_no_inflight_should_suppress =
+        post_terminal_no_inflight_suppression_candidate
+            && all_data.is_empty()
+            && !loop_poll_state.utf8_decoder.has_pending()
+            && current_offset > data_start_offset
+            && crate::services::discord::outbound::delivery_frontier_probe::delivered_frontier_current_generation(
+                watcher_provider,
+                channel_id,
+                tmux_session_name,
+                Some(current_offset),
+            )
+            .is_some_and(|commit| {
+                commit.generation_mtime_ns == source_generation_mtime_ns
+                    && commit.range.0 <= data_start_offset
+                    && commit.range.1 >= current_offset
+            });
     if post_terminal_no_inflight_should_suppress {
         let suppressed_range = (data_start_offset, current_offset);
         // #5071 T1 S3b: this arm is re-entered on every poll pass while the same
@@ -614,11 +633,12 @@ pub(super) async fn poll_watcher_output_or_continue(
             );
         }
         let confirmed_end = suppressed_terminal_confirmed_end(current_offset, all_data);
-        let generation_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
+        let generation_mtime_ns = source_generation_mtime_ns;
         last_relayed_offset = Some(current_offset);
         last_observed_generation_mtime_ns = Some(generation_mtime_ns);
-        // Suppression consumes the local range, not shared delivery authority.
-        // O+S remains once per distinct suppressed range.
+        // The receipt already proved this local range delivered. This O+S
+        // records duplicate disposal only; it cannot create a new receipt or
+        // advance shared delivery authority.
         if first_observation_of_range {
             journal_watcher::settle_without_transport(
                 shared,

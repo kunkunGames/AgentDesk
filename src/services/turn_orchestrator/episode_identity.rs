@@ -3,6 +3,7 @@ use std::time::Instant;
 use poise::serenity_prelude::MessageId;
 
 use super::*;
+use crate::services::discord::CapturedReadyDeliveryCommit;
 
 #[derive(Clone, Debug)]
 pub(super) enum TurnNonceGuard {
@@ -27,6 +28,21 @@ pub(super) fn turn_nonce_guard_matches(
 }
 
 impl ChannelMailboxHandle {
+    pub(crate) async fn commit_captured_ready_delivery(
+        &self,
+        commit: CapturedReadyDeliveryCommit,
+    ) -> Option<CapturedReadyDeliveryCommit> {
+        self.request(
+            |reply| ChannelMailboxMsg::CommitCapturedReadyDelivery {
+                commit: Box::new(commit),
+                reply,
+            },
+            None,
+        )
+        .await
+        .map(|committed| *committed)
+    }
+
     pub(crate) async fn take_timeout_override(
         &self,
         expected_token: Arc<CancelToken>,
@@ -51,6 +67,7 @@ impl ChannelMailboxHandle {
     ) -> FinishTurnResult {
         self.request(
             |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_actor: None,
                 expected_user_message_id,
                 active_started_before: Some(active_started_before),
                 turn_nonce_guard: TurnNonceGuard::exact(Some(expected_turn_nonce)),
@@ -78,8 +95,27 @@ impl ChannelMailboxHandle {
         active_started_before: Instant,
         persistence: QueuePersistenceContext,
     ) -> FinishTurnResult {
+        self.finish_turn_if_matches_episode_and_actor_started_before(
+            expected_user_message_id,
+            expected_turn_nonce,
+            active_started_before,
+            None,
+            persistence,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_turn_if_matches_episode_and_actor_started_before(
+        &self,
+        expected_user_message_id: MessageId,
+        expected_turn_nonce: Option<String>,
+        active_started_before: Instant,
+        expected_actor: Option<Arc<CancelToken>>,
+        persistence: QueuePersistenceContext,
+    ) -> FinishTurnResult {
         self.request(
             |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_actor,
                 expected_user_message_id,
                 active_started_before: Some(active_started_before),
                 turn_nonce_guard: TurnNonceGuard::exact(expected_turn_nonce),
@@ -110,6 +146,7 @@ impl ChannelMailboxHandle {
     ) -> FinishTurnResult {
         self.request(
             |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_actor: None,
                 expected_user_message_id,
                 active_started_before: None,
                 turn_nonce_guard: TurnNonceGuard::Ignore,
@@ -143,6 +180,7 @@ impl ChannelMailboxHandle {
     ) -> FinishTurnResult {
         self.request(
             |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_actor: None,
                 expected_user_message_id,
                 active_started_before: Some(active_started_before),
                 turn_nonce_guard: TurnNonceGuard::Ignore,
@@ -160,6 +198,30 @@ impl ChannelMailboxHandle {
         )
         .await
     }
+}
+
+pub(super) fn finish_turn_identity_matches(
+    state: &ChannelMailboxState,
+    expected_user_message_id: MessageId,
+    expected_actor: &Option<Arc<CancelToken>>,
+    active_started_before: Option<Instant>,
+    turn_nonce_guard: &TurnNonceGuard,
+) -> bool {
+    state
+        .active_user_message_id
+        .is_some_and(|active| active == expected_user_message_id)
+        && expected_actor.as_ref().is_none_or(|expected| {
+            state
+                .cancel_token
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+        })
+        && active_started_before.is_none_or(|started_before| {
+            state
+                .turn_started_instant
+                .is_some_and(|started_at| started_at < started_before)
+        })
+        && turn_nonce_guard_matches(turn_nonce_guard, state.active_turn_nonce.as_deref())
 }
 
 pub(super) fn persist_queue_or_restore(
@@ -203,6 +265,29 @@ pub(super) fn reset_watchdog_extension_state(state: &mut ChannelMailboxState) {
     state.watchdog_deadline_override = None;
     state.watchdog_extension_count = 0;
     state.watchdog_extension_total_secs = 0;
+}
+
+impl ChannelMailboxState {
+    pub(super) fn snapshot(&self) -> ChannelMailboxSnapshot {
+        ChannelMailboxSnapshot {
+            cancel_token: self.cancel_token.clone(),
+            active_request_owner: self.active_request_owner,
+            active_user_message_id: self.active_user_message_id,
+            active_turn_nonce: self.active_turn_nonce.clone(),
+            active_turn_kind: self.active_turn_kind,
+            intervention_queue: self.intervention_queue.clone(),
+            pending_user_dispatch: self.pending_user_dispatch,
+            pending_user_dispatch_source_ids: self.pending_user_dispatch_source_ids.clone(),
+            pending_user_dispatch_since: self.pending_user_dispatch_since,
+            pending_user_dispatch_lease_held_by_caller: self
+                .pending_user_dispatch_lease
+                .as_ref()
+                .is_some_and(|lease| Arc::strong_count(lease) > 1),
+            recently_valve_cleared_dispatch: self.recently_valve_cleared_dispatch,
+            recovery_started_at: self.recovery_started_at,
+            turn_started_at: self.turn_started_at,
+        }
+    }
 }
 
 #[cfg(test)]
