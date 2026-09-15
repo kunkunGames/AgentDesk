@@ -41,7 +41,7 @@ Even if the content feels durable, do NOT store the following as `permanent`:
 - Code rules / coding style rules — those live in `agents/_shared.prompt.md` and per-agent prompts.
 - Configuration values — those live in `agentdesk.yaml`, `kv_meta`, or the dashboard surfaces (see `docs/config-domains.md`).
 - Tool invocation lists, MCP server lists, model names — derived from runtime config.
-- Per-issue progress notes, "the campaign for #1100 is at step 4" — that is workspace scope.
+- Per-issue progress notes, "the campaign is at step 4" — that is workspace scope.
 - Speculative or inferred facts (`assertionStatus = inferred`) — keep them workspace until verified.
 
 ## Scope: workspace (session)
