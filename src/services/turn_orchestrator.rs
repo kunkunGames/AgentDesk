@@ -39,7 +39,7 @@ use dispatch_reservation::{
 };
 use episode_identity::{
     TurnNonceGuard, matching_cancel_token, persist_queue_or_restore,
-    reset_watchdog_extension_state, take_watchdog_override_if_current, turn_nonce_guard_matches,
+    reset_watchdog_extension_state, take_watchdog_override_if_current,
 };
 use front_requeue::requeue_intervention_front;
 pub(crate) use overflow::SoftInterventionProbe;
@@ -1644,8 +1644,14 @@ impl ChannelMailboxRegistry {
 //      queue RESTITUTION (`RequeueFront`/`ReplaceQueue`/hydrate, which
 //      re-persist already-accepted work to disk for a successor actor to
 //      hydrate — refusing those would drop user messages).
+//  (c) CommitCapturedReadyDelivery refuses closed actors in its own arm;
+//      replay on a successor would discard the captured actor's authority.
 // New arms must be classified here and (if start-like) gated there.
 enum ChannelMailboxMsg {
+    CommitCapturedReadyDelivery {
+        commit: Box<crate::services::discord::CapturedReadyDeliveryCommit>,
+        reply: oneshot::Sender<Option<Box<crate::services::discord::CapturedReadyDeliveryCommit>>>,
+    },
     Snapshot {
         reply: oneshot::Sender<ChannelMailboxSnapshot>,
     },
@@ -1780,6 +1786,7 @@ enum ChannelMailboxMsg {
     /// NEWER turn's token or decrement `global_active`. On mismatch this is a
     /// no-op that returns `removed_token = None`, leaving the live turn intact.
     FinishTurnIfMatches {
+        expected_actor: Option<Arc<CancelToken>>,
         preserve_queue: bool,
         expected_user_message_id: MessageId,
         active_started_before: Option<Instant>,
@@ -2218,27 +2225,14 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                 continue;
             };
             match msg {
+                ChannelMailboxMsg::CommitCapturedReadyDelivery { commit, reply } => {
+                    let committed = (!state.closed)
+                        .then(|| commit.commit(state.cancel_token.as_ref()))
+                        .flatten();
+                    let _ = reply.send(committed.map(Box::new));
+                }
                 ChannelMailboxMsg::Snapshot { reply } => {
-                    let _ = reply.send(ChannelMailboxSnapshot {
-                        cancel_token: state.cancel_token.clone(),
-                        active_request_owner: state.active_request_owner,
-                        active_user_message_id: state.active_user_message_id,
-                        active_turn_nonce: state.active_turn_nonce.clone(),
-                        active_turn_kind: state.active_turn_kind,
-                        intervention_queue: state.intervention_queue.clone(),
-                        pending_user_dispatch: state.pending_user_dispatch,
-                        pending_user_dispatch_source_ids: state
-                            .pending_user_dispatch_source_ids
-                            .clone(),
-                        pending_user_dispatch_since: state.pending_user_dispatch_since,
-                        pending_user_dispatch_lease_held_by_caller: state
-                            .pending_user_dispatch_lease
-                            .as_ref()
-                            .is_some_and(|lease| Arc::strong_count(lease) > 1),
-                        recently_valve_cleared_dispatch: state.recently_valve_cleared_dispatch,
-                        recovery_started_at: state.recovery_started_at,
-                        turn_started_at: state.turn_started_at,
-                    });
+                    let _ = reply.send(state.snapshot());
                 }
                 ChannelMailboxMsg::HasActiveTurn { reply } => {
                     let _ = reply.send(state.cancel_token.is_some());
@@ -2920,6 +2914,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     mark_turn_finished_signal_done(channel_id);
                 }
                 ChannelMailboxMsg::FinishTurnIfMatches {
+                    expected_actor,
                     preserve_queue,
                     expected_user_message_id,
                     active_started_before,
@@ -2936,18 +2931,13 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     // mirrors `mailbox_finish_turn`'s idempotent second-call
                     // shape, so the finalizer's `removed_token.is_some()` gate
                     // skips the counter decrement and trailing release.
-                    let matches = state
-                        .active_user_message_id
-                        .is_some_and(|active| active == expected_user_message_id)
-                        && active_started_before.is_none_or(|started_before| {
-                            state
-                                .turn_started_instant
-                                .is_some_and(|started_at| started_at < started_before)
-                        })
-                        && turn_nonce_guard_matches(
-                            &turn_nonce_guard,
-                            state.active_turn_nonce.as_deref(),
-                        );
+                    let matches = episode_identity::finish_turn_identity_matches(
+                        &state,
+                        expected_user_message_id,
+                        &expected_actor,
+                        active_started_before,
+                        &turn_nonce_guard,
+                    );
                     if matches {
                         state.last_persistence = Some(persistence.clone());
                         let finished_user_message_id = state.active_user_message_id;
