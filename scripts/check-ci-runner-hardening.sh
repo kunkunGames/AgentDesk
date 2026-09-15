@@ -784,8 +784,7 @@ targets = {
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
     # #5670 adds one bounded Windows owner runner; broad runtime remains nightly.
-    # #1881 added tmux to the dormant macOS brew step; re-pin the hashed job.
-    "job_sha256" => "b57605f9f924cd0743567ce295ad945186db65e45b9ca97085016134e5be70ed",
+    "job_sha256" => "58d905a59149419525d3dcc7fece3019ed652ff7d758c236f1cc10fbc307f94d",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
@@ -814,7 +813,7 @@ targets = {
     # #5230 re-pins after replacing repeated PostgreSQL skip literals with the
     # shared non-pg-test-filter source; job names, conditions, and timeouts are
     # unchanged, and the exact commands below pin each source/use pair.
-    "job_sha256" => "1e10a6a98f3e9a9b1f89001ccc260f6759a36238bb4c36dda0d08f10fe17e406",
+    "job_sha256" => "ee22751e613fae89b25fa9e6c3237388666ceb867eda5a33f0dc1c9e460d452d",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -864,7 +863,7 @@ targets = {
       },
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
-        "timeout_minutes" => 20,
+        "timeout_minutes" => 40,
       },
     },
   },

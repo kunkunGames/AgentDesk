@@ -427,6 +427,7 @@ jobs:
               - 'src/services/discord/recovery_engine.rs'
               - 'src/services/discord/recovery_engine/**'
               - 'src/services/discord/recovery_paths/**'
+              - 'src/services/discord/relay_coord.rs'
               - 'src/services/discord/relay_health.rs'
               - 'src/services/discord/relay_recovery.rs'
               - 'src/services/discord/relay_recovery/**'
@@ -872,8 +873,11 @@ jobs:
           env -u AGENTDESK_ROOT_DIR cargo test --lib watcher_terminal_commit_identity_mismatch_skips_without_clobbering_newer_row
           env -u AGENTDESK_ROOT_DIR cargo test --lib identity_guarded_save_rejects_stale_write_against_newer_turn
 
+      # Run 34926677210 selected 845 serial tests and completed 642 without
+      # failure before the 20-minute budget expired during active migrations.
+      # Preserve all tests and fail-closed results; bound the complete run at 40m.
       - name: just test-postgres
-        timeout-minutes: 20
+        timeout-minutes: 40
         shell: bash
         env:
           BASH_ENV: /dev/null
@@ -1573,7 +1577,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=a9eba787326f3cae0ce5a89a2bd621aa15d8f53d1d844a3de1a195f05eaa04ab
+          expected=9cf7a3fde3e74870c50a51ce11116698c52263e02451d2d10c56f53ab4ebb943
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -1688,7 +1692,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=a9eba787326f3cae0ce5a89a2bd621aa15d8f53d1d844a3de1a195f05eaa04ab
+          expected=9cf7a3fde3e74870c50a51ce11116698c52263e02451d2d10c56f53ab4ebb943
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
