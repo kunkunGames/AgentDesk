@@ -34,10 +34,8 @@ use exit_reconcile::{
 };
 use expected_identity::refresh_stream_tick_expected_identity_after_handoff;
 pub(super) use types::{StreamLoopContext, StreamLoopOutput, StreamLoopState};
-pub(super) async fn run_stream_loop(
-    ctx: StreamLoopContext,
-    state: StreamLoopState<'_>,
-) -> StreamLoopOutput {
+#[rustfmt::skip]
+pub(super) async fn run_stream_loop(ctx: StreamLoopContext, state: StreamLoopState<'_>) -> StreamLoopOutput {
     let recovery_lease = ctx.capture_recovery_lease();
     let context_compact_lower_bound_tokens = ctx.compact_lower_bound_tokens().await;
     let (shared_owned, gateway) = (ctx.shared_owned, ctx.gateway);
@@ -52,7 +50,6 @@ pub(super) async fn run_stream_loop(
     let (footer_owner, status_panel_started_at) = (ctx.footer_owner, ctx.status_panel_started_at);
     let (status_interval, context_window_tokens) = (ctx.status_interval, ctx.context_window_tokens);
     let context_compact_percent = ctx.context_compact_percent;
-
     let rx = &mut *state.rx;
     let mut full_response = std::mem::take(state.full_response);
     let mut last_edit_text = std::mem::take(state.last_edit_text);
@@ -777,8 +774,7 @@ pub(super) async fn run_stream_loop(
                                 break;
                             }
                         }
-                        StreamMessage::CodexTuiTerminalDone { .. }
-                        | StreamMessage::ClaudeTuiTerminalDone { .. } => unreachable!(),
+                        StreamMessage::CodexTuiTerminalDone { .. } | StreamMessage::ClaudeTuiTerminalDone { .. } => unreachable!(),
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
