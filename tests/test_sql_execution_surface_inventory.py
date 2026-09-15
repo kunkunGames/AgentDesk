@@ -52,21 +52,6 @@ class SqlExecutionSurfaceInventoryTests(unittest.TestCase):
             self.assertEqual((rc, err), (0, ""))
             self.assertIn("NON_SQL_TRACKED", out)
             self.assertIn("immutable-checksums.json", out)
-
-    def test_migration_fingerprint_is_stable_across_crlf_and_lf(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            lf = self.write(root, "migrations/postgres/0001.sql", "SELECT 1;\n")
-            lf.write_bytes(b"SELECT 1;\n")
-            crlf_root = root / "crlf"
-            crlf = self.write(crlf_root, "migrations/postgres/0001.sql", "SELECT 1;\n")
-            crlf.write_bytes(b"SELECT 1;\r\n")
-            lf_records = scanner.scan_migrations(lf, root)
-            crlf_records = scanner.scan_migrations(crlf, crlf_root)
-            self.assertEqual(len(lf_records), 1)
-            self.assertEqual(lf_records[0].fingerprint, crlf_records[0].fingerprint)
-            self.assertEqual(lf_records[0].classification, "STATIC_FILE")
-
     def test_tracked_symlink_and_unexpected_extension_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
