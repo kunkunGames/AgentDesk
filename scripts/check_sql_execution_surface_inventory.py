@@ -468,6 +468,16 @@ def scan_rust_calls(path: Path | str, repo_root: Path = REPO_ROOT) -> list[Surfa
     return records
 
 
+def _file_bytes_for_fingerprint(path: Path) -> bytes:
+    """Hash working-tree bytes after LF normalization.
+
+    Windows checkouts with ``core.autocrlf`` can materialize CRLF even when
+    ``.gitattributes`` records ``eol=lf``. Fingerprints must match the git
+    blob / Linux CI checkout, not the local line-ending translation.
+    """
+    return path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
 def scan_migrations(tracked: TrackedInput | Path | str, repo_root: Path = REPO_ROOT) -> list[SurfaceRecord]:
     if not isinstance(tracked, TrackedInput):
         path = Path(tracked).resolve()
@@ -475,7 +485,7 @@ def scan_migrations(tracked: TrackedInput | Path | str, repo_root: Path = REPO_R
         tracked = TrackedInput(
             "migrations/postgres", "MIGRATION", path, path.relative_to(root).as_posix()
         )
-    content_hash = hashlib.sha256(tracked.path.read_bytes()).hexdigest()
+    content_hash = hashlib.sha256(_file_bytes_for_fingerprint(tracked.path)).hexdigest()
     if tracked.kind == "MIGRATION_METADATA":
         return [_record(tracked, "migration.non_sql_tracked", "NON_SQL_TRACKED", content_hash)]
     return [_record(tracked, "migration.file", "STATIC_FILE", content_hash)]
