@@ -7554,6 +7554,7 @@ services::kakao::transport_tests::calendar_uses_fixed_methods_query_form_and_ind
 services::kakao::transport_tests::concurrent_old_generation_401_refreshes_once_and_retains_refresh_token
 services::kakao::transport_tests::refresh_transient_failure_does_not_erase_credentials
 services::kakao::transport_tests::rotated_tokens_survive_store_reopen
+services::kakao::transport_tests::schedule_validation_requires_loaded_credentials_without_network
 services::kakao_message::tests::feed_template_uses_a_bounded_first_line_title
 services::kakao_message::tests::message_text_is_trimmed_for_validation_but_not_rewritten
 services::kakao_message::tests::text_template_contains_only_the_configured_public_link

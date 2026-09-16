@@ -180,8 +180,13 @@ async fn rotated_tokens_survive_store_reopen() {
         assert_eq!(tokens.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(tokens.generation, 1);
     }
+    assert!(matches!(
+        client.validate_credentials().await,
+        Err(KakaoError::CredentialPersistence)
+    ));
     std::fs::remove_dir(temp.path().join("default.json")).unwrap();
     assert_eq!(client.access_token_generation(None).await.unwrap().1, 1);
+    assert!(client.validate_credentials().await.is_ok());
     drop(client);
     let reopened = token_store::TokenStore::for_test(temp.path(), "default");
     let stored = reopened.load().unwrap().unwrap();
@@ -189,6 +194,25 @@ async fn rotated_tokens_survive_store_reopen() {
     assert_eq!(stored.refresh_token.as_deref(), Some("rotated-refresh"));
     assert_eq!(stored.generation, 1);
     task.abort();
+}
+
+#[tokio::test]
+async fn schedule_validation_requires_loaded_credentials_without_network() {
+    let mut client = test_support::client("http://127.0.0.1:1", "default");
+    assert!(client.validate_credentials().await.is_ok());
+    client.tokens.lock().await.access_token = None;
+    assert!(client.validate_credentials().await.is_ok());
+    client.rest_api_key = None;
+    assert!(matches!(
+        client.validate_credentials().await,
+        Err(KakaoError::MissingCredentials)
+    ));
+    client.rest_api_key = Some("test-app-key".into());
+    client.tokens.lock().await.refresh_token = None;
+    assert!(matches!(
+        client.validate_credentials().await,
+        Err(KakaoError::MissingCredentials)
+    ));
 }
 
 #[test]

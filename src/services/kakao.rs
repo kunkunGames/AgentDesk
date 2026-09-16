@@ -213,6 +213,20 @@ impl KakaoClient {
         &self.environment.account_id
     }
 
+    /// Validate the loaded credential owner without sending or refreshing tokens.
+    pub(crate) async fn validate_credentials(&self) -> Result<(), KakaoError> {
+        let tokens = self.tokens.lock().await;
+        if tokens.persistence_failed {
+            return Err(KakaoError::CredentialPersistence);
+        }
+        if tokens.access_token.is_none()
+            && (tokens.refresh_token.is_none() || self.rest_api_key.is_none())
+        {
+            return Err(KakaoError::MissingCredentials);
+        }
+        Ok(())
+    }
+
     /// Refresh or validate credentials before a caller crosses its durable
     /// provider-dispatch fence. No token material is returned to the caller.
     pub async fn prepare(&self) -> Result<(), KakaoError> {
