@@ -783,8 +783,9 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
-    # #5670 adds one bounded Windows owner runner; broad runtime remains nightly.
-    "job_sha256" => "58d905a59149419525d3dcc7fece3019ed652ff7d758c236f1cc10fbc307f94d",
+    # Includes the existing macOS tmux prerequisite; all cargo commands,
+    # conditions, timeouts, and protected debug environments remain unchanged.
+    "job_sha256" => "b57605f9f924cd0743567ce295ad945186db65e45b9ca97085016134e5be70ed",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
