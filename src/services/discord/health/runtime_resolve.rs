@@ -129,6 +129,74 @@ fn select_direct_meeting_runtime_candidate(
     Ok(live_matches.first().copied())
 }
 
+// Explicit channel ownership is authoritative. Do not wait for Discord
+// lookups on unrelated bots before resolving a configured owner. In particular,
+// health snapshots have a short deadline and would otherwise report a detached
+// watcher when an unrelated bot's channel lookup stalls.
+async fn select_candidate_with_live_probe<F, Fut>(
+    provider_name: &str,
+    channel_id: ChannelId,
+    mut candidates: Vec<DirectMeetingRuntimeCandidate>,
+    mut probe: F,
+) -> Result<Option<usize>, String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    if candidates
+        .iter()
+        .any(|candidate| candidate.explicit_channel_match)
+    {
+        return select_direct_meeting_runtime_candidate(provider_name, channel_id, &candidates);
+    }
+    for candidate in &mut candidates {
+        candidate.live_channel_match = probe(candidate.index).await;
+    }
+    select_direct_meeting_runtime_candidate(provider_name, channel_id, &candidates)
+}
+
+async fn resolve_channel_candidate(
+    provider_name: &str,
+    channel_id: ChannelId,
+    owner_provider: &ProviderKind,
+    shared_candidates: &[(usize, Arc<SharedData>)],
+) -> Result<Option<usize>, String> {
+    let mut snapshots = Vec::with_capacity(shared_candidates.len());
+    let mut candidates = Vec::with_capacity(shared_candidates.len());
+    for (index, shared) in shared_candidates {
+        let settings = shared.settings.read().await.clone();
+        candidates.push(DirectMeetingRuntimeCandidate {
+            index: *index,
+            explicit_channel_match: settings.allowed_channel_ids.contains(&channel_id.get()),
+            live_channel_match: false,
+        });
+        snapshots.push((*index, shared, settings));
+    }
+    select_candidate_with_live_probe(provider_name, channel_id, candidates, |index| {
+        let snapshot = snapshots
+            .iter()
+            .find(|(candidate_index, _, _)| *candidate_index == index);
+        async move {
+            let Some((_, shared, settings)) = snapshot else {
+                return false;
+            };
+            match shared.http.cached_serenity_ctx.get() {
+                Some(ctx) => {
+                    crate::services::discord::provider_handles_channel(
+                        ctx,
+                        owner_provider,
+                        settings,
+                        channel_id,
+                    )
+                    .await
+                }
+                None => false,
+            }
+        }
+    })
+    .await
+}
+
 pub(super) async fn resolve_direct_meeting_runtime(
     registry: &HealthRegistry,
     channel_id: ChannelId,
@@ -153,31 +221,13 @@ pub(super) async fn resolve_direct_meeting_runtime(
         .to_string());
     }
 
-    let mut candidate_matches = Vec::with_capacity(shared_candidates.len());
-    for (index, shared) in &shared_candidates {
-        let settings = shared.settings.read().await.clone();
-        let explicit_channel_match = settings.allowed_channel_ids.contains(&channel_id.get());
-        let live_channel_match = match shared.http.cached_serenity_ctx.get() {
-            Some(ctx) => {
-                crate::services::discord::provider_handles_channel(
-                    ctx,
-                    owner_provider,
-                    &settings,
-                    channel_id,
-                )
-                .await
-            }
-            None => false,
-        };
-        candidate_matches.push(DirectMeetingRuntimeCandidate {
-            index: *index,
-            explicit_channel_match,
-            live_channel_match,
-        });
-    }
-
-    if let Some(selected_index) =
-        select_direct_meeting_runtime_candidate(provider_name, channel_id, &candidate_matches)?
+    if let Some(selected_index) = resolve_channel_candidate(
+        provider_name,
+        channel_id,
+        owner_provider,
+        &shared_candidates,
+    )
+    .await?
     {
         let (_, shared) = shared_candidates
             .iter()
@@ -259,31 +309,13 @@ pub(super) async fn resolve_direct_meeting_shared(
         .to_string());
     }
 
-    let mut candidate_matches = Vec::with_capacity(shared_candidates.len());
-    for (index, shared) in &shared_candidates {
-        let settings = shared.settings.read().await.clone();
-        let explicit_channel_match = settings.allowed_channel_ids.contains(&channel_id.get());
-        let live_channel_match = match shared.http.cached_serenity_ctx.get() {
-            Some(ctx) => {
-                crate::services::discord::provider_handles_channel(
-                    ctx,
-                    owner_provider,
-                    &settings,
-                    channel_id,
-                )
-                .await
-            }
-            None => false,
-        };
-        candidate_matches.push(DirectMeetingRuntimeCandidate {
-            index: *index,
-            explicit_channel_match,
-            live_channel_match,
-        });
-    }
-
-    if let Some(selected_index) =
-        select_direct_meeting_runtime_candidate(provider_name, channel_id, &candidate_matches)?
+    if let Some(selected_index) = resolve_channel_candidate(
+        provider_name,
+        channel_id,
+        owner_provider,
+        &shared_candidates,
+    )
+    .await?
     {
         let (_, shared) = shared_candidates
             .iter()
@@ -326,7 +358,10 @@ mod direct_meeting_candidate_tests {
 
     use poise::serenity_prelude::ChannelId;
 
-    use super::{DirectMeetingRuntimeCandidate, select_direct_meeting_runtime_candidate};
+    use super::{
+        DirectMeetingRuntimeCandidate, select_candidate_with_live_probe,
+        select_direct_meeting_runtime_candidate,
+    };
 
     fn candidate(index: usize, explicit: bool, live: bool) -> DirectMeetingRuntimeCandidate {
         DirectMeetingRuntimeCandidate {
@@ -384,5 +419,57 @@ mod direct_meeting_candidate_tests {
             body["error"],
             "multiple runtimes can handle channel 42 for provider claude"
         );
+    }
+    #[tokio::test]
+    async fn explicit_owner_does_not_wait_for_unrelated_live_probes() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            select_candidate_with_live_probe(
+                "codex",
+                ChannelId::new(42),
+                vec![candidate(0, false, false), candidate(3, true, false)],
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await
+        .expect("explicit ownership must not await Discord");
+        assert_eq!(result, Ok(Some(3)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_explicit_owners_fail_without_live_probes() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            select_candidate_with_live_probe(
+                "codex",
+                ChannelId::new(42),
+                vec![candidate(0, true, false), candidate(3, true, false)],
+                |_| std::future::pending::<bool>(),
+            ),
+        )
+        .await
+        .expect("ambiguous configuration must not await Discord");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("multiple runtimes explicitly allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_channel_still_checks_all_live_candidates() {
+        let mut probed = Vec::new();
+        let result = select_candidate_with_live_probe(
+            "codex",
+            ChannelId::new(42),
+            vec![candidate(0, false, false), candidate(3, false, false)],
+            |index| {
+                probed.push(index);
+                std::future::ready(true)
+            },
+        )
+        .await;
+        assert_eq!(probed, vec![0, 3]);
+        assert!(result.unwrap_err().contains("multiple runtimes can handle"));
     }
 }

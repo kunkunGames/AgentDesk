@@ -76,9 +76,11 @@ async fn dispatch_process_handoff_with_pin(
     });
     let mut last_activity_heartbeat_at = None;
 
+    let persisted_inflight_baseline = state.clone();
     let outcome = handle_runtime_handoff_loop_message(
         message,
         RuntimeHandoffLoopContext {
+            persisted_inflight_baseline: &persisted_inflight_baseline,
             shared_owned: shared,
             provider,
             channel_id,

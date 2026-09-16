@@ -77,6 +77,7 @@ pub(super) struct RuntimeHandoffLoopOutcome {
 }
 
 pub(super) struct RuntimeHandoffLoopContext<'a> {
+    pub(super) persisted_inflight_baseline: &'a InflightTurnState,
     pub(super) shared_owned: &'a Arc<SharedData>,
     pub(super) provider: &'a ProviderKind,
     pub(super) channel_id: ChannelId,
@@ -158,7 +159,10 @@ pub(super) async fn handle_runtime_handoff_loop_message(
             terminal_control_ready_observed = true;
             let state_dirty_before_handoff = state_dirty;
             let mut tmux_ready_guarded_save_outcome;
-            let tmux_ready_baseline = inflight_state.clone();
+            // SessionInit and output frames can update local runtime fields
+            // before they are durable. Admission must compare against the last
+            // persisted snapshot, not that uncommitted local state.
+            let tmux_ready_baseline = ctx.persisted_inflight_baseline.clone();
             let tmux_ready_expected =
                 crate::services::discord::inflight::InflightTurnIdentity::from_state(
                     &tmux_ready_baseline,

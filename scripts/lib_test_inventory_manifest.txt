@@ -2891,11 +2891,14 @@ services::discord::health::relay_dead_reattach::tests::relay_dead_watcher_reatta
 services::discord::health::relay_dead_reattach::tests::reuse_no_op_keeps_the_relay_dead_tick_short_circuit
 services::discord::health::relay_progress::tests::backlog_grace_is_observation_not_producer_or_delivery_progress
 services::discord::health::relay_progress::tests::composite_progress_distinguishes_backpressure_and_delivery_only
+services::discord::health::runtime_resolve::direct_meeting_candidate_tests::duplicate_explicit_owners_fail_without_live_probes
+services::discord::health::runtime_resolve::direct_meeting_candidate_tests::explicit_owner_does_not_wait_for_unrelated_live_probes
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::multiple_explicit_matches_are_ambiguous
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::multiple_live_matches_are_ambiguous
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::no_candidates_resolves_to_none
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::single_explicit_match_wins_over_live_matches
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::single_live_match_is_selected_without_explicit_match
+services::discord::health::runtime_resolve::direct_meeting_candidate_tests::unconfigured_channel_still_checks_all_live_candidates
 services::discord::health::session_enrichment::tests::a_channel_with_no_coordinate_entry_polls_as_absent
 services::discord::health::session_enrichment::tests::a_generation_stamp_moving_under_the_offset_read_witnesses_nothing
 services::discord::health::session_enrichment::tests::an_exhausted_tmux_budget_withholds_a_live_session
@@ -6670,6 +6673,7 @@ services::discord::turn_bridge::retry_state::tests::watcher_relay_error_frame_re
 services::discord::turn_bridge::runtime_handoff_loop::claude_e::tests::process_evidence_body_divergence_is_non_retryable_and_preserves_durable
 services::discord::turn_bridge::runtime_handoff_loop::claude_e::tests::process_evidence_callsite_uses_pre_mutation_baseline_and_adopts_exact_row
 services::discord::turn_bridge::runtime_handoff_loop::claude_e::tests::recovery_pid_sentinel_preserves_existing_process_evidence
+services::discord::turn_bridge::runtime_handoff_loop::guarded_save::tests::tmux_ready_admission_uses_durable_baseline_after_local_session_init
 services::discord::turn_bridge::runtime_handoff_loop::guarded_save::tests::tmux_ready_dirty_marking_follows_guarded_save_outcome
 services::discord::turn_bridge::runtime_handoff_loop::guarded_save::tests::tmux_ready_guarded_save_restamps_output_path_when_this_turn_still_owns_the_row
 services::discord::turn_bridge::runtime_handoff_loop::guarded_save::tests::tmux_ready_guarded_save_skips_and_does_not_clobber_a_re_owned_row
