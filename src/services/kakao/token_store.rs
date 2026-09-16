@@ -68,6 +68,7 @@ impl TokenStore {
     }
     #[cfg(all(test, unix))]
     pub(super) fn for_test(path: &std::path::Path, account: &str) -> Self {
-        Self::open(path, account).unwrap()
+        // macOS temporary directories may be reached through the system /var symlink.
+        Self::open(&path.canonicalize().unwrap(), account).unwrap()
     }
 }

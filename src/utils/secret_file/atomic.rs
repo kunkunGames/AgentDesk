@@ -170,7 +170,8 @@ mod tests {
     fn directory() -> (tempfile::TempDir, PrivateDirectory) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let dir = PrivateDirectory::open(temp.path()).unwrap();
+        // Resolve the OS temporary-directory root, not the symlinks exercised below.
+        let dir = PrivateDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
         (temp, dir)
     }
     #[test]
