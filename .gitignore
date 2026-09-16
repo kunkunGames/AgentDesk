@@ -24,6 +24,7 @@ docs/generated/giant-file-registry.md
 dist/
 output/
 reports/
+/Saved/
 # But keep curated reports under docs/reports/ tracked (#1089 / 908-7).
 !docs/reports/
 !docs/reports/**
