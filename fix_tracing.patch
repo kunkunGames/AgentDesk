@@ -1,0 +1,54 @@
+--- src/services/dispatches/wait_queue.rs
++++ src/services/dispatches/wait_queue.rs
+@@ -107,11 +107,13 @@
+                 "[dispatch] dispatch outbox wait queue wake-up"
+             ),
+             Ok(_) => {}
+-            Err(error) => tracing::warn!(
+-                error,
+-                dispatch_id = dispatch_id.as_deref(),
+-                source,
+-                "[dispatch] dispatch outbox wait queue wake-up failed"
+-            ),
++            Err(error) => {
++                tracing::warn!(
++                    error = %error,
++                    dispatch_id = dispatch_id.as_deref(),
++                    source,
++                    "[dispatch] dispatch outbox wait queue wake-up failed"
++                )
++            },
+         }
+     });
+--- src/services/discord/discord_io.rs
++++ src/services/discord/discord_io.rs
+@@ -98,7 +98,7 @@
+             )
+             .await
+             {
+-                tracing::warn!("  [dm-reply] notify source agent failed: {e}");
++                tracing::warn!(error = %e, "  [dm-reply] notify source agent failed");
+                 // Record failure in context so readConsumed can detect it
+                 let reply_id = info.id;
+                 let err_msg = format!("{e}");
+--- src/services/message_outbox.rs
++++ src/services/message_outbox.rs
+@@ -241,7 +241,8 @@
+         source = message.source,
+         reason_code,
+         session_key = session_key.as_deref(),
+-        "failed to enqueue outbox message: {error}"
++        error = %error,
++        "failed to enqueue outbox message"
+     );
+ }
+
+@@ -258,7 +259,8 @@
+         target,
+         reason_code,
+         session_key = session_key.as_deref(),
+-        "failed to enqueue lifecycle notification: {error}"
++        error = %error,
++        "failed to enqueue lifecycle notification"
+     );
+ }
