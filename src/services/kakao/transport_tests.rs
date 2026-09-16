@@ -198,9 +198,21 @@ fn calendar_adoption_requires_owned_complete_matching_content() {
     remote["id"] = json!("remote");
     remote["calendar_id"] = json!("primary");
     remote["is_host"] = json!(true);
+    remote["time"]["is_all_day"] = json!(false);
     remote["time"]["start_at"] = json!("2026-09-30T10:00:00+09:00");
     assert!(calendar::matches_adoption(&remote, "remote", &desired));
     assert!(!calendar::matches_adoption(&remote, "another", &desired));
+    for value in [json!(true), Value::Null, json!("false")] {
+        let mut altered = remote.clone();
+        altered["time"]["is_all_day"] = value;
+        assert!(!calendar::matches_adoption(&altered, "remote", &desired));
+    }
+    let mut incomplete = remote.clone();
+    incomplete["time"]
+        .as_object_mut()
+        .unwrap()
+        .remove("is_all_day");
+    assert!(!calendar::matches_adoption(&incomplete, "remote", &desired));
     for (field, value) in [
         ("is_host", json!(false)),
         ("calendar_id", json!("other")),

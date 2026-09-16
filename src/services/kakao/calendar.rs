@@ -20,7 +20,7 @@ pub(crate) fn matches_adoption(detail: &Value, id: &str, desired: &Value) -> boo
         || remote.get("title") != desired.get("title")
         || remote.get("rrule").is_some_and(|v| !v.is_null())
         || remote.get("recurrence").is_some_and(|v| !v.is_null())
-        || remote["time"]["is_all_day"] == true
+        || remote["time"]["is_all_day"].as_bool() != Some(false)
         || remote["time"]["time_zone"] != desired["time"]["time_zone"]
     {
         return false;
