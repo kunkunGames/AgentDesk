@@ -15,9 +15,8 @@ pub(crate) async fn calendar_loop(pool: Arc<PgPool>) {
 }
 
 pub(crate) async fn tick(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let Ok(accounts) = account::calendar_accounts() else {
-        return Ok(());
-    };
+    // Invalid configuration disables new claims, not database lease recovery.
+    let accounts = account::calendar_accounts().unwrap_or_default();
     // Nodes lacking a usable, exclusively owned credential store must not consume work.
     let mut available = Vec::new();
     for id in accounts {

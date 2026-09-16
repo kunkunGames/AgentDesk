@@ -184,7 +184,12 @@ async fn rotated_tokens_survive_store_reopen() {
         client.validate_credentials().await,
         Err(KakaoError::CredentialPersistence)
     ));
+    assert!(matches!(
+        client.require_durable_credentials().await,
+        Err(KakaoError::CredentialPersistence)
+    ));
     std::fs::remove_dir(temp.path().join("default.json")).unwrap();
+    assert!(client.require_durable_credentials().await.is_ok());
     assert_eq!(client.access_token_generation(None).await.unwrap().1, 1);
     assert!(client.validate_credentials().await.is_ok());
     drop(client);

@@ -148,14 +148,13 @@ impl KakaoClient {
                 "calendar requires opt-in durable token storage",
             ));
         }
-        if self.rest_api_key.is_none()
-            || self
-                .tokens
-                .lock()
-                .await
-                .refresh_token
-                .as_deref()
-                .is_none_or(str::is_empty)
+        let mut tokens = self.tokens.lock().await;
+        // Retry saving already-rotated tokens before allowing any new claim.
+        // Storage outages must not drain queued work into manual recovery.
+        if tokens.persistence_failed {
+            self.persist(&mut tokens)?;
+        }
+        if self.rest_api_key.is_none() || tokens.refresh_token.as_deref().is_none_or(str::is_empty)
         {
             return Err(KakaoError::MissingCredentials);
         }
