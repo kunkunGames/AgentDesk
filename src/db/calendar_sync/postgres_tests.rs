@@ -344,6 +344,20 @@ async fn unknown_create_blocks_only_its_target_and_accepts_late_evidence_pg() {
     let c = claim(&pool, &accounts()).await.unwrap().unwrap();
     assert!(dispatch(&pool, &c).await.unwrap());
     sqlx::query("UPDATE kakao_calendar_operations SET lease_expires_at=NOW()-INTERVAL '1 second' WHERE id=$1").bind(c.id).execute(&pool).await.unwrap();
+    // Credential unavailability must not hide an interrupted write or claim
+    // the other account's queued operation.
+    assert!(claim(&pool, &[]).await.unwrap().is_none());
+    assert_eq!(
+        get(&pool, receipt.event_id).await.unwrap()["status"],
+        "unknown"
+    );
+    assert_eq!(
+        recovery_target(&pool, receipt.event_id, c.id)
+            .await
+            .unwrap()
+            .id,
+        c.id
+    );
     let other = claim(&pool, &accounts()).await.unwrap().unwrap();
     assert_ne!(c.target_id, other.target_id);
     let mut stale = recovery_target(&pool, receipt.event_id, c.id)

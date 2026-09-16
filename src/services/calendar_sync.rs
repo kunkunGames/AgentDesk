@@ -137,23 +137,7 @@ pub(crate) async fn mutate(
         .filter(|n| *n > 0)
         .ok_or(CalendarError::Invalid("positive expectedRevision required"))?;
     let current = db::get(pool, event).await?;
-    if current["deleted"] == true {
-        return Err(db::CalendarDbError::Conflict.into());
-    }
-    let content: EventContent = serde_json::from_value(current["content"].clone())
-        .map_err(|_| CalendarError::Invalid("stored event invalid"))?;
-    let updated = if delete {
-        if input.as_object().is_none_or(|obj| obj.len() != 1) {
-            return Err(CalendarError::Invalid(
-                "delete accepts expectedRevision only",
-            ));
-        }
-        content
-    } else {
-        content.patched(&input).map_err(CalendarError::Invalid)?
-    };
-    let value =
-        serde_json::to_value(updated).map_err(|_| CalendarError::Invalid("invalid event"))?;
+    let value = patched_snapshot(&current, &input, expected, delete)?;
     Ok(db::mutate(
         pool,
         db::Mutation {
@@ -166,6 +150,35 @@ pub(crate) async fn mutate(
         },
     )
     .await?)
+}
+
+fn patched_snapshot(
+    current: &Value,
+    input: &Value,
+    expected: i64,
+    delete: bool,
+) -> Result<Value, CalendarError> {
+    // The patch must be based on the exact revision checked under the DB lock.
+    // Otherwise a request for a future revision could apply stale content after
+    // waiting for another writer to commit that revision.
+    if current["deleted"] == true || current["revision"].as_i64() != Some(expected) {
+        return Err(db::CalendarDbError::Conflict.into());
+    }
+    let content: EventContent = serde_json::from_value(current["content"].clone())
+        .map_err(|_| CalendarError::Invalid("stored event invalid"))?;
+    let updated = if delete {
+        if input.as_object().is_none_or(|obj| obj.len() != 1) {
+            return Err(CalendarError::Invalid(
+                "delete accepts expectedRevision only",
+            ));
+        }
+        content
+    } else {
+        content.patched(input).map_err(CalendarError::Invalid)?
+    };
+    let value =
+        serde_json::to_value(updated).map_err(|_| CalendarError::Invalid("invalid event"))?;
+    Ok(value)
 }
 
 pub(crate) fn error_code(error: &KakaoError) -> &'static str {
@@ -182,5 +195,32 @@ pub(crate) fn error_code(error: &KakaoError) -> &'static str {
         KakaoError::ProviderRejected(429) => "rate_limited",
         KakaoError::ProviderRejected(_) | KakaoError::ProviderResult(_) => "provider_rejected",
         _ => "configuration_invalid",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_requires_its_observed_revision_and_preserves_other_fields() {
+        let mut current = json!({"revision": 1, "deleted": false, "content": {
+            "title": "original", "description": "original description",
+            "time": {"startAt": "2026-09-30T10:00:00+09:00", "endAt": "2026-09-30T11:00:00+09:00", "timeZone": "Asia/Seoul"}
+        }});
+        let patch = json!({"expectedRevision": 2, "title": "second writer"});
+        assert!(matches!(
+            patched_snapshot(&current, &patch, 2, false),
+            Err(CalendarError::Storage(db::CalendarDbError::Conflict))
+        ));
+        current["revision"] = json!(2);
+        current["content"]["description"] = json!("first writer");
+        let updated = patched_snapshot(&current, &patch, 2, false).unwrap();
+        assert_eq!(updated["title"], "second writer");
+        assert_eq!(updated["description"], "first writer");
+        assert!(matches!(
+            patched_snapshot(&current, &patch, 1, false),
+            Err(CalendarError::Storage(db::CalendarDbError::Conflict))
+        ));
     }
 }

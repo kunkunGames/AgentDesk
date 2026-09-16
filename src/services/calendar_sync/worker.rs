@@ -27,9 +27,8 @@ pub(crate) async fn tick(pool: &PgPool) -> Result<(), sqlx::Error> {
             }
         }
     }
-    if available.is_empty() {
-        return Ok(());
-    }
+    // Claim also recovers expired leases. An empty allowlist prevents new claims,
+    // but must still expose interrupted writes for operator reconciliation.
     let Some(claim) = db::claim(pool, &available).await? else {
         return Ok(());
     };

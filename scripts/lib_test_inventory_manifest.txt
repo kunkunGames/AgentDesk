@@ -1428,6 +1428,7 @@ services::automation_candidate_materializer::iteration_result_tests::submit_iter
 services::calendar_sync::model::tests::patches_distinguish_keep_set_and_clear
 services::calendar_sync::model::tests::time_is_not_rounded_and_offsets_must_agree
 services::calendar_sync::recovery::tests::recovery_requires_explicit_resolution_and_evidence
+services::calendar_sync::tests::patch_requires_its_observed_revision_and_preserves_other_fields
 services::claude::claude_tui_followup_requeue_flag_tests::followup_requeue_defaults_on_when_env_is_unset
 services::claude::claude_tui_followup_requeue_flag_tests::followup_requeue_keeps_legacy_opt_in_and_invalid_values_enabled
 services::claude::claude_tui_followup_requeue_flag_tests::followup_requeue_respects_emergency_opt_out_values
