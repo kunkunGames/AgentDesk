@@ -3,19 +3,39 @@ use serde_json::Value;
 const MAX_DISPATCH_SUMMARY_CHARS: usize = 160;
 
 fn normalize_dispatch_summary_text(value: &str) -> Option<String> {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
+    let mut words = value.split_whitespace();
+    let first_word = words.next()?;
 
-    let mut summary = String::new();
-    for (index, ch) in normalized.chars().enumerate() {
-        if index >= MAX_DISPATCH_SUMMARY_CHARS {
+    let mut summary = String::with_capacity(value.len().min(MAX_DISPATCH_SUMMARY_CHARS + 3));
+    let mut char_count = 0;
+
+    for ch in first_word.chars() {
+        if char_count >= MAX_DISPATCH_SUMMARY_CHARS {
             summary.push_str("...");
-            break;
+            return Some(summary);
         }
         summary.push(ch);
+        char_count += 1;
     }
+
+    for word in words {
+        if char_count >= MAX_DISPATCH_SUMMARY_CHARS {
+            summary.push_str("...");
+            return Some(summary);
+        }
+        summary.push(' ');
+        char_count += 1;
+
+        for ch in word.chars() {
+            if char_count >= MAX_DISPATCH_SUMMARY_CHARS {
+                summary.push_str("...");
+                return Some(summary);
+            }
+            summary.push(ch);
+            char_count += 1;
+        }
+    }
+
     Some(summary)
 }
 
