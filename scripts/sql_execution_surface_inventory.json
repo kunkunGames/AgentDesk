@@ -1368,24 +1368,6 @@
       "api": "agentdesk.db.query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:7c5275a7c40ba8a7996b187f517262568021ecb536ecb92ee82f156cdf27568c"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/kanban-rules.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:a966e0d67733bb318e83fdea4f1eb50d64cc5d0abab21219c5d1f8f198c62a3d"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/kanban-rules.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
       "fingerprint": "sha256:eda40730bdf0f2377df0f70efedfebac9a334539ce7e176da4765e30d7e907c0"
     },
     {
