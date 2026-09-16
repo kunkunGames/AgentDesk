@@ -264,8 +264,13 @@ impl SupervisedWorkerRegistry {
                 Ok(None)
             }
             ServerWorkerId::KakaoCalendar => {
+                // Parse errors still need lease recovery after a restart. The
+                // worker uses an empty claim allowlist when configuration is invalid.
                 if self.config.cluster.enabled
-                    || !crate::services::kakao::account::calendar_enabled().unwrap_or(false)
+                    || matches!(
+                        crate::services::kakao::account::calendar_enabled(),
+                        Ok(false)
+                    )
                 {
                     self.log_skip(
                         spec,
