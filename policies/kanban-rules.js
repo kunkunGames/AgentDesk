@@ -99,18 +99,15 @@ function _maybeDispatchScopeAssessment(cardId) {
     // pending / completed / skipped → already handled, never dispatch twice.
     return;
   }
-  var rows = agentdesk.db.query(
-    "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?",
-    [cardId]
-  );
-  if (rows.length === 0 || !rows[0].assigned_agent_id) {
+  var card = agentdesk.cards.get(cardId);
+  if (!card || !card.assigned_agent_id) {
     // No assignee yet → cannot route to "the assigned agent". Skip silently;
     // the trigger re-evaluates on the next requested entry.
     agentdesk.log.info("[scope] Card " + cardId + " has no assigned agent — skipping scope-assessment");
     return;
   }
-  var agentId = rows[0].assigned_agent_id;
-  var dispatchId = _createScopeAssessmentDispatch(cardId, agentId, rows[0].title);
+  var agentId = card.assigned_agent_id;
+  var dispatchId = _createScopeAssessmentDispatch(cardId, agentId, card.title);
   if (!dispatchId) {
     // Dispatch creation failed — do NOT mark pending so a later requested entry
     // can retry. T2 is inert, so a missing scope-assessment never blocks flow.
@@ -546,11 +543,7 @@ var rules = {
   onCardTransition: function(payload) {
     agentdesk.log.info("[kanban] card " + payload.card_id + ": " + payload.from + " → " + payload.to);
     if (agentdesk.quality && typeof agentdesk.quality.emit === "function") {
-      var qualityCardRows = agentdesk.db.query(
-        "SELECT assigned_agent_id, latest_dispatch_id FROM kanban_cards WHERE id = ?",
-        [payload.card_id]
-      );
-      var qualityCard = qualityCardRows.length > 0 ? qualityCardRows[0] : {};
+      var qualityCard = agentdesk.cards.get(payload.card_id) || {};
       emitQualityEvent({
         event_type: "card_transitioned",
         source_event_id: payload.card_id + ":" + payload.to,
