@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "e53f0b35868747192a44345bcffa2ddca5cbcf26",
+  "measured_at_sha": "c77080a7b882ac2c571182eb9c948dd255bd2c8f",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1360,24 +1360,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:5ce4421bfb7b826b78a64047330dd640cf77f328262e6c573ad499274227d31a"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/kanban-rules.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:7c5275a7c40ba8a7996b187f517262568021ecb536ecb92ee82f156cdf27568c"
-    },
-    {
-      "root": "policies",
-      "kind": "POLICY",
-      "path": "policies/kanban-rules.js",
-      "api": "agentdesk.db.query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:a966e0d67733bb318e83fdea4f1eb50d64cc5d0abab21219c5d1f8f198c62a3d"
     },
     {
       "root": "policies",
