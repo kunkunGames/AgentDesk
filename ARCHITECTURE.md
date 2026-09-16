@@ -290,6 +290,8 @@ src/
 │   │   │   ├── onboarding.rs
 │   │   │   ├── ops.rs
 │   │   │   └── reviews.rs
+│   │   ├── health_api/
+│   │   │   └── public_projection.rs
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
@@ -642,6 +644,7 @@ src/
 │   │   │   │   ├── external_verdict.rs
 │   │   │   │   ├── ledger.rs
 │   │   │   │   ├── ledger_tests.rs
+│   │   │   │   ├── ledger_ttl.rs
 │   │   │   │   ├── obligation.rs
 │   │   │   │   ├── obligation_tests.rs
 │   │   │   │   ├── observation.rs
@@ -655,6 +658,8 @@ src/
 │   │   │   │   ├── stall_watchdog_task.rs
 │   │   │   │   ├── stop_result.rs
 │   │   │   │   └── watchdog_decisions.rs
+│   │   │   ├── snapshot/
+│   │   │   │   └── relay_probe.rs
 │   │   │   ├── stall_liveness/
 │   │   │   │   └── redrive_grace.rs
 │   │   │   ├── headless_turn.rs
@@ -1048,7 +1053,8 @@ src/
 │   │   │   │   ├── backstop_tests.rs
 │   │   │   │   └── idle_gate.rs
 │   │   │   ├── loop_poll_prologue/
-│   │   │   │   └── post_terminal_disposal_tests.rs
+│   │   │   │   ├── post_terminal_disposal_tests.rs
+│   │   │   │   └── watcher_resume.rs
 │   │   │   ├── streaming_status_tick/
 │   │   │   │   ├── committed_progress_tests.rs
 │   │   │   │   ├── existing_panel_update.rs
