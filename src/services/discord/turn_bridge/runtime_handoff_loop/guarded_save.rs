@@ -346,4 +346,58 @@ mod tests {
             assert!(tmux_ready_state_dirty_after_guarded_save(true, kept));
         }
     }
+    #[test]
+    fn tmux_ready_admission_uses_durable_baseline_after_local_session_init() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().expect("runtime root");
+        let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            temp.path(),
+        );
+        let channel = ChannelId::new(4_259_991);
+        let mut state = tmux_ready_owner_state(channel.get(), 77_010);
+        state.session_id = None;
+        state.output_path = None;
+        save_inflight_state(&state).expect("seed durable owner");
+        let durable_baseline = state.clone();
+        let expected = crate::services::discord::inflight::InflightTurnIdentity::from_state(&state);
+        // Qwen reports its provider session before TmuxReady, while the
+        // durable intake row still has no provider session or output path.
+        state.session_id = Some("new-provider-session".to_string());
+        let uncommitted_baseline = state.clone();
+        state.output_path = Some("/tmp/qwen-completed.jsonl".to_string());
+        let mut rejected = state.clone();
+        assert_eq!(
+            guarded_runtime_handoff_save(
+                &uncommitted_baseline,
+                &mut rejected,
+                &expected,
+                channel,
+                "regression_uncommitted_baseline"
+            ),
+            GuardedSaveOutcome::IdentityMismatch
+        );
+        assert_eq!(
+            guarded_runtime_handoff_save(
+                &durable_baseline,
+                &mut state,
+                &expected,
+                channel,
+                "regression_durable_baseline"
+            ),
+            GuardedSaveOutcome::Saved
+        );
+        let persisted =
+            load_inflight_state(&ProviderKind::Codex, channel.get()).expect("persisted");
+        assert_eq!(
+            persisted.session_id.as_deref(),
+            Some("new-provider-session")
+        );
+        assert_eq!(
+            persisted.output_path.as_deref(),
+            Some("/tmp/qwen-completed.jsonl")
+        );
+    }
 }

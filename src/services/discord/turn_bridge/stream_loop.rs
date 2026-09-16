@@ -601,6 +601,7 @@ pub(super) async fn run_stream_loop(
                                     last_offset,
                                 },
                                 RuntimeHandoffLoopContext {
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     shared_owned: &shared_owned,
                                     provider: &provider,
                                     channel_id,
@@ -640,6 +641,7 @@ pub(super) async fn run_stream_loop(
                             let outcome = handle_runtime_handoff_loop_message(
                                 RuntimeHandoffLoopMessage::RuntimeReady { handoff },
                                 RuntimeHandoffLoopContext {
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     shared_owned: &shared_owned,
                                     provider: &provider,
                                     channel_id,
@@ -687,6 +689,7 @@ pub(super) async fn run_stream_loop(
                                     last_offset,
                                 },
                                 RuntimeHandoffLoopContext {
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     shared_owned: &shared_owned,
                                     provider: &provider,
                                     channel_id,
@@ -725,6 +728,7 @@ pub(super) async fn run_stream_loop(
                             let outcome = handle_runtime_handoff_loop_message(
                                 RuntimeHandoffLoopMessage::OutputOffset { offset },
                                 RuntimeHandoffLoopContext {
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     shared_owned: &shared_owned,
                                     provider: &provider,
                                     channel_id,
