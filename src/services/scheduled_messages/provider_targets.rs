@@ -99,9 +99,9 @@ pub(crate) fn validate_for_process(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let client = KakaoClient::from_process(requested_account)
+    let account_id = KakaoClient::configured_account(requested_account)
         .map_err(ProviderTargetError::KakaoUnavailable)?;
-    validate_resolved(body, content, client.account_id())
+    validate_resolved(body, content, &account_id)
 }
 
 fn validate_resolved(

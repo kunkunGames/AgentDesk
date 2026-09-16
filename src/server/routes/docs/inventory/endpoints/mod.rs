@@ -1,5 +1,6 @@
 use super::EndpointDoc;
 
+mod kakao_calendar;
 mod part_01;
 mod part_02;
 mod part_03;
@@ -23,5 +24,6 @@ pub(super) fn all() -> Vec<EndpointDoc> {
     endpoints.extend(part_08::endpoints());
     endpoints.extend(part_09::endpoints());
     endpoints.extend(part_10::endpoints());
+    endpoints.extend(kakao_calendar::endpoints());
     endpoints
 }
