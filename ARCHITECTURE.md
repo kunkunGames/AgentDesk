@@ -90,7 +90,8 @@ src/
 │   │   └── verdict_tests.rs
 │   ├── calendar_sync/
 │   │   ├── execution.rs
-│   │   └── postgres_tests.rs
+│   │   ├── postgres_tests.rs
+│   │   └── read.rs
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
 │   │   ├── canonical_identity_pg_tests.rs
@@ -473,6 +474,7 @@ src/
 │   │   └── iteration_result_tests.rs
 │   ├── calendar_sync/
 │   │   ├── model.rs
+│   │   ├── recovery.rs
 │   │   └── worker.rs
 │   ├── claude/
 │   │   ├── active_usage.rs

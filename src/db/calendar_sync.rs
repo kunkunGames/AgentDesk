@@ -1,11 +1,15 @@
 //! Atomic calendar intent and durable request keys; provider I/O never occurs in transactions.
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 mod execution;
+mod read;
 pub(crate) use execution::*;
+pub(crate) use read::*;
 #[cfg(test)]
 mod postgres_tests;
 
@@ -214,67 +218,4 @@ pub async fn mutate(pool: &PgPool, mutation: Mutation<'_>) -> Result<Receipt, Ca
         revision,
         status: "accepted",
     })
-}
-
-pub async fn event_accounts(pool: &PgPool, event: Uuid) -> Result<Vec<String>, CalendarDbError> {
-    let accounts = sqlx::query_scalar("SELECT b.account_id FROM kakao_calendar_targets t JOIN kakao_calendar_bindings b USING(binding_id) WHERE t.event_id=$1 ORDER BY b.account_id")
-        .bind(event).fetch_all(pool).await?;
-    Ok(accounts)
-}
-
-pub async fn get(pool: &PgPool, event: Uuid) -> Result<Value, CalendarDbError> {
-    let row = sqlx::query("SELECT revision,content,deleted FROM kakao_calendar_events WHERE id=$1")
-        .bind(event)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(CalendarDbError::NotFound)?;
-    let targets = sqlx::query("SELECT b.account_id,t.applied_revision,t.remote_id,o.status,o.error_code,o.id AS operation_id
-        FROM kakao_calendar_targets t JOIN kakao_calendar_bindings b USING(binding_id)
-        JOIN LATERAL (SELECT id,status,error_code FROM kakao_calendar_operations WHERE target_id=t.id
-          ORDER BY (status IN ('needs_reconcile','dispatching','blocked','rejected')) DESC,revision DESC LIMIT 1) o ON TRUE
-        WHERE t.event_id=$1 ORDER BY b.account_id").bind(event).fetch_all(pool).await?;
-    let targets: Vec<Value> = targets.into_iter().map(|row| json!({"accountId":row.get::<String,_>("account_id"),"appliedRevision":row.get::<i64,_>("applied_revision"),"remoteKnown":row.get::<Option<String>,_>("remote_id").is_some(),"status":row.get::<String,_>("status"),"errorCode":row.get::<Option<String>,_>("error_code"),"operationId":row.get::<Uuid,_>("operation_id")})).collect();
-    let applied = targets
-        .iter()
-        .filter(|target| target["status"] == "applied")
-        .count();
-    let status = if targets
-        .iter()
-        .any(|target| target["status"] == "needs_reconcile")
-    {
-        "unknown"
-    } else if applied == targets.len() {
-        "success"
-    } else if applied > 0 {
-        "partial_success"
-    } else if targets
-        .iter()
-        .all(|target| target["status"] == "blocked" || target["status"] == "rejected")
-    {
-        "failed"
-    } else {
-        "accepted"
-    };
-    Ok(
-        json!({"eventId":event,"revision":row.get::<i64,_>("revision"),"content":row.get::<Value,_>("content"),"deleted":row.get::<bool,_>("deleted"),"status":status,"targets":targets}),
-    )
-}
-
-pub async fn list(
-    pool: &PgPool,
-    accounts: &[String],
-    before: Option<Uuid>,
-    limit: i64,
-) -> Result<Vec<Uuid>, CalendarDbError> {
-    Ok(sqlx::query_scalar("SELECT e.id FROM kakao_calendar_events e WHERE ($1::uuid IS NULL OR e.id < $1)
-        AND NOT EXISTS (SELECT 1 FROM kakao_calendar_targets t JOIN kakao_calendar_bindings b USING(binding_id)
-        WHERE t.event_id=e.id AND NOT(b.account_id=ANY($2))) ORDER BY e.id DESC LIMIT $3")
-        .bind(before).bind(accounts).bind(limit).fetch_all(pool).await?)
-}
-
-pub async fn operations(pool: &PgPool, event: Uuid) -> Result<Vec<Value>, CalendarDbError> {
-    let rows = sqlx::query("SELECT o.id,o.revision,o.action,o.status,o.error_code,o.dispatched_at,o.attempts,o.recovery_note,b.account_id
-        FROM kakao_calendar_operations o JOIN kakao_calendar_targets t ON t.id=o.target_id JOIN kakao_calendar_bindings b USING(binding_id)
-        WHERE t.event_id=$1 ORDER BY o.revision DESC,b.account_id LIMIT 200").bind(event).fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|r| json!({"operationId":r.get::<Uuid,_>("id"),"revision":r.get::<i64,_>("revision"),"action":r.get::<String,_>("action"),"status":r.get::<String,_>("status"),"accountId":r.get::<String,_>("account_id"),"errorCode":r.get::<Option<String>,_>("error_code"),"dispatchedAt":r.get::<Option<chrono::DateTime<chrono::Utc>>,_>("dispatched_at"),"attempts":r.get::<i32,_>("attempts"),"recoveryNote":r.get::<Option<String>,_>("recovery_note")})).collect())
 }

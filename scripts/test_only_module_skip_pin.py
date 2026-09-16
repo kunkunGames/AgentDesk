@@ -36,6 +36,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
     {
         "src/db/auto_queue/tests.rs",
         "src/db/automation_candidates/verdict_tests.rs",
+        "src/db/calendar_sync/postgres_tests.rs",
         "src/db/dispatched_sessions/canonical_identity_pg_tests.rs",
         "src/db/dispatched_sessions/tests.rs",
         "src/db/intake_outbox_dispatch_stamp/tests.rs",
@@ -155,6 +156,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/watchers/lifecycle/restore_tests.rs",
         "src/services/discord/watchers/lifecycle/tests.rs",
         "src/services/message_outbox_circuit_authority_tests.rs",
+        "src/services/kakao/transport_tests.rs",
         "src/services/message_outbox_recovery_tests.rs",
         "src/services/dispatch_gate/auth_profiles/selection_tests.rs",
         "src/services/provider/provider_conformance_invariant_tests.rs",
@@ -183,6 +185,7 @@ PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(
         "src/services/discord/relay_recovery/tests/circuit_breaker_apply.rs",
         "src/services/discord/tui_prompt_relay/local_model_queue_wake_e2e.rs",
         "src/services/provider/read_fault.rs",
+        "src/services/kakao/test_support.rs",
     }
 )
 

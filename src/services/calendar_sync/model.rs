@@ -107,10 +107,11 @@ impl EventContent {
         Ok(next)
     }
 
-    pub fn provider_json(&self) -> Value {
+    pub fn provider_json(&self) -> Result<Value, &'static str> {
+        self.validate()?;
         let mut value = serde_json::json!({
             "title": self.title,
-            "time": {"start_at": utc_string(&self.time.start_at), "end_at": utc_string(&self.time.end_at), "time_zone": self.time.time_zone},
+            "time": {"start_at": utc_string(&self.time.start_at)?, "end_at": utc_string(&self.time.end_at)?, "time_zone": self.time.time_zone},
             "description": self.description.as_deref().unwrap_or("")
         });
         if let Some(location) = &self.location {
@@ -119,19 +120,18 @@ impl EventContent {
         if let Some(reminders) = &self.reminders {
             value["reminders"] = serde_json::json!(reminders);
         }
-        value
+        Ok(value)
     }
 }
 
-fn utc_string(raw: &str) -> String {
-    // EventContent::validate is mandatory before durable acceptance. Invalid stored data is rejected by the executor.
+fn utc_string(raw: &str) -> Result<String, &'static str> {
     DateTime::parse_from_rfc3339(raw)
         .map(|value| {
             value
                 .with_timezone(&Utc)
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         })
-        .unwrap_or_default()
+        .map_err(|_| "time requires RFC3339 offset")
 }
 
 #[cfg(test)]
@@ -144,8 +144,15 @@ mod tests {
     fn time_is_not_rounded_and_offsets_must_agree() {
         let mut event = event();
         assert!(event.validate().is_ok());
+        assert_eq!(
+            event.provider_json().unwrap()["time"]["start_at"],
+            "2026-09-30T01:01:00Z"
+        );
         event.time.time_zone = "UTC".into();
         assert!(event.validate().is_err());
+        assert!(event.provider_json().is_err());
+        event.time.start_at = "invalid".into();
+        assert!(event.provider_json().is_err());
     }
     #[test]
     fn patches_distinguish_keep_set_and_clear() {

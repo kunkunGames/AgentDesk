@@ -78,9 +78,10 @@ pub(crate) async fn execute(
         Ok(content) => content,
         Err(_) => return db::fail(pool, claim, "rejected", "invalid_stored_intent").await,
     };
-    if content.validate().is_err() {
-        return db::fail(pool, claim, "rejected", "invalid_stored_intent").await;
-    }
+    let provider_event = match content.provider_json() {
+        Ok(event) => event,
+        Err(_) => return db::fail(pool, claim, "rejected", "invalid_stored_intent").await,
+    };
     let result = if claim.action == "delete" {
         match claim.remote_id.as_deref() {
             Some(id) => client.calendar_delete(id).await.map(|()| None),
@@ -89,13 +90,10 @@ pub(crate) async fn execute(
     } else {
         match claim.remote_id.as_deref() {
             Some(id) => client
-                .calendar_update(id, &content.provider_json())
+                .calendar_update(id, &provider_event)
                 .await
                 .map(|()| Some(id.to_string())),
-            None => client
-                .calendar_create(&content.provider_json())
-                .await
-                .map(Some),
+            None => client.calendar_create(&provider_event).await.map(Some),
         }
     };
     match result {

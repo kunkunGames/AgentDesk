@@ -21,6 +21,67 @@ fn accounts() -> Vec<String> {
 }
 
 #[tokio::test]
+async fn managed_list_filters_all_accounts_and_preserves_status_pg() {
+    let (db, pool, bindings) = fixture().await;
+    let own = create(&pool, "own", "own", &content(), &bindings[..1])
+        .await
+        .unwrap();
+    create(&pool, "both", "both", &content(), &bindings)
+        .await
+        .unwrap();
+    create(&pool, "friend", "friend", &content(), &bindings[1..])
+        .await
+        .unwrap();
+    let own_list = list(&pool, &["default".into()], None, 10).await.unwrap();
+    assert_eq!(own_list, vec![get(&pool, own.event_id).await.unwrap()]);
+    assert!(list(&pool, &[], None, 10).await.unwrap().is_empty());
+    let all = list(&pool, &accounts(), None, 10).await.unwrap();
+    assert_eq!(all.len(), 3);
+    let first_page = list(&pool, &accounts(), None, 1).await.unwrap();
+    let cursor = serde_json::from_value(first_page[0]["eventId"].clone()).unwrap();
+    let rest = list(&pool, &accounts(), Some(cursor), 10).await.unwrap();
+    assert_eq!([first_page, rest].concat(), all);
+    for _ in 0..4 {
+        let c = claim(&pool, &accounts()).await.unwrap().unwrap();
+        assert!(dispatch(&pool, &c).await.unwrap());
+        complete(&pool, &c, Some(&c.target_id.to_string()))
+            .await
+            .unwrap();
+    }
+    let mut changed = content();
+    changed["title"] = json!("next revision");
+    mutate(
+        &pool,
+        Mutation {
+            event: own.event_id,
+            key: "update",
+            fingerprint: "update",
+            expected_revision: 1,
+            content: &changed,
+            delete: false,
+        },
+    )
+    .await
+    .unwrap();
+    let current = get(&pool, own.event_id).await.unwrap();
+    assert_eq!(current["revision"], 2);
+    assert_eq!(current["targets"][0]["appliedRevision"], 1);
+    assert_eq!(current["status"], "accepted");
+    assert_eq!(
+        list(&pool, &["default".into()], None, 10).await.unwrap(),
+        vec![current]
+    );
+    let checks = account_checks(&pool, &["default".into(), "unbound".into()])
+        .await
+        .unwrap();
+    assert!(!checks[0]["lastCheckedAt"].is_null());
+    assert!(checks[1]["lastCheckedAt"].is_null());
+    assert_eq!(checks[0]["credentialVerified"], false);
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn two_account_crud_reaches_mock_provider_and_does_not_recreate_success_pg() {
     use crate::services::{calendar_sync::execute_for_test, kakao::test_support};
     use axum::{
@@ -96,7 +157,7 @@ async fn two_account_crud_reaches_mock_provider_and_does_not_recreate_success_pg
     recover(
         &pool,
         &failed,
-        "retry",
+        RecoveryResolution::Retry,
         None,
         "Consent repaired and verified",
     )
@@ -293,7 +354,7 @@ async fn unknown_create_blocks_only_its_target_and_accepts_late_evidence_pg() {
         recover(
             &pool,
             &stale,
-            "confirm_not_applied",
+            RecoveryResolution::ConfirmNotApplied,
             None,
             "stale recovery must not apply"
         )
@@ -301,7 +362,14 @@ async fn unknown_create_blocks_only_its_target_and_accepts_late_evidence_pg() {
         Err(CalendarDbError::Conflict)
     ));
     assert!(matches!(
-        recover(&pool, &c, "retry", None, "unknown write cannot be retried").await,
+        recover(
+            &pool,
+            &c,
+            RecoveryResolution::Retry,
+            None,
+            "unknown write cannot be retried"
+        )
+        .await,
         Err(CalendarDbError::Conflict)
     ));
     assert!(dispatch(&pool, &other).await.unwrap());

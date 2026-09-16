@@ -27,6 +27,15 @@ payload lifetime. This is the boundary that permits calendar evolution without
 changing message delivery semantics. Extensibility is supported by these seams;
 there is no claim that a global maximum ROI has been measured.
 
+Recovery policy and its closed set of resolutions live in the calendar service;
+the HTTP handler only authenticates, extracts input and maps the result. The DB
+read module shares one projection between detail and paginated list. One SQL
+statement reads intent and target progress from the same PostgreSQL snapshot,
+avoiding mixed revisions and the former per-event list round trips. Account
+check timestamps are also fetched in one batch. Provider payload conversion
+validates intent and returns an error instead of silently substituting an empty
+timestamp. Recovery lease checks use the database clock that issued the lease.
+
 ## F01–F21 disposition
 
 These are assessments of the pinned source, not claims of observed production incidents.

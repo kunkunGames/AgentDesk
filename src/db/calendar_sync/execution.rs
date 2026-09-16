@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecoveryResolution {
+    Retry,
+    Adopt,
+    ConfirmNotApplied,
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct Claim {
     pub id: Uuid,
@@ -147,7 +155,7 @@ pub(crate) async fn recovery_target(
 pub(crate) async fn recover(
     pool: &PgPool,
     claim: &Claim,
-    resolution: &str,
+    resolution: RecoveryResolution,
     remote: Option<&str>,
     note: &str,
 ) -> Result<(), CalendarDbError> {
@@ -157,7 +165,7 @@ pub(crate) async fn recover(
         .execute(&mut *tx)
         .await?;
     let row = sqlx::query(
-        "SELECT status,lease_expires_at,claim_token FROM kakao_calendar_operations WHERE id=$1 FOR UPDATE",
+        "SELECT status,lease_expires_at > NOW() AS lease_active,claim_token FROM kakao_calendar_operations WHERE id=$1 FOR UPDATE",
     )
     .bind(claim.id)
     .fetch_one(&mut *tx)
@@ -169,19 +177,17 @@ pub(crate) async fn recover(
     if !["blocked", "rejected", "needs_reconcile"].contains(&status.as_str()) {
         return Err(CalendarDbError::Conflict);
     }
-    if status == "needs_reconcile"
-        && row
-            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("lease_expires_at")
-            .is_some_and(|expiry| expiry > chrono::Utc::now())
-    {
+    if status == "needs_reconcile" && row.get::<Option<bool>, _>("lease_active").unwrap_or(false) {
         return Err(CalendarDbError::Conflict);
     }
     match resolution {
-        "retry" if status != "needs_reconcile" => {
+        RecoveryResolution::Retry if status != "needs_reconcile" => {
             sqlx::query("UPDATE kakao_calendar_operations SET status='queued',claim_token=NULL,dispatched_at=NULL,lease_expires_at=NULL,error_code=NULL,recovery_note=$2,next_attempt_at=NOW(),updated_at=NOW() WHERE id=$1")
                 .bind(claim.id).bind(note).execute(&mut *tx).await?;
         }
-        "adopt" if status == "needs_reconcile" && remote.is_some() && claim.action != "delete" => {
+        RecoveryResolution::Adopt
+            if status == "needs_reconcile" && remote.is_some() && claim.action != "delete" =>
+        {
             sqlx::query(
                 "UPDATE kakao_calendar_targets SET remote_id=$2,applied_revision=$3 WHERE id=$1",
             )
@@ -194,7 +200,7 @@ pub(crate) async fn recover(
                 .bind(claim.id).bind(note).execute(&mut *tx).await?;
         }
         // Explicit operator judgment after stopping the old credential owner. Never an automatic replay.
-        "confirm_not_applied" if status == "needs_reconcile" => {
+        RecoveryResolution::ConfirmNotApplied if status == "needs_reconcile" => {
             sqlx::query("UPDATE kakao_calendar_operations SET status='queued',claim_token=NULL,dispatched_at=NULL,lease_expires_at=NULL,error_code=NULL,recovery_note=$2,next_attempt_at=NOW(),updated_at=NOW() WHERE id=$1")
                 .bind(claim.id).bind(note).execute(&mut *tx).await?;
         }

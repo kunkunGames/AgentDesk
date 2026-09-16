@@ -120,17 +120,7 @@ mod tests {
 pub async fn accounts(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
     let pool = operator(&state, &headers)?;
     let ids = account::calendar_accounts().map_err(|e| map_error(e.into()))?;
-    let mut accounts = Vec::new();
-    for id in ids {
-        let checked: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT checked_at FROM kakao_calendar_bindings WHERE account_id=$1",
-        )
-        .bind(&id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|_| AppError::internal("calendar storage unavailable"))?;
-        accounts.push(json!({"accountId":id,"configured":true,"credentialVerified":false,"lastCheckedAt":checked,"nextAction":"POST account check for current identity and consent verification"}));
-    }
+    let accounts = db::account_checks(pool, &ids).await.map_err(storage)?;
     ok(json!({"accounts":accounts,"credentialBoundary":"single-node Unix private token store"}))
 }
 
@@ -178,18 +168,15 @@ pub async fn list(
     if !(1..=100).contains(&limit) {
         return Err(AppError::bad_request("limit must be 1 to 100"));
     }
-    let ids = db::list(pool, &accounts, page.before, limit + 1)
+    let mut events = db::list(pool, &accounts, page.before, limit + 1)
         .await
         .map_err(storage)?;
-    let mut events = Vec::new();
-    for id in ids.iter().take(limit as usize) {
-        events.push(db::get(pool, *id).await.map_err(storage)?);
-    }
-    let next = if ids.len() > limit as usize {
-        ids.get(limit as usize - 1)
+    let next = if events.len() > limit as usize {
+        Some(events[limit as usize - 1]["eventId"].clone())
     } else {
         None
     };
+    events.truncate(limit as usize);
     ok(json!({"events":events,"nextCursor":next}))
 }
 pub async fn get(
@@ -241,91 +228,15 @@ pub async fn operations(
     ok(json!({"operations":db::operations(pool,event).await.map_err(storage)?,"limit":200}))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Recovery {
-    resolution: String,
-    remote_event_id: Option<String>,
-    note: String,
-    credential_owner_restarted: bool,
-}
-
 pub async fn recover(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((event, operation)): Path<(Uuid, Uuid)>,
-    Json(body): Json<Recovery>,
+    Json(body): Json<service::Recovery>,
 ) -> ApiResult {
     let pool = operator(&state, &headers)?;
-    service::authorize_event(pool, event)
+    let resolution = service::recover(pool, event, operation, body)
         .await
         .map_err(map_error)?;
-    if body.note.trim().len() < 10 || body.note.len() > 1000 {
-        return Err(AppError::bad_request(
-            "recovery requires a 10 to 1000 byte non-secret audit note",
-        ));
-    }
-    if !["retry", "adopt", "confirm_not_applied"].contains(&body.resolution.as_str())
-        || (body.resolution != "adopt" && body.remote_event_id.is_some())
-    {
-        return Err(AppError::bad_request(
-            "invalid recovery resolution or unexpected remoteEventId",
-        ));
-    }
-    if body.resolution != "retry" && !body.credential_owner_restarted {
-        return Err(AppError::bad_request(
-            "stop and restart the old credential owner before resolving uncertainty",
-        ));
-    }
-    let claim = db::recovery_target(pool, event, operation)
-        .await
-        .map_err(storage)?;
-    let binding = service::check_account(pool, &claim.account_id)
-        .await
-        .map_err(map_error)?;
-    if binding.app_id != claim.app_id || binding.user_id != claim.user_id {
-        return Err(AppError::conflict("account binding changed"));
-    }
-    if body.resolution == "adopt" {
-        let id = body
-            .remote_event_id
-            .as_deref()
-            .filter(|s| !s.is_empty() && s.len() <= 512)
-            .ok_or_else(|| AppError::bad_request("remoteEventId required for adoption"))?;
-        if claim.remote_id.as_deref().is_some_and(|known| known != id) {
-            return Err(AppError::conflict(
-                "recovery cannot replace a known remote event",
-            ));
-        }
-        let client = account::shared_client(&claim.account_id, true)
-            .await
-            .map_err(|e| map_error(e.into()))?;
-        let detail = client
-            .calendar_detail(id)
-            .await
-            .map_err(|e| map_error(e.into()))?;
-        let expected: service::model::EventContent = serde_json::from_value(claim.snapshot.clone())
-            .map_err(|_| AppError::internal("invalid stored intent"))?;
-        // Full provider verification is restricted to recover; CRUD never accepts a remote ID.
-        expected.validate().map_err(AppError::bad_request)?;
-        if !crate::services::kakao::calendar::matches_adoption(
-            &detail,
-            id,
-            &expected.provider_json(),
-        ) {
-            return Err(AppError::conflict(
-                "remote event identity, calendar or content could not be verified",
-            ));
-        }
-    }
-    db::recover(
-        pool,
-        &claim,
-        &body.resolution,
-        body.remote_event_id.as_deref(),
-        &body.note,
-    )
-    .await
-    .map_err(storage)?;
-    ok(json!({"operationId":operation,"resolution":body.resolution}))
+    ok(json!({"operationId":operation,"resolution":resolution}))
 }
