@@ -88,6 +88,10 @@ src/
 │   │   └── tests.rs
 │   ├── automation_candidates/
 │   │   └── verdict_tests.rs
+│   ├── calendar_sync/
+│   │   ├── execution.rs
+│   │   ├── postgres_tests.rs
+│   │   └── read.rs
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
 │   │   ├── canonical_identity_pg_tests.rs
@@ -135,6 +139,7 @@ src/
 │   ├── agents.rs
 │   ├── automation_candidate_card_program.rs
 │   ├── automation_candidates.rs
+│   ├── calendar_sync.rs
 │   ├── cancel_tombstones.rs
 │   ├── dispatch_semaphores.rs
 │   ├── dispatched_sessions.rs
@@ -259,6 +264,7 @@ src/
 │   │   ├── docs/
 │   │   │   ├── inventory/
 │   │   │   │   └── endpoints/
+│   │   │   │       ├── kakao_calendar.rs
 │   │   │   │       ├── mod.rs
 │   │   │   │       ├── part_01.rs
 │   │   │   │       ├── part_02.rs
@@ -332,6 +338,7 @@ src/
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
 │   │   ├── idle_recap.rs
+│   │   ├── kakao_calendar.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
@@ -465,6 +472,10 @@ src/
 │   ├── automation_candidate_materializer/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
+│   ├── calendar_sync/
+│   │   ├── model.rs
+│   │   ├── recovery.rs
+│   │   └── worker.rs
 │   ├── claude/
 │   │   ├── active_usage.rs
 │   │   ├── backend_routing.rs
@@ -1501,6 +1512,12 @@ src/
 │   │   ├── repo_resolver.rs
 │   │   ├── runner.rs
 │   │   └── worktree_resolver.rs
+│   ├── kakao/
+│   │   ├── account.rs
+│   │   ├── calendar.rs
+│   │   ├── test_support.rs
+│   │   ├── token_store.rs
+│   │   └── transport_tests.rs
 │   ├── maintenance/
 │   │   ├── jobs/
 │   │   │   ├── db_retention.rs
@@ -1682,6 +1699,7 @@ src/
 │   ├── auto_queue.rs
 │   ├── automation_candidate_contract.rs
 │   ├── automation_candidate_materializer.rs
+│   ├── calendar_sync.rs
 │   ├── claude.rs
 │   ├── claude_command.rs
 │   ├── claude_compact_context.rs
@@ -1775,6 +1793,8 @@ src/
 │   ├── ai_screen.rs
 │   └── mod.rs
 ├── utils/
+│   ├── secret_file/
+│   │   └── private_directory.rs
 │   ├── api.rs
 │   ├── async_bridge.rs
 │   ├── auth.rs

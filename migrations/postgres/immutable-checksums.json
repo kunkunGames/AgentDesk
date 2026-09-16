@@ -610,6 +610,16 @@
       "path": "migrations/postgres/0119_agent_recovery_pending_intents.sql",
       "sha256": "4f35dfd8d46fe79b41b98f44f78ef819555b19c34f7fe247bfb8332c3a5d7944",
       "version": 119
+    },
+    {
+      "path": "migrations/postgres/0120_kakao_calendar_sync.sql",
+      "sha256": "a1b2581cb55bb38f035a4bccc075d9bb0f89d50d19582ce3b851149f260b0e91",
+      "version": 120
+    },
+    {
+      "path": "migrations/postgres/0121_kakao_calendar_lease_expiry.sql",
+      "sha256": "24bfe53ba58f870d67d19e69d57a4e96ce65eaa7411367d0bc93edaf8df6388f",
+      "version": 121
     }
   ],
   "version": 1
