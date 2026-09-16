@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::services::provider::ProviderKind;
 use crate::utils::format::expand_tilde_string as expand_tilde;
 
+pub mod fallback;
+
 pub const DEFAULT_PROFILE_ID: &str = "default";
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -721,6 +723,15 @@ pub fn allocate_profile_id(
     catalog: &HashMap<String, ProviderAuthProfileDef>,
     existing_homes: &[PathBuf],
 ) -> Result<String, AuthProfileError> {
+    allocate_profile_id_at(&extra_accounts_root()?, provider, catalog, existing_homes)
+}
+
+fn allocate_profile_id_at(
+    root: &Path,
+    provider: &ProviderKind,
+    catalog: &HashMap<String, ProviderAuthProfileDef>,
+    existing_homes: &[PathBuf],
+) -> Result<String, AuthProfileError> {
     let base = format!("{}-alt", provider.as_str());
     let mut candidates = vec![base.clone()];
     for index in 2..64 {
@@ -731,7 +742,7 @@ pub fn allocate_profile_id(
         if catalog.contains_key(&candidate) {
             continue;
         }
-        let home = extra_account_home(provider, &candidate)?;
+        let home = extra_account_home_at(root, provider, &candidate);
         if home.exists()
             || existing_homes.iter().any(|path| {
                 path == &home
@@ -1386,7 +1397,9 @@ mod tests {
         );
 
         let catalog = HashMap::new(); // models the post-unlink catalog state
-        let allocated = allocate_profile_id(&ProviderKind::Codex, &catalog, &[old_home]).unwrap();
+        let allocated =
+            allocate_profile_id_at(root.path(), &ProviderKind::Codex, &catalog, &[old_home])
+                .unwrap();
         assert_eq!(allocated, "codex-alt-2");
     }
 
