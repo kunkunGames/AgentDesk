@@ -60,7 +60,7 @@ These are assessments of the pinned source, not claims of observed production in
 | F16 message dispatch time fence | Confirmed missing checks | SQL now checks live lease and delivery deadline; PostgreSQL regression exercises each expiry and valid dispatch. |
 | F17 stale 401 duplicate refresh | Confirmed missing generation check | Refresh compares the generation rejected by the provider under the account mutex; concurrent old-401 test observes one refresh. |
 | F18 transient refresh classification | Confirmed overbroad reauthorization | Network/429/5xx and invalid success responses remain transient; credentials are retained. |
-| F19 Discord atomic writer coupling | Existing unsuitable dependency | Private-file primitive lives under `utils::secret_file::atomic`, without Discord telemetry or storage dependencies. Failure stages and temporary cleanup tested on Linux. |
+| F19 Discord atomic writer coupling | Existing unsuitable dependency | Private-file primitive lives under `utils::secret_file::private_directory`, without Discord telemetry or storage dependencies. Failure stages and temporary cleanup tested on Linux. |
 | F20 recipient counts versus targets | Existing contract, not a defect | Calendar persists separate target outcomes and barriers. Mock + PostgreSQL test repairs only the failed account without recreating the successful one. |
 | F21 partial external list objects | New adapter constraint | Managed list reads local intent; no arbitrary remote list is exposed or deserialized into required-ID objects. Recovery rejects insufficient detail evidence. |
 

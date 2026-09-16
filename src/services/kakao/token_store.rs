@@ -10,7 +10,7 @@ pub(super) struct StoredTokens {
 }
 pub(super) struct TokenStore {
     #[cfg(unix)]
-    dir: crate::utils::secret_file::atomic::PrivateDirectory,
+    dir: crate::utils::secret_file::private_directory::PrivateDirectory,
     #[cfg(unix)]
     filename: String,
     #[cfg(unix)]
@@ -26,7 +26,7 @@ impl TokenStore {
     #[cfg(unix)]
     fn open(path: &std::path::Path, account: &str) -> Result<Self, KakaoError> {
         super::validate_account_id(account)?;
-        let dir = crate::utils::secret_file::atomic::PrivateDirectory::open(path)
+        let dir = crate::utils::secret_file::private_directory::PrivateDirectory::open(path)
             .map_err(|_| KakaoError::CredentialPersistence)?;
         let lock = dir
             .lock(&format!("{account}.lock"))

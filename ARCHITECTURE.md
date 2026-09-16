@@ -1794,7 +1794,7 @@ src/
 │   └── mod.rs
 ├── utils/
 │   ├── secret_file/
-│   │   └── atomic.rs
+│   │   └── private_directory.rs
 │   ├── api.rs
 │   ├── async_bridge.rs
 │   ├── auth.rs
