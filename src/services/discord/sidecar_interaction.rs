@@ -412,7 +412,10 @@ mod tests {
 
     #[test]
     fn test_escape_posix_shell_arg_with_quotes() {
-        assert_eq!(escape_posix_shell_arg("Kunkun's iPad"), "'Kunkun'\\''s iPad'");
+        assert_eq!(
+            escape_posix_shell_arg("Kunkun's iPad"),
+            "'Kunkun'\\''s iPad'"
+        );
     }
 
     #[test]
@@ -426,9 +429,6 @@ mod tests {
             escape_posix_shell_arg("iPad\"; rm -rf / ; #"),
             "'iPad\"; rm -rf / ; #'"
         );
-        assert_eq!(
-            escape_posix_shell_arg("`whoami`$(id)"),
-            "'`whoami`$(id)'"
-        );
+        assert_eq!(escape_posix_shell_arg("`whoami`$(id)"), "'`whoami`$(id)'");
     }
 }
