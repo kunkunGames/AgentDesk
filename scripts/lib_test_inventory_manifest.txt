@@ -7901,6 +7901,7 @@ services::provider_auth_profile::tests::test_007_named_claude_profiles_flag_cswa
 services::provider_auth_profile::tests::test_008_debug_redacts_env_values
 services::provider_auth_profile::tests::test_012_empty_profile_home_never_copies_global
 services::provider_error_transcript::tests::ignores_normal_error_discussion
+services::provider_error_transcript::tests::qwen_terminal_error_requires_latest_complete_wrapper_envelope
 services::provider_error_transcript::tests::recognizes_narrow_provider_error_envelopes
 services::provider_hosting::tests::any_requested_tui_hosting_channel_runtime_tui_alone_is_enough
 services::provider_hosting::tests::any_requested_tui_hosting_picks_up_explicit_runtime_tui
@@ -8351,6 +8352,9 @@ services::stale_turn_reconciler::tests::unreadable_inflight_provider_maps_unknow
 services::stream_json_cli::codec::tests::agy_codec_does_not_duplicate_aggregate_after_delta
 services::stream_json_cli::codec::tests::agy_codec_failure_wins_over_partial_text_and_process_status
 services::stream_json_cli::codec::tests::agy_codec_keeps_step_failure_alongside_unrelated_stderr
+services::stream_json_cli::codec::tests::agy_codec_nested_errors_and_identity_are_preserved
+services::stream_json_cli::codec::tests::agy_codec_nested_result_without_deltas_and_failure_guards
+services::stream_json_cli::codec::tests::agy_codec_nested_stream_emits_text_and_finishes_once
 services::stream_json_cli::codec::tests::agy_codec_preserves_diagnostics_without_terminal_result
 services::stream_json_cli::codec::tests::agy_codec_preserves_step_failure_when_stderr_is_empty
 services::stream_json_cli::codec::tests::agy_codec_rejects_blank_success_with_or_without_session_identity
