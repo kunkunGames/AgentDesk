@@ -575,10 +575,6 @@ test("kanban-rules dispatches scope-assessment once when a card enters requested
         result: []
       },
       {
-        match: "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?",
-        result: [{ assigned_agent_id: "agent-7", title: "Scope card" }]
-      },
-      {
         // #3594 (T3, codex Finding 2): scope-assessment claims the card's pending
         // auto-queue entry onto its dispatch (consultation pattern).
         match: "FROM auto_queue_entries e JOIN auto_queue_runs r",
@@ -640,10 +636,6 @@ test("kanban-rules does not dispatch scope-assessment twice when status already 
         match: "SELECT id FROM task_dispatches WHERE kanban_card_id = ? AND dispatch_type = 'implementation' AND status = 'completed'",
         result: []
       },
-      {
-        match: "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?",
-        result: [{ assigned_agent_id: "agent-7", title: "Scope dup card" }]
-      }
     ])
   });
 
@@ -760,10 +752,6 @@ test("kanban-rules does not dispatch scope-assessment when preflight is consult_
       // If the (buggy) trigger reached _maybeDispatchScopeAssessment, this is the
       // lookup it would run. Provide a valid assignee so the ONLY thing that can
       // stop a dispatch is the consult_required trigger-condition guard itself.
-      {
-        match: "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?",
-        result: [{ assigned_agent_id: "agent-7", title: "Vague scope card" }]
-      }
     ])
   });
 
