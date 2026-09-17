@@ -22,7 +22,7 @@ class InstallBootstrapPortableTests(unittest.TestCase):
     def test_installer_allows_repo_and_install_dir_overrides(self):
         text = self.read_script()
 
-        self.assertIn('REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"', text)
+        self.assertIn('REPO="${AGENTDESK_INSTALL_REPO:-kunkunGames/AgentDesk}"', text)
         self.assertIn('DEFAULT_INSTALL_DIR="${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}"', text)
         self.assertIn('INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"', text)
         self.assertIn('LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"', text)
