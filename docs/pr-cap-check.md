@@ -31,6 +31,8 @@ their addition budget. Text totals do not describe binary size. External diff
 and text conversion helpers are disabled; normal Git attributes still determine
 whether a file is text or binary.
 
+Common scratch files (e.g. `plan.md`, `pr-body.md`, `*.log`, `bench.rs`, `test.sh`, and `test_*.rs` in the root directory) are actively rejected by the helper as they violate repository hygiene and queue-readiness.
+
 The merge-base calculation follows the existing primitive in
 `scripts/ratchet_admission.py` (`_merge_base`), whose configurable candidates
 and local fallback serve a different checker. Use this entrypoint for PR size

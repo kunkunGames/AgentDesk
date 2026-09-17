@@ -1,0 +1,31 @@
+What changed
+- Added common scratch files (`plan.md`, `pr-body.md`, `test.sh`, `bench.rs`, `*.log`, and `test_*.rs` at root directory) to the failure conditions in `scripts/pr_cap_check.sh`.
+- Added unit tests to `scripts/test_pr_cap_check.py` to verify scratch file detection and rejection logic.
+- Documented the change in `docs/pr-cap-check.md`.
+
+Why
+- LLM agents and developers sometimes inadvertently include ad-hoc scratch files or root-level scripts. Banning them at the PR size check script prevents repository pollution, enforces cleaner commits, and enhances code review readiness before PR merge. This aligns directly with `TEST_PLAN.md` queue hygiene guidelines.
+
+WorkFingerprint
+- Agent: Steward
+- Boundary: `scripts/pr_cap_check.sh`, `scripts/test_pr_cap_check.py`, `docs/pr-cap-check.md`
+- Primary files: `scripts/pr_cap_check.sh`, `scripts/test_pr_cap_check.py`, `docs/pr-cap-check.md`
+- Queue hygiene invariant: Guard against repository pollution by blocking scratch files from PR size limits script checking
+- Related PRs/issues: Verified no overlap with open PRs.
+- Non-overlapping reason: The change is specific to the PR cap bash script and Python tests.
+
+Duplicate/overlap check
+- Checked open PRs using `git fetch` and inspecting `origin/` refs. No overlapping work found.
+
+Verification commands and results
+- `git diff --check`: PASS
+- `python3 -m unittest scripts.test_pr_cap_check`: PASS (16 tests in 2.7s)
+
+Skipped checks and reasons
+- `npm run test:policies`: Skipped, no JS/policy changes.
+- `cargo check/test`: Skipped, no Rust code changed.
+- `./scripts/verify-dashboard.sh`: Skipped, no UI code changed.
+
+Risk and rollback notes
+- **Risk:** Low. If legitimate files share these exact names, developers might be blocked. Safeguards verify that `test_*.rs` and `scratch.*` are only blocked at the root directory level.
+- **Rollback notes:** Revert the commit to remove the `case` statement in `scripts/pr_cap_check.sh`.
