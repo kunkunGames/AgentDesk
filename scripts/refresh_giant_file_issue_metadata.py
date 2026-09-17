@@ -19,7 +19,7 @@ import generate_inventory_docs as inventory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_PATH = REPO_ROOT / "scripts" / "giant_file_issue_metadata.json"
-DEFAULT_GITHUB_REPOSITORY = "itismyfield/AgentDesk"
+DEFAULT_GITHUB_REPOSITORY = "kunkunGames/AgentDesk"
 
 
 class RefreshError(RuntimeError):
