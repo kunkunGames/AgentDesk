@@ -645,7 +645,7 @@ async fn set_dispatch_status_on_pg_tx_with_sync(
                  updated_at = NOW(),
                  last_stuck_alert_at = NULL,
                  completed_at = CASE
-                     WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW())
+                     WHEN $1 IN ('completed', 'failed', 'cancelled') THEN COALESCE(completed_at, NOW())
                      ELSE completed_at
                  END
              WHERE id = $3
@@ -682,7 +682,7 @@ async fn set_dispatch_status_on_pg_tx_with_sync(
                  updated_at = NOW(),
                  last_stuck_alert_at = NULL,
                  completed_at = CASE
-                     WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW())
+                     WHEN $1 IN ('completed', 'failed', 'cancelled') THEN COALESCE(completed_at, NOW())
                      ELSE completed_at
                  END
              WHERE id = $2
