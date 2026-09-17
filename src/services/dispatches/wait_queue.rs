@@ -114,7 +114,7 @@ pub(crate) fn spawn_wait_queue_wake_pg(
                     source,
                     "[dispatch] dispatch outbox wait queue wake-up failed"
                 )
-            },
+            }
         }
     });
 }
