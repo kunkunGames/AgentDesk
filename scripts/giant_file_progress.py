@@ -600,9 +600,9 @@ def main() -> int:
             # to equal the base repository adds no provenance guarantee, but it
             # rejects legitimate PRs from a trusted fork before the same
             # fail-closed object checks can run.
-            if repository != "itismyfield/AgentDesk" or not env.get("GFP_HEAD_REPOSITORY"):
+            if repository not in ("itismyfield/AgentDesk", "kunkunGames/AgentDesk") or not env.get("GFP_HEAD_REPOSITORY"):
                 raise RuntimeError(
-                    "progress requires a pull request targeting itismyfield/AgentDesk "
+                    "progress requires a pull request targeting itismyfield/AgentDesk or kunkunGames/AgentDesk "
                     "with a resolved head repository"
                 )
             event_base_sha = oid(env.get("GFP_BASE_SHA", ""))
