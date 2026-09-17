@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 REL_PORT="${AGENTDESK_REL_PORT:-$ADK_DEFAULT_PORT}"
 API="http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}"
-REPO="${AQ_REPO:-itismyfield/AgentDesk}"
+REPO="${AQ_REPO:-kunkunGames/AgentDesk}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
