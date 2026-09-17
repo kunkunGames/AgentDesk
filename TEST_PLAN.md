@@ -6,6 +6,7 @@
 - **Infrastructure CI Failures:** If a CI failure is determined to be an infrastructure issue or runner cancellation (e.g., 'The runner has received a shutdown signal') with no code fix applicable, produce an empty commit no-change report explaining the cancellation.
 - **Stale Branch Cleanup:** Treat low-signal or stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place. A no-change result should NOT become a PR unless it explicitly changes a queue-hygiene artifact.
 - **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
+- **False Verification Guard:** Do not falsely claim verification (e.g. PostgreSQL, Discord, tmux, provider runtime, browser, CI) unless it was actually executed. If a required check cannot run in the environment, state the exact reason in the skipped checks section and explain the residual risk.
 
 ## PR Body Requirements
 Every PR must include:
