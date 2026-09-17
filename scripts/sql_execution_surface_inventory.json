@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "f66789a175ac3d44c9850e2c297fc54cc19dea02",
+  "measured_at_sha": "e062de7d3dc2c319f98b64a77afbf55dda50f538",
   "records": [
     {
       "root": "migrations/postgres",
@@ -765,7 +765,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:b9ad46692ae37ec0921ccecee7ff2272db04b52b7651007046fae40f0a242449"
+      "fingerprint": "sha256:d55bcb63ab4e2cba57994fe24f8d1c46a68cb957df1eda043e71c7a41e2aef48"
     },
     {
       "root": "migrations/postgres",
@@ -774,7 +774,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:9d6286a9e3f10eb1e1bf9321f23651a5caa2d0755b586fb1c945f0948440759c"
+      "fingerprint": "sha256:889a6472056a5b3a4a83d453995586a3270246ba91f0e857f2c404681e4053f0"
     },
     {
       "root": "migrations/postgres",
@@ -783,7 +783,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:7ea6416f064b7f5602d0265b53ed7155aaee990f491713c72e1604d04026e7dc"
+      "fingerprint": "sha256:70c76f9f72a4c05e99e63bb8c98dde513eafff9c8cb4cb8dffb610b3b5a72c66"
     },
     {
       "root": "migrations/postgres",
@@ -792,7 +792,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:bbbf56f7b145285081fc92b303cc630be7abb39eb69f71477da35a87d5a5128f"
+      "fingerprint": "sha256:36ae4a9b30232e491ddc855cb9d9894396d43ddee8f8686998e4f79d06eced45"
     },
     {
       "root": "migrations/postgres",
@@ -801,7 +801,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:3afc6be66e4bfbd8c4af4e3251b6c3cc47c02bfcb25504c806172675696d05da"
+      "fingerprint": "sha256:96ff16bc46703204e382d052ddd1c39d79e77ee1a12414fbcce00e215b6fe240"
     },
     {
       "root": "migrations/postgres",
@@ -810,7 +810,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:1cf71a4adc5da842363eee7327a4da79bd24dd6731396527bf6e81f32204e1d5"
+      "fingerprint": "sha256:9122802b65cf35dadc5d156a74bf5b6bb33d9f018069e6f613ee3b5605290196"
     },
     {
       "root": "migrations/postgres",
@@ -954,7 +954,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:dca4f82db2633bd087f7c40e906449377a11566d4a1685ee21f3b662dbef80e4"
+      "fingerprint": "sha256:8b33d2883eb4c03ceb637ec5cd1267d2cd57eb4e513bab547a13bbd074ddfdbf"
     },
     {
       "root": "migrations/postgres",
@@ -963,7 +963,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:7055070121519089503ea966612d8df84c77bbdfef0040b086f3359754e73b07"
+      "fingerprint": "sha256:4e595cd8b2efc969fa62aa2b0e51390a1665d7fa65b191292b882601aac7005b"
     },
     {
       "root": "migrations/postgres",
@@ -972,7 +972,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:e2113b2adb7c97358a023e7ca0b4d1f8df8bb75e7395bd94b1cdff95756f1984"
+      "fingerprint": "sha256:8a22b137eb1c4b84efd9607fa14afa8635d274c40a9b3d17b7230ab097f2bc75"
     },
     {
       "root": "migrations/postgres",
@@ -981,7 +981,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:0740848dc098297c021cddab8182c8d31def07da8dbe3eb3e9f67af2b3354493"
+      "fingerprint": "sha256:da8ec5f412e147682dd576b5f7f8ee26973c0ec7151e765c3b9fea471c05234e"
     },
     {
       "root": "migrations/postgres",
@@ -990,7 +990,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:53290fb0973b951613c2930e11c12497a9d26f24098b8030b734b94794b11640"
+      "fingerprint": "sha256:daa1685c2c4f8ae09485ab75678d1f11b795753184ad61137dd9da00012dfffb"
     },
     {
       "root": "migrations/postgres",
@@ -999,7 +999,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:a185367a6db841a34a990beac025b8f99c8e0dfc946654f063be41643c2bd0cc"
+      "fingerprint": "sha256:b0a86dca7b4e359d9a270f6b33eff90b9d32bedbcab8318a22edd0e1f4684fbf"
     },
     {
       "root": "migrations/postgres",
@@ -1008,7 +1008,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:dd93a661535ba0b37844c97e83427db0b7888027c54252139fa0cd4a9d0ea266"
+      "fingerprint": "sha256:92c810e4274b5dc9a7f3b0cb013a2548951edcacc598e5a76f4a9f2d62e6eb90"
     },
     {
       "root": "migrations/postgres",
@@ -1017,7 +1017,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:aa9df9e6f1b866f08060d41654516e4152cd1c885b2f45804a8bd6675b2530cf"
+      "fingerprint": "sha256:90bba00e7abf242e2b81894dab30cfd0765b618dc870b902637cedb6215bad58"
     },
     {
       "root": "migrations/postgres",
@@ -1026,7 +1026,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:c7b4eb46860f27e65b19a937de221afe4992e0d462503f83c9b55dcdd9a7aef0"
+      "fingerprint": "sha256:72b70d9dc45855f4841301cd70178956295c72431a346ebcceb0da3856c97bde"
     },
     {
       "root": "migrations/postgres",
@@ -1035,7 +1035,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:e33e758c6566f1ba5c02ff6f0dfe9b60d217589d369d5f64f4e92a3f8be492b7"
+      "fingerprint": "sha256:460d93d1c5da530901e59c84a719782d8b5a6aaf20446b0a14220f7c07e9534c"
     },
     {
       "root": "migrations/postgres",
@@ -1044,7 +1044,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:99cba304725541bfdb937388d5e7c8dcb2f31853d61d97912ea6a414a402100f"
+      "fingerprint": "sha256:959fd34719db656d6a7cadea99e90c4015612c589c786c27e440f736f32595c2"
     },
     {
       "root": "migrations/postgres",
@@ -1053,7 +1053,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:46d6d2c3872610d972d49ea06ce889d0f7b58331068c03bca62c1911db136938"
+      "fingerprint": "sha256:11b1b82573dfe24ac0ebda89037b0e9384b5f8ea2575a37cdda4d42c20fe529f"
     },
     {
       "root": "migrations/postgres",
@@ -1062,7 +1062,7 @@
       "api": "migration.file",
       "symbol": "file",
       "classification": "STATIC_FILE",
-      "fingerprint": "sha256:d389902100a8a7e9d96e3ece7ac17954ca70891e9828dfb0c2094b68333f6b3c"
+      "fingerprint": "sha256:7595bbed9624de52eebe3074d660418d8aa2f4b8ccfc9a87c1d87db5a96e7d6e"
     },
     {
       "root": "migrations/postgres",
@@ -1125,7 +1125,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:a34cd467c5c01a75428a046c0f54ff54fb5c5bd33b90abd3c4815e5e9b717ca8"
+      "fingerprint": "sha256:b0ac059f4ef3d65c50d5d8f11df6f8f95e25e5050b73351eaaca7752bca37e6e"
     },
     {
       "root": "migrations/postgres",
@@ -12924,7 +12924,7 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:9c8c8f49beb5399b908e8ce6ecd72167659f3aa3cc6a0020d6fdaed33331ec83"
+      "fingerprint": "sha256:a01b33b699eb27e9f85cee7b29228f23390479a87143c873f554b5686922f7f9"
     },
     {
       "root": "src",
@@ -12987,7 +12987,7 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:e66d6d4726ee1d9cad19992664e088c4768a86dbac337e006387a6270e4179be"
+      "fingerprint": "sha256:ee7f04f1a5a21dcbaf4649885078ec39871dd5d4161de3ee4db4db9446ffd60c"
     },
     {
       "root": "src",
