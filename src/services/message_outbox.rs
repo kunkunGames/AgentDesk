@@ -241,7 +241,8 @@ fn warn_outbox_enqueue_failure(
         source = message.source,
         reason_code,
         session_key = session_key.as_deref(),
-        "failed to enqueue outbox message: {error}"
+        error = %error,
+        "failed to enqueue outbox message"
     );
 }
 
@@ -258,7 +259,8 @@ fn warn_lifecycle_enqueue_failure(
         target,
         reason_code,
         session_key = session_key.as_deref(),
-        "failed to enqueue lifecycle notification: {error}"
+        error = %error,
+        "failed to enqueue lifecycle notification"
     );
 }
 
