@@ -218,22 +218,22 @@ write_issue_output_case() {
 set -euo pipefail
 case "$output_mode" in
     truncated)
-        python3 -c 'import sys; p="https://github.com/kunkunGames/AgentDesk/issues/"; sys.stdout.write(p + "7" * (8192 - len(p)))'
+        python3 -c 'import sys; p="https://github.com/itismyfield/AgentDesk/issues/"; sys.stdout.write(p + "7" * (8192 - len(p)))'
         ;;
     exact)
-        python3 -c 'import sys; p="https://github.com/kunkunGames/AgentDesk/issues/"; sys.stdout.write(p + "7" * (4096 - len(p)))'
+        python3 -c 'import sys; p="https://github.com/itismyfield/AgentDesk/issues/"; sys.stdout.write(p + "7" * (4096 - len(p)))'
         ;;
     nul)
-        python3 -c 'import sys; from pathlib import Path; out=b"https://github.com/kunkunGames/AgentDesk/issues/5274\n"+b"\0"*5000; err=b"\0"*5000; Path(sys.argv[1]).write_text(f"{len(out)} {len(err)}\n"); sys.stdout.buffer.write(out); sys.stderr.buffer.write(err)' "$TMP_ROOT/${label}-nul-counts"
+        python3 -c 'import sys; from pathlib import Path; out=b"https://github.com/itismyfield/AgentDesk/issues/5274\n"+b"\0"*5000; err=b"\0"*5000; Path(sys.argv[1]).write_text(f"{len(out)} {len(err)}\n"); sys.stdout.buffer.write(out); sys.stderr.buffer.write(err)' "$TMP_ROOT/${label}-nul-counts"
         exit 0
         ;;
     empty) : ;;
     failure)
-        printf '%s\\n' 'https://github.com/kunkunGames/AgentDesk/issues/5274'
+        printf '%s\\n' 'https://github.com/itismyfield/AgentDesk/issues/5274'
         exit 1
         ;;
-    partial) printf '%s' 'https://github.com/kunkunGames/AgentDesk/issu' ;;
-    *) printf '%s\\n' 'https://github.com/kunkunGames/AgentDesk/issues/5274' ;;
+    partial) printf '%s' 'https://github.com/itismyfield/AgentDesk/issu' ;;
+    *) printf '%s\\n' 'https://github.com/itismyfield/AgentDesk/issues/5274' ;;
 esac
 printf '%s\\n' 'https://stderr.example.invalid/first' >&2
 EOF
@@ -306,7 +306,7 @@ run_issue_output_variant() {
     bash "$case_path" > "$output_path" 2>&1 || rc=$?
     cat "$output_path"
     if [ "$expected" = value ] && [ "$rc" -eq 0 ] \
-        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/kunkunGames/AgentDesk/issues/5274' "$output_path" \
+        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/itismyfield/AgentDesk/issues/5274' "$output_path" \
         && ! grep -qF 'https://stderr.example.invalid/first' "$output_path"; then
         echo "issue_url value restored: ok (stdout URL survived stderr noise)"
     elif [ "$expected" = truncation ] && [ "$rc" -eq 0 ] \
@@ -314,12 +314,12 @@ run_issue_output_variant() {
         && ! grep -qF 'Post-deploy smoke issue created (confirmed mode):' "$output_path"; then
         echo "stdout truncation detection restored: ok (no URL reported)"
     elif [ "$expected" = exact ] && [ "$rc" -eq 0 ] \
-        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/kunkunGames/AgentDesk/issues/' "$output_path" \
+        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/itismyfield/AgentDesk/issues/' "$output_path" \
         && ! grep -qF 'returned truncated stdout' "$output_path"; then
         echo "exact-cap stdout restored: ok (4096 bytes not reported as truncated)"
     elif [ "$expected" = nul_unsupported ] && [ "$rc" -eq 0 ] \
         && [ "$(tr -d '\n' < "$nul_counts_path")" = '5053 5000' ] \
-        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/kunkunGames/AgentDesk/issues/5274' "$output_path" \
+        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/itismyfield/AgentDesk/issues/5274' "$output_path" \
         && ! grep -qF 'returned truncated stdout' "$output_path" \
         && ! grep -aFq '[gh stderr truncated at 4096 bytes]' "$evidence_path" \
         && [ ! -s "$evidence_path" ]; then
@@ -355,13 +355,13 @@ run_issue_output_mutant() {
     bash "$case_path" > "$output_path" 2>&1 || rc=$?
     cat "$output_path"
     if [ "$mutant_kind" = value ] \
-        && ! grep -qF 'https://github.com/kunkunGames/AgentDesk/issues/5274' "$output_path"; then
+        && ! grep -qF 'https://github.com/itismyfield/AgentDesk/issues/5274' "$output_path"; then
         echo "issue_url value mutant: FAILED (self-assertion: fixture URL was not reported)"
     elif [ "$mutant_kind" = truncation ] \
-        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/kunkunGames/AgentDesk/issues/' "$output_path"; then
+        && grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/itismyfield/AgentDesk/issues/' "$output_path"; then
         echo "stdout truncation mutant: FAILED (self-assertion: truncated URL was reported)"
     elif [ "$mutant_kind" = merge ] \
-        && ! grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/kunkunGames/AgentDesk/issues/5274' "$output_path"; then
+        && ! grep -qF 'Post-deploy smoke issue created (confirmed mode): https://github.com/itismyfield/AgentDesk/issues/5274' "$output_path"; then
         echo "stdout/stderr merge mutant: FAILED (self-assertion: expected stdout URL was not reported)"
     elif [ "$mutant_kind" = empty ] \
         && ! grep -qF 'returned empty stdout' "$output_path"; then
@@ -438,7 +438,7 @@ mode = sys.argv[2]
 linger_s = float(sys.argv[3])
 trigger_path = Path(sys.argv[4])
 grown_path = Path(sys.argv[5])
-prefix = b"https://github.com/kunkunGames/AgentDesk/issues/"
+prefix = b"https://github.com/itismyfield/AgentDesk/issues/"
 payload = prefix + (b"7" if mode == "race" else b"5274\\n" + (b"f" * 8192))
 sys.stdout.buffer.write(payload)
 sys.stdout.buffer.flush()

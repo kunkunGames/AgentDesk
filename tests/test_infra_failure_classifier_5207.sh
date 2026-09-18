@@ -449,7 +449,7 @@ assert_e2e() {
   out="$(
     PATH="$E2E_BIN:$PATH" \
     GH_FIXTURE_DIR="$E2E_CASE" \
-    GITHUB_REPOSITORY="kunkunGames/AgentDesk" \
+    GITHUB_REPOSITORY="itismyfield/AgentDesk" \
     RUN_ID=31116949449 \
     RUN_ATTEMPT=1 \
     RERUN_DRY_RUN=1 \
