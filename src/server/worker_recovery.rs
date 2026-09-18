@@ -235,7 +235,18 @@ async fn supervise_restartable<MakeFuture, Fut, RecordTerminal>(
             WORKER_RESTART_BUDGET_EXHAUSTED_COUNT.fetch_add(1, Ordering::AcqRel);
             tracing::error!(
                 worker = spec.name,
+                target = spec.target,
+                observability_target = spec.target,
+                kind = spec.kind.as_doc_str(),
+                stage = spec.start_stage.as_doc_str(),
+                order = spec.start_order,
                 restart = spec.restart_policy.as_doc_str(),
+                shutdown = spec.shutdown_policy.as_doc_str(),
+                execution_scope = spec.execution_scope.as_doc_str(),
+                owner = spec.owner,
+                health = spec.health_owner,
+                responsibility = spec.responsibility,
+                notes = spec.notes,
                 reason = reason.as_doc_str(),
                 restart_count = restart_times.len(),
                 max_restarts = budget.max_restarts,
@@ -268,7 +279,18 @@ async fn supervise_restartable<MakeFuture, Fut, RecordTerminal>(
         consecutive_failures = consecutive_failures.saturating_add(1);
         tracing::warn!(
             worker = spec.name,
+            target = spec.target,
+            observability_target = spec.target,
+            kind = spec.kind.as_doc_str(),
+            stage = spec.start_stage.as_doc_str(),
+            order = spec.start_order,
             restart = spec.restart_policy.as_doc_str(),
+            shutdown = spec.shutdown_policy.as_doc_str(),
+            execution_scope = spec.execution_scope.as_doc_str(),
+            owner = spec.owner,
+            health = spec.health_owner,
+            responsibility = spec.responsibility,
+            notes = spec.notes,
             reason = reason.as_doc_str(),
             restart_attempt,
             backoff_ms = backoff.as_millis(),
@@ -313,7 +335,18 @@ where
         _ = wait_until_shutdown(shutdown) => {
             tracing::info!(
                 worker = spec.name,
+                target = spec.target,
+                observability_target = spec.target,
+                kind = spec.kind.as_doc_str(),
+                stage = spec.start_stage.as_doc_str(),
+                order = spec.start_order,
                 restart = spec.restart_policy.as_doc_str(),
+                shutdown = spec.shutdown_policy.as_doc_str(),
+                execution_scope = spec.execution_scope.as_doc_str(),
+                owner = spec.owner,
+                health = spec.health_owner,
+                responsibility = spec.responsibility,
+                notes = spec.notes,
                 "worker-local Tokio supervisor waiting for worker shutdown cleanup"
             );
             let grace = tokio::time::sleep(WORKER_LOCAL_SHUTDOWN_GRACE);
@@ -323,7 +356,18 @@ where
                 _ = &mut grace => {
                     tracing::warn!(
                         worker = spec.name,
+                        target = spec.target,
+                        observability_target = spec.target,
+                        kind = spec.kind.as_doc_str(),
+                        stage = spec.start_stage.as_doc_str(),
+                        order = spec.start_order,
                         restart = spec.restart_policy.as_doc_str(),
+                        shutdown = spec.shutdown_policy.as_doc_str(),
+                        execution_scope = spec.execution_scope.as_doc_str(),
+                        owner = spec.owner,
+                        health = spec.health_owner,
+                        responsibility = spec.responsibility,
+                        notes = spec.notes,
                         "worker-local Tokio worker exceeded graceful shutdown timeout; aborting"
                     );
                     worker_handle.abort();
