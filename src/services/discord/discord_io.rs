@@ -98,7 +98,7 @@ pub(super) async fn try_handle_pending_dm_reply(
             )
             .await
             {
-                tracing::warn!(error = %e, "  [dm-reply] notify source agent failed");
+                tracing::warn!("  [dm-reply] notify source agent failed: {e}");
                 // Record failure in context so readConsumed can detect it
                 let reply_id = info.id;
                 let err_msg = format!("{e}");

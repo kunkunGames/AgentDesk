@@ -107,14 +107,12 @@ pub(crate) fn spawn_wait_queue_wake_pg(
                 "[dispatch] dispatch outbox wait queue wake-up"
             ),
             Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    dispatch_id = dispatch_id.as_deref(),
-                    source,
-                    "[dispatch] dispatch outbox wait queue wake-up failed"
-                )
-            }
+            Err(error) => tracing::warn!(
+                error,
+                dispatch_id = dispatch_id.as_deref(),
+                source,
+                "[dispatch] dispatch outbox wait queue wake-up failed"
+            ),
         }
     });
 }
