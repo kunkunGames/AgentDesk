@@ -1735,7 +1735,7 @@ fn execute_streaming_local_tui_tmux(
 
     let turn_lock =
         crate::services::claude_tui::composer_lock::session_turn_lock(tmux_session_name);
-    let _turn_guard = turn_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let _turn_guard = turn_lock.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock in claude adapter"); poison.into_inner() });
     debug_log(&format!(
         "Claude TUI session turn lock acquired: {}",
         tmux_session_name
