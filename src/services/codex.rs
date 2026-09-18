@@ -1685,7 +1685,7 @@ fn execute_streaming_local_tui_tmux(
     let turn_lock = warm_followup_enabled.then(|| codex_tui_session_turn_lock(tmux_session_name));
     let _turn_guard = turn_lock
         .as_ref()
-        .map(|lock| lock.lock().unwrap_or_else(|error| error.into_inner()));
+        .map(|lock| lock.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock in codex adapter"); poison.into_inner() }));
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Codex,
         tmux_session_name,

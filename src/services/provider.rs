@@ -800,7 +800,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.completion_cleanup.store(true, Ordering::Release);
     }
 
@@ -809,7 +809,7 @@ impl CancelToken {
     }
 
     pub(crate) fn store_child_pid(&self, pid: u32) {
-        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) =
+        *self.child_pid.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() }) =
             Some(CapturedProcess::capture(pid));
     }
 
@@ -826,19 +826,19 @@ impl CancelToken {
 
     #[cfg(test)]
     pub(crate) fn store_child_pid_without_identity_for_test(&self, pid: u32) {
-        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(CapturedProcess {
+        *self.child_pid.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() }) = Some(CapturedProcess {
             pid,
             identity: None,
         });
     }
 
     pub(crate) fn clear_child_pid(&self) {
-        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.child_pid.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() }) = None;
     }
 
     pub(crate) fn store_child_pid_if_empty(&self, pid: u32) {
         let captured = CapturedProcess::capture(pid);
-        let mut child_pid = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child_pid = self.child_pid.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         if child_pid.is_none() {
             *child_pid = Some(captured);
         }
@@ -876,8 +876,8 @@ impl CancelToken {
         let mut kind = self
             .cancel_source_kind
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut current_label = self.cancel_source.lock().unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
+        let mut current_label = self.cancel_source.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         if current_label.is_none() {
             *current_label = Some(label);
             if kind.is_none() {
@@ -890,7 +890,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.set_cancel_source_if_absent_locked(source);
     }
 
@@ -903,8 +903,8 @@ impl CancelToken {
         let mut kind = self
             .cancel_source_kind
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut current_label = self.cancel_source.lock().unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
+        let mut current_label = self.cancel_source.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         if kind.is_none()
             || (*kind == Some(CancelSource::Other) && classified != CancelSource::Other)
         {
@@ -917,7 +917,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.set_cancel_source_locked(source);
     }
 
@@ -928,7 +928,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.set_cancel_source_kind_transactional(kind, |_| {});
     }
 
@@ -936,7 +936,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.publish_watchdog_timeout_locked()
     }
 
@@ -948,11 +948,11 @@ impl CancelToken {
         let mut kind = self
             .cancel_source_kind
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         let mut label = self
             .cancel_source
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         if self
             .cancelled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -971,7 +971,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.set_cancel_source_locked(source);
         self.cancelled.store(true, Ordering::Release);
     }
@@ -980,7 +980,7 @@ impl CancelToken {
         let _publication = self
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         self.set_cancel_source_if_absent_locked(source);
         self.cancelled.store(true, Ordering::Release);
     }
@@ -995,8 +995,8 @@ impl CancelToken {
         let mut current_kind = self
             .cancel_source_kind
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut label = self.cancel_source.lock().unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
+        let mut label = self.cancel_source.lock().unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         let replace_provisional_cleanup_label =
             *current_kind == Some(CancelSource::Other) && label.as_deref() == Some("tmux_cleanup");
         *current_kind = Some(kind);
@@ -1018,7 +1018,7 @@ impl CancelToken {
     pub fn cancel_source(&self) -> Option<String> {
         self.cancel_source
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() })
             .clone()
     }
 
@@ -1030,7 +1030,7 @@ impl CancelToken {
         *self
             .cancel_source_kind
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() })
     }
 }
 
@@ -2032,7 +2032,7 @@ mod cancel_token_tests {
         let publication = token
             .cancellation_publication
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .unwrap_or_else(|poison| { tracing::warn!("Recovered poisoned lock for CancelToken"); poison.into_inner() });
         let token_for_poll = Arc::clone(&token);
         let poll =
             std::thread::spawn(move || enforce_watchdog_deadline(&token_for_poll, now + 1_000));
