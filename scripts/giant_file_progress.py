@@ -600,13 +600,13 @@ def main() -> int:
             # to equal the base repository adds no provenance guarantee, but it
             # rejects legitimate PRs from a trusted fork before the same
             # fail-closed object checks can run.
-            if repository != "itismyfield/AgentDesk" or not env.get("GFP_HEAD_REPOSITORY"):
+            if repository not in ("itismyfield/AgentDesk", "kunkunGames/AgentDesk") or not env.get("GFP_HEAD_REPOSITORY"):
                 raise RuntimeError(
-                    "progress requires a pull request targeting itismyfield/AgentDesk "
+                    f"progress requires a pull request targeting {repository} "
                     "with a resolved head repository"
                 )
-            event_base_sha = oid(env.get("GFP_BASE_SHA", ""))
-            head_sha = oid(env.get("GFP_HEAD_SHA", ""))
+            event_base_sha = oid(env.get("GFP_BASE_SHA")) if env.get("GFP_BASE_SHA") else ""
+            head_sha = oid(env.get("GFP_HEAD_SHA")) if env.get("GFP_HEAD_SHA") else ""
             parents = str(git("rev-list", "--parents", "-n1", candidate_sha)).split()
             payload.update({"event_base_sha": event_base_sha, "head_sha": head_sha,
                             "merge_sha": candidate_sha, "candidate_parents": parents[1:]})
