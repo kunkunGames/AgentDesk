@@ -50,7 +50,30 @@ while IFS= read -r -d '' record; do
     IFS= read -r -d '' old_path && IFS= read -r -d '' new_path \
       || fail 'incomplete numstat rename'
     [[ -n "$old_path" && -n "$new_path" ]] || fail 'empty numstat rename path'
+    file_to_check="$new_path"
+  else
+    file_to_check="$file_path"
   fi
+
+  case "$file_to_check" in
+    plan.md | pr-body.md | pr_body.md | test.sh | bench.rs )
+      fail "scratch file detected: $file_to_check"
+      ;;
+    *.log )
+      fail "scratch file detected: $file_to_check"
+      ;;
+    test_*.rs )
+      if [[ "$file_to_check" != */* ]]; then
+        fail "scratch file detected: $file_to_check"
+      fi
+      ;;
+    scratch.* )
+      if [[ "$file_to_check" != */* ]]; then
+        fail "scratch file detected: $file_to_check"
+      fi
+      ;;
+  esac
+
   files=$((files + 1))
   if [[ "$added" == - && "$deleted" == - ]]; then
     binaries=$((binaries + 1))
