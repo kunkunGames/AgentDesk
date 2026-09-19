@@ -10,7 +10,7 @@
 - [ ] **Duplicate PR guard:** I have checked for overlapping open PRs before creating this PR (especially for generated refresh work). If `gh` is unavailable, I used `git fetch` and checked remote branches.
 - [ ] **No-change verification:** If this PR claims no change, I have verified it modifies zero files using `gh pr view --json files` (or `git show --stat` if `gh` is unavailable). (If an unavoidable no-change PR is opened, its body lists the exact overlapping PR numbers and branches).
 - [ ] **Stale branch cleanup:** I am not salvaging a stale broad branch in-place. Instead, I am closing stale branches and recreating clean branches from main.
-- [ ] **Scratch file cleanup:** I have run `git status` or a changed-file audit to ensure no ad-hoc scratch files (e.g. `plan.md`, `pr-body.md`) or unrelated test scripts (e.g. `.sh`, `.sql`) are included in this PR.
+- [ ] **Scratch file & unrelated change cleanup:** I have run `git status` or a changed-file audit to ensure no ad-hoc scratch files (e.g. `plan.md`, `pr-body.md`), unrelated test scripts (e.g. `.sh`, `.sql`), or stale broad branch baggage are included in this PR.
 - [ ] **PR size:** I ran `scripts/pr_cap_check.sh` on this PR head (20 files / +800 additions, deletion credit 0; semantics: `docs/pr-cap-check.md`).
 - [ ] **Docs-only verification:** If this is a docs-only change, I have explicitly stated 'docs-only' in the PR body and listed the source files or commands used to verify the documentation.
 
