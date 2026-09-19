@@ -208,6 +208,31 @@ class PrCapCheckTest(unittest.TestCase):
         self.assert_fail(result)
         self.assertIn("cannot compute numstat", result.stderr)
 
+    def test_scratch_files_rejected(self) -> None:
+        scratch_names = [
+            "plan.md",
+            "pr-body.md",
+            "pr_body.md",
+            "test.sh",
+            "bench.rs",
+            "build.log",
+            "test_normalize.rs",
+            "scratch.txt"
+        ]
+        for name in scratch_names:
+            with self.subTest(name=name):
+                # Clean up repo from previous subtest
+                if (self.repo / name).exists():
+                    (self.repo / name).unlink()
+                self.add_lines(1, name)
+                self.commit()
+                result = self.check_cap()
+                self.assert_fail(result)
+                self.assertIn(f"scratch file detected: {name}", result.stderr)
+
+                # Revert commit for next subtest
+                self.git(self.repo, "reset", "--hard", "HEAD~1")
+
 
 if __name__ == "__main__":
     unittest.main()
