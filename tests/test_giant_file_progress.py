@@ -638,8 +638,8 @@ class GuardRepinTest(unittest.TestCase):
             if args[0] == "diff" and binary: return patch
             raise AssertionError(args)
         def snapshot(root, evaluation_date=None): return candidate if root.name == "candidate" else base
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
-               "GFP_HEAD_REPOSITORY": "itismyfield/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
+        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "kunkunGames/AgentDesk",
+               "GFP_HEAD_REPOSITORY": "kunkunGames/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
                "GFP_BASE_SHA": "base", "GFP_HEAD_SHA": "head"}
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "evidence.json"
@@ -953,8 +953,8 @@ class GiantFileLedgerIntegrationTest(unittest.TestCase):
 
     def run_main(self, before, after, now, *, candidate="merge", base="base",
                  head="head", origin="base", checkout=None, parents=None,
-                 head_repository="itismyfield/AgentDesk"):
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
+                 head_repository="kunkunGames/AgentDesk"):
+        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "kunkunGames/AgentDesk",
                "GFP_HEAD_REPOSITORY": head_repository, "GFP_CANDIDATE_SHA": candidate,
                "GFP_BASE_SHA": base, "GFP_HEAD_SHA": head}
         lineage = [candidate, base, head] if parents is None else parents
@@ -1242,8 +1242,8 @@ class GiantFileCandidateBaseTest(unittest.TestCase):
             self.parents if parents is None else parents)
 
     def run_candidate(self, *, event_base=None, head=None, candidate=None):
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
-               "GFP_HEAD_REPOSITORY": "itismyfield/AgentDesk",
+        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "kunkunGames/AgentDesk",
+               "GFP_HEAD_REPOSITORY": "kunkunGames/AgentDesk",
                "GFP_CANDIDATE_SHA": candidate or self.candidate,
                "GFP_BASE_SHA": event_base or self.event_base,
                "GFP_HEAD_SHA": head or self.head}
