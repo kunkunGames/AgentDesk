@@ -3609,7 +3609,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 "PostgreSQL",
                 format!("{summary} — runtime init failed"),
-                "postgres 연결 검증용 async runtime 생성에 실패했습니다.",
+                "failed to create async runtime for postgres check.",
             )
             .with_expected_actual(
                 "postgres check runtime initializes",
