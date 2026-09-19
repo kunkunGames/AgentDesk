@@ -332,8 +332,8 @@ pub async fn generate(
     let mut excluded_count = 0usize;
     let mut skipped_due_to_dependency: Vec<serde_json::Value> = Vec::new();
     let mut dependency_status_cache: HashMap<i64, Option<String>> = HashMap::new();
-    for card in &cards {
-        let dep_parse = extract_dependency_parse_result(card);
+    for card in cards {
+        let dep_parse = extract_dependency_parse_result(&card);
         crate::auto_queue_log!(
             info,
             "generate.dependency_parse",
@@ -381,7 +381,7 @@ pub async fn generate(
         }
 
         if unresolved_external_dependencies.is_empty() {
-            filtered_cards.push(card.clone());
+            filtered_cards.push(card);
         } else {
             crate::auto_queue_log!(
                 info,
