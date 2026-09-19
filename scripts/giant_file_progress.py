@@ -592,6 +592,7 @@ def main() -> int:
         candidate_sha = oid(candidate_sha)
         if oid("HEAD") != candidate_sha:
             raise RuntimeError("candidate SHA is not checked-out HEAD")
+        canonical_repos = {"itismyfield/AgentDesk", "kunkunGames/AgentDesk"}
         if event == "pull_request":
             selector = "pr_strict_progress"
             # The runner checks out GitHub's synthetic merge candidate, then
@@ -600,9 +601,9 @@ def main() -> int:
             # to equal the base repository adds no provenance guarantee, but it
             # rejects legitimate PRs from a trusted fork before the same
             # fail-closed object checks can run.
-            if repository != "itismyfield/AgentDesk" or not env.get("GFP_HEAD_REPOSITORY"):
+            if repository not in canonical_repos or not env.get("GFP_HEAD_REPOSITORY"):
                 raise RuntimeError(
-                    "progress requires a pull request targeting itismyfield/AgentDesk "
+                    "progress requires a pull request targeting a canonical repository "
                     "with a resolved head repository"
                 )
             event_base_sha = oid(env.get("GFP_BASE_SHA", ""))
@@ -671,7 +672,7 @@ def main() -> int:
                     "pr_strict_progress": "retirement or 200-line partial progress",
                     "pr_ledger_repair": "bounded deadline and monotone ledger repair; production unchanged",
                 }[selector]
-            elif event == "push" and repository == "itismyfield/AgentDesk":
+            elif event == "push" and repository in canonical_repos:
                 selector = "main_no_regression_record"
                 payload.update(main_record(candidate))
                 reason = "main records current giant-file debt"
