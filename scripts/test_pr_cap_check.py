@@ -217,13 +217,28 @@ class PrCapCheckTest(unittest.TestCase):
             "bench.rs",
             "build.log",
             "test_normalize.rs",
-            "scratch.txt"
+            "scratch.txt",
+            "scratchpad.md",
+            "test.sql",
+            "scratch-check.sql",
+            "verify.sh",
+            "cargo_out.txt",
+            "npm_output.log",
+            "bun_output.txt",
+            "test.log",
+            "tests/scratch.py",
+            "docs/plan.md",
+            ".github/pr-body.md",
+            "src/patch.diff",
+            "tests/scratch.json",
+            "src/test_scratch.js"
         ]
         for name in scratch_names:
             with self.subTest(name=name):
                 # Clean up repo from previous subtest
                 if (self.repo / name).exists():
                     (self.repo / name).unlink()
+                (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
                 self.add_lines(1, name)
                 self.commit()
                 result = self.check_cap()
