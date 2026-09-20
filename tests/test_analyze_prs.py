@@ -9,6 +9,7 @@ from scripts.analyze_prs import (
     has_scratch_file_cleanup_ack,
     has_pr_size_ack,
     has_docs_only_verification_ack,
+    has_false_verification_guard_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -237,6 +238,23 @@ class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
         body = "- scratch file cleanup: ran git diff --check and git status."
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
+
+
+class PrAnalyzerFalseVerificationGuardTests(unittest.TestCase):
+    def test_unchecked_template_false_verification_guard_is_not_acknowledgement(self):
+        body = "- [ ] **False verification guard:** I have not falsely claimed verification..."
+
+        self.assertFalse(has_false_verification_guard_ack(body))
+
+    def test_checked_template_false_verification_guard_is_acknowledgement(self):
+        body = "- [x] **false verification guard:** did not claim false verification"
+
+        self.assertTrue(has_false_verification_guard_ack(body))
+
+    def test_filled_false_verification_guard_field_is_acknowledgement(self):
+        body = "- false verification guard: confirmed no false verification"
+
+        self.assertTrue(has_false_verification_guard_ack(body))
 
 
 class PrAnalyzerDocsOnlyVerificationGuardTests(unittest.TestCase):
