@@ -16,7 +16,7 @@ Baseline no-regression gates are **enabled** for 3 checks: `parent_test_residue`
 |---|---:|:--:|:--:|
 | `giant_files` | 0 | YES | no |
 | `giant_file_ratchet` | 0 | YES | no |
-| `parent_test_residue` | 5 | no | YES |
+| `parent_test_residue` | 4 | no | YES |
 | `namespace_size_caps` | 0 | YES | no |
 | `route_srp_violations` | 10 | no | YES |
 | `service_server_backflow` | 0 | no | YES |
@@ -24,7 +24,7 @@ Baseline no-regression gates are **enabled** for 3 checks: `parent_test_residue`
 | `direct_discord_reactions` | 0 | YES | no |
 | `footer_view_writes` | 0 | YES | no |
 | `manual_json_row_mapping` | 0 | YES | no |
-| `limit_clamp_duplication` | 0 | no | no |
+| `limit_clamp_duplication` | 6 | no | no |
 | `git_subprocess_callsites` | 0 | YES | no |
 | `legacy_sqlite_refs` | 0 | YES | no |
 | `source_of_truth_alias_writes` | 0 | YES | no |
@@ -47,11 +47,10 @@ Decomposition parents whose inline test LoC exceeds 3x their production LoC (fil
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/services/discord/inflight.rs` |  | 5205 test LoC vs 608 prod LoC (ratio 8.56x > 3x, 5813 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/inflight/save_store.rs` |  | 730 test LoC vs 241 prod LoC (ratio 3.03x > 3x, 971 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 146 prod LoC (ratio 3.08x > 3x, 596 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 1048 prod LoC (ratio 3.81x > 3x, 5040 raw); migrate the stranded tests with the decomposed production code |
-| warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 428 test LoC vs 87 prod LoC (ratio 4.92x > 3x, 515 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/inflight.rs` |  | 5373 test LoC vs 674 prod LoC (ratio 7.97x > 3x, 6047 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 149 prod LoC (ratio 3.02x > 3x, 599 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 839 prod LoC (ratio 4.76x > 3x, 4831 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 426 test LoC vs 88 prod LoC (ratio 4.84x > 3x, 514 raw); migrate the stranded tests with the decomposed production code |
 
 ## Namespace size caps (`namespace_size_caps`)
 
@@ -65,16 +64,16 @@ Files under src/server/routes/ that mix raw SQL, json!() shaping, and crate::ser
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (25), json!() (56), and crate::services calls (5) |
+| warn | `src/server/routes/agents_crud.rs` |  | route file mixes SQL (19), json!() (18), and crate::services calls (6) |
 | warn | `src/server/routes/agents_setup.rs` |  | route file mixes SQL (7), json!() (12), and crate::services calls (2) |
 | warn | `src/server/routes/cron_api.rs` |  | route file mixes SQL (2), json!() (12), and crate::services calls (1) |
-| warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (24), and crate::services calls (3) |
-| warn | `src/server/routes/github.rs` |  | route file mixes SQL (6), json!() (44), and crate::services calls (1) |
-| warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (17), json!() (18), and crate::services calls (7) |
-| warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (12), and crate::services calls (6) |
-| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (15), and crate::services calls (3) |
+| warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (12), and crate::services calls (6) |
+| warn | `src/server/routes/github.rs` |  | route file mixes SQL (6), json!() (29), and crate::services calls (1) |
+| warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (17), json!() (10), and crate::services calls (7) |
+| warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (2), and crate::services calls (7) |
+| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (12), and crate::services calls (4) |
 | warn | `src/server/routes/review_verdict/verdict_route.rs` |  | route file mixes SQL (5), json!() (20), and crate::services calls (5) |
-| warn | `src/server/routes/stats.rs` |  | route file mixes SQL (32), json!() (10), and crate::services calls (2) |
+| warn | `src/server/routes/stats.rs` |  | route file mixes SQL (32), json!() (7), and crate::services calls (1) |
 
 ## Service/server backflow (`service_server_backflow`)
 
@@ -110,7 +109,14 @@ _No findings._
 
 Inline `clamp(1, 2000)` is owned by `crate::utils::api::clamp_api_limit` and is flagged on every site outside the helper definition. Other limit/days clamp expressions are flagged when they appear in 3+ source files, signalling another shared helper candidate.
 
-_No findings._
+| Severity | File | Line | Message |
+|---|---|---:|---|
+| info | `src/db/dispatches/outbox/claim.rs` | 120 | duplicated clamp `limit::1, 500`: `limit.clamp(1, 500)` |
+| info | `src/db/intake_outbox.rs` | 803 | duplicated clamp `limit::1`: `limit.max(1)` |
+| info | `src/db/intake_outbox_delivery_proof.rs` | 74 | duplicated clamp `limit::1, 500`: `limit.clamp(1, 500)` |
+| info | `src/services/agent_recovery/checkpoint.rs` | 480 | duplicated clamp `limit::1`: `limit.max(1)` |
+| info | `src/services/discord/runtime_bootstrap/intake_delivery_sweep.rs` | 204 | duplicated clamp `limit::1, 500`: `limit.clamp(1, 500)` |
+| info | `src/voice/metrics.rs` | 300 | duplicated clamp `limit::1`: `limit.max(1)` |
 
 ## Direct git subprocess callsites (`git_subprocess_callsites`)
 
