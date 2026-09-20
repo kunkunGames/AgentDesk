@@ -55,24 +55,34 @@ while IFS= read -r -d '' record; do
     file_to_check="$file_path"
   fi
 
-  case "$file_to_check" in
-    plan.md | pr-body.md | pr_body.md | test.sh | bench.rs )
+  scratch_basename="${file_to_check##*/}"
+
+  case "$scratch_basename" in
+    pr-body.md | pr_body.md | plan.md | plan.txt | prs.json | scratch.json | scratchpad.json | cargo_out.txt | npm_output.log | bun_output.txt )
       fail "scratch file detected: $file_to_check"
       ;;
-    *.log )
+    *.diff | *.patch | *.log )
       fail "scratch file detected: $file_to_check"
       ;;
-    test_*.rs )
-      if [[ "$file_to_check" != */* ]]; then
-        fail "scratch file detected: $file_to_check"
-      fi
-      ;;
-    scratch.* )
-      if [[ "$file_to_check" != */* ]]; then
-        fail "scratch file detected: $file_to_check"
-      fi
+    scratch.* | scratchpad.* | test_scratch.* | scratch-* | scratchpad-* | test_scratch-* | scratch_* | scratchpad_* | test_scratch_* )
+      case "$scratch_basename" in
+        *.md | *.txt | *.sh | *.sql | *.rs | *.py | *.js | *.json )
+          fail "scratch file detected: $file_to_check"
+          ;;
+      esac
       ;;
   esac
+
+  if [[ "$file_to_check" != */* ]]; then
+    case "$file_to_check" in
+      test.sh | test.sql | verify.sh )
+        fail "scratch file detected: $file_to_check"
+        ;;
+      test_*.rs | test_*.py | test_*.js | test_*.json | bench.rs | bench_*.rs )
+        fail "scratch file detected: $file_to_check"
+        ;;
+    esac
+  fi
 
   files=$((files + 1))
   if [[ "$added" == - && "$deleted" == - ]]; then
