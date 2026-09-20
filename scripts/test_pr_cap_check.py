@@ -211,8 +211,15 @@ class PrCapCheckTest(unittest.TestCase):
     def test_scratch_files_rejected(self) -> None:
         scratch_names = [
             "plan.md",
+            "plan.txt",
             "pr-body.md",
             "pr_body.md",
+            "prs.json",
+            "scratch.json",
+            "scratchpad.json",
+            "cargo_out.txt",
+            "npm_output.log",
+            "bun_output.txt",
             "test.sh",
             "bench.rs",
             "build.log",

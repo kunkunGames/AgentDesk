@@ -56,7 +56,7 @@ while IFS= read -r -d '' record; do
   fi
 
   case "$file_to_check" in
-    plan.md | pr-body.md | pr_body.md | test.sh | bench.rs )
+    plan.md | plan.txt | pr-body.md | pr_body.md | prs.json | scratch.json | scratchpad.json | test.sh | bench.rs | cargo_out.txt | npm_output.log | bun_output.txt )
       fail "scratch file detected: $file_to_check"
       ;;
     *.log )
