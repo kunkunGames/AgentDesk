@@ -260,22 +260,20 @@ pub(super) async fn update_run_with_pg(
 }
 
 pub(super) async fn reorder_with_pg(body: &ReorderBody, pool: &sqlx::PgPool) -> Result<(), String> {
-    let mut run_id = None;
-    for id in &body.ordered_ids {
-        let found = sqlx::query_scalar::<_, String>(
+    let run_id = if body.ordered_ids.is_empty() {
+        None
+    } else {
+        sqlx::query_scalar::<_, String>(
             "SELECT run_id
              FROM auto_queue_entries
-             WHERE id = $1",
+             WHERE id = ANY($1)
+             LIMIT 1",
         )
-        .bind(id)
+        .bind(&body.ordered_ids)
         .fetch_optional(pool)
         .await
-        .map_err(|error| format!("load auto_queue_entries run_id for {id}: {error}"))?;
-        if found.is_some() {
-            run_id = found;
-            break;
-        }
-    }
+        .map_err(|error| format!("load auto_queue_entries run_id for reorder: {error}"))?
+    };
 
     let Some(run_id) = run_id else {
         return Err("not_found:no matching queue entries found".to_string());
