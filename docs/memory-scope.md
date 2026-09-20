@@ -86,7 +86,7 @@ When deciding where (or whether) to call `remember`, walk this checklist:
 
 Promotion (`workspace → permanent`) is explicit, never automatic. Use `amend` after the fact has been validated across at least one additional session.
 
-## Permanent-Scope Audit (issue #1100)
+## Permanent-Scope Audit
 
 A fragment-level audit of existing `scope: permanent` entries was NOT performed inline in this commit (no Memento fetch was issued). The audit categories below are the candidate buckets that future audit passes should sweep, ordered by likely yield. They are derived from the forbidden table above and from observed past patterns:
 
