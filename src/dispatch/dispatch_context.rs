@@ -459,7 +459,7 @@ fn commit_subject_references_issue(subject: &str, issue_number: i64) -> bool {
     // Collect all delimiter-bounded `#<digits>` references in the subject
     // along with the byte offsets of every match of our needle so we can
     // inspect the immediately-preceding token for back-reference verbs.
-    let mut all_refs: Vec<&str> = Vec::new();
+    let mut competing_ref = false;
     let mut needle_positions: Vec<usize> = Vec::new();
     let bytes = subject.as_bytes();
     let mut i = 0;
@@ -485,9 +485,10 @@ fn commit_subject_references_issue(subject: &str, issue_number: i64) -> bool {
                 };
                 if after_ok {
                     let token = &subject[i..j];
-                    all_refs.push(token);
                     if token == needle {
                         needle_positions.push(i);
+                    } else {
+                        competing_ref = true;
                     }
                 }
             }
@@ -500,7 +501,6 @@ fn commit_subject_references_issue(subject: &str, issue_number: i64) -> bool {
         return false;
     }
 
-    let competing_ref = all_refs.iter().any(|r| *r != needle);
     let trimmed = subject.trim();
     let canonical_squash = format!("({})", needle);
 
