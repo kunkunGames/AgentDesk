@@ -692,6 +692,7 @@ fn is_sql_clause_keyword(word: &str) -> bool {
             | "in"
             | "not"
             | "is"
+            | "case"
             | "when"
             | "then"
             | "else"
