@@ -802,7 +802,7 @@ fn check_qwen_runtime_artifacts(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen은 ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, <workspace>/.qwen/.env 같은 로컬 자산을 그대로 사용합니다. headless 환경에서는 project .qwen/.env 우선 여부를 함께 확인하세요.";
+    let guidance = "Qwen uses local assets such as ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, and <workspace>/.qwen/.env as-is. In a headless environment, also check if the project's .qwen/.env has priority.";
     if configured {
         Check::warn(
             "provider_qwen_runtime",
