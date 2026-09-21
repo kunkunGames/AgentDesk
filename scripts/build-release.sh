@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the common native leader/worker artifact. Python >= 3.11 is required.
 # Usage: build-release.sh [--target <rust-target>]
+#        [--profile release|release-fast]
 #        [--skip-dashboard | --prebuilt-dashboard]
 # --skip-dashboard excludes UI assets; --prebuilt-dashboard packages an already
 # verified dashboard/dist. The default verifies/builds the dashboard once.
@@ -14,6 +15,7 @@ cd "$PROJECT_DIR"
 
 DASHBOARD_MODE=build
 TARGET=""
+BUILD_PROFILE=release
 PYTHON="${AGENTDESK_PYTHON:-python3}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -33,6 +35,14 @@ while [ "$#" -gt 0 ]; do
       TARGET="$2"
       shift 2
       ;;
+    --profile)
+      if [ "$#" -lt 2 ] || { [ "$2" != release ] && [ "$2" != release-fast ]; }; then
+        echo "Error: --profile requires release or release-fast" >&2
+        exit 2
+      fi
+      BUILD_PROFILE="$2"
+      shift 2
+      ;;
     *) echo "Error: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -47,10 +57,10 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 CARGO_TARGET_ARGS=()
 if [ -n "$TARGET" ]; then
   CARGO_TARGET_ARGS+=(--target "$TARGET")
-  BINARY_DIR="$TARGET_DIR/$TARGET/release"
+  BINARY_DIR="$TARGET_DIR/$TARGET/$BUILD_PROFILE"
 else
   TARGET="$HOST_TARGET"
-  BINARY_DIR="$TARGET_DIR/release"
+  BINARY_DIR="$TARGET_DIR/$BUILD_PROFILE"
 fi
 case "$TARGET" in
   *-pc-windows-msvc) BINARY_NAME=agentdesk.exe ;;
@@ -64,10 +74,10 @@ if ! setup_sccache_env; then
   export CARGO_BUILD_RUSTC_WRAPPER=""
 fi
 
-echo "[1/3] Building common AgentDesk binary for $TARGET"
+echo "[1/3] Building common AgentDesk binary for $TARGET ($BUILD_PROFILE)"
 # Keep the shared build-token contract and its separate contention diagnostics.
 ADK_BUILD_TOKEN_DIAG_FD=3 "$PYTHON" "$SCRIPT_DIR/build_token.py" -- \
-  cargo build --locked --release --bin agentdesk "${CARGO_TARGET_ARGS[@]}" 3>&2
+  cargo build --locked --profile "$BUILD_PROFILE" --bin agentdesk "${CARGO_TARGET_ARGS[@]}" 3>&2
 
 echo "[2/3] Dashboard ($DASHBOARD_MODE)"
 case "$DASHBOARD_MODE" in
@@ -78,7 +88,7 @@ esac
 echo "[3/3] Packaging binary and common runtime assets"
 # package_release.py owns policies, routines, managed skills and entrypoints
 # (scripts/queue-stability-batch.sh and scripts/_defaults.sh), plus checksums.
-PACKAGE_ARGS=(--binary "$BINARY_DIR/$BINARY_NAME" --target "$TARGET")
+PACKAGE_ARGS=(--binary "$BINARY_DIR/$BINARY_NAME" --target "$TARGET" --profile "$BUILD_PROFILE")
 if [ "$DASHBOARD_MODE" = --skip-dashboard ]; then
   PACKAGE_ARGS+=(--without-dashboard)
 fi
