@@ -17,12 +17,14 @@ macOS/Linux/Windows에 공통 등록·배정 계약을 적용한다. 별도 work
 
 | 범위 | 현재 구현/증거 | 완료 판정에 남은 검증 |
 | --- | --- | --- |
-| R1 공유 설정 소유권 | `src/db/postgres/shared_config.rs`로 동기화 책임 분리. worker/auto는 중앙 값 확인만 수행하며 초기화 전에는 오류 반환. audit/import도 동일 소유권 함수 사용 | 실제 PG 보존·reset·선부팅·경쟁 테스트 및 두 장비 재시작 |
+| R1 공유 설정 소유권 | `src/db/postgres/shared_config.rs`로 동기화 책임 분리. worker/auto는 중앙 값 확인만 수행하며 초기화 전에는 오류 반환. audit/import도 동일 소유권 함수 사용. 실제 PG 보존·reset·선부팅·경쟁 등 관련 6개 테스트 통과 | 두 장비 배포·재시작 검증 |
 | R4 공통 release | OS별 공통 패키징·manifest 검증·GitHub workflow 추가. 세 archive 형식과 변조/누락 방지 테스트 통과 | GitHub native matrix, 실제 Release 게시, 노드 설치/갱신 |
-| R2·R3·R5·R6·R7·R8·R9 | 기존 구현 자산을 연결하는 순차 작업 범위로 유지 | 각 절의 완료 기준 및 혼합 OS E2E |
+| R2 원격 대시보드 | 공통 HTTP 인증 세대·cache 취소, truthful session probe, 15초 일회용 WS ticket, 로그인/logout UI 구현. 서버 인증 테스트 12개 및 전체 dashboard 단위 테스트 386개 통과. desktop/mobile browser fixture에서 로그인·재연결·교체·logout·refresh 검증 | 실제 LAN peer의 서버+브라우저 통합 검증 |
+| R3·R5·R6·R7·R8·R9 | 기존 구현 자산을 연결하는 순차 작업 범위로 유지 | 각 절의 완료 기준 및 혼합 OS E2E |
 | 원격 접근 | Windows → Mac mini 공개키 SSH 및 원격 명령 실행 확인 | 배포·migration·leader/worker 전환은 별도 검증 |
 
 패키징의 실행 방법과 게시 계약은 [공통 release 문서](../ci/release-packaging.md)를 따른다.
+원격 인증은 [인증 운영 문서](../operations/remote-dashboard-auth.md)를 따른다.
 `--skip-dashboard`는 UI 제외로 일관되게 동작하며, 공개 Release는 dashboard를 포함한다.
 운영자 비밀값·로컬 설정·worktree는 artifact에 넣지 않는다. 배포 파일을 줄이기 위해
 제품 구조를 중복시키지 않고, 먼저 기존 role이 실제 실행 모듈을 제한하도록 구현한다.
@@ -33,6 +35,13 @@ macOS/Linux/Windows에 공통 등록·배정 계약을 적용한다. 별도 work
 따라서 일반 migration 실행 전에 정확한 과거 version/description/checksum을 확인하는
 이관 경로와 격리 DB 검증이 필요하다. checksum 검사를 끄거나 기존 데이터를 지우는 방식은
 사용하지 않는다. 운영 DB의 변경은 아직 수행하지 않았다.
+이관 구현과 검증 계약은 [PostgreSQL migration 번호 이관](../operations/postgres-migration-relocation.md)에 정리했다.
+
+**기존 main의 배포 선행 수정:** `#2117`의 dispatch guard 접두사 범위 비교가 ICU locale에서
+실제 키를 놓치는 현상을 격리 PostgreSQL에서 확인했다. 문자열 접두사 함수로 복구하고
+ICU-collated key 및 인접한 다른 접두사 보존을 기존 PG 테스트에 추가했다. 포맷 및 canonical
+LF SQL inventory 수정과 함께 [PR #2119](https://github.com/kunkunGames/AgentDesk/pull/2119)로
+분리했다. [PR #2118](https://github.com/kunkunGames/AgentDesk/pull/2118)은 공통 native release다.
 
 ## 1. 판단과 적용 범위
 
