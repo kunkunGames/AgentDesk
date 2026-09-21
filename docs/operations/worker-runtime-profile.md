@@ -52,3 +52,9 @@ intake poller와 CLI의 실제 실행 가능 여부는 별도의 readiness 근�
 dashboard 파일이 없어도 자동으로 다시 복사하지 않는다. 패키지 크기·다운로드량은
 이 변경으로 줄지 않으며, RSS·idle CPU·DB 연결 수·시작 시간은 두 장비 실측 결과와
 함께 판정한다. Gateway/voice를 빌드에서 제거한 별도 실행 파일은 만들지 않는다.
+
+Windows 일반 사용자 계정에서는 디렉터리 symlink 권한이 없으면 Windows PowerShell
+5.1의 junction으로 연결한다. 관리자 권한이나 Developer Mode를 필수로 요구하지 않는다.
+공유 prompt의 기준 파일은 `config/agents/_shared.prompt.md`다. 과거 `_shared.md`
+파일 별칭은 symlink 생성이 허용될 때만 제공한다. 기준 파일을 복사하거나 hardlink로
+대체하지 않으므로 prompt를 원자적으로 교체해도 오래된 사본을 읽지 않는다.

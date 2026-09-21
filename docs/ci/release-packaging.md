@@ -141,6 +141,12 @@ worker DB 설정은 이 로컬 포트를 가리켜야 한다. 터널과 worker �
 
 ## 검증
 
+Mac release 재배포는 기존 launchd의 `StandardOutPath`·`StandardErrorPath`를 보존한다.
+운영자가 외장 디스크 대신 `~/Library/Logs/AgentDesk-launchd` 등에 지정한 경로가
+자동 생성 기본값으로 덮이지 않는다. 새 plist 생성·검증이 끝난 뒤 원자적으로 교체하며,
+생성이 실패하면 기존 plist를 유지한다. 로컬 재시작 도구는 API listener와 같은 포트를
+포함한 loopback Origin을 사용하고, 원격 요청의 Bearer 인증 규칙은 그대로 적용한다.
+
 ```bash
 python -m unittest tests.test_package_release
 bash -n scripts/build-release.sh

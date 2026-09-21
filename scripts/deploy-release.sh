@@ -2703,13 +2703,10 @@ ROLLBACK_ARMED=1
 
 if [ "$PLIST_REL" = "com.agentdesk.release" ]; then
     echo "▸ Regenerating release launchd plist..."
-    mkdir -p "$HOME/Library/LaunchAgents"
-    "$ADK_REL/bin/agentdesk" emit-launchd-plist \
-        --flavor release \
+    python3 "$SCRIPT_DIR/refresh_release_launchd_plist.py" \
+        --binary "$ADK_REL/bin/agentdesk" \
         --home "$HOME" \
-        --root-dir "$ADK_REL" \
-        --agentdesk-bin "$ADK_REL/bin/agentdesk" \
-        --output "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
+        --root-dir "$ADK_REL"
 else
     echo "⚠ Skipping launchd plist regeneration for custom label: $PLIST_REL"
 fi
