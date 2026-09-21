@@ -277,6 +277,7 @@ banner "Inflight blind-save ratchet guard (#4259)"
 
 # #4511 post-deploy smoke WARN post-restart scoping
 bash tests/test_deploy_smoke_warn_scope_4511.sh
+bash tests/test_deploy_smoke_scope.sh
 
 banner "Cluster deploy peer verdict + terminal marker contract (#5189)"
 bash tests/test_cluster_deploy_peer_verdict_5189.sh

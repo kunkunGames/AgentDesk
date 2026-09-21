@@ -110,6 +110,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/_defaults.sh"
 
 ADK_REL="${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}"
+POST_DEPLOY_SMOKE_SCOPE="${AGENTDESK_POST_DEPLOY_SMOKE_SCOPE:-full}"
+case "$POST_DEPLOY_SMOKE_SCOPE" in
+    full|api) ;;
+    *) echo "AGENTDESK_POST_DEPLOY_SMOKE_SCOPE must be full or api" >&2; exit 2 ;;
+esac
 POST_DEPLOY_SMOKE_WEDGE_COVERAGE="not run: wedge check did not execute"
 # The Rust dcserver reads AGENTDESK_DCSERVER_LABEL for the plist Label; honor it first
 # so launchd Label and plist filename never diverge when the operator overrides one side.
@@ -1189,6 +1194,7 @@ _deploy_peer_env_prelude() {
         AGENTDESK_REPORT_CHANNEL_ID \
         AGENTDESK_REPORT_PROVIDER \
         AGENTDESK_SKIP_TURN_DRAIN \
+        AGENTDESK_POST_DEPLOY_SMOKE_SCOPE \
         AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS \
         AGENTDESK_BUNDLE_ID \
         AGENTDESK_DCSERVER_LABEL \
@@ -1692,6 +1698,7 @@ export AGENTDESK_DEPLOY_DETACHED_CHILD=1
 export AGENTDESK_DEPLOY_LOG_PATH=$(printf '%q' "$log_path")
 export AGENTDESK_DEPLOY_TEST_MODE=$(printf '%q' "$DEPLOY_TEST_MODE")
 export AGENTDESK_SKIP_TURN_DRAIN=$(printf '%q' "${AGENTDESK_SKIP_TURN_DRAIN:-1}")
+export AGENTDESK_POST_DEPLOY_SMOKE_SCOPE=$(printf '%q' "$POST_DEPLOY_SMOKE_SCOPE")
 export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "${AGENTDESK_CODESIGN_IDENTITY:-}")
 export AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=$(printf '%q' "${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-}")
 export AGENTDESK_CODESIGN_KEYCHAIN_PW_FILE=$(printf '%q' "${AGENTDESK_CODESIGN_KEYCHAIN_PW_FILE:-}")
@@ -3640,7 +3647,10 @@ _run_post_deploy_functional_smoke() {
     if ! _post_deploy_smoke_check_fail_closed_warn_rate; then
         failed=1
     fi
-    if [ "$POST_DEPLOY_SMOKE_READY" = "true" ]; then
+    if [ "${POST_DEPLOY_SMOKE_SCOPE:-full}" = "api" ]; then
+        POST_DEPLOY_SMOKE_DURABLE_COVERAGE="not evaluated: operator selected API smoke scope"
+        _post_deploy_smoke_note "relay E-1/E-35=not evaluated: API smoke scope; no provider turns or Discord test messages" || failed=1
+    elif [ "$POST_DEPLOY_SMOKE_READY" = "true" ]; then
         if ! _post_deploy_smoke_check_relay_round_trip; then
             failed=1
         fi

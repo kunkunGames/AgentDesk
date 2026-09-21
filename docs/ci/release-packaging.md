@@ -107,6 +107,11 @@ Mac은 기존 `deploy-release.sh`의 서비스·drain 계약을 재사용한다.
 사용자 작업 스케줄러 경로를 사용할 수 있다. 실제 두 장비의 적용·테스트 완료 여부는
 [클러스터 구현 검토](../design/heterogeneous-worker-cluster-implementation-review.md)에 기록한다.
 
+Mac 배포 시 `AGENTDESK_POST_DEPLOY_SMOKE_SCOPE=api`를 지정하면 기존 drain·migration·
+서비스 교체·API·복구 상태 검증을 유지하면서 실제 provider turn과 Discord 테스트 메시지를
+생성하는 E-1/E-35만 생략한다. 기본값 `full`은 기존 검증을 유지한다. `api` 결과는
+실제 Discord 응답이나 durable delivery E2E 통과를 의미하지 않으며 coverage에 기록한다.
+
 ### Windows 사용자 worker
 
 `scripts/install-windows-runtime-task.ps1`은 기존 `%USERPROFILE%\.adk\release` 레이아웃의
