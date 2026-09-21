@@ -2,7 +2,7 @@
 
 This document pins down which kinds of facts belong in `scope: permanent` vs `scope: workspace` (a.k.a. session) in the Memento MCP store, and what must never be written to Memento at all.
 
-It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder under issue 910-6).
+It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder).
 
 This contract applies to MCP-backed Memento data. The PostgreSQL `local_memory`
 fallback documented in [`docs/source-of-truth.md`](source-of-truth.md) stores
@@ -41,7 +41,7 @@ Even if the content feels durable, do NOT store the following as `permanent`:
 - Code rules / coding style rules — those live in `agents/_shared.prompt.md` and per-agent prompts.
 - Configuration values — those live in `agentdesk.yaml`, `kv_meta`, or the dashboard surfaces (see `docs/config-domains.md`).
 - Tool invocation lists, MCP server lists, model names — derived from runtime config.
-- Per-issue progress notes, "the campaign for #1100 is at step 4" — that is workspace scope.
+- Per-issue progress notes, "the campaign is at step 4" — that is workspace scope.
 - Speculative or inferred facts (`assertionStatus = inferred`) — keep them workspace until verified.
 
 ## Scope: workspace (session)
