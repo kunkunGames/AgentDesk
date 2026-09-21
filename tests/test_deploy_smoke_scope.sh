@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Exercise the production coordinator with fake probes; never deploy or send.
+# Extracted production functions consume these fixture globals through eval.
+# shellcheck disable=SC2034
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 scratch=$(mktemp -d)
