@@ -12,7 +12,7 @@ import zipfile
 from package_release import TARGETS, sha256
 
 
-def verify_archive(archive: Path, commit: str, version: str, *, allow_dirty: bool = False) -> str:
+def verify_archive(archive: Path, commit: str, version: str, *, allow_dirty: bool = False, profile: str | None = None) -> str:
     sidecar = archive.with_name(archive.name + ".sha256")
     checksum = sidecar.read_text(encoding="utf-8").split()
     if checksum != [sha256(archive), archive.name]:
@@ -52,6 +52,8 @@ def verify_archive(archive: Path, commit: str, version: str, *, allow_dirty: boo
             raise ValueError("archive name disagrees with its target")
         if manifest.get("repo_head") != commit or manifest.get("version") != version:
             raise ValueError("release source/version does not match the publishing commit")
+        if manifest.get("build_profile") not in {"release", "release-fast"} or (profile and manifest["build_profile"] != profile):
+            raise ValueError("release build profile does not match the publishing profile")
         if not allow_dirty and manifest.get("repo_dirty") != "false":
             raise ValueError("refusing to publish an artifact from a dirty checkout")
         if manifest.get("dashboard_included") is not True:
@@ -74,7 +76,7 @@ def verify_archive(archive: Path, commit: str, version: str, *, allow_dirty: boo
         with open_member(f"{prefix}/runtime/release-source.json") as stream:
             runtime = json.load(stream)
         if any(runtime.get(k) != manifest.get(k) for k in (
-                "repo_head", "repo_dirty", "latest_postgres_migration", "generated_at")):
+                "repo_head", "repo_dirty", "latest_postgres_migration", "generated_at", "build_profile")):
             raise ValueError("runtime source identity differs from the release manifest")
     return target
 
@@ -85,10 +87,11 @@ def main() -> None:
     parser.add_argument("--commit", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--target", action="append", required=True, choices=TARGETS)
+    parser.add_argument("--profile", choices=["release", "release-fast"])
     args = parser.parse_args()
     archives = sorted([*args.directory.glob("agentdesk-*.tar.gz"), *args.directory.glob("agentdesk-*.zip")])
     try:
-        targets = [verify_archive(p, args.commit, args.version) for p in archives]
+        targets = [verify_archive(p, args.commit, args.version, profile=args.profile) for p in archives]
         if sorted(targets) != sorted(args.target):
             raise ValueError(f"release matrix incomplete or duplicated: expected {args.target}, got {targets}")
         checksums = "".join(f"{sha256(p)}  {p.name}\n" for p in archives)

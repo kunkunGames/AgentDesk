@@ -40,10 +40,20 @@ bash scripts/build-release.sh --skip-dashboard
 
 # 명시적 Rust target. 이 옵션이 cross compiler/SDK를 설치하지는 않는다.
 bash scripts/build-release.sh --target aarch64-apple-darwin --prebuilt-dashboard
+
+# 기존 운영 빌드와 같은 빠른 최적화 프로파일
+bash scripts/build-release.sh --profile release-fast --prebuilt-dashboard
 ```
 
 `AGENTDESK_PYTHON`으로 Python 실행 파일을 지정할 수 있다. `CARGO_TARGET_DIR`을 설정한
 빌드도 해당 위치의 산출물을 사용한다. `--target` 생략 시 rustc host triple을 기준으로 한다.
+
+GitHub workflow는 기존 `release-fast` 프로파일을 세 OS에 공통으로 사용한다.
+최초 macOS CI에서 전체 LTO `release` 빌드가 90분 제한에 도달한 반면, Mac mini의
+격리된 `release-fast` 빌드는 7분 47초에 완료됐다. 이는 서로 다른 장비의 빌드 시간이며
+실행 성능 비교는 아니다. 수동 스크립트 기본값은 `release`이고 `--profile`로 선택한다.
+프로파일은 artifact/runtime manifest에 기록하며 게시 검증은 matrix의 프로파일도 확인한다.
+심볼을 제거해 장애 진단을 잃거나 역할별 프로그램으로 코드를 복제하지 않는다.
 
 초기 workflow의 조합은 다음과 같다. CPU 검사가 실제 runner와 일치하지 않으면 빌드를
 중단하며 다른 architecture 파일에 잘못된 이름을 붙이지 않는다.

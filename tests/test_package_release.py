@@ -96,6 +96,14 @@ class ReleasePackagingTests(unittest.TestCase):
                     archive, manifest["repo_head"], "1.2.3", allow_dirty=True), target)
         self.assertEqual(len((self.output / "checksums.txt").read_text().splitlines()), 3)
 
+    def test_publishing_rejects_a_different_build_profile(self):
+        target = "x86_64-pc-windows-msvc"
+        archive = packaging.package(self.root, self.binary("windows"), target, self.output, profile="release-fast")
+        head = packaging.git(self.root, "rev-parse", "HEAD").strip()
+        self.assertEqual(verification.verify_archive(archive, head, "1.2.3", allow_dirty=True, profile="release-fast"), target)
+        with self.assertRaisesRegex(ValueError, "build profile"):
+            verification.verify_archive(archive, head, "1.2.3", allow_dirty=True, profile="release")
+
     def test_dashboard_exclusion_is_explicit_and_missing_dashboard_fails(self):
         binary = self.binary("windows")
         archive = packaging.package(self.root, binary, "x86_64-pc-windows-msvc", self.output, False)
