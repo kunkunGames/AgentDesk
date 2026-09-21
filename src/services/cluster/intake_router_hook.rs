@@ -129,6 +129,7 @@ pub(crate) enum IntakeBlockedReason {
     OverrideUnavailable { target_instance_id: String },
     NonPortableAttachmentForeignOwner { owner_instance_id: String },
     NonPortableAttachmentRoutedTarget { target_instance_id: String },
+    AttachmentUnavailable { detail: String },
     RoutingDependencyFailed { detail: String },
 }
 
