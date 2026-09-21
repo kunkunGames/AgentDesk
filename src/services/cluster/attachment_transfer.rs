@@ -121,3 +121,5 @@ pub(crate) fn validate_attachment_bundle_v1(
 #[path = "attachment_transfer/tests.rs"]
 mod tests;
 
+#[cfg(test)]
+mod storage_tests;
