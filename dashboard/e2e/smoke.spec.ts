@@ -2367,7 +2367,8 @@ test.describe("Dashboard smoke tests", () => {
         cluster: { enabled: true, local_instance_id: "mac-mini" },
         nodes: ["windows-worker", "linux-worker"].map((id, index) => ({
           instance_id: id, status: "online", effective_role: "worker", active_dispatch_count: 0,
-          capabilities: { execution_readiness: {
+          execution_active: 1, execution_occupied: 2,
+          capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
             os: index ? "linux" : "windows", arch: "x86_64", runtime_profile: "worker",
             observed_at_ms: now, expires_at_ms: now + 120_000, backends: ["process"],
           } },
@@ -2397,6 +2398,7 @@ test.describe("Dashboard smoke tests", () => {
     await page.goto("/ops");
     const panel = page.getByTestId("cluster-nodes-panel");
     await expect(panel.getByText("windows / x86_64", { exact: false })).toBeVisible();
+    await expect(panel.getByText(/실행 용량 대기|Waiting for capacity/)).toBeVisible();
     await expect(panel.getByText(/CLI 실행 불가|CLI unavailable/)).toBeVisible();
     await panel.getByRole("button", { name: /출력 보기|View output/ }).click();
     await expect(panel.getByText(/worker output 한글/)).toBeVisible();

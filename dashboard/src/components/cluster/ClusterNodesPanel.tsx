@@ -52,6 +52,8 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
           const probe = node.capabilities.execution_readiness;
           const reports = Object.entries(node.execution_readiness?.providers ?? {});
           const expired = !probe || probe.expires_at_ms <= now || stale;
+          const slots = node.capabilities.execution_capacity?.slots;
+          const capacityAvailable = slots === undefined || (node.execution_occupied ?? slots) < slots;
           const controlReason = nodeControlUnavailable(node, nodes.data.cluster.local_instance_id, stale);
           const owned = sessions.data?.sessions.filter(s => s.instance_id === node.instance_id) ?? [];
           return <article key={node.instance_id} className="rounded-lg border border-th-border p-3 min-w-0 space-y-2">
@@ -63,7 +65,7 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
             <p className="text-xs">{tr("지원 backend", "Available backends")}: {probe?.backends.join(", ") || "—"}</p>
             {reports.length === 0 && <p className="text-xs text-amber-400">{tr("Provider 준비 상태 미확인", "Provider readiness unknown")}</p>}
             {reports.map(([provider, report]) => <div key={provider} className="text-xs flex flex-wrap gap-2 items-center">
-              <strong>{provider}</strong><StatusBadge tone={report.eligible && !expired ? "healthy" : "warning"}>{report.eligible && !expired ? tr("신규 실행 가능", "Ready for new work") : tr("실행 보류", "Not ready")}</StatusBadge>
+              <strong>{provider}</strong><StatusBadge tone={report.eligible && !expired && capacityAvailable ? "healthy" : "warning"}>{report.eligible && !expired ? capacityAvailable ? tr("신규 실행 가능", "Ready for new work") : tr("실행 용량 대기", "Waiting for capacity") : tr("실행 보류", "Not ready")}</StatusBadge>
               <span>{(expired ? ["execution_evidence_stale"] : report.reasons).map(reason => reasons[reason]?.[isKo ? 0 : 1] ?? reason).join(" · ")}</span>
             </div>)}
             <p className="text-xs text-th-text-muted">{tr("계정의 원격 인증·quota는 미검증입니다.", "Remote account authentication and quota are unverified.")}</p>
