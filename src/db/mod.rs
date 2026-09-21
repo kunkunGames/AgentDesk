@@ -4,6 +4,7 @@ pub mod auto_queue;
 pub(crate) mod automation_candidate_card_program;
 pub mod automation_candidates;
 pub(crate) mod calendar_sync;
+pub mod campaigns;
 pub mod cancel_tombstones;
 pub mod dispatch_semaphores;
 #[path = "dispatched_sessions/canonical_identity.rs"]

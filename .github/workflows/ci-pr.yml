@@ -120,6 +120,17 @@ jobs:
               - 'src/db/**'
               - 'src/dispatch/**'
               - 'src/engine/**'
+              - 'src/services/codex_tmux_wrapper.rs'
+              - 'src/services/gemini.rs'
+              - 'src/services/qwen.rs'
+              - 'src/services/qwen_tmux_wrapper.rs'
+              - 'src/services/opencode.rs'
+              - 'src/services/provider.rs'
+              - 'src/services/provider_runtime.rs'
+              - 'src/services/provider/**'
+              - 'src/services/process.rs'
+              - 'src/services/process/**'
+              - 'src/services/stream_json_cli/**'
               - 'src/high_risk_recovery.rs'
               - 'src/kanban/**'
               - 'src/reconcile.rs'
@@ -180,8 +191,147 @@ jobs:
               - 'src/services/platform/mod.rs'
               - 'src/services/session_activity.rs'
             pg_db:
+              # BEGIN generated pg_db source paths -- #6014. Do not edit by hand.
+              # Every file scripts/pg_test_lane_manifest.txt [files] names as holding a live PG
+              # test, so a new PG test selects this lane on the PR that adds it. Run
+              #   python3 scripts/check_pg_test_lane_membership.py --write-pg-db-paths
+              # which scripts/ci-script-checks.sh reruns, demanding an empty diff. paths-
+              # filter ORs patterns, so a '!' excludes nothing (#5232): refused anywhere.
+              - 'src/db/auto_queue/entries.rs'
+              - 'src/db/auto_queue/entries/dispatch_failure.rs'
+              - 'src/db/auto_queue/phase_gates.rs'
+              - 'src/db/auto_queue/tests.rs'
+              - 'src/db/automation_candidates/verdict_tests.rs'
+              - 'src/db/campaigns/tests.rs'
+              - 'src/db/dispatched_sessions.rs'
+              - 'src/db/dispatched_sessions/canonical_identity_pg_tests.rs'
+              - 'src/db/dispatched_sessions/rebind_override.rs'
+              - 'src/db/dispatched_sessions/tests.rs'
+              - 'src/db/dispatches/delivery_events.rs'
+              - 'src/db/dispatches/outbox/delivery.rs'
+              - 'src/db/idempotency.rs'
+              - 'src/db/intake_outbox.rs'
+              - 'src/db/intake_outbox_delivery_proof.rs'
+              - 'src/db/intake_outbox_dispatch_stamp/tests.rs'
+              - 'src/db/intake_outbox_dispatched_audit.rs'
+              - 'src/db/postgres.rs'
+              - 'src/db/prompt_manifests/tests.rs'
+              - 'src/db/relay_dead_letter.rs'
+              - 'src/db/scheduled_messages/postgres_tests.rs'
+              - 'src/db/session_transcripts.rs'
+              - 'src/dispatch/dispatch_cancel.rs'
+              - 'src/dispatch/dispatch_context.rs'
+              - 'src/dispatch/dispatch_status.rs'
+              - 'src/engine/ops/auto_queue_ops.rs'
+              - 'src/engine/ops/config_ops.rs'
+              - 'src/engine/ops/db_ops.rs'
+              - 'src/engine/ops/kanban_ops.rs'
+              - 'src/engine/ops/message_ops.rs'
+              - 'src/github/sync.rs'
+              - 'src/high_risk_recovery.rs'
+              - 'src/reconcile.rs'
+              - 'src/server/issue_specs.rs'
+              - 'src/server/mod.rs'
+              - 'src/server/multinode_regression.rs'
+              - 'src/server/resource_locks.rs'
+              - 'src/server/routes/auto_queue_lifecycle_pg_tests.rs'
+              - 'src/server/routes/campaigns.rs'
+              - 'src/server/routes/dispatched_sessions_tests.rs'
+              - 'src/server/routes/dispatches/crud.rs'
+              - 'src/server/routes/escalation.rs'
+              - 'src/server/routes/memory_api.rs'
+              - 'src/server/routes/message_outbox.rs'
+              - 'src/server/routes/queue_api.rs'
+              - 'src/server/routes/scheduled_messages/postgres_tests.rs'
+              - 'src/server/routes/stats.rs'
+              - 'src/server/routes/tests/auto_queue_preflight_harness_tests.rs'
+              - 'src/server/task_dispatch_claims.rs'
+              - 'src/services/agent_quality/regression_alerts.rs'
+              - 'src/services/agent_recovery/durable/postgres_tests.rs'
+              - 'src/services/auto_queue.rs'
+              - 'src/services/auto_queue/activate_command.rs'
+              - 'src/services/auto_queue/cancel_run.rs'
+              - 'src/services/auto_queue/cleanup_tasks_pg_tests.rs'
+              - 'src/services/auto_queue/command.rs'
+              - 'src/services/auto_queue/fsm.rs'
+              - 'src/services/auto_queue/phase_gate.rs'
+              - 'src/services/auto_queue/planning.rs'
+              - 'src/services/auto_queue/route_generate.rs'
+              - 'src/services/auto_queue/runtime/clear_slot_sessions_pg_tests.rs'
+              - 'src/services/automation_candidate_materializer/iteration_result_tests.rs'
+              - 'src/services/cluster/intake_preflight.rs'
+              - 'src/services/cluster/intake_router_hook.rs'
+              - 'src/services/cluster/intake_router_hook/owner_record.rs'
+              - 'src/services/cluster/intake_worker/dispatch_stamp_tests.rs'
+              - 'src/services/discord/catch_up/too_old_notice.rs'
+              - 'src/services/discord/health/recovery.rs'
+              - 'src/services/discord/health/recovery/stall_alert.rs'
+              - 'src/services/discord/idle_recap_interaction.rs'
+              - 'src/services/discord/mod.rs'
+              - 'src/services/discord/relay_recovery_circuit_alert_producer.rs'
+              - 'src/services/discord/relay_recovery_circuit_breaker.rs'
+              - 'src/services/discord/router/intake_dispatch/tests.rs'
+              - 'src/services/discord/router/message_handler/intake_turn/dispatch_stamp/tests.rs'
+              - 'src/services/discord/router/message_handler/voice_announcement_route.rs'
+              - 'src/services/discord/runtime_bootstrap/gateway_lease_recovery_tests.rs'
+              - 'src/services/discord/runtime_bootstrap/intake_delivery_capability.rs'
+              - 'src/services/discord/runtime_bootstrap/intake_delivery_reconciler.rs'
+              - 'src/services/discord/runtime_bootstrap/intake_delivery_sweep/tests.rs'
+              - 'src/services/discord/session_runtime.rs'
+              - 'src/services/discord/task_notification_delivery/tests.rs'
+              - 'src/services/discord/terminal_delivery_custody/pg_tests.rs'
+              - 'src/services/discord/tui_prompt_relay/tests/synthetic_bridge_handoff_pg_tests.rs'
+              - 'src/services/discord/turn_bridge/completion_guard/completion_postgres.rs'
+              - 'src/services/discord/turn_bridge/headless_delivery/production_seam_tests.rs'
+              - 'src/services/discord/turn_bridge/intake_settlement/tests.rs'
+              - 'src/services/discord/turn_bridge/recovery_text.rs'
+              - 'src/services/discord/turn_bridge/resume_pin_tests.rs'
+              - 'src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/pg_tests.rs'
+              - 'src/services/discord/turn_bridge/voice_completion_tests.rs'
+              - 'src/services/discord/watchers/dispatched_origin_ghost_tests.rs'
+              - 'src/services/discord/watchers/lifecycle/restore_tests.rs'
+              - 'src/services/dispatches/discord_delivery/guard.rs'
+              - 'src/services/dispatches/outbox_claiming.rs'
+              - 'src/services/dispatches/wait_queue.rs'
+              - 'src/services/maintenance/jobs/db_retention.rs'
+              - 'src/services/maintenance/jobs/worktree_orphan_sweep.rs'
+              - 'src/services/message_outbox.rs'
+              - 'src/services/message_outbox_circuit_authority_tests.rs'
+              - 'src/services/message_outbox_recovery_tests.rs'
+              - 'src/services/observability/queries.rs'
+              - 'src/services/observability/recovery_audit.rs'
+              - 'src/services/observability/turn_lifecycle.rs'
+              - 'src/services/pipeline_override.rs'
+              - 'src/services/pipeline_routes.rs'
+              - 'src/services/scheduled_messages/context_snapshot.rs'
+              - 'src/services/scheduled_messages/postgres_tests.rs'
+              - 'src/services/session_forwarding.rs'
+              - 'src/services/session_resume.rs'
+              - 'src/services/settings.rs'
+              - 'src/services/stale_turn_reconciler.rs'
+              - 'src/services/tmux_turn_liveness/tests_pg.rs'
+              - 'src/voice/announce_meta.rs'
+              - 'src/voice/turn_link.rs'
+              # END generated pg_db source paths
               - '.github/workflows/**'
               - 'justfile'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              # Canonical campaign/anchor recovery and idle-session protection
+              # execute in just test-postgres, including their pure unit seams.
+              - 'src/server/routes/campaigns.rs'
+              - 'src/services/memory/**'
+              - 'src/services/discord/prompt_builder/**'
+              - 'src/services/discord/relay_recovery.rs'
+              - 'src/services/discord/relay_recovery/**'
+              - 'src/services/discord/session_idle_cleanup.rs'
+              - 'src/services/dispatched_sessions.rs'
+              - 'src/services/tmux_turn_liveness.rs'
+              - 'src/services/tmux_turn_liveness/**'
+              - 'src/services/tui_turn_state.rs'
+              - 'src/services/tmux_common.rs'
+              - 'src/services/provider.rs'
+              - 'src/services/platform/tmux.rs'
               - 'migrations/**'
               - 'scripts/ci/postgres-service.sh'
               - 'src/db/**'
@@ -984,9 +1134,22 @@ jobs:
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::catch_up::classification_order_tests::catch_up_human_visible_marker_recovers_and_strips_but_bot_marker_is_rejected -- --exact --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_gate::gate::tests -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib server::outbox_actionable_delivery::tests -- --test-threads=1
-          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::message_handler::watchdog::timeout_notice_tests -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::message_outbox::dedupe_key_tests -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_gate::live_intake_preserve_wiring_tests::one_admission_guard_precedes_all_soft_intervention_entrypoints -- --exact --test-threads=1
+
+      - name: Accepted turn lifetime regressions
+        run: |
+          env -u AGENTDESK_ROOT_DIR cargo test --lib accepted_turn_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib child_exit_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::process::stream_child::stream_queue::tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::process::process_group_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::process::simple_cancel_watcher_tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::provider::cancel_token_cleanup::executor::tests -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib accepted_quiet_turn_survives_virtual_day -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib accepted_stream_runs_past_virtual_day_until_real_eof -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib productive_turns_older_than_four_and_six_hours_defer_cleanup -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib quiet_native_turn_resumes_after_virtual_day -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::provider::cancel_watchdog::tests -- --test-threads=1
 
       # #5003: this production-path E2E previously ran only in main's broad
       # non-PG lane, so test-only fixes could merge without executing it on PRs.
@@ -1486,7 +1649,7 @@ jobs:
           exit "$failed"
 
       - name: Install shellcheck
-        run: sudo apt-get install -y shellcheck
+        run: sudo apt-get install -y shellcheck zsh
 
       # This direct PR-job step is deliberately outside the aggregate it
       # inspects, so deleting an aggregate writer gate or its wiring test cannot
@@ -1577,7 +1740,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=9cf7a3fde3e74870c50a51ce11116698c52263e02451d2d10c56f53ab4ebb943
+          expected=53e57a6749cd5ff0cb422320b9db1d2d7b3b01028d863428c9280fed968db2b7
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -1604,7 +1767,10 @@ jobs:
   # #5071 T0: this required-context candidate is intentionally unconditional.
   # Its version-controlled manifest names every current T1-T5 contract target,
   # records explicit GAP rows, and owns the selection floors. Condition-3 fixed
-  # mutations attach as a later step in this same job after target verification.
+  # mutations attach as a later step in this same job after target verification,
+  # and #5997 gates THAT STEP ALONE on the surface below. The job, the named
+  # targets and the #5321 backstop stay unconditional, so the floor this
+  # workflow's `library_sweep` comment measures is unchanged.
   # relay-authority-contract timeouts: 7 mutations x ~4.5min compile+test + ~6min
   # setup/base build (measured 2026-08-19, run 32194217057: 5 of 7 done at 30m16s
   # timeout). 50/45 give headroom without hiding growth.
@@ -1617,6 +1783,38 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+
+      # #5997: this selects the mutation step alone. It carries the sources
+      # `run_relay_authority_mutations.sh` mutates, the file that owns each row's
+      # judging test (six of seven rows are judged from a file they do not
+      # mutate), and the modules those judges import fixtures from -- weakening a
+      # fixture empties a judge without touching either of the first two.
+      # `tests/test_relay_authority_mutations.py` derives that third group from
+      # the judges' file-top `use super::*` / `use super::<mod>::` lines and fails
+      # if this list drifts, so a channel opened there cannot land unnoticed.
+      # A job-level filter is unavailable: `check-ci-runner-hardening.sh` forbids
+      # `if:`/`needs:` here so the #5321 backstop stays independent of `changes`.
+      # On this workflow's `pull_request`-only trigger dorny/paths-filter@v3 reads
+      # the file list from the REST API, not from git, so the default checkout
+      # depth is sufficient (`changes` pairs depth 0 with its own filter).
+      - name: Detect relay-authority mutation sources
+        id: mutation_paths
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            mutation_sources:
+              - 'src/services/discord/session_relay_sink.rs'
+              - 'src/services/discord/session_relay_sink/terminal_handoff.rs'
+              - 'src/services/discord/session_relay_sink/delivery_orchestration_tests.rs'
+              - 'src/services/discord/session_relay_sink/tests.rs'
+              - 'src/services/discord/tmux_watcher_registry/fences.rs'
+              - 'src/services/discord/tmux_watcher_registry.rs'
+              - 'src/services/discord/tmux_watcher_registry_restore_tests.rs'
+              - 'src/services/discord/destructive_cancel_gate.rs'
+              - 'src/services/discord/relay_recovery.rs'
+              - 'src/services/discord/relay_recovery/tests.rs'
+              - 'scripts/run_relay_authority_mutations.sh'
+              - '.github/workflows/ci-pr.yml'
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -1653,7 +1851,7 @@ jobs:
         run: |
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1
-          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_without_ending_stream_lifecycle -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::recorded_entry_gate_old_mirrors_the_shipped_lifecycle_gate -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::the_deployed_enforce_dial_governs_every_channel_and_observe_governs_none -- --test-threads=1
@@ -1662,8 +1860,16 @@ jobs:
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::terminal_relay_plan::soft_terminal_direct_send_authority_tests -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::streaming_status_tick::committed_progress_tests::native_collector_tests::recovered_native_preview_terminal -- --test-threads=1
           env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1
+          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::tests::scenario_census_e2e -- --test-threads=1
 
+      # The other nine filter consumers in this workflow read `== 'true'`; this
+      # one is negative on purpose. A renamed step id or filter block makes the
+      # context undefined, which expands to `''`, and `'' != 'false'` runs the
+      # gate instead of dropping it. It does not cover the filter step failing:
+      # that has no `failure()`/`always()` successor, so the job goes red and
+      # this step never starts -- fail-closed by job failure, not by condition.
       - name: Require relay-authority mutations to be killed
+        if: steps.mutation_paths.outputs.mutation_sources != 'false'
         env:
           BASH_ENV: /dev/null
           CARGO_PROFILE_DEV_DEBUG: "0"
@@ -1692,7 +1898,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=9cf7a3fde3e74870c50a51ce11116698c52263e02451d2d10c56f53ab4ebb943
+          expected=53e57a6749cd5ff0cb422320b9db1d2d7b3b01028d863428c9280fed968db2b7
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

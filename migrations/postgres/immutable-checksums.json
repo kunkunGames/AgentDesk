@@ -612,14 +612,24 @@
       "version": 119
     },
     {
-      "path": "migrations/postgres/0120_kakao_calendar_sync.sql",
-      "sha256": "a1b2581cb55bb38f035a4bccc075d9bb0f89d50d19582ce3b851149f260b0e91",
+      "path": "migrations/postgres/0120_relay_dead_letter_redelivery.sql",
+      "sha256": "ba6981fecb0e07c30dabf307d7b948e358ccfc9958ad6ab6c6f525cff62cf8a6",
       "version": 120
     },
     {
-      "path": "migrations/postgres/0121_kakao_calendar_lease_expiry.sql",
-      "sha256": "24bfe53ba58f870d67d19e69d57a4e96ce65eaa7411367d0bc93edaf8df6388f",
+      "path": "migrations/postgres/0121_campaigns.sql",
+      "sha256": "d59de79cfa690eef4b286059eb24ab2b4c38aacdf894d5a0976152141f4b38af",
       "version": 121
+    },
+    {
+      "path": "migrations/postgres/0122_kakao_calendar_sync.sql",
+      "sha256": "a1b2581cb55bb38f035a4bccc075d9bb0f89d50d19582ce3b851149f260b0e91",
+      "version": 122
+    },
+    {
+      "path": "migrations/postgres/0123_kakao_calendar_lease_expiry.sql",
+      "sha256": "24bfe53ba58f870d67d19e69d57a4e96ce65eaa7411367d0bc93edaf8df6388f",
+      "version": 123
     }
   ],
   "version": 1

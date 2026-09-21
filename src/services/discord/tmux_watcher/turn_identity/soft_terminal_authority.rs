@@ -5,12 +5,9 @@
 //! re-exports these items, so callers still reach them through the watcher's
 //! usual `use turn_identity::*` glob.
 
-/// #5175: the conjunct that denied soft-terminal delivery authority.
-///
-/// The denial used to be a single opaque `route="soft_terminal_no_authority"`
-/// string, which is why a channel that lost EVERY terminal body for a week
-/// still read `gap 0 / wedge 0` to the watchdog. Naming the failing conjunct
-/// makes the loss greppable, alertable, and attributable to one contract term.
+/// #5175: the conjunct that denied soft-terminal delivery authority, named
+/// per-conjunct (rather than one opaque route string) so a delivery loss is
+/// greppable, alertable, and attributable to one contract term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SoftTerminalAuthorityDenial {
     /// No inflight row survived to the pre-relay read.
@@ -221,9 +218,8 @@ impl WatcherSoftTerminalAuthority {
     ///
     /// Shaped after the one cell T5 S4 moved in the bridge stream tick
     /// (`guarded_persist::visible_mutation_authority_after_guarded_save`'s
-    /// `GuardedSaveOutcome::Missing if cohort_admits => Suppressed`): one
-    /// structural signal, relaxed inside the enforcement cohort only, with the
-    /// exact-episode veto (`IdentityMismatch` there) left where it was.
+    /// `GuardedSaveOutcome::RowAbsent => Suppressed`): one structural signal
+    /// relaxed, with the exact-episode veto (the mismatch family) left in place.
     pub(crate) fn authorize_pre_relay_inflight_with_rowless_authority(
         &self,
         inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,

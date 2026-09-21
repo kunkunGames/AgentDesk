@@ -94,16 +94,12 @@ test("timeouts helper module ignores synthetic reattach placeholders for infligh
     ]
   });
 
-  const progress = module.helpers.inspectInflightProgress(
+  const progress = module.helpers.findRecentInflightForSession(
     "provider:AgentDesk-codex-project-agentdesk",
     "AgentDesk-codex-project-agentdesk",
-    30,
-    180
   );
 
-  assert.equal(progress.inflight, null);
-  assert.equal(progress.channel_id, null);
-  assert.equal(progress.recent, false);
+  assert.equal(progress, null);
 });
 
 test("timeouts reconciliation module scans pending fallback dispatch keys", () => {
@@ -811,38 +807,17 @@ test("S7 active monitor exempts synthetic turns without force-kill or repeated l
       state.kv.set(key, JSON.stringify({ count: 3, ts: Date.now() - 31 * 60000 }));
       policy._section_I();
       const kills = () => state.httpPosts.filter((post) => post.url.endsWith("/force-kill"));
-      if (mode === "watchdog") {
-        assert.equal(kills().length, 0);
-        assert.equal(state.httpPosts.length, 1);
-        assert.match(state.httpPosts[0].url, /extend-timeout$/);
-        assert.equal(state.kv.has(key), false);
-      } else if (owner === 2) {
-        assert.equal(kills().length, 1, "ordinary owner must still force-kill");
-      } else {
-        assert.equal(kills().length, 0, "synthetic owner must not force-kill");
-        const logCount = state.logs.info.length + state.logs.warn.length;
-        assert.equal(state.logs.info.filter((line) => line.includes("synthetic turn exempt")).length, 1);
-        state.kv.set(key, ' { "synthetic_exempt": true, "count": 0 } ');
-        // Simulate repeated deadlock windows by aging a counter timestamp if one is written.
-        for (let window = 0; window < 5; window++) {
-          const value = state.kv.get(key);
-          if (value && value.startsWith("{") && JSON.parse(value).ts) {
-            state.kv.set(key, JSON.stringify({ ...JSON.parse(value), ts: Date.now() - 31 * 60000 }));
-          }
-          policy._section_I();
-        }
-        assert.equal(kills().length, 0, "later windows must not force-kill");
-        assert.equal(state.logs.info.length + state.logs.warn.length, logCount, "no repeated logs");
-        assert.equal(state.httpPosts.length, 0);
-        assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
-        assert.equal(state.timeoutTerminationRecords.length, 0);
-        assert.equal(state.deadlockAlerts.length, 0);
-      }
+      for (let window = 0; window < 5; window++) policy._section_I();
+      assert.equal(kills().length, 0);
+      assert.equal(state.kv.has(key), false);
+      assert.equal(state.httpPosts.length, 0);
+      assert.equal(state.timeoutTerminationRecords.length, 0);
+      assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
     }
   }
 });
 
-test("timeouts active monitor opt-in review hang recovery retries stale review dispatches", () => {
+test("timeouts active monitor preserves quiet accepted review turns", () => {
   const sessionKey = "provider:AgentDesk-claude-review-session";
   const previousCheck = Date.now() - 16 * 60 * 1000;
   const { policy, state } = loadPolicy("policies/timeouts.js", {
@@ -893,17 +868,9 @@ test("timeouts active monitor opt-in review hang recovery retries stale review d
 
   policy._section_I();
 
-  assert.equal(state.httpPosts.length, 1);
-  assert.equal(
-    state.httpPosts[0].url,
-    "http://127.0.0.1:8791/api/sessions/" + encodeURIComponent(sessionKey) + "/force-kill"
-  );
-  assert.equal(state.httpPosts[0].body.retry, true);
-  assert.match(state.httpPosts[0].body.reason, /review hang timeout/);
-  assert.equal(state.deadlockAlerts.length, 1);
-  assert.match(state.deadlockAlerts[0].message, /재디스패치 완료/);
-  assert.equal(state.timeoutTerminationRecords.length, 1);
-  assert.equal(state.timeoutTerminationRecords[0].session_key, sessionKey);
+  assert.equal(state.httpPosts.length, 0);
+  assert.equal(state.deadlockAlerts.length, 0);
+  assert.equal(state.timeoutTerminationRecords.length, 0);
 });
 
 test("timeouts active monitor review fast path leaves non-review sessions on the normal threshold", () => {
@@ -973,278 +940,21 @@ test("timeouts orphan dispatch module emits orphan recovery signals", () => {
   ]);
 });
 
-test("timeouts long turn monitor module alerts every 30-minute threshold", () => {
+test("long turns do not register monitoring or page the deadlock manager", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "codex",
-        channel_id: "channel-1",
-        channel_name: "project-agentdesk",
-        session_key: "provider:AgentDesk-codex-project-agentdesk",
-        tmux_session_name: "AgentDesk-codex-project-agentdesk",
-        started_at: timestampMinutesAgo(91),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
-      {
-        match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
-        result: []
-      },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-    ])
+    inflights: [{
+      provider: "codex",
+      channel_id: "long-running-channel",
+      started_at: timestampMinutesAgo(24 * 60)
+    }]
   });
-
-  policy._section_L();
-
-  assert.equal(state.deadlockAlerts.length, 1);
-  assert.match(state.deadlockAlerts[0].message, /장시간 턴/);
-  assert.match(state.deadlockAlerts[0].message, /90분 단계/);
-  assert.match(state.executions[0].sql, /INSERT OR REPLACE INTO kv_meta/);
-  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "90"]);
-});
-
-test("timeouts long turn monitor module skips persistent routine keep-alive sessions", () => {
-  const tmuxSession = "AgentDesk-claude-routine-warmup-obiseo-session---personal-obi";
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "claude",
-        channel_id: "routine-thread-1",
-        channel_name: "routine warmup-obiseo-session - personal-obi",
-        session_key: "provider:" + tmuxSession,
-        tmux_session_name: tmuxSession,
-        started_at: timestampMinutesAgo(91),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT execution_strategy FROM routines WHERE discord_thread_id = ? LIMIT 1",
-        result(sql, params) {
-          assert.deepEqual(toPlain(params), ["routine-thread-1"]);
-          return [{ execution_strategy: "persistent" }];
-        }
-      },
-      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
-      {
-        match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
-        result: []
-      },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
-    ])
-  });
-
-  policy._section_L();
-
+  assert.equal(policy._section_L, undefined);
+  // Isolate the minute scheduler: an old inflight must not add any hidden
+  // watchdog extension, alert, or elapsed-time intervention.
+  for (const section of ["A", "C", "D", "E", "N"]) policy["_section_" + section] = () => {};
+  policy.onTick1min({});
   assert.equal(state.deadlockAlerts.length, 0);
-  assert.equal(
-    state.executions.filter((execution) => /INSERT OR REPLACE INTO kv_meta/.test(execution.sql)).length,
-    0
-  );
-  assert.equal(
-    state.logs.warn.filter((line) => line.includes("inflight scan error")).length,
-    0,
-    state.logs.warn.join("\n")
-  );
-});
-
-test("timeouts long turn monitor module still alerts fresh routine sessions", () => {
-  const tmuxSession = "AgentDesk-claude-routine-once-only---personal-obi";
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "claude",
-        channel_id: "routine-thread-2",
-        channel_name: "routine once-only - personal-obi",
-        session_key: "provider:" + tmuxSession,
-        tmux_session_name: tmuxSession,
-        started_at: timestampMinutesAgo(91),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT execution_strategy FROM routines WHERE discord_thread_id = ? LIMIT 1",
-        result: [{ execution_strategy: "fresh" }]
-      },
-      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
-      {
-        match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
-        result: []
-      },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] }
-    ])
-  });
-
-  policy._section_L();
-
-  assert.equal(state.deadlockAlerts.length, 1);
-  assert.match(state.deadlockAlerts[0].message, /장시간 턴/);
-  assert.match(state.deadlockAlerts[0].message, /90분 단계/);
-});
-
-test("timeouts long turn monitor module skips synthetic reattach placeholders", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "codex",
-        channel_id: "channel-1",
-        channel_name: "project-agentdesk",
-        session_key: "provider:AgentDesk-codex-project-agentdesk",
-        tmux_session_name: "AgentDesk-codex-project-agentdesk",
-        session_id: null,
-        request_owner_user_id: 0,
-        user_msg_id: 0,
-        any_tool_used: false,
-        has_post_tool_text: false,
-        rebind_origin: true,
-        started_at: timestampMinutesAgo(95),
-        updated_at: timestampMinutesAgo(95),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
-    ])
-  });
-
-  policy._section_L();
-
-  // Synthetic placeholders never trigger alerts or tier writes…
-  assert.equal(state.deadlockAlerts.length, 0);
-  // …but the cleanup pass still runs and the bulk alert-key DELETE must execute.
-  const bulkAlertDeletes = state.executions.filter((execution) =>
-    /DELETE FROM kv_meta WHERE key LIKE 'long_turn_alert:%'/.test(execution.sql)
-  );
-  assert.equal(bulkAlertDeletes.length, 1);
-});
-
-test("timeouts long turn monitor batches stale KV cleanup through the typed facade", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "codex",
-        channel_id: "active-channel:thread",
-        started_at: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'",
-        result: [
-          { key: "long_turn_tier:codex:active-channel:thread" },
-          { key: "long_turn_tier:codex:stale-channel-1" },
-          { key: "long_turn_tier:claude:stale-channel-2" }
-        ]
-      },
-      {
-        match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'",
-        result: [
-          { key: "long_turn_watchdog_extension:codex:active-channel:thread" },
-          { key: "long_turn_watchdog_extension:codex:stale-channel-1" }
-        ]
-      }
-    ])
-  });
-  const keys = [
-    "long_turn_tier:codex:active-channel:thread",
-    "long_turn_tier:codex:stale-channel-1",
-    "long_turn_tier:claude:stale-channel-2",
-    "long_turn_watchdog_extension:codex:active-channel:thread",
-    "long_turn_watchdog_extension:codex:stale-channel-1"
-  ];
-  for (const key of keys) state.kv.set(key, "present");
-
-  policy._section_L();
-
-  assert.deepEqual(state.kvDeleteManyCalls, [
-    [
-      "long_turn_tier:codex:stale-channel-1",
-      "long_turn_tier:claude:stale-channel-2"
-    ],
-    ["long_turn_watchdog_extension:codex:stale-channel-1"]
-  ]);
-  assert.equal(
-    state.kv.has("long_turn_tier:codex:active-channel:thread"),
-    true
-  );
-  assert.equal(
-    state.kv.has("long_turn_watchdog_extension:codex:active-channel:thread"),
-    true
-  );
-  assert.equal(state.kv.has("long_turn_tier:codex:stale-channel-1"), false);
-  assert.equal(state.kv.has("long_turn_tier:claude:stale-channel-2"), false);
-  assert.equal(state.kv.has("long_turn_watchdog_extension:codex:stale-channel-1"), false);
-  assert.equal(
-    state.executions.some((execution) => /WHERE key = \?/.test(execution.sql)),
-    false,
-    "policy cleanup must not bypass the typed KV facade with scalar deletes"
-  );
-});
-
-test("timeouts long turn monitor module skips repeated 30-minute threshold", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    inflights: [
-      {
-        provider: "codex",
-        channel_id: "channel-1",
-        channel_name: "project-agentdesk",
-        session_key: "provider:AgentDesk-codex-project-agentdesk",
-        tmux_session_name: "AgentDesk-codex-project-agentdesk",
-        started_at: timestampMinutesAgo(95),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      {
-        match: (sql, params) => sql.includes("SELECT value FROM kv_meta WHERE key = ?") && params[0] === "long_turn_tier:codex:channel-1",
-        result: [{ value: "90" }]
-      },
-      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
-    ])
-  });
-
-  policy._section_L();
-
-  assert.equal(state.deadlockAlerts.length, 0);
-});
-
-test("timeouts long turn monitor module uses configured alert interval", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { long_turn_alert_interval_min: 40 },
-    inflights: [
-      {
-        provider: "codex",
-        channel_id: "channel-1",
-        channel_name: "project-agentdesk",
-        session_key: "provider:AgentDesk-codex-project-agentdesk",
-        tmux_session_name: "AgentDesk-codex-project-agentdesk",
-        started_at: timestampMinutesAgo(91),
-        dispatch_id: null
-      }
-    ],
-    dbQuery: createSqlRouter([
-      { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
-      {
-        match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
-        result: []
-      },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
-    ])
-  });
-
-  policy._section_L();
-
-  assert.equal(state.deadlockAlerts.length, 1);
-  assert.match(state.deadlockAlerts[0].message, /80분 단계/);
-  assert.deepEqual(toPlain(state.executions[0].params), ["long_turn_tier:codex:channel-1", "80"]);
+  assert.equal(state.executions.length, 0);
 });
 
 test("timeouts workspace branch guard module recovers wt branches", () => {
@@ -1479,6 +1189,47 @@ test("timeouts idle-kill module does not count live-activity guard skips toward 
   assert.doesNotMatch(state.logs.error.join("\n"), /tmux was alive but kill failed/);
 });
 
+test("timeouts idle-kill module does not count provider busy or unknown skips toward budget", () => {
+  const guardKeys = [
+    "provider:AgentDesk-claude-guard-1",
+    "provider:AgentDesk-claude-guard-2",
+    "provider:AgentDesk-claude-guard-3"
+  ];
+  const liveKey = "provider:AgentDesk-claude-live-after-guard";
+  function row(session_key) {
+    return {
+      session_key,
+      agent_id: null,
+      provider: "claude",
+      active_dispatch_id: null,
+      thread_channel_id: null,
+      last_seen_at: "2000-01-01 00:00:00"
+    };
+  }
+
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: { server_port: 8791 },
+    dbQuery: createSqlRouter([
+      { match: "SELECT id, name, name_ko, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx FROM agents", result: [] },
+      { match: "FROM sessions WHERE provider IN ('claude', 'codex', 'qwen') AND (agent_id IS NULL OR TRIM(agent_id) = '')", result: [] },
+      { match: (sql) => sql.includes("WHERE status = 'idle'") && sql.includes("active_dispatch_id IS NULL") && sql.includes("INTERVAL '6 hours'"), result: [...guardKeys.map(row), row(liveKey)] },
+      { match: (sql) => sql.includes("WHERE status = 'idle'") && sql.includes("active_dispatch_id IS NOT NULL") && sql.includes("INTERVAL '24 hours'"), result: [] }
+    ]),
+    httpPost(url) {
+      return url.includes("live-after-guard")
+        ? { ok: true, tmux_was_alive: true, tmux_killed: true }
+        : { ok: true, tmux_was_alive: true, tmux_killed: false, skipped_provider_activity_guard: true };
+    }
+  });
+
+  policy._section_O();
+
+  assert.equal(state.httpPosts.length, 4);
+  assert.ok(state.httpPosts.some((p) => p.url.includes("live-after-guard")));
+  assert.match(state.logs.info.join("\n"), /provider idle state not proven/);
+  assert.doesNotMatch(state.logs.error.join("\n"), /tmux was alive but kill failed/);
+});
+
 test("timeouts idle-kill module counts genuine kill failures (tmux alive but kill failed) toward budget", () => {
   // A live session whose `tmux kill-session` fails (tmux_was_alive:true,
   // tmux_killed:false) is NOT a zombie — it must consume the budget so a stuck
@@ -1583,7 +1334,7 @@ test("timeouts idle-kill module excludes thread idle rows from the main batch", 
   });
 });
 
-test("S7 ordinary successor clears synthetic marker and starts its own counter", () => {
+test("S7 ordinary successor clears a legacy synthetic marker without a silence counter", () => {
   const sessionKey = "provider:AgentDesk-claude-successor";
   let source = "external_input";
   const { policy, state } = loadPolicy("policies/timeouts.js", {
@@ -1599,17 +1350,14 @@ test("S7 ordinary successor clears synthetic marker and starts its own counter",
     httpPost() { return { ok: true, tmux_killed: true }; }
   });
   const key = "deadlock_check:" + sessionKey;
+  state.kv.set(key, '{"synthetic_exempt":true,"count":0}');
   policy._section_I();
-  assert.equal(JSON.parse(state.kv.get(key)).synthetic_exempt, true);
+  assert.equal(state.kv.has(key), false);
   source = "managed";
   policy._section_I();
-  const counter = JSON.parse(state.kv.get(key));
-  assert.equal(counter.synthetic_exempt, undefined);
-  assert.equal(counter.count, 1);
-  assert.ok(counter.ts > 0);
-  assert.equal(state.httpPosts.filter((post) => post.url.endsWith("/force-kill")).length, 0);
-  policy._section_I();
-  assert.equal(JSON.parse(state.kv.get(key)).count, 1, "ordinary window must not double-count");
+  assert.equal(state.kv.has(key), false);
+  assert.equal(state.httpPosts.length, 0);
+
 });
 
 test("timeouts reconciliation uses typed card facade for title instead of db.query", () => {
@@ -1635,5 +1383,31 @@ test("timeouts reconciliation uses typed card facade for title instead of db.que
   var pmDecisions = state.pmDecisions || [];
   if (pmDecisions.length > 0) {
     assert.equal(pmDecisions[0].title, "Test Card Title");
+  }
+});
+
+test("active monitor preserves productive turns beyond four and six hours", () => {
+  for (const ageMinutes of [241, 361, 1440]) {
+    for (const outputAge of [1, 121, 1440]) {
+    const sessionKey = "provider:AgentDesk-codex-long-active";
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      config: { server_port: 8791 },
+      inflights: [{
+        session_key: sessionKey, channel_id: "channel-long", provider: "codex",
+        tmux_session_name: "AgentDesk-codex-long-active", request_owner_user_id: 2,
+        started_at: timestampMinutesAgo(ageMinutes), updated_at: timestampMinutesAgo(outputAge)
+      }],
+      timeouts: { deadlockCandidates: [{ session_key: sessionKey, agent_id: "agent-long", last_heartbeat: timestampMinutesAgo(outputAge) }] },
+      exec() { return "0\n"; },
+      httpPost() { return { ok: true, tmux_killed: true }; }
+    });
+    const key = "deadlock_check:" + sessionKey;
+    state.kv.set(key, JSON.stringify({ count: 3, ts: Date.now() - 31 * 60000 }));
+    policy._section_I();
+    assert.equal(state.httpPosts.length, 0, "productive turn must not be killed or require extension");
+    assert.equal(state.kv.has(key), false);
+    assert.equal(state.timeoutTerminationRecords.length, 0);
+    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+    }
   }
 });

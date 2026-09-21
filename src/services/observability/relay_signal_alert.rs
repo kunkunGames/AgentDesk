@@ -349,12 +349,47 @@ mod tests {
             "offset_invariant_violation",
             "task_response_chunk_ambiguous",
             "task_card_post_ambiguous",
+            // #5941: the two halves of one loss — a frame with no delivery
+            // owner, and that frame left without even a durable record.
+            "relay_terminal_authority_denied",
+            "terminal_frame_without_owner_or_record",
+            // #5996 I20: a retirement decision taken with neither a witness nor
+            // a measured tail to read.
+            "retirement_without_progress_witness",
         ] {
             assert!(
                 keys.contains(&expected),
                 "relay signal table must monitor {expected}; present: {keys:?}"
             );
         }
+    }
+
+    /// #5948 (DoD): the resend-suppression counter must have a real CONSUMER, not
+    /// just a producer. `relay_terminal_authority_denied` is the cautionary case
+    /// #5941 surfaced — emitted for months with nothing reading it. Membership in
+    /// this table is what makes the hourly #3561 operator alert read it, so guard
+    /// both the key and the status string the emit path actually writes.
+    #[test]
+    fn signal_table_monitors_rewind_resend_suppression() {
+        let signal = RELAY_SIGNAL_DEFINITIONS
+            .iter()
+            .find(|s| s.key == "relay_resend_suppressed")
+            .expect("the #5948 resend-suppression counter must be monitored");
+        assert_eq!(
+            signal.event_type, "relay_root_cause_counter",
+            "the parser emits it through `emit_relay_root_cause_counter`"
+        );
+        assert!(
+            signal.statuses.contains(&"relay_resend_suppressed"),
+            "the monitored status must equal the emitted one, or the window query \
+             counts zero forever; present: {:?}",
+            signal.statuses
+        );
+        assert!(
+            signal.default_threshold > 1,
+            "a rewind resend is recoverable and absorbed — paging on a single one \
+             would make the signal noise instead of a root cause"
+        );
     }
 
     /// #3579: the operator alert table must NEVER count the watcher-owned
@@ -406,6 +441,14 @@ mod tests {
             "relay_uncommitted_inflight_cleared",
             "response_sent_offset_monotonic",
             "task_response_chunk_delivery_ambiguous",
+            // #5941: `metrics::record_relay_terminal_authority_denied` writes
+            // this status, and `orphan_terminal_frame` writes the invariant one.
+            "relay_terminal_authority_denied",
+            "terminal_frame_has_a_delivery_owner_or_a_record",
+            // #5996: `stale_reclaim` writes this one, reading the SAME symbol
+            // the table does — so this assertion guards the row's presence, not
+            // a hand-copied string.
+            super::super::LIVE_TURN_PROVEN_BY_PROGRESS_INVARIANT,
         ] {
             assert!(
                 statuses.contains(&expected),

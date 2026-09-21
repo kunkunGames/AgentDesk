@@ -618,7 +618,7 @@ time for diagnostics; neither is a stored approval value.
     `crash_resume_guard.rs`); -17 from #4151 removing
     `format_monitor_suppressed_body` — its only caller was the unreachable #1009
     MonitorAutoTurn suppressed-body replacement in tmux_watcher.rs (dead since
-    #1708; #4144 r2 closed the None-kind Edit path); -8 from #4198 routing the restored-watcher release D-section through the shared `turn_finalizer::cleanup` helpers (`snapshot_role_override` / `clear_watchdog_and_kick_thread_parents_after_turn_release` / `remove_owned_role_override`); +32 from #4105 adding
+    #1708; #4144 r2 closed the None-kind Edit path); -8 from #4198 routing the restored-watcher release D-section through the shared `turn_finalizer::cleanup` helpers (`snapshot_role_override` / `kick_thread_parents_after_turn_release` / `remove_owned_role_override`); +32 from #4105 adding
     cross-turn restored-seed identity (`RestoredWatcherTurn.turn_identity` +
     `restored_seed_reassigned_to_different_turn`) so a long-lived watcher reused
     for a new turn drops the prior turn's stale `full_response` seed; +101 from #4106 adding
@@ -1313,7 +1313,8 @@ time for diagnostics; neither is a stored approval value.
     without one (bridge finalizes EXACTLY ONCE, "first wins"). The committed
     runtime-binding offset still advances on successful delivery and the
     start-offset clamp to `committed_relay_offset` is untouched (no double-send).
-    The Codex idle path (`relay_tui_idle_response_through_bridge`) is unchanged;
+    The Codex idle path (`relay_tui_idle_response_through_bridge`, since removed
+    unwired by the T6 unrecorded dead-code sweep slice 1) is unchanged;
     +54 from #3282: the deferred pending-start worker's terminal backstop ABORT
     (`backstop_abort_foreign_inflight_live`) now runs the injected
     `pending_start_abort_cleanup_fn` — resolved from the SAME
@@ -1348,7 +1349,7 @@ time for diagnostics; neither is a stored approval value.
     classifiers, the `strip_leading_*` / `normalize_*` parsers,
     `slash_command_control_kind`, the `format_ssh_direct_prompt_notification` /
     `format_slash_command_control_note` / `format_system_continuation_note`
-    formatters + their `extract_loop_body` / `format_count_with_commas` /
+    formatters + their `extract_loop_body` /
     `sanitize_inline_code` / `should_suppress_local_only_kind_note_after_continuation`
     helpers) moved verbatim to the capped `tui_prompt_relay/injected_prompt_policy.rs`
     sibling (318 prod LoC, below the giant threshold); names are re-imported via
@@ -1358,7 +1359,10 @@ time for diagnostics; neither is a stored approval value.
     `local_only_kind_note_suppressed_by_recent_continuation`,
     `bridge_task_notification_to_live_panel`, `is_local_only_slash_command_prompt`)
     plus all `#[cfg(test)]` coverage stay in this root. Frozen baseline 5434 -> 5142
-    (-292, locks in the shrink; zero logic change). #3479 rank-10 (behavior-preserving
+    (-292, locks in the shrink; zero logic change). The T6 unrecorded dead-code
+    sweep slice 1 later removed three unwired members of that moved cluster
+    (`format_count_with_commas`, `slash_command_control_prompt_is_local_command_stdout`,
+    `slash_command_control_prompt_is_caveat_only`). #3479 rank-10 (behavior-preserving
     extraction): the pure transcript/rollout prompt scanners (the
     `ClaudeIdleTranscriptScan` / `CodexIdleRolloutScan` enums, the three
     `scan_*` byte-stream parsers, and the two `*_idle_prompt_observation_should_tail_response`
@@ -1483,10 +1487,12 @@ time for diagnostics; neither is a stored approval value.
   - `src/services/discord/idle_recap/scrollback.rs` (#3479 scrollback: the tmux
     `capture-pane` tail capture, the `claude-e` transcript-tail fallback
     (`capture_transcript_scrollback` + the unit-testable `extract_transcript_tail_text`
-    / `parse_transcript_line_text` workers), and the Haiku `summarize_with_haiku`
-    call plus #4079's user-perspective suggested-reply prompt contract. Deps
+    / `parse_transcript_line_text` workers), and the Haiku `compose_with_haiku`
+    call plus #4079's user-perspective suggested-reply prompt contract (its
+    summary-only wrapper `summarize_with_haiku` was removed unwired by the T6
+    unrecorded dead-code sweep slice 1). Deps
     reached via `use super::*;`;
-    `capture_tmux_scrollback` / `capture_transcript_scrollback` / `summarize_with_haiku`
+    `capture_tmux_scrollback` / `capture_transcript_scrollback` / `compose_with_haiku`
     are re-exported by the parent so the `server::routes::idle_recap` caller keeps
     byte-identical `idle_recap::<fn>` call sites, while the parsing workers stay
     `pub(super)` for the parent's in-file tests; below the giant-file threshold).
@@ -1702,7 +1708,12 @@ time for diagnostics; neither is a stored approval value.
     guard state/logging to `health/stall_liveness.rs`; #3410 wired the
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
-    new behaviour to `health/watcher_respawn.rs`).
+    new behaviour to `health/watcher_respawn.rs`; +12 from #5957 calling
+    `watcher_respawn::observe_watcher_absence_for_unwatched_work` before the
+    cross-tick retry, because the candidate loop is derived from
+    `tmux_watchers` and therefore cannot see a channel whose watcher was
+    cancelled — since #4460 retired the destructive branch 4, nothing else
+    reached the absence tracker and the retry queue was permanently empty).
   - `src/services/discord/router/message_handler/intake_turn.rs` (frozen giant surface; -84 from #4743 behavior-preserving decomposition moving the worker-facing `IntakeRequest` and `execute_intake_turn_core` into `intake_turn/worker_entry.rs`, with source-assertion seams redirected to their already-extracted owners; +6 from #4196 folding the turn-end WIP (uncommitted-changes) warning into the next turn's context — intake takes the warning stashed at the previous turn's end (provider-scoped kv key) via the sibling `take_and_merge_wip_warning` (turn_start.rs, non-baselined) and folds it into `reply_context` right after the #4307 feedback reminder, and the TUI-busy refusal branch forwards the owned warning to `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`) for a KV-only put-back under the same provider key; the stash lives in sibling `completion_postlude.rs` and the storage/format helpers in `recovery_text.rs`/`response_format.rs` (all non-baselined); +2 from #4658 threading the `scheduled_snapshot=false` argument into the intake `load_channel_recent_context` call (live user turns are never scheduled-snapshot turns); -39 from #4552 behavior-preserving decomposition moving won-claim request-anchor recording plus idle-recap generation-bump/captured-clear bootstrap to `intake_turn/claim_bootstrap.rs`; the stale-dispatch guard → bootstrap → placeholder-handoff order, queued-turn no-op gating, synthetic-id `None` anchor, and bump-before-clear ordering are unchanged; -110 from #4248/#4329 removing the now-dead busy pre-submit queued-card controller branch after reaction-only policy became unconditional; O1 Pending→Queued reaction promotion is deferred to #4598 because the reconciler intentionally rejects started→queued reversals; +0 net from #4329 gating the residual busy pre-submit queued-card render behind the reaction-only queue-status policy (guard lands fmt-stable net-zero); +3 from #4247 fail-safe queue-preservation P0 (reviewable admission, decompose tracked by #4552; net-zero proven impossible) — the turn-start DISPATCH-GUARD gains an fmt-unfoldable `&& !preserve_on_cancel` condition in its if-let chain, `set_followup_requeue_context` gains one `preserve_on_cancel` argument (one-arg-per-line under rustfmt), and the merged mutation-provable guard/wiring test mod adds one `#[cfg(test)] mod` framing line; +1 from #4309 threading the provider-known Claude-harness flag into worker-local per-turn prompt assembly; -10 net from #4485 extracting stale-busy intake recovery and channel/tmux name resolution into cohesive `tmux_reaper.rs` helpers; +9 from #4307 PR-B routing the voluntary tool_feedback reminder through the same take/inject/put-back path as the session-retry recovery context — intake folds the reminder stashed at the previous turn's end (provider-scoped kv key, codex dual-review r1) into `reply_context` via the sibling `take_and_merge_feedback_reminder` (turn_start.rs, non-baselined; take+merge logic lives there) so it reaches the prompt via `context_chunks` AND is carried forward inside `reply_context.clone()` on a TUI-busy requeue, and the refusal branch forwards `&provider` + the owned reminder to `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`, non-baselined) for a KV-only put-back under the same provider key; the stash itself lives in sibling `completion_postlude.rs` and the storage/format helpers in `recovery_text.rs`/`response_format.rs` (all non-baselined); +1 net from #4139 — the TUI-busy enqueue-refusal branch now calls `apply_tui_busy_enqueue_refusal` (sibling `tui_followup.rs`, non-baselined), which puts the taken session-retry recovery context back via a KV-only restore (no new audit row) before rewriting the refusal notice, so refusal branches no longer drop context the successful-requeue branch preserves; +2 from #4117 delaying the session-retry recovery-context take past the stale-dispatch abort and race-loss returns so unused context is never consumed/audit-stamped; +2 from #4107 moving hosted-TUI busy pre-submit mailbox release ahead of retry enqueue so the active-message retry passes the actor guard; -5 from #4049 S4-b routing queue-exit feedback through the reconciler; +5 from #4049 S4-a2 round-7 threading the reconciler's per-start-attempt token from the optimistic Pending record into the race-loss rollback path so stale delayed rollback cannot clobber a same-generation re-dispatch; +13 from #4049 S4-a2 routing queue-marker add/remove through `queue_marker.rs` so standalone 📬 notifications use `turn_view_reconciler` while ➕/🔄 stay auxiliary; -11 from #4019 R1 routing dequeue queue-marker cleanup through the shared 📬/➕/🔄 marker list and shortening the local contract note; +18 from #3813 Phase 1a intake latency spans — six thin observation-only mark/emit call-sites (turn-claimed anchor + placeholder/prep/input marks + `submitted`/`deferred_busy` emit); all monotonic-`Instant` measurement + formatting lives in sibling `latency_spans.rs`, no control-flow change; -856 from #3837 behavior-preserving decomposition lifting three cohesive `handle_text_message` clusters verbatim into sibling `intake_turn/` submodules — `voice_intake::resolve_intake_voice_announcement` (voice-announcement resolution), `race_loss::handle_race_loss_enqueue` (the `if !started` mailbox enqueue + queued-placeholder render + queue-pending reaction lifecycle), and `turn_watchdog::spawn_text_turn_watchdog` (the per-turn watchdog spawn); pure code movement + path/visibility plumbing, no logic change; +21 from #3905 threading the intake gate's already-authorized, non-consuming voice-announcement resolution into direct dispatch (new `handle_text_message` `gate_resolved_voice_announcement` param + the trust-the-carry-forward resolution branch) so a sibling-gateway durable-consume race no longer WARN-drops an announce the gate authorized; #3464 single-dispatch dedup preserved via the unchanged per-message `route_voice_transcript_announcement_once` claim; +16 from #3811 recording the original-request turn anchor (`set_turn_request_anchor`) gated on the won mailbox claim (`started == true`) so a queued message never bleeds the active turn's deeplink; +1 from #3751 routing paused-watcher attach through owner-channel persistence helper; -65 from #3653 removing the separate session-restore notify bot send path so restore is absorbed by the session/status panel; -40 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +23 from #3557 Codex review: cap the INITIAL watchdog deadline at the provider hard ceiling (+one-shot ceiling warn); +27 from #3557 (A) per-turn hard-ceiling clamp wired into the watchdog auto-extend block; +1 from #3479 item-3 `shared.dispatch.<field>` nesting; +9 from #4305 wiring `record_fresh_session_context_boundary` (durable /goal-fresh clear boundary) into the fresh-provider-session path; +10 from #4607 wiring the hosted-TUI busy pre-submit enqueue branch through the shared `note_queue_pending` pending-reaction helper via a thin `note_busy_tui_pre_submit_queue_pending` adapter (sibling `race_loss/mailbox_reaction.rs`, non-baselined) so pre-submit queue diverts surface the 📬/➕ pending reaction like every other queue path; +6 from #4571 wiring the native Discord typing indicator spawn (`super::typing_indicator::spawn_native_typing_indicator`) + per-turn identity threading into the intake dispatch path (typing module in sibling `typing_indicator.rs`, non-baselined; discord/mod.rs untouched net-zero);
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; #3464 extracted the
@@ -1723,14 +1734,7 @@ time for diagnostics; neither is a stored approval value.
     S4 mechanical placeholder/status-panel `.ui` rewiring).
   - `src/services/discord/router/message_handler/headless_turn.rs` (frozen giant surface; +1 from #4309 threading the provider-known Claude-harness flag into worker-local per-turn prompt assembly; +1 from #4117 delaying the recovery-context take past the goal-lifecycle Consumed return; -207 from #4119 — inline watchdog loop extracted to the shared watchdog.rs timeout-notice helper; #3751 routes paused-watcher attach through owner-channel persistence helper with no net LoC change; +74 from #family-profile-probe DM-fresh provider session: `dm_fresh_routine_turn` discriminator routes a fresh DM routine turn through the shared `/goal fresh` machinery (`force_fresh_provider_session = goal_fresh || dm_fresh`) — thorough clear (in-memory + DB + stale id) + Claude TUI runtime-binding clear (`tui_prompt_dedupe::clear_tmux_runtime_binding`) + DB/live-TUI restore skip + launch fresh flag, so neither the persisted id nor the live tmux pane is reused (codex review P1/R2/R3 — four reuse layers: in-memory, DB, Codex wrapper, Claude TUI runtime-binding recovery); the `/goal` prompt rewrite stays goal-only so the probe prompt is sent verbatim; so a fresh DM routine turn never resumes the accumulated per-channel session (memento caseId is the only cross-run continuity); -45 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +49 from #4305 recording the durable clear boundary for /goal-fresh and DM-fresh plus the routine identity-change path; +8 from #4571 wiring the native typing indicator spawn + per-turn identity into the non-silent headless turn path; +49 from #4658 scheduled-snapshot session isolation (incl. F1 non-disruption fix): `scheduled_snapshot_session_label` derives the ADK session key from the reservation label (not the channel name); the snapshot turn is deliberately kept OUT of `fresh_context_severance` (which records a DURABLE channel clear boundary + wipes the channel's in-memory provider session) and instead cold-starts by dropping the LOCAL session_id and disables live channel_recent_context via a dedicated `scheduled_snapshot_context` gate — so it runs isolated (DB `sessions` writeback is session_key-keyed) and never disturbs the channel's live session/continuity (AC-2);
     headless Discord turn launch/terminal-response path split from the router
-    message handler; bugfix only outside a further extraction plan; +54 from
-    #3557 (A) codex r2: the headless watchdog was missing the per-turn hard
-    ceiling cap that the foreground intake path already had — and it also
-    `mark_async_managed`s the token so the sync watchdog stops enforcing, leaving
-    this async loop as the ONLY bound. Added the initial-deadline
-    `min(now+timeout, ceiling)` cap + one-shot ceiling warn and the auto-extend
-    `clamp_auto_extend_deadline_ms` clamp, reusing the shared discord/mod.rs
-    helpers, so headless Codex honors its 4h ceiling end to end).
+    message handler; accepted turns have no elapsed or silence deadline).
   - `src/services/discord/meeting_orchestrator.rs` (#4712 de-giant: cohesive
     participant-selection, lifecycle, meeting-round, record-persistence, and
     selection-runtime clusters moved verbatim into `meeting_orchestrator/`

@@ -30,8 +30,7 @@ pub(in crate::services::discord::turn_bridge) struct StreamTickCandidateSaveCont
 /// have handed live delivery to a watcher/standby relay.  Only the historical
 /// `None` owner is bridge authority.  Store failures fail closed for this tick
 /// but remain retryable; a reowned row or a durable non-bridge relay owner
-/// permanently ends bridge authority.  A row that VANISHED ends it only outside
-/// the enforcement cohort — see [`visible_mutation_authority_after_guarded_save`].
+/// permanently ends bridge authority.  A row that VANISHED suppresses instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::services::discord::turn_bridge) enum VisibleMutationAuthority {
     Authorized,
@@ -85,7 +84,6 @@ pub(in crate::services::discord::turn_bridge) fn visible_mutation_authority_afte
     outcome: GuardedSaveOutcome,
     inflight_state: &InflightTurnState,
     intended_authority: crate::services::discord::inflight::StreamRelayAuthority,
-    cohort_admits: bool,
 ) -> VisibleMutationAuthority {
     use crate::services::discord::inflight::StreamRelayAuthority;
 
@@ -98,17 +96,13 @@ pub(in crate::services::discord::turn_bridge) fn visible_mutation_authority_afte
             VisibleMutationAuthority::Authorized
         }
         GuardedSaveOutcome::Saved if authority_unchanged => VisibleMutationAuthority::Suppressed,
-        // #5464 T5 S4: the one cell AC2-R moves. A vanished durable row is a
-        // structural signal, and AC1 forbids one from ending delivery authority
-        // on its own, so inside the cohort it withholds this tick's Discord
-        // mutation and leaves the turn alive — `post_loop_finalize` stays
-        // reachable instead of orphaning the finished answer inside a deleted
-        // row. `IdentityMismatch` deliberately does NOT move with it: it is an
-        // exact-episode veto rather than a structural signal.
-        GuardedSaveOutcome::Missing if cohort_admits => VisibleMutationAuthority::Suppressed,
+        // A vanished durable row withholds this tick's mutation and leaves the
+        // turn alive; the mismatch family is an exact-episode veto and ends it.
+        GuardedSaveOutcome::RowAbsent => VisibleMutationAuthority::Suppressed,
         GuardedSaveOutcome::Saved
-        | GuardedSaveOutcome::Missing
-        | GuardedSaveOutcome::IdentityMismatch => VisibleMutationAuthority::AuthorityLost,
+        | GuardedSaveOutcome::AuthorityPinned
+        | GuardedSaveOutcome::Unnameable
+        | GuardedSaveOutcome::SuccessorOwned => VisibleMutationAuthority::AuthorityLost,
         GuardedSaveOutcome::IoError => VisibleMutationAuthority::Retry,
     };
     // #5464 T5 S2: the one observation point that covers all sixteen
@@ -226,7 +220,7 @@ fn persist_stream_tick_state_with_authority_mode(
         *detached_current_msg_id =
             detached_current_msg_id_from_durable(inflight_state.current_msg_id);
     } else if operation.mode == StreamTickSaveMode::StrictVisibleMutationFence
-        && outcome == GuardedSaveOutcome::IdentityMismatch
+        && outcome.is_identity_mismatch_legacy()
         && expected.matches_state(inflight_state)
         && ((
             inflight_state.current_msg_id,
@@ -245,10 +239,7 @@ fn persist_stream_tick_state_with_authority_mode(
         *detached_current_msg_id =
             detached_current_msg_id_from_durable(inflight_state.current_msg_id);
     }
-    if matches!(
-        outcome,
-        GuardedSaveOutcome::Missing | GuardedSaveOutcome::IdentityMismatch
-    ) {
+    if outcome == GuardedSaveOutcome::RowAbsent || outcome.is_identity_mismatch_legacy() {
         tracing::warn!(
             channel_id = operation.channel_id.get(),
             caller = operation.caller,

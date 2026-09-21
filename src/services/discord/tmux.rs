@@ -789,48 +789,6 @@ mod restored_seed_discard_tests {
     }
 }
 
-#[allow(dead_code)] // #3034: #826/#897/#898 bg-trigger notify-outbox subsystem (unwired).
-fn lifecycle_reason_code_for_tmux_exit(reason: &str) -> &'static str {
-    let lower = reason.to_ascii_lowercase();
-    if tmux_exit_reason_is_normal_completion(reason) {
-        "lifecycle.normal_completion"
-    } else if lower.contains("force-kill")
-        || lower.contains("deadlock")
-        || lower.contains("prompt too long")
-        || lower.contains("auth")
-    {
-        "lifecycle.force_kill"
-    } else if lower.contains("idle") || lower.contains("turn cap") || lower.contains("cleanup") {
-        "lifecycle.auto_cleanup"
-    } else {
-        "lifecycle.tmux_terminated"
-    }
-}
-
-#[allow(dead_code)] // #3034: #826/#897 lifecycle-notify subsystem, see note above.
-fn tmux_death_lifecycle_notification_reason(reason: Option<&str>) -> Option<&str> {
-    let reason = reason?.trim();
-    if reason.is_empty() {
-        return None;
-    }
-
-    let reason = reason
-        .strip_prefix('[')
-        .and_then(|s| s.find("] ").map(|i| &s[i + 2..]))
-        .unwrap_or(reason)
-        .trim();
-    if reason.is_empty() || reason.eq_ignore_ascii_case("unknown") {
-        return None;
-    }
-
-    let lower = reason.to_ascii_lowercase();
-    if tmux_exit_reason_is_normal_completion(reason) || lower.contains("force-kill") {
-        return None;
-    }
-
-    Some(reason)
-}
-
 fn tmux_death_is_normal_completion(reason: Option<&str>, _diagnostic: Option<&str>) -> bool {
     reason.is_some_and(tmux_exit_reason_is_normal_completion)
 }
@@ -1442,67 +1400,6 @@ async fn drain_missing_inflight_dead_tmux_tail_to_eof(
             current_offset
         }
     }
-}
-
-/// #826 P1 #2 (option b): Decide which of the two offset watermarks
-/// (`last_relayed_offset`, `last_enqueued_offset`) a watcher tick should
-/// advance after attempting to deliver a terminal response.
-///
-///  - `last_relayed_offset` is the canonical "Discord has durably received
-///    this byte range" watermark. It must advance ONLY on confirmed
-///    foreground delivery (direct send or placeholder replace succeeded), or
-///    on the notify-path fallback that reached Discord.
-///  - `last_enqueued_offset` is the "outbox row committed" watermark. It
-///    advances when the notify-bot outbox insert succeeded — the outbox
-///    worker owns delivery + retry from there. Prevents re-enqueue of the
-///    same range on the next tick without conflating staging with delivery.
-///
-/// Both watermarks advance in lock-step on genuine delivery so a later
-/// dedupe check (which takes their max) sees a single unified floor.
-///
-/// Pure function extracted for regression-test coverage of the offset-commit
-/// gate; the runtime version lives inline in the watcher loop because it is
-/// intertwined with other relay bookkeeping.
-#[allow(dead_code)] // #3034: notify-path bg-trigger offset gate (unwired; #826/#897/#898).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct OffsetAdvanceDecision {
-    pub advance_relayed: bool,
-    pub advance_enqueued: bool,
-}
-
-#[allow(dead_code)] // #3034: notify-path offset gate, see note above.
-#[inline]
-pub(super) fn notify_path_offset_advance_decision(
-    has_current_response: bool,
-    enqueue_succeeded: bool,
-    direct_send_delivered: bool,
-) -> OffsetAdvanceDecision {
-    if direct_send_delivered {
-        // Confirmed foreground delivery. Lift both watermarks.
-        return OffsetAdvanceDecision {
-            advance_relayed: true,
-            advance_enqueued: true,
-        };
-    }
-    if enqueue_succeeded {
-        // Staged on the outbox — advance the enqueue watermark to dedupe the
-        // next tick, but leave the canonical relayed watermark alone.
-        return OffsetAdvanceDecision {
-            advance_relayed: false,
-            advance_enqueued: true,
-        };
-    }
-    if !has_current_response {
-        // Empty turn — advance both in lock-step (the original single-offset
-        // behaviour) so the watcher doesn't spin on this range.
-        return OffsetAdvanceDecision {
-            advance_relayed: true,
-            advance_enqueued: true,
-        };
-    }
-    // Nothing delivered, nothing staged — leave BOTH watermarks untouched so
-    // the next tick can try again.
-    OffsetAdvanceDecision::default()
 }
 
 #[inline]
@@ -2262,7 +2159,7 @@ fn persist_watcher_stream_progress(
             full_response_len = full_response.len(),
             "watcher: skipping stream-progress persistence until parsed body catches up"
         );
-        return super::inflight::WatcherProgressOutcome::Skipped;
+        return super::inflight::WatcherProgressOutcome::CoordinateMismatch;
     }
 
     // #3558: pre-emit the in-bounds telemetry against the caller's snapshot for
@@ -2577,7 +2474,11 @@ mod watcher_stream_progress_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let _root_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        checkpoint(&[("AGENTDESK_ROOT_DIR", tmp.path().as_os_str())]);
 
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(1509350490461180105);
@@ -2636,8 +2537,24 @@ mod watcher_stream_progress_tests {
             persisted.last_offset, 777,
             "streaming progress must preserve the non-owned last_offset watermark"
         );
+    }
 
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    use crate::test_env_panic_probe::{assert_root_restored, checkpoint};
+
+    #[test]
+    fn stream_tool_hold_witness_restores_env_after_panic_present() {
+        assert_root_restored(
+            true,
+            persist_watcher_stream_progress_persists_tool_hold_witness,
+        );
+    }
+
+    #[test]
+    fn stream_tool_hold_witness_restores_env_after_panic_absent() {
+        assert_root_restored(
+            false,
+            persist_watcher_stream_progress_persists_tool_hold_witness,
+        );
     }
 
     #[test]
@@ -2646,7 +2563,11 @@ mod watcher_stream_progress_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let _root_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        checkpoint(&[("AGENTDESK_ROOT_DIR", tmp.path().as_os_str())]);
 
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(1509350490461180415);
@@ -2689,8 +2610,22 @@ mod watcher_stream_progress_tests {
             .expect("reload row");
         assert_eq!(reloaded.full_response, "already persisted prefix");
         assert_eq!(reloaded.response_sent_offset, state.response_sent_offset);
+    }
 
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    #[test]
+    fn stream_rewind_seed_restores_env_after_panic_present() {
+        assert_root_restored(
+            true,
+            persist_watcher_stream_progress_skips_rewind_seed_before_body_catches_up_4115,
+        );
+    }
+
+    #[test]
+    fn stream_rewind_seed_restores_env_after_panic_absent() {
+        assert_root_restored(
+            false,
+            persist_watcher_stream_progress_skips_rewind_seed_before_body_catches_up_4115,
+        );
     }
 }
 
@@ -2764,7 +2699,11 @@ mod streaming_rollover_frozen_prefix_persistence_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let _root_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        checkpoint(&[("AGENTDESK_ROOT_DIR", tmp.path().as_os_str())]);
 
         let provider = ProviderKind::Claude;
         let channel_id = ChannelId::new(1_521_269_012_347_097_158);
@@ -2850,7 +2789,22 @@ mod streaming_rollover_frozen_prefix_persistence_tests {
             vec![f1.get(), f2.get()],
             "the persisted frozen-prefix set is monotonic (union, no dup)"
         );
+    }
+    use crate::test_env_panic_probe::{assert_root_restored, checkpoint};
 
-        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    #[test]
+    fn frozen_prefix_persistence_restores_env_after_panic_present() {
+        assert_root_restored(
+            true,
+            frozen_prefix_persists_across_iteration_and_restore_for_terminal_delete,
+        );
+    }
+
+    #[test]
+    fn frozen_prefix_persistence_restores_env_after_panic_absent() {
+        assert_root_restored(
+            false,
+            frozen_prefix_persists_across_iteration_and_restore_for_terminal_delete,
+        );
     }
 }

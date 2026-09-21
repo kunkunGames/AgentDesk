@@ -114,10 +114,12 @@ use self::relay_ownership::{
 
 mod synthetic_orphan_reclaim; // #3982 orphan-at-birth reclaim trigger (see module doc)
 pub(in crate::services::discord) mod synthetic_start;
-pub(in crate::services::discord) use synthetic_start::bridge_handoff::preserve_admitted_source;
 #[cfg(unix)]
 pub(in crate::services::discord) use synthetic_start::bridge_handoff::{
     DormantSyntheticClaim, capture_dormant_partial,
+};
+pub(in crate::services::discord) use synthetic_start::bridge_handoff::{
+    preserve_admitted_source, preserve_stamped_source,
 };
 mod synthetic_start_wiring; // #4002 shared Path-X wiring with #4082 neutral-note gate
 #[cfg(test)]
@@ -202,8 +204,6 @@ const CLAUDE_IDLE_INFLIGHT_DRAIN_POLL: Duration = Duration::from_millis(100);
 /// itself) so a prompt already written to the freshly-resolved transcript is
 /// still observed and its response relayed.
 const CLAUDE_IDLE_FRESH_TRANSCRIPT_LOOKBACK_BYTES: u64 = 65_536;
-const CODEX_IDLE_PROMPT_ANCHOR_WAIT: Duration = Duration::from_secs(2);
-const CODEX_IDLE_PROMPT_ANCHOR_POLL: Duration = Duration::from_millis(100);
 const TUI_DIRECT_SYNTHETIC_CLAIM_WAIT: Duration = Duration::from_secs(2);
 const TUI_DIRECT_SYNTHETIC_CLAIM_POLL: Duration = Duration::from_millis(100);
 pub(in crate::services::discord) const TUI_DIRECT_SYNTHETIC_OWNER_USER_ID: u64 = 1;
@@ -892,7 +892,8 @@ fn slash_command_control_turn_is_duplicate_external_replay(
 }
 
 #[cfg(all(test, unix))]
-#[path = "tui_prompt_relay/local_model_queue_wake_e2e.rs"]
 mod local_model_queue_wake_e2e;
+#[cfg(all(test, unix))]
+mod relay_e2e;
 #[cfg(test)]
 mod tests;

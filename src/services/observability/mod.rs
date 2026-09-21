@@ -111,6 +111,14 @@ pub(super) struct RelaySignal {
     pub(super) label: &'static str,
 }
 
+/// #5996 §I20 — the invariant key the stale-mailbox retirement decision emits.
+/// It lives beside the signal table rather than at the emit site because the two
+/// must be the SAME string: `relay_signal_alert` matches `status` exactly and has
+/// no wildcard, so a drifted key silences the alert instead of failing anything.
+/// Both sides read this symbol, which makes the match structural.
+pub(super) const LIVE_TURN_PROVEN_BY_PROGRESS_INVARIANT: &str =
+    "live_turn_proven_by_progress_not_presence";
+
 /// Canonical relay-loss signal table monitored by the #3561 operator alert
 /// job. Each entry maps 1:1 onto rows the emit path already persists to
 /// `observability_events` (see `emit::emit_relay_root_cause_counter` and
@@ -138,6 +146,16 @@ pub(super) const RELAY_SIGNAL_DEFINITIONS: &[RelaySignal] = &[
         label: "릴레이 owner 불명",
     },
     RelaySignal {
+        key: "relay_resend_suppressed",
+        event_type: "relay_root_cause_counter",
+        statuses: &["relay_resend_suppressed"],
+        // #5948: a rewind resend is a normal, recoverable event — the sink now
+        // absorbs it — so the threshold sits above the handful a busy hour
+        // produces and trips only when the upstream rewind paths are churning.
+        default_threshold: 20,
+        label: "재전송 소스 범위 억제(되감기 이중 누적 차단)",
+    },
+    RelaySignal {
         key: "offset_invariant_violation",
         event_type: "invariant_violation",
         statuses: &["last_offset_monotonic", "response_sent_offset_monotonic"],
@@ -157,6 +175,39 @@ pub(super) const RELAY_SIGNAL_DEFINITIONS: &[RelaySignal] = &[
         statuses: &["task_card_post_delivery_ambiguous"],
         default_threshold: 1,
         label: "태스크 카드 전송 결과 불명(중복 위험 격리)",
+    },
+    // #5941: this counter has had a producer since #5175 and no consumer here,
+    // so every body dropped at that seam scored zero on the operator monitor.
+    // Threshold 1 is safe only because the producer counts ADMITTED losses
+    // (`OrphanTerminalFrameFacts::record_required`), not every denial: a denial
+    // with an empty body, or one the sink had delivered, must not page at 1.
+    RelaySignal {
+        key: "relay_terminal_authority_denied",
+        event_type: "relay_root_cause_counter",
+        statuses: &["relay_terminal_authority_denied"],
+        default_threshold: 1,
+        label: "터미널 프레임 배달 소유자 없음(무음 유실 벡터)",
+    },
+    // #5941 I17: the denial above is survivable when the body is dead-lettered;
+    // this signal is the case where even that failed and the answer is gone.
+    RelaySignal {
+        key: "terminal_frame_without_owner_or_record",
+        event_type: "invariant_violation",
+        statuses: &["terminal_frame_has_a_delivery_owner_or_a_record"],
+        default_threshold: 1,
+        label: "터미널 프레임 유실 기록 실패(복구 불가 유실)",
+    },
+    // #5996 I20: a retirement decision that reached its gate with only the
+    // record's absence and a clock to read. The consumer refuses rather than
+    // retiring, so each row is a mailbox left wedged (an (a) loss) — visible
+    // only because this entry exists; `relay_signal_alert` has no wildcard, so a
+    // status missing from a `statuses` list counts zero forever.
+    RelaySignal {
+        key: "retirement_without_progress_witness",
+        event_type: "invariant_violation",
+        statuses: &[LIVE_TURN_PROVEN_BY_PROGRESS_INVARIANT],
+        default_threshold: 1,
+        label: "진행 증거 없는 은퇴 판정(메일박스 점유 유지)",
     },
 ];
 pub(super) const AGENT_QUALITY_EVENT_TYPES: &[&str] = &[
@@ -571,12 +622,9 @@ pub(crate) fn reset_for_tests() {
 }
 
 #[cfg(test)]
-pub(crate) fn test_runtime_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{lock_env_then_runtime, test_runtime_lock};
 
 #[cfg(test)]
 mod cancellation_observability_tests {
@@ -585,6 +633,13 @@ mod cancellation_observability_tests {
 
     #[tokio::test]
     async fn turn_cancelled_emit_records_normalized_payload_without_pg() {
+        let _ = crate::services::observability::events::test_capture::capture_async(
+            turn_cancelled_emit_records_normalized_payload_without_pg_scenario(),
+        )
+        .await;
+    }
+
+    async fn turn_cancelled_emit_records_normalized_payload_without_pg_scenario() {
         let _guard = test_runtime_lock();
         reset_for_tests();
         init_observability(None);
@@ -611,10 +666,7 @@ mod cancellation_observability_tests {
             ),
         );
 
-        let event = events::recent(10)
-            .into_iter()
-            .find(|event| event.event_type == "turn_cancelled")
-            .expect("turn_cancelled event should be recorded");
+        let event = crate::services::observability::events::test_capture::one("turn_cancelled");
         assert_eq!(event.channel_id, Some(42));
         assert_eq!(event.provider.as_deref(), Some("codex"));
         assert_eq!(event.payload["reason"], "queue-api cancel_turn (preserve)");

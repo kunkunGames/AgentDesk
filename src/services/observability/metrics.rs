@@ -89,10 +89,23 @@ pub struct AtomicCounters {
     /// sink did not acknowledge delivery AND the soft terminal failed the
     /// watcher's turn-authority contract, so neither actor posted the body. Any
     /// non-zero value is a silently dropped answer plus a frozen delivery
-    /// frontier (redrive then re-publishes the previous answer). The failing
-    /// conjunct is emitted alongside as a `relay_terminal_authority_denied_*`
-    /// root-cause counter.
+    /// frontier (redrive then re-publishes the previous answer). This is the
+    /// ADMITTED subset: it rises only once a body is actually owed a dead-letter
+    /// row. The failing conjunct is named by `relay_terminal_denial_cause`, which
+    /// is UNGATED (#5941) and so counts EVERY denial — including the ones that
+    /// lost nothing — so the two are not comparable per-event.
     pub relay_terminal_authority_denied: AtomicU64,
+    /// #5948: source bytes the session-bound relay parser refused to fold into
+    /// the open turn a second time, because a watcher rewind re-sent a byte range
+    /// the turn already contains. The counter rises once per FRAME whose payload
+    /// was trimmed — whether the overlap covered the whole payload or only a
+    /// prefix — never once per suppressed byte, so it counts suppression events,
+    /// not the volume of prose they held back.
+    /// A rising count means the upstream rewind paths
+    /// (`tmux_watcher` terminal-delivery rewind, `loop_poll_prologue` redrive
+    /// resume) are re-sending often enough to inspect; a count that goes to zero
+    /// after a rewind change is how the suppression proves it is still needed.
+    pub relay_resend_suppressed: AtomicU64,
     /// #4794: observed prompt-notification emissions that hit an authoritative
     /// tmux-owner registry miss and were still pending when bounded three-state
     /// probing definitively reported `DeadOrAbsent`. Poll misses are excluded;
@@ -137,6 +150,7 @@ impl AtomicCounters {
             relay_terminal_authority_denied: self
                 .relay_terminal_authority_denied
                 .load(Ordering::Relaxed),
+            relay_resend_suppressed: self.relay_resend_suppressed.load(Ordering::Relaxed),
             relay_permanent_loss: self.relay_permanent_loss.load(Ordering::Relaxed),
             relay_permanent_loss_drift_state_ttl_expired: self
                 .relay_permanent_loss_drift_state_ttl_expired
@@ -186,6 +200,8 @@ pub struct AtomicCountersSnapshot {
     pub relay_owner_unknown: u64,
     /// #5175: see [`AtomicCounters::relay_terminal_authority_denied`].
     pub relay_terminal_authority_denied: u64,
+    /// #5948: see [`AtomicCounters::relay_resend_suppressed`].
+    pub relay_resend_suppressed: u64,
     /// #4794: confirmed lost observed-prompt emissions; see
     /// [`AtomicCounters::relay_permanent_loss`] for exact inclusion rules.
     pub relay_permanent_loss: u64,
@@ -233,6 +249,9 @@ pub struct CounterSnapshotRow {
     /// #5175: terminal frames that ended with no delivery owner at all. See
     /// [`AtomicCounters::relay_terminal_authority_denied`].
     pub relay_terminal_authority_denied: u64,
+    /// #5948: resent source byte ranges the sink parser refused to fold twice.
+    /// See [`AtomicCounters::relay_resend_suppressed`].
+    pub relay_resend_suppressed: u64,
     /// #4794: confirmed lost observed-prompt emissions; see
     /// [`AtomicCounters::relay_permanent_loss`] for exact inclusion rules.
     pub relay_permanent_loss: u64,
@@ -336,6 +355,14 @@ impl ObservabilityCounters {
     pub fn record_relay_terminal_authority_denied(&self, channel_id: u64, provider: &str) {
         self.slot(channel_id, provider)
             .relay_terminal_authority_denied
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #5948: the sink parser dropped a re-sent source byte range instead of
+    /// folding it into the open turn twice.
+    pub fn record_relay_resend_suppressed(&self, channel_id: u64, provider: &str) {
+        self.slot(channel_id, provider)
+            .relay_resend_suppressed
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -451,6 +478,7 @@ impl ObservabilityCounters {
                     relay_uncommitted_inflight_cleared: snap.relay_uncommitted_inflight_cleared,
                     relay_owner_unknown: snap.relay_owner_unknown,
                     relay_terminal_authority_denied: snap.relay_terminal_authority_denied,
+                    relay_resend_suppressed: snap.relay_resend_suppressed,
                     relay_permanent_loss: snap.relay_permanent_loss,
                     relay_permanent_loss_drift_state_ttl_expired: snap
                         .relay_permanent_loss_drift_state_ttl_expired,
@@ -533,25 +561,31 @@ pub fn record_relay_terminal_ack_timeout(channel_id: u64, provider: &str) {
     super::emit::emit_relay_root_cause_counter(provider, channel_id, "relay_terminal_ack_timeout");
 }
 
+/// #5175: the per-conjunct cause counter. `denial_counter` names the failing
+/// authority conjunct (`relay_terminal_authority_denied_*`) so an alert can
+/// distinguish "the row vanished" from "a forged turn was correctly refused".
+///
+/// Split from [`record_relay_terminal_authority_denied`] by #5941 r3 so the
+/// caller can keep this one UNGATED alongside its WARN: the distinction it
+/// draws is worthless if the arm it was built to name — a forged turn nonce,
+/// which loses no body and so is never ADMITTED as a loss — never emits.
+pub fn record_relay_terminal_denial_cause(channel_id: u64, provider: &str, denial_counter: &str) {
+    super::emit::emit_relay_root_cause_counter(provider, channel_id, denial_counter);
+}
+
 /// #5175: convenience wrapper for
 /// `ObservabilityCounters::record_relay_terminal_authority_denied`.
 ///
-/// `denial_counter` names the failing authority conjunct
-/// (`relay_terminal_authority_denied_*`) and is emitted as its own root-cause
-/// counter so an alert can distinguish "the row vanished" from "a forged turn
-/// was correctly refused".
-pub fn record_relay_terminal_authority_denied(
-    channel_id: u64,
-    provider: &str,
-    denial_counter: &str,
-) {
+/// The AGGREGATE denial signal. #5941 gave it a threshold-1 alert row, which is
+/// safe only because its caller fires it on ADMITTED losses; the cause counter
+/// that used to ride along moved to [`record_relay_terminal_denial_cause`].
+pub fn record_relay_terminal_authority_denied(channel_id: u64, provider: &str) {
     global().record_relay_terminal_authority_denied(channel_id, provider);
     super::emit::emit_relay_root_cause_counter(
         provider,
         channel_id,
         "relay_terminal_authority_denied",
     );
-    super::emit::emit_relay_root_cause_counter(provider, channel_id, denial_counter);
 }
 
 /// #2838: convenience wrapper for `ObservabilityCounters::record_relay_uncommitted_inflight_cleared`.
@@ -568,6 +602,18 @@ pub fn record_relay_uncommitted_inflight_cleared(channel_id: u64, provider: &str
 pub fn record_relay_owner_unknown(channel_id: u64, provider: &str) {
     global().record_relay_owner_unknown(channel_id, provider);
     super::emit::emit_relay_root_cause_counter(provider, channel_id, "relay_owner_unknown");
+}
+
+/// #5948: convenience wrapper for
+/// `ObservabilityCounters::record_relay_resend_suppressed`.
+///
+/// Emitting the root-cause counter — not just bumping the atomic — is what gives
+/// the suppression a consumer: the atomics reset on restart, while
+/// `observability_events` is the restart-safe stream the #3561 operator alert job
+/// reads (`RELAY_SIGNAL_DEFINITIONS`).
+pub fn record_relay_resend_suppressed(channel_id: u64, provider: &str) {
+    global().record_relay_resend_suppressed(channel_id, provider);
+    super::emit::emit_relay_root_cause_counter(provider, channel_id, "relay_resend_suppressed");
 }
 
 /// #4794: record confirmed permanent relay loss as an additive emission count.
@@ -626,6 +672,21 @@ mod tests {
         assert_eq!(rows[0].relay_permanent_loss, 11);
         assert_eq!(rows[0].relay_permanent_loss_drift_state_ttl_expired, 9);
         assert_eq!(rows[0].relay_permanent_loss_dead_pane, 2);
+    }
+
+    /// #5948: the suppression counter has to reach a snapshot row, otherwise the
+    /// parser increments an atomic nobody can read.
+    #[test]
+    fn resend_suppression_reaches_the_snapshot_row() {
+        let counters = ObservabilityCounters::new();
+        counters.record_relay_resend_suppressed(5948, "Claude");
+        counters.record_relay_resend_suppressed(5948, "claude");
+
+        let rows = counters.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel_id, 5948);
+        assert_eq!(rows[0].provider, "claude");
+        assert_eq!(rows[0].relay_resend_suppressed, 2);
     }
 
     #[test]

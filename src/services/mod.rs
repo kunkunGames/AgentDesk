@@ -52,7 +52,6 @@ pub mod kakao;
 pub mod kakao_message;
 pub mod kanban;
 pub mod kanban_cards;
-pub mod long_turn_watchdog;
 // #3034: 81 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during maintenance dead-code cleanup.
 #[allow(dead_code)]
@@ -156,6 +155,7 @@ pub(crate) mod tui_prompt_dedupe;
 pub(crate) mod tui_steering;
 pub(crate) mod tui_turn_state;
 pub mod turn_cancel_finalizer;
+pub mod turn_cancel_queue_guard;
 pub mod turn_lifecycle;
 pub mod turn_orchestrator;
 

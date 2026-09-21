@@ -254,6 +254,13 @@ banner "Intake-outbox done writer per-file call-site allowlist (#5071 T2)"
 "$PYTHON" -m unittest tests.test_intake_outbox_done_writer_call_sites
 "$PYTHON" -m unittest tests.test_rust_lex
 
+banner "Comment-only change checker self-tests"
+# scripts/check_comment_only_change.py decides whether a diff may skip human
+# review, so a false "comment-only" verdict ships unread code. These tests are
+# what stops that. The checker is an on-demand reviewer tool, not a tree gate:
+# nothing here runs it against this PR.
+"$PYTHON" -m unittest tests.test_comment_only_change
+
 banner "Hotfile LOC ratchet guard (#3565)"
 "$PYTHON" scripts/check_hotfile_ratchet.py
 "$PYTHON" -m unittest scripts.test_ratchet_admission
@@ -287,17 +294,34 @@ banner "PR infrastructure failure rerun classifier (#4392/#5207)"
 ./scripts/ci/infra-failure-rerun.sh --self-test
 bash scripts/main-ci-triage.sh --self-test
 
+# Nightly notification contract (#6006).
+"$PYTHON" -m unittest tests.test_nightly_ci_triage
+# End nightly notification contract.
+
 banner "CI timeout wrapper tests (#4413)"
 "$PYTHON" -m unittest tests.test_ci_timeout
 
 banner "Relay-authority fixed mutation gate (#5071)"
+"$PYTHON" scripts/check_relay_mutation_sources.py
 "$PYTHON" -m unittest tests.test_relay_authority_mutations
 
 banner "Relay recovery targeted-lane wiring contract (#4423)"
 "$PYTHON" -m unittest tests.test_relay_recovery_ci_wiring
 
-banner "TUI relay assertion unit tests (#5065)"
-"$PYTHON" -m unittest scripts.e2e.tui_relay.test_assertions
+banner "TUI relay e2e harness unit tests (#5065/#5997)"
+# #5997: only test_assertions was wired here, so eight sibling modules covering
+# the same scenario machinery compiled in review and executed nowhere.
+"$PYTHON" -m unittest \
+  scripts.e2e.tui_relay.test_assertions \
+  scripts.e2e.tui_relay.test_cell_resolution \
+  scripts.e2e.tui_relay.test_discord_client \
+  scripts.e2e.tui_relay.test_driver_health \
+  scripts.e2e.tui_relay.test_durable_delivery \
+  scripts.e2e.tui_relay.test_fixtures \
+  scripts.e2e.tui_relay.test_known_gap \
+  scripts.e2e.tui_relay.test_matrix_runner \
+  scripts.e2e.tui_relay.test_post_deploy_relay_continuity
+"$PYTHON" -m unittest tests.test_e2e_scenario_lane_wiring
 
 banner "Relay-authority named-target floor contract (#5071)"
 "$PYTHON" scripts/check_relay_authority_contract.py --check-manifest
@@ -336,8 +360,25 @@ banner "Test-target integrity gate (#5003/#5008)"
 AGENTDESK_CI_TIMEOUT_REPORT=1 "$PYTHON" scripts/ci-timeout.py 900 "$PYTHON" scripts/check_test_target_integrity.py --verify-lib-inventory
 
 banner "PostgreSQL test-lane membership gate (#4979, enforced)"
+# The default mode also verifies the generated `pg_db` region of ci-pr.yml
+# against the manifest, so a new PG source path fails here rather than
+# skipping the PG lane on its own PR.
 "$PYTHON" scripts/check_pg_test_lane_membership.py --baseline-ref "$TEST_LANE_BASELINE_REF"
+# #6014: regenerate and demand an empty diff. The check above proves the region
+# is derivable; this proves the COMMITTED workflow is the derived one, and that
+# regenerating an in-sync tree is a no-op. Same shape as the SQL inventory above.
+"$PYTHON" scripts/check_pg_test_lane_membership.py --write-pg-db-paths
+git diff --exit-code HEAD -- .github/workflows/ci-pr.yml
 "$PYTHON" -m unittest tests.test_check_pg_test_lane_membership
+
+banner "New production file comment-ratio gate"
+# The 999-line blind spot: hotfile_ratchet only stops an ALREADY-huge file from
+# re-expanding, and both giant-file gates begin at 1,000 lines, so no gate
+# measured a brand-new file below that. #5953 added a 711-line file that was
+# 398 lines of comment and registered in neither ratchet. Added files only --
+# retroactive enforcement would red 200+ existing files at once.
+"$PYTHON" scripts/check_new_file_comment_ratio.py --base-ref "$TEST_LANE_BASELINE_REF"
+"$PYTHON" -m unittest tests.test_new_file_comment_ratio
 
 banner "Process-global Mutex<()> poison-recovery gate (#5185)"
 # The rule this enforces was documented in src/config.rs and recurred anyway:
@@ -346,6 +387,11 @@ banner "Process-global Mutex<()> poison-recovery gate (#5185)"
 # panics were PoisonError). A rule that only exists as prose is #5003.
 "$PYTHON" scripts/check_test_mutex_poison_recovery.py
 "$PYTHON" -m unittest tests.test_check_test_mutex_poison_recovery
+
+banner "Test ROOT file-reference policy"
+# Require canonical shared-lock references in discovered ROOT-mutating files.
+"$PYTHON" scripts/check_test_env_lock_references.py
+"$PYTHON" -m unittest tests.test_test_env_lock_references
 
 banner "Scheduled-message PG path-filter wiring contract"
 "$PYTHON" -m unittest tests.test_scheduled_messages_ci_wiring
@@ -444,6 +490,9 @@ banner "Relay watchdog + PG tunnel supervisor tests (#4381/#4378)"
 # silently fall out of the deploy again (the 06-29 relay-gap-watch failure).
 "$PYTHON" -m unittest tests.test_relay_watchdog tests.test_pg_tunnel
 
+banner "Session anchor CLI tests"
+"$PYTHON" -m unittest scripts.__tests__.test_session_anchor
+
 banner "Build token serialization tests (#5663)"
 # scripts/build_token.py serializes the two release scripts' cargo sites; the
 # Makefile target and install.sh's source install stay outside it by design.
@@ -451,6 +500,12 @@ banner "Build token serialization tests (#5663)"
 # its ONLY CI gate, and it scans every tracked *.sh and Makefile for release
 # cargo sites, so a dropped wiring or a new unserialized one cannot pass silently.
 "$PYTHON" -m unittest tests.test_build_token_serialization_5663
+
+banner "Build token fairness tests (#5968)"
+# The token is handed out first-come-first-served; before #5968 it was not, and
+# a lane that released and re-entered starved a waiter for 49 minutes. Same
+# reason as above -- Python, so only this unittest run gates it.
+"$PYTHON" -m unittest tests.test_build_token_fairness_5968
 
 banner "Generate inventory docs (refresh workspace; gate source-of-truth invariants, #3036)"
 # Inventory snapshots are untracked, so generate them in the CI workspace

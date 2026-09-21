@@ -60,6 +60,18 @@ fn classify_with_resolutions(
     announce_resolution: UtilityBotUserIdResolution,
     notify_resolution: UtilityBotUserIdResolution,
 ) -> CatchUpClassificationDecision {
+    classify_with_resolutions_for_author(view, announce_resolution, notify_resolution, true)
+}
+
+/// #6042: the authorization bit is now a classifier input for both catch-up
+/// phases, so the sender-ordering tests above keep their pre-#6042 meaning by
+/// passing an authorized author; only the gate's own tests pass `false`.
+fn classify_with_resolutions_for_author(
+    view: &CatchUpMessageView,
+    announce_resolution: UtilityBotUserIdResolution,
+    notify_resolution: UtilityBotUserIdResolution,
+    author_is_authorized: bool,
+) -> CatchUpClassificationDecision {
     classify_catch_up_message_with_utility_resolution(
         view,
         Some(CURRENT_BOT_ID),
@@ -69,6 +81,7 @@ fn classify_with_resolutions(
         &[],
         announce_resolution,
         notify_resolution,
+        author_is_authorized,
     )
 }
 
@@ -1092,6 +1105,11 @@ async fn recent_partial_page_failure_preserves_gap_then_recovers_older_human() {
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(4_453_010);
     write_role_map(root.path(), &provider, channel_id);
+    // #6042: phase 1 now gates on `author_is_authorized`, and
+    // `user_is_authorized` is false for every id under default test settings.
+    // Without this the fresh human message classifies `NotAllowed` and the
+    // sweep never reaches the behaviour this test exists to pin.
+    shared.settings.write().await.allow_all_users = true;
 
     let newest_terminal_id = message_id_with_age(3, Duration::from_secs(30));
     let buried_human_id = message_id_with_age(2, Duration::from_secs(120));
@@ -1184,6 +1202,11 @@ async fn recent_initial_fetch_failure_blocks_phase2_then_recovers_whole_gap() {
     let provider = ProviderKind::Claude;
     let channel_id = ChannelId::new(4_453_015);
     write_role_map(root.path(), &provider, channel_id);
+    // #6042: phase 1 now gates on `author_is_authorized`, and
+    // `user_is_authorized` is false for every id under default test settings.
+    // Without this the fresh human message classifies `NotAllowed` and the
+    // sweep never reaches the behaviour this test exists to pin.
+    shared.settings.write().await.allow_all_users = true;
 
     let bot_response_id = message_id_with_age(1, Duration::from_secs(180));
     let older_human_id = message_id_with_age(2, Duration::from_secs(120));
@@ -1880,6 +1903,198 @@ fn queued_intervention(message_id: MessageId, index: usize) -> Intervention {
     }
 }
 
+/// #5996 / contract I20: phase 2 finds this message only in
+/// `intervention_queue`. That membership says the message was accepted for a
+/// turn, never that a turn took it, so the skip is right and the checkpoint
+/// advance is not: the advance rides `phase2_retry_after_checkpoint` into the
+/// retry state and the retry scan then fetches only past it, so a queue entry
+/// that is dropped before it drains is never seen again.
+#[tokio::test(flavor = "current_thread")]
+async fn queue_membership_alone_does_not_advance_the_phase2_checkpoint() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_453_016);
+    // Both catch-up phases pass `author_is_authorized` into
+    // `classify_catch_up_message_with_utility_resolution` — #6042 merged the
+    // phase-2 gate into that shared path — and `user_is_authorized` is false
+    // for every id under default test settings. Without this the fresh human
+    // message classifies `NotAllowed`, phase 2 skips it before the capacity
+    // gate, and the sweep never reaches the checkpoint decision this test
+    // exists to pin.
+    shared.settings.write().await.allow_all_users = true;
+
+    let bot_id = message_id_with_age(1, Duration::from_secs(300));
+    let queued_id = message_id_with_age(2, Duration::from_secs(120));
+    let fresh_id = message_id_with_age(3, Duration::from_secs(30));
+    // Registers the channel and puts phase 1 in `After(..)` mode, so phase 1
+    // takes fetch call 0 (the empty list) and phase 2 takes call 1. Phase 2's
+    // own starting checkpoint comes from the in-memory `last_message_ids`,
+    // which an empty phase-1 page leaves untouched.
+    write_checkpoint(root.path(), &provider, channel_id, bot_id.get());
+
+    // Fill to capacity with `queued_id` among the entries: phase 2 then skips
+    // it as a duplicate and defers on `fresh_id`, and that defer is what
+    // publishes the phase-2 checkpoint where this test can read it.
+    for index in 0..MAX_INTERVENTIONS_PER_CHANNEL {
+        let id = if index == 0 {
+            queued_id
+        } else {
+            MessageId::new(8_100_000_000_000_000_000 + index as u64)
+        };
+        let outcome = super::super::mailbox_enqueue_intervention(
+            &shared,
+            &provider,
+            channel_id,
+            queued_intervention(id, index),
+        )
+        .await;
+        assert!(super::catch_up_enqueue_accepted(&outcome));
+    }
+
+    let (api, outbox) = TestCatchUpApi::new(Vec::new());
+    let api = api.with_phase2_messages(vec![
+        discord_message(
+            channel_id,
+            fresh_id,
+            HUMAN_ID,
+            false,
+            "newer unanswered request",
+        ),
+        discord_message(
+            channel_id,
+            queued_id,
+            HUMAN_ID,
+            false,
+            "queued but never dispatched",
+        ),
+        discord_message(
+            channel_id,
+            bot_id,
+            CURRENT_BOT_ID,
+            true,
+            "previous bot response",
+        ),
+    ]);
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    // This proves phase 2 issued its own request. It does NOT prove the sweep
+    // reached the message loop: the empty-page bail and the "no bot response
+    // found" bail both run after this counter moves. The retry assertion below
+    // is what pins that the loop ran and stopped where it should.
+    assert!(
+        api.fetch_calls.load(Ordering::Relaxed) >= 2,
+        "phase 2 must have run its own fetch"
+    );
+    let retry = shared
+        .catch_up_retry_pending
+        .get(&channel_id)
+        .expect("the capacity-blocked fresh message must stay recoverable");
+    assert_eq!(
+        retry.checkpoint,
+        bot_id.get(),
+        "queue membership is not evidence of dispatch and must not move the checkpoint"
+    );
+    assert!(
+        retry.checkpoint < queued_id.get(),
+        "a checkpoint at or past the queued message forecloses its recovery"
+    );
+    assert!(
+        shared.last_message_ids.get(&channel_id).is_none(),
+        "a scan that recovered nothing must not establish a durable frontier"
+    );
+    assert!(outbox.lock().expect("outbox capture lock").is_empty());
+}
+
+/// The other half of the #5996 split: `active_user_message_id` names the
+/// message `try_start_turn` stamped onto the slot a turn holds, which IS the
+/// dispatch evidence I20 asks for. Removing the advance outright instead of
+/// grading it would wedge this scan on a message no rescan can help.
+#[tokio::test(flavor = "current_thread")]
+async fn an_active_turn_still_advances_the_phase2_checkpoint() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_453_017);
+    // Same reason as the sibling test above: phase 2 gates on
+    // `author_is_authorized`, so the fresh human message that must reach the
+    // capacity gate is otherwise classified `NotAllowed` and skipped.
+    shared.settings.write().await.allow_all_users = true;
+
+    let bot_id = message_id_with_age(1, Duration::from_secs(300));
+    let active_id = message_id_with_age(2, Duration::from_secs(120));
+    let fresh_id = message_id_with_age(3, Duration::from_secs(30));
+    write_checkpoint(root.path(), &provider, channel_id, bot_id.get());
+
+    let started = super::super::mailbox_try_start_turn(
+        &shared,
+        channel_id,
+        Arc::new(crate::services::provider::CancelToken::new()),
+        serenity::UserId::new(HUMAN_ID),
+        active_id,
+    )
+    .await;
+    assert!(started, "the active turn must claim the slot");
+
+    for index in 0..MAX_INTERVENTIONS_PER_CHANNEL {
+        let outcome = super::super::mailbox_enqueue_intervention(
+            &shared,
+            &provider,
+            channel_id,
+            queued_intervention(
+                MessageId::new(8_200_000_000_000_000_000 + index as u64),
+                index,
+            ),
+        )
+        .await;
+        assert!(super::catch_up_enqueue_accepted(&outcome));
+    }
+
+    let (api, _outbox) = TestCatchUpApi::new(Vec::new());
+    let api = api.with_phase2_messages(vec![
+        discord_message(
+            channel_id,
+            fresh_id,
+            HUMAN_ID,
+            false,
+            "newer unanswered request",
+        ),
+        discord_message(
+            channel_id,
+            active_id,
+            HUMAN_ID,
+            false,
+            "the turn currently running",
+        ),
+        discord_message(
+            channel_id,
+            bot_id,
+            CURRENT_BOT_ID,
+            true,
+            "previous bot response",
+        ),
+    ]);
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    // This proves phase 2 issued its own request. It does NOT prove the sweep
+    // reached the message loop: the empty-page bail and the "no bot response
+    // found" bail both run after this counter moves. The retry assertion below
+    // is what pins that the loop ran and stopped where it should.
+    assert!(
+        api.fetch_calls.load(Ordering::Relaxed) >= 2,
+        "phase 2 must have run its own fetch"
+    );
+    let retry = shared
+        .catch_up_retry_pending
+        .get(&channel_id)
+        .expect("the capacity-blocked fresh message must stay recoverable");
+    assert_eq!(
+        retry.checkpoint,
+        active_id.get(),
+        "a turn took this message, so the checkpoint is earned and must move"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn production_sweep_checkpoint_stops_before_capacity_blocked_human() {
     let root = scoped_runtime_root();
@@ -1890,6 +2105,11 @@ async fn production_sweep_checkpoint_stops_before_capacity_blocked_human() {
     let human_id = message_id_with_age(2, Duration::from_secs(30));
     write_checkpoint(root.path(), &provider, channel_id, bot_id.get() - 1);
     shared.settings.write().await.allowed_bot_ids = vec![INFO_BOT_ID];
+    // #6042: phase 1 now gates on `author_is_authorized`, and
+    // `user_is_authorized` is false for every id under default test settings.
+    // Without this the fresh human message classifies `NotAllowed` and the
+    // sweep never reaches the behaviour this test exists to pin.
+    shared.settings.write().await.allow_all_users = true;
 
     for index in 0..MAX_INTERVENTIONS_PER_CHANNEL {
         let queued_id = MessageId::new(8_000_000_000_000_000_000 + index as u64);
@@ -2098,4 +2318,223 @@ async fn ledger_suppresses_the_restart_gap_notice_for_an_answered_message() {
         outbox.lock().expect("outbox capture lock").is_empty(),
         "an answered message on the ledger must not raise a restart-gap notice"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #6042: catch-up phase 1 had no author authorization gate. Phase 2 already
+// refused unauthorized authors, so a message that arrived while the relay was
+// down could start a turn that the same message could never have started while
+// the relay was up. These tests pin the gate BEHAVIOURALLY — queue membership
+// and checkpoint motion — rather than on the classifier's return value, so
+// cutting the wiring at the phase-1 call site cannot leave them green.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn phase1_unauthorized_human_is_not_enqueued() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_604_201);
+    let human_message_id = message_id_with_age(1, Duration::from_secs(30));
+    write_checkpoint(
+        root.path(),
+        &provider,
+        channel_id,
+        human_message_id.get() - 1,
+    );
+
+    // Default test settings authorize nobody: `allow_all_users` is false,
+    // `owner_user_id` is None, `allowed_user_ids` is empty.
+    let (api, outbox) = TestCatchUpApi::new(vec![discord_message(
+        channel_id,
+        human_message_id,
+        HUMAN_ID,
+        false,
+        "미인가 사용자의 복구 요청",
+    )]);
+    let api = api.with_utility_bot_ids(Some(ANNOUNCE_BOT_ID), Some(NOTIFY_BOT_ID));
+
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    let mailbox = super::super::mailbox_snapshot(&shared, channel_id).await;
+    assert!(
+        !mailbox
+            .intervention_queue
+            .iter()
+            .any(|intervention| intervention.message_id == human_message_id),
+        "an unauthorized author's message must not become recovery work in phase 1"
+    );
+    assert!(
+        mailbox.intervention_queue.is_empty(),
+        "the refused message is the only message in the scan"
+    );
+    // The refusal is terminal, not a deferral: the settled frontier must move
+    // past the message so the next sweep does not rescan it forever.
+    assert_eq!(
+        shared.last_message_ids.get(&channel_id).map(|id| *id),
+        Some(human_message_id.get()),
+        "a terminally refused message must retire on the durable frontier"
+    );
+    assert!(
+        !shared.catch_up_retry_pending.contains_key(&channel_id),
+        "authorization refusal is not an ambiguity and must not arm a retry"
+    );
+    assert!(outbox.lock().expect("outbox capture lock").is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn phase1_authorized_human_is_enqueued() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_604_202);
+    let human_message_id = message_id_with_age(1, Duration::from_secs(30));
+    write_checkpoint(
+        root.path(),
+        &provider,
+        channel_id,
+        human_message_id.get() - 1,
+    );
+    // The other pole of the gate: an authorized author keeps the pre-#6042
+    // behaviour exactly. Without this test an inverted gate stays green.
+    shared.settings.write().await.allow_all_users = true;
+
+    let (api, outbox) = TestCatchUpApi::new(vec![discord_message(
+        channel_id,
+        human_message_id,
+        HUMAN_ID,
+        false,
+        "인가된 사용자의 복구 요청",
+    )]);
+    let api = api.with_utility_bot_ids(Some(ANNOUNCE_BOT_ID), Some(NOTIFY_BOT_ID));
+
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    let mailbox = super::super::mailbox_snapshot(&shared, channel_id).await;
+    assert_eq!(
+        mailbox
+            .intervention_queue
+            .iter()
+            .map(|intervention| intervention.message_id)
+            .collect::<Vec<_>>(),
+        vec![human_message_id],
+        "an authorized author must still be recovered exactly as before #6042"
+    );
+    assert_eq!(
+        shared.last_message_ids.get(&channel_id).map(|id| *id),
+        Some(human_message_id.get())
+    );
+    assert!(outbox.lock().expect("outbox capture lock").is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn phase1_announce_bot_bypasses_authorization() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_604_203);
+    let announce_message_id = message_id_with_age(1, Duration::from_secs(30));
+    write_checkpoint(
+        root.path(),
+        &provider,
+        channel_id,
+        announce_message_id.get() - 1,
+    );
+
+    // `allowed_bot_ids` stays empty and `allow_all_users` stays false: the only
+    // thing that can carry this message past the gate is the announce identity.
+    // Automation is authorized by its configured role, never by
+    // `user_is_authorized`, so the gate must consult allowance FIRST.
+    let (api, outbox) = TestCatchUpApi::new(vec![discord_message(
+        channel_id,
+        announce_message_id,
+        ANNOUNCE_BOT_ID,
+        true,
+        "PM triage: inspect the stalled workflow",
+    )]);
+    let api = api.with_utility_bot_ids(Some(ANNOUNCE_BOT_ID), Some(NOTIFY_BOT_ID));
+
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    let mailbox = super::super::mailbox_snapshot(&shared, channel_id).await;
+    assert_eq!(
+        mailbox
+            .intervention_queue
+            .iter()
+            .map(|intervention| intervention.message_id)
+            .collect::<Vec<_>>(),
+        vec![announce_message_id],
+        "the announce identity must start turns without any per-user authorization"
+    );
+    assert_eq!(
+        shared.last_message_ids.get(&channel_id).map(|id| *id),
+        Some(announce_message_id.get())
+    );
+    assert!(outbox.lock().expect("outbox capture lock").is_empty());
+}
+
+/// The sweep tests above cannot see the difference between `NotAllowed` and any
+/// other non-`Recover` outcome: both `continue` and both advance the settled
+/// frontier. Only a direct classifier assertion pins which outcome the gate
+/// produces, which is what keeps the stats breakdown honest.
+#[test]
+fn phase1_classification_returns_not_allowed_for_unauthorized_human() {
+    let human = view(HUMAN_ID, false, 30, "미인가 사용자의 복구 요청");
+    assert_eq!(
+        classify_with_resolutions_for_author(
+            &human,
+            UtilityBotUserIdResolution::Resolved(ANNOUNCE_BOT_ID),
+            UtilityBotUserIdResolution::Resolved(NOTIFY_BOT_ID),
+            false,
+        ),
+        CatchUpClassificationDecision::Determinate(CatchUpClassification::NotAllowed),
+        "an unauthorized human must classify exactly NotAllowed, not some other terminal skip"
+    );
+}
+
+/// #6042 left phase 2 unchanged in behaviour, but the repo pinned that
+/// behaviour nowhere: before this test, replacing the phase-2 call site's
+/// authorization argument with `true` broke nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn phase2_unauthorized_human_is_not_enqueued() {
+    let root = scoped_runtime_root();
+    let shared = super::super::make_shared_data_for_tests();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(4_604_204);
+    let bot_id = message_id_with_age(1, Duration::from_secs(300));
+    let fresh_id = message_id_with_age(2, Duration::from_secs(30));
+    // Registers the channel and puts phase 1 in `After(..)` mode, so phase 1
+    // takes fetch call 0 (the empty list) and phase 2 takes call 1.
+    write_checkpoint(root.path(), &provider, channel_id, bot_id.get());
+
+    let (api, outbox) = TestCatchUpApi::new(Vec::new());
+    let api = api.with_phase2_messages(vec![
+        discord_message(
+            channel_id,
+            fresh_id,
+            HUMAN_ID,
+            false,
+            "미인가 사용자의 phase 2 요청",
+        ),
+        discord_message(
+            channel_id,
+            bot_id,
+            CURRENT_BOT_ID,
+            true,
+            "previous bot response",
+        ),
+    ]);
+
+    run_catch_up_sweep(CatchUpDeps::new(&api, &shared, &provider)).await;
+
+    assert!(
+        api.fetch_calls.load(Ordering::Relaxed) >= 2,
+        "phase 2 must have run its own fetch"
+    );
+    let mailbox = super::super::mailbox_snapshot(&shared, channel_id).await;
+    assert!(
+        mailbox.intervention_queue.is_empty(),
+        "phase 2 must keep refusing an unauthorized author"
+    );
+    assert!(outbox.lock().expect("outbox capture lock").is_empty());
 }

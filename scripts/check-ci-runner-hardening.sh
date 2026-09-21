@@ -913,7 +913,18 @@ targets = {
     # no commands or enforcement checks are removed or relaxed.
     # #5908 adds four S7a witnesses and the C1 module; retain their exact
     # commands below and refresh both workflow gate pins with this file.
-    "job_sha256" => "fb61b50f46c33c9219d205b8d13844fa3e11be6837dd1171513221b2b2890cbd",
+    # T6 D1 re-pins after renaming one existing S4 witness selector; no command
+    # is added, removed, or relaxed and the lane minimum stays 1.
+    # #5997 re-pins after adding the mutation-surface paths-filter step and
+    # gating the mutation step alone on it. No command is removed or relaxed,
+    # and the job still declares neither `if:` nor `needs:`.
+    # #5997 V2 re-pins after appending the scenario-census target to the named
+    # command list. Nothing is removed; the census target now inherits this
+    # inventory pin, so dropping its line from the workflow fails here too.
+    # The target is nested under `tests::` because declaring it at the relay
+    # root would push tui_prompt_relay.rs past its hotfile ceiling, and the
+    # ceiling may not be raised.
+    "job_sha256" => "feb18b590f02930e88324f196fbbf50a546ffe91d8e510b0c64922f4e17864de",
     "job_timeout_minutes" => 50,
     "cargo_steps" => {
       "Verify named relay-authority targets and selection floors" => {
@@ -924,7 +935,7 @@ targets = {
         "commands" => [
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1",
-          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it -- --test-threads=1",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_without_ending_stream_lifecycle -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::recorded_entry_gate_old_mirrors_the_shipped_lifecycle_gate -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::the_deployed_enforce_dial_governs_every_channel_and_observe_governs_none -- --test-threads=1",
@@ -933,12 +944,17 @@ targets = {
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::terminal_relay_plan::soft_terminal_direct_send_authority_tests -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::streaming_status_tick::committed_progress_tests::native_collector_tests::recovered_native_preview_terminal -- --test-threads=1",
           "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1",
+          "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::tests::scenario_census_e2e -- --test-threads=1",
         ],
         "timeout_minutes" => 30,
       },
       "Require relay-authority mutations to be killed" => {
         "commands" => ["bash scripts/run_relay_authority_mutations.sh"],
         "timeout_minutes" => 45,
+        # #5997: the one conditional step inside this unconditional job. The
+        # negative form runs the gate unless the filter positively answered
+        # "unrelated", so a missing or empty output cannot skip it silently.
+        "if_condition" => "steps.mutation_paths.outputs.mutation_sources != 'false'",
       },
       "Pin required-check mirror content (#5321)" => {
         "commands" => [
@@ -968,18 +984,9 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.high_risk_recovery == 'true'",
     "runs_on" => "ubuntu-latest",
-    # #5034 re-pins after adding the attachment-delivery and catch-up
-    # operational-alert targets to the path-filtered required high-risk lane.
-    # #5170 re-pins after wiring the transition-busy requeue oracles, which the
-    # lib inventory manifest counted while no curated filter executed them.
-    # #5181 re-pins after widening that lane from the two named #5170 oracles to
-    # the whole `services::discord::queue_io::` module, now that the module's
-    # pre-existing #4270/#4893 failures are fixed rather than filtered around.
-    # #5147 re-pins after adding the hang-forensics and health-diagnostics
-    # test steps to this lane. Steps were only added -- none removed,
-    # reordered or given a relaxed env -- and the value is recomputed from
-    # the workflow with this script's own canonical_yaml, never copied.
-    "job_sha256" => "131ff4835b5b0811ceeb28a2a1b11efbf0d9f1dc6bf7ad87ab62da8d1dcd02bf",
+    # Pin the accepted-turn regressions and removal of the retired timeout test.
+    # All remaining commands and execution settings retain their reviewed values.
+    "job_sha256" => "bc9b37fe902f19c4d5100391da9c625ea69d32beadf415146798c5987af7d80b",
     "require_debug_env" => false,
     "cargo_steps" => {
       "Observe curated lane selections" => {

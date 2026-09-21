@@ -8,100 +8,10 @@ use routine_metadata::{
 
 use routine_metadata::persist_boundary_before_provider_clear;
 
-#[allow(clippy::too_many_arguments)]
-pub(in crate::services::discord) async fn start_headless_turn(
-    ctx: &serenity::Context,
-    channel_id: ChannelId,
-    prompt: &str,
-    request_owner_name: &str,
-    shared: &Arc<SharedData>,
-    token: &str,
-    source: Option<&str>,
-    metadata: Option<serde_json::Value>,
-    channel_name_hint: Option<String>,
-) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
-    start_reserved_headless_turn(
-        ctx,
-        channel_id,
-        prompt,
-        request_owner_name,
-        shared,
-        token,
-        source,
-        metadata,
-        channel_name_hint,
-        None,
-        None,
-        reserve_headless_turn(),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(in crate::services::discord) async fn start_reserved_headless_turn(
-    ctx: &serenity::Context,
-    channel_id: ChannelId,
-    prompt: &str,
-    request_owner_name: &str,
-    shared: &Arc<SharedData>,
-    token: &str,
-    source: Option<&str>,
-    metadata: Option<serde_json::Value>,
-    channel_name_hint: Option<String>,
-    // #5: synthetic tmux-session label for routine turns (see
-    // `start_reserved_headless_turn_with_owner`); `None` for all other callers.
-    tmux_session_label: Option<String>,
-    is_dm_hint: Option<bool>,
-    reservation: HeadlessTurnReservation,
-) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
-    start_reserved_headless_turn_with_owner(
-        ctx,
-        channel_id,
-        prompt,
-        request_owner_name,
-        UserId::new(1),
-        shared,
-        token,
-        source,
-        metadata,
-        channel_name_hint,
-        tmux_session_label,
-        is_dm_hint,
-        reservation,
-    )
-    .await
-}
-
-#[allow(dead_code)] // #3034: exported voice entry point, wired-but-dormant (no live dispatch yet).
-#[allow(clippy::too_many_arguments)]
-pub(in crate::services::discord) async fn start_voice_headless_turn(
-    ctx: &serenity::Context,
-    channel_id: ChannelId,
-    prompt: &str,
-    request_owner_name: &str,
-    request_owner: UserId,
-    shared: &Arc<SharedData>,
-    token: &str,
-    metadata: Option<serde_json::Value>,
-    channel_name_hint: Option<String>,
-) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
-    start_reserved_headless_turn_with_owner(
-        ctx,
-        channel_id,
-        prompt,
-        request_owner_name,
-        request_owner,
-        shared,
-        token,
-        Some(crate::dispatch::Source::Voice.as_str()),
-        metadata,
-        channel_name_hint,
-        None,
-        Some(false),
-        reserve_headless_turn(),
-    )
-    .await
-}
+mod entrypoints;
+pub(in crate::services::discord) use entrypoints::{
+    start_headless_turn, start_reserved_headless_turn, start_voice_headless_turn,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn start_reserved_headless_turn_with_owner(
@@ -766,9 +676,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
 
     drop(session_transition_guard);
 
-    // #5168: no server-side recall. The turn only needs the resolved memory
-    // settings so the prompt can name the backend and emit the memento scope
-    // hint; the model performs its own `context`/`recall` through the MCP.
+    // General recall stays model-owned; session anchors use the native instruction layer.
     let memory_settings = settings::memory_settings_for_binding(role_binding.as_ref());
 
     let mut context_chunks = Vec::new();
@@ -850,6 +758,18 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         channel_recent_context.as_ref(),
         Some(&turn_id),
     );
+    let built_system_prompt = built_system_prompt
+        .with_session_anchors(crate::services::memory::SessionAnchorRequest {
+            settings: &memory_settings,
+            provider: &provider,
+            current_path: &current_path,
+            channel_id: channel_id.get(),
+            memory_scope_channel_id: memory_scope_channel_id.get(),
+            role_binding: role_binding.as_ref(),
+            session_id: session_id.as_deref(),
+            fresh: force_fresh_provider_session || session_was_cleared,
+        })
+        .await;
     let system_prompt_owned = built_system_prompt.system_prompt;
     if let Some(manifest) = built_system_prompt.manifest {
         crate::db::prompt_manifests::spawn_save_prompt_manifest(shared.pg_pool.clone(), manifest);
@@ -872,15 +792,6 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         channel_id.get(),
         provider_label,
         session_id.is_some(),
-    );
-
-    spawn_headless_turn_watchdog(
-        &cancel_token,
-        shared,
-        &ctx.http,
-        channel_id,
-        &provider,
-        provider_label,
     );
 
     let remote_profile = {
@@ -1364,99 +1275,6 @@ mod recovery_context_take_order_tests {
                 .contains("HEADLESS ACTUAL HEADLESS 4560")
         );
         assert!(!built.system_prompt.contains("HEADLESS ACTUAL FULL 4560"));
-    }
-}
-
-#[cfg(test)]
-mod headless_hard_ceiling_tests {
-    //! #3557 (A) Codex-review r2: the headless watchdog now mirrors the
-    //! foreground intake path's per-turn hard ceiling cap (the headless path
-    //! had been missing it, and it also `mark_async_managed`s the token so the
-    //! sync watchdog does not enforce — leaving this async loop as the ONLY
-    //! bound). These tests reproduce the exact arithmetic the headless loop
-    //! applies (initial-deadline `min` cap + auto-extend clamp) so a regression
-    //! that drops the cap is caught at the headless call site, not only in the
-    //! shared helper tests in `discord/mod.rs`.
-    use super::super::super::super::{
-        ProviderKind, clamp_auto_extend_deadline_ms, turn_hard_ceiling_deadline_ms,
-        turn_watchdog_timeout,
-    };
-
-    /// Codex's tighter 4h ceiling must cap the headless INITIAL deadline below
-    /// the 6h watchdog timeout — exactly the `min(now + timeout, ceiling)` the
-    /// headless spawn now uses. Skipped when env overrides the defaults.
-    #[test]
-    fn headless_initial_deadline_capped_at_codex_ceiling() {
-        if std::env::var("AGENTDESK_CODEX_TURN_HARD_CEILING_SECS").is_ok()
-            || std::env::var("AGENTDESK_TURN_TIMEOUT_SECS").is_ok()
-        {
-            return;
-        }
-        let now_ms: i64 = 1_700_000_000_000;
-        let proposed_initial_dl = now_ms + turn_watchdog_timeout().as_millis() as i64; // ~6h
-        let codex_ceiling = turn_hard_ceiling_deadline_ms(now_ms, &ProviderKind::Codex);
-        let initial = std::cmp::min(proposed_initial_dl, codex_ceiling);
-        assert_eq!(
-            initial, codex_ceiling,
-            "headless Codex initial deadline must land at the 4h ceiling, not 6h"
-        );
-        assert!(
-            initial < proposed_initial_dl,
-            "the headless cap must actually lower the deadline below the watchdog timeout"
-        );
-        // The init-time one-shot warn fires exactly when proposed > ceiling.
-        assert!(proposed_initial_dl > codex_ceiling);
-    }
-
-    /// For a default-Claude turn (generic ceiling == watchdog timeout) the
-    /// headless initial cap is a no-op and the init warn must NOT fire.
-    #[test]
-    fn headless_initial_deadline_uncapped_for_default_claude() {
-        if std::env::var("AGENTDESK_TURN_HARD_CEILING_SECS").is_ok()
-            || std::env::var("AGENTDESK_TURN_TIMEOUT_SECS").is_ok()
-        {
-            return;
-        }
-        let now_ms: i64 = 1_700_000_000_000;
-        let proposed_initial_dl = now_ms + turn_watchdog_timeout().as_millis() as i64;
-        let claude_ceiling = turn_hard_ceiling_deadline_ms(now_ms, &ProviderKind::Claude);
-        let initial = std::cmp::min(proposed_initial_dl, claude_ceiling);
-        assert_eq!(initial, proposed_initial_dl);
-        assert!(
-            proposed_initial_dl <= claude_ceiling,
-            "with equal defaults the headless init warn (proposed > ceiling) must not fire"
-        );
-    }
-
-    /// The headless AUTO-EXTEND must clamp to the ceiling: a turn that keeps
-    /// inflight warm can no longer push the deadline past its Codex ceiling.
-    /// Mirrors `clamp_auto_extend_deadline_ms(now + timeout, ceiling)`.
-    #[test]
-    fn headless_auto_extend_clamped_at_codex_ceiling() {
-        if std::env::var("AGENTDESK_CODEX_TURN_HARD_CEILING_SECS").is_ok()
-            || std::env::var("AGENTDESK_TURN_TIMEOUT_SECS").is_ok()
-        {
-            return;
-        }
-        // Turn started 3h ago; an auto-extend would propose now + 6h, well past
-        // the 4h Codex ceiling (1h of budget left), so the clamp must bind.
-        let turn_started_ms: i64 = 1_700_000_000_000;
-        let now_ms_check = turn_started_ms + 3 * 3600 * 1000;
-        let ceiling_ms = turn_hard_ceiling_deadline_ms(turn_started_ms, &ProviderKind::Codex);
-        let proposed_dl = now_ms_check + turn_watchdog_timeout().as_millis() as i64;
-        let (new_dl, clamped) = clamp_auto_extend_deadline_ms(proposed_dl, ceiling_ms);
-        assert!(
-            clamped,
-            "auto-extend past the Codex ceiling must be clamped"
-        );
-        assert_eq!(
-            new_dl, ceiling_ms,
-            "clamped deadline must park at the ceiling"
-        );
-        assert!(
-            new_dl < proposed_dl,
-            "the clamp must lower the proposed extension to the ceiling"
-        );
     }
 }
 

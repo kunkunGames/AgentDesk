@@ -19,9 +19,10 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "9cf7a3fde3e74870c50a51ce11116698c52263e02451d2d10c56f53ab4ebb943"
+    "53e57a6749cd5ff0cb422320b9db1d2d7b3b01028d863428c9280fed968db2b7"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
+FILTER_BLOCK_HEADER = re.compile(r"^            \w+:$", re.M)
 CROSS_OS_CONSUMER_SCRIPT = REPO_ROOT / "scripts/cross_os_consumer_paths.py"
 # #5828's own break (turn_bridge/mod.rs) plus the 22 files measured on PR #5834
 # that carry the same shim and were left unselected by the hand-written list.
@@ -40,7 +41,6 @@ CFG_SHIM_CONSUMERS = (
     "src/services/discord/router/message_handler/watchdog.rs",
     "src/services/discord/router/intake_dispatch/tests.rs",
     "src/services/discord/runtime_bootstrap/recovery_flush.rs",
-    "src/services/discord/runtime_bootstrap/session_gc.rs",
     "src/services/discord/turn_finalizer.rs",
     "src/services/discord/turn_finalizer/delivery_lease.rs",
     "src/services/discord/terminal_ui_obligation.rs",
@@ -219,6 +219,30 @@ def replace_last(source: str, old: str, new: str) -> str:
     if not separator:
         raise AssertionError(f"missing text for final replacement: {old!r}")
     return head + new + tail
+
+
+def comment_out_in_filter(workflow: str, block: str, selector: str) -> str:
+    """Comment one pattern out of ONE named filter block.
+
+    A whole-file `replace_last` used to land on `cross_os_rust` only because it
+    was the last block naming these paths. #5997 added a second paths-filter
+    step, inside `relay-authority-contract` and further down the file, that
+    repeats some of them, so an unscoped edit silently mutates that block
+    instead and leaves the block under test intact. The search therefore stops
+    at the next block header: a selector this block does not list has to raise
+    rather than be commented out of a later one, where `assertNotIn` on THIS
+    block's survivors would then pass having proved nothing.
+    """
+    head, separator, rest = workflow.partition(f"            {block}:\n")
+    if not separator:
+        raise AssertionError(f"missing filter block: {block!r}")
+    following = FILTER_BLOCK_HEADER.search(rest)
+    cut = following.start() if following else len(rest)
+    body, tail = rest[:cut], rest[cut:]
+    line = f"              - '{selector}'"
+    if line not in body:
+        raise AssertionError(f"{block!r} does not list {selector!r}")
+    return head + separator + body.replace(line, f"              # - '{selector}'", 1) + tail
 
 
 def glob_matcher(pattern: str) -> re.Pattern[str]:
@@ -569,11 +593,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         for selector in derived:
             with self.subTest(selector=selector):
                 survivors = paths_filter_definitions(
-                    replace_last(
-                        workflow,
-                        f"              - '{selector}'",
-                        f"              # - '{selector}'",
-                    )
+                    comment_out_in_filter(workflow, "cross_os_rust", selector)
                 )["cross_os_rust"]
                 self.assertNotIn(selector, survivors)
                 self.assertTrue(
@@ -721,6 +741,17 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r'      CARGO_PROFILE_TEST_DEBUG: "0"\n'
             r"    steps:\n"
             r"      - uses: actions/checkout@v4\n\n"
+            # #5997: the mutation-surface filter sits between checkout and the
+            # toolchain so the gated step below can read its output.
+            r"(?:      #[^\n]*\n)+"
+            r"      - name: Detect relay-authority mutation sources\n"
+            r"        id: mutation_paths\n"
+            r"        uses: dorny/paths-filter@v3\n"
+            r"        with:\n"
+            r"          filters: \|\n"
+            r"            mutation_sources:\n"
+            r"(?:              - '[^']+'\n)+"
+            r"\n"
             r"      - name: Install Rust toolchain\n"
             r"        uses: dtolnay/rust-toolchain@master\n"
             r"        with:\n"
@@ -738,7 +769,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"        run: \|\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::session_relay_sink -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::relay_recovery::tests -- --test-threads=1\n"
-            r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it -- --test-threads=1\n"
+            r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_without_ending_stream_lifecycle -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::stream_tick::guarded_persist::tests::same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::recorded_entry_gate_old_mirrors_the_shipped_lifecycle_gate -- --test-threads=1\n"
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests::the_deployed_enforce_dial_governs_every_channel_and_observe_governs_none -- --test-threads=1\n"
@@ -751,6 +782,9 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertRegex(
             job,
             r"(?m)^      - name: Require relay-authority mutations to be killed\n"
+            # #5997: the negative form is load-bearing -- a missing or empty
+            # filter output has to run the gate rather than skip it.
+            r"        if: steps\.mutation_paths\.outputs\.mutation_sources != 'false'\n"
             r"        env:\n"
             r"          BASH_ENV: /dev/null\n"
             r'          CARGO_PROFILE_DEV_DEBUG: "0"\n'
@@ -959,14 +993,14 @@ class FastCheckCiWiringTests(unittest.TestCase):
             ),
             "previous GITHUB_ENV write": workflow.replace(
                 "      - name: Install shellcheck\n"
-                "        run: sudo apt-get install -y shellcheck\n",
+                "        run: sudo apt-get install -y shellcheck zsh\n",
                 "      - name: Install shellcheck\n"
                 "        run: echo \"PYTHON=/bin/true\" >> \"$GITHUB_ENV\"\n",
                 1,
             ),
             "previous GITHUB_PATH write": workflow.replace(
                 "      - name: Install shellcheck\n"
-                "        run: sudo apt-get install -y shellcheck\n",
+                "        run: sudo apt-get install -y shellcheck zsh\n",
                 "      - name: Install shellcheck\n"
                 "        run: echo \"/tmp/injected\" >> \"$GITHUB_PATH\"\n",
                 1,
@@ -1432,10 +1466,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
             ),
             "GITHUB_ENV prose without redirection": workflow.replace(
                 "      - name: Install shellcheck\n"
-                "        run: sudo apt-get install -y shellcheck\n",
+                "        run: sudo apt-get install -y shellcheck zsh\n",
                 "      - name: Install shellcheck\n"
                 "        # This prose mentions GITHUB_ENV but performs no write.\n"
-                "        run: sudo apt-get install -y shellcheck\n",
+                "        run: sudo apt-get install -y shellcheck zsh\n",
                 1,
             ),
             "aggregate timeout": workflow.replace(
@@ -2165,6 +2199,25 @@ jobs:
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("linked.yaml must not be a symlink", result.stderr)
+
+    def test_nightly_notification_suite_is_executable_and_failure_is_fatal(self) -> None:
+        aggregate = (REPO_ROOT / "scripts/ci-script-checks.sh").read_text()
+        start = aggregate.index("# Nightly notification contract (#6006).")
+        end = aggregate.index("# End nightly notification contract.", start)
+        block = aggregate[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "python-probe"
+            journal = Path(tmp) / "argv"
+            probe.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$JOURNAL"\nexit "$PROBE_RC"\n')
+            probe.chmod(0o755)
+            for rc in (0, 17):
+                result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block],
+                    env={"PATH": os.environ["PATH"], "PYTHON": str(probe),
+                         "JOURNAL": str(journal), "PROBE_RC": str(rc)},
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, rc, result.stderr)
+                self.assertEqual(journal.read_text().splitlines(),
+                                 ["-m", "unittest", "tests.test_nightly_ci_triage"])
 
     def test_ci_script_checks_runs_this_contract(self) -> None:
         script = (REPO_ROOT / "scripts/ci-script-checks.sh").read_text(

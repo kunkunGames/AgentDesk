@@ -132,6 +132,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "eventbus.rs": "In-process broadcast event bus (history/replay/batching) shared by the WS server layer and background services without a service→server backflow.",
     "github/": "GitHub sync, issue triage, and Definition-of-Done mirroring.",
     "high_risk_recovery.rs": "PG-only high-risk recovery tests for boot reconciliation and review refire paths.",
+    "test_env_panic_probe.rs": "Isolated test-fixture panic and environment restoration probes.",
     "kanban/": "High-level kanban orchestration, state machine facade, and shared test support.",
     "launch.rs": "Starts the Tokio runtime and hands off to server boot.",
     "lib.rs": "Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests.",
@@ -237,6 +238,12 @@ def test_line_count(text: str) -> int:
     fixtures (#3036).
     """
 
+    return len(test_line_numbers(text))
+
+
+def test_line_numbers(text: str) -> set[int]:
+    """Line numbers covered by ``#[cfg(test)] mod`` blocks (1-based)."""
+
     total = line_count(text)
     test_lines: set[int] = set()
     for match in _CFG_MOD_RE.finditer(text):
@@ -252,7 +259,7 @@ def test_line_count(text: str) -> int:
         for line in range(start_line, end_line + 1):
             if 1 <= line <= total:
                 test_lines.add(line)
-    return len(test_lines)
+    return test_lines
 
 
 def split_prod_test_lines(text: str) -> tuple[int, int]:

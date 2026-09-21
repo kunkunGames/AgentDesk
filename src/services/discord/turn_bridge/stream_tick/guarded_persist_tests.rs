@@ -40,8 +40,8 @@ fn with_runtime_root<T>(test: impl FnOnce() -> T) -> T {
     test()
 }
 
-/// #5464 T5 S2: the recorded `old` verdict has to BE the mapping that
-/// ships. Asserted over all sixteen cells of the `outcome ×
+/// #5464 T5 S2: the recorded `new` verdict has to BE the mapping that ships.
+/// Asserted over all sixteen cells of the `outcome ×
 /// authority_unchanged × bridge_owns_relay` product by driving the production
 /// function with a state built to realize each operand pair, so the mirror
 /// cannot drift. r1 covered twelve: the missing column was
@@ -52,15 +52,10 @@ fn with_runtime_root<T>(test: impl FnOnce() -> T) -> T {
 /// no-op for its caller: the assertion below IS the production return
 /// value, taken with recording compiled in.
 ///
-/// #5464 T5 S4 turns one mirror into two, over the same sixteen cells: outside
-/// the enforcement cohort the shipped mapping must still be `stream_gate_old`
-/// exactly, and inside it must be `stream_gate_new` exactly. That is the whole
-/// enforcement claim stated as a table rather than as a cell — and it also means
-/// the observation S2 records is the same table production now decides on, so
-/// `new_stricter_verdicts` reading `0` across the promotion window is a
-/// measurement OF this gate and not of a parallel copy of it.
+/// `stream_gate_old` survives only as the monotonicity floor the shipped mapping
+/// is checked against: the new gate may end only FEWER lifecycles.
 #[test]
-fn recorded_stream_gate_old_mirrors_the_shipped_authority_mapping() {
+fn recorded_stream_gate_new_mirrors_the_shipped_authority_mapping() {
     use crate::services::discord::relay_recovery::authority_observation::{
         LifecycleVerdict, stream_gate_new, stream_gate_old,
     };
@@ -80,8 +75,10 @@ fn recorded_stream_gate_old_mirrors_the_shipped_authority_mapping() {
 
     for outcome in [
         GuardedSaveOutcome::Saved,
-        GuardedSaveOutcome::Missing,
-        GuardedSaveOutcome::IdentityMismatch,
+        GuardedSaveOutcome::RowAbsent,
+        GuardedSaveOutcome::AuthorityPinned,
+        GuardedSaveOutcome::Unnameable,
+        GuardedSaveOutcome::SuccessorOwned,
         GuardedSaveOutcome::IoError,
     ] {
         for (state, intended, authority_unchanged, bridge_owns_relay) in [
@@ -101,43 +98,33 @@ fn recorded_stream_gate_old_mirrors_the_shipped_authority_mapping() {
                 VisibleMutationAuthority::Retry => LifecycleVerdict::Retry,
                 VisibleMutationAuthority::AuthorityLost => LifecycleVerdict::End,
             };
-            let shipped =
-                visible_mutation_authority_after_guarded_save(outcome, state, intended, false);
+            let shipped = visible_mutation_authority_after_guarded_save(outcome, state, intended);
             let recorded = stream_gate_old(outcome, authority_unchanged, bridge_owns_relay);
-            assert_eq!(
-                recorded,
-                verdict_of(shipped),
-                "{outcome:?}/{authority_unchanged}/{bridge_owns_relay}: recorded old stream \
-                 verdict disagrees with the shipped mapping outside the cohort"
-            );
-            assert_eq!(
-                shipped.mutation_permission().is_none(),
-                recorded.ends_lifecycle(),
-                "lifecycle termination must mean the same thing on both sides"
-            );
             let new = stream_gate_new(outcome, authority_unchanged, bridge_owns_relay);
             assert!(
                 !(!recorded.ends_lifecycle() && new.ends_lifecycle()),
                 "the new stream gate may only end FEWER lifecycles"
             );
-            let enforced =
-                visible_mutation_authority_after_guarded_save(outcome, state, intended, true);
             assert_eq!(
                 new,
-                verdict_of(enforced),
-                "{outcome:?}/{authority_unchanged}/{bridge_owns_relay}: the enforced mapping \
+                verdict_of(shipped),
+                "{outcome:?}/{authority_unchanged}/{bridge_owns_relay}: the shipped mapping \
                  disagrees with the recorded new stream verdict"
+            );
+            assert_eq!(
+                shipped.mutation_permission().is_none(),
+                new.ends_lifecycle(),
+                "lifecycle termination must mean the same thing on both sides"
             );
         }
     }
 }
 
-/// #5464 T5 S4's deployment no-op, stated as the property that makes it one:
-/// under the SHIPPED dial no channel is admitted, so the operand every call site
-/// passes is `false` and the mapping above is the pre-S4 one. `Observe` is
-/// deliberately not enough either — it is the mode the promotion evidence is
-/// collected under, and admitting it here would change the behaviour the
-/// evidence describes.
+/// #5464 T5 S4's deployment no-op, stated as the property that makes it one: the
+/// predicate's only caller is the S7a entry gate
+/// (`bridge_entry_persist::bridge_entry_rowless_cohort_admits`) and under the
+/// SHIPPED dial it must admit no channel. `Observe` is deliberately not enough
+/// either: it is the mode the promotion evidence is collected under.
 #[test]
 fn the_shipped_dial_admits_no_channel_to_the_stream_loop_enforcement_cohort() {
     use crate::config::RelayAuthorityMode;
@@ -158,63 +145,20 @@ fn the_shipped_dial_admits_no_channel_to_the_stream_loop_enforcement_cohort() {
     }
 }
 
-/// The tick's half of the wiring, pinned the way this repo pins wiring claims.
-/// `stream_tick.rs`'s two gate call sites take the operand from ONE read taken at
-/// tick entry, so the sixteen `authorize_visible_mutation!` sites and the dirty
-/// flush cannot disagree with each other inside a single tick. A literal at
-/// either site would leave every behavioural assertion in this file green while
-/// pinning that site to one side of the rollout.
+/// The one cell S4 moves, at the seam that decides it — and the cells that must
+/// NOT move with it. The mismatch family is an exact-episode veto rather than a
+/// structural signal (design r3 ERRATUM R3-E4-3), so it keeps its termination
+/// right; `IoError` stays retryable.
 #[test]
-fn the_tick_reads_the_enforcement_cohort_once_and_both_gate_sites_use_that_read() {
-    let source = include_str!("../stream_tick.rs");
-    assert_eq!(
-        source
-            .lines()
-            .filter(|line| {
-                line.trim()
-                    == "let cohort_admits = stream_loop_suppression_cohort_admits(channel_id.get());"
-            })
-            .count(),
-        1,
-        "the tick must read the cohort exactly once",
-    );
-    assert_eq!(
-        source
-            .lines()
-            .filter(|line| line.trim() == "cohort_admits,")
-            .count(),
-        2,
-        "both gate call sites must pass the tick-entry read",
-    );
-}
-
-/// The one cell S4 moves, at the seam that decides it, in both cohort states —
-/// and the two cells that must NOT move with it. `IdentityMismatch` is an
-/// exact-episode veto rather than a structural signal (design r3 ERRATUM
-/// R3-E4-3), so it keeps its termination right inside the cohort; `IoError` stays
-/// retryable. The promotion gate for the transition asserted here is S2's
-/// `new_stricter_verdicts` counter reading `0` across the observation window.
-#[test]
-fn a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it() {
+fn a_vanished_row_suppresses_without_ending_stream_lifecycle() {
     let bridge = owner_state(4_259_124, 77_010);
     let intended = crate::services::discord::inflight::StreamRelayAuthority::from_state(&bridge);
     assert!(intended.bridge_owns_relay());
 
-    assert_eq!(
-        visible_mutation_authority_after_guarded_save(
-            GuardedSaveOutcome::Missing,
-            &bridge,
-            intended,
-            false,
-        ),
-        VisibleMutationAuthority::AuthorityLost,
-        "outside the cohort a vanished row must still end bridge lifecycle authority",
-    );
     let suppressed = visible_mutation_authority_after_guarded_save(
-        GuardedSaveOutcome::Missing,
+        GuardedSaveOutcome::RowAbsent,
         &bridge,
         intended,
-        true,
     );
     assert_eq!(suppressed, VisibleMutationAuthority::Suppressed);
     assert_eq!(
@@ -224,26 +168,27 @@ fn a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_
          and orphans the finished answer inside the deleted row",
     );
 
-    for unmoved in [
-        GuardedSaveOutcome::IdentityMismatch,
-        GuardedSaveOutcome::IoError,
+    for (unmoved, expected) in [
+        (
+            GuardedSaveOutcome::AuthorityPinned,
+            VisibleMutationAuthority::AuthorityLost,
+        ),
+        (
+            GuardedSaveOutcome::Unnameable,
+            VisibleMutationAuthority::AuthorityLost,
+        ),
+        (
+            GuardedSaveOutcome::SuccessorOwned,
+            VisibleMutationAuthority::AuthorityLost,
+        ),
+        (GuardedSaveOutcome::IoError, VisibleMutationAuthority::Retry),
     ] {
         assert_eq!(
-            visible_mutation_authority_after_guarded_save(unmoved, &bridge, intended, true),
-            visible_mutation_authority_after_guarded_save(unmoved, &bridge, intended, false),
-            "{unmoved:?} is not a structural signal and the cohort must not reach it",
+            visible_mutation_authority_after_guarded_save(unmoved, &bridge, intended),
+            expected,
+            "{unmoved:?} is not a structural signal and must not move with the vanished row",
         );
     }
-    assert_eq!(
-        visible_mutation_authority_after_guarded_save(
-            GuardedSaveOutcome::IdentityMismatch,
-            &bridge,
-            intended,
-            true,
-        ),
-        VisibleMutationAuthority::AuthorityLost,
-        "an exact-episode veto keeps its termination right inside the cohort",
-    );
 }
 
 #[test]
@@ -256,7 +201,6 @@ fn visible_authority_distinguishes_bridge_self_delegation_and_foreign_projection
             GuardedSaveOutcome::Saved,
             &bridge,
             bridge_authority,
-            false,
         ),
         VisibleMutationAuthority::Authorized,
     );
@@ -282,7 +226,6 @@ fn visible_authority_distinguishes_bridge_self_delegation_and_foreign_projection
                 GuardedSaveOutcome::Saved,
                 &delegated,
                 intended,
-                false,
             ),
             VisibleMutationAuthority::Suppressed,
         );
@@ -299,7 +242,6 @@ fn visible_authority_distinguishes_bridge_self_delegation_and_foreign_projection
                 GuardedSaveOutcome::Saved,
                 &foreign,
                 intended,
-                false,
             ),
             VisibleMutationAuthority::AuthorityLost,
         );
@@ -403,12 +345,8 @@ fn same_authority_watcher_epoch_advance_keeps_bridge_lifecycle_authority() {
             "the adopted row must carry the answer forward into the delivery path",
         );
 
-        let authority = visible_mutation_authority_after_guarded_save(
-            outcome,
-            &state,
-            intended_authority,
-            false,
-        );
+        let authority =
+            visible_mutation_authority_after_guarded_save(outcome, &state, intended_authority);
         assert_eq!(authority, VisibleMutationAuthority::Authorized);
         assert_eq!(
             authority.mutation_permission(),
@@ -464,10 +402,9 @@ fn changed_durable_relay_authority_still_ends_bridge_authority() {
             "turn_bridge::stream_tick::authority_preflight",
         );
 
-        assert_eq!(
-            outcome,
-            GuardedSaveOutcome::IdentityMismatch,
-            "a changed durable relay owner must still be rejected by the fence",
+        assert!(
+            outcome.is_identity_mismatch_legacy(),
+            "a changed durable relay owner must still be rejected by the fence"
         );
         let persisted =
             load_inflight_state(&ProviderKind::Codex, channel.get()).expect("persisted row");
@@ -476,15 +413,10 @@ fn changed_durable_relay_authority_still_ends_bridge_authority() {
             "the bridge must not write its local delta after a real handoff",
         );
         assert_eq!(
-            visible_mutation_authority_after_guarded_save(
-                outcome,
-                &state,
-                intended_authority,
-                true
-            )
-            .mutation_permission(),
+            visible_mutation_authority_after_guarded_save(outcome, &state, intended_authority)
+                .mutation_permission(),
             None,
-            "a real relay handoff must still terminate bridge lifecycle authority, cohort or not",
+            "a real relay handoff must still terminate bridge lifecycle authority",
         );
     });
 }
@@ -549,7 +481,7 @@ fn reowned_flush_skips_without_clobbering_or_retrying_dirty() {
             "turn_bridge::stream_tick::dirty_flush_test",
         );
 
-        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        assert!(outcome.is_identity_mismatch_legacy());
         assert!(!dirty_after_guarded_save(outcome));
         let persisted =
             load_inflight_state(&ProviderKind::Codex, channel.get()).expect("persisted row");
@@ -654,12 +586,14 @@ fn dirty_and_side_effect_transitions_follow_guarded_outcome() {
     use GuardedSaveOutcome::*;
     assert!(!dirty_after_guarded_save(Saved));
     assert!(dirty_after_guarded_save(IoError));
-    assert!(!dirty_after_guarded_save(Missing));
-    assert!(!dirty_after_guarded_save(IdentityMismatch));
+    // #5951 S1: every refusal the pre-split enum collapsed into `Missing` /
+    // `IdentityMismatch` keeps the identical dirty + `Saved`-match verdict.
+    for refusal in [RowAbsent, AuthorityPinned, Unnameable, SuccessorOwned] {
+        assert!(!dirty_after_guarded_save(refusal));
+        assert!(!matches!(refusal, GuardedSaveOutcome::Saved));
+    }
     assert!(matches!(Saved, GuardedSaveOutcome::Saved));
     assert!(!matches!(IoError, GuardedSaveOutcome::Saved));
-    assert!(!matches!(Missing, GuardedSaveOutcome::Saved));
-    assert!(!matches!(IdentityMismatch, GuardedSaveOutcome::Saved));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -822,7 +756,7 @@ async fn candidate_cleanup_covers_saved_competing_reowned_and_missing_rows() {
     let mut stale_current = MessageId::new(4);
     let mut stale_pending = Some(stale_current);
     let mut stale_created = Some(stale_current);
-    assert_eq!(
+    assert!(
         persist_stream_tick_state_with_candidate_cleanup(
             StreamTickCandidateSaveContext {
                 gateway: &gateway,
@@ -839,8 +773,8 @@ async fn candidate_cleanup_covers_saved_competing_reowned_and_missing_rows() {
             },
             "turn_bridge::stream_tick::candidate_reowned_test",
         )
-        .await,
-        GuardedSaveOutcome::IdentityMismatch
+        .await
+        .is_identity_mismatch_legacy()
     );
     assert_eq!(stale_pending, None);
     assert_eq!(stale_created, None);
@@ -881,7 +815,7 @@ async fn candidate_cleanup_covers_saved_competing_reowned_and_missing_rows() {
             "turn_bridge::stream_tick::candidate_missing_test",
         )
         .await,
-        GuardedSaveOutcome::Missing
+        GuardedSaveOutcome::RowAbsent
     );
     assert_eq!(missing_pending, None);
     assert_eq!(missing_created, None);
@@ -938,7 +872,7 @@ async fn strict_fence_loses_authority_before_visible_mutation() {
     )
     .await;
     let authority =
-        visible_mutation_authority_after_guarded_save(outcome, &stale, intended_authority, false);
+        visible_mutation_authority_after_guarded_save(outcome, &stale, intended_authority);
     if authority == VisibleMutationAuthority::Authorized {
         TurnGateway::edit_message(
             &gateway,
@@ -950,7 +884,7 @@ async fn strict_fence_loses_authority_before_visible_mutation() {
         .expect("test mutation");
     }
 
-    assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+    assert!(outcome.is_identity_mismatch_legacy());
     assert_eq!(authority, VisibleMutationAuthority::AuthorityLost);
     assert!(gateway.edits.lock().expect("edits lock").is_empty());
     assert_eq!(
@@ -1141,7 +1075,7 @@ async fn second_rollover_failure_keeps_bound_m2_and_deletes_only_unbound_m3() {
     .await;
     assert_eq!(outcome, GuardedSaveOutcome::IoError);
     assert_eq!(
-        visible_mutation_authority_after_guarded_save(outcome, &state, intended_authority, true),
+        visible_mutation_authority_after_guarded_save(outcome, &state, intended_authority),
         VisibleMutationAuthority::Retry
     );
     assert_eq!(pending_candidate, Some(MessageId::new(3)));
@@ -1313,9 +1247,9 @@ fn heartbeat_touches_same_owner_but_skips_successor() {
 
         let successor = owner_state(channel.get(), 99_999);
         save_inflight_state(&successor).expect("seed successor row");
-        assert_eq!(
-            persist_stream_tick_heartbeat(&ProviderKind::Codex, channel, &expected),
-            GuardedSaveOutcome::IdentityMismatch
+        assert!(
+            persist_stream_tick_heartbeat(&ProviderKind::Codex, channel, &expected)
+                .is_identity_mismatch_legacy()
         );
         let persisted =
             load_inflight_state(&ProviderKind::Codex, channel.get()).expect("persisted row");

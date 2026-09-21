@@ -91,10 +91,10 @@
         "cargo",
         "test",
         "--lib",
-        "services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it"
+        "services::discord::turn_bridge::stream_tick::guarded_persist::tests::a_vanished_row_suppresses_without_ending_stream_lifecycle"
       ],
       "minimum": 1,
-      "derivation": "Measured on origin/main b4ee089369f12cb052993560b77e375226680342: the declared named selector plus -- --list selects one test; execution with -- --test-threads=1 passes one test (no ignored tests or DB soft-skip). Existing S4 witness only, not full T5 teardown or S7a coverage."
+      "derivation": "Re-measured on origin/main d72504ca89d34beac7b4edd47f032199cb5140db after T6 D1 renamed this witness from a_vanished_row_suppresses_inside_the_cohort_and_still_ends_lifecycle_outside_it: the declared named selector plus -- --list selects one test; execution with -- --test-threads=1 passes one test (no ignored tests or DB soft-skip). The lane minimum is unchanged at 1. Existing S4 witness only, not full T5 teardown or S7a coverage."
     },
     {
       "name": "t5-s4-same-authority-watcher-epoch",
@@ -204,6 +204,20 @@
       ],
       "minimum": 5,
       "derivation": "Measured on origin/main 0ae1c5b77 with the declared command plus -- --list. This Rust production-path E2E drives the local Discord mock, mailbox lifecycle, durable queue wake, and production workers; dashboard Playwright is unrelated and nightly-only."
+    },
+    {
+      "name": "relay-e2e-scenario-census",
+      "boundary": "relay-e2e",
+      "status": "active",
+      "module": "services::discord::tui_prompt_relay::tests::scenario_census_e2e",
+      "command": [
+        "cargo",
+        "test",
+        "--lib",
+        "services::discord::tui_prompt_relay::tests::scenario_census_e2e"
+      ],
+      "minimum": 4,
+      "derivation": "Four tests: the class census, the per-file exclusion reasons, the production replay of the runnable scenarios through session_backend::process_stream_line and codex_tui::rollout_tail::RolloutRecordDecoder, and the #6033 pin. The floor is the count declared before each mutation run; a run that selects fewer is a failure, not a pass."
     }
   ]
 }

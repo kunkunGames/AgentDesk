@@ -38,6 +38,13 @@ MOD_DECL = re.compile(
 )
 ATTR_PATH = re.compile(r'^\s*#\[path\s*=\s*"([^"]+)"\s*\]')
 ATTR_LINE = re.compile(r"^\s*#\[")
+RAW_STRING_OPEN = re.compile(r'r(#{0,255})"')
+CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'\n])'")
+# Leftmost start of anything that changes how the rest of the text is read.
+COMMENT_OR_LITERAL = re.compile(r"""//|/\*|r\#{0,255}"|"|'""")
+# Everything except the separators str.splitlines() splits on; only these
+# are blanked out, so comment removal never moves a line number.
+NON_LINE_BREAK = re.compile(r"[^\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 # Options consuming a value; their value must not be read as a filter.
 CARGO_VALUE_OPTIONS = {
     "-p", "--package", "--exclude", "-j", "--jobs", "--features", "--profile",
@@ -253,10 +260,42 @@ def _rust_tokens(text: str) -> list[RustToken]:
             tokens.append(RustToken(ident.group(), line, "ident"))
             index += ident.end()
             continue
-        if char in "#[]{}();=:":
+        if char in "#![]{}();=:":
             tokens.append(RustToken(char, line))
         index += 1
     return tokens
+
+
+def _attribute_bracket(tokens: list[RustToken], index: int) -> int | None:
+    """Index of the `[` that opens the attribute at `index`, else None.
+
+    Only real punctuation opens one: the STRING `"#"` in front of an index
+    expression (`&"#"[{ ... }..]`) is ordinary code, and skipping its block
+    as an attribute drops the items inside it. `#![...]` opens one too.
+    """
+    if tokens[index].kind != "punct" or tokens[index].value != "#":
+        return None
+    cursor = index + 1
+    if cursor < len(tokens) and tokens[cursor].kind == "punct" \
+            and tokens[cursor].value == "!":
+        cursor += 1
+    return cursor if cursor < len(tokens) \
+        and tokens[cursor].kind == "punct" \
+        and tokens[cursor].value == "[" else None
+
+
+def _attribute_span(tokens: list[RustToken], index: int) -> tuple[int, int] | None:
+    """Return the opening bracket and exclusive end of a real attribute."""
+    bracket = _attribute_bracket(tokens, index)
+    if bracket is None:
+        return None
+    end, depth = bracket + 1, 1
+    while end < len(tokens) and depth:
+        if tokens[end].kind == "punct":
+            depth += tokens[end].value == "["
+            depth -= tokens[end].value == "]"
+        end += 1
+    return bracket, end
 
 
 @dataclass(frozen=True)
@@ -292,15 +331,10 @@ def collect_static_tests(root: Path, repo_root: Path) -> StaticTestInventory:
             token = tokens[index]
             current_names = outer + tuple(scope[1] for scope in scopes)
             current_dir = scopes[-1][2] if scopes else base_dir
-            if token.value == "#" and index + 1 < len(tokens) \
-                    and tokens[index + 1].value == "[":
-                end = index + 2
-                attr_depth = 1
-                while end < len(tokens) and attr_depth:
-                    attr_depth += tokens[end].value == "["
-                    attr_depth -= tokens[end].value == "]"
-                    end += 1
-                attr = tokens[index + 2:end - 1]
+            span = _attribute_span(tokens, index)
+            if span is not None:
+                bracket, end = span
+                attr = tokens[bracket + 1:end - 1]
                 path_end = next((offset for offset, item in enumerate(attr)
                                  if item.value in ("(", "=", "]")), len(attr))
                 attr_path = tuple(item.value for item in attr[:path_end]
@@ -378,26 +412,165 @@ def collect_static_tests(root: Path, repo_root: Path) -> StaticTestInventory:
     return StaticTestInventory(tests, module_errors, tuple(duplicate_tests))
 
 
-def collect_modules(root: Path, repo_root: Path) -> dict[str, str]:
-    """Walk `mod` declarations from a crate root; name -> first decl site."""
-    modules: dict[str, str] = {}
-    queue, seen = [root], set()
-    while queue:
-        source = queue.pop()
-        if source in seen or not source.is_file():
+def _rust_literal_end(text: str, index: int) -> int | None:
+    """End offset of the string/char literal at `index`, else None.
+
+    Mirrors the token scanner's rules so a `'a` lifetime is not read as an
+    unterminated char literal and `r#"..."#` keeps its embedded quotes.
+    """
+    raw = RAW_STRING_OPEN.match(text, index)
+    if raw:
+        marker = '"' + raw.group(1)
+        end = text.find(marker, raw.end())
+        return len(text) if end < 0 else end + len(marker)
+    if text[index] == '"':
+        cursor = index + 1
+        while cursor < len(text):
+            if text[cursor] == "\\":
+                cursor += 2
+            elif text[cursor] == '"':
+                return cursor + 1
+            else:
+                cursor += 1
+        return len(text)
+    literal = CHAR_LITERAL.match(text, index)
+    return literal.end() if literal else None
+
+
+def _strip_rust_comments(text: str) -> str:
+    """Blank out line/block comments, keeping every other offset intact.
+
+    Comment bytes become spaces and line separators are preserved, so line
+    numbers and the surrounding layout are unchanged. String, raw-string and
+    char literals are skipped whole, so `//` inside `#[path = "a//b.rs"]` or
+    `/*` inside a string literal is never mistaken for a comment.
+    """
+    pieces: list[str] = []
+    copied = index = 0
+    while True:
+        hit = COMMENT_OR_LITERAL.search(text, index)
+        if hit is None:
+            break
+        index = hit.start()
+        token = hit.group()
+        if token not in ("//", "/*"):
+            literal = _rust_literal_end(text, index)
+            index = hit.end() if literal is None else literal
             continue
-        seen.add(source)
+        if token == "//":
+            end = text.find("\n", index)
+            end = len(text) if end < 0 else end
+        else:
+            depth, end = 1, index + 2
+            while end < len(text) and depth:
+                if text.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+        pieces.append(text[copied:index])
+        pieces.append(NON_LINE_BREAK.sub(" ", text[index:end]))
+        copied = index = end
+    if not pieces:
+        return text
+    pieces.append(text[copied:])
+    return "".join(pieces)
+
+
+def _attribute_end(line: str, start: int = 0) -> int | None:
+    """End offset of the balanced `#[...]` attribute at `start`, else None.
+
+    An attribute whose brackets do not close on this line returns None so it
+    keeps the existing whole-line handling instead of swallowing the item
+    after it. Literals are skipped so `#[path = "a]b.rs"]` stays balanced.
+    """
+    index = start
+    while index < len(line) and line[index].isspace():
+        index += 1
+    if not line.startswith("#[", index):
+        return None
+    depth = 0
+    index += 1
+    while index < len(line):
+        char = line[index]
+        if char in "\"'" or (char == "r"
+                             and RAW_STRING_OPEN.match(line, index)):
+            end = _rust_literal_end(line, index)
+            index = index + 1 if end is None else end
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if not depth:
+                return index + 1
+        index += 1
+    return None
+
+
+@dataclass(frozen=True)
+class _ModuleFrame:
+    """Where rustc looks for the children of one module.
+
+    Mirrors rustc's module resolution state: `directory` is `dir_path` and
+    `relative` is the unconsumed `DirOwnership::Owned { relative }` component
+    a non-mod-rs `foo.rs` leaves behind, so its children live in `foo/`.
+    """
+
+    directory: Path
+    relative: str | None = None
+
+    def child_dir(self) -> Path:
+        """Directory that plain `mod x;`/`mod x {}` children descend into."""
+        return (self.directory / self.relative if self.relative
+                else self.directory)
+
+
+def collect_modules(root: Path, repo_root: Path) -> dict[str, str]:
+    """Walk `mod` declarations from a crate root; name -> first decl site.
+
+    Descent follows rustc's real directory ownership (confirmed against
+    rustc 1.94.1 and 1.94.0): a root and a `mod.rs` own their directory
+    whatever the root file is called, a plain `foo.rs` owns `foo/`,
+    and an outlined `#[path]` picks a file whose own children are siblings.
+    Inline directory ownership is not modeled by this file-level walk.
+    """
+    modules: dict[str, str] = {}
+    queue = [(root, _ModuleFrame(root.parent))]
+    # One physical file can be owned by two different directories (a
+    # `#[path]` alias of a normal module). Keep the frame in the identity so
+    # both ownerships are walked, while the reported site stays the source.
+    seen: set[tuple[Path, Path, str | None]] = set()
+    while queue:
+        source, frame = queue.pop()
+        identity = (source.resolve(), frame.directory.resolve(),
+                    frame.relative)
+        if identity in seen or not source.is_file():
+            continue
+        seen.add(identity)
         pending_path: str | None = None
-        for lineno, line in enumerate(source.read_text("utf-8").splitlines(), 1):
-            attr = ATTR_PATH.match(line)
-            if attr:
-                pending_path = attr.group(1)
-                continue
-            match = MOD_DECL.match(line)
+        # Comments are trivia: a `// why this moved` line between #[path] and
+        # its `mod` must not detach the redirect.
+        text = _strip_rust_comments(source.read_text("utf-8"))
+        for lineno, line in enumerate(text.splitlines(), 1):
+            # An attribute and the item it decorates may share one line
+            # (`#[path = "x.rs"] mod x;`), so consume the attribute prefix
+            # instead of skipping the rest of the line with it.
+            remainder = line
+            while ATTR_LINE.match(remainder):
+                attr = ATTR_PATH.match(remainder)
+                end = attr.end() if attr else _attribute_end(remainder)
+                if end is None:
+                    break  # unbalanced: a multi-line attribute, handled below
+                if attr:
+                    pending_path = attr.group(1)
+                remainder = remainder[end:]
+            match = MOD_DECL.match(remainder)
             if not match:
                 # Other attributes (#[cfg], ...) may sit between #[path] and
-                # the mod item; any other non-blank line detaches the attr.
-                if line.strip() and not ATTR_LINE.match(line):
+                # the mod item; any other non-blank code detaches the attr.
+                if remainder.strip() and not ATTR_LINE.match(remainder):
                     pending_path = None
                 continue
             name, terminator = match.groups()
@@ -405,19 +578,24 @@ def collect_modules(root: Path, repo_root: Path) -> dict[str, str]:
             modules.setdefault(name, f"{source.relative_to(repo_root)}:{lineno}")
             if terminator != ";":
                 continue  # inline module: same-file lines are already scanned
+            current = frame
             if redirect is not None:
-                # #[path = "..."] outside inline blocks is relative to the
-                # directory of the declaring source file.
-                candidates: tuple[Path, ...] = (source.parent / redirect,)
-            elif source.name in ("lib.rs", "main.rs", "mod.rs"):
-                base = source.parent
-                candidates = (base / f"{name}.rs", base / name / "mod.rs")
+                # An outlined `#[path]` resolves against the frame directory
+                # and never against its pending relative component.
+                candidates: tuple[Path, ...] = (current.directory / redirect,)
             else:
-                base = source.parent / source.stem
+                base = current.child_dir()
                 candidates = (base / f"{name}.rs", base / name / "mod.rs")
             for candidate in candidates:
                 if candidate.is_file():
-                    queue.append(candidate)
+                    # A `#[path]` file and a `mod.rs` both own their own
+                    # directory; only a plain `x.rs` leaves `x` behind for
+                    # its children to consume.
+                    relative = (None if redirect is not None
+                                or candidate.name == "mod.rs"
+                                else candidate.stem)
+                    queue.append((candidate,
+                                  _ModuleFrame(candidate.parent, relative)))
                     break
     return modules
 
@@ -706,7 +884,10 @@ def validate_command(spec: CommandSpec, inventories: dict[str, dict[str, str]],
                 findings.append(("unknown-target",
                                  f"--test {name}: tests/{name}.rs not found"))
                 continue
-            inventories.setdefault(target, collect_modules(path, repo_root))
+            # setdefault evaluates its argument even on a hit, so it
+            # re-walked an integration root already inventoried here.
+            if target not in inventories:
+                inventories[target] = collect_modules(path, repo_root)
         if target not in inventories:
             findings.append(("unknown-target",
                              f"target `{target}` not found in Cargo.toml"))

@@ -29,14 +29,10 @@ fn queued_restart_foreign_authority_propagates_loss_while_self_delegation_contin
     let mut foreign = bridge.clone();
     foreign.set_watcher_owner_channel_id(foreign.channel_id + 1);
     foreign.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-    // #5464 T5 S4: driven with the cohort ADMITTING, because the propagation this
-    // pins must survive enforcement — `IdentityMismatch` is an exact-episode veto
-    // and keeps ending the lifecycle inside the cohort (ERRATUM R3-E4-3).
     let foreign_authority = visible_mutation_authority_after_guarded_save(
-        crate::services::discord::inflight::GuardedSaveOutcome::IdentityMismatch,
+        crate::services::discord::inflight::GuardedSaveOutcome::SuccessorOwned,
         &foreign,
         intended,
-        true,
     );
     assert_eq!(foreign_authority, VisibleMutationAuthority::AuthorityLost);
     assert_eq!(
@@ -49,7 +45,6 @@ fn queued_restart_foreign_authority_propagates_loss_while_self_delegation_contin
         crate::services::discord::inflight::GuardedSaveOutcome::Saved,
         &foreign,
         delegated,
-        true,
     );
     assert_eq!(self_delegated, VisibleMutationAuthority::Suppressed);
     assert_eq!(
@@ -59,17 +54,11 @@ fn queued_restart_foreign_authority_propagates_loss_while_self_delegation_contin
 }
 
 /// #5464 T5 S4 at the tool-arm entry, driven through production: with no durable
-/// row the real restart fence reports `Missing`, and under the SHIPPED dial that
-/// must still end the arm exactly as it does today.
-///
-/// The two fence functions ask the cohort themselves — they hold none of
-/// `stream_tick`'s per-tick locals — so the source assertion below pins that they
-/// still ASK. A literal at either call site would keep this file's behavioural
-/// assertions green while silently pinning the whole tool-arm surface to one side
-/// of the rollout, and the promotion evidence S2 collects would then describe a
-/// gate the arms are not running.
+/// row the real restart fence reports `Missing`, which suppresses this arm's
+/// visible mutation instead of ending the arm, so `post_loop_finalize` stays
+/// reachable.
 #[test]
-fn the_restart_fence_asks_the_cohort_and_a_vanished_row_still_ends_the_arm() {
+fn a_vanished_row_suppresses_the_restart_fence_without_ending_the_arm() {
     let temp = tempfile::TempDir::new().expect("runtime root");
     let _env_guard = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
 
@@ -94,8 +83,7 @@ fn the_restart_fence_asks_the_cohort_and_a_vanished_row_still_ends_the_arm() {
 
     // Nothing was ever saved for this channel, so the guarded save inside the
     // fence can only answer `Missing` — asserted, because `IdentityMismatch`
-    // maps to the same `AuthorityLost` and would let this pass for the wrong
-    // reason.
+    // would reach the fence as an exact-episode veto and still end the arm.
     assert!(
         crate::services::discord::inflight::load_inflight_state(
             &ProviderKind::Codex,
@@ -120,21 +108,12 @@ fn the_restart_fence_asks_the_cohort_and_a_vanished_row_still_ends_the_arm() {
     });
     assert_eq!(
         authority,
-        VisibleMutationAuthority::AuthorityLost,
-        "outside the enforcement cohort a vanished row must still end the arm",
+        VisibleMutationAuthority::Suppressed,
+        "a vanished row must suppress the arm's visible mutation, not end the arm",
     );
     assert_eq!(
         stream_tool_outcome_after_restart_authority(Some(authority)),
-        StreamToolArmOutcome::AuthorityLost,
-    );
-
-    let source = include_str!("authority.rs");
-    assert_eq!(
-        source
-            .matches("stream_loop_suppression_cohort_admits(context.inflight_state.channel_id)")
-            .count(),
-        2,
-        "both tool-arm fences must read the cohort instead of passing a literal",
+        StreamToolArmOutcome::Continue,
     );
 }
 
@@ -600,4 +579,190 @@ async fn watcher_stamped_tool_flags_survive_the_fence_and_the_next_real_stream_t
             .turn_delivered,
         &tick_delivery_pin,
     ));
+}
+
+/// #5938 r2 P0-1. The tool-arm fences run the SAME durable-row body adoption
+/// `stream_tick` runs, and the branch that produces the `GuardedSaveOutcome::
+/// Saved` they require can be the watcher/standby self-handoff — so an
+/// unrecorded copy here is the bridge adopting WATCHER bytes with nothing in the
+/// readout to say so, and an analyst reading only the append records would
+/// conclude bridge-first. Driven through the REAL reconcile, so deleting the
+/// observation fails here.
+#[test]
+fn the_tool_arm_durable_adoption_emits_its_own_body_mutation_record() {
+    use crate::services::discord::turn_bridge::chunk_compose::body_mutation_telemetry::body_mutation_telemetry_tests::captured_logs;
+
+    let mut durable = bridge_state(42_593_124);
+    durable.full_response = "COUNT-001\nCOUNT-002\n".to_string();
+    durable.response_sent_offset = durable.full_response.len();
+
+    let mut current_msg_id = MessageId::new(1_534_511_598_012_600_371);
+    let mut full_response = "COUNT-001\n".to_string();
+    let mut expected_current_message = (1_534_511_598_012_600_371_u64, 21_usize);
+    let mut response_sent_offset = "COUNT-001\n".len();
+    let mut bridge_confirmed_response_sent_offset = response_sent_offset;
+    let mut any_tool_used = false;
+    let mut has_post_tool_text = false;
+
+    let logs = captured_logs(|| {
+        reconcile_tool_arm_locals_after_guarded_save(
+            &durable,
+            &mut expected_current_message,
+            &mut current_msg_id,
+            &mut full_response,
+            &mut response_sent_offset,
+            &mut bridge_confirmed_response_sent_offset,
+            &mut any_tool_used,
+            &mut has_post_tool_text,
+        );
+    });
+
+    // The adoption itself is untouched by the observation.
+    assert_eq!(full_response, durable.full_response);
+
+    assert!(
+        logs.contains(
+            "site=\"tool_arms::authority::reconcile_tool_arm_locals_after_guarded_save\""
+        ),
+        "the tool-arm adoption must publish its OWN site, distinct from the \
+         stream_tick one, or the readout cannot say which fence carried the \
+         durable bytes in; got: {logs}"
+    );
+    assert!(logs.contains("before_len=10"), "got: {logs}");
+    assert!(logs.contains("after_len=20"), "got: {logs}");
+    // It must NOT borrow the stream_tick label.
+    assert!(
+        !logs.contains(
+            "site=\"bridge_entry_persist::reconcile_runtime_locals_from_inflight_state\""
+        ),
+        "got: {logs}"
+    );
+}
+
+/// The no-op skip travels with the shared helper: `stage_tick_state_for_guard!`
+/// pushes the loop body into the row and the fence reads it straight back, so
+/// the overwhelmingly common tool-arm adoption assigns a string to itself and
+/// must stay out of the readout.
+#[test]
+fn an_unchanged_tool_arm_adoption_records_nothing() {
+    use crate::services::discord::turn_bridge::chunk_compose::body_mutation_telemetry::body_mutation_telemetry_tests::captured_logs;
+
+    let mut durable = bridge_state(42_593_125);
+    durable.full_response = "COUNT-001\nCOUNT-002\n".to_string();
+
+    let mut current_msg_id = MessageId::new(1_534_511_598_012_600_371);
+    let mut full_response = durable.full_response.clone();
+    let mut expected_current_message = (1_534_511_598_012_600_371_u64, 21_usize);
+    let mut response_sent_offset = 0usize;
+    let mut bridge_confirmed_response_sent_offset = 0usize;
+    let mut any_tool_used = false;
+    let mut has_post_tool_text = false;
+
+    let logs = captured_logs(|| {
+        reconcile_tool_arm_locals_after_guarded_save(
+            &durable,
+            &mut expected_current_message,
+            &mut current_msg_id,
+            &mut full_response,
+            &mut response_sent_offset,
+            &mut bridge_confirmed_response_sent_offset,
+            &mut any_tool_used,
+            &mut has_post_tool_text,
+        );
+    });
+
+    assert_eq!(full_response, durable.full_response);
+    assert!(
+        !logs.contains("turn_bridge full_response body mutation"),
+        "an adoption that changes nothing must emit nothing; got: {logs}"
+    );
+}
+
+/// #5938 r3 P2-1. The two shallow tests above call the reconcile directly; this
+/// one earns the separate `ReconcileToolArmLocalsFromInflightState` variant by
+/// driving the REAL `fence_restart_visible_mutation` through the exact branch the
+/// variant's doc names — `stream_loop_patch.rs`'s "Exact watcher/standby
+/// self-handoff", which reaches `GuardedSaveOutcome::Saved` only after
+/// overwriting the row from the ON-DISK copy while the watcher owns the relay.
+///
+/// So the bytes this asserts on are genuinely the watcher's: they are written to
+/// disk by a watcher-owned row, adopted into `inflight_state` by the guarded
+/// save, and then copied into the loop-local body by the fence. That is the whole
+/// scenario round 1 raised as P0, end to end, with no hand-wired staging.
+#[tokio::test(flavor = "current_thread")]
+async fn the_watcher_self_handoff_fence_records_the_durable_body_it_adopts() {
+    use crate::services::discord::turn_bridge::chunk_compose::body_mutation_telemetry::body_mutation_telemetry_tests::captured_logs;
+
+    let temp = tempfile::TempDir::new().expect("runtime root");
+    let _env_guard = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+
+    let channel = ChannelId::new(42_593_150);
+    let mut inflight_state = bridge_state(channel.get());
+    inflight_state.current_msg_id = 1_534_511_598_012_600_371;
+    inflight_state.current_msg_len = 4;
+    inflight_state.full_response = "COUNT-001\nCOUNT-002\n".to_string();
+    inflight_state.response_sent_offset = inflight_state.full_response.len();
+    // Watcher owns the relay: this is what makes the guarded save take the
+    // self-handoff branch instead of the merge branch.
+    inflight_state
+        .set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
+    inflight_state.set_watcher_owner_channel_id(channel.get());
+    crate::services::discord::inflight::save_inflight_state(&inflight_state)
+        .expect("publish the watcher-owned on-disk row");
+
+    let expected =
+        crate::services::discord::inflight::InflightTurnIdentity::from_state(&inflight_state);
+    let mut baseline = inflight_state.clone();
+    let mut expected_current_message = (
+        inflight_state.current_msg_id,
+        inflight_state.current_msg_len,
+    );
+
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let gateway: std::sync::Arc<dyn TurnGateway> =
+        std::sync::Arc::new(crate::services::discord::gateway::HeadlessGateway);
+
+    let mut current_msg_id = crate::services::discord::turn_bridge::current_message_anchor::detached_current_msg_id_from_durable(
+        inflight_state.current_msg_id,
+    );
+    // The loop still holds the SHORTER body it staged before the save.
+    let mut full_response = "COUNT-001\n".to_string();
+    let mut response_sent_offset = full_response.len();
+    let mut confirmed_offset = response_sent_offset;
+    let mut any_tool_used = false;
+    let mut has_post_tool_text = false;
+
+    let logs = captured_logs(|| {
+        let authority = fence_restart_visible_mutation(StreamToolAuthorityContext {
+            shared_owned: &shared,
+            gateway: &gateway,
+            persisted_inflight_baseline: &mut baseline,
+            inflight_state: &mut inflight_state,
+            stream_tick_expected_identity: &expected,
+            expected_current_message: &mut expected_current_message,
+            current_msg_id: &mut current_msg_id,
+            full_response: &mut full_response,
+            response_sent_offset: &mut response_sent_offset,
+            confirmed_offset: &mut confirmed_offset,
+            any_tool_used: &mut any_tool_used,
+            has_post_tool_text: &mut has_post_tool_text,
+        });
+        // Not the claim under test, but pinned so a future authority change that
+        // silently stops reaching the fence cannot make this test vacuous.
+        let _ = authority;
+    });
+
+    assert_eq!(
+        full_response, "COUNT-001\nCOUNT-002\n",
+        "the fence must have adopted the watcher-owned durable body",
+    );
+    assert!(
+        logs.contains(
+            "site=\"tool_arms::authority::reconcile_tool_arm_locals_after_guarded_save\""
+        ),
+        "the watcher self-handoff adoption must appear in the readout, or a \
+         watcher-first turn shows no class-1 record at all; got: {logs}"
+    );
+    assert!(logs.contains("before_len=10"), "got: {logs}");
+    assert!(logs.contains("after_len=20"), "got: {logs}");
 }

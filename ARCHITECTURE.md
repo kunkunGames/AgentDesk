@@ -11,7 +11,7 @@ High-signal navigation guide for contributors. The generated inventories under `
 - `docs/generated/route-inventory.md` — generated HTTP/WebSocket route inventory.
 - `docs/generated/worker-inventory.md` — generated supervised worker inventory.
 
-Worktree builds expect `sccache` on `PATH` via `.cargo/config.toml`; install it with `brew install sccache`, and override the documented `SCCACHE_CACHE_SIZE=10G` default only when a host needs a different local cache cap.
+Install `sccache` with `brew install sccache` for local build caching. AgentDesk build helpers default to `SCCACHE_CACHE_SIZE=40G` and `SCCACHE_IDLE_TIMEOUT=0` while preserving nonempty overrides; see the [sccache setup guide](docs/ci/sccache-setup.md#22-shell-env-release-deploy-and-installer-source-builds) for activation rules, manual-wrapper behavior, and existing-daemon limits.
 
 ## Generated `src/` Tree
 
@@ -68,7 +68,10 @@ src/
 │   ├── legacy_tmp_paths.rs
 │   └── mod.rs
 ├── config/
-│   └── agent_channels.rs
+│   ├── test_env/
+│   │   └── teardown_probe.rs
+│   ├── agent_channels.rs
+│   └── test_env.rs
 ├── db/
 │   ├── auto_queue/
 │   │   ├── entries/
@@ -92,11 +95,14 @@ src/
 │   │   ├── execution.rs
 │   │   ├── postgres_tests.rs
 │   │   └── read.rs
+│   ├── campaigns/
+│   │   └── tests.rs
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
 │   │   ├── canonical_identity_pg_tests.rs
 │   │   ├── rebind_override.rs
-│   │   └── tests.rs
+│   │   ├── tests.rs
+│   │   └── thread_gc.rs
 │   ├── dispatches/
 │   │   ├── outbox/
 │   │   │   ├── claim.rs
@@ -140,6 +146,7 @@ src/
 │   ├── automation_candidate_card_program.rs
 │   ├── automation_candidates.rs
 │   ├── calendar_sync.rs
+│   ├── campaigns.rs
 │   ├── cancel_tombstones.rs
 │   ├── dispatch_semaphores.rs
 │   ├── dispatched_sessions.rs
@@ -275,7 +282,8 @@ src/
 │   │   │   │       ├── part_07.rs
 │   │   │   │       ├── part_08.rs
 │   │   │   │       ├── part_09.rs
-│   │   │   │       └── part_10.rs
+│   │   │   │       ├── part_10.rs
+│   │   │   │       └── part_11.rs
 │   │   │   ├── guides.rs
 │   │   │   ├── inventory.rs
 │   │   │   └── taxonomy.rs
@@ -323,6 +331,7 @@ src/
 │   │   ├── auto_queue.rs
 │   │   ├── auto_queue_lifecycle_pg_tests.rs
 │   │   ├── automation_candidates.rs
+│   │   ├── campaigns.rs
 │   │   ├── claude_accounts_api.rs
 │   │   ├── cluster.rs
 │   │   ├── cron_api.rs
@@ -530,6 +539,7 @@ src/
 │   │   ├── stream_relay/
 │   │   │   ├── tests/
 │   │   │   │   └── shutdown_tests.rs
+│   │   │   ├── frame_admission.rs
 │   │   │   ├── identity.rs
 │   │   │   ├── shutdown.rs
 │   │   │   └── terminal_resolution.rs
@@ -662,6 +672,8 @@ src/
 │   │   │   │   └── relay_probe.rs
 │   │   │   ├── stall_liveness/
 │   │   │   │   └── redrive_grace.rs
+│   │   │   ├── watcher_respawn/
+│   │   │   │   └── idle_relay_absence.rs
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── liveness_authority.rs
 │   │   │   ├── mailbox.rs
@@ -712,6 +724,7 @@ src/
 │   │   │   │   ├── create_monotonic_observer.rs
 │   │   │   │   ├── delivery_rewind.rs
 │   │   │   │   ├── identity_gate.rs
+│   │   │   │   ├── outcome_decomposition_tests.rs
 │   │   │   │   ├── post_loop_identity_guard_tests.rs
 │   │   │   │   └── rebind_adoption.rs
 │   │   │   ├── stall_recovery_tests/
@@ -810,7 +823,8 @@ src/
 │   │   │   ├── manifest.rs
 │   │   │   ├── memory_guidance.rs
 │   │   │   ├── mod.rs
-│   │   │   └── section_dedupe.rs
+│   │   │   ├── section_dedupe.rs
+│   │   │   └── session_anchors.rs
 │   │   ├── queue_io/
 │   │   │   └── turn_admission.rs
 │   │   ├── recovery_engine/
@@ -899,6 +913,7 @@ src/
 │   │   │   │   └── stale_turn.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── headless_turn/
+│   │   │   │   │   ├── entrypoints.rs
 │   │   │   │   │   └── routine_metadata.rs
 │   │   │   │   ├── intake_turn/
 │   │   │   │   │   ├── dispatch_stamp/
@@ -910,6 +925,7 @@ src/
 │   │   │   │   │   │   └── requeue_tests.rs
 │   │   │   │   │   ├── adk_thread.rs
 │   │   │   │   │   ├── claim_bootstrap.rs
+│   │   │   │   │   ├── context.rs
 │   │   │   │   │   ├── dispatch_runtime.rs
 │   │   │   │   │   ├── dispatch_stamp.rs
 │   │   │   │   │   ├── inflight_create_log.rs
@@ -918,7 +934,6 @@ src/
 │   │   │   │   │   ├── race_loss.rs
 │   │   │   │   │   ├── runtime_transition.rs
 │   │   │   │   │   ├── stale_dispatch_guard.rs
-│   │   │   │   │   ├── turn_watchdog.rs
 │   │   │   │   │   ├── voice_intake.rs
 │   │   │   │   │   └── worker_entry.rs
 │   │   │   │   ├── attachments.rs
@@ -957,6 +972,8 @@ src/
 │   │   │   │   └── tests.rs
 │   │   │   ├── queued_placeholders/
 │   │   │   │   └── tests.rs
+│   │   │   ├── relay_dlq_redelivery/
+│   │   │   │   └── tests.rs
 │   │   │   ├── deferred_restart.rs
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
@@ -971,6 +988,7 @@ src/
 │   │   │   ├── orphan_recovery.rs
 │   │   │   ├── queued_placeholders.rs
 │   │   │   ├── recovery_flush.rs
+│   │   │   ├── relay_dlq_redelivery.rs
 │   │   │   ├── restored_state.rs
 │   │   │   ├── session_gc.rs
 │   │   │   ├── shared_data.rs
@@ -985,6 +1003,10 @@ src/
 │   │   │   │   ├── pg_store.rs
 │   │   │   │   ├── recovery.rs
 │   │   │   │   └── watcher.rs
+│   │   │   ├── tests/
+│   │   │   │   └── stream_frame_fixtures.rs
+│   │   │   ├── turn_parser/
+│   │   │   │   └── resend_dedupe_tests.rs
 │   │   │   ├── delivery_commit.rs
 │   │   │   ├── delivery_frontier.rs
 │   │   │   ├── delivery_orchestration_tests.rs
@@ -1060,11 +1082,14 @@ src/
 │   │   │   │   ├── existing_panel_update.rs
 │   │   │   │   ├── native_collector_tests.rs
 │   │   │   │   └── types.rs
+│   │   │   ├── supervisor_relay/
+│   │   │   │   └── supervisor_frame_source.rs
 │   │   │   ├── terminal_commit_epilogue/
 │   │   │   │   └── continuation_marker_tests.rs
 │   │   │   ├── turn_identity/
 │   │   │   │   └── soft_terminal_authority.rs
 │   │   │   ├── turn_stream_collector/
+│   │   │   │   ├── chunk_forward.rs
 │   │   │   │   └── state.rs
 │   │   │   ├── cancel_handoff.rs
 │   │   │   ├── commit_decisions.rs
@@ -1080,6 +1105,7 @@ src/
 │   │   │   ├── loop_poll_prologue.rs
 │   │   │   ├── no_result_exits.rs
 │   │   │   ├── orphan_status_panel_cleanup.rs
+│   │   │   ├── orphan_terminal_frame.rs
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── panel_decisions_tests.rs
 │   │   │   ├── placeholder_reclaim.rs
@@ -1137,11 +1163,15 @@ src/
 │   │   ├── tui_prompt_relay/
 │   │   │   ├── rehydration/
 │   │   │   │   └── idempotency_tests.rs
+│   │   │   ├── relay_e2e/
+│   │   │   │   ├── discord_mock.rs
+│   │   │   │   └── mod.rs
 │   │   │   ├── synthetic_start/
 │   │   │   │   ├── bridge_handoff.rs
 │   │   │   │   ├── claim.rs
 │   │   │   │   └── stale_reclaim.rs
 │   │   │   ├── tests/
+│   │   │   │   ├── scenario_census_e2e.rs
 │   │   │   │   ├── synthetic_bridge_handoff_pg_tests.rs
 │   │   │   │   └── synthetic_terminal_ordering_tests.rs
 │   │   │   ├── anchor_completion.rs
@@ -1240,6 +1270,8 @@ src/
 │   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   └── process_table.rs
 │   │   │   ├── activity_heartbeat.rs
+│   │   │   ├── body_mutation_telemetry.rs
+│   │   │   ├── body_mutation_telemetry_tests.rs
 │   │   │   ├── bridge_entry_persist.rs
 │   │   │   ├── bridge_latency_spans.rs
 │   │   │   ├── cancel_finalize_policy.rs
@@ -1493,7 +1525,8 @@ src/
 │   │   │   └── selection_tests.rs
 │   │   └── auth_profiles.rs
 │   ├── dispatched_sessions/
-│   │   └── canonical_identity.rs
+│   │   ├── canonical_identity.rs
+│   │   └── tmux_cleanup.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery/
 │   │   │   ├── guard.rs
@@ -1538,12 +1571,18 @@ src/
 │   ├── memory/
 │   │   ├── local.rs
 │   │   ├── memento.rs
+│   │   ├── memento_anchor.rs
+│   │   ├── memento_endpoint.rs
 │   │   ├── memento_throttle.rs
 │   │   ├── mod.rs
 │   │   └── runtime_state.rs
 │   ├── message_outbox/
 │   │   └── identity.rs
 │   ├── observability/
+│   │   ├── events/
+│   │   │   ├── capture_stress_tests.rs
+│   │   │   ├── capture_tests.rs
+│   │   │   └── test_capture.rs
 │   │   ├── emit.rs
 │   │   ├── events.rs
 │   │   ├── helpers.rs
@@ -1555,6 +1594,7 @@ src/
 │   │   ├── relay_signal_alert.rs
 │   │   ├── retention.rs
 │   │   ├── session_inventory.rs
+│   │   ├── test_support.rs
 │   │   ├── turn_lifecycle.rs
 │   │   ├── watcher_latency.rs
 │   │   └── worker.rs
@@ -1575,6 +1615,14 @@ src/
 │   │   ├── mod.rs
 │   │   ├── shell.rs
 │   │   └── tmux.rs
+│   ├── process/
+│   │   ├── stream_child/
+│   │   │   ├── stream_queue/
+│   │   │   │   ├── test_delay.rs
+│   │   │   │   └── tests.rs
+│   │   │   ├── stream_queue.rs
+│   │   │   └── test_fixture.rs
+│   │   └── stream_child.rs
 │   ├── provider/
 │   │   ├── cancel_token_cleanup/
 │   │   │   ├── authority.rs
@@ -1671,6 +1719,8 @@ src/
 │   │   └── session.rs
 │   ├── tmux_common/
 │   │   └── session_markers.rs
+│   ├── tmux_turn_liveness/
+│   │   └── tests_pg.rs
 │   ├── tui_prompt_dedupe/
 │   │   ├── extract.rs
 │   │   ├── observation.rs
@@ -1687,6 +1737,8 @@ src/
 │   │   ├── dispatch_reservation.rs
 │   │   ├── episode_identity.rs
 │   │   ├── front_requeue.rs
+│   │   ├── inbound_order.rs
+│   │   ├── lease_release.rs
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── queue_cancellation.rs
@@ -1733,7 +1785,6 @@ src/
 │   ├── kakao_message.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
-│   ├── long_turn_watchdog.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── message_outbox_circuit_authority.rs
@@ -1790,6 +1841,7 @@ src/
 │   ├── tui_steering.rs
 │   ├── tui_turn_state.rs
 │   ├── turn_cancel_finalizer.rs
+│   ├── turn_cancel_queue_guard.rs
 │   ├── turn_lifecycle.rs
 │   ├── turn_orchestrator.rs
 │   └── writer_protocol.rs
@@ -1857,7 +1909,8 @@ src/
 ├── pipeline.rs
 ├── queue_contract.rs
 ├── receipt.rs
-└── reconcile.rs
+├── reconcile.rs
+└── test_env_panic_probe.rs
 ```
 <!-- END GENERATED: SRC TREE -->
 
@@ -1906,6 +1959,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/queue_contract.rs` | Queue field compatibility contracts shared by planner prompts, API documentation, and runtime-facing consumers. |
 | `src/receipt.rs` | Receipt parsing and workspace attribution helpers. |
 | `src/reconcile.rs` | Boot-time reconciliation for persisted state and dispatch-runtime drift. |
+| `src/test_env_panic_probe.rs` | Isolated test-fixture panic and environment restoration probes. |
 <!-- END GENERATED: TOP LEVEL MODULE MAP -->
 
 ### Discord Runtime

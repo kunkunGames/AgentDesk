@@ -124,12 +124,11 @@ pub(in crate::services::discord) fn snapshot_role_override(
         .map(|entry| *entry.value())
 }
 
-pub(in crate::services::discord) async fn clear_watchdog_and_kick_thread_parents_after_turn_release(
+pub(in crate::services::discord) async fn kick_thread_parents_after_turn_release(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: serenity::model::id::ChannelId,
 ) {
-    super::super::clear_watchdog_deadline_override(channel_id.get()).await;
     let thread_parent_kickoffs = collect_and_clear_thread_parents(shared, channel_id);
     kickoff_thread_parents_after_finalize(shared, provider, thread_parent_kickoffs);
 }
@@ -503,8 +502,7 @@ pub(super) async fn already_finalized_active_state(
         .cancelled
         .store(true, std::sync::atomic::Ordering::Relaxed);
     super::super::saturating_decrement_global_active(shared);
-    clear_watchdog_and_kick_thread_parents_after_turn_release(shared, provider, key.channel_id)
-        .await;
+    kick_thread_parents_after_turn_release(shared, provider, key.channel_id).await;
     if !finish.has_pending {
         remove_owned_role_override(shared, key.channel_id, owned_role_override);
     }
@@ -781,22 +779,32 @@ mod tests {
         940_000_000_000_000 + offset
     }
 
-    fn with_isolated_runtime_root(f: impl FnOnce()) {
+    fn with_isolated_runtime_root(f: impl FnOnce(&std::path::Path)) {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let prev = std::env::var_os("AGENTDESK_ROOT_DIR");
         let tmp = tempfile::tempdir().expect("create temp runtime dir for reaction cleanup test");
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path().to_str().unwrap());
-        }
-        f();
-        unsafe {
-            match prev {
-                Some(value) => std::env::set_var("AGENTDESK_ROOT_DIR", value),
-                None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
-            }
-        }
+        let _root_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        f(tmp.path());
+    }
+
+    use crate::test_env_panic_probe::{assert_root_restored, checkpoint};
+
+    fn exercise_finalizer_runtime_root() {
+        with_isolated_runtime_root(|root| checkpoint(&[("AGENTDESK_ROOT_DIR", root.as_os_str())]))
+    }
+
+    #[test]
+    fn finalizer_runtime_root_restores_env_after_panic_present() {
+        assert_root_restored(true, exercise_finalizer_runtime_root);
+    }
+
+    #[test]
+    fn finalizer_runtime_root_restores_env_after_panic_absent() {
+        assert_root_restored(false, exercise_finalizer_runtime_root);
     }
 
     async fn seed_active_turn(
@@ -814,7 +822,7 @@ mod tests {
 
     #[test]
     fn complete_finalize_snapshot_queues_status_panel_reconcile() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             let shared = super::super::super::make_shared_data_for_tests();
             let provider = ProviderKind::Claude;
             let channel_id = ChannelId::new(4_340_001);
@@ -860,7 +868,7 @@ mod tests {
 
     #[test]
     fn cancel_finalize_snapshot_queues_aborted_status_panel_reconcile() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             let shared = super::super::super::make_shared_data_for_tests();
             let provider = ProviderKind::Codex;
             let channel_id = ChannelId::new(4_340_011);
@@ -904,7 +912,7 @@ mod tests {
 
     #[test]
     fn mailbox_release_backstop_coalesces_duplicate_arms_and_eventually_fires_4906() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 use crate::services::turn_orchestrator::{
                     Intervention, InterventionMode, SourceMessageTextSegment,
@@ -1128,7 +1136,7 @@ mod tests {
             InflightTurnState, TurnSource, save_inflight_state,
         };
 
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_350_100);
@@ -1224,7 +1232,7 @@ mod tests {
             InflightTurnState, TurnSource, save_inflight_state,
         };
 
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_350_200);
@@ -1346,7 +1354,7 @@ mod tests {
 
     #[test]
     fn reconciler_backstop_finalize_removes_hourglass_and_marks_complete() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_100);
@@ -1389,7 +1397,7 @@ mod tests {
 
     #[test]
     fn backstop_reaction_cleanup_targets_dispatch_parent_channel() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let parent = ChannelId::new(3_334_120);
@@ -1448,7 +1456,7 @@ mod tests {
 
     #[test]
     fn backstop_reaction_cleanup_keeps_thread_origin_when_original_succeeds() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared =
                     super::super::super::make_shared_data_for_tests_with_storage(None);
@@ -1505,7 +1513,7 @@ mod tests {
 
     #[test]
     fn backstop_reaction_cleanup_without_mapping_keeps_single_failed_attempt() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_124);
@@ -1550,7 +1558,7 @@ mod tests {
 
     #[test]
     fn standby_relay_completion_finalizer_removes_hourglass_and_marks_complete() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared =
                     super::super::super::make_shared_data_for_tests_with_storage(None);
@@ -1611,7 +1619,7 @@ mod tests {
 
     #[test]
     fn standby_relay_cancel_does_not_mark_complete() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_180);
@@ -1668,7 +1676,7 @@ mod tests {
 
     #[test]
     fn synthetic_message_ids_skip_backstop_reaction_cleanup() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_130);
@@ -1737,7 +1745,7 @@ mod tests {
 
     #[test]
     fn relay_ownership_only_snapshot_skips_backstop_reaction_cleanup() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared =
                     super::super::super::make_shared_data_for_tests_with_storage(None);
@@ -1797,7 +1805,7 @@ mod tests {
 
     #[test]
     fn already_finalized_loser_does_not_claim_reaction_cleanup() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared =
                     super::super::super::make_shared_data_for_tests_with_storage(None);
@@ -1845,7 +1853,7 @@ mod tests {
 
     #[test]
     fn late_already_finalized_cleanup_releases_mailbox_and_rearms_once_4906() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 use crate::services::turn_orchestrator::{
                     Intervention, InterventionMode, SourceMessageTextSegment,
@@ -1982,7 +1990,7 @@ mod tests {
 
     #[test]
     fn watcher_context_skips_extra_reaction_calls() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_400);
@@ -2014,7 +2022,7 @@ mod tests {
 
     #[test]
     fn cleanup_targets_turn_identity_and_skips_synthetic_id_zero() {
-        with_isolated_runtime_root(|| {
+        with_isolated_runtime_root(|_root| {
             test_rt().block_on(async {
                 let shared = super::super::super::make_shared_data_for_tests_with_storage(None);
                 let ch = ChannelId::new(3_334_500);

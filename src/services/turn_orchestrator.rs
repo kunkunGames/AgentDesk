@@ -16,6 +16,8 @@ mod dispatch_cleanup;
 mod dispatch_reservation;
 mod episode_identity;
 mod front_requeue;
+mod inbound_order;
+mod lease_release;
 mod overflow;
 mod pending_queue_persistence;
 mod queue_cancellation;
@@ -36,12 +38,15 @@ use dispatch_reservation::{
     hydrate_pending_queue_into_state, merge_pending_dispatch_marker_into_state,
     pending_dispatch_lease_is_orphaned, reconcile_pending_dispatch_marker_before_take_next,
     record_valve_cleared_pending_dispatch, set_pending_user_dispatch,
+    settle_pending_dispatch_on_claim,
 };
-use episode_identity::{
-    TurnNonceGuard, matching_cancel_token, persist_queue_or_restore,
-    reset_watchdog_extension_state, take_watchdog_override_if_current,
-};
+use episode_identity::{TurnNonceGuard, matching_cancel_token, persist_queue_or_restore};
 use front_requeue::requeue_intervention_front;
+#[cfg(test)]
+use inbound_order::INBOUND_ORDER_FAIL_OPEN_AFTER;
+pub(crate) use inbound_order::TurnAdmissionOrder;
+use inbound_order::{claim_yields, pause_inbound_stall_for_turn};
+use lease_release::release_active_turn_anchor;
 pub(crate) use overflow::SoftInterventionProbe;
 use overflow::drain_head_overflow;
 #[cfg(test)]
@@ -57,10 +62,12 @@ pub(crate) use pending_queue_persistence::{
 use pending_queue_persistence::{
     cleanup_stale_pending_queue_tmp_files_in_dir, cleanup_stale_pending_queue_tmp_files_under_root,
 };
+#[cfg(test)]
+use queue_cancellation::cancel_soft_intervention_by_message_id;
 pub(crate) use queue_cancellation::has_soft_intervention_at;
 use queue_cancellation::{
-    cancel_soft_intervention_by_message_id, cancel_soft_intervention_by_primary_message_id,
-    dequeue_next_soft_intervention, has_soft_intervention,
+    cancel_soft_intervention_by_primary_message_id, dequeue_next_soft_intervention,
+    has_soft_intervention,
 };
 pub(crate) use source_generation::SourceMessageQueuedGeneration;
 pub(crate) use turn_finished_signal::TurnFinishedSignal;
@@ -863,6 +870,7 @@ impl ChannelMailboxHandle {
             request_owner,
             user_message_id,
             ActiveTurnKind::UserOrAgent,
+            TurnAdmissionOrder::Immediate,
             None,
         )
         .await
@@ -882,6 +890,7 @@ impl ChannelMailboxHandle {
             request_owner,
             user_message_id,
             ActiveTurnKind::UserOrAgent,
+            TurnAdmissionOrder::Immediate,
             Some(persistence),
         )
         .await
@@ -904,6 +913,7 @@ impl ChannelMailboxHandle {
             request_owner,
             user_message_id,
             turn_kind,
+            TurnAdmissionOrder::Immediate,
             None,
         )
         .await
@@ -916,6 +926,7 @@ impl ChannelMailboxHandle {
         request_owner: UserId,
         user_message_id: MessageId,
         turn_kind: ActiveTurnKind,
+        admission_order: TurnAdmissionOrder,
         persistence: QueuePersistenceContext,
     ) -> TryStartTurnResult {
         self.try_start_turn_kinded_result(
@@ -923,6 +934,7 @@ impl ChannelMailboxHandle {
             request_owner,
             user_message_id,
             turn_kind,
+            admission_order,
             Some(persistence),
         )
         .await
@@ -934,6 +946,7 @@ impl ChannelMailboxHandle {
         request_owner: UserId,
         user_message_id: MessageId,
         turn_kind: ActiveTurnKind,
+        admission_order: TurnAdmissionOrder,
         persistence: Option<QueuePersistenceContext>,
     ) -> TryStartTurnResult {
         self.request(
@@ -942,6 +955,7 @@ impl ChannelMailboxHandle {
                 request_owner,
                 user_message_id,
                 turn_kind,
+                admission_order,
                 persistence,
                 reply,
             },
@@ -1149,26 +1163,6 @@ impl ChannelMailboxHandle {
         .await
     }
 
-    pub(crate) async fn cancel_queued_message(
-        &self,
-        message_id: MessageId,
-        persistence: QueuePersistenceContext,
-    ) -> CancelQueuedMessageResult {
-        self.request(
-            |reply| ChannelMailboxMsg::CancelQueuedMessage {
-                message_id,
-                persistence,
-                reply,
-            },
-            CancelQueuedMessageResult {
-                removed: None,
-                queue_exit_events: Vec::new(),
-                persistence_error: None,
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn cancel_queued_primary_message(
         &self,
         message_id: MessageId,
@@ -1350,29 +1344,6 @@ impl ChannelMailboxHandle {
         .await
     }
 
-    pub(crate) async fn extend_timeout(
-        &self,
-        extend_by_secs: u64,
-    ) -> Result<WatchdogDeadlineExtension, WatchdogDeadlineExtensionError> {
-        self.request(
-            |reply| ChannelMailboxMsg::ExtendTimeout {
-                extend_by_secs,
-                reply,
-            },
-            Err(WatchdogDeadlineExtensionError::MailboxUnavailable),
-        )
-        .await
-    }
-
-    pub(crate) async fn clear_timeout_override(&self) {
-        let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::ClearTimeoutOverride { reply },
-                (),
-            )
-            .await;
-    }
-
     #[cfg(test)]
     pub(crate) async fn age_active_turn_for_test(&self, age: Duration) {
         let _ = self
@@ -1383,11 +1354,14 @@ impl ChannelMailboxHandle {
             .await;
     }
 
+    /// Wind both inbound waits back by `age`: the dequeue→claim reservation and
+    /// the #5937 free-slot stall clock. Both are `Instant`-based thresholds no
+    /// test can reach by waiting.
     #[cfg(test)]
-    pub(crate) async fn age_pending_dispatch_for_test(&self, age: Duration) {
+    pub(crate) async fn age_inbound_waits_for_test(&self, age: Duration) {
         let _ = self
             .request(
-                |reply| ChannelMailboxMsg::AgePendingDispatchForTest { age, reply },
+                |reply| ChannelMailboxMsg::AgeInboundWaitsForTest { age, reply },
                 (),
             )
             .await;
@@ -1402,26 +1376,6 @@ impl ChannelMailboxHandle {
             )
             .await;
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WatchdogDeadlineExtension {
-    pub(crate) requested_deadline_ms: i64,
-    pub(crate) new_deadline_ms: i64,
-    pub(crate) max_deadline_ms: i64,
-    pub(crate) applied_extend_secs: u64,
-    pub(crate) requested_extend_secs: u64,
-    pub(crate) extension_count: u32,
-    pub(crate) extension_count_limit: u32,
-    pub(crate) extension_total_secs: u64,
-    pub(crate) extension_total_secs_limit: u64,
-    pub(crate) clamped: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WatchdogDeadlineExtensionError {
-    MailboxUnavailable,
-    NoActiveTurn,
 }
 
 /// #2443 — deterministic "recovery finished" signal per channel.
@@ -1715,6 +1669,8 @@ enum ChannelMailboxMsg {
         user_message_id: MessageId,
         /// #3167 — priority class to record on the success branch.
         turn_kind: ActiveTurnKind,
+        /// #5937 — whether this claim may overtake queued inbound work.
+        admission_order: TurnAdmissionOrder,
         persistence: Option<QueuePersistenceContext>,
         reply: oneshot::Sender<TryStartTurnResult>,
     },
@@ -1763,11 +1719,6 @@ enum ChannelMailboxMsg {
         persistence: QueuePersistenceContext,
         consume_marker: bool,
         reply: oneshot::Sender<bool>,
-    },
-    CancelQueuedMessage {
-        message_id: MessageId,
-        persistence: QueuePersistenceContext,
-        reply: oneshot::Sender<CancelQueuedMessageResult>,
     },
     CancelQueuedPrimaryMessage {
         message_id: MessageId,
@@ -1860,24 +1811,13 @@ enum ChannelMailboxMsg {
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<RestartDrainResult>,
     },
-    ExtendTimeout {
-        extend_by_secs: u64,
-        reply: oneshot::Sender<Result<WatchdogDeadlineExtension, WatchdogDeadlineExtensionError>>,
-    },
-    TakeTimeoutOverride {
-        expected_token: Arc<CancelToken>,
-        reply: oneshot::Sender<Option<WatchdogDeadlineExtension>>,
-    },
-    ClearTimeoutOverride {
-        reply: oneshot::Sender<()>,
-    },
     #[cfg(test)]
     AgeActiveTurnForTest {
         age: Duration,
         reply: oneshot::Sender<()>,
     },
     #[cfg(test)]
-    AgePendingDispatchForTest {
+    AgeInboundWaitsForTest {
         age: Duration,
         reply: oneshot::Sender<()>,
     },
@@ -1973,6 +1913,10 @@ struct ChannelMailboxState {
     /// is bounded and provably non-permanent.
     pending_user_dispatch_yield_count: u32,
     pending_user_dispatch_since: Option<Instant>,
+    /// #5937 — since when the drain has had a free slot it did not use. Only
+    /// idle time accrues, and no claim ever resets it, so a channel on a turn
+    /// cycle cannot hide a wedge and a fail-open cannot become a duty cycle.
+    inbound_stall_since: Option<Instant>,
     recently_valve_cleared_dispatch: Option<(MessageId, Instant)>,
     last_persistence: Option<QueuePersistenceContext>,
     recovery_started_at: Option<Instant>,
@@ -1985,9 +1929,6 @@ struct ChannelMailboxState {
     /// Monotonic companion to `turn_started_at`, for in-process race guards
     /// that must distinguish a stale active claim from a fresh same-id claim.
     turn_started_instant: Option<Instant>,
-    watchdog_deadline_override: Option<WatchdogDeadlineExtension>,
-    watchdog_extension_count: u32,
-    watchdog_extension_total_secs: u64,
 }
 
 fn persist_queue(
@@ -2026,16 +1967,11 @@ fn finalize_turn_state(
     persistence: Option<&QueuePersistenceContext>,
     preserve_queue: bool,
 ) -> FinishTurnResult {
-    let removed_token = state.cancel_token.take();
-    state.active_request_owner = None;
-    state.active_user_message_id = None;
-    state.active_turn_nonce = None;
-    // #3167 — clear the priority class with the rest of the active-turn anchor.
-    state.active_turn_kind = ActiveTurnKind::default();
-    state.recovery_started_at = None;
-    state.turn_started_at = None;
-    state.turn_started_instant = None;
-    reset_watchdog_extension_state(state);
+    let removed_token = release_active_turn_anchor(
+        state,
+        channel_id,
+        persistence.map(|context| &context.provider),
+    );
     if preserve_queue {
         return FinishTurnResult {
             removed_token,
@@ -2080,66 +2016,6 @@ fn finalize_turn_state(
         queue_exit_events: pending_result.queue_exit_events,
         persistence_error: None,
     }
-}
-
-fn extend_active_watchdog_deadline(
-    state: &mut ChannelMailboxState,
-    requested_extend_secs: u64,
-) -> Result<WatchdogDeadlineExtension, WatchdogDeadlineExtensionError> {
-    let Some(cancel_token) = state.cancel_token.as_ref() else {
-        return Err(WatchdogDeadlineExtensionError::NoActiveTurn);
-    };
-
-    let count_limit = u32::MAX;
-    let total_secs_limit = u64::MAX;
-    let applied_extend_secs = requested_extend_secs;
-
-    let now_ms = Utc::now().timestamp_millis();
-    let current_deadline = cancel_token.watchdog_deadline_ms.load(Ordering::Relaxed);
-    let current_deadline = if current_deadline > 0 {
-        current_deadline
-    } else {
-        now_ms
-    };
-    let current_max_deadline = cancel_token
-        .watchdog_max_deadline_ms
-        .load(Ordering::Relaxed);
-    let current_max_deadline = if current_max_deadline > 0 {
-        current_max_deadline
-    } else {
-        current_deadline
-    };
-    let requested_deadline_ms =
-        std::cmp::max(current_deadline, now_ms) + requested_extend_secs as i64 * 1000;
-    let new_deadline_ms =
-        std::cmp::max(current_deadline, now_ms) + applied_extend_secs as i64 * 1000;
-    let max_deadline_ms = std::cmp::max(current_max_deadline, new_deadline_ms);
-
-    let new_deadline_ms = cancel_token.raise_watchdog_deadlines(new_deadline_ms, max_deadline_ms);
-    let max_deadline_ms = cancel_token
-        .watchdog_max_deadline_ms
-        .load(Ordering::Relaxed)
-        .max(new_deadline_ms);
-
-    state.watchdog_extension_count = state.watchdog_extension_count.saturating_add(1);
-    state.watchdog_extension_total_secs = state
-        .watchdog_extension_total_secs
-        .saturating_add(applied_extend_secs);
-
-    let extension = WatchdogDeadlineExtension {
-        requested_deadline_ms,
-        new_deadline_ms,
-        max_deadline_ms,
-        applied_extend_secs,
-        requested_extend_secs,
-        extension_count: state.watchdog_extension_count,
-        extension_count_limit: count_limit,
-        extension_total_secs: state.watchdog_extension_total_secs,
-        extension_total_secs_limit: total_secs_limit,
-        clamped: false,
-    };
-    state.watchdog_deadline_override = Some(extension);
-    Ok(extension)
 }
 
 #[cfg(test)]
@@ -2378,52 +2254,19 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     request_owner,
                     user_message_id,
                     turn_kind,
+                    admission_order,
                     persistence,
                     reply,
                 } => {
-                    // #3167 BLOCKER-2 — background yields to a queued backlog AND
-                    // to a reserved dequeue→claim window. The start rule used to
-                    // only check `cancel_token.is_some()`. After a background
-                    // finalizer releases the slot, another background cycle
-                    // (monitor relay / self-paced TUI loop) could win the race
-                    // for the freed slot AHEAD of the deferred kickoff that
-                    // drains a queued user intervention — starving the user
-                    // indefinitely. Refuse a Background start whenever a backlog
-                    // is already queued, OR while a `pending_user_dispatch`
-                    // reservation is live: `TakeNextSoft` REMOVES the queued
-                    // head before the dequeued user turn actually claims the
-                    // slot, leaving an EMPTY queue during that window — without
-                    // the reservation a Background start would slip in and
-                    // race-win ahead of the user. A `false` return is the
-                    // background callers' normal lost-race path (they do not
-                    // error or hot-spin; the watcher relays terminal output
-                    // independently of the mailbox slot, so no output is
-                    // dropped). UserOrAgent starts are UNCHANGED.
-                    let queue_non_empty = !state.intervention_queue.is_empty();
-                    let reservation_held = state.pending_user_dispatch.is_some();
-                    let background_yields =
-                        turn_kind.is_background() && (queue_non_empty || reservation_held);
-                    // SAFETY VALVE: only the dequeue→claim window (queue empty,
-                    // reservation held) can deadlock if the dequeued user turn is
-                    // lost. Count those refusals; a queue-backed refusal is a real
-                    // backlog and is never counted. After N consecutive
-                    // reservation-only refusals, drop the (possibly stale)
-                    // reservation so Background can proceed next time.
-                    if background_yields && !queue_non_empty && reservation_held {
-                        state.pending_user_dispatch_yield_count += 1;
-                        if state.pending_user_dispatch_yield_count
-                            >= PENDING_USER_DISPATCH_MAX_YIELDS
-                        {
-                            if pending_dispatch_lease_is_orphaned(&state)
-                                && let Some(cleared_id) = clear_pending_user_dispatch(&mut state)
-                            {
-                                record_valve_cleared_pending_dispatch(&mut state, cleared_id);
-                            }
-                        }
-                    }
+                    // #3167 BLOCKER-2 / #5937 — a claim yields to work that was
+                    // queued or reserved before it; see `inbound_order`. A
+                    // claim that cannot start must disturb neither gate.
+                    let idle = state.cancel_token.is_none();
+                    let yields = idle
+                        && claim_yields(&mut state, turn_kind, user_message_id, admission_order);
                     let mut queue_exit_events = Vec::new();
                     let mut persistence_error = None;
-                    let can_start = state.cancel_token.is_none() && !background_yields;
+                    let can_start = idle && !yields;
                     if can_start && turn_kind == ActiveTurnKind::UserOrAgent {
                         let previous_queue = state.intervention_queue.clone();
                         queue_exit_events = purge_active_source_from_queue(
@@ -2457,22 +2300,19 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                             // dequeue gates can treat a background turn as
                             // non-blocking.
                             state.active_turn_kind = turn_kind;
-                            // #3167 BLOCKER-2 — a real (UserOrAgent) turn claiming the
-                            // slot satisfies any reserved dequeue→claim window: clear
-                            // the reservation and reset the valve counter.
+                            // #3167 BLOCKER-2 — retire the dequeue→claim
+                            // reservation only when this claim is the one it
+                            // reserved. (#5937: a claim is not drain progress.)
                             if turn_kind == ActiveTurnKind::UserOrAgent {
-                                consume_pending_dispatch_marker_if_matches(
+                                settle_pending_dispatch_on_claim(
                                     &mut state,
                                     channel_id,
                                     user_message_id,
-                                    "try_start_turn",
                                 );
-                                clear_pending_user_dispatch(&mut state);
                             }
                             state.recovery_started_at = None;
                             state.turn_started_at = Some(Utc::now());
                             state.turn_started_instant = Some(Instant::now());
-                            reset_watchdog_extension_state(&mut state);
                             true
                         },
                         queue_exit_events,
@@ -2500,7 +2340,6 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     if was_idle || state.turn_started_instant.is_none() {
                         state.turn_started_instant = Some(Instant::now());
                     }
-                    reset_watchdog_extension_state(&mut state);
                     let _ = reply.send(());
                 }
                 ChannelMailboxMsg::RecoveryKickoff {
@@ -2525,7 +2364,6 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     if activated_turn || state.turn_started_instant.is_none() {
                         state.turn_started_instant = Some(recovery_started_at);
                     }
-                    reset_watchdog_extension_state(&mut state);
                     let _ = reply.send(RecoveryKickoffResult {
                         activated_turn,
                         refused_closed: false,
@@ -2793,6 +2631,11 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                             );
                             clear_pending_user_dispatch(&mut state);
                         }
+                        // #5937 — the head is back at the queue front, so the
+                        // drain is between rounds, not wedged: the clock starts
+                        // over. Here rather than in the hosted-TUI defer (#4270)
+                        // that motivated it — this arm covers every caller.
+                        state.inbound_stall_since = None;
                         RequeueInterventionResult {
                             enqueued: true,
                             refusal_reason: None,
@@ -2833,36 +2676,6 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         );
                     }
                     let _ = reply.send(authorized);
-                }
-                ChannelMailboxMsg::CancelQueuedMessage {
-                    message_id,
-                    persistence,
-                    reply,
-                } => {
-                    state.last_persistence = Some(persistence.clone());
-                    let previous_queue = state.intervention_queue.clone();
-                    let mut cancel_result = cancel_soft_intervention_by_message_id(
-                        &mut state.intervention_queue,
-                        message_id,
-                    );
-                    if cancel_result.removed.is_some()
-                        || !cancel_result.queue_exit_events.is_empty()
-                    {
-                        if let Err(error) = persist_queue_or_restore(
-                            &mut state,
-                            channel_id,
-                            &persistence,
-                            previous_queue,
-                            "cancel_queued_message",
-                        ) {
-                            cancel_result = CancelQueuedMessageResult {
-                                removed: None,
-                                queue_exit_events: Vec::new(),
-                                persistence_error: Some(error),
-                            };
-                        }
-                    }
-                    let _ = reply.send(cancel_result);
                 }
                 ChannelMailboxMsg::CancelQueuedPrimaryMessage {
                     message_id,
@@ -3011,16 +2824,11 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                 }
                 ChannelMailboxMsg::Clear { persistence, reply } => {
                     state.last_persistence = Some(persistence.clone());
-                    let removed_token = state.cancel_token.take();
-                    state.active_request_owner = None;
-                    state.active_user_message_id = None;
-                    state.active_turn_nonce = None;
-                    // #3167 — clear the priority class with the anchor.
-                    state.active_turn_kind = ActiveTurnKind::default();
-                    state.recovery_started_at = None;
-                    state.turn_started_at = None;
-                    state.turn_started_instant = None;
-                    reset_watchdog_extension_state(&mut state);
+                    let removed_token = release_active_turn_anchor(
+                        &mut state,
+                        channel_id,
+                        Some(&persistence.provider),
+                    );
                     let previous_queue = state.intervention_queue.clone();
                     let queue_exit_events = state
                         .intervention_queue
@@ -3080,16 +2888,11 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         && state.cancel_token.as_ref().is_some_and(|token| {
                             token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
                         }) {
-                        state.cancel_token = None;
-                        state.active_request_owner = None;
-                        state.active_user_message_id = None;
-                        state.active_turn_nonce = None;
-                        // #3167 — clear the priority class with the anchor.
-                        state.active_turn_kind = ActiveTurnKind::default();
-                        state.recovery_started_at = None;
-                        state.turn_started_at = None;
-                        state.turn_started_instant = None;
-                        reset_watchdog_extension_state(&mut state);
+                        release_active_turn_anchor(
+                            &mut state,
+                            channel_id,
+                            Some(&persistence.provider),
+                        );
                         true
                     } else {
                         false
@@ -3250,25 +3053,6 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         persistence_error,
                     });
                 }
-                ChannelMailboxMsg::ExtendTimeout {
-                    extend_by_secs,
-                    reply,
-                } => {
-                    let _ = reply.send(extend_active_watchdog_deadline(&mut state, extend_by_secs));
-                }
-                ChannelMailboxMsg::TakeTimeoutOverride {
-                    expected_token,
-                    reply,
-                } => {
-                    let _ = reply.send(take_watchdog_override_if_current(
-                        &mut state,
-                        &expected_token,
-                    ));
-                }
-                ChannelMailboxMsg::ClearTimeoutOverride { reply } => {
-                    state.watchdog_deadline_override = None;
-                    let _ = reply.send(());
-                }
                 #[cfg(test)]
                 ChannelMailboxMsg::AgeActiveTurnForTest { age, reply } => {
                     if state.cancel_token.is_some() {
@@ -3280,9 +3064,12 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     let _ = reply.send(());
                 }
                 #[cfg(test)]
-                ChannelMailboxMsg::AgePendingDispatchForTest { age, reply } => {
+                ChannelMailboxMsg::AgeInboundWaitsForTest { age, reply } => {
                     if state.pending_user_dispatch.is_some() {
                         state.pending_user_dispatch_since = Some(Instant::now() - age);
+                    }
+                    if state.inbound_stall_since.is_some() {
+                        state.inbound_stall_since = Some(Instant::now() - age);
                     }
                     let _ = reply.send(());
                 }
@@ -3431,7 +3218,11 @@ mod actor_hydrate_regression_tests {
             .join(format!("{}.dispatch", channel_id.get()))
     }
 
-    fn make_intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
+    pub(super) fn make_intervention(
+        message_id: u64,
+        text: &str,
+        created_at: Instant,
+    ) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
             author_is_bot: false,
@@ -3606,6 +3397,350 @@ mod actor_hydrate_regression_tests {
             assert_eq!(persisted.len(), 1);
             assert_eq!(persisted[0].source_message_ids, vec![tail_id]);
             assert_eq!(persisted[0].text, "tail copy");
+        });
+    }
+
+    /// One tick past the fail-open window; no test can reach it by waiting.
+    const PAST_STALL_WINDOW: Duration =
+        Duration::from_secs(INBOUND_ORDER_FAIL_OPEN_AFTER.as_secs() + 1);
+
+    /// Env-locked scratch runtime root for the #5937 ordering tests. Destructure
+    /// as `(lock, tmp, env)`: bindings drop in reverse, so the env var and the
+    /// directory are gone before the lock lets the next test in.
+    fn locked_root() -> (MutexGuard<'static, ()>, tempfile::TempDir, EnvGuard) {
+        let lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        (lock, tmp, EnvGuard)
+    }
+
+    /// One channel of a scratch registry, with the provider and owner every
+    /// #5937 ordering test shares; only the channel id and token differ.
+    struct OrderFixture {
+        _registry: ChannelMailboxRegistry,
+        handle: ChannelMailboxHandle,
+        persistence: QueuePersistenceContext,
+        owner: UserId,
+    }
+
+    impl OrderFixture {
+        fn new(channel_id: u64, token_hash: &str) -> Self {
+            let registry = ChannelMailboxRegistry::default();
+            Self {
+                handle: registry.handle(ChannelId::new(channel_id)),
+                _registry: registry,
+                persistence: QueuePersistenceContext::new(&ProviderKind::Claude, token_hash, None),
+                owner: UserId::new(5_937),
+            }
+        }
+
+        /// Distinct bodies, because one author resending identical text inside
+        /// `INTERVENTION_DEDUP_WINDOW` is a rapid resend the queue refuses.
+        async fn enqueue(&self, message_id: MessageId) {
+            let text = format!("queued {}", message_id.get());
+            let queued = make_intervention(message_id.get(), &text, Instant::now());
+            let result = self.handle.enqueue(queued, self.persistence.clone()).await;
+            assert!(result.enqueued, "the ordering assertions need this queued");
+        }
+
+        /// Claim the slot the way Discord text intake does: behind queued work.
+        async fn claim(&self, message_id: MessageId) -> bool {
+            self.claim_ordered(message_id, TurnAdmissionOrder::BehindQueue)
+                .await
+        }
+
+        async fn claim_ordered(&self, message_id: MessageId, order: TurnAdmissionOrder) -> bool {
+            self.handle
+                .try_start_turn_kinded_with_persistence(
+                    Arc::new(CancelToken::new()),
+                    self.owner,
+                    message_id,
+                    ActiveTurnKind::UserOrAgent,
+                    order,
+                    self.persistence.clone(),
+                )
+                .await
+                .started
+        }
+
+        /// Dispatch the queued head the way the idle-queue drain does: take it,
+        /// then claim the slot for it.
+        async fn drain_one(&self) -> MessageId {
+            let taken = self.handle.take_next_soft(self.persistence.clone()).await;
+            let head = taken.intervention.expect("queued head must be promotable");
+            let _lease = taken.dispatch_lease;
+            assert!(self.claim(head.message_id).await, "the head IS the drain");
+            head.message_id
+        }
+
+        async fn queue_len(&self) -> usize {
+            self.handle.snapshot().await.intervention_queue.len()
+        }
+
+        async fn reservation(&self) -> Option<MessageId> {
+            self.handle.snapshot().await.pending_user_dispatch
+        }
+    }
+
+    /// #5937 — three consecutive injections must reach the agent in fire order.
+    /// ALPHA holds the slot, BRAVO queues behind it, and CHARLIE arrives after
+    /// the slot frees but before the drain promotes BRAVO. Without the inbound
+    /// order gate CHARLIE takes the idle slot and is delivered ahead of BRAVO.
+    #[test]
+    fn consecutive_inbound_messages_reach_the_agent_in_fire_order() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_101, "inbound_order_fire_order");
+            let alpha = MessageId::new(5_937_201);
+            let bravo = MessageId::new(5_937_202);
+            let charlie = MessageId::new(5_937_203);
+
+            assert!(
+                f.claim(alpha).await,
+                "an idle slot and an empty queue admit"
+            );
+            assert!(
+                !f.claim(bravo).await,
+                "BRAVO arrives while ALPHA holds the slot"
+            );
+            f.enqueue(bravo).await;
+            f.handle.finish_turn(f.persistence.clone()).await;
+            assert!(!f.claim(charlie).await, "CHARLIE must not overtake BRAVO");
+            f.enqueue(charlie).await;
+
+            let mut delivered = vec![alpha];
+            for _ in 0..2 {
+                delivered.push(f.drain_one().await);
+                f.handle.finish_turn(f.persistence.clone()).await;
+            }
+            assert_eq!(delivered, vec![alpha, bravo, charlie], "fire order wins");
+            assert_eq!(
+                f.queue_len().await,
+                0,
+                "each message delivered exactly once"
+            );
+        });
+    }
+
+    /// #5937 — the order gate must not stall the drain it protects. During the
+    /// dequeue-to-claim window the queue is already empty and only the pending
+    /// dispatch reservation records the promoted head: an arrival then must
+    /// wait, and the head itself must still be admitted.
+    #[test]
+    fn dequeued_head_claims_the_slot_while_later_arrivals_wait() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_111, "inbound_order_head_exempt");
+            let head = MessageId::new(5_937_211);
+            let latecomer = MessageId::new(5_937_212);
+            f.enqueue(head).await;
+
+            let taken = f.handle.take_next_soft(f.persistence.clone()).await;
+            let _lease = taken.dispatch_lease;
+            assert_eq!(f.reservation().await, Some(head), "the head is promoted");
+            assert_eq!(
+                f.queue_len().await,
+                0,
+                "the dequeue-to-claim window empties it"
+            );
+
+            assert!(
+                !f.claim(latecomer).await,
+                "an arrival waits behind the head"
+            );
+            assert!(f.claim(head).await, "the promoted head must claim the slot");
+        });
+    }
+
+    /// #5937 — a queued message can be older than `INBOUND_ORDER_FAIL_OPEN_AFTER`
+    /// simply because it waited out a long turn or a parked capped retry. Age
+    /// alone is not a wedged drain, so it must not release later arrivals; the
+    /// stall clock is unit-tested in `inbound_order`, which can wind it back.
+    #[test]
+    fn aged_backlog_does_not_overtake_while_the_drain_progresses() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_121, "inbound_order_aged_backlog");
+            let aged = MessageId::new(5_937_221);
+            let arrival = MessageId::new(5_937_222);
+            let long_waited = Instant::now()
+                .checked_sub(PAST_STALL_WINDOW)
+                .expect("test clock must reach past the fail-open window");
+            f.handle
+                .replace_queue(
+                    vec![make_intervention(aged.get(), "aged", long_waited)],
+                    f.persistence.clone(),
+                )
+                .await;
+
+            assert!(!f.claim(arrival).await, "message age is not drain stall");
+            assert_eq!(f.drain_one().await, aged, "the aged message goes first");
+        });
+    }
+
+    /// #5937 — an `Immediate` claim (recovery, reaper, healing) may take an idle
+    /// slot, but it does not own the dequeue→claim reservation a queued head is
+    /// holding. Erasing it would let the next arrival overtake that head.
+    #[test]
+    fn immediate_claim_preserves_a_foreign_pending_dispatch_reservation() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_141, "inbound_order_foreign_reservation");
+            let head = MessageId::new(5_937_241);
+            let healer = MessageId::new(5_937_242);
+            let latecomer = MessageId::new(5_937_243);
+            f.enqueue(head).await;
+
+            let taken = f.handle.take_next_soft(f.persistence.clone()).await;
+            let _lease = taken.dispatch_lease;
+            assert_eq!(f.reservation().await, Some(head), "the head is promoted");
+            assert!(
+                f.claim_ordered(healer, TurnAdmissionOrder::Immediate).await,
+                "an immediate claim still takes an idle slot"
+            );
+            f.handle.finish_turn(f.persistence.clone()).await;
+
+            assert_eq!(f.reservation().await, Some(head), "reservation survives");
+            assert!(!f.claim(latecomer).await, "the head still owns the slot");
+            assert!(f.claim(head).await, "the promoted head must still claim");
+        });
+    }
+
+    /// #5937 — only inbound intake is ordered. Recovery, reaper and healing
+    /// claims are not queue traffic and keep taking an idle slot immediately.
+    #[test]
+    fn immediate_admission_still_takes_an_idle_slot_ahead_of_the_queue() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_131, "inbound_order_immediate");
+            f.enqueue(MessageId::new(5_937_231)).await;
+            let healer = MessageId::new(5_937_232);
+            assert!(
+                f.claim_ordered(healer, TurnAdmissionOrder::Immediate).await,
+                "immediate admission is unchanged by the inbound order gate"
+            );
+        });
+    }
+
+    /// #5937 × #4270 — the hosted-TUI defer hands the promoted head back with
+    /// `restore_dequeued_head`, which ends a drain round rather than wedging
+    /// one. That window must be discounted, or the next arrival fails open and
+    /// overtakes the head now sitting at the queue front again.
+    #[test]
+    fn a_restored_dequeued_head_discounts_the_inbound_stall_window() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_151, "inbound_order_restore_discount");
+            let head = MessageId::new(5_937_251);
+            let arrival = MessageId::new(5_937_252);
+            let latecomer = MessageId::new(5_937_253);
+            f.enqueue(head).await;
+
+            let taken = f.handle.take_next_soft(f.persistence.clone()).await;
+            let promoted = taken.intervention.expect("head must be promotable");
+            let lease = taken.dispatch_lease.expect("promotion holds a lease");
+            assert!(!f.claim(arrival).await, "the arrival arms the stall clock");
+            f.handle.age_inbound_waits_for_test(PAST_STALL_WINDOW).await;
+
+            let restored = f
+                .handle
+                .restore_dequeued_head(promoted, f.persistence.clone(), lease)
+                .await;
+            assert!(restored.enqueued, "the deferred head returns to the front");
+            assert_eq!(f.reservation().await, None, "the restore frees the slot");
+
+            assert!(
+                !f.claim(latecomer).await,
+                "the deferred window is discounted"
+            );
+            assert_eq!(
+                f.drain_one().await,
+                head,
+                "the head is still delivered first"
+            );
+        });
+    }
+
+    /// #5937 — the discount must not disarm the fail-open it protects. A head
+    /// that never claims and is never restored is a real wedge: after
+    /// `INBOUND_ORDER_FAIL_OPEN_AFTER` the next arrival must retire the dead
+    /// reservation and take the slot rather than wait behind it forever.
+    #[test]
+    fn a_reservation_nobody_restores_still_fails_open_after_the_window() {
+        let (_lock, _tmp, _env_guard) = locked_root();
+        run_async(async {
+            let f = OrderFixture::new(5_937_161, "inbound_order_wedge_fail_open");
+            let head = MessageId::new(5_937_261);
+            let arrival = MessageId::new(5_937_262);
+            let latecomer = MessageId::new(5_937_263);
+            f.enqueue(head).await;
+
+            let taken = f.handle.take_next_soft(f.persistence.clone()).await;
+            // Holding the lease keeps the reservation live, so the fail-open
+            // below is the stall clock expiring, not orphan-lease detection.
+            let _lease = taken.dispatch_lease.expect("promotion holds a lease");
+            assert!(!f.claim(arrival).await, "the arrival arms the stall clock");
+            f.handle.age_inbound_waits_for_test(PAST_STALL_WINDOW).await;
+
+            assert!(
+                f.claim(latecomer).await,
+                "a dead head must not wedge the channel"
+            );
+            assert_eq!(
+                f.reservation().await,
+                None,
+                "failing open retires the wedge"
+            );
+        });
+    }
+
+    /// #5937 — a window an active turn occupied was never a window the drain
+    /// could have used. `Clear` releases the same anchor `FinishTurn` does, and
+    /// when its persist fails the queue comes back and the drain has to retry —
+    /// against a discounted clock, not one that expired under the turn.
+    #[test]
+    fn a_cleared_turn_that_held_the_slot_discounts_the_window_it_occupied() {
+        let (_lock, tmp, _env_guard) = locked_root();
+        run_async(async {
+            let token_hash = "inbound_order_clear_discount";
+            let channel_id = ChannelId::new(5_937_171);
+            let f = OrderFixture::new(channel_id.get(), token_hash);
+            let arrival = MessageId::new(5_937_272);
+            let holder = MessageId::new(5_937_273);
+            let latecomer = MessageId::new(5_937_274);
+            f.enqueue(MessageId::new(5_937_271)).await;
+            assert!(!f.claim(arrival).await, "the arrival arms the stall clock");
+            assert!(
+                f.claim_ordered(holder, TurnAdmissionOrder::Immediate).await,
+                "a recovery turn takes the idle slot"
+            );
+            f.handle.age_active_turn_for_test(PAST_STALL_WINDOW).await;
+            f.handle.age_inbound_waits_for_test(PAST_STALL_WINDOW).await;
+
+            // An emptied queue is persisted by removing its file, so a directory
+            // in that file's place makes the clear's persist fail and roll back.
+            let path = queue_file_path(tmp.path(), &ProviderKind::Claude, token_hash, channel_id);
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let cleared = f.handle.clear(f.persistence.clone()).await;
+
+            assert!(
+                cleared.persistence_error.is_some(),
+                "the clear must fail to persist"
+            );
+            assert!(
+                cleared.removed_token.is_some(),
+                "the anchor is released anyway"
+            );
+            assert_eq!(
+                f.queue_len().await,
+                1,
+                "the failed clear restores the queue"
+            );
+            assert!(
+                !f.claim(latecomer).await,
+                "the held window is not drain stall"
+            );
         });
     }
 
@@ -4873,7 +5008,7 @@ mod active_turn_kind_tests {
         assert_eq!(taken.queue_len_after, 0);
         drop(taken);
         handle
-            .age_pending_dispatch_for_test(
+            .age_inbound_waits_for_test(
                 PENDING_USER_DISPATCH_LEASE_ORPHAN_AFTER + Duration::from_secs(1),
             )
             .await;
@@ -6376,7 +6511,7 @@ mod persistence_tests {
                 .as_ref()
                 .expect("live dispatch should hold a caller lease");
             handle
-                .age_pending_dispatch_for_test(
+                .age_inbound_waits_for_test(
                     PENDING_USER_DISPATCH_LEASE_ORPHAN_AFTER + Duration::from_secs(60),
                 )
                 .await;
@@ -6474,7 +6609,7 @@ mod persistence_tests {
             );
             drop(first);
             handle
-                .age_pending_dispatch_for_test(
+                .age_inbound_waits_for_test(
                     PENDING_USER_DISPATCH_LEASE_ORPHAN_AFTER + Duration::from_secs(1),
                 )
                 .await;
@@ -6517,7 +6652,7 @@ mod persistence_tests {
             );
             drop(taken);
             handle
-                .age_pending_dispatch_for_test(
+                .age_inbound_waits_for_test(
                     PENDING_USER_DISPATCH_LEASE_ORPHAN_AFTER + Duration::from_secs(1),
                 )
                 .await;
@@ -7256,7 +7391,11 @@ mod finish_cancelled_turn_tests {
             Err(poisoned) => poisoned.into_inner(),
         };
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _root_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            tmp.path(),
+        );
+        checkpoint(&[("AGENTDESK_ROOT_DIR", tmp.path().as_os_str())]);
 
         let provider = ProviderKind::Codex;
         let token_hash = "finish-cancelled-no-rehydrate";
@@ -7303,8 +7442,24 @@ mod finish_cancelled_turn_tests {
             snapshot.intervention_queue.is_empty(),
             "finish_cancelled_turn must not hydrate disk-only pending queues",
         );
+    }
 
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    use crate::test_env_panic_probe::{assert_root_restored, checkpoint};
+
+    #[test]
+    fn cancelled_turn_cleanup_restores_env_after_panic_present() {
+        assert_root_restored(
+            true,
+            finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue,
+        );
+    }
+
+    #[test]
+    fn cancelled_turn_cleanup_restores_env_after_panic_absent() {
+        assert_root_restored(
+            false,
+            finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue,
+        );
     }
 
     #[tokio::test]

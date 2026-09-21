@@ -182,6 +182,9 @@ pub(crate) async fn rebind_inflight_for_channel(
     .await
 }
 
+/// `expected_episode` pins the inflight row the caller observed. Supplying it
+/// keeps the `WatcherReattach` arm on its adopt branch, so a recovery that only
+/// needs a watcher back can never clear the row it was called to serve.
 pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -189,6 +192,7 @@ pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
     channel_id: u64,
     tmux_session_override: Option<String>,
     minimum_initial_offset: Option<u64>,
+    expected_episode: Option<&super::inflight::InflightEpisodePin>,
 ) -> Result<RebindOutcome, RebindError> {
     rebind_inflight_for_channel_inner(
         http,
@@ -198,7 +202,7 @@ pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
         tmux_session_override,
         ManualRebindOverrides::default(),
         minimum_initial_offset,
-        None,
+        expected_episode,
     )
     .await
 }
@@ -1038,11 +1042,8 @@ mod stall_watchdog_respawn_deadlock_tests {
     /// arm classifies this row `Pending` and the first assert fails.
     #[test]
     fn respawn_preflight_adopts_reacquired_orphan_row_instead_of_409() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let _env = crate::config::set_agentdesk_root_for_test(tmp.path());
 
         let provider = ProviderKind::Claude;
         let channel_id = 1_479_671_298_497_183_835_u64;
@@ -1104,11 +1105,8 @@ mod stall_watchdog_respawn_deadlock_tests {
     /// exist.
     #[test]
     fn respawn_with_absent_row_still_creates_new_synthetic_inflight() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+        let _env = crate::config::set_agentdesk_root_for_test(tmp.path());
 
         let provider = ProviderKind::Claude;
         let channel_id = 1_479_671_298_497_184_007_u64;
@@ -1307,6 +1305,41 @@ mod stall_watchdog_respawn_deadlock_tests {
             row.effective_relay_owner_kind(),
             super::inflight::RelayOwnerKind::Watcher,
             "the adopted row must stay watcher-owned"
+        );
+    }
+    #[test]
+    fn respawn_preflight_restores_present_root() {
+        crate::config::test_env::teardown_probe::assert_restores_after_return(
+            concat!(module_path!(), "::respawn_preflight_restores_present_root"),
+            true,
+            respawn_preflight_adopts_reacquired_orphan_row_instead_of_409,
+        );
+    }
+
+    #[test]
+    fn respawn_preflight_restores_absent_root() {
+        crate::config::test_env::teardown_probe::assert_restores_after_return(
+            concat!(module_path!(), "::respawn_preflight_restores_absent_root"),
+            false,
+            respawn_preflight_adopts_reacquired_orphan_row_instead_of_409,
+        );
+    }
+
+    #[test]
+    fn respawn_absent_row_restores_present_root() {
+        crate::config::test_env::teardown_probe::assert_restores_after_return(
+            concat!(module_path!(), "::respawn_absent_row_restores_present_root"),
+            true,
+            respawn_with_absent_row_still_creates_new_synthetic_inflight,
+        );
+    }
+
+    #[test]
+    fn respawn_absent_row_restores_absent_root() {
+        crate::config::test_env::teardown_probe::assert_restores_after_return(
+            concat!(module_path!(), "::respawn_absent_row_restores_absent_root"),
+            false,
+            respawn_with_absent_row_still_creates_new_synthetic_inflight,
         );
     }
 }
