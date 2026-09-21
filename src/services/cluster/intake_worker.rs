@@ -326,6 +326,15 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Processed);
     }
 
+    let uploads = match super::attachment_transfer::worker_uploads(pool, &row).await {
+        Ok(uploads) => uploads,
+        Err(reason) => {
+            mark_failed_pre_accept(pool, row.id, claim_owner, &format!("attachments: {reason}"))
+                .await?;
+            return Ok(TickOutcome::Processed);
+        }
+    };
+
     // Payload conversion can race the marker too. Recheck at the final
     // pre-accept boundary; after acceptance the lifecycle guard makes marker
     // acknowledgement wait for execute/final DB transition to drain.
@@ -366,7 +375,7 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Processed);
     }
 
-    let result = execute_intake_turn_core(http, shared, token, request, Vec::new()).await;
+    let result = execute_intake_turn_core(http, shared, token, request, uploads).await;
 
     match result {
         Ok(()) => {
@@ -591,6 +600,7 @@ mod tests {
     fn fake_row() -> IntakeOutboxRow {
         IntakeOutboxRow {
             execution_requirements: serde_json::json!({}),
+            attachment_refs: serde_json::json!([]),
             id: 42,
             target_instance_id: "worker-1".to_string(),
             forwarded_by_instance_id: "leader-1".to_string(),

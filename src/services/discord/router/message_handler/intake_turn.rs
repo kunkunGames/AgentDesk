@@ -1674,8 +1674,13 @@ pub(super) async fn handle_text_message(
         session_retry_context.as_ref(),
     )
     .await;
-    if !pending_uploads.is_empty() {
-        context_chunks.push(pending_uploads.join("\n"));
+    let materialized_uploads = crate::services::cluster::attachment_transfer::materialize::prepare(
+        &pending_uploads,
+        shared.pg_pool.as_ref(),
+    )
+    .await?;
+    if !materialized_uploads.records.is_empty() {
+        context_chunks.push(materialized_uploads.records.join("\n"));
     }
     if let Some(ref reply_ctx) = reply_context {
         context_chunks.push(reply_ctx.clone());
@@ -2382,6 +2387,7 @@ pub(super) async fn handle_text_message(
     }
     let provider_for_blocking = provider.clone();
     tokio::task::spawn_blocking(move || {
+        let _upload_lifetime = materialized_uploads;
         let result = crate::services::platform::with_provider_execution_context(
             provider_execution_context,
             || {

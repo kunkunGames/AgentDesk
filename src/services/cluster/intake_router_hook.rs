@@ -192,6 +192,7 @@ pub(crate) struct IntakeRouterContext<'a> {
     pub preserve_on_cancel: bool,
     pub node_override_instance_id: Option<&'a str>,
     pub has_nonportable_uploads: bool,
+    pub attachment_refs: &'a [super::attachment_transfer::uploads::BundleRef],
 }
 
 fn worker_heartbeat_lease_secs() -> u64 {
@@ -589,6 +590,8 @@ async fn route_by_preferred_labels(
                     ) && super::readiness::evaluate_declared(node, ctx.provider, &auth_profile)
                         .eligible
                         && required_node_reasons(node, requirements).is_empty()
+                        && (ctx.attachment_refs.is_empty()
+                            || super::attachment_transfer::supports(node))
                 })
                 .collect();
             candidates_from_worker_nodes_json(&eligible_nodes)
@@ -881,7 +884,7 @@ async fn route_to_instance(
                 .iter()
                 .find(|node| node["instance_id"].as_str() == Some(target))
                 .map(|node| {
-                    super::readiness::evaluate_declared(
+                    let mut report = super::readiness::evaluate_declared(
                         node,
                         ctx.provider,
                         &super::readiness::expected_auth_profile(
@@ -889,7 +892,16 @@ async fn route_to_instance(
                             ctx.channel_id,
                             agent_id,
                         ),
-                    )
+                    );
+                    if !ctx.attachment_refs.is_empty()
+                        && !super::attachment_transfer::supports(node)
+                    {
+                        report.eligible = false;
+                        report
+                            .reasons
+                            .push("attachment_bundle_protocol_missing".into());
+                    }
+                    report
                 })
                 .ok_or_else(|| "target registry row missing".to_string()),
             Err(error) => Err(error),
@@ -1015,6 +1027,7 @@ fn build_payload_for_insert(
 ) -> InsertPendingPayload {
     InsertPendingPayload {
         execution_requirements: serde_json::json!({}),
+        attachment_refs: serde_json::json!(ctx.attachment_refs),
         target_instance_id: target.to_string(),
         forwarded_by_instance_id: ctx.leader_instance_id.to_string(),
         provider: ctx.provider.to_string(),
@@ -1119,6 +1132,7 @@ mod pg_tests {
             preserve_on_cancel: false,
             node_override_instance_id: None,
             has_nonportable_uploads: false,
+            attachment_refs: &[],
         }
     }
 

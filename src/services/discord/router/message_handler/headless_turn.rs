@@ -694,8 +694,14 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         session_retry_context.as_ref(),
     )
     .await;
-    if !pending_uploads.is_empty() {
-        context_chunks.push(pending_uploads.join("\n"));
+    let materialized_uploads = crate::services::cluster::attachment_transfer::materialize::prepare(
+        &pending_uploads,
+        shared.pg_pool.as_ref(),
+    )
+    .await
+    .map_err(HeadlessTurnStartError::Internal)?;
+    if !materialized_uploads.records.is_empty() {
+        context_chunks.push(materialized_uploads.records.join("\n"));
     }
     if let Some(headless_context) = build_headless_trigger_context(source, metadata.as_ref()) {
         context_chunks.push(headless_context);
@@ -1003,6 +1009,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     let prompt_owned = prompt.to_string();
     let provider_for_blocking = provider.clone();
     tokio::task::spawn_blocking(move || {
+        let _upload_lifetime = materialized_uploads;
         let result = crate::services::platform::with_provider_execution_context(
             provider_execution_context,
             || {
