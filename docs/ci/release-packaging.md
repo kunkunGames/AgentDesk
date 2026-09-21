@@ -139,6 +139,19 @@ worker DB 설정은 이 로컬 포트를 가리켜야 한다. 터널과 worker �
 등록하는 것만으로 서비스 계약이 생긴다고 가정하지 않는다. 설정에 service host가 없는 이
 설치 경로의 재시작은 `Stop-ScheduledTask`와 `Start-ScheduledTask`로 관리한다.
 
+Windows 방화벽이 API 수신을 차단하면 관리자 PowerShell에서 패키지의
+`scripts/install-windows-worker-firewall.ps1`을 한 번 실행한다. worker 실행 계정에는
+관리자 권한이 필요하지 않다. 규칙은 실행 파일·TCP 포트·leader IP 주소로 범위를
+제한한다. 다른 관리자 계정에서 실행할 수 있으므로 runtime 경로를 명시한다.
+
+```powershell
+.\scripts\install-windows-worker-firewall.ps1 -RuntimeRoot 'C:\Users\worker\.adk\release' -LeaderAddress '192.168.1.147' -WhatIf
+.\scripts\install-windows-worker-firewall.ps1 -RuntimeRoot 'C:\Users\worker\.adk\release' -LeaderAddress '192.168.1.147'
+```
+
+포트는 worker의 `server.port`와 같아야 한다. leader의 고정 IP가 바뀌면 같은 명령을
+새 주소로 다시 실행한다. 네트워크 프로필 전체의 기본 수신 정책은 변경하지 않는다.
+
 ## 검증
 
 Mac release 재배포는 기존 launchd의 `StandardOutPath`·`StandardErrorPath`를 보존한다.
