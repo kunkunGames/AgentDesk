@@ -366,7 +366,7 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Processed);
     }
 
-    let result = execute_intake_turn_core(http, shared, token, request).await;
+    let result = execute_intake_turn_core(http, shared, token, request, Vec::new()).await;
 
     match result {
         Ok(()) => {
