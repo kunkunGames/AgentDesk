@@ -82,7 +82,9 @@ def write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
 
 
-def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool = True) -> Path:
+def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool = True, profile: str = "release") -> Path:
+    if profile not in {"release", "release-fast"}:
+        raise ValueError("unsupported build profile")
     system, arch = TARGETS[target]
     verify_binary(binary, target)
     if dashboard and not (root / "dashboard/dist/index.html").is_file():
@@ -117,6 +119,7 @@ def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool
         source_manifest = {
             "generated_at": generated, "repo_head": head, "repo_dirty": str(dirty).lower(),
             "latest_postgres_migration": migrations[-1].name if migrations else None,
+            "build_profile": profile,
         }
         write_json(staging / "runtime/release-source.json", source_manifest)
         manifest = {
@@ -151,10 +154,11 @@ def main() -> None:
     parser.add_argument("--target", required=True, choices=TARGETS)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--without-dashboard", action="store_true")
+    parser.add_argument("--profile", choices=["release", "release-fast"], default="release")
     args = parser.parse_args()
     try:
         artifact = package(args.root.resolve(), args.binary.resolve(), args.target,
-                           (args.output or args.root / "dist").resolve(), not args.without_dashboard)
+                           (args.output or args.root / "dist").resolve(), not args.without_dashboard, args.profile)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Release packaging failed: {error}\n")
     print(f"Artifact: {artifact}\nSHA-256: {sha256(artifact)}")

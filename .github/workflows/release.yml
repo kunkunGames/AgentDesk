@@ -144,11 +144,11 @@ jobs:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
           python -m unittest tests.test_package_release
-          bash scripts/build-release.sh --target "$RELEASE_TARGET" --prebuilt-dashboard
-          binary="target/$RELEASE_TARGET/release/agentdesk"
+          bash scripts/build-release.sh --target "$RELEASE_TARGET" --profile release-fast --prebuilt-dashboard
+          binary="target/$RELEASE_TARGET/release-fast/agentdesk"
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
           "$binary" --version
-          python scripts/verify_release_artifacts.py dist --commit "$GITHUB_SHA" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET"
+          python scripts/verify_release_artifacts.py dist --commit "$GITHUB_SHA" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET" --profile release-fast
       - uses: actions/upload-artifact@v4
         with:
           name: agentdesk-${{ matrix.target }}
@@ -182,7 +182,7 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          python scripts/verify_release_artifacts.py dist --commit "$GITHUB_SHA" --version "$RELEASE_VERSION" \
+          python scripts/verify_release_artifacts.py dist --commit "$GITHUB_SHA" --version "$RELEASE_VERSION" --profile release-fast \
             --target aarch64-apple-darwin --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-gnu
           prerelease=()
           if [[ "$RELEASE_TAG" == *-* ]]; then prerelease+=(--prerelease); fi
