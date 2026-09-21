@@ -21,15 +21,20 @@ macOS/Linux/Windows에 공통 등록·배정 계약을 적용한다. 별도 work
 | R4 공통 release | OS별 공통 패키징·manifest 검증·GitHub workflow 추가. 기존 `release-fast` 프로필 재사용. 패키징 테스트 7개와 GitHub run `35651612825`의 Windows/Linux/macOS arm64 native matrix 통과. Mac mini에서도 동일 계열 소스 native build 및 실행 확인 | 최종 구현 commit의 Release 게시, 노드 설치/갱신, LAN DB 연결과 노드별 pool 예산 적용 |
 | R2 원격 대시보드 | 공통 HTTP 인증 세대·cache 취소, truthful session probe, 15초 일회용 WS ticket, 로그인/logout UI 구현. 서버 인증 테스트 12개 및 전체 dashboard 단위 테스트 386개 통과. desktop/mobile browser fixture에서 로그인·재연결·교체·logout·refresh 검증 | 실제 LAN peer의 서버+브라우저 통합 검증 |
 | R3 readiness | CLI·인증 프로필 존재·로컬 repo·도구·backend·poller의 기한 있는 증거와 인증된 peer probe를 수집. 신규 remote admission에 연결. HTTP peer identity/auth 경계 및 TTL 테스트 통과 | 실제 LAN 노드에서 provider 인증·quota 확인 및 장애 주입 |
-| R5 필수 실행 조건 | OS/arch/node/tool/repo/backend 필수 조건과 선호 조건 분리. outbox와 재시도에 조건 snapshot 보존. 신규 PG 테스트 2개 통과. 관련 56개 중 55개 통과, 정책 조회 실패 시 fallback을 기대하던 기존 테스트 1개는 fail-closed 계약으로 수정 | 수정 테스트 재실행, 최종 통합 검증 |
+| R5 필수 실행 조건 | OS/arch/node/tool/repo/backend 필수 조건과 선호 조건 분리. outbox와 재시도에 조건 snapshot 보존. 신규 PG 테스트 2개 통과. 관련 56개 중 55개 통과 후, 정책 조회 실패 시 fallback을 기대하던 기존 테스트를 fail-closed 계약으로 수정해 재실행 통과 | 최종 통합 검증 |
 | R7 중앙 관측·제어 | 노드 상태/readiness/owner와 process·tmux 출력 API를 Ops 화면에 연결. Windows native child 출력·종료 테스트 및 desktop/mobile 브라우저 fixture 2개 통과 | 실제 remote 작업의 출력·취소 검증 |
 | R8 worker profile | 공통 바이너리의 `runtime_profile: worker`에서 gateway/voice/dashboard/admin/leader services 초기화 제외. 실행·복구·poller·owner control 유지. profile·route·health·worker registry 테스트 통과 | 두 장비 배포 후 기능 범위·자원 측정 |
-| R6 첨부파일 | 기존 bundle validator, bounded PG 저장, typed queue 참조, 실행 시 임시 파일 복원을 연결 중 | Rust/PG 검증, requeue·만료·복구·cleanup 및 실제 첨부 E2E |
-| R9 용량·분산 | 기존 selector와 실행 경계의 재사용 범위 검토 중 | 구현, PG 경쟁 테스트 및 여러 Worker 검증 |
+| R6 첨부파일 | 기존 bundle validator, bounded PG 저장, typed queue 참조, 실행 guard의 임시 파일 복원·정리 연결 완료. 저장/재시도/만료/identity/hash/큐 복구/OS lock 관련 테스트 통과 | 실제 노드 간 첨부 E2E 및 Mac 파일 잠금 검증 |
+| R9 용량·분산 | 공통 provider 호출의 slot 제한, outbox 예약과 renewable lease 통합, 사용률·배정 시각 기반 선택, PG 원자적 상한 구현. 동시 12개/slot 2개, 여러 worker 선택, 만료 취소·nonce fencing 테스트 통과 | 실제 여러 노드 부하·재시작 검증 |
 | 원격 접근 | Windows → Mac mini 공개키 SSH 및 원격 명령 실행 확인 | 배포·migration·leader/worker 전환은 별도 검증 |
+
+2026-09-22 로컬 작업 브랜치에 `origin/main` @ `3635585762dc9915f086433e545f88ca1302a5c5`를 병합했다. CI 기준 수정 PR #2119는 필수 검사 통과 후 main에 반영됐으며, 해당 이전 head의 장시간 추가 macOS 검사는 취소했다. 원래 소스 조사 baseline은 문서 상단 commit을 유지한다.
 
 패키징의 실행 방법과 게시 계약은 [공통 release 문서](../ci/release-packaging.md)를 따른다.
 원격 인증은 [인증 운영 문서](../operations/remote-dashboard-auth.md)를 따른다.
+첨부와 용량 계약은 [portable attachments](../operations/portable-attachments.md),
+[execution capacity](../operations/execution-capacity.md)에 정리했다.
+Windows worker의 DB는 검증된 SSH 연결을 재사용하는 로컬 터널로 준비한다. 운영 PostgreSQL을 LAN에 추가 공개하지 않는다.
 `--skip-dashboard`는 UI 제외로 일관되게 동작하며, 공개 Release는 dashboard를 포함한다.
 운영자 비밀값·로컬 설정·worktree는 artifact에 넣지 않는다. 배포 파일을 줄이기 위해
 제품 구조를 중복시키지 않고, 먼저 기존 role이 실제 실행 모듈을 제한하도록 구현한다.

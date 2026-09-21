@@ -41,3 +41,5 @@ orphan만 제거한다. 활성 실행, 다른 이름의 디렉터리, symlink와
 [저장](../../src/services/cluster/attachment_transfer/store.rs),
 [typed 참조](../../src/services/cluster/attachment_transfer/uploads.rs),
 [materialization](../../src/services/cluster/attachment_transfer/materialize.rs).
+
+2026-09-22 검증: Windows Rust library/test compile, 실제 PostgreSQL 저장·멱등성·identity/hash·만료·재시도·큐 복구·파일 복원과 정리 테스트를 통과했다. OS 파일 잠금 테스트도 Windows에서 통과했다. 실제 Discord 첨부의 LAN 전달과 Mac 잠금 검증은 아직 수행하지 않았다.
