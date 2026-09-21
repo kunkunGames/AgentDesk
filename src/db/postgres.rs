@@ -12,6 +12,7 @@ use sqlx::{PgConnection, PgPool, Row};
 
 use crate::config::{AgentChannel, AgentDef, Config};
 
+mod migration_compat;
 mod shared_config;
 pub(crate) use shared_config::shared_config_sync_enabled;
 pub use shared_config::{startup_reseed, startup_reseed_with_warmup_pool};
@@ -445,11 +446,7 @@ pub async fn connect_and_migrate(config: &Config) -> Result<Option<PgPool>, Stri
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
-    POSTGRES_MIGRATOR
-        .run(pool)
-        .await
-        .map_err(|error| format!("run postgres migrations: {error}"))?;
-    Ok(())
+    migration_compat::migrate(pool).await
 }
 
 async fn acquire_startup_advisory_lock(pool: &PgPool) -> Result<AdvisoryLockLease, String> {
@@ -1777,6 +1774,8 @@ pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
+    mod migration_compat_tests;
+
     use super::{
         AGENTDESK_REQUIRE_PG_ENV, AdvisoryLockLease, POSTGRES_MIGRATOR,
         STARTUP_PG_ACQUIRE_TIMEOUT_SECS, bootstrap_pool_settings, checksum_hex,
