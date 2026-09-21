@@ -114,7 +114,8 @@ pub(crate) struct Intervention {
     pub(crate) reply_context: Option<String>,
     pub(crate) has_reply_boundary: bool,
     pub(crate) merge_consecutive: bool,
-    pub(crate) pending_uploads: Vec<String>,
+    pub(crate) pending_uploads:
+        crate::services::cluster::attachment_transfer::uploads::PendingUploads,
     /// #2266: when a voice-transcript announcement loses the
     /// `mailbox_try_start_turn` race and is enqueued for later dispatch, the
     /// per-process `voice::announce_meta` store entry is consumed by the

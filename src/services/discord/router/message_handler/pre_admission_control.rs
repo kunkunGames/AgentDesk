@@ -108,7 +108,10 @@ pub(super) fn may_complete_locally(user_text: &str) -> bool {
 pub(super) async fn take_channel_input_state(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-) -> (Vec<String>, bool) {
+) -> (
+    crate::services::cluster::attachment_transfer::uploads::PendingUploads,
+    bool,
+) {
     let mut data = shared.core.lock().await;
     data.sessions
         .get_mut(&channel_id)
