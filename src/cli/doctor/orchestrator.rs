@@ -3857,13 +3857,13 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
         "Stale DB Files",
         format!("zero-byte stale DB file(s): {listed}"),
         format!(
-            "the canonical DB is {}; do not open guessed paths with sqlite3. Clean up stale files with agentdesk doctor --fix if necessary.",
+            "the canonical DB is {}; do not open guessed paths with sqlite3. Clean up stale files with agentdesk doctor --fix --repair-sqlite-cache if necessary.",
             canonical_db_path.display()
         ),
     )
     .with_path(runtime_root.display().to_string())
     .with_expected_actual("no zero-byte stale DB files", listed)
-    .with_next_steps(vec!["agentdesk doctor --fix".to_string()])
+    .with_next_steps(vec!["agentdesk doctor --fix --repair-sqlite-cache".to_string()])
 }
 
 fn check_github_repo_registry(cfg: &config::Config) -> Check {
