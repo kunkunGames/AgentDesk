@@ -24,6 +24,7 @@ import zipfile
 RUNTIME_ASSETS = (
     "policies", "routines", "skills", "scripts/launchd-migrated",
     "scripts/_defaults.sh", "scripts/queue-stability-batch.sh",
+    "scripts/install-windows-runtime-task.ps1", "scripts/agentdesk-dcserver.service",
     "defaults.json", "agentdesk.example.yaml", "LICENSE",
 )
 TARGETS = {
