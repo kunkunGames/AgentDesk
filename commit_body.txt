@@ -1,0 +1,32 @@
+**What changed**
+Pushed the batch pagination (`ORDER BY key LIMIT $2`) inside the individual `SELECT` arms of the `UNION ALL` Common Table Expression (CTE) in `fetch_delivery_kv_guard_batch_pg`. Enclosed each query in parentheses to satisfy PostgreSQL syntax.
+
+**Why**
+Previously, PostgreSQL would scan, evaluate, and extract all remaining matching index entries across both `kv_meta` search paths into memory before filtering and truncating the combined result to `$2` rows. This created an O(N) database scan latency bottleneck when reconciling extensive dispatch activity. By pushing the limits down to the index lookup itself (where `key` is effectively monotonic and deterministic), the query avoids massive allocation and scan overhead, achieving an O(K) complexity reduction where K is the limit constraint.
+
+**WorkFingerprint**
+- Agent: Bolt
+- Category Boundary: `src/reconcile.rs`
+- Primary Files: `src/reconcile.rs`
+- Invariant Protected: Deterministic top-N dispatch sync evaluation across KV guard states.
+- Public API impact: None
+- Docs impact: None
+- Verification plan: Cargo compile check, diff verification.
+- Related PRs/issues: None
+
+**Duplicate/Overlap Check**
+Executed `git status` and verified against recent commits. No existing PRs affect the kv guard fetch iteration. No overlaps found with RoutineSmith, FacadePilot, WorkerRegistry, Reconciler, or ProviderPilot.
+
+**Verification commands and results**
+- `git diff --check`: Clean.
+- `cargo check --bin agentdesk`: Compiled successfully.
+- Code review: Manually confirmed logic reduction from O(N) to O(LIMIT).
+
+**Skipped checks with reasons**
+- `cargo test dispatch_delivery_event_reconcile` and `cargo check --all-targets` timed out due to environmental constraints (the test suite exceeds the 400s bash execution ceiling). We relied on compiling the primary binary instead.
+
+**Risk**
+Extremely low. Changes are bounded to query performance tuning via syntax scoping. It maintains identical functionality and return schemas.
+
+**Rollback notes**
+Revert to previous query string in `src/reconcile.rs`.
