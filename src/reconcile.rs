@@ -338,7 +338,7 @@ pub(crate) async fn reconcile_boot_db_pg(
         });
 
     let stale_dispatch_reservations_cleared =
-        sqlx::query("DELETE FROM kv_meta WHERE key >= 'dispatch_reserving:' AND key < 'dispatch_reserving;'")
+        sqlx::query("DELETE FROM kv_meta WHERE starts_with(key, 'dispatch_reserving:')")
             .execute(pool)
             .await
             .map(|r| r.rows_affected() as usize)
@@ -537,7 +537,7 @@ async fn recover_expired_dispatch_reserving_pg(pool: &PgPool) -> Result<usize> {
     // delete to "typed reservation is also done" closes that window.
     sqlx::query(
         "DELETE FROM kv_meta m
-          WHERE m.key >= 'dispatch_reserving:' AND m.key < 'dispatch_reserving;'
+          WHERE starts_with(m.key, 'dispatch_reserving:')
             AND m.expires_at IS NOT NULL
             AND m.expires_at <= NOW()
             AND NOT EXISTS (
@@ -596,7 +596,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
         "WITH targets AS (
             SELECT SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
               FROM kv_meta m
-             WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
+             WHERE starts_with(m.key, 'dispatch_notified:')
         ),
         latest AS (
             SELECT DISTINCT ON (e.dispatch_id) e.id, e.dispatch_id, e.status, e.reserved_until
@@ -689,7 +689,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
            FROM (
                 SELECT SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
                   FROM kv_meta m
-                 WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
+                 WHERE starts_with(m.key, 'dispatch_notified:')
            ) targets
           WHERE EXISTS (
               SELECT 1 FROM task_dispatches td WHERE td.id = targets.dispatch_id
@@ -714,7 +714,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
     //    to re-send. Reclaim those keys so they stop pinning the mismatch scan.
     let pruned = sqlx::query(
         "DELETE FROM kv_meta m
-          WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
+          WHERE starts_with(m.key, 'dispatch_notified:')
             AND NOT EXISTS (
                 SELECT 1
                   FROM task_dispatches td
@@ -2477,6 +2477,21 @@ mod dispatch_delivery_reconcile_tests {
         };
         let pool = pg_db.connect_and_migrate().await;
 
+        // Prefix identity is byte-exact, independent of the operator's DB
+        // locale. Alphabetic collation orders ':' and ';' differently from C,
+        // so a range from 'prefix:' to 'prefix;' silently misses real guards.
+        sqlx::query("ALTER TABLE kv_meta ALTER COLUMN key TYPE TEXT COLLATE \"en-US-x-icu\"")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for key in [
+            "dispatchXreserving:unrelated",
+            "dispatch_reserving;unrelated",
+            "dispatchXnotified:unrelated",
+        ] {
+            insert_kv_with_expiry(&pool, key, "unrelated", -60).await;
+        }
+
         // Orphaned notified key with no typed event => missing_typed mismatch on
         // the first pass, then reclaimed so the backlog clears on the next pass.
         seed_dispatch(&pool, "dispatch-backlog-notified").await;
@@ -2514,6 +2529,16 @@ mod dispatch_delivery_reconcile_tests {
         assert_eq!(first.recovered_expired_reserving, 1);
         assert_eq!(first.recovered_orphan_notified, 1);
         assert_eq!(first.recovered_orphan_typed, 1);
+        for key in [
+            "dispatchXreserving:unrelated",
+            "dispatch_reserving;unrelated",
+            "dispatchXnotified:unrelated",
+        ] {
+            assert!(
+                kv_key_exists(&pool, key).await,
+                "recovery must preserve unrelated prefixes"
+            );
+        }
 
         let recovery_metrics = dispatch_delivery_event_recovery_metrics_snapshot();
         assert!(

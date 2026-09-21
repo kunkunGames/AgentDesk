@@ -802,13 +802,10 @@ impl CancelToken {
     }
 
     pub(crate) fn clear_child_pid_if_matches(&self, pid: u32) {
-        let mut child = self
-            .child_pid
-            .lock()
-            .unwrap_or_else(|poison| {
-                tracing::warn!("Recovered poisoned lock for CancelToken");
-                poison.into_inner()
-            });
+        let mut child = self.child_pid.lock().unwrap_or_else(|poison| {
+            tracing::warn!("Recovered poisoned lock for CancelToken");
+            poison.into_inner()
+        });
         if child.as_ref().is_some_and(|current| current.pid == pid) {
             *child = None;
         }
@@ -934,7 +931,6 @@ impl CancelToken {
             });
         self.set_cancel_source_kind_transactional(kind, |_| {});
     }
-
 
     pub(crate) fn publish_cancel(&self, source: impl Into<String>) {
         let _publication = self
