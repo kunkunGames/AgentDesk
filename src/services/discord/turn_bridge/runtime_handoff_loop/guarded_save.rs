@@ -380,7 +380,9 @@ mod tests {
                 channel,
                 "regression_uncommitted_baseline"
             ),
-            GuardedSaveOutcome::IdentityMismatch
+            // The episode still owns the row, but this uncommitted baseline
+            // conflicts with durable runtime authority; it is not a successor.
+            GuardedSaveOutcome::AuthorityPinned
         );
         assert_eq!(
             guarded_runtime_handoff_save(
