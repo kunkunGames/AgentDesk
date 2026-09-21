@@ -209,6 +209,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     );
     let base_capabilities = cluster_capabilities_with_worker_api(&config.cluster);
     super::readiness::spawn_probe(config.clone());
+    super::attachment_transfer::temporary::spawn_cleanup();
     crate::services::session_forwarding::probe::spawn(
         config.clone(),
         pool.clone(),
@@ -290,6 +291,9 @@ pub(crate) async fn run_leader_intake_retry_maintenance_once(
     retry: impl FnOnce() -> Option<(u32, u64)>,
 ) -> Result<Option<crate::db::intake_outbox::FailedPreAcceptSweepOutcome>, String> {
     mark_stale_worker_nodes_offline(pool, stale_threshold_secs, instance_id).await?;
+    super::attachment_transfer::store::cleanup(pool)
+        .await
+        .map_err(|e| format!("attachment cleanup: {e}"))?;
     let Some((max_attempts, retry_authorization_secs)) = retry() else {
         return Ok(None);
     };

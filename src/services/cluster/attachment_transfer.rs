@@ -4,6 +4,7 @@
 //! unblock) own all I/O, so nothing here has a production caller yet.
 
 pub(crate) mod store;
+pub(crate) mod temporary;
 pub(crate) mod uploads;
 
 use serde::{Deserialize, Serialize};
