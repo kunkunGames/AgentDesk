@@ -910,6 +910,9 @@ pub struct ClusterConfig {
     pub role: String,
     #[serde(default, skip_serializing_if = "RuntimeProfile::is_full")]
     pub runtime_profile: RuntimeProfile,
+    /// Maximum simultaneous provider turns on this node; restart to change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_slots: Option<u32>,
     #[serde(default = "default_cluster_heartbeat_interval_secs")]
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_cluster_lease_ttl_secs")]
@@ -970,6 +973,7 @@ impl Default for ClusterConfig {
             instance_id: None,
             role: default_cluster_role(),
             runtime_profile: RuntimeProfile::default(),
+            execution_slots: None,
             heartbeat_interval_secs: default_cluster_heartbeat_interval_secs(),
             lease_ttl_secs: default_cluster_lease_ttl_secs(),
             api_base_url: None,
@@ -1088,6 +1092,9 @@ fn is_default_dispatch_routing_wake_interval_secs(value: &u64) -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterIntakeRoutingConfig {
+    /// Automatically rank eligible bounded nodes by available execution slots.
+    #[serde(default)]
+    pub capacity_aware: bool,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "ClusterIntakeRoutingMode::is_default")]
@@ -1111,6 +1118,7 @@ pub struct ClusterIntakeRoutingConfig {
 impl Default for ClusterIntakeRoutingConfig {
     fn default() -> Self {
         Self {
+            capacity_aware: false,
             enabled: false,
             mode: ClusterIntakeRoutingMode::default(),
             owner_authority_channel_ids: Vec::new(),
@@ -3391,6 +3399,18 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
 
 pub(crate) fn validate_config(config: &Config) -> Result<()> {
     config.cluster.runtime_profile.validate(&config.cluster)?;
+    if let Some(slots) = config.cluster.execution_slots {
+        anyhow::ensure!(
+            config.cluster.enabled && (1..=1024).contains(&slots),
+            "execution_slots requires enabled cluster and a value from 1 to 1024"
+        );
+    }
+    if config.cluster.intake_routing.capacity_aware {
+        anyhow::ensure!(
+            config.cluster.enabled && config.cluster.intake_routing.enabled,
+            "capacity_aware requires cluster and intake routing"
+        );
+    }
     config.onboarding.warn_invalid_rules();
     validate_escalation_schedule(&config.escalation.schedule)?;
     validate_scheduled_message_required_mentions(

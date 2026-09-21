@@ -1008,6 +1008,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
 
     let prompt_owned = prompt.to_string();
     let provider_for_blocking = provider.clone();
+    let execution_pool = shared.pg_pool.clone();
     tokio::task::spawn_blocking(move || {
         let _upload_lifetime = materialized_uploads;
         let result = crate::services::platform::with_provider_execution_context(
@@ -1022,6 +1023,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                         );
                     super::provider_dispatch::execute(
                         super::provider_dispatch::StreamingTurn {
+                            pool: execution_pool.as_ref(),
                             provider: &provider_for_blocking,
                             prompt: &context_prompt,
                             session_id: session_id_clone.as_deref(),

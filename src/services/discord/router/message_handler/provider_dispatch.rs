@@ -13,6 +13,7 @@ use crate::services::stream_json_cli::{
 use crate::services::{claude, codex, gemini, opencode, qwen};
 
 pub(super) struct StreamingTurn<'a> {
+    pub pool: Option<&'a sqlx::PgPool>,
     pub provider: &'a ProviderKind,
     pub prompt: &'a str,
     pub session_id: Option<&'a str>,
@@ -38,6 +39,12 @@ pub(super) fn execute(
     turn: StreamingTurn<'_>,
     sender: Sender<StreamMessage>,
 ) -> Result<(), String> {
+    let _execution_guard = crate::services::cluster::execution_capacity::acquire(
+        turn.pool,
+        turn.provider.as_str(),
+        turn.channel_id,
+        Arc::clone(&turn.cancel),
+    )?;
     match turn.provider.legacy_streaming_dispatch_kind() {
         LegacyDispatchKind::Claude => claude::execute_command_streaming(
             turn.prompt,
@@ -165,6 +172,7 @@ mod tests {
         let provider = ProviderKind::from_str("agy").unwrap();
         let tools = vec!["Read".to_string()];
         let mut turn = StreamingTurn {
+            pool: None,
             provider: &provider,
             prompt: "question",
             session_id: Some("conversation"),
