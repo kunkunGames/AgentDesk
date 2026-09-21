@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 mod store;
+#[cfg(test)]
+mod tests;
 
 static LOCAL: OnceLock<(u32, Arc<Semaphore>)> = OnceLock::new();
 const LEASE_SECONDS: i64 = 30;

@@ -70,6 +70,7 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
             <p className="text-xs">{tr("중앙 제어", "Central control")}: {node.instance_id === nodes.data.cluster.local_instance_id ? tr("현재 노드", "Local node") : !controlReason ? tr("인증·노드 식별 확인", "Authentication and node identity verified") : node.forwarding_diagnostics?.configured ? tr("전달 연결 확인 필요", "Forwarding connection requires verification") : tr("전달 설정 필요", "Forwarding configuration required")}</p>
             {node.forwarding_diagnostics?.configured && controlReason === "unreachable" && <p className="text-xs text-amber-400">{node.forwarding_diagnostics.reachability_status}</p>}
             <p className="text-xs text-th-text-muted">{tr("전달 처리 중 dispatch", "Dispatch deliveries in progress")}: {node.active_dispatch_count ?? "—"}</p>
+            <p className="text-xs">{tr("실행 중", "Executing")}: {node.execution_active ?? "—"} · {tr("예약 포함 점유 / 용량", "Occupied including reservations / capacity")}: {node.execution_occupied ?? "—"} / {node.capabilities.execution_capacity?.slots ?? "—"}</p>
             {sessions.isError && <p className="text-xs text-amber-400">{tr("세션 소유권 갱신 실패", "Session ownership refresh failed")}</p>}
             {owned.slice(0, 20).map(session => <div key={session.id} className="border-t border-th-border pt-2 space-y-2">
               <p className="text-xs break-all">{session.name || session.session_key} · {session.provider} · {session.status}</p>

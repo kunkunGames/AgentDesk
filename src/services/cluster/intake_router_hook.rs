@@ -27,6 +27,8 @@ use sqlx::PgPool;
 #[cfg(test)]
 mod attachment_tests;
 #[cfg(test)]
+mod capacity_tests;
+#[cfg(test)]
 mod execution_requirement_tests;
 pub(crate) mod owner_record;
 mod session_owner;
@@ -530,6 +532,7 @@ async fn route_by_preferred_labels(
     ctx: &IntakeRouterContext<'_>,
     requirements: &ExecutionRequirements,
 ) -> IntakeRouterDecision {
+    let capacity_aware = super::execution_capacity::automatic_enabled();
     // Resolve agent + preference. NoAgentForChannel is NOT an error —
     // many channels (DMs, ad-hoc cross-bot) have no agent row.
     //
@@ -564,7 +567,7 @@ async fn route_by_preferred_labels(
             }
         };
 
-    if preferred_labels.is_empty() && requirements.is_empty() {
+    if preferred_labels.is_empty() && requirements.is_empty() && !capacity_aware {
         return apply_observe_mode(
             ctx.mode,
             IntakeRouterDecision::RanLocal {
@@ -575,14 +578,14 @@ async fn route_by_preferred_labels(
 
     let auth_profile =
         super::readiness::expected_auth_profile(ctx.provider, ctx.channel_id, &agent_id);
-    let candidates = match crate::services::cluster::node_registry::list_worker_nodes(
+    let mut candidates = match crate::services::cluster::node_registry::list_worker_nodes(
         pool,
         worker_heartbeat_lease_secs(),
     )
     .await
     {
         Ok(nodes) => {
-            let eligible_nodes: Vec<_> = nodes
+            let mut eligible_nodes: Vec<_> = nodes
                 .into_iter()
                 .filter(|node| {
                     crate::services::cluster::node_registry::node_supports_intake_request(
@@ -596,10 +599,13 @@ async fn route_by_preferred_labels(
                             || super::attachment_transfer::supports(node))
                 })
                 .collect();
+            if capacity_aware {
+                super::execution_capacity::rank(&mut eligible_nodes);
+            }
             candidates_from_worker_nodes_json(&eligible_nodes)
         }
         Err(error) => {
-            if !requirements.is_empty() {
+            if !requirements.is_empty() || capacity_aware {
                 return required_block(error);
             }
             return apply_observe_mode(
@@ -609,63 +615,76 @@ async fn route_by_preferred_labels(
         }
     };
 
-    let selection = if requirements.is_empty() {
-        pick_intake_target(&candidates, &preferred_labels, ctx.leader_instance_id)
-    } else {
-        super::intake_routing::pick_required_intake_target(
-            &candidates,
-            &preferred_labels,
-            ctx.leader_instance_id,
-        )
-    };
-    let target = match selection {
-        IntakeRouteTarget::Worker { instance_id } => instance_id,
-        IntakeRouteTarget::Local { reason } => {
-            if !requirements.is_empty() && reason == LocalRouteReason::NoEligibleWorker {
-                return required_block("no online worker satisfies the hard execution requirements; retry after a suitable worker is ready".into());
+    loop {
+        let selection = if requirements.is_empty() && !capacity_aware {
+            pick_intake_target(&candidates, &preferred_labels, ctx.leader_instance_id)
+        } else {
+            super::intake_routing::pick_required_intake_target(
+                &candidates,
+                &preferred_labels,
+                ctx.leader_instance_id,
+            )
+        };
+        let target = match selection {
+            IntakeRouteTarget::Worker { instance_id } => instance_id,
+            IntakeRouteTarget::Local { reason } => {
+                if (!requirements.is_empty() || capacity_aware)
+                    && reason == LocalRouteReason::NoEligibleWorker
+                {
+                    return required_block("no ready worker has capacity and satisfies the execution requirements; retry when capacity is available".into());
+                }
+                return apply_observe_mode(
+                    ctx.mode,
+                    IntakeRouterDecision::RanLocal {
+                        reason: match reason {
+                            LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
+                            LocalRouteReason::LeaderIsOnlyEligible => {
+                                RanLocalReason::LeaderIsOnlyEligible
+                            }
+                            LocalRouteReason::NoPreference => unreachable!(
+                                "pick_intake_target cannot return no-preference after non-empty preference gate"
+                            ),
+                        },
+                    },
+                );
             }
+        };
+
+        if ctx.has_nonportable_uploads {
             return apply_observe_mode(
                 ctx.mode,
-                IntakeRouterDecision::RanLocal {
-                    reason: match reason {
-                        LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
-                        LocalRouteReason::LeaderIsOnlyEligible => {
-                            RanLocalReason::LeaderIsOnlyEligible
-                        }
-                        LocalRouteReason::NoPreference => unreachable!(
-                            "pick_intake_target cannot return no-preference after non-empty preference gate"
-                        ),
+                IntakeRouterDecision::Blocked {
+                    reason: IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
+                        target_instance_id: target,
                     },
                 },
             );
         }
-    };
 
-    if ctx.has_nonportable_uploads {
-        return apply_observe_mode(
-            ctx.mode,
-            IntakeRouterDecision::Blocked {
-                reason: IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
-                    target_instance_id: target,
-                },
+        let decision = route_to_instance(
+            pool,
+            ctx,
+            &target,
+            if requirements.is_empty() && !capacity_aware {
+                &preferred_labels
+            } else {
+                &[]
             },
-        );
+            &agent_id,
+            ObserveTargetKind::PreferredLabels,
+            requirements,
+        )
+        .await;
+        if capacity_aware
+            && matches!(&decision, IntakeRouterDecision::Blocked {
+        reason: IntakeBlockedReason::RoutingDependencyFailed { detail }
+    } if detail == super::execution_capacity::EXHAUSTED)
+        {
+            candidates.retain(|candidate| candidate.instance_id != target);
+            continue;
+        }
+        return decision;
     }
-
-    route_to_instance(
-        pool,
-        ctx,
-        &target,
-        if requirements.is_empty() {
-            &preferred_labels
-        } else {
-            &[]
-        },
-        &agent_id,
-        ObserveTargetKind::PreferredLabels,
-        requirements,
-    )
-    .await
 }
 
 async fn route_node_override_without_owner(
@@ -1014,7 +1033,11 @@ async fn route_to_instance(
             }
             None => IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::RoutingDependencyFailed {
-                    detail: format!("insert_pending: {error}"),
+                    detail: if super::execution_capacity::is_exhausted(&error) {
+                        super::execution_capacity::EXHAUSTED.into()
+                    } else {
+                        format!("insert_pending: {error}")
+                    },
                 },
             },
         },
