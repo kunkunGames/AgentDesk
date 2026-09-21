@@ -8,6 +8,7 @@ import importlib.util
 import io
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -818,6 +819,7 @@ class ParserMutations(FixtureCase):
         )
         jobs = membership.parse_jobs(workflow, self.root)
         self.assertEqual([job.name for job in jobs], ["first", "second"])
+        self.assertEqual(jobs[0].key, ".github/workflows/extra.yaml:first")
         self.assertNotIn("second", jobs[0].text)
 
     def test_jobs_parser_variants_surface_rule4_by_set_equality(self) -> None:
@@ -1918,7 +1920,7 @@ class PgDbCiWiring(unittest.TestCase):
         _, banner, rest = self.script_checks.partition(self.PG_BANNER)
         self.assertTrue(banner, "the PG membership gate lost its banner")
         done = subprocess.run(
-            ["bash", "-euo", "pipefail", "-c", "banner() { :; }\n"
+            [shutil.which("bash") or "bash", "-euo", "pipefail", "-c", "banner() { :; }\n"
              f"py() {{ echo \"py $*\"; return {py_rc}; }}\n"
              f"git() {{ echo \"git $*\"; return {git_rc}; }}\n"
              "PYTHON=py TEST_LANE_BASELINE_REF=fixture-ref\n"
