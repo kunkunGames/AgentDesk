@@ -630,6 +630,21 @@
       "path": "migrations/postgres/0123_kakao_calendar_lease_expiry.sql",
       "sha256": "24bfe53ba58f870d67d19e69d57a4e96ce65eaa7411367d0bc93edaf8df6388f",
       "version": 123
+    },
+    {
+      "path": "migrations/postgres/0124_execution_requirements.sql",
+      "version": 124,
+      "sha256": "f6a3196c1814a69d580dac963f83f4abd7616941e678f933ac7e653cf14c9835"
+    },
+    {
+      "path": "migrations/postgres/0125_attachment_bundles.sql",
+      "version": 125,
+      "sha256": "b46cda7a34e49cca3c6de65f7107c2e05c863e25baafb81877acee009f35a9c0"
+    },
+    {
+      "path": "migrations/postgres/0126_execution_capacity.sql",
+      "version": 126,
+      "sha256": "454270eb193d7662599df8be3b93aa5e20016a33c1e3d7d4f439988112a63ae1"
     }
   ],
   "version": 1
