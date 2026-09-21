@@ -24,6 +24,8 @@ use crate::services::cluster::intake_routing::{
 };
 use sqlx::PgPool;
 
+#[cfg(test)]
+mod execution_requirement_tests;
 pub(crate) mod owner_record;
 mod session_owner;
 
