@@ -10,12 +10,15 @@ use super::super::{
 // Category: ops and integrations
 
 pub(crate) fn router(state: AppState) -> ApiRouter {
-    public_api_domain(
+    let router = public_api_domain(
         Router::new()
             .route("/health", get(health_api::health_handler))
             .route("/auth/session", get(auth::get_session)),
-    )
-    .merge(protected_api_domain(
+    );
+    if !state.config.cluster.runtime_profile.modules().dashboard {
+        return router;
+    }
+    router.merge(protected_api_domain(
         Router::new().route("/auth/ws-ticket", post(auth::issue_ws_ticket)),
         state,
     ))
