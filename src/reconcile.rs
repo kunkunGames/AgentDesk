@@ -338,7 +338,7 @@ pub(crate) async fn reconcile_boot_db_pg(
         });
 
     let stale_dispatch_reservations_cleared =
-        sqlx::query("DELETE FROM kv_meta WHERE key LIKE 'dispatch_reserving:%'")
+        sqlx::query("DELETE FROM kv_meta WHERE key >= 'dispatch_reserving:' AND key < 'dispatch_reserving;'")
             .execute(pool)
             .await
             .map(|r| r.rows_affected() as usize)
@@ -537,7 +537,7 @@ async fn recover_expired_dispatch_reserving_pg(pool: &PgPool) -> Result<usize> {
     // delete to "typed reservation is also done" closes that window.
     sqlx::query(
         "DELETE FROM kv_meta m
-          WHERE m.key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
+          WHERE m.key >= 'dispatch_reserving:' AND m.key < 'dispatch_reserving;'
             AND m.expires_at IS NOT NULL
             AND m.expires_at <= NOW()
             AND NOT EXISTS (
@@ -596,7 +596,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
         "WITH targets AS (
             SELECT SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
               FROM kv_meta m
-             WHERE m.key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
+             WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
         ),
         latest AS (
             SELECT DISTINCT ON (e.dispatch_id) e.id, e.dispatch_id, e.status, e.reserved_until
@@ -687,9 +687,9 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
                     'detail', 'reconciled from dispatch_notified delivery guard'
                 )
            FROM (
-               SELECT SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
-                 FROM kv_meta m
-                WHERE m.key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
+                SELECT SUBSTRING(m.key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id
+                  FROM kv_meta m
+                 WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
            ) targets
           WHERE EXISTS (
               SELECT 1 FROM task_dispatches td WHERE td.id = targets.dispatch_id
@@ -714,7 +714,7 @@ async fn recover_orphan_dispatch_notified_pg(pool: &PgPool) -> Result<usize> {
     //    to re-send. Reclaim those keys so they stop pinning the mismatch scan.
     let pruned = sqlx::query(
         "DELETE FROM kv_meta m
-          WHERE m.key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
+          WHERE m.key >= 'dispatch_notified:' AND m.key < 'dispatch_notified;'
             AND NOT EXISTS (
                 SELECT 1
                   FROM task_dispatches td
