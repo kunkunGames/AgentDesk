@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "a92b661c1ad04b5b1fc7d22e41af083229c77c6a",
+  "measured_at_sha": "e6c037517b1acfee5f0b9c704cac45102469abb4",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1179,7 +1179,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:7b70c9a6a3b3f8e2fea800fd805b942edcde9757eea3dc69c0a79837d574cb0b"
+      "fingerprint": "sha256:9ecc7d3b4e3f13b572fb507875f89f6c5458d6706a031188ba59b2b52ade1f6b"
     },
     {
       "root": "policies",
