@@ -939,13 +939,13 @@ async fn fetch_delivery_kv_guard_batch_pg(
                    'reserving' AS guard_kind
               FROM kv_meta
              WHERE key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) > $1
+               AND key > 'dispatch_reserving:' || $1
             UNION ALL
             SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id,
                    'notified' AS guard_kind
               FROM kv_meta
              WHERE key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
-               AND SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) > $1
+               AND key > 'dispatch_notified:' || $1
         ),
         grouped AS (
             SELECT dispatch_id,
