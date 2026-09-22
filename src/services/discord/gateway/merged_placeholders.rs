@@ -5,38 +5,22 @@ use super::super::{
 };
 use super::{ChannelId, MessageId};
 
-/// codex review P2 (#1332 follow-up): drain the `queued_placeholders` /
-/// `placeholder_controller` bookkeeping for every non-head source message id
-/// of a merged intervention. The dispatch path uses `intervention.message_id`
-/// (the merged tail) as the Active card, so the head id's mapping must be
-/// preserved here — only the *other* source ids leak. Returns the placeholder
-/// Discord message ids whose visible cards the caller should delete (kept as
-/// a return value to keep the helper independent of `serenity::Http` so the
-/// test harness can invoke it without a real Discord client).
-///
-/// #5035 (A4/A5): a non-head source id losing its mapping does not make the card
-/// unowned — a rollback can leave a *surviving* entry owning it, so each drained
-/// card is gated and only released ones come back, as teardown tokens.
+/// Preserve the active head mapping and drain other merged-source mappings.
+/// A surviving entry may still own a drained card after rollback; return teardown
+/// tokens only for cards released by the ownership gate. The caller deletes them.
 pub(in crate::services::discord) async fn drain_merged_queued_placeholders(
     shared: &SharedData,
     channel_id: ChannelId,
     head_message_id: MessageId,
     source_message_ids: &[MessageId],
 ) -> Vec<QueuedCardTeardown> {
-    // codex review round-4 P2 + round-5 P2: serialize the merged-source
-    // drain with every other `queued_placeholders` mutation on the same
-    // channel via the per-channel async persistence mutex. Otherwise an
-    // `insert_queued_placeholder` for the head id could race this drain and
-    // let the older snapshot overwrite the newer disk file, resurrecting
-    // non-head source mappings on restart. The lock is async so this helper
-    // can be safely awaited from both the live dispatch path and the
-    // restart-induced kickoff path (round-5 P2 finding 3) without blocking
-    // the runtime runner.
+    // Serialize map edits and persistence so an older snapshot cannot overwrite
+    // a concurrent head insertion and resurrect drained mappings on restart.
     let persist_lock = shared.queued_placeholders_persist_lock(channel_id);
     let _persist_guard = persist_lock.lock().await;
     let mut to_delete = Vec::new();
     let mut mutated = false;
-    // #5035: complete departing hint (head ∪ sources) — re-key ordering only.
+    // Include the head in the departing hint used for re-key ordering.
     let departing: Vec<MessageId> = std::iter::once(head_message_id)
         .chain(source_message_ids.iter().copied())
         .collect();
@@ -64,8 +48,7 @@ pub(in crate::services::discord) async fn drain_merged_queued_placeholders(
             }
         }
     }
-    // codex review round-3 P2: persist the write-through after the batch
-    // drain so a restart sees the same state as memory.
+    // Persist the batch before releasing the channel lock.
     if mutated {
         queued_placeholders_store::persist_channel_from_map(
             &shared.queued.queued_placeholders,

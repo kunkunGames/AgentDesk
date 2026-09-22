@@ -116,8 +116,14 @@ COMMIT;
 실행 조건의 `nodes` 목록을 함께 갱신한다. 다른 JSON 내용과 provider 세션 ID는 유지한다.
 실행 중인 lease/intake, 이미 있는 목적지 ID, 잘못된 ID 또는 실행 중인 Hub가 있으면
 중단하며 SQL 오류 시 transaction 전체가 되돌아간다. 반환값은 변경한 참조별 행 수다.
-각 장비 YAML의 `instance_id`도 같은 새 값으로 맞춘 뒤 시작한다. CLI 인증 파일,
-작업 폴더, provider 세션 파일을 다른 장비로 옮기는 함수는 아니다.
+각 장비 YAML의 `cluster.instance_id`도 같은 새 값으로 맞춘 뒤 시작한다.
+다른 장비에 저장된 `cluster.nodes.<기존 ID>` 키, `gateway_preferred_instance_id`,
+장비별 `blackout_windows` 키와 운영 설정의 장비 참조도 함께 확인한다. DB 함수는
+YAML을 수정하지 않는다. 특히 `cluster.nodes` 키를 남겨 두면 새 ID에 대한
+`trusted_forward_origin` 설정을 찾지 못해 원격 실행과 세션 제어가 차단된다.
+키를 옮길 때 기존 신뢰 주소와 허용 정책은 유지하고, 기동 후 노드 API의
+`forwarding_diagnostics.trust_validated`와 `reachability_verified`를 확인한다.
+CLI 인증 파일, 작업 폴더, provider 세션 파일을 다른 장비로 옮기는 함수는 아니다.
 
 ## 기존 설치를 새 이름으로 일괄 전환
 
