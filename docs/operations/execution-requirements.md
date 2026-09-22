@@ -1,5 +1,9 @@
 # 필수 실행 조건
 
+에이전트의 새 Discord 세션을 시작할 기본 장비는
+[기본 실행 노드](agent-execution-node.md)로 설정한다. 아래 필수 조건은 기존 owner에도
+적용되므로 장비의 기본값을 고르는 용도로 혼용하지 않는다.
+
 agent의 필수 조건은 PostgreSQL `agents.execution_requirements`가 소유한다.
 Worker의 로컬 YAML이나 선호 label로 덮어쓰지 않는다. 정책을 저장하는 보호 API는
 full 런타임의 `GET/PUT /api/agents/{id}/execution-requirements`이며 worker 프로파일에는

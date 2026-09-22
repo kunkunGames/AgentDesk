@@ -10,6 +10,11 @@
 
 ## 0. 구현 결정과 검증 기록
 
+**실기기 적용 현황은 [2026-09-22 배포·검증 보고서](../reports/heterogeneous-worker-rollout-2026-09-22.md)를
+우선한다.** 아래 표는 구현 단계에서 누적한 계획/검증 기록이며, 운영 배포 이후의 결과와
+남은 작업은 보고서에 구분한다. §1 이후의 소스 조사와 §10의 main 동기화 표는 최초 조사
+시점의 snapshot이다.
+
 실제 적용 대상은 **Mac mini leader + Windows worker**로 확정했다. worker 수는 N개이며
 macOS/Linux/Windows에 공통 등록·배정 계약을 적용한다. 별도 worker binary, 새로운 큐,
 새로운 DB를 제품 구조에 추가하지 않는다. 역할별 기능 시작 계획과 플랫폼 adapter를
@@ -44,7 +49,8 @@ Windows worker의 DB는 검증된 SSH 연결을 재사용하는 로컬 터널로
 운영 DB에 기록된 checksum과 일치한다. 현재 120/121번은 relay redelivery/campaigns다.
 따라서 일반 migration 실행 전에 정확한 과거 version/description/checksum을 확인하는
 이관 경로와 격리 DB 검증이 필요하다. checksum 검사를 끄거나 기존 데이터를 지우는 방식은
-사용하지 않는다. 운영 DB의 변경은 아직 수행하지 않았다.
+사용하지 않는다. 이후 격리 복원 rehearsal과 운영 schema 126 적용을 완료했으며,
+배포 보고서에 데이터 보존·rollback 경계를 기록했다.
 이관 구현과 검증 계약은 [PostgreSQL migration 번호 이관](../operations/postgres-migration-relocation.md)에 정리했다.
 
 **기존 main의 배포 선행 수정:** `#2117`의 dispatch guard 접두사 범위 비교가 ICU locale에서
@@ -669,9 +675,10 @@ DB lease/claim의 단일 소유권을 검증했다고 provider 실행과 외부 
 - 전체 이벤트 버스 교체나 자동 tmux 이동.
 - provider 원격 SSH 실행을 활성화하는 우회 경로. 현재 [remote_stub.rs](../../src/services/remote_stub.rs)와 [codex_remote_policy.rs](../../src/services/codex_remote_policy.rs)는 해당 실행을 지원하지 않는다. 기존 배포 스크립트의 SSH 사용과 구분한다.
 
-## 10. 로컬 저장소와 원격 main 동기화 확인
+## 10. 최초 조사 시점의 로컬 저장소와 원격 main 동기화 확인
 
-2026-09-22 확인 시 로컬은 kunkunGames/AgentDesk의 main과 동일한 소스 상태다.
+2026-09-22 최초 조사 시 로컬은 kunkunGames/AgentDesk의 main과 동일한 소스 상태였다.
+이 표는 구현 시작 전 snapshot이며 현재 구현 브랜치의 상태를 뜻하지 않는다.
 
 | 확인 항목 | 결과 |
 | --- | --- |
@@ -689,7 +696,10 @@ DB lease/claim의 단일 소유권을 검증했다고 provider 실행과 외부 
 
 조사 중 작업 트리에는 새 검토 문서와 기존 미추적 docs/kunkun-to-itismyfield-candidates.md가 있다. 이는 source HEAD 동기화와 구분한다. 설치된 release 실행 파일이나 실행 중 서비스 버전이 이 commit과 같은지는 확인하지 않았다.
 
-## 11. 조사와 검증의 한계
+## 11. 최초 정적 조사의 검증 범위
+
+아래 항목은 최초 조사 당시에 한정한다. 이후 수행한 구현·배포·migration·실기기 검증은
+§0과 연결된 배포 보고서를 따른다.
 
 - 로컬 HEAD와 Git 원격 main이 동일한 위 commit임을 확인했다.
 - 이 문서의 현재 동작은 코드와 호출부를 추적한 정적 조사 결과다. API 응답·권한·설정 쓰기 경로의 실제 운영 재현을 주장하지 않는다.

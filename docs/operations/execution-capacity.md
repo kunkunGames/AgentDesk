@@ -1,6 +1,9 @@
 # Worker 실행 용량과 자동 배정
 
-구현과 PostgreSQL 경쟁·만료·취소·nonce 검증을 완료했으며 아직 운영 노드에 적용하지 않았다. 같은 바이너리에서 node별
+구현과 PostgreSQL 경쟁·만료·취소·nonce 검증을 완료했고 Mac mini/Windows 운영 노드에
+각 2개 slot을 적용했다. 실제 Discord 검증 중에는 자동 배정을 비활성화한다.
+[실기기 적용 기록](../reports/heterogeneous-worker-rollout-2026-09-22.md)과 구분해 아래 예제는
+자동 배정을 활성화하는 설정을 보여준다. 같은 바이너리에서 node별
 slot 수와 자동 배정 여부를 설정한다. 별도 scheduler 서비스나 역할별 프로그램은 없다.
 
 ```yaml
