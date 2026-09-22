@@ -1541,7 +1541,7 @@ pub fn cmd_health(json_output: bool) -> Result<(), String> {
         .get("instance_id")
         .and_then(Value::as_str)
         .unwrap_or("-");
-    let role = node_role_name(local);
+    let role = node_role_name(&local);
     let active_dispatches = local
         .get("active_dispatch_count")
         .and_then(Value::as_i64)
