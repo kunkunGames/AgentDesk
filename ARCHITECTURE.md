@@ -21,6 +21,8 @@ This block is generated from the filesystem and is checked in CI for drift.
 ```text
 src/
 ├── cli/
+│   ├── args/
+│   │   └── parsing.rs
 │   ├── client/
 │   │   └── runtime_config.rs
 │   ├── doctor/
@@ -71,6 +73,7 @@ src/
 │   ├── test_env/
 │   │   └── teardown_probe.rs
 │   ├── agent_channels.rs
+│   ├── runtime_profile.rs
 │   └── test_env.rs
 ├── db/
 │   ├── auto_queue/
@@ -124,6 +127,11 @@ src/
 │   │   ├── metadata.rs
 │   │   ├── mod.rs
 │   │   └── transitions.rs
+│   ├── postgres/
+│   │   ├── tests/
+│   │   │   └── migration_compat_tests.rs
+│   │   ├── migration_compat.rs
+│   │   └── shared_config.rs
 │   ├── prompt_manifests/
 │   │   ├── builder.rs
 │   │   ├── mod.rs
@@ -245,8 +253,11 @@ src/
 │   ├── mod.rs
 │   ├── paths.rs
 │   ├── skill_refresh.rs
-│   └── skill_sync.rs
+│   ├── skill_sync.rs
+│   └── windows_links.rs
 ├── server/
+│   ├── dashboard_auth/
+│   │   └── tests.rs
 │   ├── dto/
 │   │   ├── agents.rs
 │   │   ├── analytics.rs
@@ -271,6 +282,7 @@ src/
 │   │   ├── docs/
 │   │   │   ├── inventory/
 │   │   │   │   └── endpoints/
+│   │   │   │       ├── cluster_execution.rs
 │   │   │   │       ├── kakao_calendar.rs
 │   │   │   │       ├── mod.rs
 │   │   │   │       ├── part_01.rs
@@ -297,7 +309,8 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── onboarding.rs
 │   │   │   ├── ops.rs
-│   │   │   └── reviews.rs
+│   │   │   ├── reviews.rs
+│   │   │   └── runtime.rs
 │   │   ├── health_api/
 │   │   │   └── public_projection.rs
 │   │   ├── review_verdict/
@@ -343,6 +356,7 @@ src/
 │   │   ├── docs.rs
 │   │   ├── e2e_control.rs
 │   │   ├── escalation.rs
+│   │   ├── execution_requirements.rs
 │   │   ├── github.rs
 │   │   ├── github_dashboard.rs
 │   │   ├── health_api.rs
@@ -371,6 +385,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
+│   │   ├── runtime_profile_tests.rs
 │   │   ├── scheduled_messages.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
@@ -389,6 +404,7 @@ src/
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
+│   ├── dashboard_auth.rs
 │   ├── dashboard_provision.rs
 │   ├── database_fixture_invariant_tests.rs
 │   ├── issue_specs.rs
@@ -529,13 +545,30 @@ src/
 │   │   └── tui_relay.rs
 │   ├── cluster/
 │   │   ├── attachment_transfer/
+│   │   │   ├── materialize.rs
+│   │   │   ├── storage_tests.rs
+│   │   │   ├── store.rs
+│   │   │   ├── temporary.rs
+│   │   │   ├── tests.rs
+│   │   │   └── uploads.rs
+│   │   ├── execution_capacity/
+│   │   │   ├── store.rs
+│   │   │   └── tests.rs
+│   │   ├── execution_requirements/
 │   │   │   └── tests.rs
 │   │   ├── intake_router_hook/
+│   │   │   ├── agent_execution_node_tests.rs
+│   │   │   ├── attachment_tests.rs
+│   │   │   ├── capacity_tests.rs
+│   │   │   ├── execution_requirement_tests.rs
+│   │   │   ├── model.rs
 │   │   │   ├── owner_record.rs
 │   │   │   └── session_owner.rs
 │   │   ├── intake_worker/
 │   │   │   ├── dispatch_stamp_tests.rs
 │   │   │   └── drain_tests.rs
+│   │   ├── readiness/
+│   │   │   └── tests.rs
 │   │   ├── stream_relay/
 │   │   │   ├── tests/
 │   │   │   │   └── shutdown_tests.rs
@@ -543,8 +576,11 @@ src/
 │   │   │   ├── identity.rs
 │   │   │   ├── shutdown.rs
 │   │   │   └── terminal_resolution.rs
+│   │   ├── agent_execution_node.rs
 │   │   ├── attachment_transfer.rs
 │   │   ├── capability_routing.rs
+│   │   ├── execution_capacity.rs
+│   │   ├── execution_requirements.rs
 │   │   ├── intake_preflight.rs
 │   │   ├── intake_router_hook.rs
 │   │   ├── intake_routing.rs
@@ -554,6 +590,7 @@ src/
 │   │   ├── intake_worker_capabilities.rs
 │   │   ├── mod.rs
 │   │   ├── node_registry.rs
+│   │   ├── readiness.rs
 │   │   ├── registry_adapter_sink.rs
 │   │   ├── relay_producer_registry.rs
 │   │   ├── session_discovery.rs
@@ -902,6 +939,7 @@ src/
 │   │   │   ├── intake_dispatch/
 │   │   │   │   ├── attachment.rs
 │   │   │   │   ├── notice.rs
+│   │   │   │   ├── policy_channel.rs
 │   │   │   │   ├── queued.rs
 │   │   │   │   ├── skill.rs
 │   │   │   │   └── tests.rs
@@ -1526,6 +1564,7 @@ src/
 │   │   └── auth_profiles.rs
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
+│   │   ├── output.rs
 │   │   └── tmux_cleanup.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery/
@@ -1607,14 +1646,17 @@ src/
 │   │   └── streaming_entry.rs
 │   ├── platform/
 │   │   ├── binary_resolver/
-│   │   │   └── grok.rs
+│   │   │   ├── grok.rs
+│   │   │   └── windows_codex.rs
 │   │   ├── tmux/
 │   │   │   └── availability.rs
 │   │   ├── binary_resolver.rs
 │   │   ├── dump_tool.rs
 │   │   ├── mod.rs
+│   │   ├── network.rs
 │   │   ├── shell.rs
-│   │   └── tmux.rs
+│   │   ├── tmux.rs
+│   │   └── windows_job.rs
 │   ├── process/
 │   │   ├── stream_child/
 │   │   │   ├── stream_queue/
@@ -1696,9 +1738,13 @@ src/
 │   │   └── timing.rs
 │   ├── session_backend/
 │   │   ├── auth_profiles.rs
+│   │   ├── output.rs
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
 │   ├── session_forwarding/
+│   │   ├── probe/
+│   │   │   └── tests.rs
+│   │   ├── probe.rs
 │   │   └── trusted_target.rs
 │   ├── settings/
 │   │   └── runtime_config_put.rs
