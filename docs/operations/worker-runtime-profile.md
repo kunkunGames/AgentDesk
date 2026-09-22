@@ -69,3 +69,9 @@ Claude/Codex/Qwen wrapper CLI는 모든 플랫폼에서 공통 pipe 경로로 �
 제외하면 안 된다. FIFO 입력은 Unix에서만 노출하고 Windows 기본 입력은 pipe다.
 Release matrix는 `verify_worker_wrappers.py`로 실제 native 바이너리의 세 wrapper가
 pipe 진입점까지 도달하는지 확인한다. CLI 설치 확인과 실제 계정 응답 검증은 별도다.
+
+Windows PATH에서 찾은 표준 npm Codex shim은 같은 npm 설치의 CPU에 맞는
+`codex.exe`로 해석한다. `.cmd`를 거치면 Windows shell의 명령행 길이 제한 때문에
+역할 prompt가 긴 요청이 실행 전에 실패한다. 다른 패키지·custom launcher는 바꾸지
+않으며 명시적인 registry/env 경로는 운영자 선택을 유지한다. macOS/Linux 해석은
+기존 경로를 유지한다.

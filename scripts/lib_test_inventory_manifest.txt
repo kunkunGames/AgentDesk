@@ -8048,6 +8048,8 @@ services::platform::binary_resolver::tests::generic_seam_seals_claude_while_seal
 services::platform::binary_resolver::tests::parses_codex_cli_semver_from_version_output
 services::platform::binary_resolver::tests::resolve_provider_binary_redacts_claude_paths_in_attempts
 services::platform::binary_resolver::tests::scrub_seals_only_claude_paths
+services::platform::binary_resolver::windows_codex::tests::preserves_unknown_custom_missing_and_mismatched_launchers
+services::platform::binary_resolver::windows_codex::tests::resolves_same_install_native_binary_and_preserves_architecture
 services::platform::network::tests::api_listener_is_not_inheritable_by_provider_processes
 services::platform::tmux::availability::availability_cache_tests::consecutive_probe_failures_demote_after_threshold
 services::platform::tmux::availability::availability_cache_tests::live_session_proof_marks_cache_available
