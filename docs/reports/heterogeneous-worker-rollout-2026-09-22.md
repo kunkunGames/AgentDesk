@@ -13,6 +13,10 @@
 기본 실행을 검증했다. 두 노드는 healthy·fully recovered이며 검증 자원을 정리했다.
 Mac의 부가 표시와 idle 세션 강제 종료에서 확인한 제한도 아래에 기록한다.
 
+이후 16:11 KST에 같은 설치본으로 새 Discord 입력을 보내 Windows 실행·DB 기록·
+첨부·후속 대화·취소를 다시 검증했다. 결과는
+[Discord ↔ Windows worker 송수신·DB 재검증](discord-windows-worker-roundtrip-2026-09-22.md)에 기록했다.
+
 ## 결정과 ROI
 
 현재의 신뢰하는 소규모 장비 집합에서는 **하나의 AgentDesk 코드와 OS별 공통 artifact에
