@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getClusterNodes, getNodeSessions, getNodeSessionOutput, nodeControlUnavailable, stopNodeSession, type NodeSession } from "../../api/clusterNodes";
 import { StatusBadge } from "../common/StatusBadge";
 import { FreshnessIndicator } from "../common/FreshnessIndicator";
+import { nodePlatformLabel, nodeRoleLabel, runtimeModeLabel } from "../../lib/nodeLabels";
 
 const reasons: Record<string, [string, string]> = {
   node_offline: ["노드 오프라인", "Node offline"],
@@ -25,7 +26,7 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1_000); return () => window.clearInterval(timer); }, []);
   const stale = nodes.isError || !nodes.dataUpdatedAt || now - nodes.dataUpdatedAt > 15_000;
   const selectedNode = nodes.data?.nodes.find(node => node.instance_id === selected?.instance_id);
-  const canControlSelected = selectedNode && !nodeControlUnavailable(selectedNode, nodes.data?.cluster.local_instance_id, stale);
+  const canControlSelected = nodes.data?.cluster.enabled && selectedNode && !nodeControlUnavailable(selectedNode, nodes.data.cluster.local_instance_id, stale);
   const output = useQuery({
     queryKey: ["cluster-session-output", selected?.id],
     queryFn: ({ signal }) => getNodeSessionOutput(selected!.id, signal),
@@ -36,19 +37,19 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
     void queryClient.invalidateQueries({ queryKey: ["cluster-node-sessions"] });
   } });
 
-  return <section className="card mb-5 min-w-0" aria-label={tr("클러스터 노드", "Cluster nodes")} data-testid="cluster-nodes-panel">
+  return <section className="card mb-5 min-w-0" aria-label={tr("실행 장비", "Execution devices")} data-testid="cluster-nodes-panel">
     <div className="card-head flex flex-wrap items-center justify-between gap-3">
-      <div><h2 className="card-title">{tr("클러스터 노드", "Cluster nodes")}</h2>
-        <p className="mt-1 text-xs text-th-text-muted">{tr("노드 연결과 실행 준비 상태를 따로 확인합니다. 5초마다 갱신합니다.", "Connectivity and execution readiness are separate. Refreshes every 5 seconds.")}</p></div>
+      <div><h2 className="card-title">{tr("실행 장비", "Execution devices")}</h2>
+        <p className="mt-1 text-xs text-th-text-muted">{tr("장비 연결과 실행 준비 상태를 따로 확인합니다. 5초마다 갱신합니다.", "Connectivity and execution readiness are separate. Refreshes every 5 seconds.")}</p></div>
       <FreshnessIndicator timestamp={nodes.dataUpdatedAt || null} staleAfterSeconds={15} criticalAfterSeconds={30} compact />
     </div>
     <div className="card-body space-y-3 min-w-0">
       {nodes.isPending && <p>{tr("노드 불러오는 중…", "Loading nodes…")}</p>}
       {nodes.isError && <p role="alert" className="text-amber-400">{tr("노드 갱신 실패. 마지막 정보를 표시하며 제어를 잠시 중단합니다.", "Node refresh failed. Showing the last snapshot; controls are disabled.")}</p>}
-      {nodes.data && !nodes.data.cluster.enabled && <p className="text-th-text-muted">{tr("단일 노드로 실행 중입니다.", "Running as a single node.")}</p>}
+      {nodes.data && !nodes.data.cluster.enabled && <p className="text-th-text-muted">{tr("이 컴퓨터 · 단독 운영", "This computer · Standalone")}</p>}
       {nodes.data?.cluster.enabled && nodes.data.nodes.length === 0 && <p>{tr("등록된 노드가 없습니다.", "No registered nodes.")}</p>}
       <div className="grid gap-3 md:grid-cols-2">
-        {nodes.data?.nodes.map(node => {
+        {nodes.data?.cluster.enabled && nodes.data.nodes.map(node => {
           const probe = node.capabilities.execution_readiness;
           const reports = Object.entries(node.execution_readiness?.providers ?? {});
           const expired = !probe || probe.expires_at_ms <= now || stale;
@@ -58,10 +59,12 @@ export default function ClusterNodesPanel({ isKo }: { isKo: boolean }) {
           const owned = sessions.data?.sessions.filter(s => s.instance_id === node.instance_id) ?? [];
           return <article key={node.instance_id} className="rounded-lg border border-th-border p-3 min-w-0 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <h3 className="font-semibold break-all">{node.instance_id}</h3>
+              <h3 className="font-semibold break-all">{node.hostname || node.instance_id}</h3>
               <StatusBadge tone={!stale && node.status === "online" ? "healthy" : "warning"}>{stale ? "STALE" : node.status ?? "unknown"}</StatusBadge>
             </div>
-            <p className="text-xs text-th-text-muted">{node.effective_role ?? "unknown"} · {probe ? `${probe.os} / ${probe.arch} · ${probe.runtime_profile}` : tr("실행 정보 대기", "Awaiting execution evidence")}</p>
+            {node.hostname && node.hostname !== node.instance_id && <p className="text-xs text-th-text-muted break-all">{node.instance_id}</p>}
+            <p className="text-xs text-th-text-muted">{tr("현재 역할", "Current role")}: {nodeRoleLabel(node.effective_role, tr)} · {tr("기능 모드", "Feature mode")}: {runtimeModeLabel(probe?.runtime_profile, tr)}</p>
+            <p className="text-xs text-th-text-muted">{probe ? `${nodePlatformLabel(probe.os, tr)} / ${probe.arch}` : tr("실행 정보 대기", "Awaiting execution evidence")}</p>
             <p className="text-xs">{tr("지원 backend", "Available backends")}: {probe?.backends.join(", ") || "—"}</p>
             {reports.length === 0 && <p className="text-xs text-amber-400">{tr("Provider 준비 상태 미확인", "Provider readiness unknown")}</p>}
             {reports.map(([provider, report]) => <div key={provider} className="text-xs flex flex-wrap gap-2 items-center">

@@ -1,12 +1,12 @@
 # 필수 실행 조건
 
 에이전트의 새 Discord 세션을 시작할 기본 장비는
-[기본 실행 노드](agent-execution-node.md)로 설정한다. 아래 필수 조건은 기존 owner에도
+[우선 실행 장비](agent-execution-node.md)로 설정한다. 아래 필수 조건은 기존 owner에도
 적용되므로 장비의 기본값을 고르는 용도로 혼용하지 않는다.
 
 agent의 필수 조건은 PostgreSQL `agents.execution_requirements`가 소유한다.
-Worker의 로컬 YAML이나 선호 label로 덮어쓰지 않는다. 정책을 저장하는 보호 API는
-full 런타임의 `GET/PUT /api/agents/{id}/execution-requirements`이며 worker 프로파일에는
+실행 노드의 로컬 YAML이나 선호 label로 덮어쓰지 않는다. 정책을 저장하는 보호 API는
+전체 기능 모드(`full`)의 `GET/PUT /api/agents/{id}/execution-requirements`이며 실행 전용 모드에는
 관리 route를 제공하지 않는다. PUT 본문은 아래와 같은 조건 객체이고 `{}`는 조건 해제다.
 
 ```json
@@ -42,8 +42,8 @@ provider 인증 프로파일은 기존 channel → agent → primary/default 선
 필수 조건과 맞지 않으면 거절하며 같은 세션을 다른 OS에 생성하지 않는다. 선호 label은
 필수 조건을 통과한 후보 사이에서 사용하고, 필수 조건이 없는 기존 동작은 유지한다.
 
-배정 시 조건을 `intake_outbox.execution_requirements`에 저장한다. Worker는 수락 전에
-현재 로컬 probe와 실제 provider 프로파일을 다시 검사한다. 오래된 Worker는
+배정 시 조건을 `intake_outbox.execution_requirements`에 저장한다. 실행 노드는 수락 전에
+현재 로컬 probe와 실제 provider 프로파일을 다시 검사한다. 오래된 실행 노드는
 `execution_requirements_v1` 소비 능력을 광고하지 않으므로 필수 조건 작업을 받지 않는다.
 자동 pre-accept 복구와 운영자 재시도 모두 원본 조건을 복사한다. 중앙 정책을 변경해도
 이미 저장된 요청의 조건은 바뀌지 않는다. 정책 변경을 과거 요청에 적용하려면 기존

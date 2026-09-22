@@ -3,6 +3,7 @@ import { getAgentExecutionNode, setAgentExecutionNode } from "../../api/agentExe
 import { getClusterNodes, type ClusterNode } from "../../api/clusterNodes";
 import { SurfaceActionButton, SurfaceNotice, SurfaceSubsection } from "../common/SurfacePrimitives";
 import type { Translator } from "./types";
+import { nodePlatformLabel, nodeRoleLabel } from "../../lib/nodeLabels";
 
 export function AgentExecutionNodeSelect({ agentId, provider, tr, onSaved }: {
   agentId: string; provider: string; tr: Translator; onSaved?: () => void;
@@ -57,19 +58,19 @@ export function AgentExecutionNodeSelect({ agentId, provider, tr, onSaved }: {
   const readiness = node?.execution_readiness?.providers[provider];
   const unavailable = selected !== "" && (!node || node.status !== "online" || !readiness?.eligible);
 
-  return <SurfaceSubsection title={tr("Discord 기본 실행 노드", "Default Discord execution node")}
-    description={tr("이 에이전트의 새 세션을 우선 시작할 장비를 선택합니다.", "Choose the preferred device for this agent's new sessions.")}
+  return <SurfaceSubsection title={tr("우선 실행 장비", "Preferred execution device")}
+    description={tr("Discord에서 이 에이전트의 새 세션을 우선 시작할 장비를 선택합니다.", "Choose the preferred device for this agent's new Discord sessions.")}
     className="md:col-span-2">
-    <label htmlFor={id} className="mb-1 block text-xs">{tr("실행 장비", "Execution device")}</label>
+    <label htmlFor={id} className="mb-1 block text-xs">{tr("우선 실행 장비", "Preferred execution device")}</label>
     <div className="flex flex-wrap items-center gap-2">
       <select id={id} value={selected} disabled={!ready || loading || saving}
         className="min-w-0 flex-1 rounded border px-2 py-2 text-sm"
         style={{ background: "var(--th-bg-surface)", borderColor: "var(--th-border)", color: "var(--th-text-primary)" }}
         onChange={(event) => { setSelected(event.target.value); setSuccess(false); }}>
-        <option value="">{tr("기본 배정 정책 사용", "Use default placement policy")}</option>
+        <option value="">{tr("기본 정책 사용", "Use default policy")}</option>
         {selected && !node && <option value={selected}>{selected} — {tr("등록 정보 없음", "Not registered")}</option>}
         {nodes.map((entry) => <option key={entry.instance_id} value={entry.instance_id} disabled={!enforced}>
-          {entry.hostname || entry.instance_id} · {entry.effective_role || "unknown"} · {entry.capabilities.execution_readiness?.os || "unknown"}
+          {entry.hostname || entry.instance_id} · {nodeRoleLabel(entry.effective_role, tr)} · {nodePlatformLabel(entry.capabilities.execution_readiness?.os, tr)}
           {entry.status !== "online" ? ` · ${tr("오프라인", "Offline")}` : ""}
         </option>)}
       </select>

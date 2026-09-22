@@ -10,6 +10,8 @@ mod agent_channels;
 pub use agent_channels::AgentChannels;
 mod runtime_profile;
 pub use runtime_profile::RuntimeProfile;
+mod cluster_role;
+pub use cluster_role::ClusterRole;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -906,8 +908,8 @@ pub struct ClusterConfig {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
-    #[serde(default = "default_cluster_role")]
-    pub role: String,
+    #[serde(default)]
+    pub role: ClusterRole,
     #[serde(default, skip_serializing_if = "RuntimeProfile::is_full")]
     pub runtime_profile: RuntimeProfile,
     /// Maximum simultaneous provider turns on this node; restart to change.
@@ -971,7 +973,7 @@ impl Default for ClusterConfig {
         Self {
             enabled: false,
             instance_id: None,
-            role: default_cluster_role(),
+            role: ClusterRole::default(),
             runtime_profile: RuntimeProfile::default(),
             execution_slots: None,
             heartbeat_interval_secs: default_cluster_heartbeat_interval_secs(),
@@ -2913,9 +2915,6 @@ fn default_database_foreground_reserve() -> u32 {
     // background behaviour is unchanged. `0` disables the backpressure
     // (behaviour-preserving).
     6
-}
-fn default_cluster_role() -> String {
-    "auto".into()
 }
 fn default_cluster_heartbeat_interval_secs() -> u64 {
     10

@@ -30,7 +30,7 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
     let engine = PolicyEngine::new_with_pg(&config, None).unwrap();
     for profile in [
         crate::config::RuntimeProfile::Full,
-        crate::config::RuntimeProfile::Worker,
+        crate::config::RuntimeProfile::Runner,
     ] {
         config.cluster.runtime_profile = profile;
         let state = AppState {
@@ -78,7 +78,7 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("POST", "/provider-auth-profiles/codex/login-start"),
             ("POST", "/auth/ws-ticket"),
         ] {
-            let is_worker = profile == crate::config::RuntimeProfile::Worker;
+            let is_worker = profile == crate::config::RuntimeProfile::Runner;
             let response = app
                 .clone()
                 .oneshot(request(method, path, is_worker))

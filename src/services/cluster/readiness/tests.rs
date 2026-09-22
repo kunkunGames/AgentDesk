@@ -5,7 +5,7 @@ fn node() -> Value {
         "intake_poller":{"codex":1_000_000},
         "execution_readiness": ExecutionProbe {
             schema:1, boot_id:"boot-a".into(), observed_at_ms:1_000_000, expires_at_ms:1_120_000,
-            os:"windows".into(), arch:"x86_64".into(), runtime_profile:crate::config::RuntimeProfile::Worker,
+            os:"windows".into(), arch:"x86_64".into(), runtime_profile:crate::config::RuntimeProfile::Runner,
             release:json!({}), providers:BTreeMap::from([("codex".into(),ProviderEvidence {
                 cli_usable:true,version:Some("1.0".into()),failure:None,
                 credential_profiles:BTreeMap::from([("default".into(),true)]),
@@ -13,6 +13,38 @@ fn node() -> Value {
             })]), tools:BTreeMap::new(),repositories:BTreeMap::new(),backends:vec!["process".into()],disk_free_bytes:None,
         }
     }})
+}
+
+#[test]
+fn runner_probes_remain_readable_during_a_mixed_version_rollout() {
+    let published = node();
+    assert_eq!(
+        published["capabilities"]["execution_readiness"]["runtime_profile"],
+        "worker"
+    );
+    // Match the previous binary's enum: it has no knowledge of `runner`.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyProfile {
+        Full,
+        Worker,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyProbe {
+        runtime_profile: LegacyProfile,
+    }
+    let old: LegacyProbe =
+        serde_json::from_value(published["capabilities"]["execution_readiness"].clone()).unwrap();
+    assert!(matches!(old.runtime_profile, LegacyProfile::Worker));
+    for profile in ["worker", "runner"] {
+        let mut candidate = published.clone();
+        candidate["capabilities"]["execution_readiness"]["runtime_profile"] = json!(profile);
+        assert_eq!(
+            evidence(&candidate, 1_000_100).unwrap().runtime_profile,
+            crate::config::RuntimeProfile::Runner
+        );
+        assert!(evaluate(&candidate, "codex", "default", 1_000_100).eligible);
+    }
 }
 
 #[test]

@@ -1746,7 +1746,7 @@ fn apply_db_import(
 ) -> Result<String, String> {
     if !db::postgres::shared_config_sync_enabled(config) {
         return Err(format!(
-            "OpenClaw --write-db imports run the destructive config-to-DB agent roster sync; run this command only on a single-node deployment or the configured cluster leader (cluster.role={}).",
+            "OpenClaw --write-db imports run the destructive config-to-DB agent roster sync; run this command only on a single-node deployment or the configured cluster hub (cluster.role={}).",
             config.cluster.role
         ));
     }

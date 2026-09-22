@@ -2,7 +2,7 @@
 //! Workers validate the shared baseline without applying their local YAML.
 
 use super::{connect_for_startup, register_repo, sync_agents_from_config_pg};
-use crate::config::Config;
+use crate::config::{ClusterRole, Config};
 use crate::services::settings::{KvSeedAction, config_default_seed_actions};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -20,7 +20,7 @@ pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String
         if !initialized {
             return Err(
                 "shared configuration is not initialized; start a node configured as \
-                 cluster.role=leader before starting worker/auto nodes (missing server_port \
+                 cluster.role=hub before starting runner/auto nodes (missing server_port \
                  or runtime-config); this node will not seed the shared database"
                     .to_string(),
             );
@@ -78,12 +78,12 @@ pub async fn startup_reseed_with_warmup_pool(
 
 /// Whether this node owns synchronization of YAML into shared configuration.
 /// True for single-node deployments (cluster disabled) and for the node
-/// explicitly configured as `cluster.role: leader`. Worker/auto nodes return
+/// explicitly configured as `cluster.role: hub`. Runner/auto nodes return
 /// false. Schema migration and node-local initialization use separate paths.
 /// Config audit and explicit imports share this ownership check because they
 /// can update the agent roster before `startup_reseed` runs.
 pub(crate) fn shared_config_sync_enabled(config: &Config) -> bool {
-    !config.cluster.enabled || config.cluster.role.trim().eq_ignore_ascii_case("leader")
+    !config.cluster.enabled || config.cluster.role == ClusterRole::Hub
 }
 
 async fn apply_kv_seed_actions(pool: &PgPool, actions: &[KvSeedAction]) -> Result<(), String> {

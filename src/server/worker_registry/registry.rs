@@ -24,12 +24,7 @@ impl SupervisedWorkerRegistry {
     pub(crate) async fn run_boot_only_steps(&self) -> Result<()> {
         for step in BOOT_ONLY_STEPS {
             if step.id == BootStepId::DrainStartupHooks
-                && !self
-                    .config
-                    .cluster
-                    .runtime_profile
-                    .modules()
-                    .leader_services
+                && !self.config.cluster.runtime_profile.modules().hub_services
             {
                 continue;
             }
@@ -100,12 +95,7 @@ impl SupervisedWorkerRegistry {
         broadcast_tx: Option<BroadcastTx>,
     ) -> Result<Option<BatchBuffer>> {
         if spec.execution_scope == WorkerExecutionScope::LeaderOnly
-            && !self
-                .config
-                .cluster
-                .runtime_profile
-                .modules()
-                .leader_services
+            && !self.config.cluster.runtime_profile.modules().hub_services
         {
             self.log_skip(spec, "disabled by worker runtime profile");
             return Ok(None);

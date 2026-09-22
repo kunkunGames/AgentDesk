@@ -982,9 +982,9 @@ async function mockAgentsHubApis(page: Page) {
     await route.fulfill({ json: {
       cluster: { enabled: true, local_instance_id: "mac-mini" },
       nodes: [
-        { instance_id: "mac-mini", hostname: "Mac mini", effective_role: "leader", status: "online", os: "macos" },
+        { instance_id: "mac-mini", hostname: "Mac mini", effective_role: "hub", status: "online", os: "macos" },
         { instance_id: "windows-1", hostname: "Windows PC", effective_role: "worker", status: "online", os: "windows" },
-        { instance_id: "linux-2", hostname: "Linux PC", effective_role: "worker", status: "offline", os: "linux" },
+        { instance_id: "linux-2", hostname: "Linux PC", effective_role: "runner", status: "offline", os: "linux" },
       ].map(({ os, ...node }) => ({ ...node,
         capabilities: { execution_readiness: {
           os, arch: "x86_64", runtime_profile: "full", observed_at_ms: Date.now(),
@@ -2317,12 +2317,12 @@ test.describe("Dashboard smoke tests", () => {
     await page.getByRole("button", { name: /리스트|List/ }).click();
     await page.getByTestId("agents-card-agent-ada").click();
     const dialog = page.getByRole("dialog", { name: /직원 상세|Agent Details/ });
-    const device = dialog.getByLabel(/실행 장비|Execution device/);
+    const device = dialog.getByLabel(/우선 실행 장비|Preferred execution device/);
     const save = dialog.getByRole("button", { name: /^(저장|Save)$/ });
     await expect(device).toBeEnabled();
     await expect(device).toHaveValue("");
-    await expect(device.locator('option[value="mac-mini"]')).toContainText("leader · macos");
-    await expect(device.locator('option[value="windows-1"]')).toContainText("worker · windows");
+    await expect(device.locator('option[value="mac-mini"]')).toContainText(/(?:허브|Hub) · macOS/);
+    await expect(device.locator('option[value="windows-1"]')).toContainText(/(?:실행 노드|Runner) · Windows/);
     await device.selectOption("windows-1");
     expect(writes).toEqual([]);
     await save.click();
@@ -2422,18 +2422,29 @@ test.describe("Dashboard smoke tests", () => {
   });
 
   test("ops: cluster controls distinguish readiness, bound output and stale state", async ({ page }, testInfo) => {
+    await page.route(/\/api\/settings$/, route => route.fulfill({ json: {
+      language: testInfo.project.name === "desktop" ? "en" : "ko", theme: "dark",
+    } }));
+    await page.route(/\/api\/prompt-manifest\/retention$/, route => route.fulfill({ json: {
+      total_stored_bytes: 0, total_original_bytes: 0, truncated_count: 0,
+      manifest_count: 0, layer_count: 0, oldest_full_content_at: null, retention_horizon_at: null,
+      retention_days: 30, per_layer_max_bytes_adk_provided: 65536, per_layer_max_bytes_user_derived: 8192,
+      enabled: true, restart_required_for_config_changes: true, config_applied_at: "2026-09-22T00:00:00Z",
+      config_source: "fixture", hot_reload: false,
+    } }));
     let failRefresh = false;
+    let clusterEnabled = true;
     let stopCount = 0;
     await page.route(/\/api\/cluster\/nodes$/, async route => {
       if (failRefresh) return route.fulfill({ status: 503, json: { error: "fixture unavailable" } });
       const now = Date.now();
       await route.fulfill({ json: {
-        cluster: { enabled: true, local_instance_id: "mac-mini" },
+        cluster: { enabled: clusterEnabled, local_instance_id: "mac-mini" },
         nodes: ["windows-worker", "linux-worker"].map((id, index) => ({
-          instance_id: id, status: "online", effective_role: "worker", active_dispatch_count: 0,
+          instance_id: id, status: "online", effective_role: index ? "worker" : "runner", active_dispatch_count: 0,
           execution_active: 1, execution_occupied: 2,
           capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
-            os: index ? "linux" : "windows", arch: "x86_64", runtime_profile: "worker",
+            os: index ? "linux" : "windows", arch: "x86_64", runtime_profile: index ? "full" : "runner",
             observed_at_ms: now, expires_at_ms: now + 120_000, backends: ["process"],
           } },
           execution_readiness: { providers: { codex: { eligible: index === 0,
@@ -2461,7 +2472,9 @@ test.describe("Dashboard smoke tests", () => {
     });
     await page.goto("/ops");
     const panel = page.getByTestId("cluster-nodes-panel");
-    await expect(panel.getByText("windows / x86_64", { exact: false })).toBeVisible();
+    await expect(panel.getByText("Windows / x86_64", { exact: false })).toBeVisible();
+    await expect(panel.getByText(/(?:실행 노드.*실행 전용|Runner.*Execution only)/)).toBeVisible();
+    await expect(panel.getByText(/(?:실행 노드.*전체 기능|Runner.*Full features)/)).toBeVisible();
     await expect(panel.getByText(/실행 용량 대기|Waiting for capacity/)).toBeVisible();
     await expect(panel.getByText(/CLI 실행 불가|CLI unavailable/)).toBeVisible();
     await panel.getByRole("button", { name: /출력 보기|View output/ }).click();
@@ -2478,6 +2491,11 @@ test.describe("Dashboard smoke tests", () => {
     await expect(panel.getByText(/노드 갱신 실패|Node refresh failed/)).toBeVisible();
     await expect(panel.getByText(/worker output 한글/)).toBeVisible();
     await expectNoHorizontalOverflow(page);
+    failRefresh = false;
+    clusterEnabled = false;
+    await expect(panel.getByText(/이 컴퓨터 · 단독 운영|This computer · Standalone/)).toBeVisible({ timeout: 15_000 });
+    await expect(panel.locator("article")).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: /실행 중지|Stop execution/, exact: true })).toHaveCount(0);
   });
 
   test("ops: ws events resync the health snapshot", async ({ page }) => {

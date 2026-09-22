@@ -2,11 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
-use crate::config::{ClusterConfig, Config};
+use crate::config::{ClusterConfig, ClusterRole, Config};
 use crate::db::postgres::AdvisoryLockLease;
 use crate::services::cluster::session_routing::{
     cluster_capabilities_with_worker_api, worker_api_base_url_from_capabilities,
@@ -25,32 +24,6 @@ pub(crate) use super::intake_worker_capabilities::{
     register_gateway_waiter, register_intake_worker_provider,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ClusterRole {
-    Leader,
-    Worker,
-    Auto,
-}
-
-impl ClusterRole {
-    pub(crate) fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "leader" => Self::Leader,
-            "worker" => Self::Worker,
-            _ => Self::Auto,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Leader => "leader",
-            Self::Worker => "worker",
-            Self::Auto => "auto",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterRuntime {
     enabled: bool,
@@ -68,8 +41,8 @@ impl ClusterRuntime {
         Self {
             enabled: false,
             instance_id: "single-node".to_string(),
-            configured_role: ClusterRole::Leader,
-            effective_role: ClusterRole::Leader,
+            configured_role: ClusterRole::Hub,
+            effective_role: ClusterRole::Hub,
             leader_active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -88,7 +61,7 @@ impl ClusterRuntime {
             enabled: true,
             instance_id: "test-node".to_string(),
             configured_role: ClusterRole::Auto,
-            effective_role: ClusterRole::Worker,
+            effective_role: ClusterRole::Runner,
             leader_active,
         }
     }
@@ -148,7 +121,7 @@ fn auto_node_can_attempt_leadership(config: &Config) -> bool {
 
 pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> ClusterRuntime {
     if !config.cluster.enabled {
-        tracing::info!("[cluster] disabled; running in single-node leader-compatible mode");
+        tracing::info!("[cluster] disabled; running in standalone hub mode");
         return ClusterRuntime::single_node();
     }
 
@@ -165,19 +138,19 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     // the first wins.
     let _ = SELF_INSTANCE_ID.set(instance_id.clone());
     let hostname = crate::services::platform::hostname_short();
-    let configured_role = ClusterRole::parse(&config.cluster.role);
+    let configured_role = config.cluster.role;
     let auto_leader_eligible =
         configured_role != ClusterRole::Auto || auto_node_can_attempt_leadership(config);
     let mut leader_lease = match configured_role {
-        ClusterRole::Worker => None,
+        ClusterRole::Runner => None,
         ClusterRole::Auto if !auto_leader_eligible => {
             tracing::info!(
                 instance_id,
-                "[cluster] auto node has no configured Discord gateway token; registering as worker standby"
+                "[cluster] auto node has no configured Discord gateway token; registering as runner standby"
             );
             None
         }
-        ClusterRole::Leader | ClusterRole::Auto => {
+        ClusterRole::Hub | ClusterRole::Auto => {
             match AdvisoryLockLease::try_acquire(
                 &pool,
                 CLUSTER_LEADER_ADVISORY_LOCK_ID,
@@ -194,9 +167,9 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
         }
     };
     let effective_role = if leader_lease.is_some() {
-        ClusterRole::Leader
+        ClusterRole::Hub
     } else {
-        ClusterRole::Worker
+        ClusterRole::Runner
     };
     let leader_active = Arc::new(AtomicBool::new(leader_lease.is_some()));
     let labels = serde_json::Value::Array(
@@ -337,7 +310,7 @@ fn spawn_heartbeat_loop(
     let interval_secs = heartbeat_interval_secs.max(1);
     let stale_threshold_secs = lease_ttl_secs.max(interval_secs * 3);
     let leader_eligible =
-        leader_eligible && matches!(configured_role, ClusterRole::Leader | ClusterRole::Auto);
+        leader_eligible && matches!(configured_role, ClusterRole::Hub | ClusterRole::Auto);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await;
@@ -379,9 +352,9 @@ fn spawn_heartbeat_loop(
                 }
             }
             let current_effective_role = if leader_active.load(Ordering::Acquire) {
-                ClusterRole::Leader
+                ClusterRole::Hub
             } else {
-                ClusterRole::Worker
+                ClusterRole::Runner
             };
             let capabilities = capabilities_with_runtime_state(&base_capabilities);
             if let Err(error) = upsert_worker_node(
@@ -561,8 +534,8 @@ async fn upsert_worker_node(
     .bind(instance_id)
     .bind(hostname)
     .bind(pid)
-    .bind(configured_role.as_str())
-    .bind(effective_role.as_str())
+    .bind(configured_role.registry_value())
+    .bind(effective_role.registry_value())
     .bind(labels)
     .bind(capabilities)
     .execute(pool)
@@ -833,13 +806,6 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn cluster_role_parses_known_values_and_defaults_to_auto() {
-        assert_eq!(ClusterRole::parse("leader"), ClusterRole::Leader);
-        assert_eq!(ClusterRole::parse("WORKER"), ClusterRole::Worker);
-        assert_eq!(ClusterRole::parse("anything-else"), ClusterRole::Auto);
-    }
-
-    #[test]
     fn intake_retry_tick_reads_each_hot_reload_snapshot() {
         let mut config = Config::default();
         config.cluster.intake_routing.enabled = true;
@@ -877,7 +843,7 @@ mod tests {
     fn auto_node_leadership_requires_configured_gateway_token() {
         let mut config = Config::default();
         config.cluster.enabled = true;
-        config.cluster.role = "auto".to_string();
+        config.cluster.role = ClusterRole::Auto;
         config.discord.bots.clear();
 
         assert!(!auto_node_can_attempt_leadership(&config));
@@ -903,7 +869,7 @@ mod tests {
             enabled: true,
             instance_id: "test-node".to_string(),
             configured_role: ClusterRole::Auto,
-            effective_role: ClusterRole::Worker,
+            effective_role: ClusterRole::Runner,
             leader_active: leader_active.clone(),
         };
         let wait = tokio::spawn({

@@ -1,8 +1,8 @@
 # Cluster execution evidence and central session control
 
 Use one native AgentDesk artifact per OS/CPU target. Runtime roles select the
-modules that start; a worker does not need a separate executable or scheduler.
-See [worker runtime profile](worker-runtime-profile.md) and
+modules that start; a runner does not need a separate executable or scheduler.
+See [execution only mode](worker-runtime-profile.md), [display terminology](node-terminology.md), and
 [remote dashboard authentication](remote-dashboard-auth.md).
 
 ## Evidence and freshness
@@ -14,7 +14,7 @@ See [worker runtime profile](worker-runtime-profile.md) and
 | `status` | PostgreSQL node heartbeat/lease | The node is recently online |
 | `capabilities.execution_readiness` | Local execution probe | OS/architecture, CLI, credential metadata, logical repositories, tools and available backends |
 | `execution_readiness.providers` | Fresh local evidence plus intake progress | Provider admission eligibility and explicit blocking reasons |
-| `forwarding_diagnostics.configured` | Operator-owned trusted origin configuration | The leader has an explicit target origin |
+| `forwarding_diagnostics.configured` | Operator-owned trusted origin configuration | The hub has an explicit target origin |
 | `forwarding_diagnostics.trust_validated` | Existing trusted-target validator | Advertisement agrees with allowed origin, address and transport rules |
 | `forwarding_diagnostics.reachability_verified` | Authenticated request and matching node identity | The expected peer responded through that trusted target |
 
