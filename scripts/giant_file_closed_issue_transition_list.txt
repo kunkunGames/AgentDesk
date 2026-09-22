@@ -15,7 +15,7 @@ baseline. Growth above that baseline is rejected; the writer never raises it.
 already landed while this list kept naming them, which failed the inventory
 gate for three consecutive nightly runs. None of them is a giant any more --
 measured production LoC against the 1000-line threshold:
-  - server/runner_registry.rs                             483  (#5688)
+  - server/worker_registry.rs                             483  (#5688)
   - services/discord/outbound/turn_output_controller.rs   996  (#5679)
   - services/discord/tui_direct_pending_start.rs          935  (#5699)
   - services/discord/turn_finalizer.rs                    844

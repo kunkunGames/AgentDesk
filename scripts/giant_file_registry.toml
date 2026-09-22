@@ -785,7 +785,7 @@ decompose_issue = "#4712"
 # scripts/giant_file_closed_issue_transition_list.txt after their decompositions
 # had actually landed and their [[entry]] blocks had been removed. They are not
 # giants and must not be re-registered. Measured prod LoC (threshold 1000):
-#   - src/server/runner_registry.rs                              483 (#5688)
+#   - src/server/worker_registry.rs                              483 (#5688)
 #   - src/services/discord/outbound/turn_output_controller.rs    996 (#5679)
 #   - src/services/discord/tui_direct_pending_start.rs           935 (#5699)
 #   - src/services/discord/turn_finalizer.rs                     844

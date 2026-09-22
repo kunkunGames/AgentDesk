@@ -224,6 +224,8 @@ class GiantFileProgressTest(unittest.TestCase):
         root_production = PROGRESS.production_line_numbers(base_files[root], 1200)
         self.assertNotIn(1201, root_production)
         self.assertEqual(PROGRESS.production_line_numbers(candidate_files[child], 0), set())
+        file_module = "#[cfg(test)]\nmod fixture;\npub fn production() {}\n"
+        self.assertEqual(PROGRESS.production_line_numbers(file_module, 1), {3})
         with self.movement_repository(base_files, candidate_files) as (base_ref, candidate_ref):
             ledger = PROGRESS.movement_ledger(
                 base_ref, candidate_ref, {root}, {root: [child]},
