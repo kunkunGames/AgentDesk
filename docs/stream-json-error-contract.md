@@ -43,6 +43,8 @@ An omitted or zero setting retains the 60-second default; positive values are
 capped at 86,400 seconds. New launches read the live configuration snapshot.
 The existing zero-caller-timeout handshake remains 90 seconds. This setting
 does not impose a total duration limit after the first non-blank stdout line.
+The [2026-09-22 deployment record](reports/stream-json-startup-timeout-deployment-2026-09-22.md)
+tracks the explicit 300-second override on the Mac leader and Windows worker.
 
 AgentDesk does not pass `--print-timeout` to Antigravity. Unlimited headless turns
 require Antigravity CLI 1.2.6 or newer, whose
