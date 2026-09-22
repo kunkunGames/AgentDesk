@@ -32,6 +32,7 @@ from pathlib import Path
 
 
 # Mechanical ``tests.rs`` / ``*_tests.rs`` basename exclusions.
+
 PINNED_BASENAME_TEST_FILES = frozenset(
     {
         "src/db/auto_queue/tests.rs",
@@ -46,8 +47,8 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/db/scheduled_messages/postgres_tests.rs",
         "src/github/sync/warning_tests.rs",
         "src/github/triage/warning_tests.rs",
-        "src/server/database_fixture_invariant_tests.rs",
         "src/server/dashboard_auth/tests.rs",
+        "src/server/database_fixture_invariant_tests.rs",
         "src/server/routes/auto_queue_lifecycle_pg_tests.rs",
         "src/server/routes/dispatched_sessions_tests.rs",
         "src/server/routes/runtime_profile_tests.rs",
@@ -67,12 +68,14 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/cluster/attachment_transfer/tests.rs",
         "src/services/cluster/execution_capacity/tests.rs",
         "src/services/cluster/execution_requirements/tests.rs",
+        "src/services/cluster/intake_router_hook/agent_execution_node_tests.rs",
         "src/services/cluster/intake_router_hook/attachment_tests.rs",
         "src/services/cluster/intake_router_hook/capacity_tests.rs",
+        "src/services/cluster/intake_router_hook/edge_case_tests.rs",
         "src/services/cluster/intake_router_hook/execution_requirement_tests.rs",
-        "src/services/cluster/readiness/tests.rs",
         "src/services/cluster/intake_worker/dispatch_stamp_tests.rs",
         "src/services/cluster/intake_worker/drain_tests.rs",
+        "src/services/cluster/readiness/tests.rs",
         "src/services/cluster/stream_relay/tests/shutdown_tests.rs",
         "src/services/discord/abandon_request_store/probe_contract_tests.rs",
         "src/services/discord/catch_up/classification_order_tests.rs",
@@ -93,6 +96,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/placeholder_live_events/probe_fixtures_tests.rs",
         "src/services/discord/placeholder_live_events/tests.rs",
         "src/services/discord/prompt_builder/dispatch_contract_tests.rs",
+        "src/services/discord/queue_io/transport/tests.rs",
         "src/services/discord/recovery_engine/manual_rebind/coordinate_adoption_tests.rs",
         "src/services/discord/recovery_engine/manual_rebind/post_adoption_guard_tests.rs",
         "src/services/discord/recovery_engine/restore_inflight/ready_without_output_tests.rs",
@@ -132,10 +136,10 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/tmux_watcher/streaming_status_tick/committed_progress_tests.rs",
         "src/services/discord/tmux_watcher/streaming_status_tick/native_collector_tests.rs",
         "src/services/discord/tmux_watcher/supervisor_relay_tests.rs",
+        "src/services/discord/tmux_watcher/terminal_commit_epilogue/continuation_marker_tests.rs",
         "src/services/discord/tmux_watcher/terminal_direct_fallback_tests.rs",
         "src/services/discord/tmux_watcher/terminal_readiness_tests.rs",
         "src/services/discord/tmux_watcher/terminal_relay_plan_tests.rs",
-        "src/services/discord/tmux_watcher/terminal_commit_epilogue/continuation_marker_tests.rs",
         "src/services/discord/tmux_watcher/tests.rs",
         "src/services/discord/tmux_watcher/turn_identity_tests.rs",
         "src/services/discord/tmux_watcher/two_message_panel_tests.rs",
@@ -159,6 +163,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/turn_bridge/stream_loop/tool_arms/authority_tests.rs",
         "src/services/discord/turn_bridge/stream_tick/guarded_persist_tests.rs",
         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests.rs",
+        "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rest_delivery_tests.rs",
         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests.rs",
         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/pg_tests.rs",
         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/preloop_cleanup_tests.rs",
@@ -170,12 +175,12 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/watchers/dispatched_origin_ghost_tests.rs",
         "src/services/discord/watchers/lifecycle/restore_tests.rs",
         "src/services/discord/watchers/lifecycle/tests.rs",
+        "src/services/dispatch_gate/auth_profiles/selection_tests.rs",
+        "src/services/kakao/transport_tests.rs",
+        "src/services/message_outbox_circuit_authority_tests.rs",
+        "src/services/message_outbox_recovery_tests.rs",
         "src/services/observability/events/capture_stress_tests.rs",
         "src/services/observability/events/capture_tests.rs",
-        "src/services/message_outbox_circuit_authority_tests.rs",
-        "src/services/kakao/transport_tests.rs",
-        "src/services/message_outbox_recovery_tests.rs",
-        "src/services/dispatch_gate/auth_profiles/selection_tests.rs",
         "src/services/process/stream_child/stream_queue/tests.rs",
         "src/services/provider/provider_conformance_invariant_tests.rs",
         "src/services/provider_auth_profile/fallback/tests.rs",
@@ -183,8 +188,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/scheduled_messages/postgres_tests.rs",
         "src/services/session_forwarding/probe/tests.rs",
         "src/services/tui_prompt_dedupe/tests.rs",
-    }
-)
+    })
 
 # Production-looking basenames classified as test-only by the shared resolver.
 PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(
