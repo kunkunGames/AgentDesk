@@ -23,6 +23,7 @@ cli::args::tests::legacy_flat_discord_send_help_matches_routed_send_contract
 cli::args::tests::legacy_launchd_and_provider_value_aliases_still_parse
 cli::args::tests::legacy_queue_help_directs_users_to_query_without_changing_compatibility_contract
 cli::args::tests::provider_cli_status_coexists_with_global_json
+cli::args::tests::provider_wrappers_accept_process_backend_pipe_arguments
 cli::args::tests::send_to_agent_parses_expect_reply_false
 cli::args::tests::send_to_agent_parses_expect_reply_true
 cli::args::tests::send_to_agent_requires_expect_reply

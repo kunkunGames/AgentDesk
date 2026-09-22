@@ -63,3 +63,9 @@ Windows dcserver는 시작 전에 전용 Job Object에 자신을 등록한다. �
 예약 작업 중지·강제 종료에서도 OpenCode server 같은 자식·손자 프로세스가 함께 종료된다.
 API listener는 생성 시점부터 핸들 상속을 차단하므로 하위 CLI가 이전 API 포트를 붙잡아
 재시작을 방해하지 않는다. Job Object 등록에 실패하면 dcserver 기동을 거절한다.
+
+Claude/Codex/Qwen wrapper CLI는 모든 플랫폼에서 공통 pipe 경로로 컴파일한다.
+이름에 `tmux`가 들어 있어도 ProcessBackend가 사용하는 명령이므로 Unix 전용으로
+제외하면 안 된다. FIFO 입력은 Unix에서만 노출하고 Windows 기본 입력은 pipe다.
+Release matrix는 `verify_worker_wrappers.py`로 실제 native 바이너리의 세 wrapper가
+pipe 진입점까지 도달하는지 확인한다. CLI 설치 확인과 실제 계정 응답 검증은 별도다.
