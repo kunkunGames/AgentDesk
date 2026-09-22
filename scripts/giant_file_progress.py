@@ -622,7 +622,9 @@ def main() -> int:
             if event == "pull_request":
                 base_root = Path(temporary) / "base"
                 base_root.mkdir(); archive(base_sha, base_root)
-                base = inventory.giant_file_snapshot(base_root, evaluation_date=today)
+                base = inventory.giant_file_snapshot(
+                    base_root, evaluation_date=today, candidate_modules=candidate["modules"])
+                payload["repaired_base_registrations"] = base.get("repaired_unregistered", [])
                 facts = diff_facts(base_sha, candidate_sha)
                 if facts["changed"] and facts["changed"] <= LEDGER:
                     facts.update(ledger_base=load_ledger(base_root, snapshot="base"),

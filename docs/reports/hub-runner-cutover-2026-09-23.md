@@ -9,7 +9,7 @@
 배포한 실행 코드는 `eedf46d369273d2074da6d4c4bf7535c9ff75d3a`다.
 [네이티브 빌드 35765254082](https://github.com/kunkunGames/AgentDesk/actions/runs/35765254082)의
 Windows x64, macOS ARM64, Linux x64 패키지가 모두 성공했다. 공개 Release는 발행하지 않았다.
-후속 커밋은 테스트 fixture·CI inventory·주석·문서를 정리하며 배포 코드의 동작을 바꾸지 않는다.
+후속 커밋은 테스트 fixture·CI inventory·주석·문서와 두 지역 변수명을 정리하며 배포 코드의 동작을 바꾸지 않는다.
 
 | 항목 | Mac mini | Windows PC |
 | --- | --- | --- |
@@ -115,13 +115,21 @@ Windows의 정상 force-kill API가 `tmux_killed=true`를 반환했으며 실제
 - 보호된 기존 migration 132개 checksum, Rust formatting, diff whitespace 검사 통과.
 - Python 회귀 49개는 WSL 17개 + WSL 31개 + Windows의 compiler 전용 1개로 검증했다.
   단일 환경에서 49개가 한 번에 성공한 결과로 표현하지 않는다.
+- 대형 파일 inventory와 진행 검사 회귀: Linux에서 166개 통과.
 
 처음 검출된 CI 문제는 누락된 writer-gate 경로 pin, Windows 전용 테스트 inventory,
 분리된 helper를 따라가지 못한 소스 검사, runtime으로 옮겨진 queue route의 오래된
 테스트 router, intake owner 취소 경로의 소스 정규식이었다. 테스트의 실제 계약을 유지하며
-fixture와 inventory를 수정했다. 마지막 Script checks 실패는 새로 분리한
+fixture와 inventory를 수정했다. 후속 Script checks 실패는 새로 분리한
 `merged_placeholders.rs`의 주석 비율 32.5%였다. 변경 이력 주석을 줄여 13.3%로 만들었고
-동작 코드는 유지했다. 각 실패와 최종 재실행은 PR checks 및 아래 로그로 구분한다.
+동작 코드는 유지했다.
+
+진행 검사는 기준 `main`의 미등록 대형 파일 `gateway.rs` 1,009줄 때문에 후보를 평가하기
+전에 중단됐다. 엄격한 후보 검사부터 통과하고 같은 경로가 1,000줄 미만으로 줄어든 경우만
+기준점의 미등록 상태를 수리된 것으로 기록하도록 고쳤다. 후보의 새 대형 파일, 삭제·이름
+변경, 다른 잘못된 registry 항목은 계속 거절한다. 외부 `#[cfg(test)] mod` 선언도 테스트
+줄로 계산하도록 수정하고 두 지역 변수명을 줄여 formatter가 만든 불필요한 증가를 없앴다.
+각 실패와 최종 재실행은 PR checks 및 아래 로그로 구분한다.
 
 로컬 Rust 빌드는 처음 세 번 LLVM out-of-memory로 중단됐다. WSL의 사용하지 않는
 clean page cache를 회수한 뒤 같은 빌드가 15분 10초에 성공했다. 다른 사용자 작업을
@@ -139,6 +147,7 @@ clean page cache를 회수한 뒤 같은 빌드가 15분 10초에 성공했다. 
 | `node-terminology-served-dashboard.json` | 배포 패키지와 제공 자산 비교 |
 | `focused-tests.json`, `test-runner-final.log` | 로컬 Rust 77개 결과 |
 | `ci-library-latest.log`, `ci-postgres-latest.log`, `ci-script-latest.log` | CI 개별 job 원문과 최초 실패 |
+| `giant-baseline-final-linux-tests.log`, `giant-baseline-preflight.json` | 대형 파일 검사 회귀·실제 기준점 비교 |
 | `rust-build-reclaimed.log` | 성공한 로컬 Rust 빌드 |
 | `windows-trust-config.json` | 신뢰 설정의 장비 키 교체·다른 값 보존 |
 

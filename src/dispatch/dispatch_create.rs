@@ -375,9 +375,8 @@ async fn load_capability_claim_owner_pg_tx(
         return Ok(None);
     };
 
-    let cluster_nodes = load_live_capability_route_nodes_pg_tx(tx).await?;
-    let route_candidates =
-        crate::server::cluster::select_capability_route(&cluster_nodes, required);
+    let nodes = load_live_capability_route_nodes_pg_tx(tx).await?;
+    let route_candidates = crate::server::cluster::select_capability_route(&nodes, required);
     let Some(selected_owner) = route_candidates
         .first()
         .and_then(|candidate| candidate.decision.instance_id.as_deref())
@@ -395,7 +394,7 @@ async fn load_capability_claim_owner_pg_tx(
         return Ok(None);
     }
 
-    let owner_node = cluster_nodes.iter().find(|node| {
+    let owner_node = nodes.iter().find(|node| {
         node.get("instance_id").and_then(|value| value.as_str()) == Some(&selected_owner)
     });
     let decision =
