@@ -342,7 +342,11 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Cancelled);
     };
     let owner_shutdown = runtime.shared.restart.shutdown_reader();
-    let owner_cancelled = || cancelled() || owner_shutdown.load(Ordering::Acquire);
+    let owner_cancelled = || {
+        cancelled()
+            || shared.restart.intake_worker_lifecycle.admission_is_fenced()
+            || owner_shutdown.load(Ordering::Acquire)
+    };
 
     if let Err(reason) = super::execution_requirements::validate_worker(&row) {
         mark_failed_pre_accept(
