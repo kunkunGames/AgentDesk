@@ -176,6 +176,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/discord/watchers/lifecycle/restore_tests.rs",
         "src/services/discord/watchers/lifecycle/tests.rs",
         "src/services/dispatch_gate/auth_profiles/selection_tests.rs",
+        "src/services/git/repo_resolver/metadata_probe_tests.rs",
         "src/services/kakao/transport_tests.rs",
         "src/services/message_outbox_circuit_authority_tests.rs",
         "src/services/message_outbox_recovery_tests.rs",
@@ -188,6 +189,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/scheduled_messages/postgres_tests.rs",
         "src/services/session_forwarding/probe/tests.rs",
         "src/services/tui_prompt_dedupe/tests.rs",
+        "src/services/turn_lifecycle/native_session_tests.rs",
     }
 )
 

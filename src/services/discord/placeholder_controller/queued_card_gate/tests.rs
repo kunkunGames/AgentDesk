@@ -473,6 +473,10 @@ const RAW_DISCORD_MESSAGE_OPS: &[&str] = &[
 /// raw call fails the second assertion — co-existence is rejected, not accepted.
 fn gated(label: &str, source: &str, start: &str, end: &str) {
     let body = region(source, label, start, end);
+    gated_body(label, body);
+}
+
+fn gated_body(label: &str, body: &str) {
     assert!(body.contains("queued_card_gate::"), "{label}: not gated");
     for op in RAW_DISCORD_MESSAGE_OPS {
         assert!(
@@ -490,6 +494,7 @@ fn t7_gated_sites_hold_no_raw_destructive_call() {
     const MOD_RS: &str = include_str!("../../mod.rs");
     const KICKOFF_RS: &str = include_str!("../../queue_dispatch/kickoff.rs");
     const GATEWAY_RS: &str = include_str!("../../gateway.rs");
+    const MERGED_PLACEHOLDERS_RS: &str = include_str!("../../gateway/merged_placeholders.rs");
     const INTAKE_RS: &str = include_str!("../../router/message_handler/intake_turn.rs");
     const HANDOFF_RS: &str =
         include_str!("../../router/message_handler/intake_turn/placeholder_handoff.rs");
@@ -515,12 +520,7 @@ fn t7_gated_sites_hold_no_raw_destructive_call() {
         "let drained_cards = gateway::drain_merged_queued_placeholders(",
         "let dispatch_result =",
     );
-    gated(
-        "A4 merged drain helper",
-        GATEWAY_RS,
-        "pub(super) async fn drain_merged_queued_placeholders",
-        "fn live_bot_owner_provider",
-    );
+    gated_body("A4 merged drain helper", MERGED_PLACEHOLDERS_RS);
     gated(
         "A4 dispatch call site",
         GATEWAY_RS,

@@ -82,7 +82,14 @@ LIB_INVENTORY_STATIC_ONLY_BASE = frozenset({
     "cli::discord_thread_create::tests::windows_cancelled_async_holder_releases_before_runtime_exit",
     "cli::discord_thread_create::tests::windows_lock_uses_global_current_sid_named_mutex",
     "cli::discord_thread_create_lock::windows::tests::wait_status_accepts_normal_and_abandoned_but_reports_errors",
+    "runtime_layout::windows_links::tests::windows_junction_paths_are_literal_and_removal_preserves_target",
+    "runtime_layout::windows_links::tests::windows_optional_file_alias_never_copies_or_hardlinks_content",
     "services::discord::placeholder_sweeper::abandon_guard::tests::claude_e_process_cleanup_is_fail_closed_without_unix_probe",
+    "services::dispatched_sessions::output::tests::windows_missing_process_is_unavailable_instead_of_empty_tmux_success",
+    "services::platform::network::tests::api_listener_is_not_inheritable_by_provider_processes",
+    "services::platform::shell::hostname_tests::windows_native_hostname_matches_computer_name",
+    "services::platform::windows_job::tests::forced_runtime_exit_terminates_grandchildren_and_releases_ports",
+    "services::platform::windows_job::tests::runtime_job_descendant_fixture",
 })
 LIB_INVENTORY_STATIC_ONLY_BY_PLATFORM = {
     "darwin": frozenset({
