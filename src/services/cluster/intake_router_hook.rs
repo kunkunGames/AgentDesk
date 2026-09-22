@@ -28,6 +28,8 @@ mod attachment_tests;
 #[cfg(test)]
 mod capacity_tests;
 #[cfg(test)]
+mod edge_case_tests;
+#[cfg(test)]
 mod execution_requirement_tests;
 pub(crate) mod owner_record;
 mod session_owner;
