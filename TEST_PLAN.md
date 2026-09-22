@@ -8,6 +8,7 @@
 - **Stale Branch Cleanup:** Treat low-signal open PR volume and stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place.
 - **Clean Workspace & Baggage Audit:** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body. If the diff contains unrelated files, old merged work, or broad stale branch baggage, abandon the branch and report that a clean PR is required.
 - **False Verification Guard:** Do not falsely claim verification (e.g. PostgreSQL, Discord, tmux, provider runtime, browser, CI) unless it was actually executed. If a required check cannot run in the environment, state the exact reason in the skipped checks section and explain the residual risk.
+- **Partial Check Status:** Do not claim a PR is merge-ready from a partial check status. Pending or UNKNOWN mergeability must be explicitly called out in the PR body or report.
 
 ## PR Body Requirements
 Every PR must include:
@@ -20,7 +21,7 @@ Every PR must include:
 - Risk and rollback notes
 
 ## Verification Commands
-- **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`. When executing commands that might terminate the shell session (like `cargo check --all-targets`), wrap them in `bash -c '<command>'` to prevent session loss and preserve environment state.
+- **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`. Explicitly tailor test commands to execute only the specifically affected tests/targets to avoid recurrent 400-second execution timeouts in the environment. If `cargo check --all-targets` fails due to environment timeouts or internal errors, `cargo check --bin agentdesk` can be used as a faster, reliable alternative to verify compilation. When executing commands that might terminate the shell session (like `cargo check --all-targets`), wrap them in `bash -c '<command>'` to prevent session loss and preserve environment state.
 - **Dashboard Changes:** `./scripts/verify-dashboard.sh`
 - **Policy Changes:** `npm run test:policies`
 - **Scripts:** `shellcheck`
