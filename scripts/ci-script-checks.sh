@@ -283,11 +283,18 @@ bash tests/test_deploy_smoke_scope.sh
 banner "Cluster deploy peer verdict + terminal marker contract (#5189)"
 bash tests/test_cluster_deploy_peer_verdict_5189.sh
 
+banner "Deploy migration-floor fail-forward contract (#6090)"
+bash tests/test_deploy_migration_floor_fail_forward_6090.sh
+
+banner "Deploy verdict health axis (#6092)"
+bash tests/test_deploy_verdict_health_axis_6092.sh
+
 banner "CI runner hardening guard"
 ./scripts/check-ci-runner-hardening.sh
 "$PYTHON" -m unittest tests.test_discord_thread_create_ci_wiring
 # Nightly #6006 profiles, tmux and executable selection contracts.
 "$PYTHON" -m unittest tests.test_nightly_repair
+"$PYTHON" -m unittest tests.test_pg_boundary_diagnostics
 
 banner "PR infrastructure failure rerun classifier (#4392/#5207)"
 # These self-tests also enforce the #5207 sibling-regex sync contract: the

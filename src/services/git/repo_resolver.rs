@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use super::git_command;
+use super::GitCommand;
+
+// Local metadata probes must not strand the cluster readiness collector when
+// a repository or Git configuration is on an unavailable filesystem.
+const REPO_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Canonicalize a path, stripping the Windows `\\?\` extended-length prefix
 /// that `std::fs::canonicalize` adds on Windows. Without stripping, these
@@ -132,25 +137,29 @@ fn configured_repo_dir(repo_id: &str) -> Option<String> {
 }
 
 pub(crate) fn repo_id_for_dir(repo_dir: &str) -> Option<String> {
-    let output = git_command()
+    let output = GitCommand::new()
+        .repo(repo_dir)
+        .timeout(REPO_METADATA_TIMEOUT)
         .args(["config", "--get", "remote.origin.url"])
-        .current_dir(repo_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
+        .run_output()
+        .ok()?;
     super::parse_github_repo_from_remote(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn ensure_git_worktree(path: &str) -> Result<(), String> {
-    let output = git_command()
+    GitCommand::new()
+        .repo(path)
+        .timeout(REPO_METADATA_TIMEOUT)
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(path)
-        .output()
-        .map_err(|e| format!("git rev-parse failed for '{}': {e}", path))?;
-    if !output.status.success() {
-        return Err(format!("'{}' is not a git worktree", path));
-    }
-    Ok(())
+        .run_output()
+        .map(|_| ())
+        .map_err(|error| {
+            if error.status_code().is_some() && !error.timed_out_flag() {
+                format!("'{path}' is not a git worktree")
+            } else {
+                format!("git rev-parse failed for '{path}': {error}")
+            }
+        })
 }
 
 /// Stable sentinel prefix for the "no `repo_dirs` mapping" resolver error.
@@ -270,3 +279,6 @@ mod no_repo_mapping_classification_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod metadata_probe_tests;

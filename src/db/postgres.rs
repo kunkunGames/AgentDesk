@@ -2806,7 +2806,7 @@ mod tests {
         runner.agents.clear();
         runner.runtime.dispatch_poll_sec = Some(7);
         runner.runtime.reset_overrides_on_restart = true;
-        for role in ["runner", "runner", "auto"] {
+        for role in ["runner", "auto"] {
             runner.cluster.role = role.parse().unwrap();
             with_startup_advisory_lock(&pool, || startup_reseed(&pool, &runner))
                 .await

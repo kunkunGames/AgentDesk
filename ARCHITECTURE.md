@@ -1597,6 +1597,8 @@ src/
 │   │   ├── thread_reuse.rs
 │   │   └── wait_queue.rs
 │   ├── git/
+│   │   ├── repo_resolver/
+│   │   │   └── metadata_probe_tests.rs
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
 │   │   ├── mod.rs
@@ -1791,6 +1793,8 @@ src/
 │   │   └── tests.rs
 │   ├── tui_turn_state/
 │   │   └── completion_scan.rs
+│   ├── turn_lifecycle/
+│   │   └── native_session_tests.rs
 │   ├── turn_orchestrator/
 │   │   ├── active_source_dedup.rs
 │   │   ├── dispatch_cleanup.rs

@@ -48,7 +48,7 @@ cli::client::health_compare_tests::classify_machine_label_prefers_explicit_label
 cli::client::health_compare_tests::cluster_lease_ttl_secs_handles_missing_and_zero_values
 cli::client::health_compare_tests::diff_marker_only_fires_on_real_mismatch
 cli::client::health_compare_tests::human_age_seconds_buckets_match_expected_units
-cli::client::health_compare_tests::machine_role_display_uses_effective_role_and_accepts_legacy_names
+cli::client::health_compare_tests::machine_role_display_uses_effective_role_and_canonical_names
 cli::client::health_compare_tests::render_machine_compare_table_synthesises_offline_columns
 cli::client::health_compare_tests::validate_status_payload_rejects_missing_arrays
 cli::client::runtime_config::tests::api_get_payload_preserves_explicit_keys_for_cli_set
@@ -389,6 +389,8 @@ db::campaigns::tests::campaign_checkpoint_normalizes_optional_groups_without_inf
 db::campaigns::tests::campaign_validation_rejects_false_completion_and_bad_identity
 db::campaigns::tests::campaign_validation_rejects_missing_duplicate_and_cyclic_dependencies
 db::campaigns::tests::postgres_campaign_concurrent_cas_and_reconnect_preserve_canonical_history_pg
+db::campaigns::tests::postgres_campaign_revision_history_stays_bounded_by_retention_pg
+db::campaigns::tests::postgres_campaign_revision_prune_keeps_newest_by_rank_across_gaps_pg
 db::dispatch_semaphores::tests::required_semaphore_names_accepts_object_and_singular_forms
 db::dispatch_semaphores::tests::required_semaphore_names_reads_required_namespace
 db::dispatched_session_canonical_identity::pg_tests::canonical_identity_actor_pin_missing_insert_and_retry_pg
@@ -1024,7 +1026,11 @@ server::routes::bind_security_tests::loopback_host_is_never_downgraded
 server::routes::bind_security_tests::loopback_notation_edges_are_not_force_downgraded
 server::routes::bind_security_tests::nonloopback_with_token_binds_requested_host
 server::routes::bind_security_tests::nonloopback_without_token_is_forced_to_loopback
+server::routes::campaigns::tests::ledger_body_limit_stays_at_sixteen_mebibytes
+server::routes::campaigns::tests::ledger_put_accepts_a_document_larger_than_the_axum_default_limit
+server::routes::campaigns::tests::ledger_put_over_the_limit_reports_the_limit_and_the_remedy
 server::routes::campaigns::tests::postgres_campaign_http_auth_conflict_and_history_pg
+server::routes::campaigns::tests::postgres_ledger_round_trips_a_document_past_the_axum_default_limit_pg
 server::routes::cluster::idle_kill_config_tests::idle_kill_owner_config_requires_explicit_nonempty_trusted_origin
 server::routes::departments::tests::db_error_preserves_500_and_verbatim_message
 server::routes::departments::tests::department_not_found_preserves_404_and_message
@@ -7763,6 +7769,8 @@ services::gemini::child_exit_tests::published_terminal_survives_delayed_consumer
 services::gemini::path_expansion_tests::expand_gemini_working_dir_keeps_existing_trimmed_relative_behavior
 services::gemini::path_expansion_tests::expand_gemini_working_dir_reuses_runtime_tilde_expansion
 services::git::commit_resolver::fail_closed_tests::git_tracked_change_paths_strict_fails_closed_on_non_repo_dir
+services::git::repo_resolver::metadata_probe_tests::repository_metadata_preserves_origin_and_rejects_non_worktrees
+services::git::repo_resolver::metadata_probe_tests::stalled_git_configuration_is_terminated_by_metadata_deadline
 services::git::repo_resolver::no_repo_mapping_classification_tests::classifies_the_no_mapping_error_as_suppressible
 services::git::repo_resolver::no_repo_mapping_classification_tests::keeps_persistent_misconfiguration_errors_as_real_warns
 services::git::runner::tests::run_text_captures_stdout
@@ -9053,6 +9061,8 @@ services::turn_cancel_queue_guard::tests::kept_ids_cover_the_queue_the_dispatch_
 services::turn_cancel_queue_guard::tests::records_the_queued_message_a_cancel_removed
 services::turn_cancel_queue_guard::tests::the_guard_never_writes_to_the_mailbox
 services::turn_cancel_queue_guard::tests::the_promoted_message_is_not_recorded_as_lost
+services::turn_lifecycle::native_session_tests::force_kill_terminates_native_wrapper_without_tmux
+services::turn_lifecycle::native_session_tests::preserving_session_keeps_native_wrapper_alive
 services::turn_lifecycle::policy_observability_tests::cancel_observability_emits_unknown_noop_direct_fallback
 services::turn_lifecycle::policy_observability_tests::cleanup_policy_observability_surface_matches_cancel_contract
 services::turn_lifecycle::policy_observability_tests::compute_queue_preserved_detects_disk_and_memory_loss

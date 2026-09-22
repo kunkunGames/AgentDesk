@@ -2441,7 +2441,7 @@ test.describe("Dashboard smoke tests", () => {
       await route.fulfill({ json: {
         cluster: { enabled: clusterEnabled, local_instance_id: "mac-mini" },
         nodes: ["windows-runner", "linux-runner"].map((id, index) => ({
-          instance_id: id, status: "online", effective_role: index ? "runner" : "runner", active_dispatch_count: 0,
+          instance_id: id, status: "online", effective_role: "runner", active_dispatch_count: 0,
           execution_active: 1, execution_occupied: 2,
           capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
             os: index ? "linux" : "windows", arch: "x86_64", runtime_profile: index ? "full" : "runner",

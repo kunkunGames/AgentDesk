@@ -7,6 +7,12 @@ use crate::services::tmux_diagnostics::record_tmux_exit_reason;
 
 const DIRECT_FALLBACK_PATH: &str = "direct-fallback";
 
+fn session_backend_is_alive(session_name: &str) -> bool {
+    !session_name.is_empty()
+        && (crate::services::session_backend::process_session_is_alive(session_name)
+            || crate::services::platform::tmux::has_session(session_name))
+}
+
 #[cfg(test)]
 static FORCE_KILL_PRESERVE_TMUX_FOR_TESTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
@@ -205,8 +211,7 @@ async fn stop_turn_with_policy(
     let mut termination_recorded = false;
     let mut runtime_persistent_inflight_cleared = false;
     let mut mailbox_foreground_free = None;
-    let tmux_was_alive = !probe_session_owned.is_empty()
-        && crate::services::platform::tmux::has_session(&probe_session_owned);
+    let tmux_was_alive = session_backend_is_alive(&probe_session_owned);
     let cleanup_tmux = cleanup_policy.should_cleanup_tmux();
 
     if let (Some(registry), Some(provider), Some(channel_id)) =
@@ -297,6 +302,8 @@ async fn stop_turn_with_policy(
         let preserve_for_test = false;
         let killed_now = if preserve_for_test {
             false
+        } else if crate::services::session_backend::terminate_process_session(kill_target) {
+            true
         } else if crate::services::platform::tmux::has_session(kill_target) {
             crate::services::platform::tmux::kill_session(
                 kill_target,
@@ -320,7 +327,7 @@ async fn stop_turn_with_policy(
         // stops misreporting `tmux_killed=false` for sessions that died.
         tmux_was_alive
             && !probe_session_owned.is_empty()
-            && !crate::services::platform::tmux::has_session(&probe_session_owned)
+            && !session_backend_is_alive(&probe_session_owned)
     };
 
     let inflight_cleared = if runtime_persistent_inflight_cleared {
@@ -739,3 +746,6 @@ fn compute_queue_preserved(
         _ => true,
     }
 }
+
+#[cfg(test)]
+mod native_session_tests;

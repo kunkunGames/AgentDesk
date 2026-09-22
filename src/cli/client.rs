@@ -2695,7 +2695,7 @@ mod health_compare_tests {
     }
 
     #[test]
-    fn machine_role_display_uses_effective_role_and_accepts_legacy_names() {
+    fn machine_role_display_uses_effective_role_and_canonical_names() {
         for (raw, expected) in [("hub", "hub"), ("runner", "runner"), ("standby", "standby")] {
             let node = serde_json::json!({"role":"hub", "effective_role":raw});
             assert_eq!(node_role_name(&node), expected);
