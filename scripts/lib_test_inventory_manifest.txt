@@ -8047,6 +8047,7 @@ services::platform::binary_resolver::tests::generic_seam_seals_claude_while_seal
 services::platform::binary_resolver::tests::parses_codex_cli_semver_from_version_output
 services::platform::binary_resolver::tests::resolve_provider_binary_redacts_claude_paths_in_attempts
 services::platform::binary_resolver::tests::scrub_seals_only_claude_paths
+services::platform::network::tests::api_listener_is_not_inheritable_by_provider_processes
 services::platform::tmux::availability::availability_cache_tests::consecutive_probe_failures_demote_after_threshold
 services::platform::tmux::availability::availability_cache_tests::live_session_proof_marks_cache_available
 services::platform::tmux::availability::availability_cache_tests::missing_tmux_binary_demotes_immediately_and_resets_failures
@@ -8070,6 +8071,8 @@ services::platform::tmux::timeout_tests::probe_failure_widens_to_live_or_ambiguo
 services::platform::tmux::timeout_tests::send_keys_timeout_preserves_tmux_stderr_on_fast_failure
 services::platform::tmux::timeout_tests::send_keys_timeout_reports_hung_tmux
 services::platform::tmux::timeout_tests::session_presence_distinguishes_missing_from_probe_failure
+services::platform::windows_job::tests::forced_runtime_exit_terminates_grandchildren_and_releases_ports
+services::platform::windows_job::tests::runtime_job_descendant_fixture
 services::pr_summary::tests::cache_hit_on_repeated_lookup
 services::pr_summary::tests::closed_pr_uses_longer_ttl
 services::pr_summary::tests::eviction_caps_entries

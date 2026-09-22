@@ -58,3 +58,8 @@ Windows 일반 사용자 계정에서는 디렉터리 symlink 권한이 없으�
 공유 prompt의 기준 파일은 `config/agents/_shared.prompt.md`다. 과거 `_shared.md`
 파일 별칭은 symlink 생성이 허용될 때만 제공한다. 기준 파일을 복사하거나 hardlink로
 대체하지 않으므로 prompt를 원자적으로 교체해도 오래된 사본을 읽지 않는다.
+
+Windows dcserver는 시작 전에 전용 Job Object에 자신을 등록한다. 일반 종료뿐 아니라
+예약 작업 중지·강제 종료에서도 OpenCode server 같은 자식·손자 프로세스가 함께 종료된다.
+API listener는 생성 시점부터 핸들 상속을 차단하므로 하위 CLI가 이전 API 포트를 붙잡아
+재시작을 방해하지 않는다. Job Object 등록에 실패하면 dcserver 기동을 거절한다.
