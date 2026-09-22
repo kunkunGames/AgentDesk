@@ -79,3 +79,4 @@ Windows 방화벽 설치에는 `-HubAddress`를 사용한다. 이전 `-LeaderAdd
 [`cluster_role.rs`](../../src/config/cluster_role.rs)와
 [`runtime_profile.rs`](../../src/config/runtime_profile.rs)에 모은다.
 설치 구성과 활성 기능은 [실행 전용 기능 모드](worker-runtime-profile.md)를 참고한다.
+검증과 실기기 적용 내역은 [변경 보고서](../reports/hub-runner-terminology-2026-09-23.md)에 기록한다.
