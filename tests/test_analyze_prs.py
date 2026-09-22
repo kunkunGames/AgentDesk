@@ -10,6 +10,7 @@ from scripts.analyze_prs import (
     has_pr_size_ack,
     has_docs_only_verification_ack,
     has_false_verification_guard_ack,
+    has_partial_check_status_ack,
     has_overlap_reference,
     has_template_summary,
     is_scratch_file_path,
@@ -255,6 +256,21 @@ class PrAnalyzerFalseVerificationGuardTests(unittest.TestCase):
         body = "- false verification guard: confirmed no false verification"
 
         self.assertTrue(has_false_verification_guard_ack(body))
+
+    def test_unchecked_template_partial_check_status_is_not_acknowledgement(self):
+        body = "- [ ] **Partial check status:** I have not claimed this PR is merge-ready..."
+
+        self.assertFalse(has_partial_check_status_ack(body))
+
+    def test_checked_template_partial_check_status_is_acknowledgement(self):
+        body = "- [x] **partial check status:** no partial checks claimed"
+
+        self.assertTrue(has_partial_check_status_ack(body))
+
+    def test_filled_partial_check_status_field_is_acknowledgement(self):
+        body = "- partial check status: confirmed no partial checks"
+
+        self.assertTrue(has_partial_check_status_ack(body))
 
 
 class PrAnalyzerDocsOnlyVerificationGuardTests(unittest.TestCase):

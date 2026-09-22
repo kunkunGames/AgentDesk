@@ -156,6 +156,16 @@ def has_docs_only_verification_ack(body):
         ],
     )
 
+def has_partial_check_status_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*partial check status:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "partial check status",
+        ],
+    )
+
 def has_false_verification_guard_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*false verification guard:\*\*", body):
         return True
@@ -315,6 +325,8 @@ def main():
             print("  [!] MISSING PR SIZE CHECK: PR body lacks a completed PR size acknowledgement.")
         if not has_false_verification_guard_ack(body):
             print("  [!] MISSING FALSE VERIFICATION GUARD: PR body lacks a completed false verification guard acknowledgement.")
+        if not has_partial_check_status_ack(body):
+            print("  [!] MISSING PARTIAL CHECK STATUS: PR body lacks a completed partial check status acknowledgement.")
         if "docs-only" in normalized_body or "docs only" in normalized_body:
             if not has_docs_only_verification_ack(body):
                 print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body claims docs-only but lacks a completed docs-only verification acknowledgement.")
