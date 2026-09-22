@@ -579,7 +579,7 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn raw_attachment_foreign_owner_blocks_before_outbox_or_local_state_pg() {
+async fn untrusted_attachment_urls_block_before_outbox_or_local_state_pg() {
     let _env = ScopedIntakeTestEnv::enforce();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -590,7 +590,7 @@ async fn raw_attachment_foreign_owner_blocks_before_outbox_or_local_state_pg() {
         crate::services::discord::make_shared_data_for_tests_with_storage(Some(pool.clone()));
     let http = Arc::new(serenity::Http::new("Bot intake-dispatch-test"));
     let deps = deps(&http, &shared);
-    let submission = IntakeSubmission {
+    let mut submission = IntakeSubmission {
         provider: ProviderKind::Claude,
         request: request(channel_id, 4_350_161, "inspect the attachment"),
         origin: IntakeOrigin::LiveMessage,
@@ -598,18 +598,30 @@ async fn raw_attachment_foreign_owner_blocks_before_outbox_or_local_state_pg() {
         has_nonportable_uploads: false,
         attachments: vec![super::super::message_handler::AttachmentDescriptor {
             filename: "report.txt".to_string(),
-            url: "https://cdn.discordapp.com/attachments/1/2/report.txt".to_string(),
+            url: "file:///private/tmp/report.txt".to_string(),
         }],
         preloaded_uploads: Vec::new(),
         voice_announcement: None,
     };
 
-    assert!(matches!(
-        super::admit_text_intake(&deps, &submission).await,
-        super::IntakeAdmission::Blocked {
-            reason: crate::services::cluster::intake_router_hook::IntakeBlockedReason::NonPortableAttachmentForeignOwner { .. }
-        }
-    ));
+    // Raw Discord attachments are now downloaded into portable bundles before
+    // routing. Invalid sources must fail at that boundary, without relying on
+    // a real CDN 404 or the obsolete blanket foreign-attachment prohibition.
+    for url in [
+        "file:///private/tmp/report.txt",
+        "http://cdn.discordapp.com/attachments/1/2/report.txt",
+        "https://cdn.discordapp.com.invalid/report.txt",
+        "https://cdn.discordapp.com:8443/attachments/1/2/report.txt",
+    ] {
+        submission.attachments[0].url = url.to_string();
+        let admission = super::admit_text_intake(&deps, &submission).await;
+        assert!(
+            matches!(&admission, super::IntakeAdmission::Blocked {
+                reason: crate::services::cluster::intake_router_hook::IntakeBlockedReason::AttachmentUnavailable { detail }
+            } if detail == "attachment URL host is not allowed"),
+            "untrusted source must be rejected before download: {admission:?}"
+        );
+    }
     let outbox_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
             .bind(channel_id.get().to_string())
@@ -618,7 +630,7 @@ async fn raw_attachment_foreign_owner_blocks_before_outbox_or_local_state_pg() {
             .expect("count raw attachment routes");
     assert_eq!(
         outbox_count, 0,
-        "raw attachments never enter a foreign outbox"
+        "unavailable attachments must not enter a foreign outbox"
     );
     assert!(
         shared.core.lock().await.sessions.is_empty(),

@@ -7,7 +7,13 @@
 [릴리스 패키징](../ci/release-packaging.md)이다.
 이 문서는 소스 구현, 자동 검사, 실제 설치, provider 응답을 구분한다.
 
-최종 확인: **2026-09-22 15:18 KST**. Mac mini와 Windows에
+최신 설치본은 **`45c63b12560ef317eb400c54d32cfe0ba41e4acd`**다. 두 머신에 추가 대기열
+수정본을 배포했고, 관련 자동 검사 76개와 실제 Windows 대기열 복구·연속 입력·취소·
+오프라인 차단·복귀, 미지정 Mac 기본 대화를 확인했다. schema는 127로 유지했다.
+최신 health·DB·정리 결과와 Mac 부가 기능의 남은 제한은
+[Worker 배치·대기열 추가 엣지케이스 검증](worker-edge-cases-2026-09-22.md)을 따른다.
+
+이하에는 앞선 배포 단계의 기록을 보존한다. **2026-09-22 15:18 KST**에 Mac mini와 Windows에
 `3befd20797ce29d893a7ce13f04d6fb714d94924`를 설치했으며 운영 schema는 127이다.
 에이전트별 우선 장비 선택, 새 세션 대체, 기존 owner 유지와 미지정 에이전트의
 기본 실행을 검증했다. 두 노드는 healthy·fully recovered이며 검증 자원을 정리했다.

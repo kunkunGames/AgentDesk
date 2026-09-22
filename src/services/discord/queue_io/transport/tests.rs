@@ -30,9 +30,9 @@ async fn mock_discord() -> (
         async move {
             let id = uri.path().rsplit('/').next().unwrap();
             let (kind, name, parent) = match id {
-                "42001" => (11, "child-codex", Some("42002")),
+                "42001" => (11, "child-cdx", Some("42002")),
                 "42003" => (1, "", None),
-                _ => (0, "queue-claude", None),
+                _ => (0, "queue-cc", None),
             };
             axum::Json(serde_json::json!({
                 "id": id, "type": kind, "name": name, "guild_id": "42000",

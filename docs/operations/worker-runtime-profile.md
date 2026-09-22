@@ -44,6 +44,13 @@ provider `runtime_role`은 `worker`이며 gateway 접속이 없다는 이유로 
 장애로 바꾸지 않는다. 실제 DB 장애, 종료 대기, 복구 미완료 등은 그대로 반영한다.
 intake poller와 CLI의 실제 실행 가능 여부는 별도의 readiness 근거로 확인한다.
 
+Worker도 실행 중 받은 후속 입력을 대기열에 저장하고, 앞선 turn이 끝나면 자동으로
+이어 실행한다. 재시작할 때는 디스크에 남은 대기열을 복구한다. 이 경로는 Gateway
+연결 없이 기존 Discord REST 인증 정보를 사용하며, full profile과 같은 채널 정책,
+세션 소유권, dispatch lease와 중복 방지 검사를 거친다. `intake_outbox.status=done`은
+worker의 인수 완료를 뜻하므로, 실제 작업 완료는 Discord 답변과 실행·대기열 상태를
+함께 확인한다. 실기기 검증은 [대기열·배치 엣지케이스 보고서](../reports/worker-edge-cases-2026-09-22.md)를 참고한다.
+
 이 프로필은 모듈 실행 범위의 제한이다. 선택한 trusted-worker 운영 모델에서는
 기존 공유 PostgreSQL 연결과 Discord REST credential을 사용한다. 노드별 credential
 권한 격리, Discord token 없는 실행, DB 비접속 protocol을 구현했다는 의미는 아니다.
