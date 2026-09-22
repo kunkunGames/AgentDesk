@@ -25,6 +25,8 @@ use crate::services::cluster::intake_routing::{
 use sqlx::PgPool;
 
 #[cfg(test)]
+mod agent_execution_node_tests;
+#[cfg(test)]
 mod attachment_tests;
 #[cfg(test)]
 mod capacity_tests;
@@ -181,6 +183,9 @@ pub(crate) struct IntakeRouterContext<'a> {
     /// cc and cdx channels.
     pub provider: &'a str,
     pub channel_id: &'a str,
+    /// Direct agent binding, otherwise the verified Discord thread parent.
+    /// Ownership and delivery always continue to use `channel_id`.
+    pub policy_channel_id: &'a str,
     pub user_msg_id: &'a str,
     pub request_owner_id: &'a str,
     pub request_owner_name: Option<&'a str>,
@@ -236,7 +241,7 @@ async fn check_required_target(
         )));
     };
     let mut reasons = required_node_reasons(node, requirements);
-    let agent = match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
+    let agent = match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
         Ok(Some((agent, _, _))) => agent,
         Ok(None) => String::new(),
         Err(error) => return Some(required_block(error.to_string())),
@@ -266,7 +271,8 @@ pub(crate) async fn try_route_intake(
     pool: &PgPool,
     ctx: &IntakeRouterContext<'_>,
 ) -> IntakeRouterDecision {
-    let requirements = match super::execution_requirements::for_channel(pool, ctx.channel_id).await
+    let requirements = match super::execution_requirements::for_channel(pool, ctx.policy_channel_id)
+        .await
     {
         Ok(policy) => policy,
         Err(error) => return required_block(format!("execution policy lookup failed: {error}")),
@@ -274,10 +280,21 @@ pub(crate) async fn try_route_intake(
     if !requirements.is_empty() && ctx.mode != IntakeRoutingMode::Enforce {
         return required_block("hard execution requirements require enforce routing".into());
     }
-    let node_override = ctx
+    let agent_default =
+        match super::agent_execution_node::for_channel(pool, ctx.policy_channel_id).await {
+            Ok(node) => node,
+            Err(error) => {
+                return required_block(format!("agent execution node lookup failed: {error}"));
+            }
+        };
+    if agent_default.is_some() && ctx.mode != IntakeRoutingMode::Enforce {
+        return required_block("agent default execution node requires enforce routing".into());
+    }
+    let explicit_node_override = ctx
         .node_override_instance_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let node_override = explicit_node_override.or(agent_default.as_deref());
 
     if matches!(ctx.mode, IntakeRoutingMode::Disabled) {
         if node_override.is_some() {
@@ -288,10 +305,11 @@ pub(crate) async fn try_route_intake(
         // Disabled-but-preference-set is reported separately so Phase 5
         // operators can spot agents whose label preferences are set
         // but the global mode hasn't been flipped yet.
-        let preference_set = match agent_preferred_labels_for_channel(pool, ctx.channel_id).await {
-            Ok(Some(labels)) => !labels.is_empty(),
-            _ => false,
-        };
+        let preference_set =
+            match agent_preferred_labels_for_channel(pool, ctx.policy_channel_id).await {
+                Ok(Some(labels)) => !labels.is_empty(),
+                _ => false,
+            };
         return IntakeRouterDecision::RanLocal {
             reason: if preference_set {
                 RanLocalReason::DisabledButPreferenceSet
@@ -304,7 +322,7 @@ pub(crate) async fn try_route_intake(
     // Observe and Enforce share the owner/open-route/attachment/placement path.
     // Only the final outbox mutation is mode-dependent.
 
-    // Enforce precedence: live session owner -> explicit /node -> preferred
+    // Enforce precedence: live session owner -> explicit /node -> agent default -> preferred
     // labels. The owner lookup must complete before any placement fallback.
     let owner = match session_owner::resolve_session_owner(
         pool,
@@ -455,7 +473,7 @@ pub(crate) async fn try_route_intake(
             stale_instance_ids,
         } => {
             log_shadowed_owner_state(ctx, &instance_id, node_override, &stale_instance_ids);
-            let agent_id = match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
+            let agent_id = match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
                 Ok(Some((agent_id, _, _))) => agent_id,
                 Ok(None) => String::new(),
                 Err(error) => {
@@ -487,7 +505,20 @@ pub(crate) async fn try_route_intake(
         }
         SessionOwnerResolution::NoOwner => {
             if let Some(target) = node_override {
-                route_node_override_without_owner(pool, ctx, target, &requirements).await
+                // Pin only this new request's retry snapshot. The central hard policy
+                // stays unchanged, so a later default change cannot move a live owner.
+                let mut placement_requirements = requirements.clone();
+                if explicit_node_override.is_none() && agent_default.is_some() {
+                    if !requirements.nodes.is_empty()
+                        && !requirements.nodes.iter().any(|id| id == target)
+                    {
+                        return required_block(
+                            "agent default node conflicts with required nodes".into(),
+                        );
+                    }
+                    placement_requirements.nodes = vec![target.to_string()];
+                }
+                route_node_override_without_owner(pool, ctx, target, &placement_requirements).await
             } else {
                 route_by_preferred_labels(pool, ctx, &requirements).await
             }
@@ -541,7 +572,7 @@ async fn route_by_preferred_labels(
     // channels, so on a paired agent it disagrees with the bot that is
     // actually handling this message. `ctx.provider` is that bot.
     let (agent_id, _agent_provider, preferred_labels) =
-        match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
+        match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => {
                 if !requirements.is_empty() {
@@ -696,7 +727,7 @@ async fn route_node_override_without_owner(
     // #4349: `agents.provider` is ignored here for the same reason as in
     // `try_route_intake` — the handling bot is `ctx.provider`.
     let (agent_id, _agent_provider, _) =
-        match agent_id_and_preferred_labels(pool, ctx.channel_id).await {
+        match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
             Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
             Ok(None) => (String::new(), String::new(), Vec::new()),
             Err(error) => {
@@ -1142,6 +1173,7 @@ mod pg_tests {
             leader_instance_id: "leader-1",
             provider: "claude",
             channel_id: channel,
+            policy_channel_id: channel,
             user_msg_id: "9999",
             request_owner_id: "100",
             request_owner_name: Some("Tester"),

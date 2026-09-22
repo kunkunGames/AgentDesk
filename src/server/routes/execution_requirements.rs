@@ -1,3 +1,4 @@
+use crate::services::cluster::agent_execution_node::AgentExecutionNode;
 use crate::services::cluster::execution_requirements::ExecutionRequirements;
 use crate::{
     app_state::AppState,
@@ -8,6 +9,65 @@ use axum::{
     extract::{Path, State},
 };
 use serde_json::{Value, json};
+
+pub(super) async fn get_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let pool = state
+        .pg_pool_ref()
+        .ok_or_else(|| AppError::internal("postgres unavailable"))?;
+    let node: Option<Option<String>> =
+        sqlx::query_scalar("SELECT default_execution_node_id FROM agents WHERE id=$1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({
+        "default_node_id": node.ok_or_else(|| AppError::not_found("agent not found"))?,
+        "routing_enforced": crate::services::cluster::intake_routing_config::effective_intake_routing_config().mode_is_enforce(),
+    })))
+}
+
+pub(super) async fn put_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(policy): Json<AgentExecutionNode>,
+) -> AppResult<Json<Value>> {
+    policy.validate().map_err(AppError::bad_request)?;
+    let pool = state
+        .pg_pool_ref()
+        .ok_or_else(|| AppError::internal("postgres unavailable"))?;
+    if let Some(node) = &policy.default_node_id {
+        if !crate::services::cluster::intake_routing_config::effective_intake_routing_config()
+            .mode_is_enforce()
+        {
+            return Err(AppError::bad_request(
+                "default execution node requires enforce intake routing",
+            ));
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM worker_nodes WHERE instance_id=$1)")
+                .bind(node)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| AppError::internal(e.to_string()))?;
+        if !exists {
+            return Err(AppError::bad_request("unknown node instance ID"));
+        }
+    }
+    let result =
+        sqlx::query("UPDATE agents SET default_execution_node_id=$2, updated_at=NOW() WHERE id=$1")
+            .bind(id)
+            .bind(&policy.default_node_id)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("agent not found"));
+    }
+    Ok(Json(json!({"default_node_id": policy.default_node_id})))
+}
 
 pub(super) async fn get(
     State(state): State<AppState>,
