@@ -210,6 +210,12 @@ pub(super) trait TurnGateway: Send + Sync {
 
     fn can_chain_locally(&self) -> bool;
 
+    /// REST delivery does not require a Gateway connection. Worker turns can
+    /// edit their own placeholder while queue admission stays with the leader.
+    fn can_deliver_directly(&self) -> bool {
+        self.can_chain_locally()
+    }
+
     fn bot_owner_provider(&self) -> Option<ProviderKind>;
 }
 
@@ -888,6 +894,10 @@ impl TurnGateway for DiscordGateway {
 
     fn can_chain_locally(&self) -> bool {
         self.live_turn.is_some()
+    }
+
+    fn can_deliver_directly(&self) -> bool {
+        true
     }
 
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
