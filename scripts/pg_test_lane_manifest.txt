@@ -70,6 +70,7 @@ src/services/cluster/intake_router_hook.rs
 src/services/cluster/intake_router_hook/agent_execution_node_tests.rs
 src/services/cluster/intake_router_hook/attachment_tests.rs
 src/services/cluster/intake_router_hook/capacity_tests.rs
+src/services/cluster/intake_router_hook/edge_case_tests.rs
 src/services/cluster/intake_router_hook/execution_requirement_tests.rs
 src/services/cluster/intake_router_hook/owner_record.rs
 src/services/cluster/intake_worker/dispatch_stamp_tests.rs
@@ -198,6 +199,7 @@ services::cluster::intake_preflight::tests
 services::cluster::intake_router_hook::agent_execution_node_tests
 services::cluster::intake_router_hook::attachment_tests
 services::cluster::intake_router_hook::capacity_tests
+services::cluster::intake_router_hook::edge_case_tests
 services::cluster::intake_router_hook::execution_requirement_tests
 services::cluster::intake_router_hook::owner_record::tests
 services::cluster::intake_router_hook::pg_tests
@@ -712,6 +714,11 @@ services::cluster::intake_router_hook::agent_execution_node_tests::preferred_lea
 services::cluster::intake_router_hook::agent_execution_node_tests::unavailable_primary_uses_only_ready_compatible_candidates_and_never_moves_stale_owner_pg
 services::cluster::intake_router_hook::attachment_tests::attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg
 services::cluster::intake_router_hook::capacity_tests::execution_capacity_routes_concurrent_channels_without_overflow_pg
+services::cluster::intake_router_hook::edge_case_tests::duplicate_message_race_and_replay_after_primary_change_do_not_execute_twice_pg
+services::cluster::intake_router_hook::edge_case_tests::explicit_override_cannot_bypass_requirements_or_silently_use_primary_pg
+services::cluster::intake_router_hook::edge_case_tests::idle_owner_overrides_new_primary_and_offline_or_conflicting_owners_block_pg
+services::cluster::intake_router_hook::edge_case_tests::per_agent_primary_race_reserves_two_slots_and_reuses_a_released_slot_pg
+services::cluster::intake_router_hook::edge_case_tests::primary_readiness_loss_and_removed_registration_only_use_compatible_fallback_pg
 services::cluster::intake_router_hook::execution_requirement_tests::execution_requirements_block_fallback_and_survive_recovery_pg
 services::cluster::intake_router_hook::execution_requirement_tests::execution_requirements_reject_incompatible_existing_owner_without_reassignment_pg
 services::cluster::intake_router_hook::owner_record::tests::acquire_covers_each_generation_rule

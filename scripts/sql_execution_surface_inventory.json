@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "dd57dcca407d1905668315875868290ef2b76f0d",
+  "measured_at_sha": "0ced7fa74ab9d9035b176843b9000e476bd26d12",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1188,7 +1188,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:cc7343a96d25c8a15c12ec10af5677864419a88d538b17e860ad48788e0f5133"
+      "fingerprint": "sha256:2159c7d92ce740f2e9a7e5af39ad973446b28da261386fa6db4ee17f64d962b9"
     },
     {
       "root": "policies",
@@ -24193,6 +24193,159 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:1e29a92d75138dcc2fc07f619f90e8e6f672e2763ff80cb3524dd9618de7bff3"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:1d3a2ca04cb04302f0e9a31a320a1d78a4327fb72955dda4fd66e26739f763d4"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:205b1b2706b9a65fb209b81498d20cf462bf3d700ac5c1d22e8a3e08c3b58380"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:2cc9484cf75686c12191e6f71e8856935565954315a76c22c314ed89cdff2bd7"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:6e72d81d90746f35a006fd5377efa5e62ba95ee21b34d930a78943edd373e11a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:8479bff07a378c96ad187eaa7db8af43018ef22eae7debcb8635507903bf1253"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:9264045d7c1458df8c684515d35dc5280cd72bf04916f71f2716bf2d4fc519cb"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:c6cff657ce43a8b15bedb7f51435ba31a6275e1b67707027acb02b789aa26233"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:cda2c16ad68e29e13bfc01cc538ae0e03478a05b26784771bc7beb8c9ea14c0a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:dd049f2886b862d88e7ad994a6fa73bc9904363649248236d2a0feaf01fb6030"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e31566d2623fe8ddf694ac5df67e29bc7e6e2219e0c798322320eb02dc36deac"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:99f3118e5ce28c00aa168bc67f89010825e352163afa20bb86112caaf15038e6"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:10644a0f0966761e7e1e00e4a50976ca3cb8798f4c1845568919bde499487996"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:14b15547a5f5e29ea4b791432b9fc341bcc4fbcb991ead724bb27af2d72feb1a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:217d237a90f4624de6d754835a1c26c2d730a0a36488f1b1d833ea20e80a1fba"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:56e3cce7cea8d824b481b9e16edc95ac1fc22cd47765afb9e94a52c50301c069"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:aacbeaeb1c6134c83a0cd693d028890a785bbadc5455d290567348a355217de9"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b7294a85127363c46b76af0cfc243d6ad53341e0311d72257d981759d775f2b3"
     },
     {
       "root": "src",
