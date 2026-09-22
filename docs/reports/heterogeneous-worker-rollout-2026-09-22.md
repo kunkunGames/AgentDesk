@@ -7,6 +7,12 @@
 [릴리스 패키징](../ci/release-packaging.md)이다.
 이 문서는 소스 구현, 자동 검사, 실제 설치, provider 응답을 구분한다.
 
+최종 확인: **2026-09-22 15:18 KST**. Mac mini와 Windows에
+`3befd20797ce29d893a7ce13f04d6fb714d94924`를 설치했으며 운영 schema는 127이다.
+에이전트별 우선 장비 선택, 새 세션 대체, 기존 owner 유지와 미지정 에이전트의
+기본 실행을 검증했다. 두 노드는 healthy·fully recovered이며 검증 자원을 정리했다.
+Mac의 부가 표시와 idle 세션 강제 종료에서 확인한 제한도 아래에 기록한다.
+
 ## 결정과 ROI
 
 현재의 신뢰하는 소규모 장비 집합에서는 **하나의 AgentDesk 코드와 OS별 공통 artifact에
@@ -79,17 +85,19 @@ Windows 작업은 로그인한 사용자 권한으로 실행된다. 재부팅 �
 worker 프로세스 종료와 함께 끝나며 살아 있는 프로세스 재연결을 성공으로 가장하지
 않는다. 후속 turn/resume은 provider와 세션 복구 계약을 따른다.
 
-기존 23개 agent row는 Windows 초기화·재시작 및 Mac 재배포 전후의 동일 집계
-checksum으로 보존을 확인했다. Discord 실험에는 전용 thread와 임시 검증 agent를
-사용하며, 이 agent는 운영 정의 변경을 뜻하지 않는다.
+기존 23개 agent의 정의는 Windows 초기화·재시작 및 Mac 재배포 전후의 동일 집계
+checksum으로 보존을 확인했다. 최종 비교는 schema 126 baseline과 동일한 열을
+사용했으며 checksum은 `33b08124bb7a7db487fd1e48a1edca59`다. 새로 추가한
+`default_execution_node_id`는 별도로 검사해 기존 23개 모두 `null`임을 확인했다.
+Discord 실험에는 전용 thread와 임시 검증 agent를 사용했고, 운영 정의를 일괄 변경하지 않았다.
 
 운영자가 새 채널/스레드에서 `/node` 선택기로 worker를 지정할 수 있다. 기존 live
 owner가 있으면 해당 owner가 우선하므로 이 선택은 살아 있는 Mac 세션을 Windows로
 이동시키는 명령이 아니다. 새 소스는 에이전트 상세 화면에서 기본 실행 노드를 선택하고,
 직접 연결되지 않은 Discord 스레드가 실제 부모 채널의 실행 정책을 상속하도록 구현했다.
 직접 연결된 스레드 정책은 부모보다 우선하며 `threadInherit: false`도 유지한다.
-이 기능은 migration 127과 새 leader 설치가 필요하다. 기존 schema 126 설치본에
-UI와 부모 실행 정책 상속이 이미 반영됐다는 의미는 아니다.
+이 기능은 migration 127과 새 leader 설치가 필요하며 이번 두 장비 배포에 반영했다.
+기존 schema 126 binary만 사용하는 설치본에는 UI와 부모 실행 정책 상속이 없다.
 
 기본 노드는 우선 장비로 취급한다. 소유자가 없는 새 세션은 우선 장비의 준비 상태·필수
 조건·여유 슬롯을 확인하고, 불가능하면 다른 호환 노드를 선택한다. 우선 장비가 leader여도
@@ -137,9 +145,16 @@ migration을 두 번 실행했다. 120/121번에 적용됐던 과거 Kakao migra
 checksum과 description이 정확히 일치하는 경우만 122/123번 이력으로 이관했다.
 checksum 검사를 비활성화하지 않았다.
 
-운영 schema는 `0126_execution_capacity.sql`까지 적용됐다. Kakao 관련 데이터는
+첫 배포에서 `0126_execution_capacity.sql`까지 적용했다. Kakao 관련 데이터는
 격리 검증에서 bindings 2, events 34, targets 36, requests 38, operations 42개로
 보존됐다. 이전 schema를 전제로 한 binary만 되돌리는 rollback은 사용하지 않는다.
+
+에이전트 우선 장비 배포 직전 schema 126 운영 DB를 다시 백업했다. 내부 디스크의
+`/Users/kunkun/.adk/backups/agent-primary-pre127-20260922T043615Z`에 169,222,302-byte
+dump와 binary·설정·release manifest 백업을 보관하고 `pg_restore --list`로 archive를
+검사했다. 이후 migration 127을 적용했다. 최종 `3befd2079` 재배포는 같은 schema를
+사용하며 두 머신의 설정 파일 checksum도 유지됐다. schema 127 DB에 이전 schema용
+binary만 되돌리는 방식은 사용하지 않는다.
 
 Mac 배포는 기존 deploy script의 drain, migration, package layout을 재사용했다.
 기존 운영자가 지정한 내부 디스크 launchd stdout/stderr 경로를 원자적 plist 갱신 시
@@ -244,30 +259,106 @@ owner는 Windows였다. 후속 대화에서 동일 DB session과 provider sessio
 새 turn의 취소 토큰을 연결하지 않던 것이 원인이었다. 공통 process 입력 함수에서
 각 turn의 PID를 입력 전 등록하고 이미 취소된 입력을 거절하도록 수정했다. Claude도
 같은 경로를 재사용하며 Windows `taskkill`은 실제 성공 종료 코드를 확인한다.
-소스 수정만으로 실제 취소 성공을 주장하지 않으며 새 설치본에서 자식 종료를 재검증한다.
+두 장비에 `502b12897`을 설치한 뒤 재검증했다. 실제 PowerShell 대기 자식 PID를 관찰하고
+Mac 중앙 API에서 취소했을 때 3.86초 안에 종료됐으며, 실행 lease가 해제되고
+취소된 완료 문자열은 게시되지 않았다. 단순 in-flight 삭제와 실제 자식 종료를 구분했다.
+최종 `3befd2079` 설치본에서도 같은 검증이 통과했다. 실제 45초 대기 자식 PID 57360은
+취소 요청 후 2.44초 안에 종료됐고, 중앙 출력 조회·lease 해제·완료 문자열 미게시를 확인했다.
 
 ### 에이전트별 기본 노드 선택
 
 `fc579aa65`부터 `agents.default_execution_node_id`, full-profile API, 에이전트 상세 화면의
 장비 선택과 Discord 부모 정책 상속을 추가했다. 우선순위는 기존 live owner → 채널 `/node`
-→ 에이전트 기본 노드 → label/활성 자동 배정이다. 선택은 구체적인 instance ID이며,
-오프라인 또는 실행 조건 불충족 시 다른 OS로 자동 대체하지 않는다.
+→ 준비된 에이전트 우선 노드 → 호환되는 대체 노드다. `dd57dcca4`에서 기본값을 우선
+장비로 해석하도록 개선했으며, 새 세션에 한해 오프라인·미준비·용량 부족 시 대체한다.
+기존 세션의 소유권이 불확실하거나 필수 OS·노드 조건을 충족하는 장비가 없으면 차단한다.
+`502b12897`에서는 API의 SQL을 실행 정책 서비스로 옮겨 책임을 정리했다.
 
 대시보드 컴포넌트 4개 검사, TypeScript 검사와 production build가 통과했다. Playwright의
 desktop/mobile에서 선택만으로 쓰기 요청이 발생하지 않는 것, 저장, 상세 재개방 후 값 유지,
 기본값 해제, 오프라인 안내를 확인했다. 인접 에이전트 상세/모바일 목록 검사도 통과했다.
-이 브라우저 검증은 API fixture를 사용한다. UI 저장의 실제 운영 DB 반영 및 새 세션 배정은
-migration 127과 leader/worker 배포 후 별도로 확인해야 한다.
+처음 브라우저 검증은 API fixture를 사용했다. 이후 migration 127과 `502b12897`을
+두 장비에 설치하고 실제 LAN 대시보드에서도 desktop 1440×900, mobile 390×844의
+선택·해제·저장·재개방 및 가로 넘침 없음을 확인했다. 검증용 agent만 임시 office에
+연결했으며 검증 후 연결을 제거했다. 최종 확인에서도 원래 office의 agent 수는 16개다.
+
+실제 Discord 새 세션은 Windows에 배정됐다. 기본값을 Mac으로 바꾼 뒤 같은 대화의
+DB session과 provider session은 Windows에서 유지됐다. 별도 새 대화에서는 기본값을
+Windows로 두고 worker 프로세스를 실제 중지했다. leader가 offline을 관찰한 뒤
+Mac에서 새 session을 시작해 답했으며 기본값은 Windows로 유지됐다. Worker를 재시작해
+readiness 복귀도 확인했다. 이는 기존 세션의 OS 간 자동 이전 검증이 아니다.
+
+해당 Mac 검증 session의 정리 중 idle `force-kill` API는 20초 내 응답하지 않았다.
+검증 thread의 정확한 tmux session만 SSH로 종료한 후 정상 session/agent 삭제 API로
+정리했다. 이 결과로 Mac의 모든 session 제어 API가 검증됐다고 주장하지 않는다.
+
+### Worker REST 응답 중복과 Discord 링크
+
+`502b12897`의 실제 첨부 검증에서 파일 안의 nonce는 정확히 읽었지만 동일 답변을 다른
+Codex 기반 봇도 게시했다. intake_outbox는 한 건이었고 `message_outbox`의
+`source=headless_turn`에서 두 번째 게시가 발생했다. `can_chain_locally=false`를
+직접 Discord 답변 불가로도 해석한 것이 원인이다. REST로 편집한 기존 답변과 별도
+headless outbox 전송이 겹쳤다. 이전 검사에서 첫 답변만 관찰한 결과를 단일 전송의
+증거로 사용하지 않는다.
+
+`3befd2079`에서 `TurnGateway::can_deliver_directly`를 분리했다. REST worker는
+자신의 채널 runtime과 bot HTTP를 통해 기존 placeholder를 완료하고, queue chaining은
+계속 leader의 권한에 따른다. 실제 HeadlessGateway의 outbox 전달 계약은 유지한다.
+일반 Mac gateway도 같은 직접 전달 경로를 사용한다.
+
+완료 footer의 원문 링크도 프로세스의 기본 guild ID를 사용해 다른 Discord 서버의
+채널에서 잘못 표시됐다. 정상 intake가 획득한 채널의 실제 guild를 turn anchor에
+기록하고 DM은 `@me`를 사용한다. 확인 실패 시 다른 서버 ID로 링크를 만들지 않는다.
+기존 두 머신의 기본 guild 설정은 변경하지 않았다.
+
+고정한 `3befd2079` 소스로 Windows library test executable을 컴파일했다. 직접 REST
+전달·headless 전달·완료 처리·guild anchor의 서로 다른 54개 검사가 통과했다. 여섯
+PostgreSQL 검사도 포함하며, 한 fixture migration이 기존 15초 제한을 넘긴 최초 실패와
+그 검사만 다시 실행해 통과한 결과를 모두 보존했다. 운영 DB는 테스트 DB로 쓰지 않았다.
+이 수정본의 재배포·실제 단일 응답 검증은 아래 완료 기록으로 확정한다.
+
+### 최종 설치본의 Discord 재검증
+
+두 머신을 `3befd2079`로 배포한 뒤 전용
+[Windows 검증 스레드](https://discord.com/channels/1469509996621594686/1551836722734825592)에서
+아래 항목을 확인했다. 첫 답변 수신뿐 아니라 turn 종료 후 전체 메시지와 outbox를 검사했다.
+
+| 검사 | 실제 결과 |
+| --- | --- |
+| 에이전트 우선 장비를 Windows로 지정하고 새 대화 시작 | session 111131의 owner가 `windows-worker-1`, 실행 완료 |
+| 우선 장비를 Mac으로 변경하고 같은 대화에 후속 입력 | 같은 DB session과 provider session을 Windows에서 유지 |
+| Discord 첨부 파일 안에만 넣은 임의 문자열 읽기 | Windows가 파일을 읽고 정확한 문자열로 응답 |
+| 위 세 turn의 답변 전달 | 각 turn에서 올바른 Codex 봇의 답변 한 개, 실제 guild의 원문 링크, `headless_turn` 중복 outbox 없음 |
+| 중앙 Mac API로 Windows 출력 조회·실행 취소 | process 출력 조회 성공, 실제 대기 자식 종료 2.44초, 실행 lease 해제 |
+
+실제 worker 중지 후 새 세션이 Mac으로 대체되는 검증은 배정 코드가 동일한
+`502b12897`에서 통과했다. worker를 재기동한 후 최종 수정본을 설치했고, leader가 확인한
+Windows Codex readiness·인증된 도달 가능성이 다시 정상임을 확인했다.
+
+별도 [Mac 기본 동작 검증 스레드](https://discord.com/channels/1469509996621594686/1551837431253311523)에서는
+우선 장비와 필수 실행 조건을 설정하지 않은 agent로 두 번 대화했다. 첫 turn은 Mac의
+session 111132에서 실행됐고, 후속 turn도 같은 DB/provider session을 유지하며 정확한
+문자열을 한 번씩 답했다. cluster intake outbox로 우회하지 않은 기존 local 실행도 확인했다.
+
+Mac 검사에 추가했던 **원문 링크 존재 assertion은 통과하지 않았다**. 첫 답변과 후속
+답변 모두 정상 본문·소요 시간·호스트 표시가 있었지만 원문 링크는 없었다. 실행 및 세션
+연속성 검증과 링크 표시 검증을 구분하며, Mac까지 링크 검사가 통과했다고 기록하지 않는다.
+앞서 확인한 idle `force-kill` API 지연과 함께 Mac의 모든 부가 표시·세션 제어 동작이
+검증됐다는 주장을 제한한다. Mac 검증용 tmux만 정확한 이름으로 종료하고 정상 삭제
+API로 session/agent를 제거했다. 모든 검증 스레드는 기록을 남긴 채 archive했다.
 
 ## 릴리스와 검증 경계
 
 - [PR #2118](https://github.com/kunkunGames/AgentDesk/pull/2118)의 native release workflow와
   [PR #2119](https://github.com/kunkunGames/AgentDesk/pull/2119)의 CI/복구 선행 수정은 main에 반영됐다.
 - 2026-09-22 확인 당시 원격 main은 `f2a71b102738ded6631bac11043ebba9903e587c`이며
-  구현 브랜치가 이 main을 포함한다. 구현 브랜치는 `feat/heterogeneous-worker-release`다.
+  최종 소스 검증 중 다시 fetch한 결과도 동일했다. 구현 브랜치는 이 main을 포함하는
+  `feat/heterogeneous-worker-release`다.
   전체 cluster 기능이 main에 병합됐다는 뜻은 아니다.
-- feature CI의 native Linux/Windows/macOS matrix `35664190385`는 모두 통과했다.
-  이후 코드 수정본의 빌드와 실기기 응답은 별도로 검증한다.
+- 최종 소스 `3befd2079`의 [native release CI 35689976952](https://github.com/kunkunGames/AgentDesk/actions/runs/35689976952)에서
+  validate, dashboard와 Linux x86_64·Windows x86_64·macOS ARM64 native matrix가 모두 통과했다.
+  publish는 요청하지 않아 skipped다. 각 archive의 source commit·release profile·파일 계약을
+  검증한 뒤 이 CI의 Mac/Windows artifact를 실제 두 장비에 설치했다.
 - 공개 version tag나 GitHub Release를 게시하지 않았다. GitHub의 artifact 생성·검증·
   게시 workflow와 LAN 장비의 실제 설치는 별도 단계다. LAN으로 자동 배포하는
   상시 self-hosted runner가 설치됐다고 주장하지 않는다.
@@ -277,14 +368,32 @@ migration 127과 leader/worker 배포 후 별도로 확인해야 한다.
 - Linux worker의 실제 설치, Mac Studio 추가 설치, 재부팅 후 무인 Windows 서비스,
   장시간 다중 노드 부하 검증은 수행하지 않았다.
 
-## 완료 조건
+## 완료 기록과 운영 경계
 
-Windows 수정본으로 실행 중인 자식의 실제 취소를 확인하고, 에이전트별 기본 노드 API와
-새 세션의 선택 노드 실행을 확인한 뒤 임시 검증 agent를 정리한다. 전역 자동 배정은
-비활성으로 유지하며 에이전트별 명시적 기본값부터 운영자가 선택한다. 기존 owner 보존과
-필수 OS/provider 조건을 유지하며, SSD 장애에 따른 Mac 로컬 저장소 제한을 정상 동작으로
-표시하지 않는다.
+기본 노드 API·실제 LAN UI·새 Windows 세션·owner 유지·실제 worker 중지 후 Mac 대체·
+Windows 자식 취소·미지정 Mac agent의 새 세션과 후속 대화를 확인했다. REST 중복 수정본의
+두 장비 배포와 Windows 단일 응답 검증도 완료했다. Mac 원문 링크 존재 assertion 실패는
+별도 제한으로 남기며 전체 확장 검사가 모두 통과했다고 표현하지 않는다.
 
-로컬 증거는 `target/heterogeneous-worker-validation/` 아래 build·migration·native
-verification 로그와 `windows-production-restart-verification.json`에 남긴다. 이 경로의
-운영 진단 파일을 release asset에 포함하지 않는다.
+2026-09-22 15:18 KST 최종 검사에서 두 노드는 `online`, `healthy`,
+`fully_recovered=true`였고 active/finalizing/queue와 실행 slot 점유는 모두 0이었다.
+원래 agent 23개의 기존 열 checksum, 새 기본 노드 값 23개 모두 `null`, office agent 수
+16개를 재확인했다. 임시 검증 agent는 0개이며 검증 session도 제거했다.
+
+전역 자동 배정은 비활성으로 유지하며 대시보드에서 에이전트별 **Discord 기본 실행 노드**를
+선택해 적용한다. 기존 owner 보존과 필수 OS/provider 조건을 유지한다. Mac mini의
+gateway/DB 중단 시 전체 서비스 승계, worker의 로컬 prompt·계정·저장소 자동 동기화,
+외장 SSD 복구와 로그온 전 Windows 서비스 가동까지 완료한 구성은 아니다.
+
+로컬 증거는 `target/heterogeneous-worker-validation/`의 다음 파일에 남겼다.
+
+- `agent-node-rollout-final.json`: 최종 배포 commit, health, 기존 agent 보존, 검증 자원 정리.
+- `agent-default-node-live.json`: Windows 새 세션·owner 유지·첨부·단일 전달·중앙 취소.
+- `agent-fallback-live.json`: 실제 worker 중지와 Mac 대체, worker 복귀.
+- `agent-legacy-mac-live.json`: 미지정 Mac agent의 실행·세션 유지 및 원문 링크 검사 실패.
+- `agent-node-native-artifacts.json`, `windows-provider-deployment-verification.json`,
+  `mac-rest-delivery-deploy.log`: CI artifact 검증과 실제 설치.
+- `rest-delivery-coverage.json`, `rest-delivery-focused-tests-initial.json`,
+  `rest-delivery-pg-retry.log`: 54개 검사와 최초 fixture timeout·재실행 결과.
+
+이 경로의 운영 진단 파일을 release asset에 포함하지 않는다.
