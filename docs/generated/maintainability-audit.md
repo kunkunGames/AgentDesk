@@ -47,7 +47,7 @@ Decomposition parents whose inline test LoC exceeds 3x their production LoC (fil
 
 | Severity | File | Line | Message |
 |---|---|---:|---|
-| warn | `src/services/discord/inflight.rs` |  | 5373 test LoC vs 674 prod LoC (ratio 7.97x > 3x, 6047 raw); migrate the stranded tests with the decomposed production code |
+| warn | `src/services/discord/inflight.rs` |  | 5372 test LoC vs 674 prod LoC (ratio 7.97x > 3x, 6046 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_bridge/cancel_finalize_policy.rs` |  | 450 test LoC vs 149 prod LoC (ratio 3.02x > 3x, 599 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_finalizer.rs` |  | 3992 test LoC vs 839 prod LoC (ratio 4.76x > 3x, 4831 raw); migrate the stranded tests with the decomposed production code |
 | warn | `src/services/discord/turn_finalizer/delivery_lease.rs` |  | 426 test LoC vs 88 prod LoC (ratio 4.84x > 3x, 514 raw); migrate the stranded tests with the decomposed production code |
@@ -71,7 +71,7 @@ Files under src/server/routes/ that mix raw SQL, json!() shaping, and crate::ser
 | warn | `src/server/routes/github.rs` |  | route file mixes SQL (6), json!() (29), and crate::services calls (1) |
 | warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (17), json!() (10), and crate::services calls (7) |
 | warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (2), and crate::services calls (7) |
-| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (12), and crate::services calls (4) |
+| warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (10), json!() (11), and crate::services calls (5) |
 | warn | `src/server/routes/review_verdict/verdict_route.rs` |  | route file mixes SQL (5), json!() (20), and crate::services calls (5) |
 | warn | `src/server/routes/stats.rs` |  | route file mixes SQL (32), json!() (7), and crate::services calls (1) |
 
