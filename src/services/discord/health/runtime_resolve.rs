@@ -175,13 +175,13 @@ async fn resolve_channel_candidate(
     // A worker has no gateway Context. Resolve a thread's authoritative parent
     // once, then reuse the configured allowlists instead of probing every bot.
     // Keep explicit child bindings ahead of inherited parent bindings.
-    if candidates.len() > 1
-        && !candidates
-            .iter()
-            .any(|candidate| candidate.explicit_channel_match)
-        && snapshots
-            .iter()
-            .any(|(_, shared, _)| shared.http.cached_serenity_ctx.get().is_none())
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.explicit_channel_match)
+        && snapshots.iter().any(|(_, shared, settings)| {
+            shared.http.cached_serenity_ctx.get().is_none()
+                && !settings.allowed_channel_ids.is_empty()
+        })
     {
         let lookup = async {
             for (_, shared, _) in &snapshots {
@@ -299,7 +299,8 @@ pub(super) async fn resolve_direct_meeting_runtime(
         return Ok((http, shared));
     }
 
-    if shared_candidates.len() == 1 {
+    if shared_candidates.len() == 1 && unbound_single_runtime_allowed(&shared_candidates[0].1).await
+    {
         let (_, shared) = shared_candidates[0].clone();
         if let Some(http) = shared.serenity_http_or_token_fallback() {
             return Ok((http, shared));
@@ -403,7 +404,8 @@ pub(super) async fn resolve_direct_meeting_shared(
         return Ok(shared);
     }
 
-    if shared_candidates.len() == 1 {
+    if shared_candidates.len() == 1 && unbound_single_runtime_allowed(&shared_candidates[0].1).await
+    {
         return Ok(shared_candidates[0].1.clone());
     }
 
@@ -416,6 +418,14 @@ pub(super) async fn resolve_direct_meeting_shared(
         ),
     })
     .to_string())
+}
+
+async fn unbound_single_runtime_allowed(shared: &SharedData) -> bool {
+    // During worker startup the eventual channel owner may not be registered
+    // yet. A single restricted REST runtime is not proof that it owns every
+    // channel. Preserve legacy gateway and unrestricted single-bot behavior.
+    shared.http.cached_serenity_ctx.get().is_some()
+        || shared.settings.read().await.allowed_channel_ids.is_empty()
 }
 
 #[cfg(test)]
@@ -599,5 +609,13 @@ mod direct_meeting_candidate_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn restricted_worker_cannot_take_an_unbound_channel_during_startup() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        assert!(super::unbound_single_runtime_allowed(&shared).await);
+        shared.settings.write().await.allowed_channel_ids = vec![41];
+        assert!(!super::unbound_single_runtime_allowed(&shared).await);
     }
 }
