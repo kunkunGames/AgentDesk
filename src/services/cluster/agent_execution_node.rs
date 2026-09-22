@@ -23,6 +23,41 @@ impl AgentExecutionNode {
     }
 }
 
+pub(crate) async fn get(
+    pool: &PgPool,
+    agent: &str,
+) -> Result<Option<AgentExecutionNode>, sqlx::Error> {
+    let node: Option<Option<String>> =
+        sqlx::query_scalar("SELECT default_execution_node_id FROM agents WHERE id=$1")
+            .bind(agent)
+            .fetch_optional(pool)
+            .await?;
+    Ok(node.map(|default_node_id| AgentExecutionNode { default_node_id }))
+}
+
+pub(crate) async fn node_registered(pool: &PgPool, node: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM worker_nodes WHERE instance_id=$1)")
+        .bind(node)
+        .fetch_one(pool)
+        .await
+}
+
+pub(crate) async fn set(
+    pool: &PgPool,
+    agent: &str,
+    policy: &AgentExecutionNode,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query("UPDATE agents SET default_execution_node_id=$2, updated_at=NOW() WHERE id=$1")
+            .bind(agent)
+            .bind(&policy.default_node_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
 pub(crate) async fn for_channel(
     pool: &PgPool,
     channel: &str,

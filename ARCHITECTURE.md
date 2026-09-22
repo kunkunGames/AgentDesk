@@ -563,6 +563,7 @@ src/
 │   │   │   ├── execution_requirement_tests.rs
 │   │   │   ├── model.rs
 │   │   │   ├── owner_record.rs
+│   │   │   ├── placement.rs
 │   │   │   └── session_owner.rs
 │   │   ├── intake_worker/
 │   │   │   ├── dispatch_stamp_tests.rs

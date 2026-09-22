@@ -1,5 +1,5 @@
-use crate::services::cluster::agent_execution_node::AgentExecutionNode;
-use crate::services::cluster::execution_requirements::ExecutionRequirements;
+use crate::services::cluster::agent_execution_node::{self, AgentExecutionNode};
+use crate::services::cluster::execution_requirements::{self, ExecutionRequirements};
 use crate::{
     app_state::AppState,
     error::{AppError, AppResult},
@@ -17,14 +17,12 @@ pub(super) async fn get_node(
     let pool = state
         .pg_pool_ref()
         .ok_or_else(|| AppError::internal("postgres unavailable"))?;
-    let node: Option<Option<String>> =
-        sqlx::query_scalar("SELECT default_execution_node_id FROM agents WHERE id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
+    let node = agent_execution_node::get(pool, &id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .ok_or_else(|| AppError::not_found("agent not found"))?;
     Ok(Json(json!({
-        "default_node_id": node.ok_or_else(|| AppError::not_found("agent not found"))?,
+        "default_node_id": node.default_node_id,
         "routing_enforced": crate::services::cluster::intake_routing_config::effective_intake_routing_config().mode_is_enforce(),
     })))
 }
@@ -46,24 +44,17 @@ pub(super) async fn put_node(
                 "default execution node requires enforce intake routing",
             ));
         }
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM worker_nodes WHERE instance_id=$1)")
-                .bind(node)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| AppError::internal(e.to_string()))?;
+        let exists = agent_execution_node::node_registered(pool, node)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         if !exists {
             return Err(AppError::bad_request("unknown node instance ID"));
         }
     }
-    let result =
-        sqlx::query("UPDATE agents SET default_execution_node_id=$2, updated_at=NOW() WHERE id=$1")
-            .bind(id)
-            .bind(&policy.default_node_id)
-            .execute(pool)
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-    if result.rows_affected() == 0 {
+    let updated = agent_execution_node::set(pool, &id, &policy)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !updated {
         return Err(AppError::not_found("agent not found"));
     }
     Ok(Json(json!({"default_node_id": policy.default_node_id})))
@@ -76,12 +67,9 @@ pub(super) async fn get(
     let pool = state
         .pg_pool_ref()
         .ok_or_else(|| AppError::internal("postgres unavailable"))?;
-    let policy: Option<Value> =
-        sqlx::query_scalar("SELECT execution_requirements FROM agents WHERE id=$1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
+    let policy = execution_requirements::get(pool, &id)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(Json(
         json!({"execution_requirements":policy.ok_or_else(|| AppError::not_found("agent not found"))?}),
     ))
@@ -97,14 +85,10 @@ pub(super) async fn put(
     let pool = state
         .pg_pool_ref()
         .ok_or_else(|| AppError::internal("postgres unavailable"))?;
-    let result =
-        sqlx::query("UPDATE agents SET execution_requirements=$2, updated_at=NOW() WHERE id=$1")
-            .bind(id)
-            .bind(&value)
-            .execute(pool)
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-    if result.rows_affected() == 0 {
+    let updated = execution_requirements::set(pool, &id, &value)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    if !updated {
         return Err(AppError::not_found("agent not found"));
     }
     Ok(Json(json!({"execution_requirements":value})))
