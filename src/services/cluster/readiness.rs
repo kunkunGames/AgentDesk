@@ -37,6 +37,7 @@ pub(crate) struct ExecutionProbe {
     pub expires_at_ms: i64,
     pub os: String,
     pub arch: String,
+    #[serde(serialize_with = "crate::config::RuntimeProfile::serialize_registry")]
     pub runtime_profile: crate::config::RuntimeProfile,
     pub release: Value,
     pub providers: BTreeMap<String, ProviderEvidence>,

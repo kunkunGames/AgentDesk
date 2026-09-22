@@ -1,4 +1,4 @@
-# Worker 실행 용량과 자동 배정
+# 실행 노드의 실행 용량과 자동 배정
 
 구현과 PostgreSQL 경쟁·만료·취소·nonce 검증을 완료했고 Mac mini/Windows 운영 노드에
 각 2개 slot을 적용했다. 실제 Discord 검증 중에는 자동 배정을 비활성화한다.
@@ -10,8 +10,8 @@ slot 수와 자동 배정 여부를 설정한다. 별도 scheduler 서비스나 
 cluster:
   enabled: true
   instance_id: windows-worker-1
-  role: worker
-  runtime_profile: worker
+  role: runner
+  runtime_profile: runner
   execution_slots: 2
   intake_routing:
     enabled: true
@@ -21,9 +21,9 @@ cluster:
 
 `execution_slots`는 1~1024의 정수이며 변경 후 재시작해야 한다. 실제 장비에서 측정한
 동시 실행 수를 넣는다. CPU 코어 수를 그대로 사용하지 않는다. `capacity_aware`는
-새 channel의 적합한 worker를 점유율 → 최근 배정이 오래된 순서 → instance ID로 고른다.
+새 channel의 적합한 실행 노드를 점유율 → 최근 배정이 오래된 순서 → instance ID로 고른다.
 비율을 비교하므로 slot 2개와 8개인 장비를 같은 용량으로 취급하지 않는다.
-현재 자동 배정은 worker를 우선하고 leader는 적합한 worker가 없을 때 후보가 된다.
+현재 자동 배정은 실행 노드를 우선하고 허브는 적합한 실행 노드가 없을 때 후보가 된다.
 
 기존 provider·필수 OS/architecture·도구·repository·인증 프로필·첨부 소비 능력 검사를
 먼저 통과해야 한다. version 1 용량을 광고하지 않는 구버전 노드는 자동 배정 집합에
@@ -43,7 +43,7 @@ cluster:
 - 프로세스 내 semaphore는 provider 함수가 반환할 때까지 유지한다. DB lease가
   만료되어도 살아 있는 동일 프로세스의 실행 수를 상한 이상으로 늘리지 않는다.
 - lease nonce가 일치할 때만 갱신·해제한다. 오래된 실행의 정리가 후속 실행이나
-  다른 worker의 lease를 지우지 않는다. 정상 종료·시작 실패·panic에서는 RAII로
+  다른 실행 노드의 lease를 지우지 않는다. 정상 종료·시작 실패·panic에서는 RAII로
   반환하고, 프로세스가 강제 종료되면 DB 만료와 기존 outbox 복구가 작동한다.
 
 가득 찬 고정 owner를 다른 OS로 이동하지 않는다. 신규 입력은 실행하지 않고 이유를
@@ -59,7 +59,7 @@ TUI 세션은 다르며 idle 세션만으로 slot을 차지하지 않는다.
 
 노드 API는 `execution_active`와 `execution_occupied`를 반환한다. 각각 실제 실행
 lease 수와 전달 예약을 합친 점유 수이다. 기존 `active_dispatch_count`는 전달 작업
-관측값으로 유지한다. 계정 quota는 별도 병목이며 worker 증설로 해결된다고 가정하지 않는다.
+관측값으로 유지한다. 계정 quota는 별도 병목이며 실행 노드 증설로 해결된다고 가정하지 않는다.
 
 instance ID는 fleet에서 유일해야 한다. 같은 ID로 두 프로세스를 띄우는 구성은 지원하지
 않는다. PostgreSQL 단절 시 새 작업을 거절하고 기존 작업을 취소하는 정책이다.

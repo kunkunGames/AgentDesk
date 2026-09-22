@@ -1,16 +1,17 @@
-# 에이전트별 Discord 기본 실행 노드
+# 에이전트별 Discord 우선 실행 장비
 
-leader/worker는 AgentDesk **노드의 운영 역할**이다. Discord 에이전트는 기존 역할과
-채널 연결을 유지하면서 새 세션을 시작할 기본 장비를 선택할 수 있다. 여러 worker를
-구분하기 위해 `leader` 또는 `worker`라는 문자열 대신 안정적인 `instance_id`를 저장한다.
+허브/실행 노드는 AgentDesk **노드의 운영 역할**이다. Discord 에이전트는 기존 역할과
+채널 연결을 유지하면서 새 세션을 시작할 우선 장비를 선택할 수 있다. 여러 실행 노드를
+구분하기 위해 `hub` 또는 `runner`라는 역할 이름 대신 안정적인 `instance_id`를 저장한다.
 
-대시보드의 에이전트 상세 → **Discord 기본 실행 노드**에서 등록된 노드를 선택하고
-저장한다. 목록은 hostname, leader/worker 역할, OS를 함께 보여준다. 등록 정보가
+대시보드의 에이전트 상세 → **우선 실행 장비**에서 등록된 장비를 선택하고
+저장한다. 목록은 hostname, 허브/실행 노드 역할, OS를 함께 보여준다. 등록 정보가
 없어진 기본 노드도 설정값에는 유지하며 명시적으로 해제할 수 있다. 실제 새 세션은
 우선 장비를 사용할 수 없으면 준비된 다른 호환 장비에 배정할 수 있다.
 
 중앙 PostgreSQL `agents.default_execution_node_id`가 기본값의 정본이다.
-worker의 로컬 YAML reseed는 이 값을 쓰지 않는다. API는 full profile에서만 제공한다.
+실행 노드의 로컬 YAML reseed는 이 값을 쓰지 않는다. API는 전체 기능 모드(`full`)에서만 제공한다.
+표시 용어와 저장 값의 대응은 [공통 용어 안내](node-terminology.md)를 참고한다.
 
 ```http
 GET /api/agents/{id}/execution-node
@@ -33,19 +34,19 @@ OS·도구·저장소 조건은 별도의 `execution-requirements` API에 유지
 
 우선 노드가 없는 에이전트는 종전 label/전역 자동 배정 정책을 그대로 사용한다.
 우선 노드를 지정한 에이전트만 전역 자동 배정의 활성화 여부와 무관하게 이 대체 배정에
-참여한다. 우선 장비로 leader를 선택하면 준비된 worker가 있어도 leader를 먼저 사용한다.
+참여한다. 우선 장비로 허브를 선택하면 준비된 실행 노드가 있어도 허브를 먼저 사용한다.
 
 | 상황 | 배정 결과 |
 | --- | --- |
 | 우선 Windows에 여유가 있고 새 대화가 들어옴 | Windows에 세션을 시작한다. |
-| 우선 Windows가 꺼졌거나 슬롯이 가득 참 | 실행 조건을 충족하는 다른 worker, 또는 leader에서 새 세션을 시작한다. |
+| 우선 Windows가 꺼졌거나 슬롯이 가득 참 | 실행 조건을 충족하는 다른 실행 노드, 또는 허브에서 새 세션을 시작한다. |
 | Windows 필수 조건이 있지만 준비된 Windows가 없음 | Mac/Linux에서 실행하지 않고 불가능한 사유를 반환한다. |
 | 기존 Mac 세션이 있고 우선값을 Windows로 바꿈 | 그 대화는 계속 Mac이 소유한다. |
 | 기존 Windows 세션의 소유 머신이 오프라인 | 소유권을 무시한 자동 재실행을 차단한다. |
 | 우선 장비도 cluster도 지정하지 않음 | 기존 단일 머신 실행을 유지한다. |
 
-이 결정은 LLM이 프롬프트를 해석해서 내리는 것이 아니다. leader의 intake router가
-중앙 정책과 세션 소유권·노드 상태를 조회해 결정하고, 선택된 worker가 요청을 받아
+이 결정은 LLM이 프롬프트를 해석해서 내리는 것이 아니다. 허브의 intake router가
+중앙 정책과 세션 소유권·노드 상태를 조회해 결정하고, 선택된 실행 노드가 요청을 받아
 자신의 OS에 맞는 실행 backend를 시작한다. 여러 스레드를 가진 같은 에이전트도
 세션별로 서로 다른 소유 머신을 가질 수 있다.
 
@@ -58,7 +59,7 @@ category를 부모 에이전트로 취급하지 않으며, 기존 `threadInherit
 기본 노드는 새 세션 배정에 적용된다. Mac이 소유한 기존 대화에서 기본값을 Windows로
 바꿔도 다음 입력은 Mac에서 처리한다. 새 스레드/새 세션부터 Windows를 선택한다.
 살아 있는 터미널, provider session 파일, 로그인 또는 작업 폴더를 OS 사이에 복제하는
-기능은 아니다. worker에 해당 agent의 prompt·bot 설정·CLI 계정과 작업 경로를 준비해야 한다.
+기능은 아니다. 실행 노드에 해당 agent의 prompt·bot 설정·CLI 계정과 작업 경로를 준비해야 한다.
 
 대체 배정은 **소유자가 없는 새 세션**에 적용한다. heartbeat만으로 실행 가능하다고
 판단하지 않고 provider CLI·선택 계정의 준비 상태, 실행 poller, 필수 OS·도구·저장소,
@@ -78,12 +79,12 @@ category를 부모 에이전트로 취급하지 않으며, 기존 `threadInherit
 
 기존 설정에서 cluster를 생략하면 `enabled=false`, `runtime_profile=full`이며 기존
 Discord gateway·대시보드·API를 같은 머신에서 실행한다. 에이전트의 우선 노드 기본값은
-`null`이다. 기존 에이전트를 일괄 worker로 이동시키거나 leader/worker 선택을 강제하지 않는다.
+`null`이다. 기존 에이전트를 일괄 실행 노드로 이동시키거나 허브/실행 노드 선택을 강제하지 않는다.
 
-현재 Mac mini는 Discord gateway와 중앙 PostgreSQL을 함께 운영한다. Windows worker는
+현재 Mac mini 허브는 Discord gateway와 중앙 PostgreSQL을 함께 운영한다. Windows 실행 노드는
 실행 전용이다. Windows가 꺼지면 새 세션을 준비된 Mac에서 실행할 수 있지만, Mac mini가
 꺼지면 Discord 수신과 DB도 사용할 수 없다. 이 구성은 실행 머신의 대체이며,
-gateway/DB 고가용성을 제공하지 않는다. 상시 가동 mini와 복수 worker를 먼저 운영하고,
+gateway/DB 고가용성을 제공하지 않는다. 상시 가동 mini와 복수 실행 노드를 먼저 운영하고,
 필요해지면 별도로 gateway 승계와 DB 가용성을 설계한다.
 
 이 설정은 Discord intake의 기본 배정이다. 별도 dispatch 작업의

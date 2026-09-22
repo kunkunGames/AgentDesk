@@ -2733,7 +2733,7 @@ mod tests {
         let mut config = crate::config::Config::default();
 
         config.cluster.enabled = false; // single-node: always owns the roster
-        config.cluster.role = "auto".to_string();
+        config.cluster.role = crate::config::ClusterRole::Auto;
         assert!(shared_config_sync_enabled(&config));
 
         config.cluster.enabled = true;
@@ -2743,9 +2743,10 @@ mod tests {
             ("  leader  ", true),
             ("worker", false),
             ("auto", false),
-            ("", false),
+            ("runner", false),
+            ("hub", true),
         ] {
-            config.cluster.role = role.to_string();
+            config.cluster.role = role.parse().unwrap();
             assert_eq!(
                 shared_config_sync_enabled(&config),
                 expected,
@@ -2780,7 +2781,7 @@ mod tests {
         let test_db = TestDatabase::create().await;
         let mut leader = postgres_test_config(&test_db);
         leader.cluster.enabled = true;
-        leader.cluster.role = "leader".to_string();
+        leader.cluster.role = crate::config::ClusterRole::Hub;
         let pool = connect_test_pool_and_migrate_config(&leader, "shared config ownership")
             .await
             .expect("migrate")
@@ -2803,8 +2804,8 @@ mod tests {
         worker.agents.clear();
         worker.runtime.dispatch_poll_sec = Some(7);
         worker.runtime.reset_overrides_on_restart = true;
-        for role in ["worker", "auto"] {
-            worker.cluster.role = role.to_string();
+        for role in ["runner", "worker", "auto"] {
+            worker.cluster.role = role.parse().unwrap();
             with_startup_advisory_lock(&pool, || startup_reseed(&pool, &worker))
                 .await
                 .expect("read shared configuration");
@@ -2844,7 +2845,7 @@ mod tests {
         let test_db = TestDatabase::create().await;
         let mut config = postgres_test_config(&test_db);
         config.cluster.enabled = true;
-        config.cluster.role = "worker".to_string();
+        config.cluster.role = crate::config::ClusterRole::Runner;
         let pool = connect_test_pool_and_migrate_config(&config, "worker first boot")
             .await
             .expect("schema migrations still run")
@@ -2853,11 +2854,11 @@ mod tests {
         let error = startup_reseed(&pool, &config)
             .await
             .expect_err("leader is absent");
-        assert!(error.contains("cluster.role=leader"), "{error}");
+        assert!(error.contains("cluster.role=hub"), "{error}");
         assert_eq!(shared_configuration_snapshot(&pool).await, before);
 
         let mut leader = config.clone();
-        leader.cluster.role = "leader".to_string();
+        leader.cluster.role = crate::config::ClusterRole::Hub;
         // Both paths use the same startup lock. A worker that wins the race may
         // refuse startup, but it must never become the configuration writer.
         let (leader_result, worker_result) = tokio::join!(
@@ -2866,7 +2867,7 @@ mod tests {
         );
         leader_result.expect("leader initializes shared configuration");
         if let Err(error) = worker_result {
-            assert!(error.contains("cluster.role=leader"), "{error}");
+            assert!(error.contains("cluster.role=hub"), "{error}");
         }
         startup_reseed(&pool, &config)
             .await
@@ -2910,7 +2911,7 @@ mod tests {
 
         // This node is a cluster worker: reseed must skip the agent sync.
         config.cluster.enabled = true;
-        config.cluster.role = "worker".to_string();
+        config.cluster.role = crate::config::ClusterRole::Runner;
         startup_reseed(&pool, &config).await.expect("worker reseed");
 
         let leader_owned: i64 =

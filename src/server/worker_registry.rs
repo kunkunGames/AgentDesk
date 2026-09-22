@@ -512,7 +512,7 @@ mod leader_takeover_tests {
     async fn worker_profile_starts_local_workers_without_spawning_leader_waiters() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
-        config.cluster.runtime_profile = crate::config::RuntimeProfile::Worker;
+        config.cluster.runtime_profile = crate::config::RuntimeProfile::Runner;
         config.policies.dir = dir.path().join("policies");
         config.policies.hot_reload = false;
         config.data.dir = dir.path().join("data");

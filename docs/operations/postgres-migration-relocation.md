@@ -27,8 +27,8 @@ checksum, 실행 시간과 업무 데이터는 수정하지 않는다. 이후 SQ
 2. 운영 DB의 `pg_dump --format=custom` 백업과 migration 이력을 보관한다. 백업은 운영자
    전용 경로에서 관리하며 저장소나 공개 artifact에 넣지 않는다.
 3. 백업 복원본에서 새 binary의 `release-migrate-postgres`를 먼저 검증한다. 운영에서
-   같은 명령으로 이관한 뒤 새 릴리스의 leader를 시작하고 health/schema를 확인한다.
-4. 동일 릴리스 worker를 시작하고 중앙 설정 보존과 원격 작업을 확인한다.
+   같은 명령으로 이관한 뒤 새 릴리스의 허브를 시작하고 health/schema를 확인한다.
+4. 동일 릴리스 실행 노드를 시작하고 중앙 설정 보존과 원격 작업을 확인한다.
 
 두 프로세스가 동시에 업그레이드해도 migration lock이 직렬화한다. 이미 이관한 DB나
 새 DB에서는 같은 이관을 반복하지 않는다. 새 schema 적용 후에는 구버전 binary만으로

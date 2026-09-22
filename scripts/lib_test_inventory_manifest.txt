@@ -48,6 +48,7 @@ cli::client::health_compare_tests::classify_machine_label_prefers_explicit_label
 cli::client::health_compare_tests::cluster_lease_ttl_secs_handles_missing_and_zero_values
 cli::client::health_compare_tests::diff_marker_only_fires_on_real_mismatch
 cli::client::health_compare_tests::human_age_seconds_buckets_match_expected_units
+cli::client::health_compare_tests::machine_role_display_uses_effective_role_and_accepts_legacy_names
 cli::client::health_compare_tests::render_machine_compare_table_synthesises_offline_columns
 cli::client::health_compare_tests::validate_status_payload_rejects_missing_arrays
 cli::client::runtime_config::tests::api_get_payload_preserves_explicit_keys_for_cli_set
@@ -183,6 +184,8 @@ cli::utils::memento_hook_install_tests::install_into_empty_settings_creates_both
 cli::utils::memento_hook_install_tests::install_is_idempotent_and_preserves_operator_entries
 cli::utils::memento_hook_install_tests::install_replaces_stale_memento_command_on_re_run
 cli::utils::memento_hook_install_tests::uninstall_removes_only_memento_entries
+config::cluster_role::tests::role_aliases_round_trip_to_canonical_configuration
+config::cluster_role::tests::unknown_role_cannot_silently_participate_in_hub_election
 config::cluster_semaphore_config_tests::cluster_intake_routing_parses_defaults_and_yaml_fields
 config::cluster_semaphore_config_tests::cluster_nodes_parse_max_concurrent_dispatches
 config::cluster_semaphore_config_tests::cluster_semaphores_parse_kebab_scope_and_default_capacity
@@ -203,7 +206,8 @@ config::runtime_hook_registry_config_tests::publication_permit_modes_are_additiv
 config::runtime_hook_registry_config_tests::relay_authority_dial_defaults_dormant_and_round_trips_each_knob_alone
 config::runtime_hook_registry_config_tests::relay_verdict_source_defaults_structural_and_round_trips
 config::runtime_profile::tests::omitted_cluster_roles_keep_single_machine_full_runtime
-config::runtime_profile::tests::worker_profile_is_explicit_validated_and_does_not_change_legacy_roles
+config::runtime_profile::tests::runner_and_legacy_profiles_have_identical_modules_and_canonical_output
+config::runtime_profile::tests::runner_profile_is_explicit_validated_and_does_not_change_legacy_roles
 config::scheduled_message_required_mention_config_tests::required_mentions_allow_empty_or_valid_lists
 config::scheduled_message_required_mention_config_tests::required_mentions_reject_duplicates_and_invalid_ids
 config::secret_bearing_config_file_tests::load_from_path_hardens_secret_file_before_semantic_validation_error
@@ -2018,7 +2022,6 @@ services::cluster::intake_worker_capabilities::tests::runtime_capability_adverti
 services::cluster::node_registry::tests::auto_node_leadership_requires_configured_gateway_token
 services::cluster::node_registry::tests::capability_match_accepts_labels_providers_and_healthy_mcp
 services::cluster::node_registry::tests::capability_match_reports_exclusion_reasons
-services::cluster::node_registry::tests::cluster_role_parses_known_values_and_defaults_to_auto
 services::cluster::node_registry::tests::configured_instance_id_wins
 services::cluster::node_registry::tests::equally_preferred_candidates_tie_break_by_latest_heartbeat
 services::cluster::node_registry::tests::intake_retry_tick_reads_each_hot_reload_snapshot
@@ -2028,6 +2031,7 @@ services::cluster::node_registry::tests::preferred_label_ranks_online_match_but_
 services::cluster::node_registry::tests::required_namespace_remains_hard_and_preferred_namespace_is_soft
 services::cluster::node_registry::tests::wait_until_leader_follows_late_leadership_transition
 services::cluster::readiness::tests::execution_readiness_separates_liveness_freshness_poller_and_credentials
+services::cluster::readiness::tests::runner_probes_remain_readable_during_a_mixed_version_rollout
 services::cluster::registry_adapter_sink::tests::deliver_counts_per_session
 services::cluster::registry_adapter_sink::tests::end_to_end_relay_through_sink_records_matched_channel_binding
 services::cluster::registry_adapter_sink::tests::registry_to_supervisor_to_sink_end_to_end
