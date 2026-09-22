@@ -3038,6 +3038,19 @@ _post_deploy_smoke_fail() {
     return 1
 }
 
+_post_deploy_smoke_optional_accounts_absent() {
+    # Account discovery deliberately returns 503/not_installed on nodes that
+    # do not have Claude. Only accept that diagnostic when runtime health
+    # proves no Claude provider was configured; preserve the #4126 failure gate.
+    [ "$1" = "/api/claude-accounts" ] && [ "$2" = "503" ] || return 1
+    [ -n "${POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY:-}" ] || return 1
+    jq -e '.code == "not_installed"' "$3" >/dev/null 2>&1 || return 1
+    jq -e '.providers | (type == "array") and all(.[];
+        (type == "object") and (.name | type == "string")
+        and (.name | ascii_downcase != "claude"))' \
+        "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY" >/dev/null 2>&1
+}
+
 _post_deploy_smoke_probe_apis() {
     local endpoint body_path http_code
     local failed=0
@@ -3058,6 +3071,10 @@ _post_deploy_smoke_probe_apis() {
             continue
         fi
         if [ "$http_code" != "200" ]; then
+            if _post_deploy_smoke_optional_accounts_absent "$endpoint" "$http_code" "$body_path"; then
+                _post_deploy_smoke_note "api endpoint=${endpoint} optional=not_installed; no Claude runtime configured" || return 1
+                continue
+            fi
             _post_deploy_smoke_fail "core API ${endpoint}: expected HTTP 200, got ${http_code}" || true
             failed=1
         elif [ ! -s "$body_path" ]; then

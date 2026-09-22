@@ -154,6 +154,10 @@ Windows 방화벽이 API 수신을 차단하면 관리자 PowerShell에서 패�
 
 ## 검증
 
+API smoke는 Claude runtime이 없는 노드의 계정 탐색 응답 `503 / not_installed`를
+정상적인 미설치 진단으로 구분한다. Claude runtime이 설정됐거나 health 목록을
+확인할 수 없으면 같은 응답도 실패다. 그 밖의 API 오류·timeout은 그대로 실패한다.
+
 Mac release 재배포는 기존 launchd의 `StandardOutPath`·`StandardErrorPath`를 보존한다.
 운영자가 외장 디스크 대신 `~/Library/Logs/AgentDesk-launchd` 등에 지정한 경로가
 자동 생성 기본값으로 덮이지 않는다. 새 plist 생성·검증이 끝난 뒤 원자적으로 교체하며,

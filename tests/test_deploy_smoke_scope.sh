@@ -45,3 +45,20 @@ unset POST_DEPLOY_SMOKE_SCOPE
 _run_post_deploy_functional_smoke
 test "$api_calls:$relay_calls:$durable_calls" = 4:2:2
 echo 'PASS: API scope preserves API failures and full/default retain external probes'
+
+eval "$(awk '/^_post_deploy_smoke_optional_accounts_absent\(\) \{$/ {copy=1} copy {print} copy && /^}$/ {exit}' "$root/scripts/deploy-release.sh")"
+POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY="$scratch/health.json"
+account_body="$scratch/accounts.json"
+printf '%s\n' '{"code":"not_installed"}' > "$account_body"
+printf '%s\n' '{"providers":[{"name":"codex"}]}' > "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY"
+_post_deploy_smoke_optional_accounts_absent /api/claude-accounts 503 "$account_body"
+if _post_deploy_smoke_optional_accounts_absent /api/sessions 503 "$account_body"; then exit 1; fi
+if _post_deploy_smoke_optional_accounts_absent /api/claude-accounts 502 "$account_body"; then exit 1; fi
+printf '%s\n' '{"code":"probe_failed"}' > "$account_body"
+if _post_deploy_smoke_optional_accounts_absent /api/claude-accounts 503 "$account_body"; then exit 1; fi
+printf '%s\n' '{"code":"not_installed"}' > "$account_body"
+for health in '{"providers":[{"name":"claude"}]}' '{"providers":[{"name":"CLAUDE"}]}' '{}' '{"providers":[{}]}'; do
+    printf '%s\n' "$health" > "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY"
+    if _post_deploy_smoke_optional_accounts_absent /api/claude-accounts 503 "$account_body"; then exit 1; fi
+done
+echo 'PASS: absent optional Claude accounts do not hide configured providers or other API failures'
