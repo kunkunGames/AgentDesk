@@ -10,6 +10,7 @@ use crate::db::intake_outbox_status::IntakeOutboxStatus;
 pub(crate) enum IntakeRoutingBasis {
     LiveForeignOwner,
     NodeOverride,
+    AgentDefault,
     PreferredLabels,
 }
 
@@ -111,6 +112,8 @@ pub(crate) enum RanLocalReason {
     /// Agent opted in and a worker matched, but the only eligible
     /// candidate IS the leader.
     LeaderIsOnlyEligible,
+    /// The ready leader is the agent's preferred execution device.
+    AgentDefaultIsLeader,
     /// Some DB or schema error during the routing decision. Reported
     /// so operators see WHY a forward turned into a local fallback.
     DbErrorFellBackToLocal { detail: String },

@@ -19,9 +19,6 @@ use crate::db::intake_outbox::{
 };
 use crate::db::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
 use crate::db::intake_outbox_status::IntakeOutboxStatus;
-use crate::services::cluster::intake_routing::{
-    IntakeRouteTarget, LocalRouteReason, candidates_from_worker_nodes_json, pick_intake_target,
-};
 use sqlx::PgPool;
 
 #[cfg(test)]
@@ -43,11 +40,13 @@ pub(crate) use super::intake_routing_config::{
 };
 
 mod model;
+mod placement;
 use model::build_payload_for_insert;
 pub(crate) use model::{
     IntakeBlockedReason, IntakeRouterContext, IntakeRouterDecision, IntakeRoutingBasis,
     ObservedIntakeOutcome, RanLocalReason, ResolvedSessionOwner,
 };
+use placement::route_by_preference;
 
 fn worker_heartbeat_lease_secs() -> u64 {
     crate::config::load_graceful().cluster.lease_ttl_secs.max(1)
@@ -349,23 +348,10 @@ pub(crate) async fn try_route_intake(
             unreachable!("owner fail-safe outcomes return before the open-route fence")
         }
         SessionOwnerResolution::NoOwner => {
-            if let Some(target) = node_override {
-                // Pin only this new request's retry snapshot. The central hard policy
-                // stays unchanged, so a later default change cannot move a live owner.
-                let mut placement_requirements = requirements.clone();
-                if explicit_node_override.is_none() && agent_default.is_some() {
-                    if !requirements.nodes.is_empty()
-                        && !requirements.nodes.iter().any(|id| id == target)
-                    {
-                        return required_block(
-                            "agent default node conflicts with required nodes".into(),
-                        );
-                    }
-                    placement_requirements.nodes = vec![target.to_string()];
-                }
-                route_node_override_without_owner(pool, ctx, target, &placement_requirements).await
+            if let Some(target) = explicit_node_override {
+                route_node_override_without_owner(pool, ctx, target, &requirements).await
             } else {
-                route_by_preferred_labels(pool, ctx, &requirements).await
+                route_by_preference(pool, ctx, &requirements, agent_default.as_deref()).await
             }
         }
     }
@@ -394,172 +380,6 @@ fn log_shadowed_owner_state(
             node_override_instance_id = node_override,
             "[intake_router] override_shadowed_by_live_owner"
         );
-    }
-}
-
-fn preferred_label_dependency_fallback(detail: String) -> IntakeRouterDecision {
-    IntakeRouterDecision::RanLocal {
-        reason: RanLocalReason::DbErrorFellBackToLocal { detail },
-    }
-}
-
-async fn route_by_preferred_labels(
-    pool: &PgPool,
-    ctx: &IntakeRouterContext<'_>,
-    requirements: &ExecutionRequirements,
-) -> IntakeRouterDecision {
-    let capacity_aware = super::execution_capacity::automatic_enabled();
-    // Resolve agent + preference. NoAgentForChannel is NOT an error —
-    // many channels (DMs, ad-hoc cross-bot) have no agent row.
-    //
-    // #4349: the agent's own `provider` column is deliberately ignored for
-    // routing. It is a single value shared by the agent's cc and cdx
-    // channels, so on a paired agent it disagrees with the bot that is
-    // actually handling this message. `ctx.provider` is that bot.
-    let (agent_id, _agent_provider, preferred_labels) =
-        match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
-            Ok(Some((agent_id, provider, labels))) => (agent_id, provider, labels),
-            Ok(None) => {
-                if !requirements.is_empty() {
-                    return required_block(
-                        "agent disappeared while validating execution requirements".into(),
-                    );
-                }
-                return apply_observe_mode(
-                    ctx.mode,
-                    IntakeRouterDecision::RanLocal {
-                        reason: RanLocalReason::NoAgentForChannel,
-                    },
-                );
-            }
-            Err(error) => {
-                if !requirements.is_empty() {
-                    return required_block(error.to_string());
-                }
-                return apply_observe_mode(
-                    ctx.mode,
-                    preferred_label_dependency_fallback(format!("agent lookup: {error}")),
-                );
-            }
-        };
-
-    if preferred_labels.is_empty() && requirements.is_empty() && !capacity_aware {
-        return apply_observe_mode(
-            ctx.mode,
-            IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::AgentHasNoPreference,
-            },
-        );
-    }
-
-    let auth_profile =
-        super::readiness::expected_auth_profile(ctx.provider, ctx.channel_id, &agent_id);
-    let mut candidates = match crate::services::cluster::node_registry::list_worker_nodes(
-        pool,
-        worker_heartbeat_lease_secs(),
-    )
-    .await
-    {
-        Ok(nodes) => {
-            let mut eligible_nodes: Vec<_> = nodes
-                .into_iter()
-                .filter(|node| {
-                    crate::services::cluster::node_registry::node_supports_intake_request(
-                        node,
-                        ctx.provider,
-                        ctx.preserve_on_cancel,
-                    ) && super::readiness::evaluate_declared(node, ctx.provider, &auth_profile)
-                        .eligible
-                        && required_node_reasons(node, requirements).is_empty()
-                        && (ctx.attachment_refs.is_empty()
-                            || super::attachment_transfer::supports(node))
-                })
-                .collect();
-            if capacity_aware {
-                super::execution_capacity::rank(&mut eligible_nodes);
-            }
-            candidates_from_worker_nodes_json(&eligible_nodes)
-        }
-        Err(error) => {
-            if !requirements.is_empty() || capacity_aware {
-                return required_block(error);
-            }
-            return apply_observe_mode(
-                ctx.mode,
-                preferred_label_dependency_fallback(format!("list worker_nodes: {error}")),
-            );
-        }
-    };
-
-    loop {
-        let selection = if requirements.is_empty() && !capacity_aware {
-            pick_intake_target(&candidates, &preferred_labels, ctx.leader_instance_id)
-        } else {
-            super::intake_routing::pick_required_intake_target(
-                &candidates,
-                &preferred_labels,
-                ctx.leader_instance_id,
-            )
-        };
-        let target = match selection {
-            IntakeRouteTarget::Worker { instance_id } => instance_id,
-            IntakeRouteTarget::Local { reason } => {
-                if (!requirements.is_empty() || capacity_aware)
-                    && reason == LocalRouteReason::NoEligibleWorker
-                {
-                    return required_block("no ready worker has capacity and satisfies the execution requirements; retry when capacity is available".into());
-                }
-                return apply_observe_mode(
-                    ctx.mode,
-                    IntakeRouterDecision::RanLocal {
-                        reason: match reason {
-                            LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
-                            LocalRouteReason::LeaderIsOnlyEligible => {
-                                RanLocalReason::LeaderIsOnlyEligible
-                            }
-                            LocalRouteReason::NoPreference => unreachable!(
-                                "pick_intake_target cannot return no-preference after non-empty preference gate"
-                            ),
-                        },
-                    },
-                );
-            }
-        };
-
-        if ctx.has_nonportable_uploads {
-            return apply_observe_mode(
-                ctx.mode,
-                IntakeRouterDecision::Blocked {
-                    reason: IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
-                        target_instance_id: target,
-                    },
-                },
-            );
-        }
-
-        let decision = route_to_instance(
-            pool,
-            ctx,
-            &target,
-            if requirements.is_empty() && !capacity_aware {
-                &preferred_labels
-            } else {
-                &[]
-            },
-            &agent_id,
-            ObserveTargetKind::PreferredLabels,
-            requirements,
-        )
-        .await;
-        if capacity_aware
-            && matches!(&decision, IntakeRouterDecision::Blocked {
-        reason: IntakeBlockedReason::RoutingDependencyFailed { detail }
-    } if detail == super::execution_capacity::EXHAUSTED)
-        {
-            candidates.retain(|candidate| candidate.instance_id != target);
-            continue;
-        }
-        return decision;
     }
 }
 
@@ -668,6 +488,7 @@ async fn route_node_override_without_owner(
 enum ObserveTargetKind {
     LiveForeignOwner,
     NodeOverride,
+    AgentDefault,
     PreferredLabels,
 }
 
@@ -736,9 +557,9 @@ async fn route_to_instance(
 ) -> IntakeRouterDecision {
     let resolved_owner = match observe_target_kind {
         ObserveTargetKind::LiveForeignOwner => ResolvedSessionOwner::LiveForeign,
-        ObserveTargetKind::NodeOverride | ObserveTargetKind::PreferredLabels => {
-            ResolvedSessionOwner::NoOwner
-        }
+        ObserveTargetKind::NodeOverride
+        | ObserveTargetKind::AgentDefault
+        | ObserveTargetKind::PreferredLabels => ResolvedSessionOwner::NoOwner,
     };
     match existing_open_route(pool, ctx.channel_id).await {
         Ok(Some((_, _, existing_user_msg_id, _, _))) if existing_user_msg_id == ctx.user_msg_id => {
@@ -790,6 +611,20 @@ async fn route_to_instance(
                             agent_id,
                         ),
                     );
+                    if matches!(observe_target_kind, ObserveTargetKind::AgentDefault) {
+                        let verified = super::readiness::evaluate(
+                            node,
+                            ctx.provider,
+                            &super::readiness::expected_auth_profile(
+                                ctx.provider,
+                                ctx.channel_id,
+                                agent_id,
+                            ),
+                            chrono::Utc::now().timestamp_millis(),
+                        );
+                        report.eligible &= verified.eligible;
+                        report.reasons.extend(verified.reasons);
+                    }
                     if !ctx.attachment_refs.is_empty()
                         && !super::attachment_transfer::supports(node)
                     {
@@ -826,7 +661,9 @@ async fn route_to_instance(
                     target_instance_id: target.to_string(),
                 }
             }
-            ObserveTargetKind::NodeOverride | ObserveTargetKind::PreferredLabels => {
+            ObserveTargetKind::NodeOverride
+            | ObserveTargetKind::AgentDefault
+            | ObserveTargetKind::PreferredLabels => {
                 ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
                     target_instance_id: target.to_string(),
                 }
@@ -856,6 +693,7 @@ async fn route_to_instance(
             basis: match observe_target_kind {
                 ObserveTargetKind::LiveForeignOwner => IntakeRoutingBasis::LiveForeignOwner,
                 ObserveTargetKind::NodeOverride => IntakeRoutingBasis::NodeOverride,
+                ObserveTargetKind::AgentDefault => IntakeRoutingBasis::AgentDefault,
                 ObserveTargetKind::PreferredLabels => IntakeRoutingBasis::PreferredLabels,
             },
         },
@@ -898,6 +736,7 @@ async fn route_to_instance(
                 let kind_str = match observe_target_kind {
                     ObserveTargetKind::LiveForeignOwner => "live foreign owner",
                     ObserveTargetKind::NodeOverride => "node override",
+                    ObserveTargetKind::AgentDefault => "agent default",
                     ObserveTargetKind::PreferredLabels => "preferred labels",
                 };
                 tracing::info!(

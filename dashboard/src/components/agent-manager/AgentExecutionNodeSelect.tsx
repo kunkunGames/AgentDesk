@@ -58,7 +58,7 @@ export function AgentExecutionNodeSelect({ agentId, provider, tr, onSaved }: {
   const unavailable = selected !== "" && (!node || node.status !== "online" || !readiness?.eligible);
 
   return <SurfaceSubsection title={tr("Discord 기본 실행 노드", "Default Discord execution node")}
-    description={tr("이 에이전트의 새 세션을 시작할 장비를 선택합니다.", "Choose where this agent starts new sessions.")}
+    description={tr("이 에이전트의 새 세션을 우선 시작할 장비를 선택합니다.", "Choose the preferred device for this agent's new sessions.")}
     className="md:col-span-2">
     <label htmlFor={id} className="mb-1 block text-xs">{tr("실행 장비", "Execution device")}</label>
     <div className="flex flex-wrap items-center gap-2">
@@ -80,8 +80,8 @@ export function AgentExecutionNodeSelect({ agentId, provider, tr, onSaved }: {
       </SurfaceActionButton>
     </div>
     <p className="mt-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
-      {tr("진행 중인 세션은 현재 장비를 유지합니다. 채널의 /node 선택은 이 기본값보다 우선합니다. 지정 장비를 사용할 수 없으면 새 요청의 실행을 거절하고 사유를 표시합니다.",
-        "Existing sessions keep their current device. A channel /node selection takes precedence. If the selected device is unavailable, new requests are rejected with a reason.")}
+      {tr("기존 세션은 현재 장비를 유지합니다. 새 세션은 선택한 장비가 준비되지 않았거나 실행 여유가 없으면 조건을 충족하는 다른 장비에 배정합니다. 가능한 장비가 없으면 사유를 표시합니다. 채널의 /node 지정과 필수 실행 조건은 계속 적용됩니다.",
+        "Existing sessions keep their current device. New sessions use another compatible device if the preferred one is not ready or has no capacity. If no device qualifies, a reason is shown. Channel /node selections and required execution conditions still apply.")}
     </p>
     {!loading && !enforced && !error && <SurfaceNotice tone="warn" compact className="mt-2">
       {tr("현재 서버는 노드 배정을 적용하지 않습니다. 운영 설정에서 배정을 활성화한 뒤 장비를 선택할 수 있습니다.", "Node placement is not enforced on this server. Enable placement before selecting a device.")}

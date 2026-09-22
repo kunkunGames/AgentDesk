@@ -91,6 +91,16 @@ owner가 있으면 해당 owner가 우선하므로 이 선택은 살아 있는 M
 이 기능은 migration 127과 새 leader 설치가 필요하다. 기존 schema 126 설치본에
 UI와 부모 실행 정책 상속이 이미 반영됐다는 의미는 아니다.
 
+기본 노드는 우선 장비로 취급한다. 소유자가 없는 새 세션은 우선 장비의 준비 상태·필수
+조건·여유 슬롯을 확인하고, 불가능하면 다른 호환 노드를 선택한다. 우선 장비가 leader여도
+동일하게 우선권을 적용한다. 기존 `/node` 선택과 필수 `nodes` 조건, live/stale owner와
+outbox 중복 방지 경계를 재사용하며 별도 스케줄러를 추가하지 않았다. 우선값이 없는
+기존 agent는 전역 자동 배정이 꺼진 상태에서 기존 local 동작을 유지한다.
+
+Mac mini가 꺼지는 경우는 별개다. 현재 mini가 gateway와 PostgreSQL을 함께 실행하므로
+실행 전용 Windows worker만으로 Discord 서비스를 이어받을 수 없다. 우선 구성은
+상시 가동 mini와 복수 worker이며, gateway/DB 고가용성은 이번 실행 대체 범위에 포함하지 않는다.
+
 Windows의 세션은 background native child process로 실행된다. Discord 에이전트의
 역할을 다시 작성할 필요는 없지만, 각 worker에는 provider CLI/로그인과 실제 작업
 경로가 필요하다. Git 저장소의 논리 ID를 노드별 로컬 경로에 매핑하며, Mac의 파일,
