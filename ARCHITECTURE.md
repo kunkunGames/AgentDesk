@@ -403,7 +403,6 @@ src/
 │   ├── runner_registry/
 │   │   ├── registry.rs
 │   │   └── status.rs
-│   ├── worker_registry/
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
@@ -572,7 +571,6 @@ src/
 │   │   ├── intake_runner/
 │   │   │   ├── dispatch_stamp_tests.rs
 │   │   │   └── drain_tests.rs
-│   │   ├── intake_worker/
 │   │   ├── readiness/
 │   │   │   └── tests.rs
 │   │   ├── stream_relay/
