@@ -2975,6 +2975,8 @@ services::discord::health::runtime_resolve::direct_meeting_candidate_tests::no_c
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::single_explicit_match_wins_over_live_matches
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::single_live_match_is_selected_without_explicit_match
 services::discord::health::runtime_resolve::direct_meeting_candidate_tests::unconfigured_channel_still_checks_all_live_candidates
+services::discord::health::runtime_resolve::direct_meeting_candidate_tests::worker_claimant_uses_channel_owner_credentials_without_gateway
+services::discord::health::runtime_resolve::direct_meeting_candidate_tests::worker_owner_without_rest_credentials_is_rejected
 services::discord::health::session_enrichment::tests::a_channel_with_no_coordinate_entry_polls_as_absent
 services::discord::health::session_enrichment::tests::a_generation_stamp_moving_under_the_offset_read_witnesses_nothing
 services::discord::health::session_enrichment::tests::a_probe_fault_withholds_the_executor_witness_instead_of_claiming_absence
@@ -8051,6 +8053,9 @@ services::platform::binary_resolver::tests::scrub_seals_only_claude_paths
 services::platform::binary_resolver::windows_codex::tests::preserves_unknown_custom_missing_and_mismatched_launchers
 services::platform::binary_resolver::windows_codex::tests::resolves_same_install_native_binary_and_preserves_architecture
 services::platform::network::tests::api_listener_is_not_inheritable_by_provider_processes
+services::platform::shell::hostname_tests::accepts_native_and_fully_qualified_hostnames
+services::platform::shell::hostname_tests::rejects_failed_empty_or_invalid_hostname_output
+services::platform::shell::hostname_tests::windows_native_hostname_matches_computer_name
 services::platform::tmux::availability::availability_cache_tests::consecutive_probe_failures_demote_after_threshold
 services::platform::tmux::availability::availability_cache_tests::live_session_proof_marks_cache_available
 services::platform::tmux::availability::availability_cache_tests::missing_tmux_binary_demotes_immediately_and_resets_failures

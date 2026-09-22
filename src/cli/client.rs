@@ -63,10 +63,24 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn request_json(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
+    request_json_at(&api_base(), method, path, body)
+}
+
+/// Use a caller-resolved target for local startup diagnostics as well as CLI requests.
+pub(crate) fn get_json_at(base: &str, path: &str) -> Result<Value, String> {
+    request_json_at(base, "GET", path, None)
+}
+
+fn request_json_at(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<Value, String> {
     let url = if path.starts_with('/') {
-        format!("{}{}", api_base(), path)
+        format!("{base}{path}")
     } else {
-        format!("{}/{}", api_base(), path)
+        format!("{base}/{path}")
     };
 
     let a = agent();
@@ -101,7 +115,7 @@ fn request_json(method: &str, path: &str, body: Option<&str>) -> Result<Value, S
         Err(ureq::Error::Transport(err)) => {
             return Err(connection_error_hint(
                 &format!("Request failed: {err}"),
-                &api_base(),
+                base,
                 "AGENTDESK_API_URL",
             ));
         }

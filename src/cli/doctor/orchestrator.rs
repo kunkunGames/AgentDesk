@@ -406,8 +406,14 @@ struct HealthSnapshot {
 }
 
 fn fetch_health_snapshot(options: &DoctorOptions) -> HealthSnapshot {
-    let base = crate::cli::client::api_base();
     let cfg = config::load_graceful();
+    // Startup diagnostics describe this process, even when the user's CLI
+    // target is a remote leader. Manual doctor keeps its remote opt-in gate.
+    let base = if options.run_context == RunContext::StartupOnce {
+        cfg.server.local_base_url()
+    } else {
+        crate::cli::client::api_base()
+    };
     if cfg
         .server
         .auth_token
@@ -427,9 +433,9 @@ fn fetch_health_snapshot(options: &DoctorOptions) -> HealthSnapshot {
         };
     }
 
-    match crate::cli::client::get_json("/api/health/detail").or_else(|detail_error| {
+    match crate::cli::client::get_json_at(&base, "/api/health/detail").or_else(|detail_error| {
         if detail_error.contains("(404)") {
-            crate::cli::client::get_json("/api/health")
+            crate::cli::client::get_json_at(&base, "/api/health")
         } else {
             Err(detail_error)
         }
