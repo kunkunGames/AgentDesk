@@ -53,9 +53,9 @@ pub(crate) fn should_suppress_post_terminal_output_without_inflight(
     // turn is live and merely lost its inflight — relay (and re-acquire) rather
     // than suppress.
     // #3154: while a deferred synthetic turn-start is pending for this channel,
-    // the worker has not yet saved the matching inflight. Suppressing here (or
+    // the runner has not yet saved the matching inflight. Suppressing here (or
     // advancing the confirmed offset) would EAT the wait window and drop the
-    // wakeup turn's response batch. Keep the bytes buffered until the worker
+    // wakeup turn's response batch. Keep the bytes buffered until the runner
     // claims (its inflight save then takes over the relay).
     terminal_success_seen
         && inflight_missing
@@ -162,7 +162,7 @@ mod post_terminal_output_tests {
     #[test]
     fn post_terminal_output_with_pending_synthetic_start_is_not_suppressed() {
         // #3154: while a deferred synthetic turn-start is pending for this
-        // channel (the per-channel worker has not yet saved the matching
+        // channel (the per-channel runner has not yet saved the matching
         // inflight), the (terminal + no-inflight) shape that would otherwise be
         // suppressed must keep its bytes buffered — suppressing here would EAT
         // the wait window and drop the wakeup turn's response batch.

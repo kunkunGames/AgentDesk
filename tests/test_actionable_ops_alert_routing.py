@@ -106,7 +106,7 @@ class ActionableOpsAlertRoutingContract(unittest.TestCase):
         self.assertIn('incident_kind\" != \"ANOMALY', monitor)
         self.assertIn("discord-sendmessage", monitor)
 
-    def test_worker_fallback_is_exactly_announce_to_notify(self) -> None:
+    def test_runner_fallback_is_exactly_announce_to_notify(self) -> None:
         delivery = self.source("src/server/outbox_actionable_delivery.rs")
         self.assertIn("is_actionable_ops_alert", delivery)
         self.assertIn("ACTIONABLE_OPS_ALERT_BOT", delivery)

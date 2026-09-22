@@ -627,7 +627,7 @@ pub(super) async fn queue_or_resume_open_alert_with_enqueue(
         open_generation: open.generation,
     };
     // Stage first without any filesystem authority. `held` rows are invisible
-    // to the outbox worker, so progress while this network await is in flight
+    // to the outbox runner, so progress while this network await is in flight
     // cannot leak a stale alert.
     let staged_id = if let Some(id) = resume_staged_alert_id {
         id

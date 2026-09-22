@@ -11,8 +11,8 @@ async fn seed_dispatched(pool: &PgPool) -> i64 {
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
             status, claim_owner, spawned_at, dispatched_at
          ) VALUES (
-            'worker', 'leader', 'worker-cas', 'worker-cas', 'user', 'hello',
-            'standard', 'agent', 'dispatched', 'dispatch-worker', NOW(), $1
+            'runner', 'hub', 'runner-cas', 'runner-cas', 'user', 'hello',
+            'standard', 'agent', 'dispatched', 'dispatch-runner', NOW(), $1
          ) RETURNING id",
     )
     .bind(Utc::now())
@@ -21,22 +21,22 @@ async fn seed_dispatched(pool: &PgPool) -> i64 {
     .expect("seed dispatched intake row")
 }
 
-fn assert_worker_false_branch_calls_classifier() {
-    let source = include_str!("../intake_worker.rs");
+fn assert_runner_false_branch_calls_classifier() {
+    let source = include_str!("../intake_runner.rs");
     let start = source
         .find("let advanced = mark_done(")
-        .expect("worker done writer exists");
+        .expect("runner done writer exists");
     let end = source[start..]
         .find("Ok(TickOutcome::Processed)")
         .map(|offset| start + offset)
-        .expect("worker Ok branch terminates");
+        .expect("runner Ok branch terminates");
     let branch = &source[start..end];
     assert_eq!(branch.matches("mark_done(").count(), 1);
     assert_eq!(branch.matches("classify_mark_done_miss(").count(), 1);
 }
 
 #[tokio::test]
-async fn worker_mark_done_false_on_dispatched_is_not_a_divergence_pg() {
+async fn runner_mark_done_false_on_dispatched_is_not_a_divergence_pg() {
     let _counter_guard = COUNTER_TEST_LOCK.lock().await;
     let database = TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;
@@ -45,7 +45,7 @@ async fn worker_mark_done_false_on_dispatched_is_not_a_divergence_pg() {
     let handoff_before = counters.stamp_handoff_observed.load(Ordering::Relaxed);
     let divergence_before = counters.divergence.load(Ordering::Relaxed);
 
-    classify_mark_done_miss(&pool, id, "worker-cas", "worker-cas").await;
+    classify_mark_done_miss(&pool, id, "runner-cas", "runner-cas").await;
 
     assert_eq!(
         counters.stamp_handoff_observed.load(Ordering::Relaxed),
@@ -55,14 +55,14 @@ async fn worker_mark_done_false_on_dispatched_is_not_a_divergence_pg() {
         counters.divergence.load(Ordering::Relaxed),
         divergence_before
     );
-    assert_worker_false_branch_calls_classifier();
+    assert_runner_false_branch_calls_classifier();
 
     pool.close().await;
     database.drop().await;
 }
 
 #[tokio::test]
-async fn worker_mark_done_false_on_missing_row_is_a_divergence_pg() {
+async fn runner_mark_done_false_on_missing_row_is_a_divergence_pg() {
     let _counter_guard = COUNTER_TEST_LOCK.lock().await;
     let database = TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;

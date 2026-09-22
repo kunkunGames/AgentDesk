@@ -8,20 +8,20 @@ use sqlx::{PgPool, Row};
 use crate::config::{ClusterConfig, ClusterRole, Config};
 use crate::db::postgres::AdvisoryLockLease;
 use crate::services::cluster::session_routing::{
-    cluster_capabilities_with_worker_api, worker_api_base_url_from_capabilities,
+    cluster_capabilities_with_runner_api, runner_api_base_url_from_capabilities,
 };
 
-pub(crate) const CLUSTER_LEADER_ADVISORY_LOCK_ID: i64 = 7_801_100;
+pub(crate) const CLUSTER_HUB_ADVISORY_LOCK_ID: i64 = 7_801_100;
 
 pub(crate) use super::capability_routing::{
     CapabilityRouteCandidate, CapabilityRouteDecision, explain_capability_match,
     select_capability_route,
 };
-use super::intake_worker_capabilities::capabilities_with_runtime_state;
-pub(crate) use super::intake_worker_capabilities::{
+use super::intake_runner_capabilities::capabilities_with_runtime_state;
+pub(crate) use super::intake_runner_capabilities::{
     deregister_gateway_waiter, node_awaits_gateway, node_supports_intake_provider,
-    node_supports_intake_request, refresh_worker_node_runtime_capabilities,
-    register_gateway_waiter, register_intake_worker_provider,
+    node_supports_intake_request, refresh_runner_node_runtime_capabilities,
+    register_gateway_waiter, register_intake_runner_provider,
 };
 
 #[derive(Clone, Debug)]
@@ -30,12 +30,12 @@ pub(crate) struct ClusterRuntime {
     instance_id: String,
     configured_role: ClusterRole,
     effective_role: ClusterRole,
-    leader_active: Arc<AtomicBool>,
+    hub_active: Arc<AtomicBool>,
 }
 
 impl ClusterRuntime {
     pub(crate) fn single_node() -> Self {
-        // Cache the synthetic id so the intake-routing leader hook
+        // Cache the synthetic id so the intake-routing hub hook
         // sees a stable answer in single-node mode too.
         let _ = SELF_INSTANCE_ID.set("single-node".to_string());
         Self {
@@ -43,26 +43,26 @@ impl ClusterRuntime {
             instance_id: "single-node".to_string(),
             configured_role: ClusterRole::Hub,
             effective_role: ClusterRole::Hub,
-            leader_active: Arc::new(AtomicBool::new(true)),
+            hub_active: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    pub(crate) fn is_leader(&self) -> bool {
-        !self.enabled || self.leader_active.load(Ordering::Acquire)
+    pub(crate) fn is_hub(&self) -> bool {
+        !self.enabled || self.hub_active.load(Ordering::Acquire)
     }
 
     /// Test-only constructor that builds an `enabled=true` runtime backed by a
-    /// caller-provided `leader_active` flag. Lets tests flip leadership at will
-    /// to exercise supervised workers across lease takeovers without standing
-    /// up a real cluster. See `worker_registry::tests`.
+    /// caller-provided `hub_active` flag. Lets tests flip hub ownership at will
+    /// to exercise supervised runners across lease takeovers without standing
+    /// up a real cluster. See `runner_registry::tests`.
     #[cfg(test)]
-    pub(crate) fn for_test_with_leader(leader_active: Arc<AtomicBool>) -> Self {
+    pub(crate) fn for_test_with_hub(hub_active: Arc<AtomicBool>) -> Self {
         Self {
             enabled: true,
             instance_id: "test-node".to_string(),
             configured_role: ClusterRole::Auto,
             effective_role: ClusterRole::Runner,
-            leader_active,
+            hub_active,
         }
     }
 
@@ -70,30 +70,30 @@ impl ClusterRuntime {
         &self.instance_id
     }
 
-    pub(crate) async fn wait_until_not_leader(&self) {
+    pub(crate) async fn wait_until_not_hub(&self) {
         if !self.enabled {
             std::future::pending::<()>().await;
             return;
         }
         loop {
-            if !self.is_leader() {
+            if !self.is_hub() {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    // reason: cluster-runtime leadership-wait API exercised directly by the
-    // `#[cfg(test)]` leadership-transition test; the production supervisor path
-    // now blocks via `wait_until_leader_or_shutdown`, so the lib build sees no
+    // reason: cluster-runtime hub ownership-wait API exercised directly by the
+    // `#[cfg(test)]` hub ownership-transition test; the production supervisor path
+    // now blocks via `wait_until_hub_or_shutdown`, so the lib build sees no
     // caller. See #3034.
     #[allow(dead_code)]
-    pub(crate) async fn wait_until_leader(&self) {
+    pub(crate) async fn wait_until_hub(&self) {
         if !self.enabled {
             return;
         }
         loop {
-            if self.is_leader() {
+            if self.is_hub() {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -106,12 +106,12 @@ impl ClusterRuntime {
             "instance_id": self.instance_id,
             "configured_role": self.configured_role.as_str(),
             "effective_role": self.effective_role.as_str(),
-            "is_leader": self.is_leader(),
+            "is_hub": self.is_hub(),
         })
     }
 }
 
-fn auto_node_can_attempt_leadership(config: &Config) -> bool {
+fn auto_node_can_attempt_hub_ownership(config: &Config) -> bool {
     config.discord.bots.values().any(|bot| {
         bot.token
             .as_deref()
@@ -132,18 +132,18 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
 
     let instance_id = resolve_instance_id(&config.cluster);
     // Phase 4 of intake-node-routing: cache the resolved instance_id
-    // so the intake-routing leader hook (`services::cluster::intake_router_hook`)
-    // sees the same id we register with `worker_nodes`. The OnceLock
+    // so the intake-routing hub hook (`services::cluster::intake_router_hook`)
+    // sees the same id we register with `cluster_nodes`. The OnceLock
     // ignores subsequent sets; if bootstrap is called twice in tests,
     // the first wins.
     let _ = SELF_INSTANCE_ID.set(instance_id.clone());
     let hostname = crate::services::platform::hostname_short();
     let configured_role = config.cluster.role;
-    let auto_leader_eligible =
-        configured_role != ClusterRole::Auto || auto_node_can_attempt_leadership(config);
-    let mut leader_lease = match configured_role {
+    let auto_hub_eligible =
+        configured_role != ClusterRole::Auto || auto_node_can_attempt_hub_ownership(config);
+    let mut hub_lease = match configured_role {
         ClusterRole::Runner => None,
-        ClusterRole::Auto if !auto_leader_eligible => {
+        ClusterRole::Auto if !auto_hub_eligible => {
             tracing::info!(
                 instance_id,
                 "[cluster] auto node has no configured Discord gateway token; registering as runner standby"
@@ -151,27 +151,23 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
             None
         }
         ClusterRole::Hub | ClusterRole::Auto => {
-            match AdvisoryLockLease::try_acquire(
-                &pool,
-                CLUSTER_LEADER_ADVISORY_LOCK_ID,
-                "cluster-leader",
-            )
-            .await
+            match AdvisoryLockLease::try_acquire(&pool, CLUSTER_HUB_ADVISORY_LOCK_ID, "cluster-hub")
+                .await
             {
                 Ok(lease) => lease,
                 Err(error) => {
-                    tracing::warn!("[cluster] leader lease acquisition failed: {error}");
+                    tracing::warn!("[cluster] hub lease acquisition failed: {error}");
                     None
                 }
             }
         }
     };
-    let effective_role = if leader_lease.is_some() {
+    let effective_role = if hub_lease.is_some() {
         ClusterRole::Hub
     } else {
         ClusterRole::Runner
     };
-    let leader_active = Arc::new(AtomicBool::new(leader_lease.is_some()));
+    let hub_active = Arc::new(AtomicBool::new(hub_lease.is_some()));
     let labels = serde_json::Value::Array(
         config
             .cluster
@@ -180,7 +176,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
             .map(|label| serde_json::Value::String(label.clone()))
             .collect(),
     );
-    let base_capabilities = cluster_capabilities_with_worker_api(&config.cluster);
+    let base_capabilities = cluster_capabilities_with_runner_api(&config.cluster);
     super::readiness::spawn_probe(config.clone());
     super::attachment_transfer::temporary::spawn_cleanup();
     crate::services::session_forwarding::probe::spawn(
@@ -191,7 +187,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     let capabilities = capabilities_with_runtime_state(&base_capabilities);
     let pid = std::process::id() as i32;
 
-    if let Err(error) = upsert_worker_node(
+    if let Err(error) = upsert_runner_node(
         &pool,
         &instance_id,
         &hostname,
@@ -203,12 +199,12 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     )
     .await
     {
-        tracing::warn!("[cluster] worker node registration failed: {error}");
+        tracing::warn!("[cluster] runner node registration failed: {error}");
     }
-    if let Err(error) = upsert_worker_mcp_endpoints(&pool, &instance_id, &capabilities).await {
-        tracing::warn!("[cluster] worker MCP endpoint registration failed: {error}");
+    if let Err(error) = upsert_node_mcp_endpoints(&pool, &instance_id, &capabilities).await {
+        tracing::warn!("[cluster] runner MCP endpoint registration failed: {error}");
     }
-    if should_wake_wait_queue_after_node_join(&leader_active) {
+    if should_wake_wait_queue_after_node_join(&hub_active) {
         crate::services::dispatches::wait_queue::spawn_wait_queue_wake_pg(
             pool.clone(),
             config.cluster.clone(),
@@ -223,7 +219,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     spawn_stale_claim_owner_reassignment_loop(
         stale_reassignment_pool,
         stale_reassignment_config,
-        leader_active.clone(),
+        hub_active.clone(),
     );
 
     spawn_heartbeat_loop(
@@ -236,9 +232,9 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
         base_capabilities,
         config.cluster.heartbeat_interval_secs,
         config.cluster.lease_ttl_secs,
-        leader_active.clone(),
-        leader_lease.take(),
-        auto_leader_eligible,
+        hub_active.clone(),
+        hub_lease.take(),
+        auto_hub_eligible,
     );
 
     let runtime = ClusterRuntime {
@@ -246,24 +242,24 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
         instance_id,
         configured_role,
         effective_role,
-        leader_active,
+        hub_active,
     };
     tracing::info!(cluster = %runtime.describe_for_log(), "[cluster] runtime bootstrapped");
     runtime
 }
 
-fn should_wake_wait_queue_after_node_join(leader_active: &AtomicBool) -> bool {
-    leader_active.load(Ordering::Acquire)
+fn should_wake_wait_queue_after_node_join(hub_active: &AtomicBool) -> bool {
+    hub_active.load(Ordering::Acquire)
 }
 
-pub(crate) async fn run_leader_intake_retry_maintenance_once(
+pub(crate) async fn run_hub_intake_retry_maintenance_once(
     pool: &PgPool,
     instance_id: &str,
     stale_threshold_secs: u64,
     lease_ttl_secs: u64,
     retry: impl FnOnce() -> Option<(u32, u64)>,
 ) -> Result<Option<crate::db::intake_outbox::FailedPreAcceptSweepOutcome>, String> {
-    mark_stale_worker_nodes_offline(pool, stale_threshold_secs, instance_id).await?;
+    mark_stale_cluster_nodes_offline(pool, stale_threshold_secs, instance_id).await?;
     super::attachment_transfer::store::cleanup(pool)
         .await
         .map_err(|e| format!("attachment cleanup: {e}"))?;
@@ -303,61 +299,61 @@ fn spawn_heartbeat_loop(
     base_capabilities: serde_json::Value,
     heartbeat_interval_secs: u64,
     lease_ttl_secs: u64,
-    leader_active: Arc<AtomicBool>,
-    mut leader_lease: Option<AdvisoryLockLease>,
-    leader_eligible: bool,
+    hub_active: Arc<AtomicBool>,
+    mut hub_lease: Option<AdvisoryLockLease>,
+    hub_eligible: bool,
 ) {
     let interval_secs = heartbeat_interval_secs.max(1);
     let stale_threshold_secs = lease_ttl_secs.max(interval_secs * 3);
-    let leader_eligible =
-        leader_eligible && matches!(configured_role, ClusterRole::Hub | ClusterRole::Auto);
+    let hub_eligible =
+        hub_eligible && matches!(configured_role, ClusterRole::Hub | ClusterRole::Auto);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await;
-        // #3651: throttle for the leader-only stale-GC backpressure yield log.
+        // #3651: throttle for the hub-only stale-GC backpressure yield log.
         let mut last_pressure_log = Instant::now() - crate::db::postgres::BACKPRESSURE_LOG_THROTTLE;
         loop {
             interval.tick().await;
-            if let Some(lease) = leader_lease.as_mut()
+            if let Some(lease) = hub_lease.as_mut()
                 && let Err(error) = lease.keepalive().await
             {
-                tracing::warn!("[cluster] leader lease keepalive failed: {error}");
-                leader_active.store(false, Ordering::Release);
-                leader_lease = None;
+                tracing::warn!("[cluster] hub lease keepalive failed: {error}");
+                hub_active.store(false, Ordering::Release);
+                hub_lease = None;
             }
             // Live failover: if this node is eligible to lead and currently is
-            // not leader, retry the advisory lock. Picks up leadership when the
-            // previous leader's session is gone (Postgres releases the lock on
+            // not hub, retry the advisory lock. Picks up hub ownership when the
+            // previous hub's session is gone (Postgres releases the lock on
             // session disconnect), without waiting for a dcserver restart.
-            if leader_eligible && leader_lease.is_none() && !leader_active.load(Ordering::Acquire) {
+            if hub_eligible && hub_lease.is_none() && !hub_active.load(Ordering::Acquire) {
                 match AdvisoryLockLease::try_acquire(
                     &pool,
-                    CLUSTER_LEADER_ADVISORY_LOCK_ID,
-                    "cluster-leader",
+                    CLUSTER_HUB_ADVISORY_LOCK_ID,
+                    "cluster-hub",
                 )
                 .await
                 {
                     Ok(Some(new_lease)) => {
                         tracing::info!(
                             instance_id,
-                            "[cluster] acquired leader advisory lock via failover"
+                            "[cluster] acquired hub advisory lock via failover"
                         );
-                        leader_lease = Some(new_lease);
-                        leader_active.store(true, Ordering::Release);
+                        hub_lease = Some(new_lease);
+                        hub_active.store(true, Ordering::Release);
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!("[cluster] leader lease retry failed: {error}");
+                        tracing::warn!("[cluster] hub lease retry failed: {error}");
                     }
                 }
             }
-            let current_effective_role = if leader_active.load(Ordering::Acquire) {
+            let current_effective_role = if hub_active.load(Ordering::Acquire) {
                 ClusterRole::Hub
             } else {
                 ClusterRole::Runner
             };
             let capabilities = capabilities_with_runtime_state(&base_capabilities);
-            if let Err(error) = upsert_worker_node(
+            if let Err(error) = upsert_runner_node(
                 &pool,
                 &instance_id,
                 &hostname,
@@ -371,21 +367,20 @@ fn spawn_heartbeat_loop(
             {
                 tracing::warn!("[cluster] heartbeat failed: {error}");
             }
-            if let Err(error) =
-                upsert_worker_mcp_endpoints(&pool, &instance_id, &capabilities).await
+            if let Err(error) = upsert_node_mcp_endpoints(&pool, &instance_id, &capabilities).await
             {
                 tracing::warn!("[cluster] heartbeat MCP endpoint sync failed: {error}");
             }
-            // Stale-row GC: leader-only sweep that flips
-            // worker_nodes.status='offline' when a peer's last_heartbeat_at is
+            // Stale-row GC: hub-only sweep that flips
+            // cluster_nodes.status='offline' when a peer's last_heartbeat_at is
             // beyond stale_threshold_secs. Without this, dead nodes keep
             // status='online' and split-brain diagnostics remain unreliable.
             //
             // #3651: the heartbeat upsert above is NEVER gated (liveness /
-            // leader-lease signal — gating it would risk false failover). Only
+            // hub-lease signal — gating it would risk false failover). Only
             // this deferrable GC backs off under pool pressure; it self-heals on
             // the next heartbeat tick once pressure clears.
-            if leader_active.load(Ordering::Acquire) {
+            if hub_active.load(Ordering::Acquire) {
                 let throttle = crate::db::postgres::BACKPRESSURE_LOG_THROTTLE;
                 if crate::db::postgres::background_should_yield(&pool) {
                     if last_pressure_log.elapsed() >= throttle {
@@ -393,7 +388,7 @@ fn spawn_heartbeat_loop(
                         last_pressure_log = Instant::now();
                     }
                 } else {
-                    match run_leader_intake_retry_maintenance_once(
+                    match run_hub_intake_retry_maintenance_once(
                         &pool,
                         &instance_id,
                         stale_threshold_secs,
@@ -410,9 +405,9 @@ fn spawn_heartbeat_loop(
                             ?outcome,
                             "[cluster] swept failed pre-accept intake route"
                         ),
-                        Err(error) => tracing::warn!(
-                            "[cluster] leader intake retry maintenance failed: {error}"
-                        ),
+                        Err(error) => {
+                            tracing::warn!("[cluster] hub intake retry maintenance failed: {error}")
+                        }
                     }
                 }
             }
@@ -423,7 +418,7 @@ fn spawn_heartbeat_loop(
 fn spawn_stale_claim_owner_reassignment_loop(
     pool: PgPool,
     cluster_config: ClusterConfig,
-    leader_active: Arc<AtomicBool>,
+    hub_active: Arc<AtomicBool>,
 ) {
     let interval_secs = cluster_config.heartbeat_interval_secs.max(1);
     tokio::spawn(async move {
@@ -433,10 +428,10 @@ fn spawn_stale_claim_owner_reassignment_loop(
         let mut last_pressure_log = Instant::now() - crate::db::postgres::BACKPRESSURE_LOG_THROTTLE;
         loop {
             interval.tick().await;
-            if !leader_active.load(Ordering::Acquire) {
+            if !hub_active.load(Ordering::Acquire) {
                 continue;
             }
-            // #3651: this leader-only loop holds the longest-lived background tx
+            // #3651: this hub-only loop holds the longest-lived background tx
             // (reassignment + routing CPU), so it yields first under foreground
             // pool pressure. Skipping is safe — stale claims are reassigned on
             // the next tick once pressure clears.
@@ -473,13 +468,13 @@ fn spawn_stale_claim_owner_reassignment_loop(
     });
 }
 
-async fn mark_stale_worker_nodes_offline(
+async fn mark_stale_cluster_nodes_offline(
     pool: &PgPool,
     stale_threshold_secs: u64,
     self_instance_id: &str,
 ) -> Result<u64, String> {
     let result = sqlx::query(
-        "UPDATE worker_nodes
+        "UPDATE cluster_nodes
             SET status = 'offline'
           WHERE status = 'online'
             AND instance_id <> $2
@@ -489,20 +484,20 @@ async fn mark_stale_worker_nodes_offline(
     .bind(self_instance_id)
     .execute(pool)
     .await
-    .map_err(|error| format!("mark stale worker_nodes offline: {error}"))?;
+    .map_err(|error| format!("mark stale cluster_nodes offline: {error}"))?;
     let affected = result.rows_affected();
     if affected > 0 {
         tracing::info!(
             stale_threshold_secs,
             affected,
-            "[cluster] flipped stale worker_nodes to offline"
+            "[cluster] flipped stale cluster_nodes to offline"
         );
     }
     Ok(affected)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn upsert_worker_node(
+async fn upsert_runner_node(
     pool: &PgPool,
     instance_id: &str,
     hostname: &str,
@@ -514,7 +509,7 @@ async fn upsert_worker_node(
 ) -> Result<(), String> {
     sqlx::query(
         r#"
-        INSERT INTO worker_nodes (
+        INSERT INTO cluster_nodes (
             instance_id, hostname, process_id, role, effective_role, status,
             labels, capabilities, last_heartbeat_at, started_at, updated_at
         )
@@ -534,28 +529,28 @@ async fn upsert_worker_node(
     .bind(instance_id)
     .bind(hostname)
     .bind(pid)
-    .bind(configured_role.registry_value())
-    .bind(effective_role.registry_value())
+    .bind(configured_role.as_str())
+    .bind(effective_role.as_str())
     .bind(labels)
     .bind(capabilities)
     .execute(pool)
     .await
     .map(|_| ())
-    .map_err(|error| format!("upsert worker_nodes: {error}"))
+    .map_err(|error| format!("upsert cluster_nodes: {error}"))
 }
 
-async fn upsert_worker_mcp_endpoints(
+async fn upsert_node_mcp_endpoints(
     pool: &PgPool,
     instance_id: &str,
     capabilities: &Value,
 ) -> Result<(), String> {
     let mut endpoint_names = Vec::new();
     let Some(mcp) = capabilities.get("mcp") else {
-        sqlx::query("DELETE FROM worker_mcp_endpoints WHERE instance_id = $1")
+        sqlx::query("DELETE FROM node_mcp_endpoints WHERE instance_id = $1")
             .bind(instance_id)
             .execute(pool)
             .await
-            .map_err(|error| format!("clear worker_mcp_endpoints: {error}"))?;
+            .map_err(|error| format!("clear node_mcp_endpoints: {error}"))?;
         return Ok(());
     };
 
@@ -572,7 +567,7 @@ async fn upsert_worker_mcp_endpoints(
                     .or_else(|| metadata.as_bool());
                 sqlx::query(
                     r#"
-                    INSERT INTO worker_mcp_endpoints (
+                    INSERT INTO node_mcp_endpoints (
                         instance_id, endpoint_name, healthy, metadata, last_checked_at, updated_at
                     )
                     VALUES ($1, $2, $3, $4, NOW(), NOW())
@@ -589,7 +584,7 @@ async fn upsert_worker_mcp_endpoints(
                 .bind(metadata)
                 .execute(pool)
                 .await
-                .map_err(|error| format!("upsert worker_mcp_endpoints: {error}"))?;
+                .map_err(|error| format!("upsert node_mcp_endpoints: {error}"))?;
             }
         }
         Value::Array(names) => {
@@ -600,7 +595,7 @@ async fn upsert_worker_mcp_endpoints(
                 endpoint_names.push(endpoint.to_string());
                 sqlx::query(
                     r#"
-                    INSERT INTO worker_mcp_endpoints (
+                    INSERT INTO node_mcp_endpoints (
                         instance_id, endpoint_name, healthy, metadata, last_checked_at, updated_at
                     )
                     VALUES ($1, $2, NULL, '{}'::jsonb, NOW(), NOW())
@@ -615,14 +610,14 @@ async fn upsert_worker_mcp_endpoints(
                 .bind(endpoint)
                 .execute(pool)
                 .await
-                .map_err(|error| format!("upsert worker_mcp_endpoints: {error}"))?;
+                .map_err(|error| format!("upsert node_mcp_endpoints: {error}"))?;
             }
         }
         _ => {}
     }
 
     sqlx::query(
-        "DELETE FROM worker_mcp_endpoints
+        "DELETE FROM node_mcp_endpoints
           WHERE instance_id = $1
             AND NOT (endpoint_name = ANY($2))",
     )
@@ -630,14 +625,14 @@ async fn upsert_worker_mcp_endpoints(
     .bind(endpoint_names)
     .execute(pool)
     .await
-    .map_err(|error| format!("prune worker_mcp_endpoints: {error}"))?;
+    .map_err(|error| format!("prune node_mcp_endpoints: {error}"))?;
     Ok(())
 }
 
 /// Process-global cache of the resolved self `instance_id`. Set once
 /// during `bootstrap()` from `ClusterRuntime.instance_id()` so callers
-/// (e.g. the intake-routing leader hook in `services::cluster::intake_router_hook`)
-/// see the SAME id the cluster bootstrap registered with `worker_nodes`,
+/// (e.g. the intake-routing hub hook in `services::cluster::intake_router_hook`)
+/// see the SAME id the cluster bootstrap registered with `cluster_nodes`,
 /// even when the id was supplied via `ClusterConfig.instance_id` rather
 /// than env or hostname.
 pub(crate) static SELF_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -649,8 +644,8 @@ pub(crate) static SELF_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::Onc
 ///
 /// Phase 4 codex blocker fix #1: a config-driven id must be reachable
 /// from the intake hook so `pick_intake_target` can correctly
-/// classify the leader as self. Otherwise the hook can route a
-/// message to leader's own `instance_id` and the gate then skips
+/// classify the hub as self. Otherwise the hook can route a
+/// message to hub's own `instance_id` and the gate then skips
 /// local execution, leaving the row unconsumed.
 pub(crate) fn resolve_self_instance_id_without_config() -> String {
     if let Some(value) = SELF_INSTANCE_ID.get() {
@@ -669,7 +664,7 @@ pub(crate) fn resolve_self_instance_id_without_config() -> String {
 }
 
 /// Wait until `cluster::bootstrap` has populated `SELF_INSTANCE_ID`, then
-/// return its value. Used by callers (Phase 5.1 intake_worker spawn) that
+/// return its value. Used by callers (Phase 5.1 intake_runner spawn) that
 /// race with cluster bootstrap and would otherwise pick up the
 /// hostname+PID fallback. Times out after `max_wait` and falls back to
 /// `resolve_self_instance_id_without_config()` so the caller never blocks
@@ -710,14 +705,14 @@ fn resolve_instance_id(config: &ClusterConfig) -> String {
     )
 }
 
-pub(crate) async fn list_worker_nodes(
+pub(crate) async fn list_cluster_nodes(
     pool: &PgPool,
     lease_ttl_secs: u64,
 ) -> Result<Vec<serde_json::Value>, String> {
     let rows = sqlx::query(
         r#"
         SELECT
-            worker_nodes.instance_id,
+            cluster_nodes.instance_id,
             hostname,
             process_id,
             role,
@@ -730,27 +725,27 @@ pub(crate) async fn list_worker_nodes(
             capabilities,
             COALESCE(active_dispatches.active_dispatch_count, 0)::BIGINT AS active_dispatch_count,
             execution_assignments.last_execution_assignment_at,
-            (SELECT count(*) FROM node_execution_occupancy(worker_nodes.instance_id)) AS execution_occupied,
-            (SELECT count(*) FROM node_execution_leases l WHERE l.instance_id=worker_nodes.instance_id AND l.expires_at>NOW()) AS execution_active,
+            (SELECT count(*) FROM node_execution_occupancy(cluster_nodes.instance_id)) AS execution_occupied,
+            (SELECT count(*) FROM node_execution_leases l WHERE l.instance_id=cluster_nodes.instance_id AND l.expires_at>NOW()) AS execution_active,
             last_heartbeat_at,
             started_at,
             updated_at
-        FROM worker_nodes
-        LEFT JOIN node_execution_assignments execution_assignments ON execution_assignments.instance_id=worker_nodes.instance_id
+        FROM cluster_nodes
+        LEFT JOIN node_execution_assignments execution_assignments ON execution_assignments.instance_id=cluster_nodes.instance_id
         LEFT JOIN (
             SELECT claim_owner, COUNT(*)::BIGINT AS active_dispatch_count
               FROM dispatch_outbox
              WHERE status IN ('claimed', 'processing')
                AND claim_owner IS NOT NULL
              GROUP BY claim_owner
-        ) active_dispatches ON active_dispatches.claim_owner = worker_nodes.instance_id
-        ORDER BY last_heartbeat_at DESC, worker_nodes.instance_id ASC
+        ) active_dispatches ON active_dispatches.claim_owner = cluster_nodes.instance_id
+        ORDER BY last_heartbeat_at DESC, cluster_nodes.instance_id ASC
         "#,
     )
     .bind(lease_ttl_secs.max(1) as i64)
     .fetch_all(pool)
     .await
-    .map_err(|error| format!("query worker_nodes: {error}"))?;
+    .map_err(|error| format!("query cluster_nodes: {error}"))?;
 
     Ok(rows
         .into_iter()
@@ -760,7 +755,7 @@ pub(crate) async fn list_worker_nodes(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| serde_json::json!({}));
-            let api_base_url = worker_api_base_url_from_capabilities(&capabilities);
+            let api_base_url = runner_api_base_url_from_capabilities(&capabilities);
             let session_api_routable = api_base_url.is_some();
             serde_json::json!({
                 "instance_id": row.try_get::<String, _>("instance_id").ok(),
@@ -795,9 +790,9 @@ pub(crate) async fn list_worker_nodes(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterRole, ClusterRuntime, auto_node_can_attempt_leadership, current_intake_retry_config,
-        explain_capability_match, resolve_instance_id, select_capability_route,
-        should_wake_wait_queue_after_node_join,
+        ClusterRole, ClusterRuntime, auto_node_can_attempt_hub_ownership,
+        current_intake_retry_config, explain_capability_match, resolve_instance_id,
+        select_capability_route, should_wake_wait_queue_after_node_join,
     };
     use crate::config::{ClusterConfig, Config};
     use serde_json::json;
@@ -831,22 +826,22 @@ mod tests {
     }
 
     #[test]
-    fn node_join_wake_runs_only_on_leader() {
-        let leader = AtomicBool::new(true);
-        assert!(should_wake_wait_queue_after_node_join(&leader));
+    fn node_join_wake_runs_only_on_hub() {
+        let hub = AtomicBool::new(true);
+        assert!(should_wake_wait_queue_after_node_join(&hub));
 
-        leader.store(false, Ordering::Release);
-        assert!(!should_wake_wait_queue_after_node_join(&leader));
+        hub.store(false, Ordering::Release);
+        assert!(!should_wake_wait_queue_after_node_join(&hub));
     }
 
     #[test]
-    fn auto_node_leadership_requires_configured_gateway_token() {
+    fn auto_node_hub_ownership_requires_configured_gateway_token() {
         let mut config = Config::default();
         config.cluster.enabled = true;
         config.cluster.role = ClusterRole::Auto;
         config.discord.bots.clear();
 
-        assert!(!auto_node_can_attempt_leadership(&config));
+        assert!(!auto_node_can_attempt_hub_ownership(&config));
 
         config.discord.bots.insert(
             "codex".to_string(),
@@ -856,33 +851,33 @@ mod tests {
                 ..crate::config::BotConfig::default()
             },
         );
-        assert!(!auto_node_can_attempt_leadership(&config));
+        assert!(!auto_node_can_attempt_hub_ownership(&config));
 
         config.discord.bots.get_mut("codex").unwrap().token = Some("token".to_string());
-        assert!(auto_node_can_attempt_leadership(&config));
+        assert!(auto_node_can_attempt_hub_ownership(&config));
     }
 
     #[tokio::test]
-    async fn wait_until_leader_follows_late_leadership_transition() {
-        let leader_active = Arc::new(AtomicBool::new(false));
+    async fn wait_until_hub_follows_late_hub_ownership_transition() {
+        let hub_active = Arc::new(AtomicBool::new(false));
         let runtime = ClusterRuntime {
             enabled: true,
             instance_id: "test-node".to_string(),
             configured_role: ClusterRole::Auto,
             effective_role: ClusterRole::Runner,
-            leader_active: leader_active.clone(),
+            hub_active: hub_active.clone(),
         };
         let wait = tokio::spawn({
             let runtime = runtime.clone();
-            async move { runtime.wait_until_leader().await }
+            async move { runtime.wait_until_hub().await }
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!wait.is_finished());
-        leader_active.store(true, Ordering::Release);
+        hub_active.store(true, Ordering::Release);
         tokio::time::timeout(Duration::from_secs(2), wait)
             .await
-            .expect("wait_until_leader should observe leadership")
+            .expect("wait_until_hub should observe hub ownership")
             .expect("wait task should not panic");
     }
 

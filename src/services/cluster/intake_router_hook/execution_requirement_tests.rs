@@ -1,6 +1,6 @@
 use super::pg_tests::{
-    ctx_for_channel, seed_agent_with_preference, seed_session_owner,
-    seed_worker_node_with_capabilities,
+    ctx_for_channel, seed_agent_with_preference, seed_runner_node_with_capabilities,
+    seed_session_owner,
 };
 use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
@@ -19,11 +19,8 @@ async fn execution_requirements_block_fallback_and_survive_recovery_pg() {
         .execute(&pool)
         .await
         .unwrap();
-    for (id, os, status) in [
-        ("leader-1", "macos", "online"),
-        ("win", "windows", "offline"),
-    ] {
-        seed_worker_node_with_capabilities(
+    for (id, os, status) in [("hub-1", "macos", "online"), ("win", "windows", "offline")] {
+        seed_runner_node_with_capabilities(
             &pool,
             id,
             json!([]),
@@ -44,13 +41,13 @@ async fn execution_requirements_block_fallback_and_survive_recovery_pg() {
             IntakeRouterDecision::Blocked { .. }
         ));
     }
-    ctx.node_override_instance_id = Some("leader-1");
+    ctx.node_override_instance_id = Some("hub-1");
     assert!(matches!(
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::Blocked { .. }
     ));
     ctx.node_override_instance_id = None;
-    sqlx::query("UPDATE worker_nodes SET status='online' WHERE instance_id='win'")
+    sqlx::query("UPDATE cluster_nodes SET status='online' WHERE instance_id='win'")
         .execute(&pool)
         .await
         .unwrap();
@@ -70,36 +67,36 @@ async fn execution_requirements_block_fallback_and_survive_recovery_pg() {
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::SkippedDuplicate { .. }
     ));
-    let claimed = claim_pending_for_target(&pool, "win", "claude", "worker-test")
+    let claimed = claim_pending_for_target(&pool, "win", "claude", "runner-test")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(claimed.execution_requirements, policy);
     assert_eq!(claimed.id, id);
     assert!(
-        crate::services::cluster::execution_requirements::validate_worker(&claimed).is_err(),
+        crate::services::cluster::execution_requirements::validate_runner(&claimed).is_err(),
         "an unprobed receiver cannot accept the persisted hard policy"
     );
-    mark_failed_pre_accept(&pool, id, "worker-test", "fixture unavailable")
+    mark_failed_pre_accept(&pool, id, "runner-test", "fixture unavailable")
         .await
         .unwrap();
-    sqlx::query("UPDATE worker_nodes SET status='offline' WHERE instance_id='win'")
+    sqlx::query("UPDATE cluster_nodes SET status='offline' WHERE instance_id='win'")
         .execute(&pool)
         .await
         .unwrap();
     assert!(matches!(
-        sweep_failed_pre_accept_once(&pool, "leader-1", 4, 60, None)
+        sweep_failed_pre_accept_once(&pool, "hub-1", 4, 60, None)
             .await
             .unwrap(),
         FailedPreAcceptSweepOutcome::NoCapableTarget { .. }
     ));
     sqlx::query(
-        "UPDATE worker_nodes SET status='online',last_heartbeat_at=NOW() WHERE instance_id='win'",
+        "UPDATE cluster_nodes SET status='online',last_heartbeat_at=NOW() WHERE instance_id='win'",
     )
     .execute(&pool)
     .await
     .unwrap();
-    let child = match sweep_failed_pre_accept_once(&pool, "leader-1", 4, 60, None)
+    let child = match sweep_failed_pre_accept_once(&pool, "hub-1", 4, 60, None)
         .await
         .unwrap()
     {
@@ -113,12 +110,12 @@ async fn execution_requirements_block_fallback_and_survive_recovery_pg() {
             .await
             .unwrap();
     assert_eq!(persisted, policy);
-    let row = claim_pending_for_target(&pool, "win", "claude", "worker-test")
+    let row = claim_pending_for_target(&pool, "win", "claude", "runner-test")
         .await
         .unwrap()
         .unwrap();
-    assert!(mark_accepted(&pool, row.id, "worker-test").await.unwrap());
-    assert!(mark_spawned(&pool, row.id, "worker-test").await.unwrap());
+    assert!(mark_accepted(&pool, row.id, "runner-test").await.unwrap());
+    assert!(mark_spawned(&pool, row.id, "runner-test").await.unwrap());
     let retry = crate::db::intake_outbox_force_fail::force_fail_and_retry_as_new(
         &pool,
         row.id,
@@ -147,8 +144,8 @@ async fn execution_requirements_reject_incompatible_existing_owner_without_reass
         .execute(&pool)
         .await
         .unwrap();
-    for (id, os) in [("leader-1", "macos"), ("win", "windows")] {
-        seed_worker_node_with_capabilities(
+    for (id, os) in [("hub-1", "macos"), ("win", "windows")] {
+        seed_runner_node_with_capabilities(
             &pool,
             id,
             json!([]),
@@ -162,7 +159,7 @@ async fn execution_requirements_reject_incompatible_existing_owner_without_reass
         "claude:required-owner",
         "claude",
         "8222",
-        "leader-1",
+        "hub-1",
         "turn_active",
     )
     .await;

@@ -87,7 +87,7 @@ impl Drop for DeferredRestartCancellationGuard {
 /// per-provider CAS gives exactly one poller permission to wait, persist, and
 /// consume that provider's shutdown-barrier slot.
 pub(super) fn begin_deferred_restart(shared: &SharedData) -> Option<DeferredRestartPermit> {
-    shared.restart.intake_worker_lifecycle.fence_admission();
+    shared.restart.intake_runner_lifecycle.fence_admission();
     shared.restart.legacy_deferred_begin();
     shared
         .restart
@@ -106,7 +106,7 @@ pub(super) async fn prepare_deferred_restart(
     let guard = DeferredRestartCancellationGuard::new(shared.clone(), root.to_path_buf(), nonce);
     shared
         .restart
-        .intake_worker_lifecycle
+        .intake_runner_lifecycle
         .wait_until_drained()
         .await;
     if guard.cancelled() {
@@ -210,7 +210,7 @@ fn release_deferred_restart_ownership(shared: &SharedData) {
 }
 
 pub(super) fn rollback_deferred_restart(shared: &SharedData) {
-    shared.restart.intake_worker_lifecycle.unfence_admission();
+    shared.restart.intake_runner_lifecycle.unfence_admission();
     shared.restart.legacy_deferred_rollback();
     release_deferred_restart_ownership(shared);
 }

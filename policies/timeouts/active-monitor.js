@@ -31,7 +31,7 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
         var tmuxName = (swKey || "").split(":").pop();
         // #219: Check if tmux session has a live pane (not just session existence).
         // has-session returns true for zombie sessions with dead panes;
-        // list-panes #{pane_dead} distinguishes live vs dead workers.
+        // list-panes #{pane_dead} distinguishes live vs dead runners.
         var tmuxAlive = timeouts._tmuxHasLivePane(tmuxName);
         var inflight;
         try {

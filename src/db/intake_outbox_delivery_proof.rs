@@ -161,7 +161,7 @@ pub(crate) async fn mark_done_from_delivery_proof(
 
 /// Settles a receipt-backed intake row from either open handoff state.
 ///
-/// The bridge does not own the worker claim token, so this deliberately uses
+/// The bridge does not own the runner claim token, so this deliberately uses
 /// only the monotonic `spawned`/`dispatched` state CAS.  Audit fields such as
 /// `claim_owner`, `spawned_at`, and `dispatched_at` are left untouched.
 pub(crate) async fn settle_intake_done_from_receipt(
@@ -350,8 +350,8 @@ mod tests {
                 user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
                 status, claim_owner, dispatched_at
              ) VALUES (
-                'worker', 'leader', $1, $1, 'user', 'hello', 'standard', 'agent',
-                $2, 'dispatch-worker', $3
+                'runner', 'hub', $1, $1, 'user', 'hello', 'standard', 'agent',
+                $2, 'dispatch-runner', $3
              ) RETURNING id",
         )
         .bind(key)
@@ -438,7 +438,7 @@ mod tests {
             (
                 IntakeOutboxStatus::Dispatched,
                 None,
-                Some("dispatch-worker".into()),
+                Some("dispatch-runner".into()),
                 Some(dispatched_at)
             )
         );
@@ -463,7 +463,7 @@ mod tests {
             (committed.0, committed.2, committed.3),
             (
                 IntakeOutboxStatus::Done,
-                Some("dispatch-worker".into()),
+                Some("dispatch-runner".into()),
                 Some(dispatched_at)
             )
         );
@@ -504,7 +504,7 @@ mod tests {
             (settled.0, settled.2, settled.3),
             (
                 IntakeOutboxStatus::Unknown,
-                Some("dispatch-worker".into()),
+                Some("dispatch-runner".into()),
                 Some(old_at)
             )
         );

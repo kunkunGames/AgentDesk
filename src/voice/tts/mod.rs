@@ -394,7 +394,7 @@ fn is_progress_cache_file_name(name: &str) -> bool {
 /// playback. Only finalized `<64-hex>.<ext>` cache files are considered, so the
 /// in-progress `.tmp` write and any unrelated file are left untouched.
 /// Synchronous (`std::fs`) so it can run inside a `spawn_blocking` from the
-/// leader-only maintenance sweep. Missing dir is a no-op; a symlinked root or
+/// hub-only maintenance sweep. Missing dir is a no-op; a symlinked root or
 /// symlinked entries are skipped so the sweep never follows a link into an
 /// external tree.
 pub(crate) fn sweep_progress_tts_cache(

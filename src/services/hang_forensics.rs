@@ -11,9 +11,9 @@
 //!    participation, so a wedged acceptor reads as `NoResponse` until the
 //!    backlog fills — [`verdict`] always consults the beacon for this stage.
 //! 2. Whether the runtime is scheduling tasks — [`RuntimeLiveness`], driven
-//!    by [`spawn_runtime_liveness_beacon`]. One idle worker is enough to tick
+//!    by [`spawn_runtime_liveness_beacon`]. One idle runner is enough to tick
 //!    it, so `Scheduling` rules out a wedged runtime but not partial executor
-//!    starvation; `runtime_workers=` is logged alongside it.
+//!    starvation; `runtime_runners=` is logged alongside it.
 //! 3. What Postgres was doing — [`Breadcrumbs::db_in_flight`], set by every
 //!    [`DbProbeGuard`] around a `GET /api/health` query (sites enumerated in
 //!    `services::health_diagnostics`). [`verdict`] combines all three; the
@@ -44,11 +44,11 @@ static LAST_DB_OK_AT: AtomicU64 = AtomicU64::new(0);
 static LAST_DB_ERR_AT: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_TICKS: AtomicU64 = AtomicU64::new(0);
 static LAST_RUNTIME_TICK_AT: AtomicU64 = AtomicU64::new(0);
-/// Worker threads the runtime was built with, recorded once by
+/// Runner threads the runtime was built with, recorded once by
 /// [`spawn_runtime_liveness_beacon`]. `0` means the beacon never started.
-/// Logged because `runtime=scheduling` only says *one* worker was free; this
+/// Logged because `runtime=scheduling` only says *one* runner was free; this
 /// is the denominator that makes that readable. See [`RuntimeLiveness`].
-static RUNTIME_WORKERS: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_RUNNERS: AtomicU64 = AtomicU64::new(0);
 
 /// How often [`spawn_runtime_liveness_beacon`] proves the runtime is alive.
 /// Short enough that a stalled tick unambiguously spans the watchdog's 5s
@@ -200,12 +200,12 @@ pub(crate) fn record_runtime_tick() {
 /// panic at boot costs the whole service.
 pub(crate) fn spawn_runtime_liveness_beacon() -> BeaconArmed {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return BeaconArmed { workers: None };
+        return BeaconArmed { runners: None };
     };
     // Recorded here, not at the read side: the watchdog reads from its own OS
     // thread, where no runtime handle is available.
-    let workers = handle.metrics().num_workers() as u64;
-    RUNTIME_WORKERS.store(workers, Ordering::Relaxed);
+    let runners = handle.metrics().num_workers() as u64;
+    RUNTIME_RUNNERS.store(runners, Ordering::Relaxed);
     handle.spawn(async {
         let mut interval = tokio::time::interval(RUNTIME_TICK_PERIOD);
         // `Delay` (not the default `Burst`) so a stall doesn't replay every
@@ -217,7 +217,7 @@ pub(crate) fn spawn_runtime_liveness_beacon() -> BeaconArmed {
         }
     });
     BeaconArmed {
-        workers: Some(workers),
+        runners: Some(runners),
     }
 }
 
@@ -230,7 +230,7 @@ pub(crate) fn spawn_runtime_liveness_beacon() -> BeaconArmed {
 ///
 /// Scoped narrowly: `Copy` (one token can start two threads), says nothing
 /// about other ways to start a thread (`std::thread::spawn` needs no token),
-/// and is issued on the failure path too (`workers: None`) — it proves arming
+/// and is issued on the failure path too (`runners: None`) — it proves arming
 /// was *attempted*, not that it succeeded. [`BeaconArmed::boot_report`]
 /// distinguishes those, logged at ERROR by `spawn_watchdog_thread`.
 ///
@@ -238,15 +238,15 @@ pub(crate) fn spawn_runtime_liveness_beacon() -> BeaconArmed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "the watchdog thread takes this by value; dropping it means the beacon was armed for nothing"]
 pub(crate) struct BeaconArmed {
-    /// Worker threads the beacon saw, or `None` when there was no runtime
+    /// Runner threads the beacon saw, or `None` when there was no runtime
     /// handle and therefore no beacon.
-    workers: Option<u64>,
+    runners: Option<u64>,
 }
 
 impl BeaconArmed {
-    /// `Some(n)` when the beacon is running on an `n`-worker runtime.
-    pub(crate) fn workers(self) -> Option<u64> {
-        self.workers
+    /// `Some(n)` when the beacon is running on an `n`-runner runtime.
+    pub(crate) fn runners(self) -> Option<u64> {
+        self.runners
     }
 
     /// The line the boot path must emit, and at which level. Returned rather
@@ -254,9 +254,9 @@ impl BeaconArmed {
     /// subscriber; `Err` means every later watchdog failure will report
     /// `verdict=undetermined_no_beacon`.
     pub(crate) fn boot_report(self) -> Result<String, String> {
-        match self.workers {
-            Some(workers) => Ok(format!(
-                "hang_forensics: runtime-liveness beacon armed on {workers} worker thread(s)"
+        match self.runners {
+            Some(runners) => Ok(format!(
+                "hang_forensics: runtime-liveness beacon armed on {runners} runner thread(s)"
             )),
             None => Err(
                 "hang_forensics: runtime-liveness beacon NOT armed — no tokio runtime \
@@ -289,27 +289,27 @@ pub(crate) struct Breadcrumbs {
     pub(crate) runtime_ticks: u64,
     /// Age of the last beacon tick, or `None` if it never ticked.
     pub(crate) runtime_tick_age_ms: Option<u64>,
-    /// Worker threads in the runtime, or `0` if the beacon never started. See
-    /// [`RUNTIME_WORKERS`] for why a verdict is unreadable without it.
-    pub(crate) runtime_workers: u64,
+    /// Runner threads in the runtime, or `0` if the beacon never started. See
+    /// [`RUNTIME_RUNNERS`] for why a verdict is unreadable without it.
+    pub(crate) runtime_runners: u64,
 }
 
 /// What the beacon says about the runtime, independently of the acceptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeLiveness {
     /// The beacon ticked within [`RUNTIME_TICK_STALE_MS`]: **at least one**
-    /// worker thread ran a ready timer task. One free worker is enough to tick
+    /// runner thread ran a ready timer task. One free runner is enough to tick
     /// a beacon that only stores two atomics, so this:
     ///
-    /// * **Excludes** a fully wedged runtime — no worker polling anything.
-    /// * **Does not exclude** partial executor starvation: N-1 of N workers
+    /// * **Excludes** a fully wedged runtime — no runner polling anything.
+    /// * **Does not exclude** partial executor starvation: N-1 of N runners
     ///   blocked in sync I/O or `block_in_place` still tick the beacon and
     ///   still produce a `handler_*` verdict, while the actual fault is the
-    ///   executor. Compare `runtime_workers=` against known concurrent load
+    ///   executor. Compare `runtime_runners=` against known concurrent load
     ///   before believing a `handler_*` verdict.
     Scheduling { age_ms: u64 },
     /// The beacon has not ticked for [`RUNTIME_TICK_STALE_MS`]: not **any** of
-    /// the runtime's worker threads ran the beacon task for at least as long
+    /// the runtime's runner threads ran the beacon task for at least as long
     /// as the probe waited for a byte. Nothing short of a fully wedged runtime
     /// produces this.
     Stalled { age_ms: u64 },
@@ -346,7 +346,7 @@ pub(crate) fn snapshot() -> Breadcrumbs {
         last_db_err_age_ms: age_since(LAST_DB_ERR_AT.load(Ordering::Relaxed), now),
         runtime_ticks: RUNTIME_TICKS.load(Ordering::Relaxed),
         runtime_tick_age_ms: age_since(LAST_RUNTIME_TICK_AT.load(Ordering::Relaxed), now),
-        runtime_workers: RUNTIME_WORKERS.load(Ordering::Relaxed),
+        runtime_runners: RUNTIME_RUNNERS.load(Ordering::Relaxed),
     }
 }
 
@@ -369,7 +369,7 @@ impl Breadcrumbs {
             value.map_or_else(|| "never".to_string(), |ms| ms.to_string())
         }
         format!(
-            "db_in_flight={} db_probes_started={} db_probes_failed={} last_db_ok_age_ms={} last_db_err_age_ms={} runtime={} runtime_workers={} runtime_ticks={} runtime_tick_age_ms={}",
+            "db_in_flight={} db_probes_started={} db_probes_failed={} last_db_ok_age_ms={} last_db_err_age_ms={} runtime={} runtime_runners={} runtime_ticks={} runtime_tick_age_ms={}",
             self.db_in_flight,
             self.db_probes_started,
             self.db_probes_failed,
@@ -377,9 +377,9 @@ impl Breadcrumbs {
             age(self.last_db_err_age_ms),
             self.runtime_liveness().label(),
             // Rendered next to `runtime=` on purpose: `scheduling` alone means
-            // "one worker was free", and this is the denominator that makes
+            // "one runner was free", and this is the denominator that makes
             // that readable. `0` == the beacon never started.
-            self.runtime_workers,
+            self.runtime_runners,
             self.runtime_ticks,
             age(self.runtime_tick_age_ms),
         )
@@ -397,7 +397,7 @@ impl Breadcrumbs {
 /// | verdict                           | means                                                         |
 /// |-----------------------------------|---------------------------------------------------------------|
 /// | `responsive`                      | the probe got bytes back; the watchdog prints no failure line  |
-/// | `runtime_stalled`                 | no worker ran a timer task for 5s — a wedged runtime           |
+/// | `runtime_stalled`                 | no runner ran a timer task for 5s — a wedged runtime           |
 /// | `listener_gone`                   | runtime scheduling, yet the handshake did not complete         |
 /// | `handler_blocked_on_db`           | runtime scheduling, *a* health request is inside a query       |
 /// | `handler_slow_db_idle`            | runtime scheduling, no health query outstanding                |
@@ -512,7 +512,7 @@ impl HealthProbeOutcome {
 /// Runs one loopback `GET /api/health` and classifies where it got to.
 ///
 /// Deliberately synchronous and dependency-free: it runs on the watchdog's own
-/// OS thread so that it keeps working when every tokio worker is blocked.
+/// OS thread so that it keeps working when every tokio runner is blocked.
 pub(crate) fn probe_health_once(
     addr: &str,
     host: &str,
@@ -667,7 +667,7 @@ mod tests {
             last_db_err_age_ms: Some(1234),
             runtime_ticks: 500,
             runtime_tick_age_ms: Some(120),
-            runtime_workers: 14,
+            runtime_runners: 14,
         }
     }
 
@@ -717,27 +717,27 @@ mod tests {
         assert!(rendered.contains("runtime_ticks=500"), "{rendered}");
         assert!(rendered.contains("runtime_tick_age_ms=120"), "{rendered}");
         assert!(
-            rendered.contains("runtime_workers=14"),
-            "`runtime=scheduling` only says ONE worker was free; without the \
-             worker count beside it a reader cannot tell whether that leaves 13 \
-             workers unaccounted for: {rendered}"
+            rendered.contains("runtime_runners=14"),
+            "`runtime=scheduling` only says ONE runner was free; without the \
+             runner count beside it a reader cannot tell whether that leaves 13 \
+             runners unaccounted for: {rendered}"
         );
     }
 
     /// `0` in production would silently mean "we never asked"; pin that the
-    /// beacon records the worker count of the runtime it was started on.
+    /// beacon records the runner count of the runtime it was started on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn the_beacon_records_the_runtime_worker_count() {
+    async fn the_beacon_records_the_runtime_runner_count() {
         let _serial = exclusive();
         spawn_runtime_liveness_beacon();
         let after = snapshot();
         assert_eq!(
-            after.runtime_workers, 3,
-            "the beacon must record the worker count of the runtime it was \
+            after.runtime_runners, 3,
+            "the beacon must record the runner count of the runtime it was \
              spawned on, or `runtime=scheduling` is unreadable"
         );
         assert!(
-            after.render().contains("runtime_workers=3"),
+            after.render().contains("runtime_runners=3"),
             "{}",
             after.render()
         );
@@ -1325,21 +1325,21 @@ mod tests {
     /// enforced elsewhere as a data dependency; what remains testable here is
     /// the arming function's own contract.
     #[tokio::test]
-    async fn arming_the_beacon_inside_a_runtime_reports_the_worker_count() {
+    async fn arming_the_beacon_inside_a_runtime_reports_the_runner_count() {
         let _serial = exclusive();
         let armed = spawn_runtime_liveness_beacon();
-        let workers = armed
-            .workers()
-            .expect("on a runtime the beacon must arm and see the worker count");
+        let runners = armed
+            .runners()
+            .expect("on a runtime the beacon must arm and see the runner count");
         assert!(
-            workers > 0,
-            "a runtime has at least one worker, got {workers}"
+            runners > 0,
+            "a runtime has at least one runner, got {runners}"
         );
         assert_eq!(
-            snapshot().runtime_workers,
-            workers,
+            snapshot().runtime_runners,
+            runners,
             "arming must publish the same count the breadcrumbs render; \
-             `runtime_workers=0` is the signal that reads as `the beacon never started`"
+             `runtime_runners=0` is the signal that reads as `the beacon never started`"
         );
         let report = armed
             .boot_report()
@@ -1354,7 +1354,7 @@ mod tests {
     fn arming_the_beacon_off_a_runtime_is_reported_not_fatal() {
         let armed = spawn_runtime_liveness_beacon();
         assert_eq!(
-            armed.workers(),
+            armed.runners(),
             None,
             "without a runtime handle there is nothing to spawn onto"
         );

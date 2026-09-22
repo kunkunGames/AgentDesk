@@ -15,7 +15,7 @@ pub(crate) mod thread_reuse;
 // live in the service layer; DB modules only select/mark/persist.
 pub(crate) mod outbox_claiming;
 
-// #1694: Dispatch outbox queue worker + state-transition logic, extracted
+// #1694: Dispatch outbox queue runner + state-transition logic, extracted
 // from `src/server/routes/dispatches/outbox.rs`. See module doc for the
 // route ↔ service ↔ db boundary.
 pub(crate) mod outbox_queue;

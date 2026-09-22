@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if git diff --quiet -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md; then
+          if git diff --quiet -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/runner-inventory.md; then
             echo "has_drift=false" >> "$GITHUB_OUTPUT"
             echo "Tracked inventory docs are up to date."
           else
@@ -63,7 +63,7 @@ jobs:
           fi
 
           git checkout -b "$branch"
-          git add ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md
+          git add ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/runner-inventory.md
           git commit -m "chore: regenerate inventory docs"
           git push -u origin "$branch"
 

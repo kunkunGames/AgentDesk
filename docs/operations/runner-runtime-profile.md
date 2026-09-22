@@ -3,13 +3,13 @@
 같은 AgentDesk 실행 파일을 사용한다. `cluster.role`은 PostgreSQL 허브 권한 lease
 선택이고, `cluster.runtime_profile`은 프로세스가 시작할 모듈의 범위다.
 화면에서는 허브(`hub`), 실행 노드(`runner`), 전체 기능(`full`), 실행 전용(`runner`)으로
-표시한다. 이전 설정 값은 호환 입력으로 받으며 저장 시 새 이름을 사용한다. [공통 용어 안내](node-terminology.md)를 따른다.
+표시한다. 이전 역할·기능 모드의 별칭은 지원하지 않는다. [공통 용어 안내](node-terminology.md)를 따른다.
 기능 모드를 생략한 기존 설정은 `full`로 해석하므로 기존 허브·자동 선택·대기 동작을 보존한다.
 
 ```yaml
 cluster:
   enabled: true
-  instance_id: windows-worker
+  instance_id: windows-pc
   role: runner
   runtime_profile: runner
   api_base_url: http://192.168.1.100:8791
@@ -42,7 +42,7 @@ TUI provider hook/relay는 provider self-exec를 위해 필요한 경우 유지�
 
 `/api/health`는 `runtime_profile`, `modules`, `dashboard_required`를 제공한다.
 실행 전용 모드의 dashboard는 `false`, `dashboard_required`도 `false`다. 상세 health의
-provider `runtime_role`은 `worker`이며 gateway 접속이 없다는 이유로 standby나
+provider `runtime_role`은 `runner`이며 gateway 접속이 없다는 이유로 standby나
 장애로 바꾸지 않는다. 실제 DB 장애, 종료 대기, 복구 미완료 등은 그대로 반영한다.
 intake poller와 CLI의 실제 실행 가능 여부는 별도의 readiness 근거로 확인한다.
 
@@ -76,7 +76,7 @@ API listener는 생성 시점부터 핸들 상속을 차단하므로 하위 CLI�
 Claude/Codex/Qwen wrapper CLI는 모든 플랫폼에서 공통 pipe 경로로 컴파일한다.
 이름에 `tmux`가 들어 있어도 ProcessBackend가 사용하는 명령이므로 Unix 전용으로
 제외하면 안 된다. FIFO 입력은 Unix에서만 노출하고 Windows 기본 입력은 pipe다.
-Release matrix는 `verify_worker_wrappers.py`로 실제 native 바이너리의 세 wrapper가
+Release matrix는 `verify_runner_wrappers.py`로 실제 native 바이너리의 세 wrapper가
 pipe 진입점까지 도달하는지 확인한다. CLI 설치 확인과 실제 계정 응답 검증은 별도다.
 
 Windows PATH에서 찾은 표준 npm Codex shim은 같은 npm 설치의 CPU에 맞는

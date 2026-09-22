@@ -172,7 +172,7 @@ async fn record_confirmed_agent_turn(pool: &PgPool, fire: &ClaimedFire, turn_id:
 }
 
 async fn claim_after_exhausting_rearms(pool: &PgPool) -> ClaimedFire {
-    let mut fire = claim_one(pool, "retry-worker-0").await;
+    let mut fire = claim_one(pool, "retry-runner-0").await;
     assert_eq!(fire.retry_count, 0);
 
     for expected_retry_count in 1..=(MAX_FIRE_RETRIES + 1) {
@@ -190,7 +190,7 @@ async fn claim_after_exhausting_rearms(pool: &PgPool) -> ClaimedFire {
             .expect("interrupt retryable fire"),
             "the current claim should rewind its definition"
         );
-        fire = claim_one(pool, &format!("retry-worker-{expected_retry_count}")).await;
+        fire = claim_one(pool, &format!("retry-runner-{expected_retry_count}")).await;
         assert_eq!(fire.retry_count, expected_retry_count);
     }
 
@@ -222,7 +222,7 @@ async fn postgres_scheduled_message_default_notify_reaches_push_outbox() {
 
     let mut claims = db::claim_due_fires_pg(
         &pool,
-        "notify-default-worker",
+        "notify-default-runner",
         true,
         1,
         LEASE_SECS,
@@ -310,7 +310,7 @@ async fn postgres_scheduled_push_atomically_fans_out_to_discord_and_kakao() {
     )
     .await
     .expect("insert multi-channel scheduled push");
-    let fire = claim_one(&pool, "provider-fanout-worker").await;
+    let fire = claim_one(&pool, "provider-fanout-runner").await;
 
     fire_claimed(&pool, None, fire.clone(), Utc::now()).await;
     fire_claimed(&pool, None, fire, Utc::now()).await;
@@ -491,7 +491,7 @@ async fn postgres_scheduled_message_retry_exhaustion_terminalizes_recurring_defi
     assert!(
         db::claim_due_fires_pg(
             &pool,
-            "post-terminal-worker",
+            "post-terminal-runner",
             true,
             10,
             LEASE_SECS,
@@ -589,7 +589,7 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
     .await
     .expect("insert trigger-now recurring definition");
 
-    let manual = db::trigger_now_pg(&pool, &message.id, "manual-worker", LEASE_SECS)
+    let manual = db::trigger_now_pg(&pool, &message.id, "manual-runner", LEASE_SECS)
         .await
         .expect("trigger recurring definition")
         .expect("scheduled definition should trigger");
@@ -610,7 +610,7 @@ async fn postgres_trigger_now_retry_preserves_recurring_anchor() {
     );
 
     let mut retries =
-        db::claim_due_fires_pg(&pool, "retry-worker", true, 10, LEASE_SECS, Utc::now())
+        db::claim_due_fires_pg(&pool, "retry-runner", true, 10, LEASE_SECS, Utc::now())
             .await
             .expect("reclaim manual fire");
     assert_eq!(retries.len(), 1);
@@ -676,7 +676,7 @@ async fn postgres_resume_anchor_compat_migration_preserves_active_trigger_now_an
     )
     .await
     .expect("insert legacy trigger-now definition");
-    let manual = db::trigger_now_pg(&pool, &message.id, "legacy-worker", LEASE_SECS)
+    let manual = db::trigger_now_pg(&pool, &message.id, "legacy-runner", LEASE_SECS)
         .await
         .expect("trigger legacy recurring definition")
         .expect("legacy definition should trigger");
@@ -744,7 +744,7 @@ async fn postgres_launch_compat_migration_backfills_legacy_turn_as_ambiguous() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-legacy-launch-agent", "fail").await;
-    let fire = claim_one(&pool, "legacy-launch-worker").await;
+    let fire = claim_one(&pool, "legacy-launch-runner").await;
     sqlx::query(
         "UPDATE scheduled_message_deliveries
          SET turn_id = 'legacy-ambiguous-turn',
@@ -846,7 +846,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
     .await
     .expect("insert agent trigger-now recurring definition");
 
-    let manual = db::trigger_now_pg(&pool, &message.id, "manual-agent-worker", LEASE_SECS)
+    let manual = db::trigger_now_pg(&pool, &message.id, "manual-agent-runner", LEASE_SECS)
         .await
         .expect("trigger recurring agent definition")
         .expect("scheduled agent definition should trigger");
@@ -866,7 +866,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
     );
     let blocked = db::claim_due_fires_pg(
         &pool,
-        "early-retry-agent-worker",
+        "early-retry-agent-runner",
         true,
         10,
         LEASE_SECS,
@@ -877,7 +877,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
     assert!(blocked.is_empty());
     let mut retries = db::claim_due_fires_pg(
         &pool,
-        "retry-agent-worker",
+        "retry-agent-runner",
         true,
         10,
         LEASE_SECS,
@@ -889,7 +889,7 @@ async fn postgres_agent_trigger_now_retry_preserves_recurring_anchor_through_pol
     let retry = retries.pop().expect("manual agent retry exists");
     record_confirmed_agent_turn(&pool, &retry, "agent-trigger-retry-turn").await;
 
-    let running = db::list_running_agent_deliveries_pg(&pool, "retry-agent-worker", LEASE_SECS, 10)
+    let running = db::list_running_agent_deliveries_pg(&pool, "retry-agent-runner", LEASE_SECS, 10)
         .await
         .expect("poll agent trigger-now retry");
     assert_eq!(running.len(), 1);
@@ -927,7 +927,7 @@ async fn postgres_agent_timeout_with_push_raw_fails_closed_without_outbox() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-timeout-agent", "push_raw").await;
-    let fire = claim_one(&pool, "timeout-worker").await;
+    let fire = claim_one(&pool, "timeout-runner").await;
     record_confirmed_agent_turn(&pool, &fire, "scheduled-timeout-turn").await;
     sqlx::query(
         "UPDATE scheduled_message_deliveries
@@ -939,7 +939,7 @@ async fn postgres_agent_timeout_with_push_raw_fails_closed_without_outbox() {
     .execute(&pool)
     .await
     .expect("age agent delivery beyond completion timeout");
-    let mut running = db::list_running_agent_deliveries_pg(&pool, "timeout-worker", LEASE_SECS, 10)
+    let mut running = db::list_running_agent_deliveries_pg(&pool, "timeout-runner", LEASE_SECS, 10)
         .await
         .expect("poll timed-out agent turn");
     let delivery = running.pop().expect("timed-out delivery should be polled");
@@ -985,7 +985,7 @@ async fn postgres_agent_evidence_before_runtime_ack_is_not_missed() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-fast-evidence-agent", "fail").await;
-    let fire = claim_one(&pool, "fast-evidence-worker").await;
+    let fire = claim_one(&pool, "fast-evidence-runner").await;
     let turn_id = "scheduled-fast-evidence-turn";
     assert!(
         db::record_delivery_agent_turn_intent_pg(
@@ -1075,7 +1075,7 @@ async fn postgres_provider_error_transcripts_fail_without_false_delivery() {
     let cases = [
         (
             "scheduled-codex-usage-limit-agent",
-            "codex-provider-error-worker",
+            "codex-provider-error-runner",
             "scheduled-codex-usage-limit-turn",
             "Error: You've hit your usage limit. Try again later.",
             serde_json::json!([{
@@ -1091,7 +1091,7 @@ async fn postgres_provider_error_transcripts_fail_without_false_delivery() {
         ),
         (
             "scheduled-qwen-api-error-agent",
-            "qwen-provider-error-worker",
+            "qwen-provider-error-runner",
             "scheduled-qwen-api-error-turn",
             "[API Error: 400 status code (no body)]",
             serde_json::json!([
@@ -1235,11 +1235,11 @@ async fn postgres_definitive_agent_failure_atomically_enqueues_one_fallback() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-no-reply-agent", "push_raw").await;
-    let fire = claim_one(&pool, "fallback-worker").await;
+    let fire = claim_one(&pool, "fallback-runner").await;
     let turn_id = "scheduled-no-reply-turn";
     record_confirmed_agent_turn(&pool, &fire, turn_id).await;
     let mut running =
-        db::list_running_agent_deliveries_pg(&pool, "fallback-worker", LEASE_SECS, 10)
+        db::list_running_agent_deliveries_pg(&pool, "fallback-runner", LEASE_SECS, 10)
             .await
             .expect("poll no-reply agent turn");
     let delivery = running.pop().expect("no-reply delivery should be polled");
@@ -1297,7 +1297,7 @@ async fn postgres_runtime_absence_defers_terminal_agent_fallback_polling() {
     let message =
         insert_recurring_agent_message(&pool, "scheduled-runtime-absent-poll-agent", "push_raw")
             .await;
-    let fire = claim_one(&pool, "agent-launch-worker").await;
+    let fire = claim_one(&pool, "agent-launch-runner").await;
     let turn_id = "scheduled-runtime-absent-poll-turn";
     record_confirmed_agent_turn(&pool, &fire, turn_id).await;
     assert!(
@@ -1345,7 +1345,7 @@ async fn postgres_runtime_absence_defers_terminal_agent_fallback_polling() {
     let runtime = HealthRegistry::new();
     assert!(
         tick_once(&pool, Some(&runtime), "runtime-restored-poller").await,
-        "a runtime-capable leader should adopt and resolve the durable turn"
+        "a runtime-capable hub should adopt and resolve the durable turn"
     );
     let completed_parent = db::get_scheduled_message_pg(&pool, &message.id)
         .await
@@ -1416,7 +1416,7 @@ async fn postgres_missing_runtime_waits_without_consuming_agent_retry() {
     assert!(
         db::claim_due_fires_pg(
             &pool,
-            "runtime-hot-loop-worker",
+            "runtime-hot-loop-runner",
             true,
             10,
             LEASE_SECS,
@@ -1429,7 +1429,7 @@ async fn postgres_missing_runtime_waits_without_consuming_agent_retry() {
     );
     let mut restored = db::claim_due_fires_pg(
         &pool,
-        "runtime-restored-worker",
+        "runtime-restored-runner",
         true,
         10,
         LEASE_SECS,
@@ -1502,7 +1502,7 @@ async fn postgres_expired_running_agent_never_enqueues_raw_fallback() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-expired-live-agent", "push_raw").await;
-    let fire = claim_one(&pool, "expired-agent-worker").await;
+    let fire = claim_one(&pool, "expired-agent-runner").await;
     let turn_id = "scheduled-expired-agent-turn";
     record_confirmed_agent_turn(&pool, &fire, turn_id).await;
     sqlx::query(
@@ -1513,7 +1513,7 @@ async fn postgres_expired_running_agent_never_enqueues_raw_fallback() {
     .await
     .expect("expire running agent definition");
     let mut running =
-        db::list_running_agent_deliveries_pg(&pool, "expired-agent-worker", LEASE_SECS, 10)
+        db::list_running_agent_deliveries_pg(&pool, "expired-agent-runner", LEASE_SECS, 10)
             .await
             .expect("poll expired running agent");
     let delivery = running
@@ -1558,7 +1558,7 @@ async fn postgres_expiry_does_not_terminalize_a_still_live_agent_turn() {
     .await;
     let message =
         insert_recurring_agent_message(&pool, "scheduled-expired-running-agent", "push_raw").await;
-    let fire = claim_one(&pool, "expired-live-agent-worker").await;
+    let fire = claim_one(&pool, "expired-live-agent-runner").await;
     record_confirmed_agent_turn(&pool, &fire, "scheduled-expired-live-turn").await;
     sqlx::query(
         "UPDATE scheduled_messages SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
@@ -1568,7 +1568,7 @@ async fn postgres_expiry_does_not_terminalize_a_still_live_agent_turn() {
     .await
     .expect("expire definition while its turn is live");
     let mut running =
-        db::list_running_agent_deliveries_pg(&pool, "expired-live-agent-worker", LEASE_SECS, 10)
+        db::list_running_agent_deliveries_pg(&pool, "expired-live-agent-runner", LEASE_SECS, 10)
             .await
             .expect("poll live expired definition");
     let delivery = running.pop().expect("live turn should remain pollable");

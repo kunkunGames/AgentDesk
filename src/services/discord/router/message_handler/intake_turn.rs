@@ -13,12 +13,12 @@ mod dispatch_stamp;
 pub(crate) mod inflight_create_log;
 mod placeholder_handoff;
 pub(super) mod race_loss;
+mod runner_entry;
 mod runtime_transition;
 mod stale_dispatch_guard;
 mod voice_intake;
-mod worker_entry;
 
-pub(crate) use worker_entry::{IntakeRequest, execute_intake_turn_core};
+pub(crate) use runner_entry::{IntakeRequest, execute_intake_turn_core};
 
 mod context;
 pub(in crate::services::discord) use context::IntakeDeps;
@@ -28,9 +28,9 @@ mod intake_outbox_state_builder_tests {
     use super::*;
 
     #[test]
-    fn builder_adopts_worker_intake_outbox_identity() {
+    fn builder_adopts_runner_intake_outbox_identity() {
         // This covers construction plus the private-field adoption boundary.
-        // Only the worker row-conversion test carries an executed value
+        // Only the runner row-conversion test carries an executed value
         // assertion (its production `Some(row.id)`). The other four production
         // `IntakeRequest` constructors — two intake-gate, queued, skill — all
         // pass `None`, and none asserts that value; those `None` edges rest on

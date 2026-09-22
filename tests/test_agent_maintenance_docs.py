@@ -223,7 +223,7 @@ class DocTouchRulesTest(unittest.TestCase):
         self.assertEqual(findings[0].path, "docs/agent-maintenance/change-surfaces.md")
 
     def test_multinode_source_change_requires_multinode_doc_touch(self) -> None:
-        findings = CHECKER.check_doc_touch_rules({"src/server/worker_registry.rs"})
+        findings = CHECKER.check_doc_touch_rules({"src/server/runner_registry.rs"})
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].severity, "error")
         self.assertEqual(
@@ -233,7 +233,7 @@ class DocTouchRulesTest(unittest.TestCase):
 
     def test_cluster_intake_change_requires_multinode_doc_touch(self) -> None:
         findings = CHECKER.check_doc_touch_rules(
-            {"src/services/cluster/intake_worker_capabilities.rs"}
+            {"src/services/cluster/intake_runner_capabilities.rs"}
         )
         self.assertEqual(len(findings), 1)
         self.assertEqual(

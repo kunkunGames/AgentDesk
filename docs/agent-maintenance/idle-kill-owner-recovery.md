@@ -1,7 +1,7 @@
 # Idle-kill owner recovery
 
 Idle-kill skips remote session owners whose trusted origin is not configured or
-whose worker heartbeat has expired. Each affected owner emits one warning while
+whose runner heartbeat has expired. Each affected owner emits one warning while
 the condition persists. The next tick rechecks configuration and heartbeat;
 recovery restores eligibility and resets the warning for a later outage. Owners
 without idle candidates leave the warning cache, so the cache stays bounded by

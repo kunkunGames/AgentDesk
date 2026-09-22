@@ -172,7 +172,7 @@ async fn resolve_channel_candidate(
         });
         snapshots.push((*index, shared, settings));
     }
-    // A worker has no gateway Context. Resolve a thread's authoritative parent
+    // A runner has no gateway Context. Resolve a thread's authoritative parent
     // once, then reuse the configured allowlists instead of probing every bot.
     // Keep explicit child bindings ahead of inherited parent bindings.
     if !candidates
@@ -191,11 +191,11 @@ async fn resolve_channel_candidate(
                     return Ok(channel);
                 }
             }
-            Err("no registered bot can resolve the worker channel".to_string())
+            Err("no registered bot can resolve the runner channel".to_string())
         };
         let channel = tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
             .await
-            .map_err(|_| "worker channel ownership lookup timed out".to_string())??;
+            .map_err(|_| "runner channel ownership lookup timed out".to_string())??;
         if let serenity::Channel::Guild(channel) = channel
             && matches!(
                 channel.kind,
@@ -322,7 +322,7 @@ pub(super) async fn resolve_direct_meeting_runtime(
     .to_string())
 }
 
-pub(crate) struct IntakeWorkerRuntime {
+pub(crate) struct IntakeRunnerRuntime {
     pub(crate) http: Arc<serenity::Http>,
     pub(crate) shared: Arc<SharedData>,
     pub(crate) token: String,
@@ -330,15 +330,15 @@ pub(crate) struct IntakeWorkerRuntime {
 
 /// A provider queue may be polled by several bots. The claimant is not the
 /// channel owner: all execution state and REST credentials must come from the
-/// same channel-resolved runtime before the worker accepts the row.
-pub(crate) async fn resolve_intake_worker_runtime(
+/// same channel-resolved runtime before the runner accepts the row.
+pub(crate) async fn resolve_intake_runner_runtime(
     claimant: &SharedData,
     channel_id: ChannelId,
-) -> Result<IntakeWorkerRuntime, String> {
+) -> Result<IntakeRunnerRuntime, String> {
     let registry = claimant
         .health_registry
         .upgrade()
-        .ok_or_else(|| "worker runtime registry unavailable".to_string())?;
+        .ok_or_else(|| "runner runtime registry unavailable".to_string())?;
     let (http, shared) =
         resolve_direct_meeting_runtime(&registry, channel_id, &claimant.provider).await?;
     let token = shared
@@ -347,7 +347,7 @@ pub(crate) async fn resolve_intake_worker_runtime(
         .get()
         .cloned()
         .ok_or_else(|| "channel owner Discord REST credentials unavailable".to_string())?;
-    Ok(IntakeWorkerRuntime {
+    Ok(IntakeRunnerRuntime {
         http,
         shared,
         token,
@@ -421,7 +421,7 @@ pub(super) async fn resolve_direct_meeting_shared(
 }
 
 async fn unbound_single_runtime_allowed(shared: &SharedData) -> bool {
-    // During worker startup the eventual channel owner may not be registered
+    // During runner startup the eventual channel owner may not be registered
     // yet. A single restricted REST runtime is not proof that it owns every
     // channel. Preserve legacy gateway and unrestricted single-bot behavior.
     shared.http.cached_serenity_ctx.get().is_some()
@@ -552,7 +552,7 @@ mod direct_meeting_candidate_tests {
     }
 
     #[tokio::test]
-    async fn worker_claimant_uses_channel_owner_credentials_without_gateway() {
+    async fn runner_claimant_uses_channel_owner_credentials_without_gateway() {
         use crate::services::discord::{health::HealthRegistry, make_shared_data_for_tests};
         use std::sync::Arc;
         let registry = Arc::new(HealthRegistry::new());
@@ -573,7 +573,7 @@ mod direct_meeting_candidate_tests {
             .unwrap();
         registry.register("claude".into(), claimant.clone()).await;
         registry.register("claude".into(), owner.clone()).await;
-        let runtime = super::resolve_intake_worker_runtime(&claimant, ChannelId::new(42))
+        let runtime = super::resolve_intake_runner_runtime(&claimant, ChannelId::new(42))
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&runtime.shared, &owner));
@@ -581,14 +581,14 @@ mod direct_meeting_candidate_tests {
         assert!(runtime.shared.http.cached_serenity_ctx.get().is_none());
         claimant.settings.write().await.allowed_channel_ids.push(42);
         assert!(
-            super::resolve_intake_worker_runtime(&claimant, ChannelId::new(42))
+            super::resolve_intake_runner_runtime(&claimant, ChannelId::new(42))
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn worker_owner_without_rest_credentials_is_rejected() {
+    async fn runner_owner_without_rest_credentials_is_rejected() {
         use crate::services::discord::{health::HealthRegistry, make_shared_data_for_tests};
         use std::sync::Arc;
         let registry = Arc::new(HealthRegistry::new());
@@ -605,14 +605,14 @@ mod direct_meeting_candidate_tests {
         registry.register("claude".into(), claimant.clone()).await;
         registry.register("claude".into(), owner).await;
         assert!(
-            super::resolve_intake_worker_runtime(&claimant, ChannelId::new(42))
+            super::resolve_intake_runner_runtime(&claimant, ChannelId::new(42))
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn restricted_worker_cannot_take_an_unbound_channel_during_startup() {
+    async fn restricted_runner_cannot_take_an_unbound_channel_during_startup() {
         let shared = crate::services::discord::make_shared_data_for_tests();
         assert!(super::unbound_single_runtime_allowed(&shared).await);
         shared.settings.write().await.allowed_channel_ids = vec![41];

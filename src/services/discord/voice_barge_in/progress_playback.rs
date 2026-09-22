@@ -32,7 +32,7 @@ impl VoiceBargeInRuntime {
         });
     }
 
-    pub(in crate::services::discord) fn spawn_progress_worker(
+    pub(in crate::services::discord) fn spawn_progress_runner(
         self: &Arc<Self>,
         shared: Arc<SharedData>,
         shutdown_flag: crate::services::discord::shared_state::ShutdownReader,
@@ -64,7 +64,7 @@ impl VoiceBargeInRuntime {
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(
                                     skipped,
-                                    "voice progress worker lagged behind broadcast events"
+                                    "voice progress runner lagged behind broadcast events"
                                 );
                             }
                             Err(broadcast::error::RecvError::Closed) => break,

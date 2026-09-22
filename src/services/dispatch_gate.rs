@@ -190,12 +190,12 @@ static GATE_BYPASSES: AtomicU64 = AtomicU64::new(0);
 static LAST_DEFER_AT: AtomicU64 = AtomicU64::new(0);
 /// Unix-seconds timestamp of the last process-local snapshot refresh (0 ==
 /// never). Used by [`refresh_snapshots_if_stale`] to throttle the on-activation
-/// refresh that keeps NON-leader serving nodes populated (the leader-only
+/// refresh that keeps NON-hub serving nodes populated (the hub-only
 /// `rate_limit_sync_loop` does not run on followers).
 static LAST_SNAPSHOT_REFRESH_AT: AtomicU64 = AtomicU64::new(0);
 
 /// Minimum interval (seconds) between process-local snapshot refreshes triggered
-/// off the activation path. The leader's `rate_limit_sync_loop` already refreshes
+/// off the activation path. The hub's `rate_limit_sync_loop` already refreshes
 /// every ~120s; this matches that cadence so a follower's lazy refresh reads the
 /// shared DB cache (no provider credentials) at most once per window and never
 /// adds per-entry DB cost to the dispatch loop.
@@ -289,10 +289,10 @@ pub fn clear_agent_provider_snapshot() {
 /// `rate_limit_cache` DB rows and the current agent/channel bindings.
 ///
 /// This reads ONLY the shared DB cache (no provider credentials, no live API
-/// calls), so it is safe to run on EVERY serving node — not just the leader.
-/// The leader's `rate_limit_sync_loop` calls it after refreshing the cache; the
+/// calls), so it is safe to run on EVERY serving node — not just the hub.
+/// The hub's `rate_limit_sync_loop` calls it after refreshing the cache; the
 /// activation path calls it (throttled, via [`refresh_snapshots_if_stale`]) so
-/// non-leader nodes — where `RateLimitSync` never runs — still have populated
+/// non-hub nodes — where `RateLimitSync` never runs — still have populated
 /// snapshots and the gate is not silently a no-op there. (P2 review fix —
 /// server/mod.rs:1018.)
 ///
@@ -345,7 +345,7 @@ pub async fn refresh_agent_provider_snapshot_from_db(pg_pool: &sqlx::PgPool) {
 /// run). Returns `true` when a refresh was performed.
 ///
 /// Called from the auto-queue activation path on whichever node serves
-/// `POST /api/queue/dispatch-next`. On the leader this is a cheap no-op (the sync
+/// `POST /api/queue/dispatch-next`. On the hub this is a cheap no-op (the sync
 /// loop already refreshed within the window); on a follower it populates the
 /// snapshots the gate reads. The throttle keeps the dispatch loop DB-free in the
 /// common case. `now` is unix seconds.
@@ -364,9 +364,9 @@ pub async fn refresh_snapshots_if_stale(pg_pool: &sqlx::PgPool, now: i64) -> boo
 }
 
 /// Mark the process-local snapshots as freshly refreshed as of `now` (unix
-/// seconds) without doing any DB work. The leader's `rate_limit_sync_loop` calls
+/// seconds) without doing any DB work. The hub's `rate_limit_sync_loop` calls
 /// this after it refreshes the snapshots so the activation-path throttle in
-/// [`refresh_snapshots_if_stale`] does not redundantly re-refresh on the leader.
+/// [`refresh_snapshots_if_stale`] does not redundantly re-refresh on the hub.
 pub fn mark_snapshots_refreshed(now: i64) {
     if now > 0 {
         LAST_SNAPSHOT_REFRESH_AT.store(now as u64, Ordering::Relaxed);

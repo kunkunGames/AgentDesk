@@ -52,7 +52,7 @@ package "Server  (src/server/)" as ServerPkg #Honeydew {
     [mod.rs / boot.rs\n(Axum boot)] as ServerBoot
     [ws.rs\n(WebSocket /ws)] as WS
     [tick.rs\n(3-Tier Tick)] as Tick
-    [worker_registry.rs] as Workers
+    [runner_registry.rs] as Runners
     [background.rs] as Background
 
     package "Routes  (src/server/routes/)" as RoutesPkg #MintCream {
@@ -273,7 +273,7 @@ Launch --> ServerBoot : start Axum
 ServerBoot --> RouteMod : mount /api
 ServerBoot --> WS : mount /ws
 ServerBoot --> Tick : spawn tick loops
-ServerBoot --> Workers : register workers
+ServerBoot --> Runners : register runners
 ServerBoot --> Background : spawn tasks
 ServerBoot --> DashApp : serve static\n/dashboard/dist/
 

@@ -18,7 +18,7 @@ pub(super) struct TuiDirectSyntheticTurnClaim {
     pub(super) claimed: bool,
     // #3154 P1 (timestamp-anchor output loss): the post-drain EOF offset the claim
     // seeded into this turn's inflight `turn_start_offset`. The deferred-BridgeAdapter
-    // worker anchors its bridge tail to THIS byte boundary instead of a `Utc::now()`
+    // runner anchors its bridge tail to THIS byte boundary instead of a `Utc::now()`
     // scan, which can skip bytes written during the deferred-claim wait window.
     pub(super) turn_start_offset: u64,
 }
@@ -2243,7 +2243,7 @@ mod tests {
 /// [`PriorTurnObservation`](super::super::tui_direct_pending_start::PriorTurnObservation)
 /// for the synthetic-start deferral decision: read inflight, mailbox, and the
 /// fresh runtime binding. Besides the pure decision view it carries the live
-/// FOREIGN inflight's identity (codex r2) so the worker can pin it on the
+/// FOREIGN inflight's identity (codex r2) so the runner can pin it on the
 /// aborted-anchor marker even when the row vanishes before the ABORT cleanup.
 pub(super) async fn synthetic_start_prior_turn_view(
     shared: &Arc<SharedData>,
@@ -2294,7 +2294,7 @@ pub(super) async fn synthetic_start_prior_turn_view(
 }
 
 /// Persist a durable pending-start record and spawn the detached per-channel
-/// worker. Returns immediately (non-blocking for the observer loop).
+/// runner. Returns immediately (non-blocking for the observer loop).
 pub(super) fn defer_synthetic_turn_start(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -2328,10 +2328,10 @@ pub(super) fn defer_synthetic_turn_start(
             channel_id = record.channel_id,
             anchor_message_id = record.anchor_message_id,
             error = %error,
-            "failed to persist durable TUI-direct pending-start record; spawning worker anyway off the in-memory presence index"
+            "failed to persist durable TUI-direct pending-start record; spawning runner anyway off the in-memory presence index"
         );
     }
-    super::super::tui_direct_pending_start::spawn_worker(
+    super::super::tui_direct_pending_start::spawn_runner(
         shared.clone(),
         record,
         pending_start_view_fn(),
@@ -2341,7 +2341,7 @@ pub(super) fn defer_synthetic_turn_start(
     );
 }
 
-/// The worker's per-poll view builder (see [`synthetic_start_prior_turn_view`]).
+/// The runner's per-poll view builder (see [`synthetic_start_prior_turn_view`]).
 pub(super) fn pending_start_view_fn() -> super::super::tui_direct_pending_start::ViewFn {
     Box::new(|shared, record| {
         Box::pin(async move {
@@ -2361,7 +2361,7 @@ pub(super) fn pending_start_view_fn() -> super::super::tui_direct_pending_start:
     })
 }
 
-/// The worker's claim action: rehydrate the lease (in case a restart dropped the
+/// The runner's claim action: rehydrate the lease (in case a restart dropped the
 /// in-memory map), then run the normal [`claim_tui_direct_synthetic_turn`] which
 /// reads the runtime binding FRESH and seeds `turn_start_offset = relay_last_offset()`
 /// (post-drain == EOF) with `response_sent_offset = 0`.
@@ -2445,14 +2445,14 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
 
             // #3154 P1 (BridgeAdapter-GAP fix). The observer stood down for ALL
             // deferred starts because it could not know the RESOLVED owner before
-            // the claim ran. Now that the claim has resolved it, the worker is the
+            // the claim ran. Now that the claim has resolved it, the runner is the
             // single place that knows the owner kind, so it MIRRORS the inline path:
             // when the claim resolved to the BridgeAdapter (no watcher will relay
-            // this turn), the worker spawns EXACTLY ONE bridge tail here — otherwise
+            // this turn), the runner spawns EXACTLY ONE bridge tail here — otherwise
             // the synthetic turn's output is never relayed (relayer_count == 0). When
             // the claim resolved to the watcher this predicate is false (the watcher
             // is the sole relayer; spawning would double-relay). The spawn is on the
-            // detached worker task (unix), exactly like the observer's unix-only tail.
+            // detached runner task (unix), exactly like the observer's unix-only tail.
             #[cfg(unix)]
             if claim.claimed && deferred_claim_requires_bridge_tail_relayer(claim.relay_owner) {
                 // The lease the bridge tail reads must reflect the resolved owner.
@@ -2503,7 +2503,7 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
                     anchor_message_id = record.anchor_message_id,
                     resolved_relay_owner = claim.relay_owner.as_str(),
                     bridge_tail_spawned = spawned,
-                    "tui_direct_pending_start: deferred claim resolved to BridgeAdapter owner; worker spawned the bridge tail (no relay GAP)"
+                    "tui_direct_pending_start: deferred claim resolved to BridgeAdapter owner; runner spawned the bridge tail (no relay GAP)"
                 );
             }
             claim.claimed
@@ -2511,12 +2511,12 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
     })
 }
 
-/// #3296 (supersedes the #3282 `⏳ → ⚠` swap): the worker's terminal-ABORT
+/// #3296 (supersedes the #3282 `⏳ → ⚠` swap): the runner's terminal-ABORT
 /// reconcile hook. The input was ALREADY provider-submitted by ABORT time (the
 /// abort drops only the synthetic OWNERSHIP claim), so the anchor's `⏳` is
 /// still TRUE — the old `⚠` swap branded ANSWERED messages as failures. So:
 /// KEEP the `⏳` and record a durable aborted-anchor marker pinning the
-/// FOREIGN prior inflight's identity — the worker's LAST-VIEW identity first,
+/// FOREIGN prior inflight's identity — the runner's LAST-VIEW identity first,
 /// the cleanup-instant row only as the no-view fallback (codex r3,
 /// `pin_abort_foreign_identity`). The marker stays uncovered unless a commit
 /// tombstone proves the prior owner committed (`record_for_abort`'s 대조;
@@ -2580,7 +2580,7 @@ pub(super) fn pending_start_abort_cleanup_fn()
 
 /// #3154 restart durability: restore durable pending-start records during
 /// provider relay startup. Rehydrates the in-memory presence index (so the
-/// watcher / idle-queue gates hold immediately) and respawns the worker for each
+/// watcher / idle-queue gates hold immediately) and respawns the runner for each
 /// record whose provider matches.
 pub(super) fn restore_pending_starts(shared: &Arc<SharedData>, provider: &ProviderKind) {
     for record in super::super::tui_direct_pending_start::load_all() {
@@ -2588,7 +2588,7 @@ pub(super) fn restore_pending_starts(shared: &Arc<SharedData>, provider: &Provid
             continue;
         }
         // Re-mark present (load_all does not touch the index) so the gates hold
-        // before the worker's first poll.
+        // before the runner's first poll.
         super::super::tui_direct_pending_start::mark_present_on_restore(
             &record.provider,
             record.channel_id,
@@ -2598,9 +2598,9 @@ pub(super) fn restore_pending_starts(shared: &Arc<SharedData>, provider: &Provid
             channel_id = record.channel_id,
             tmux_session_name = %record.tmux_session_name,
             anchor_message_id = record.anchor_message_id,
-            "restored durable TUI-direct pending-start record on relay startup; respawning detached worker (prompt NOT resubmitted)"
+            "restored durable TUI-direct pending-start record on relay startup; respawning detached runner (prompt NOT resubmitted)"
         );
-        super::super::tui_direct_pending_start::spawn_worker(
+        super::super::tui_direct_pending_start::spawn_runner(
             shared.clone(),
             record,
             pending_start_view_fn(),

@@ -179,7 +179,7 @@ pub async fn recover_external_delivery_leases_pg(
         "UPDATE scheduled_external_delivery_outbox
          SET status = 'unknown', payload = NULL, claim_owner = NULL,
              claim_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
-             error_code = 'worker_lost_after_dispatch', finished_at = $1,
+             error_code = 'runner_lost_after_dispatch', finished_at = $1,
              updated_at = $1
          WHERE status = 'processing' AND lease_expires_at <= $1
            AND dispatch_started_at IS NOT NULL",
@@ -207,7 +207,7 @@ pub async fn recover_external_delivery_leases_pg(
          SET status = 'failed', payload = NULL, claim_owner = NULL,
              claim_token = NULL, claimed_at = NULL, lease_expires_at = NULL,
              successful_count = 0, failed_count = requested_count,
-             error_code = 'worker_loss_retry_exhausted', finished_at = $1,
+             error_code = 'runner_loss_retry_exhausted', finished_at = $1,
              updated_at = $1
          WHERE status = 'processing' AND lease_expires_at <= $1
            AND dispatch_started_at IS NULL AND deliver_before > $1
@@ -223,7 +223,7 @@ pub async fn recover_external_delivery_leases_pg(
          SET status = 'pending', claim_owner = NULL, claim_token = NULL,
              claimed_at = NULL, lease_expires_at = NULL,
              retry_count = retry_count + 1, next_attempt_at = $1,
-             error_code = 'worker_lost_before_dispatch', updated_at = $1
+             error_code = 'runner_lost_before_dispatch', updated_at = $1
          WHERE status = 'processing' AND lease_expires_at <= $1
            AND dispatch_started_at IS NULL AND deliver_before > $1
            AND retry_count < $2",

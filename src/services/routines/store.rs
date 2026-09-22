@@ -3089,7 +3089,7 @@ impl RoutineStore {
     }
 
     /// Boot recovery: mark expired-lease `running` runs as `interrupted`, clear
-    /// `in_flight_run_id` on their parent routines. Called once at worker
+    /// `in_flight_run_id` on their parent routines. Called once at runner
     /// startup before the tick loop begins. Running rows without an expired
     /// lease are left alone so a second server instance cannot interrupt work
     /// that another instance is actively executing.

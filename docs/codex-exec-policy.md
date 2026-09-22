@@ -85,8 +85,8 @@ orchestrator) can produce long-running Codex turns. The policy for these:
   Known follow-ups (tracked as part of this ADR rollout, not blockers for
   merging the ADR itself):
 
-  - `execute_command_simple_with_timeout` currently spawns a worker thread
-    and returns on `recv_timeout` without cancelling the worker's
+  - `execute_command_simple_with_timeout` currently spawns a runner thread
+    and returns on `recv_timeout` without cancelling the runner's
     `execute_command_simple` call. Per this policy it must be reimplemented
     to thread a `CancelToken` and kill the child on timeout (mirror
     `provider_exec::execute_simple_with_timeout`).

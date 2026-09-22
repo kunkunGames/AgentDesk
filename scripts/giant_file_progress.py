@@ -19,7 +19,7 @@ REGISTRY = "scripts/giant_file_registry.toml"
 EVALUATOR = "scripts/giant_file_progress.py"
 METADATA = "scripts/giant_file_issue_metadata.json"
 GENERATED_DOCS = frozenset({"ARCHITECTURE.md", "docs/generated/route-inventory.md",
-                            "docs/generated/worker-inventory.md"})
+                            "docs/generated/runner-inventory.md"})
 GUARD_REPIN_ALLOWED = frozenset({
     "scripts/check_delivery_journal_raw_writer.py",
     "scripts/check_durable_frontier_writer_call_sites.py",

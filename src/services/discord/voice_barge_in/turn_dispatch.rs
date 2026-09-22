@@ -820,7 +820,7 @@ impl VoiceBargeInRuntime {
                                         source_channel_id = source_channel_id.get(),
                                         target_channel_id = target_channel_id.get(),
                                         utterance_id = %utterance.utterance_id,
-                                        "voice transcript announcement durable reservation bind failed; skipping local metadata cache so workers must use the pending ref"
+                                        "voice transcript announcement durable reservation bind failed; skipping local metadata cache so runners must use the pending ref"
                                     );
                                 }
                             }

@@ -172,7 +172,7 @@ fn is_single_active_dispatch_violation_pg(error: &sqlx::Error) -> bool {
     )
 }
 
-const SESSION_AFFINITY_WORKER_LEASE_TTL_SECS: i64 = 60;
+const SESSION_AFFINITY_RUNNER_LEASE_TTL_SECS: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DispatchSessionAffinity {
@@ -227,14 +227,14 @@ async fn load_live_session_owner_by_id_pg_tx(
          )
          SELECT so.instance_id
            FROM session_owner so
-           JOIN worker_nodes wn ON wn.instance_id = so.instance_id
+           JOIN cluster_nodes wn ON wn.instance_id = so.instance_id
           WHERE wn.status = 'online'
             AND wn.last_heartbeat_at IS NOT NULL
             AND wn.last_heartbeat_at >= NOW() - ($2::BIGINT * INTERVAL '1 second')
           LIMIT 1",
     )
     .bind(session_id)
-    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .bind(SESSION_AFFINITY_RUNNER_LEASE_TTL_SECS)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| {
@@ -255,14 +255,14 @@ async fn load_live_session_owner_by_key_pg_tx(
          )
          SELECT so.instance_id
            FROM session_owner so
-           JOIN worker_nodes wn ON wn.instance_id = so.instance_id
+           JOIN cluster_nodes wn ON wn.instance_id = so.instance_id
           WHERE wn.status = 'online'
             AND wn.last_heartbeat_at IS NOT NULL
             AND wn.last_heartbeat_at >= NOW() - ($2::BIGINT * INTERVAL '1 second')
           LIMIT 1",
     )
     .bind(session_key)
-    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .bind(SESSION_AFFINITY_RUNNER_LEASE_TTL_SECS)
     .fetch_optional(&mut **tx)
     .await
     .map_err(|error| {
@@ -329,16 +329,16 @@ async fn load_live_capability_route_nodes_pg_tx(
 ) -> Result<Vec<serde_json::Value>> {
     let rows = sqlx::query(
         "SELECT instance_id, labels, capabilities, last_heartbeat_at
-         FROM worker_nodes
+         FROM cluster_nodes
          WHERE status = 'online'
            AND last_heartbeat_at IS NOT NULL
            AND last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
          ORDER BY last_heartbeat_at DESC, instance_id ASC",
     )
-    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .bind(SESSION_AFFINITY_RUNNER_LEASE_TTL_SECS)
     .fetch_all(&mut **tx)
     .await
-    .map_err(|error| anyhow::anyhow!("load live capability route worker nodes: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("load live capability route runner nodes: {error}"))?;
 
     Ok(rows
         .into_iter()
@@ -375,8 +375,9 @@ async fn load_capability_claim_owner_pg_tx(
         return Ok(None);
     };
 
-    let worker_nodes = load_live_capability_route_nodes_pg_tx(tx).await?;
-    let route_candidates = crate::server::cluster::select_capability_route(&worker_nodes, required);
+    let cluster_nodes = load_live_capability_route_nodes_pg_tx(tx).await?;
+    let route_candidates =
+        crate::server::cluster::select_capability_route(&cluster_nodes, required);
     let Some(selected_owner) = route_candidates
         .first()
         .and_then(|candidate| candidate.decision.instance_id.as_deref())
@@ -394,7 +395,7 @@ async fn load_capability_claim_owner_pg_tx(
         return Ok(None);
     }
 
-    let owner_node = worker_nodes.iter().find(|node| {
+    let owner_node = cluster_nodes.iter().find(|node| {
         node.get("instance_id").and_then(|value| value.as_str()) == Some(&selected_owner)
     });
     let decision =

@@ -320,16 +320,16 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             degraded_reasons.push(reason);
         }
 
-        // #4515 PR2: worker-local recovery circuit. Budget exhaustion of a
-        // necessary worker (dispatch_outbox / session_discovery) worsens to
-        // Unhealthy → readiness 503; an un-migrated LoopOwned worker's
+        // #4515 PR2: runner-local recovery circuit. Budget exhaustion of a
+        // necessary runner (dispatch_outbox / session_discovery) worsens to
+        // Unhealthy → readiness 503; an un-migrated LoopOwned runner's
         // unexpected death worsens to Degraded. Flapping is intentionally kept
         // OUT of degraded_reasons (§9.3 deploy-gate safety) and exposed as a
         // separate informational field below.
-        apply_worker_recovery_reasons(&mut status, &mut degraded_reasons);
-        let worker_restart_flapping = crate::server::worker_recovery::recovery_flapping_info();
-        if !worker_restart_flapping.is_empty() {
-            json["worker_restart_flapping"] = serde_json::Value::Array(worker_restart_flapping);
+        apply_runner_recovery_reasons(&mut status, &mut degraded_reasons);
+        let runner_restart_flapping = crate::server::runner_recovery::recovery_flapping_info();
+        if !runner_restart_flapping.is_empty() {
+            json["runner_restart_flapping"] = serde_json::Value::Array(runner_restart_flapping);
         }
 
         // Startup doctor warnings are boot/recovery diagnostics, not proof
@@ -347,7 +347,7 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             startup_doctor_count_reasons(doctor_failed, doctor_warned);
 
         // A standby without a gateway is operationally degraded even when its
-        // HTTP server and worker heartbeat remain live. Keep this explicit so
+        // HTTP server and runner heartbeat remain live. Keep this explicit so
         // health checks cannot report a relay-dead node as healthy.
         if cluster_standby_without_gateway {
             status = status.worsen(health::HealthStatus::Degraded);
@@ -444,12 +444,12 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             degraded_reasons.push(reason);
         }
 
-        // #4515 PR2: mirror the registry branch so a fatal worker recovery
+        // #4515 PR2: mirror the registry branch so a fatal runner recovery
         // circuit also drives standalone `/api/health` readiness — otherwise a
-        // HealthRegistry-less node would report ready while a necessary worker
+        // HealthRegistry-less node would report ready while a necessary runner
         // is permanently dead.
-        apply_worker_recovery_reasons(&mut health_state, &mut degraded_reasons);
-        let worker_restart_flapping = crate::server::worker_recovery::recovery_flapping_info();
+        apply_runner_recovery_reasons(&mut health_state, &mut degraded_reasons);
+        let runner_restart_flapping = crate::server::runner_recovery::recovery_flapping_info();
 
         let status = if health_state.is_http_ready() {
             StatusCode::OK
@@ -485,8 +485,8 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             "recovery_duration": 0.0,
             "degraded_reasons": serde_json::Value::Array(degraded_reasons),
         });
-        if !worker_restart_flapping.is_empty() {
-            json["worker_restart_flapping"] = serde_json::Value::Array(worker_restart_flapping);
+        if !runner_restart_flapping.is_empty() {
+            json["runner_restart_flapping"] = serde_json::Value::Array(runner_restart_flapping);
         }
         if let Some(snapshot) = disk_snapshot {
             json["disk_free_bytes"] = serde_json::json!(snapshot.free_bytes);
@@ -813,7 +813,7 @@ async fn cluster_standby_without_gateway(
     if instance_id.is_empty() {
         return false;
     }
-    health_diagnostics::is_recent_cluster_worker(
+    health_diagnostics::is_recent_cluster_runner(
         state.pg_pool_ref(),
         instance_id,
         state.config.cluster.lease_ttl_secs,
@@ -907,16 +907,16 @@ fn opencode_warm_pool_degraded_reasons() -> Vec<serde_json::Value> {
     reasons
 }
 
-/// #4515 PR2: fold worker-local recovery reasons into a health snapshot. Shared
-/// by the registry and standalone `/api/health` branches so a fatal worker
+/// #4515 PR2: fold runner-local recovery reasons into a health snapshot. Shared
+/// by the registry and standalone `/api/health` branches so a fatal runner
 /// recovery circuit drives readiness identically in both. Flapping is handled
 /// separately (informational field) and never appears here.
-fn apply_worker_recovery_reasons(
+fn apply_runner_recovery_reasons(
     status: &mut health::HealthStatus,
     degraded_reasons: &mut Vec<serde_json::Value>,
 ) {
-    use crate::server::worker_recovery::RecoveryReasonSeverity;
-    for reason in crate::server::worker_recovery::recovery_health_reasons() {
+    use crate::server::runner_recovery::RecoveryReasonSeverity;
+    for reason in crate::server::runner_recovery::recovery_health_reasons() {
         let worsened = match reason.severity {
             RecoveryReasonSeverity::Unhealthy => health::HealthStatus::Unhealthy,
             RecoveryReasonSeverity::Degraded => health::HealthStatus::Degraded,

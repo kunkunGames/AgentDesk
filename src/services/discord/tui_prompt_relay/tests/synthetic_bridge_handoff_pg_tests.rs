@@ -217,7 +217,7 @@ fn synthetic_bridge_handoff_fixture(
                         &shared, provider.as_str(), channel, &observed, anchor, true,
                         &relay_observed_prompt_injected_prompt_decision(&observed.prompt),
                         &mut inline_lease,
-                    ).await, "failed inline save must hand its retry to the pending worker");
+                    ).await, "failed inline save must hand its retry to the pending runner");
                     assert!(inflight::load_inflight_state_read_only(&provider, channel.get()).is_none());
                     let record = pending::load_all().into_iter().find(|record| record.channel_id == channel.get()).unwrap();
                     assert_eq!(record.anchor_message_id, anchor.get());
@@ -228,7 +228,7 @@ fn synthetic_bridge_handoff_fixture(
                     advanced.last_offset = std::fs::metadata(&output).unwrap().len();
                     advanced.relay_last_offset = Some(advanced.last_offset);
                     crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(tmux, advanced);
-                    // Exhaust the real claim worker while atomic persistence
+                    // Exhaust the real claim runner while atomic persistence
                     // still fails, then exercise the production startup restore.
                     tokio::time::pause();
                     tokio::task::yield_now().await;
@@ -250,7 +250,7 @@ fn synthetic_bridge_handoff_fixture(
                         {
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
-                    }).await.expect("existing pending worker must save the original source");
+                    }).await.expect("existing pending runner must save the original source");
                     let row = inflight::load_inflight_state_read_only(&provider, channel.get()).unwrap();
                     assert_eq!(row.turn_start_offset, Some(0));
                     // The detached HTTP adapter has no real HTTP in this fixture;

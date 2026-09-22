@@ -4,11 +4,11 @@ use serde_json::json;
 pub(crate) fn ready_node(id: &str, os: &str) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
     json!({"instance_id":id,"status":"online","labels":[],"capabilities":{
-        "intake_worker":{"enabled":true,"providers":["claude"],"features":["execution_requirements_v1","preserve_on_cancel_v1"]},
+        "intake_runner":{"enabled":true,"providers":["claude"],"features":["execution_requirements_v1","preserve_on_cancel_v1"]},
         "intake_poller":{"claude":now},
         "execution_readiness":{
-            "schema":1,"boot_id":"fixture","observed_at_ms":now,"expires_at_ms":now+120_000,
-            "os":os,"arch":"x86_64","runtime_profile":"worker","release":{},
+            "schema":2,"boot_id":"fixture","observed_at_ms":now,"expires_at_ms":now+120_000,
+            "os":os,"arch":"x86_64","runtime_profile":"runner","release":{},
             "providers":{"claude":{"cli_usable":true,"version":"1.0","failure":null,
                 "credential_profiles":{"default":true},"authentication_verified":false,"quota_verified":false}},
             "tools":{"git":true},"repositories":{"kunkunGames/AgentDesk":true},

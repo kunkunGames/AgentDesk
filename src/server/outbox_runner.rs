@@ -12,13 +12,13 @@ pub(super) async fn message_outbox_loop(
     use std::time::Duration;
 
     let Some(health_registry) = health_registry else {
-        tracing::error!("[outbox] Health registry unavailable; message outbox worker stopped");
+        tracing::error!("[outbox] Health registry unavailable; message outbox runner stopped");
         return;
     };
 
     // Give Discord runtime bootstrap a brief head start before polling.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    tracing::info!("[outbox] Message outbox worker started (adaptive backoff 500ms-5s)");
+    tracing::info!("[outbox] Message outbox runner started (adaptive backoff 500ms-5s)");
     let claim_owner = format!(
         "message-outbox:{}:{}",
         std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string()),

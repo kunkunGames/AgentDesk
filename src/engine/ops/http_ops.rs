@@ -81,9 +81,9 @@ fn invoke_localhost_post(url: &str, body_json: &str) -> String {
     let url_owned = url.to_string();
     let body_owned = body_json.to_string();
     // Run on a dedicated thread to avoid blocking the tokio I/O driver.
-    // The request is synchronous — if issued directly on a tokio worker it can
-    // self-deadlock when the target is our own HTTP server (the worker blocks
-    // on recv while no other worker is available to handle the inbound
+    // The request is synchronous — if issued directly on a tokio runner it can
+    // self-deadlock when the target is our own HTTP server (the runner blocks
+    // on recv while no other runner is available to handle the inbound
     // request).
     let handle = std::thread::spawn(move || match url::Url::parse(&url_owned) {
         // The dcserver is plain http, so every real policy call takes this

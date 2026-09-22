@@ -17,7 +17,7 @@
 //!
 //! Intended use: per-agent reconciliation tasks, cache warmers, soft-TTL
 //! sweepers — anything that needs to run "every N seconds/minutes" without the
-//! ceremony of adding a row to `server::worker_registry` or a kv_meta key.
+//! ceremony of adding a row to `server::runner_registry` or a kv_meta key.
 //!
 //! 909-3 will register the first real job against this surface.
 

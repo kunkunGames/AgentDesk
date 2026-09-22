@@ -281,7 +281,7 @@ mod tests {
     fn rollover_skips_tui_chrome_prefixed_subagent_notification_3818() {
         let current_portion = format!(
             "No response requested.\n<subagent_notification>\n{{\"agent_path\":\"/tmp/adk-issue-3818-subagent-xml/private-agent\",\"status\":{{\"completed\":\"{}\"}}}}\n</subagent_notification>",
-            "Implementation worker complete. ".repeat(180),
+            "Implementation runner complete. ".repeat(180),
         );
 
         assert!(watcher_streaming_rollover_should_skip(&current_portion));

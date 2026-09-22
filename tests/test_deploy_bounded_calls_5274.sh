@@ -425,8 +425,8 @@ write_issue_writer_case() {
     cat > "$bin/gh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-# The gh leader exits after its child has written the initial payload. The child
-# therefore keeps gh's stdout descriptor open after the leader is gone.
+# The gh hub exits after its child has written the initial payload. The child
+# therefore keeps gh's stdout descriptor open after the hub is gone.
 (
     python3 - "$ready_path" "$mode" "$linger_s" "$trigger_path" "$grown_path" <<'PY'
 import sys
@@ -527,7 +527,7 @@ EOF
             'POST_DEPLOY_SMOKE_CREATE_ISSUE=confirmed' \
             "POST_DEPLOY_SMOKE_STAMP=bounded-5274-$label" \
             "POST_DEPLOY_SMOKE_EVIDENCE=$TMP_ROOT/$label-evidence.log" \
-            "POST_DEPLOY_SMOKE_FAILURES=(\"$mode writer kept stdout open after leader exit\")" \
+            "POST_DEPLOY_SMOKE_FAILURES=(\"$mode writer kept stdout open after hub exit\")" \
             '_report_post_deploy_smoke_failure'
     } > "$case_path"
     chmod +x "$case_path"
@@ -589,7 +589,7 @@ run_issue_variant() {
     fi
 }
 
-run_issue_leader_exit_variant() {
+run_issue_hub_exit_variant() {
     local label="$1"
     local source_path="$2"
     local expected="$3"
@@ -602,16 +602,16 @@ run_issue_leader_exit_variant() {
     tail -n 1 "$measure_output"
     if [ "$expected" = "ok" ]; then
         if [ "$rc" -ne 0 ]; then
-            echo "FAIL: restored issue-create call waited for a leader's inherited stdout" >&2
+            echo "FAIL: restored issue-create call waited for a hub's inherited stdout" >&2
             FAILURES=$((FAILURES + 1))
         else
-            echo "gh issue create leader-exit restored: ok"
+            echo "gh issue create hub-exit restored: ok"
         fi
     elif [ "$rc" -eq 0 ]; then
-        echo "FAIL: pipe mutation did not fail the leader-exit EOF assertion" >&2
+        echo "FAIL: pipe mutation did not fail the hub-exit EOF assertion" >&2
         FAILURES=$((FAILURES + 1))
     else
-        echo "gh issue create leader-exit pipe mutation: FAILED (EOF assertion)"
+        echo "gh issue create hub-exit pipe mutation: FAILED (EOF assertion)"
     fi
 }
 
@@ -811,8 +811,8 @@ if [ "$TCP_LISTENER_AVAILABLE" -eq 1 ]; then
     run_issue_variant restored_issue "$DEPLOY_SH" ok
     run_issue_variant removed_issue "$MUTATED_ISSUE" failed
 fi
-run_issue_leader_exit_variant restored_leader_exit "$DEPLOY_SH" ok
-run_issue_leader_exit_variant removed_leader_exit "$MUTATED_ISSUE_PIPE" failed
+run_issue_hub_exit_variant restored_hub_exit "$DEPLOY_SH" ok
+run_issue_hub_exit_variant removed_hub_exit "$MUTATED_ISSUE_PIPE" failed
 run_issue_writer_variant restored_finite "$DEPLOY_SH" finite ok
 run_issue_writer_variant removed_finite "$MUTATED_ISSUE_READ" finite failed
 run_issue_writer_variant restored_persistent "$DEPLOY_SH" persistent ok

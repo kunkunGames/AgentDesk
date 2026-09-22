@@ -2,12 +2,12 @@
 
 use sqlx::{PgPool, Postgres, Transaction};
 
-/// True when every online cluster worker can render scheduled Discord mentions
+/// True when every online cluster runner can render scheduled Discord mentions
 /// without leaking them into external-provider payloads.
 pub async fn discord_mentions_rollout_ready_pg(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT NOT EXISTS (\
-             SELECT 1 FROM worker_nodes \
+             SELECT 1 FROM cluster_nodes \
              WHERE status = 'online' \
                AND COALESCE(\
                    capabilities #>> '{scheduled_messages,discord_mention_consumer_v1}', \

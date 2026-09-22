@@ -71,8 +71,8 @@ mod hostname_tests {
     #[test]
     fn accepts_native_and_fully_qualified_hostnames() {
         assert_eq!(
-            parse_short_hostname(true, b"worker-1\r\n").as_deref(),
-            Some("worker-1")
+            parse_short_hostname(true, b"runner-1\r\n").as_deref(),
+            Some("runner-1")
         );
         assert_eq!(
             parse_short_hostname(true, b"mac-mini.local\n").as_deref(),
@@ -83,7 +83,7 @@ mod hostname_tests {
     #[test]
     fn rejects_failed_empty_or_invalid_hostname_output() {
         for (success, output) in [
-            (false, b"worker-1".as_slice()),
+            (false, b"runner-1".as_slice()),
             (true, b" \r\n"),
             (true, b"usage: hostname"),
             (true, b".local"),

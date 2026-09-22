@@ -256,7 +256,7 @@ The contract — process-group based, not PTY-foreground based:
   cancel mechanism.
 - The remote shell MUST launch Codex through a small operator-supplied
   wrapper script whose contract is:
-  1. The wrapper MUST make itself the leader of a new process group
+  1. The wrapper MUST make itself the hub of a new process group
      while staying attached to the SSH-allocated PTY. Concretely:
      `set -m` (job control) plus an immediate `kill -0 -$$` self-check
      that the wrapper's PID equals its PGID; if the equality does not
@@ -271,14 +271,14 @@ The contract — process-group based, not PTY-foreground based:
      group", and is well-defined regardless of whether `$$` equals
      the PGID). It waits a short grace period (≤ 2s) and then sends
      `kill -KILL 0`. The shell-pid form (`kill -- -$$`) is **forbidden**
-     because it assumes the wrapper is the group leader without
+     because it assumes the wrapper is the group hub without
      verifying it; `kill 0` is the canonical correct form.
   3. The wrapper waits on Codex and exits with Codex's status. It does
      **not** background Codex, does **not** call `nohup`, and does
      **not** redirect stdout/stderr.
   4. The wrapper writes its own PID and PGID into a per-turn file the
      operator names (so the integration test can verify the group
-     leader identity from outside). The file is unlinked on exit.
+     hub identity from outside). The file is unlinked on exit.
 - On `CancelToken` fire, AgentDesk MUST, in order: (a) write `0x03`
   (ETX / Ctrl-C) into the PTY so the foreground process group sees
   SIGINT — this is Codex's chance to flush; (b) close the SSH channel,

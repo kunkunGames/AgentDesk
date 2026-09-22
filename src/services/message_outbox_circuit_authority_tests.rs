@@ -532,7 +532,7 @@ async fn activation_then_vouch_cancels_pending_and_releases_dedupe_pg() {
     db.drop().await;
 }
 
-// #4615 S3b: worker delivery fence — re-validates a claimed `processing` row's
+// #4615 S3b: runner delivery fence — re-validates a claimed `processing` row's
 // circuit authority immediately before the Discord send.
 
 /// Drive a staged+activated circuit row to `processing` under `owner`'s lease,
@@ -690,9 +690,9 @@ async fn fence_stale_lease_is_noop_pg() {
     };
     owner(&pool, "604", "node-a").await;
     let (id, c, stale_claimed_at) = processing_circuit_row(&pool, "604", "w1").await;
-    // Another worker steals the lease (stale-claim reclaim).
+    // Another runner steals the lease (stale-claim reclaim).
     let fresh_claimed_at = claim_as(&pool, id, "w2").await;
-    // Supersede the authority so, were the stale worker allowed to act, it would
+    // Supersede the authority so, were the stale runner allowed to act, it would
     // fence the row — proving the lease guard (not authority state) is what stops it.
     assert_eq!(
         revoke_on_fresh_vouch(&pool, &c, "live").await.unwrap(),
@@ -724,7 +724,7 @@ async fn fence_stale_lease_is_noop_pg() {
     assert!(
         row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("delivery_fence_checked_at")
             .is_none(),
-        "a stale worker must not stamp or mutate the row"
+        "a stale runner must not stamp or mutate the row"
     );
     pool.close().await;
     db.drop().await;

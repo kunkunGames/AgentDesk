@@ -498,8 +498,8 @@
 # #4807: remove the hosted-TUI readiness-wait placeholder edit (-10), then
 # lower the frozen baseline to the measured production LoC after current-main
 # drift (-2) so the deleted presentation path cannot silently regrow. 2708 -> 2706.
-# #4743: behavior-preserving decomposition moves the worker-facing IntakeRequest
-# and execute_intake_turn_core entry into `intake_turn/worker_entry.rs`; root source
+# #4743: behavior-preserving decomposition moves the runner-facing IntakeRequest
+# and execute_intake_turn_core entry into `intake_turn/runner_entry.rs`; root source
 # assertions follow the already-extracted busy_retry helper. 2706 -> 2622.
 "src/services/discord/router/message_handler/intake_turn.rs" = 2622
 "src/services/discord/meeting_orchestrator.rs" = 3227
@@ -559,7 +559,7 @@
 # into `runtime_bootstrap/shared_data.rs` (gated on the SharedData S1-S3
 # slices, now merged). The root keeps only RunBotContext + run_bot +
 # mod/re-export plumbing; final registry/baseline cleanup is the S5 slice.
-# #3038 run_bot S5: lowered 369 -> 274 by moving the 120-line leader gateway
+# #3038 run_bot S5: lowered 369 -> 274 by moving the 120-line hub gateway
 # runtime tail into `runtime_bootstrap/gateway_runtime.rs`; all
 # `runtime_bootstrap/` child modules remain under the 700-line namespace cap.
 "src/services/discord/runtime_bootstrap.rs" = 285

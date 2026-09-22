@@ -94,12 +94,12 @@ pub(super) const ABORT_MARKER_HARD_CAP_TTL_MULTIPLIER: u64 = 6;
 #[serde(rename_all = "snake_case")]
 pub(super) enum MarkerOrigin {
     /// The synthetic turn-start ABORTed on the backstop escalation budget
-    /// (#3296): the pinned identity is the FOREIGN prior turn the worker
+    /// (#3296): the pinned identity is the FOREIGN prior turn the runner
     /// deferred on.
     #[default]
     Abort,
     /// The synthetic turn-start claim SUCCEEDED (#3303): the pinned identity
-    /// is the worker's OWN synthetic turn (`user_msg_id == anchor`, own row
+    /// is the runner's OWN synthetic turn (`user_msg_id == anchor`, own row
     /// `started_at`), so a relay failure / EOF-consumed commit path that never
     /// flips the anchor's `⏳ → ✅` still converges (own commit → drain `✅`;
     /// nothing ever commits → bounded sweep `⚠` instead of an eternal `⏳`).
@@ -131,7 +131,7 @@ pub(super) struct AbortedAnchorMarker {
     /// (`inflight.rs` `InflightTurnIdentity` convention; codex r1: positive
     /// correlation). For `Abort` markers this is the live FOREIGN prior
     /// inflight at the ABORT instant; for `DeferredClaim` markers it is the
-    /// worker's OWN synthetic turn — NEVER the prior turn (the prior commit's
+    /// runner's OWN synthetic turn — NEVER the prior turn (the prior commit's
     /// tombstone is definitionally already durable at claim time, so pinning
     /// it would false-`✅` a still-streaming unanswered turn; #3303 SC1). The
     /// drain covers this marker ONLY on a terminal commit whose turn identity
@@ -161,7 +161,7 @@ impl AbortedAnchorMarker {
     }
 
     /// Build the marker the ABORT path records. `foreign` is the foreign prior
-    /// inflight's `(user_msg_id, started_at)`: the worker's LAST-VIEW identity,
+    /// inflight's `(user_msg_id, started_at)`: the runner's LAST-VIEW identity,
     /// with the cleanup-instant row only as the no-view fallback (codex r3 —
     /// see `tui_direct_pending_start::pin_abort_foreign_identity`). ALWAYS
     /// uncovered: bare row-absence is NOT commit evidence (force-clears also
@@ -796,7 +796,7 @@ mod tests {
     /// commit-tombstone store are siblings under it — codex r2) via the
     /// THREAD-LOCAL override (never the process-global `AGENTDESK_ROOT_DIR`
     /// env — mutating that races every test that reads the root without the
-    /// crate env lock, e.g. the `tui_direct_pending_start` worker tests'
+    /// crate env lock, e.g. the `tui_direct_pending_start` runner tests'
     /// `persist()`). No lock is needed: each test thread sees only its own
     /// override.
     struct TestRoot {

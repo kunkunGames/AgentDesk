@@ -34,7 +34,7 @@ agents:
     channels:
       codex: {id: "555"}
 """
-        # A pre-ops config may still contain the retired worker; ignore it.
+        # A pre-ops config may still contain the retired runner; ignore it.
         legacy_extra = """
   - id: adk-claude-e-e2e
     channels:
@@ -48,7 +48,7 @@ agents:
                 path.write_text(yaml + extra, encoding="utf-8")
                 self.assertEqual(matrix.load_channel_ids(path), expected)
 
-    def test_default_cells_are_the_four_supported_workers(self):
+    def test_default_cells_are_the_four_supported_runners(self):
         self.assertEqual(
             matrix.parse_cells(",".join(matrix.DEFAULT_CELLS)),
             ["claude-pipe", "claude-tui", "codex-pipe", "codex-tui"],

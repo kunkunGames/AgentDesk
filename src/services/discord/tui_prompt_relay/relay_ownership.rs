@@ -488,11 +488,11 @@ pub(super) fn bridge_adapter_owns_external_turn(owner: ExternalInputRelayOwner) 
 /// #3154 P1-3 no-relay-GAP guard: may the OBSERVER loop spawn its own BridgeAdapter
 /// idle-response tail? The output must come from EXACTLY ONE owner (never a GAP, never
 /// a DUPLICATE). DEFERRED ⇒ the observer cannot yet know the RESOLVED owner (the claim
-/// runs later in the detached worker), so it STANDS DOWN unconditionally and the worker
+/// runs later in the detached runner), so it STANDS DOWN unconditionally and the runner
 /// re-runs [`deferred_claim_requires_bridge_tail_relayer`] against the resolved owner.
 /// NOT deferred ⇒ spawn iff the lease still owns as BridgeAdapter (the inline claim
 /// already adopted any watcher handoff, so a watcher-owned lease means the observer
-/// stands down). Pairing this with the worker's owner-kind-aware spawn is the proof.
+/// stands down). Pairing this with the runner's owner-kind-aware spawn is the proof.
 pub(super) fn observer_should_spawn_bridge_tail(
     deferred_synthetic_start: bool,
     lease_owner: ExternalInputRelayOwner,
@@ -501,7 +501,7 @@ pub(super) fn observer_should_spawn_bridge_tail(
 }
 
 /// #3154 P1 (BridgeAdapter-GAP fix). The OWNER-KIND-AWARE decision the deferred
-/// worker runs AFTER its claim resolves the relay owner, mirroring the inline path:
+/// runner runs AFTER its claim resolves the relay owner, mirroring the inline path:
 /// TmuxWatcher ⇒ the watcher relays so the bridge tail STANDS DOWN (else DUPLICATE);
 /// BridgeAdapter ⇒ no watcher relays and the observer already stood down, so the
 /// bridge tail MUST run exactly once here (else `relayer_count == 0`, the GAP). The

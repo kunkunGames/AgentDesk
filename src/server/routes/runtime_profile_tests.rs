@@ -19,7 +19,7 @@ fn request(method: &str, path: &str, bearer: bool) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods() {
+async fn runner_profile_routes_preserve_execution_auth_and_remove_admin_methods() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.policies.dir = dir.path().join("policies");
@@ -63,7 +63,7 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
                 "{profile:?}: {method} {path}"
             );
         }
-        // A valid administrator credential cannot mount disabled worker routes.
+        // A valid administrator credential cannot mount disabled runner routes.
         for (method, path) in [
             ("PUT", "/settings"),
             ("PATCH", "/settings/config"),
@@ -78,15 +78,15 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("POST", "/provider-auth-profiles/codex/login-start"),
             ("POST", "/auth/ws-ticket"),
         ] {
-            let is_worker = profile == crate::config::RuntimeProfile::Runner;
+            let is_runner = profile == crate::config::RuntimeProfile::Runner;
             let response = app
                 .clone()
-                .oneshot(request(method, path, is_worker))
+                .oneshot(request(method, path, is_runner))
                 .await
                 .unwrap();
             assert_eq!(
                 response.status(),
-                if is_worker {
+                if is_runner {
                     StatusCode::NOT_FOUND
                 } else {
                     StatusCode::UNAUTHORIZED

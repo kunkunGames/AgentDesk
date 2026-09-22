@@ -6,7 +6,6 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RuntimeRoot,
     [Parameter(Mandatory = $true)]
-    [Alias('LeaderAddress')]
     [System.Net.IPAddress[]]$HubAddress,
     [ValidateRange(1, 65535)]
     [int]$Port = 8791
@@ -17,7 +16,7 @@ $binary = [IO.Path]::GetFullPath((Join-Path $RuntimeRoot 'bin\agentdesk.exe'))
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw "Runner executable is missing: $binary" }
 if (-not $HubAddress.Count) { throw 'At least one hub IP address is required.' }
 $addresses = @($HubAddress | ForEach-Object { $_.ToString() } | Sort-Object -Unique)
-$name = "AgentDeskWorker-TCP-$Port"
+$name = "AgentDeskAPI-TCP-$Port"
 $existing = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
 if ($existing) {
     $application = $existing | Get-NetFirewallApplicationFilter
@@ -27,7 +26,7 @@ if ($existing) {
 }
 $rule = @{
     Name = $name
-    DisplayName = "AgentDesk Runner API ($Port)"
+    DisplayName = "AgentDesk API ($Port)"
     Group = 'AgentDesk'
     Description = 'Hub-to-runner API access scoped to the configured hub IP addresses.'
     Direction = 'Inbound'

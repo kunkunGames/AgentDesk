@@ -733,7 +733,7 @@ _check_repo_source_identity() {
 
 _assert_release_binary_runtime_surface() {
     # If this source tree contains durable routines, the staged binary must expose
-    # the matching worker/API surface. This catches deploying an older binary that
+    # the matching runner/API surface. This catches deploying an older binary that
     # can pass /api/health while silently dropping scheduled routine execution.
     [ -f "$REPO/src/services/routines/runtime.rs" ] || return 0
     [ -f "$REPO/src/server/routes/routines.rs" ] || return 0
@@ -747,7 +747,7 @@ _assert_release_binary_runtime_surface() {
     strings "$SOURCE_BINARY" >"$surface_dump"
     if ! grep -Fq "routine-runtime" "$surface_dump"; then
         rm -f "$surface_dump"
-        echo "✗ Source binary is missing the routine-runtime worker surface: $SOURCE_BINARY"
+        echo "✗ Source binary is missing the routine-runtime runner surface: $SOURCE_BINARY"
         echo "  Rebuild from a routines-enabled checkout before deploying release."
         exit 1
     fi
@@ -1578,8 +1578,8 @@ echo \"\$port\"")"'')"; then
 
     # Operator-private routines are excluded from the repo (.gitignore:50), so the
     # peer's own `git fetch` above cannot deliver them. Push them before the peer
-    # deploys: leadership can move between nodes, and the routine runtime is a
-    # LeaderOnly worker that resolves `script_ref` against the local disk. A node
+    # deploys: hub ownership can move between nodes, and the routine runtime is a
+    # HubOnly runner that resolves `script_ref` against the local disk. A node
     # missing these files fails every routine row with "routine script ... is not
     # loaded". No --delete: the peer may hold routines this node does not.
     if [ -d "$ADK_REL/routines" ]; then
@@ -1964,7 +1964,7 @@ else
 fi
 
 # Stage launchd-migrated shell entrypoints before stopping release so routines
-# can invoke the same release-owned path on whichever node holds leadership.
+# can invoke the same release-owned path on whichever node holds hub ownership.
 if [ -d "$REPO/scripts/launchd-migrated" ]; then
     echo "▸ Staging launchd-migrated entrypoints..."
     LAUNCHD_MIGRATED_STAGED="$ADK_REL/scripts/launchd-migrated.new"
@@ -2882,7 +2882,7 @@ echo "▸ Waiting for release health on :${REL_PORT}..."
 REL_HEALTHY=false
 # #4348 Defect 1: the trailing `1` opts the DEPLOY readiness gate into treating a
 # serving node that is unhealthy SOLELY because no provider runtimes are
-# registered (leader-only / no-agent-session node) as deploy-ready. Runtime
+# registered (hub-only / no-agent-session node) as deploy-ready. Runtime
 # /api/health keeps reporting unhealthy for monitoring; only this gate relaxes.
 if wait_for_http_service_health "$PLIST_REL" "$REL_PORT" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1; then
     REL_HEALTHY=true
@@ -2978,7 +2978,7 @@ rm -f "$REL_BINARY_BACKUP.tmp" 2>/dev/null || true
 
 if _health_json_unhealthy_only_no_provider_runtimes "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then
     echo "✓ Release is serving on :${REL_PORT} (deploy-ready: no provider runtimes registered —"
-    echo "  leader-only / no-agent-session node; runtime /api/health stays unhealthy for"
+    echo "  hub-only / no-agent-session node; runtime /api/health stays unhealthy for"
     echo "  monitoring, but the server, DB, and dashboard are up [#4348])"
 elif _health_json_field_exists "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}" "fully_recovered" \
   && ! _health_json_field_is_true "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}" "fully_recovered"; then

@@ -27,7 +27,7 @@ const DELIVERY_FINALIZE_RETRY_BACKOFFS: [Duration; 4] = [
 // (reconcile backfills the ledger to `sent`, no resend) — never neither.
 //
 // SCOPE — what this PR closes vs. the irreducible residual (verified against the
-// outbox worker + reconcile paths; do not overstate):
+// outbox runner + reconcile paths; do not overstate):
 //   * CLOSED — transient finalize failure: a transient typed-finalize /
 //     reserving-delete failure (or its swallowed `.ok()` predecessor) can no
 //     longer strand a delivered message with no dedup proof. STEP 1 commits the
@@ -35,11 +35,11 @@ const DELIVERY_FINALIZE_RETRY_BACKOFFS: [Duration; 4] = [
 //     bookkeeping failure is self-healing.
 //   * CLOSED — slow/hanging send: a transport `send_dispatch` that ran longer
 //     than the reservation TTL used to let an outbox reclaim observe an EXPIRED
-//     reservation while the original worker was still in-flight, and re-send.
+//     reservation while the original runner was still in-flight, and re-send.
 //     `reqwest::Client::new()` carries no request timeout, so that wall-clock was
 //     unbounded. We now bound the whole send to `DISPATCH_SEND_DEADLINE_SECS`,
 //     held strictly below the reservation TTL by the static assertion below, so
-//     the original worker always settles (success or timeout-as-failure) before
+//     the original runner always settles (success or timeout-as-failure) before
 //     its reservation can expire — the reclaim either sees the durable anchor or
 //     an active reservation, never an in-flight-but-expired one.
 //   * IRREDUCIBLE: the remaining duplicate paths are (i) a process crash in the
@@ -55,7 +55,7 @@ const DELIVERY_FINALIZE_RETRY_BACKOFFS: [Duration; 4] = [
 //     and a STEP 1 permanent failure is escalated as an operator-alertable
 //     invariant breach so it is never silent.
 //   * NOT a duplicate (verified): in an ALIVE process a STEP 1 anchor failure
-//     still returns the transport's Ok, so the worker marks the outbox row `done`
+//     still returns the transport's Ok, so the runner marks the outbox row `done`
 //     (mark_outbox_done_pg) and it is never reclaimed — zero re-send; the typed
 //     ledger merely settles to a cosmetic `failed` that reconcile cannot upgrade
 //     without the anchor.
@@ -151,7 +151,7 @@ pub(crate) async fn send_dispatch_with_delivery_guard<T: DispatchTransport>(
 /// `reqwest::Client::new()` carries no request timeout, so a hung or repeatedly
 /// rate-limited Discord HTTP send could otherwise outlive the delivery
 /// reservation and let an outbox reclaim re-send it. Bounding the send below the
-/// reservation TTL guarantees the original worker settles before its reservation
+/// reservation TTL guarantees the original runner settles before its reservation
 /// can expire. A timeout is surfaced as a normal failed send: it flows through
 /// the failed-send finalize (no anchor; reserving key released so the dispatch
 /// can be retried). The residual at-least-once exposure — a timed-out send that
@@ -1419,13 +1419,13 @@ mod tests {
         async fn delivery_first_send_not_resent_by_reclaim_after_permanent_bookkeeping_failure() {
             let pg_db = create_test_pg_db().await;
             let pool = pg_db.connect_and_migrate().await;
-            let dispatch_id = "dispatch-worker-path-no-resend";
+            let dispatch_id = "dispatch-runner-path-no-resend";
             seed_dispatch(&pool, dispatch_id).await;
 
             let transport =
                 RecordingDispatchTransport::new("1500000000000000040", "1500000000000000041");
 
-            // 1. FIRST worker processing through the real entry point. The transport
+            // 1. FIRST runner processing through the real entry point. The transport
             //    sends (call #1); STEP 1 anchor commits; STEP 2 bookkeeping permanently
             //    fails against the CHECK constraint. The guard still returns the
             //    transport's success (it must not re-drive a delivered message).
@@ -1433,8 +1433,8 @@ mod tests {
             let first = send_dispatch_with_delivery_guard(
                 Some(&pool),
                 "agent-1",
-                "Worker path first send",
-                "card-worker-path",
+                "Runner path first send",
+                "card-runner-path",
                 dispatch_id,
                 &transport,
             )
@@ -1487,8 +1487,8 @@ mod tests {
             let redrive = send_dispatch_with_delivery_guard(
                 Some(&pool),
                 "agent-1",
-                "Worker path reclaim redrive",
-                "card-worker-path",
+                "Runner path reclaim redrive",
+                "card-runner-path",
                 dispatch_id,
                 &transport,
             )

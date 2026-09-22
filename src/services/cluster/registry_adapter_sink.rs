@@ -108,7 +108,7 @@ impl RelaySink for RegistryAdapterSink {
     }
 }
 
-/// Convenience entry-point for tests/fallback runtimes. Production worker
+/// Convenience entry-point for tests/fallback runtimes. Production runner
 /// registration prefers the Discord sink.
 pub async fn run_with_registry_adapter_sink(shutdown: Arc<AtomicBool>) {
     let sink: Arc<dyn RelaySink> = Arc::new(RegistryAdapterSink::new());

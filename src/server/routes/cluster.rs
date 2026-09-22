@@ -25,7 +25,7 @@ pub async fn list_nodes(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let pool = pg_pool(&state)?;
     let lease_ttl_secs = state.config.cluster.lease_ttl_secs.max(1);
-    match crate::server::cluster::list_worker_nodes(pool, lease_ttl_secs).await {
+    match crate::server::cluster::list_cluster_nodes(pool, lease_ttl_secs).await {
         Ok(mut nodes) => {
             for node in &mut nodes {
                 crate::services::cluster::readiness::attach_diagnostics(node);
@@ -45,7 +45,7 @@ pub async fn list_nodes(
                             state.cluster_instance_id.as_deref(),
                             &nodes,
                         );
-                        crate::server::cluster_session_routing::attach_active_session_counts_to_worker_nodes(
+                        crate::server::cluster_session_routing::attach_active_session_counts_to_cluster_nodes(
                             &mut nodes,
                             &sessions,
                         );
@@ -58,7 +58,7 @@ pub async fn list_nodes(
                     }
                     Err(error) => {
                         tracing::warn!("failed to load active session owner summary: {error}");
-                        crate::server::cluster_session_routing::attach_active_session_counts_to_worker_nodes(
+                        crate::server::cluster_session_routing::attach_active_session_counts_to_cluster_nodes(
                             &mut nodes,
                             &[],
                         );
@@ -83,7 +83,7 @@ pub async fn list_nodes(
                         "configured_role": state.config.cluster.role,
                         "lease_ttl_secs": lease_ttl_secs,
                         "heartbeat_interval_secs": state.config.cluster.heartbeat_interval_secs.max(1),
-                        "local_worker_runtime": crate::server::worker_registry::leader_only_worker_status_json(),
+                        "local_runner_runtime": crate::server::runner_registry::hub_only_runner_status_json(),
                     },
                     "nodes": nodes,
                     "session_owners": session_owners,
@@ -123,7 +123,7 @@ mod idle_kill_config_tests {
         for (owner, origin) in [
             ("missing", None),
             ("blank", Some("  ")),
-            ("worker", Some("https://worker.example:8791")),
+            ("runner", Some("https://runner.example:8791")),
         ] {
             cluster.nodes.insert(
                 owner.into(),
@@ -133,7 +133,7 @@ mod idle_kill_config_tests {
                 },
             );
         }
-        assert_eq!(configured_forward_owner_ids(&cluster), vec!["worker"]);
+        assert_eq!(configured_forward_owner_ids(&cluster), vec!["runner"]);
         cluster
             .nodes
             .get_mut("missing")
@@ -167,7 +167,7 @@ pub async fn routing_diagnostics(
         _ => json!({}),
     };
     let lease_ttl_secs = state.config.cluster.lease_ttl_secs.max(1);
-    match crate::server::cluster::list_worker_nodes(pool, lease_ttl_secs).await {
+    match crate::server::cluster::list_cluster_nodes(pool, lease_ttl_secs).await {
         Ok(nodes) => {
             let routing_engine =
                 crate::services::dispatches::routing_constraint::RoutingEngine::from_cluster_config(
@@ -397,7 +397,7 @@ pub async fn upsert_issue_spec(
 
 /// Diagnostic readout of the per-process `SessionRegistry` populated by
 /// `SessionDiscovery` (Epic #2285 / E2, issue #2344). Read-only — the registry
-/// itself is leader-only writeable, but the snapshot is safe to expose on any
+/// itself is hub-only writeable, but the snapshot is safe to expose on any
 /// node so dashboards can scrape every host.
 ///
 /// E5 (#2412) augments each entry with a `relay_frames_received` field

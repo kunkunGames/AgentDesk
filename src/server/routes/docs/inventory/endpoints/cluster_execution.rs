@@ -6,11 +6,11 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
         ep("GET", "/api/agents/{id}/execution-node", "agents",
             "Read the default node for this agent's new Discord sessions. Existing session ownership and explicit channel /node selection take precedence.")
             .with_params([("id", path_param("Agent ID."))])
-            .with_example(json!({"path":{"id":"codex"}}), json!({"default_node_id":"windows-worker-1","routing_enforced":true})),
+            .with_example(json!({"path":{"id":"codex"}}), json!({"default_node_id":"windows-runner-1","routing_enforced":true})),
         ep("PUT", "/api/agents/{id}/execution-node", "agents",
             "Set or clear a registered default node. Requires enforced intake routing for a non-null selection. Does not move existing sessions or modify hard execution requirements. Full runtime only.")
             .with_params([("id", path_param("Agent ID.")), ("default_node_id", body_param("string|null", true, "Registered instance ID; null restores the existing placement policy."))])
-            .with_example(json!({"path":{"id":"codex"},"body":{"default_node_id":"windows-worker-1"}}), json!({"default_node_id":"windows-worker-1"})),
+            .with_example(json!({"path":{"id":"codex"},"body":{"default_node_id":"windows-runner-1"}}), json!({"default_node_id":"windows-runner-1"})),
         ep("GET", "/api/agents/{id}/execution-requirements", "agents",
             "Read central hard execution requirements. Unlike the default node, these constraints also apply to existing session owners.")
             .with_params([("id", path_param("Agent ID."))])
@@ -20,7 +20,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             .with_params([("id", path_param("Agent ID."))])
             .with_example(json!({"path":{"id":"codex"},"body":{"os":["windows"],"repositories":["kunkunGames/AgentDesk"]}}), json!({"execution_requirements":{"os":["windows"],"repositories":["kunkunGames/AgentDesk"]}})),
         ep("GET", "/api/internal/node-probe", "cluster",
-            "Authenticated node identity and session-forwarding protocol probe. Used to verify that the configured peer endpoint belongs to the advertised node; does not grant access to worker admin routes."),
+            "Authenticated node identity and session-forwarding protocol probe. Used to verify that the configured peer endpoint belongs to the advertised node; does not grant access to runner admin routes."),
         ep("GET", "/api/sessions/{id}/output", "sessions",
             "Read recent output through the durable session owner. Supports native process and tmux backends. Unavailable output is reported explicitly instead of fabricated from stale state.")
             .with_params([("id", path_param("Numeric session ID.")), ("lines", query_param("integer", false, "Maximum recent output lines."))]),

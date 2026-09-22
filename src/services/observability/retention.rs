@@ -1,13 +1,13 @@
 //! #2049 Finding 9: retention sweep split out of `mod.rs`. Prunes old
 //! observability rows so disk and index growth stay bounded on long-lived
-//! single-node deployments. Schedule lives in the worker loop; this module
+//! single-node deployments. Schedule lives in the runner loop; this module
 //! is pure I/O.
 
 use std::sync::Arc;
 
 use sqlx::PgPool;
 
-use super::worker::storage_handles;
+use super::runner::storage_handles;
 use super::{
     DEFAULT_COUNTER_SNAPSHOT_RETENTION_DAYS, DEFAULT_OBSERVABILITY_EVENT_RETENTION_DAYS,
     DEFAULT_QUALITY_EVENT_RETENTION_DAYS, ObservabilityRuntime,

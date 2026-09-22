@@ -16,7 +16,7 @@
 //!   same transaction so suppression remains one-shot per cancel (codex P1 on
 //!   #1277).
 //! - `prune_expired_cancel_tombstones` is invoked periodically by the
-//!   `cancel_tombstone_pruner` maintenance worker so the table cannot grow
+//!   `cancel_tombstone_pruner` maintenance runner so the table cannot grow
 //!   without bound when the watcher never observes the death.
 
 use std::sync::OnceLock;
@@ -138,7 +138,7 @@ pub async fn consume_cancel_tombstone(
     let mut tx = pool.begin().await?;
 
     // Lock candidate rows so a concurrent consume on a different
-    // dcserver / worker cannot double-suppress.
+    // dcserver / runner cannot double-suppress.
     let rows = sqlx::query(
         "SELECT id, tmux_session_name, stop_output_offset
          FROM cancel_tombstones

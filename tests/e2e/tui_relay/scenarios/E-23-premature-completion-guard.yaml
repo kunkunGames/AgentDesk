@@ -13,7 +13,7 @@ notes: |
   intentionally creates a short tool gap before the body so a relay that posts
   "응답 완료" before user-visible content is visible to
   completion_chrome_after_body. Codex cells are excluded because their E2E
-  worker role cannot execute live shell/tool commands; Codex modern-schema
+  runner role cannot execute live shell/tool commands; Codex modern-schema
   coverage remains in fixture E-25.
 steps:
   - send_prompt: |

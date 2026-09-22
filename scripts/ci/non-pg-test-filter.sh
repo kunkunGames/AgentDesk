@@ -22,7 +22,7 @@ readonly -a PG_INCLUDE_ARGS
 # them in the full non-PG sweeps to preserve their macOS/Windows coverage.
 NON_PG_FILTER_FALSE_POSITIVES=(
   db::dispatched_session_canonical_identity::pg_tests::canonical_identity_conflict_is_http_409_ready
-  db::postgres::tests::agent_roster_sync_gated_to_leader_or_single_node
+  db::postgres::tests::agent_roster_sync_gated_to_hub_or_single_node
   db::postgres::tests::background_backpressure_disabled_when_reserve_zero
   db::postgres::tests::background_backpressure_saturating_boundaries
   db::postgres::tests::background_backpressure_yields_only_at_or_past_budget

@@ -125,8 +125,8 @@ pub(crate) async fn wake_waiting_dispatch_outbox_pg(
     trigger: &str,
 ) -> Result<DispatchOutboxWakeSummary, String> {
     let lease_ttl_secs = cluster_config.lease_ttl_secs.max(1);
-    let mut worker_nodes =
-        crate::services::cluster::node_registry::list_worker_nodes(pool, lease_ttl_secs).await?;
+    let mut cluster_nodes =
+        crate::services::cluster::node_registry::list_cluster_nodes(pool, lease_ttl_secs).await?;
     let routing_engine = RoutingEngine::from_cluster_config(cluster_config);
     let cluster_default = cluster_default_required_capabilities(&cluster_config.dispatch_routing);
     let now = Utc::now();
@@ -164,7 +164,7 @@ pub(crate) async fn wake_waiting_dispatch_outbox_pg(
             effective_required_capabilities(dispatch_required.clone(), cluster_default.clone());
         let route_required = effective_required.clone().unwrap_or_else(|| json!({}));
         let dispatch = RoutingDispatch::new(dispatch_id.clone(), None, effective_required.clone());
-        let routing_decision = routing_engine.route(&worker_nodes, &route_required, &dispatch);
+        let routing_decision = routing_engine.route(&cluster_nodes, &route_required, &dispatch);
         let diagnostics = wake_diagnostics(
             trigger,
             &dispatch_id,
@@ -204,7 +204,7 @@ pub(crate) async fn wake_waiting_dispatch_outbox_pg(
             .execute(&mut *tx)
             .await
             .map_err(|error| format!("reassign dispatch outbox wait row {outbox_id}: {error}"))?;
-            increment_active_dispatch_count(&mut worker_nodes, selected);
+            increment_active_dispatch_count(&mut cluster_nodes, selected);
             summary.reassigned += 1;
             continue;
         }
@@ -359,8 +359,8 @@ fn wait_timed_out(
     now.signed_duration_since(wait_started_at).num_seconds() >= timeout_secs as i64
 }
 
-fn increment_active_dispatch_count(worker_nodes: &mut [Value], instance_id: &str) {
-    let Some(node) = worker_nodes
+fn increment_active_dispatch_count(cluster_nodes: &mut [Value], instance_id: &str) {
+    let Some(node) = cluster_nodes
         .iter_mut()
         .find(|node| node.get("instance_id").and_then(Value::as_str) == Some(instance_id))
     else {
@@ -489,11 +489,11 @@ mod tests {
         let pool = &pg.pool;
 
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, process_id, role, effective_role, status,
                 labels, capabilities, last_heartbeat_at, started_at, updated_at
              ) VALUES (
-                'mac-mini-release', 'mac-mini', 100, 'auto', 'leader', 'online',
+                'mac-mini-release', 'mac-mini', 100, 'auto', 'hub', 'online',
                 $1, $2, NOW(), NOW(), NOW()
              )",
         )

@@ -4,7 +4,7 @@ use crate::services::discord::bot_role::UtilityBotRole;
 
 /// Actionable operational alerts are delivered by the announce bot first so
 /// the channel's resident AgentDesk role receives a human-visible notice. The
-/// delivery path stamps non-turn provenance; the outbox worker falls back to
+/// delivery path stamps non-turn provenance; the outbox runner falls back to
 /// the notify bot only when that primary delivery fails (#4449).
 pub(crate) const ACTIONABLE_OPS_ALERT_BOT: &str = UtilityBotRole::Announce.alias();
 

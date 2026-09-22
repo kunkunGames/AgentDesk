@@ -468,7 +468,7 @@ pub(in crate::services::discord) mod tests {
         let initial = append_completion_footer_metadata("Context".to_string(), &metadata);
         let recovered = completion_footer_metadata_from_block(Some(&initial));
         let refreshed =
-            append_completion_footer_metadata("Subagents\n└ worker ⠸".to_string(), &recovered);
+            append_completion_footer_metadata("Subagents\n└ runner ⠸".to_string(), &recovered);
 
         assert!(refreshed.contains("⏱ 2m 34s"));
         assert!(refreshed.contains("⏳ 5h 80% · 7d 60%"));

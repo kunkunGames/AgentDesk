@@ -635,14 +635,14 @@ async fn handle_completed_dispatch_followups_internal<T: DispatchTransport>(
                 // done because the rest of the followup succeeded, so the
                 // archive attempt never retried and threads piled up. A
                 // dedicated `dispatch_outbox(action='archive_thread')` retry
-                // lane needs a worker counterpart; track that as a follow-up
+                // lane needs a runner counterpart; track that as a follow-up
                 // (#2045 Finding 17) and at least make the failure visible
                 // in the meantime.
                 tracing::error!(
                     dispatch_id = %dispatch_id,
                     thread_id = %tid,
                     error = %err,
-                    "[dispatch] Failed to archive thread for completed dispatch — manual review or worker re-run required"
+                    "[dispatch] Failed to archive thread for completed dispatch — manual review or runner re-run required"
                 );
             } else {
                 tracing::info!(

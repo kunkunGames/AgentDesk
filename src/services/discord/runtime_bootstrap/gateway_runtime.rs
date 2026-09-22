@@ -1,7 +1,7 @@
 use super::*;
 
-/// Start the leader gateway runtime after health registration, restart-marker
-/// fencing, and optional intake-worker startup. This final `run_bot` tail owns
+/// Start the hub gateway runtime after health registration, restart-marker
+/// fencing, and optional intake-runner startup. This final `run_bot` tail owns
 /// framework/client construction, gateway-lease keepalive, the SIGTERM handler,
 /// and the gateway backend event loop, in that order.
 #[allow(clippy::too_many_arguments)]

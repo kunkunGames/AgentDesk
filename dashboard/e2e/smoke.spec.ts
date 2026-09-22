@@ -983,7 +983,7 @@ async function mockAgentsHubApis(page: Page) {
       cluster: { enabled: true, local_instance_id: "mac-mini" },
       nodes: [
         { instance_id: "mac-mini", hostname: "Mac mini", effective_role: "hub", status: "online", os: "macos" },
-        { instance_id: "windows-1", hostname: "Windows PC", effective_role: "worker", status: "online", os: "windows" },
+        { instance_id: "windows-1", hostname: "Windows PC", effective_role: "runner", status: "online", os: "windows" },
         { instance_id: "linux-2", hostname: "Linux PC", effective_role: "runner", status: "offline", os: "linux" },
       ].map(({ os, ...node }) => ({ ...node,
         capabilities: { execution_readiness: {
@@ -2440,8 +2440,8 @@ test.describe("Dashboard smoke tests", () => {
       const now = Date.now();
       await route.fulfill({ json: {
         cluster: { enabled: clusterEnabled, local_instance_id: "mac-mini" },
-        nodes: ["windows-worker", "linux-worker"].map((id, index) => ({
-          instance_id: id, status: "online", effective_role: index ? "worker" : "runner", active_dispatch_count: 0,
+        nodes: ["windows-runner", "linux-runner"].map((id, index) => ({
+          instance_id: id, status: "online", effective_role: index ? "runner" : "runner", active_dispatch_count: 0,
           execution_active: 1, execution_occupied: 2,
           capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
             os: index ? "linux" : "windows", arch: "x86_64", runtime_profile: index ? "full" : "runner",
@@ -2457,11 +2457,11 @@ test.describe("Dashboard smoke tests", () => {
       } });
     });
     await page.route(/\/api\/dispatched-sessions$/, route => route.fulfill({ json: { sessions: [{
-      id: 17, session_key: "codex/token/windows:fixture", instance_id: "windows-worker",
+      id: 17, session_key: "codex/token/windows:fixture", instance_id: "windows-runner",
       name: "Windows build", provider: "codex", status: stopCount ? "disconnected" : "working",
     }] } }));
     await page.route(/\/api\/sessions\/17\/output\?lines=100$/, route => route.fulfill({ json: {
-      recent_output: `{"text":"worker output 한글 ${"a".repeat(200)}"}`, backend: "process",
+      recent_output: `{"text":"runner output 한글 ${"a".repeat(200)}"}`, backend: "process",
       available: true, unavailable_reason: null, output_format: "jsonl", captured_at_ms: Date.now(),
     } }));
     await page.route(/\/api\/sessions\/[^/]+\/force-kill$/, async route => {
@@ -2478,7 +2478,7 @@ test.describe("Dashboard smoke tests", () => {
     await expect(panel.getByText(/실행 용량 대기|Waiting for capacity/)).toBeVisible();
     await expect(panel.getByText(/CLI 실행 불가|CLI unavailable/)).toBeVisible();
     await panel.getByRole("button", { name: /출력 보기|View output/ }).click();
-    await expect(panel.getByText(/worker output 한글/)).toBeVisible();
+    await expect(panel.getByText(/runner output 한글/)).toBeVisible();
     await panel.getByRole("button", { name: /실행 중지|Stop execution/, exact: true }).click();
     expect(stopCount).toBe(0);
     await panel.getByRole("button", { name: /중지 확인|Confirm stop/ }).click();
@@ -2489,7 +2489,7 @@ test.describe("Dashboard smoke tests", () => {
     failRefresh = true;
     await expect(panel.getByRole("button", { name: /실행 중지|Stop execution/, exact: true })).toBeDisabled({ timeout: 20_000 });
     await expect(panel.getByText(/노드 갱신 실패|Node refresh failed/)).toBeVisible();
-    await expect(panel.getByText(/worker output 한글/)).toBeVisible();
+    await expect(panel.getByText(/runner output 한글/)).toBeVisible();
     await expectNoHorizontalOverflow(page);
     failRefresh = false;
     clusterEnabled = false;

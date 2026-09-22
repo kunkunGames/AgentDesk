@@ -140,7 +140,7 @@ jobs:
               - 'src/server/outbox_actionable_delivery.rs'
               - 'src/server/routes/message_outbox.rs'
               - 'src/server/routes/scheduled_messages.rs'
-              - 'src/server/worker_registry.rs'
+              - 'src/server/runner_registry.rs'
               - 'src/services/auto_queue.rs'
               - 'src/services/auto_queue/**'
               - 'src/services/scheduled_messages.rs'
@@ -216,6 +216,7 @@ jobs:
               - 'src/db/intake_outbox_dispatch_stamp/tests.rs'
               - 'src/db/intake_outbox_dispatched_audit.rs'
               - 'src/db/postgres.rs'
+              - 'src/db/postgres/hub_runner_names_tests.rs'
               - 'src/db/prompt_manifests/tests.rs'
               - 'src/db/relay_dead_letter.rs'
               - 'src/db/scheduled_messages/postgres_tests.rs'
@@ -270,7 +271,7 @@ jobs:
               - 'src/services/cluster/intake_router_hook/edge_case_tests.rs'
               - 'src/services/cluster/intake_router_hook/execution_requirement_tests.rs'
               - 'src/services/cluster/intake_router_hook/owner_record.rs'
-              - 'src/services/cluster/intake_worker/dispatch_stamp_tests.rs'
+              - 'src/services/cluster/intake_runner/dispatch_stamp_tests.rs'
               - 'src/services/discord/catch_up/too_old_notice.rs'
               - 'src/services/discord/health/recovery.rs'
               - 'src/services/discord/health/recovery/stall_alert.rs'
@@ -357,7 +358,7 @@ jobs:
               - 'src/server/routes/message_outbox.rs'
               - 'src/server/routes/scheduled_messages.rs'
               - 'src/server/routes/scheduled_messages/**'
-              - 'src/server/worker_registry.rs'
+              - 'src/server/runner_registry.rs'
               - 'src/services/auto_queue.rs'
               - 'src/services/auto_queue/**'
               - 'src/services/agent_recovery/**'
@@ -390,8 +391,8 @@ jobs:
               - 'src/services/discord/inflight/**'
               # #5071 T2-W S-W1: the bridge-handoff stamp and its PG-backed
               # sidecar tests must select the PostgreSQL lane together.
-              - 'src/services/cluster/intake_worker.rs'
-              - 'src/services/cluster/intake_worker/**'
+              - 'src/services/cluster/intake_runner.rs'
+              - 'src/services/cluster/intake_runner/**'
               - 'src/services/discord/router/message_handler/intake_turn.rs'
               - 'src/services/discord/router/message_handler/intake_turn/**'
               - 'src/services/discord/runtime_bootstrap/intake_delivery_capability.rs'
@@ -1233,7 +1234,7 @@ jobs:
   # before `fb2357a66`: `expected=6971 ignored=8 executed=6963`. The Linux
   # `derive_expected_selection` difference between those SHAs with skips `_pg`, `pg_` and `postgres` is 54 added and none removed, under
   # `server::routes::health_api::tests` (4),
-  # `server::worker_registry::leader_takeover_tests` (1) and
+  # `server::runner_registry::hub_takeover_tests` (1) and
   # `services::health_diagnostics::tests` (4), `services::hang_forensics::tests` (30),
   # `services::discord::recovery_engine::terminal_text_idempotency::tests` (5) and
   # `services::discord::session_relay_sink::journal::controller::controller_terminal_semantics_tests` (5) and

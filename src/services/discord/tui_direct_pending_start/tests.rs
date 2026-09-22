@@ -2,10 +2,10 @@ use super::*;
 
 /// The presence index (`PRESENT`) and the durable store root are PROCESS-WIDE
 /// statics. Any test that calls `persist` / `delete` / `reset_present_for_tests`
-/// / drives `run_worker` mutates them, so concurrent tests would stomp each
+/// / drives `run_runner` mutates them, so concurrent tests would stomp each
 /// other (e.g. one test's `reset_present_for_tests` clearing another's gate).
 /// Serialize all such tests on this module-local lock.
-fn worker_test_lock() -> std::sync::MutexGuard<'static, ()> {
+fn runner_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -46,7 +46,7 @@ impl Drop for EnvReset {
     }
 }
 
-/// Wrap a pure view into the worker's per-poll observation (no foreign
+/// Wrap a pure view into the runner's per-poll observation (no foreign
 /// identity — the common already-finalized case).
 fn obs(view: PriorTurnView) -> PriorTurnObservation {
     PriorTurnObservation {
@@ -97,7 +97,7 @@ fn own_anchor_inflight_does_not_block_idempotent_restore() {
     );
 }
 
-/// #3296 codex r3 (RED ③ — pure): the ABORT cleanup pins the worker's
+/// #3296 codex r3 (RED ③ — pure): the ABORT cleanup pins the runner's
 /// LAST-VIEW identity, never the cleanup-instant row, when both exist.
 /// RED pre-r3: the relay hook preferred the live row — when the final
 /// poll's foreign row terminal-committed (tombstone + clear) and a
@@ -171,7 +171,7 @@ fn not_finalized_without_runtime_binding() {
 
 #[test]
 fn presence_index_marks_and_clears() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     reset_present_for_tests();
     let provider = "claude";
     let channel = 777u64;
@@ -191,7 +191,7 @@ fn presence_index_marks_and_clears() {
 
 #[test]
 fn abandoned_presence_clear_keeps_durable_record() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -207,7 +207,7 @@ fn abandoned_presence_clear_keeps_durable_record() {
     assert!(pending_synthetic_start_present("claude", 70));
     assert!(
         pending_synthetic_start_abandoned("claude", 70),
-        "a capped durable attempt_count with no active worker is an abandoned claim"
+        "a capped durable attempt_count with no active runner is an abandoned claim"
     );
     assert!(clear_abandoned_synthetic_start_presence("claude", 70));
     assert!(
@@ -263,7 +263,7 @@ fn record_roundtrips_through_json() {
 /// `ViewFn`/`ClaimFn` boxed-closure convention. Records each invocation —
 /// and the last-view foreign identity it received (codex r2) — so a test
 /// can pin WHEN the cleanup fires (terminal backstop ABORT only) and what
-/// identity the worker threaded, and when it must NOT fire (successful
+/// identity the runner threaded, and when it must NOT fire (successful
 /// claim — the normal `⏳ → ✅` completion owns the anchor; retry
 /// exhaustion — the record is retained for restart).
 type RecordedForeignIdentity = Arc<Mutex<Option<Option<(u64, String)>>>>;
@@ -290,7 +290,7 @@ fn recording_abort_cleanup() -> (
 
 /// A [`ReclaimOrphanFn`] that never reclaims. Preserves the
 /// pre-#3982 backstop behavior for every test that does not exercise the
-/// orphan-reclaim path — the worker escalates/aborts exactly as before.
+/// orphan-reclaim path — the runner escalates/aborts exactly as before.
 fn never_reclaim_orphan() -> ReclaimOrphanFn {
     Box::new(|_shared, _record| Box::pin(async move { ReclaimStaleForeignOutcome::None }))
 }
@@ -533,7 +533,7 @@ fn restart_request_window_sidecar_keeps_old_process_epoch() {
 
 #[test]
 fn restart_orphan_archive_moves_sidecar_under_archive_root() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -601,14 +601,14 @@ fn stale_foreign_demote_excludes_session_bound_relay_for_orphan_reclaim() {
 /// #3154 interleave integration test (design point: tokio interleave with
 /// `tokio::time::pause()`):
 ///   - channel A's wakeup DEFERS while a seeded turn1 inflight is undrained;
-///   - channel B relays FIRST (no cross-channel starvation: B's worker is on
+///   - channel B relays FIRST (no cross-channel starvation: B's runner is on
 ///     a different channel lock and finishes immediately);
 ///   - A claims ONLY after turn1's inflight clears, and the EOF offset the
 ///     claim reads at THAT moment is recorded (asserting the claim is seeded
 ///     post-drain, never from the stale prior cursor).
-// SAFETY (await_holding_lock): `worker_test_lock()` serializes tests that
+// SAFETY (await_holding_lock): `runner_test_lock()` serializes tests that
 // mutate the process-wide PRESENT index / durable store root; the guard is
-// held across `tokio::time::advance` awaits that drive `run_worker`.
+// held across `tokio::time::advance` awaits that drive `run_runner`.
 // Releasing before the awaits would let concurrent tests stomp the statics.
 // Test-only.
 #[allow(clippy::await_holding_lock)]
@@ -616,7 +616,7 @@ fn stale_foreign_demote_excludes_session_bound_relay_for_orphan_reclaim() {
 async fn channel_a_defers_until_prior_clears_while_channel_b_does_not_starve() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -672,7 +672,7 @@ async fn channel_a_defers_until_prior_clears_while_channel_b_does_not_starve() {
         "A's pending start gates the watcher/idle-queue immediately"
     );
     let (a_cleanup, a_cleanup_calls, _) = recording_abort_cleanup();
-    let a_handle = tokio::spawn(run_worker(
+    let a_handle = tokio::spawn(run_runner(
         shared.clone(),
         rec_a,
         a_view,
@@ -705,7 +705,7 @@ async fn channel_a_defers_until_prior_clears_while_channel_b_does_not_starve() {
     let rec_b = record("claude", 2, 22);
     persist(&rec_b).unwrap();
     let (b_cleanup, b_cleanup_calls, _) = recording_abort_cleanup();
-    let b_handle = tokio::spawn(run_worker(
+    let b_handle = tokio::spawn(run_runner(
         shared.clone(),
         rec_b,
         b_view,
@@ -757,7 +757,7 @@ async fn channel_a_defers_until_prior_clears_while_channel_b_does_not_starve() {
 
 // ====================================================================
 // #3154 P2-2 — codex P1/P2 regression coverage for the deferred-claim
-// safety properties. Each test drives the REAL `run_worker` (or the REAL
+// safety properties. Each test drives the REAL `run_runner` (or the REAL
 // durable `load_all` restore path) and is RED→GREEN: a comment on each
 // assertion names the neutralization that makes it fail.
 // ====================================================================
@@ -803,7 +803,7 @@ fn backstop_claim_safe_only_when_foreign_inflight_gone() {
 
 #[test]
 fn stale_foreign_inflight_dead_frontier_is_demoted_via_finalizer_cancel() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -875,7 +875,7 @@ fn stale_foreign_inflight_dead_frontier_is_demoted_via_finalizer_cancel() {
 fn committed_leaked_foreign_row_clears_then_pending_start_claims() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1021,7 +1021,7 @@ fn committed_leaked_foreign_row_clears_then_pending_start_claims() {
         });
 
         let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared.clone(),
             rec,
             view,
@@ -1066,7 +1066,7 @@ fn committed_leaked_foreign_row_clears_then_pending_start_claims() {
 
 #[test]
 fn stale_foreign_demote_uses_no_progress_not_absolute_zero_frontier() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1125,7 +1125,7 @@ fn stale_foreign_demote_uses_no_progress_not_absolute_zero_frontier() {
 
 #[test]
 fn stale_foreign_gate_pass_then_generation_mismatch_preserves_turn() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1192,7 +1192,7 @@ fn stale_foreign_gate_pass_then_generation_mismatch_preserves_turn() {
 
 #[test]
 fn stale_foreign_demote_cancels_and_removes_current_watcher() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1256,7 +1256,7 @@ fn stale_foreign_demote_cancels_and_removes_current_watcher() {
 #[cfg(unix)]
 #[test]
 fn enforce_mode_stale_foreign_demote_refuses_across_a_respawn() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1500,7 +1500,7 @@ async fn stale_foreign_demote_under_delivery_lease(
 /// deadline comparison fails arm B.
 #[test]
 fn stale_foreign_demote_refuses_only_a_live_identity_matched_delivery_lease() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1678,7 +1678,7 @@ async fn stale_foreign_demote_with_replaced_binding(
 #[cfg(unix)]
 #[test]
 fn enforce_mode_stale_foreign_demote_refuses_a_replaced_owner_and_output() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1717,7 +1717,7 @@ fn enforce_mode_stale_foreign_demote_refuses_a_replaced_owner_and_output() {
 #[cfg(unix)]
 #[test]
 fn legacy_mode_stale_foreign_demote_keeps_its_pre_a1_session_and_pointer_check() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1748,7 +1748,7 @@ fn legacy_mode_stale_foreign_demote_keeps_its_pre_a1_session_and_pointer_check()
 
 #[test]
 fn stale_foreign_demote_without_watcher_still_commits_cancel() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1800,7 +1800,7 @@ fn stale_foreign_demote_without_watcher_still_commits_cancel() {
 
 #[test]
 fn stale_foreign_death_gate_clears_rebind_origin_lifecycle_row() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1856,7 +1856,7 @@ fn stale_foreign_death_gate_clears_rebind_origin_lifecycle_row() {
 
 #[test]
 fn stale_foreign_same_identity_revival_blocks_destructive_cancel() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1924,7 +1924,7 @@ fn stale_foreign_same_identity_revival_blocks_destructive_cancel() {
 
 #[test]
 fn stale_foreign_demote_racing_fresh_claim_does_not_clear_fresh_row() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _env_lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -1995,7 +1995,7 @@ fn stale_foreign_demote_racing_fresh_claim_does_not_clear_fresh_row() {
 }
 
 /// P2-2 (a): backstop expires while a FOREIGN prior inflight stays live
-/// across the WHOLE escalation budget. The worker must NEVER claim (no
+/// across the WHOLE escalation budget. The runner must NEVER claim (no
 /// overwrite) and, after the budget, ABORT safely WITHOUT resubmitting —
 /// proven by the claim closure never running.
 // Sync test + explicit block_on: the std-mutex test-env guards live only in
@@ -2005,7 +2005,7 @@ fn stale_foreign_demote_racing_fresh_claim_does_not_clear_fresh_row() {
 fn backstop_foreign_inflight_live_aborts_without_claim() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2023,7 +2023,7 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
         let shared = super::super::make_shared_data_for_tests();
 
         // A foreign prior inflight is live FOREVER (never drains, never ours).
-        // Every poll observes its identity — the worker must thread the
+        // Every poll observes its identity — the runner must thread the
         // LAST-VIEW identity into the abort cleanup (codex r2).
         let view: ViewFn = Box::new(move |_shared, _record| {
             Box::pin(async move {
@@ -2056,7 +2056,7 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
 
         let (abort_cleanup, abort_cleanup_calls, abort_cleanup_identity) =
             recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared.clone(),
             rec,
             view,
@@ -2081,7 +2081,7 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
         );
         assert!(
             !pending_synthetic_start_present("claude", 10),
-            "after the escalation budget the worker ABORTS and drops only the \
+            "after the escalation budget the runner ABORTS and drops only the \
          ownership record (no prompt resubmit). RED if abort leaks the record \
          or never fires."
         );
@@ -2100,7 +2100,7 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone(),
             Some(Some((777, "2026-06-10 12:00:00".to_string()))),
-            "codex r2: the worker must thread the LAST-VIEW foreign inflight \
+            "codex r2: the runner must thread the LAST-VIEW foreign inflight \
          identity into the cleanup, so a row that vanishes before the \
          cleanup's own read still yields an identity-pinned marker — RED \
          if the hook receives None (the marker would be sweep-only and \
@@ -2114,13 +2114,13 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
 /// path. A producer-dead `SessionBoundRelay` orphan (born with a stale
 /// `get_producer` `Some`, never commits) is perpetually misread as a live
 /// FOREIGN inflight, so pre-#3982 EVERY later TUI-direct turn escalated to the
-/// terminal abort and never relayed. The worker must, on the backstop, attempt
+/// terminal abort and never relayed. The runner must, on the backstop, attempt
 /// the orphan downgrade; once it reclaims (owner → `None`), the next view drops
 /// the now-ownerless row and the deferred claim PROCEEDS. Proven by: the
 /// reclaim runs, the claim runs exactly once, and the abort cleanup NEVER runs.
-// SAFETY (await_holding_lock): `worker_test_lock()` serializes tests that
+// SAFETY (await_holding_lock): `runner_test_lock()` serializes tests that
 // mutate the process-wide PRESENT index / durable store root; the guard is
-// held across `tokio::time::advance` awaits that drive `run_worker`.
+// held across `tokio::time::advance` awaits that drive `run_runner`.
 // Releasing before the awaits would let concurrent tests stomp the statics.
 // Test-only.
 #[allow(clippy::await_holding_lock)]
@@ -2128,7 +2128,7 @@ fn backstop_foreign_inflight_live_aborts_without_claim() {
 async fn backstop_orphan_reclaim_downgrades_then_claims() {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2202,7 +2202,7 @@ async fn backstop_orphan_reclaim_downgrades_then_claims() {
     assert!(pending_synthetic_start_present("claude", 15));
 
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let handle = tokio::spawn(run_worker(
+    let handle = tokio::spawn(run_runner(
         shared.clone(),
         rec,
         view,
@@ -2213,7 +2213,7 @@ async fn backstop_orphan_reclaim_downgrades_then_claims() {
 
     // One backstop window to hit `BackstopForeignInflightLive` + reclaim, then
     // a poll for the re-evaluated (now-finalized) view to claim. Advancing a
-    // few windows is harmless once the worker has claimed and returned.
+    // few windows is harmless once the runner has claimed and returned.
     for _ in 0..3 {
         tokio::time::advance(PENDING_START_BACKSTOP + PENDING_START_POLL * 2).await;
         tokio::task::yield_now().await;
@@ -2222,7 +2222,7 @@ async fn backstop_orphan_reclaim_downgrades_then_claims() {
 
     assert!(
         reclaim_calls.load(Ordering::SeqCst) >= 1,
-        "the worker MUST attempt the orphan reclaim on the backstop before \
+        "the runner MUST attempt the orphan reclaim on the backstop before \
          aborting — RED if the BackstopForeignInflightLive branch never calls \
          reclaim_orphan_fn (#3982)"
     );
@@ -2230,14 +2230,14 @@ async fn backstop_orphan_reclaim_downgrades_then_claims() {
         claim_calls.load(Ordering::SeqCst),
         1,
         "after the orphan is downgraded the deferred claim PROCEEDS (the row is \
-         no longer a live foreign inflight) — RED if the worker aborts instead \
+         no longer a live foreign inflight) — RED if the runner aborts instead \
          of re-evaluating + claiming (#3982)"
     );
     assert_eq!(
         abort_cleanup_calls.load(Ordering::SeqCst),
         0,
         "#3982: a reclaimed orphan must NEVER reach the terminal backstop abort \
-         — the successful claim owns the ⏳ → ✅ completion. RED if the worker \
+         — the successful claim owns the ⏳ → ✅ completion. RED if the runner \
          escalates to the abort despite a successful downgrade."
     );
     assert!(
@@ -2259,7 +2259,7 @@ async fn backstop_orphan_reclaim_downgrades_then_claims() {
 async fn backstop_failed_reclaim_falls_back_to_bounded_abort() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2311,7 +2311,7 @@ async fn backstop_failed_reclaim_falls_back_to_bounded_abort() {
     assert!(pending_synthetic_start_present("claude", 16));
 
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let handle = tokio::spawn(run_worker(
+    let handle = tokio::spawn(run_runner(
         shared.clone(),
         rec,
         view,
@@ -2350,10 +2350,10 @@ async fn backstop_failed_reclaim_falls_back_to_bounded_abort() {
 }
 
 /// #3540 (B′ — NO-EVICT queue promote): after the terminal backstop ABORT
-/// the worker must kick the EXISTING mailbox dispatch ONCE so a follow-up
+/// the runner must kick the EXISTING mailbox dispatch ONCE so a follow-up
 /// parked behind a QUEUE-ACK promotes promptly — WITHOUT touching any
 /// inflight. Proven by: (1) the claim (the ONLY inflight-write seam in the
-/// worker) NEVER runs, so no row is created/cleared/reset/deleted; (2) the
+/// runner) NEVER runs, so no row is created/cleared/reset/deleted; (2) the
 /// promote seam fires EXACTLY ONCE; (3) it fires AFTER abort_cleanup +
 /// record-delete (the pending gate is released first). This is the
 /// defense-in-depth that breaks the phantom-inflight → infinite QUEUE-ACK
@@ -2366,7 +2366,7 @@ async fn backstop_failed_reclaim_falls_back_to_bounded_abort() {
 fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Isolate the durable store root to a per-test temp dir (under the crate
     // env lock) so this test's persist/delete never races other tests'
     // store reads on the shared default root.
@@ -2409,7 +2409,7 @@ fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
             })
         });
 
-        // The claim is the ONLY inflight-write seam in the worker; if the B′
+        // The claim is the ONLY inflight-write seam in the runner; if the B′
         // promote ever reached for an evict/clear it would have to go through a
         // claim-like write. We assert it stays at zero — structural no-evict.
         let claim_calls = Arc::new(AtomicU32::new(0));
@@ -2427,7 +2427,7 @@ fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
         assert!(pending_synthetic_start_present("claude", 14));
 
         let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared.clone(),
             rec,
             view,
@@ -2445,7 +2445,7 @@ fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
         assert_eq!(
             claim_calls.load(Ordering::SeqCst),
             0,
-            "#3540 B′: the claim (the worker's only inflight-write seam) must \
+            "#3540 B′: the claim (the runner's only inflight-write seam) must \
          NEVER run on the ABORT path — the foreign/phantom row is left \
          untouched (NO evict). RED if the promote path tries to overwrite/clear \
          an inflight to make room for the follow-up."
@@ -2476,12 +2476,12 @@ fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
 }
 
 /// P2-2 (b): the claim returns `false` (transient — another turn briefly
-/// owns the mailbox). The worker MUST retain the durable record (never lose a
+/// owns the mailbox). The runner MUST retain the durable record (never lose a
 /// Discord-submitted prompt) and retry; once the claim later succeeds it
 /// deletes. Proves the record is RETAINED across the false returns.
-// SAFETY (await_holding_lock): `worker_test_lock()` serializes tests that
+// SAFETY (await_holding_lock): `runner_test_lock()` serializes tests that
 // mutate the process-wide PRESENT index / durable store root; the guard is
-// held across `tokio::time::advance` awaits that drive `run_worker`.
+// held across `tokio::time::advance` awaits that drive `run_runner`.
 // Releasing before the awaits would let concurrent tests stomp the statics.
 // Test-only.
 #[allow(clippy::await_holding_lock)]
@@ -2489,7 +2489,7 @@ fn backstop_abort_promotes_queued_follow_up_without_evicting_inflight() {
 async fn claim_false_retains_record_and_retries() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Isolate the durable store root to a per-test temp dir under the crate
     // env lock — mirrors the sibling `claim_false_exhausted_still_retains_record`.
     // Without it this test reads the ambient `AGENTDESK_ROOT_DIR`, so a
@@ -2524,7 +2524,7 @@ async fn claim_false_retains_record_and_retries() {
     let rec = record("claude", 11, 111);
     persist(&rec).unwrap();
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let handle = tokio::spawn(run_worker(
+    let handle = tokio::spawn(run_runner(
         shared.clone(),
         rec,
         view,
@@ -2541,7 +2541,7 @@ async fn claim_false_retains_record_and_retries() {
     assert!(
         pending_synthetic_start_present("claude", 11),
         "a transient claim==false MUST NOT delete the durable record (the \
-         turn-loss bug). RED if the worker deletes on claim==false."
+         turn-loss bug). RED if the runner deletes on claim==false."
     );
 
     // Let the remaining retries elapse and the third claim succeed.
@@ -2553,7 +2553,7 @@ async fn claim_false_retains_record_and_retries() {
 
     assert!(
         attempts.load(Ordering::SeqCst) >= 3,
-        "the worker retried the claim after the false returns (did not bail)"
+        "the runner retried the claim after the false returns (did not bail)"
     );
     assert!(
         !pending_synthetic_start_present("claude", 11),
@@ -2569,11 +2569,11 @@ async fn claim_false_retains_record_and_retries() {
 }
 
 /// P2-2 (b'): the claim returns `false` ACROSS THE WHOLE retry budget. The
-/// worker exhausts attempts but STILL must NOT delete the record (it is left
+/// runner exhausts attempts but STILL must NOT delete the record (it is left
 /// for a restart re-attempt — never silently lose the prompt).
-// SAFETY (await_holding_lock): `worker_test_lock()` serializes tests that
+// SAFETY (await_holding_lock): `runner_test_lock()` serializes tests that
 // mutate the process-wide PRESENT index / durable store root; the guard is
-// held across `tokio::time::advance` awaits that drive `run_worker`.
+// held across `tokio::time::advance` awaits that drive `run_runner`.
 // Releasing before the awaits would let concurrent tests stomp the statics.
 // Test-only.
 #[allow(clippy::await_holding_lock)]
@@ -2581,7 +2581,7 @@ async fn claim_false_retains_record_and_retries() {
 async fn claim_false_exhausted_still_retains_record() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2607,7 +2607,7 @@ async fn claim_false_exhausted_still_retains_record() {
     let rec = record("claude", 12, 122);
     persist(&rec).unwrap();
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let handle = tokio::spawn(run_worker(
+    let handle = tokio::spawn(run_runner(
         shared.clone(),
         rec,
         view,
@@ -2625,30 +2625,30 @@ async fn claim_false_exhausted_still_retains_record() {
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         PENDING_START_MAX_CLAIM_ATTEMPTS,
-        "the worker bounds the retries at PENDING_START_MAX_CLAIM_ATTEMPTS (no spin)"
+        "the runner bounds the retries at PENDING_START_MAX_CLAIM_ATTEMPTS (no spin)"
     );
     assert!(
         pending_synthetic_start_present("claude", 12),
         "on retry exhaustion the record is RETAINED for restart re-attempt — \
-         RED if the worker deletes after exhausting claims (turn-loss)."
+         RED if the runner deletes after exhausting claims (turn-loss)."
     );
     assert!(
         pending_synthetic_start_abandoned("claude", 12),
-        "after the worker exits with retry exhaustion, the durable capped \
-         attempt_count plus no active worker identifies the record as abandoned"
+        "after the runner exits with retry exhaustion, the durable capped \
+         attempt_count plus no active runner identifies the record as abandoned"
     );
     let retained = records_for_channel("claude", 12);
     assert_eq!(retained.len(), 1);
     assert_eq!(
         retained[0].attempt_count, PENDING_START_MAX_CLAIM_ATTEMPTS,
         "retry exhaustion must be persisted so queue_io can distinguish \
-         abandoned claims from live workers"
+         abandoned claims from live runners"
     );
     assert_eq!(
         abort_cleanup_calls.load(Ordering::SeqCst),
         0,
         "#3282: claim-retry exhaustion RETAINS the record for a restart \
-         re-attempt — the anchor's ⏳ must stay (the restored worker may still \
+         re-attempt — the anchor's ⏳ must stay (the restored runner may still \
          claim and complete it normally), so the abort cleanup must NOT fire"
     );
     reset_present_for_tests();
@@ -2724,7 +2724,7 @@ async fn drive_claim_retries_to_exhaustion() {
     }
 }
 
-/// S6T1 (#5833 E11): after the claim retry budget is exhausted the worker
+/// S6T1 (#5833 E11): after the claim retry budget is exhausted the runner
 /// abandons the synthetic ownership claim, so the `(provider, tmux)` prompt
 /// anchor slot must no longer hold the abandoned record's `anchor_message_id`
 /// — `prompt_anchor_for_response` resolves `None`. RED pre-#5833: the slot kept
@@ -2736,7 +2736,7 @@ async fn drive_claim_retries_to_exhaustion() {
 // needed (#3034 ratchet stays frozen at its baseline).
 #[test]
 fn claim_retry_exhaustion_releases_the_abandoned_prompt_anchor_slot() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _rig = AnchorSlotRig::new();
 
     let rec = record("claude", 31, 310);
@@ -2757,12 +2757,12 @@ fn claim_retry_exhaustion_releases_the_abandoned_prompt_anchor_slot() {
     persist(&rec).unwrap();
 
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let for_worker = rec.clone();
+    let for_runner = rec.clone();
     paused_rt().block_on(async move {
         let shared = super::super::make_shared_data_for_tests();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared,
-            for_worker,
+            for_runner,
             finalized_view(),
             claim_always_false(),
             abort_cleanup,
@@ -2801,7 +2801,7 @@ fn claim_retry_exhaustion_releases_the_abandoned_prompt_anchor_slot() {
 // Sync test + explicit block_on: see the note on the sibling test above.
 #[test]
 fn claim_retry_exhaustion_leaves_a_newer_turns_prompt_anchor_in_place() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _rig = AnchorSlotRig::new();
 
     let rec = record("claude", 32, 320);
@@ -2825,12 +2825,12 @@ fn claim_retry_exhaustion_leaves_a_newer_turns_prompt_anchor_in_place() {
     persist(&rec).unwrap();
 
     let (abort_cleanup, _, _) = recording_abort_cleanup();
-    let for_worker = rec.clone();
+    let for_runner = rec.clone();
     paused_rt().block_on(async move {
         let shared = super::super::make_shared_data_for_tests();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared,
-            for_worker,
+            for_runner,
             finalized_view(),
             claim_always_false(),
             abort_cleanup,
@@ -2848,7 +2848,7 @@ fn claim_retry_exhaustion_leaves_a_newer_turns_prompt_anchor_in_place() {
     );
 }
 
-/// S6T3 (scope): a TRANSIENT claim failure is not an abandon. The worker keeps
+/// S6T3 (scope): a TRANSIENT claim failure is not an abandon. The runner keeps
 /// retrying, so the slot must still hold this turn's anchor across the retry
 /// backoff, and it must still hold it after the claim finally SUCCEEDS (the
 /// normal `⏳ → ✅` completion owns the anchor there, per #3282). RED if the
@@ -2860,7 +2860,7 @@ fn claim_retry_exhaustion_leaves_a_newer_turns_prompt_anchor_in_place() {
 fn transient_claim_retry_and_success_keep_the_prompt_anchor_slot() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _rig = AnchorSlotRig::new();
 
     let rec = record("claude", 33, 330);
@@ -2885,12 +2885,12 @@ fn transient_claim_retry_and_success_keep_the_prompt_anchor_slot() {
     });
 
     let (abort_cleanup, _, _) = recording_abort_cleanup();
-    let for_worker = rec.clone();
+    let for_runner = rec.clone();
     let mid_flight_slot = paused_rt().block_on(async move {
         let shared = super::super::make_shared_data_for_tests();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared,
-            for_worker,
+            for_runner,
             finalized_view(),
             claim,
             abort_cleanup,
@@ -2918,7 +2918,7 @@ fn transient_claim_retry_and_success_keep_the_prompt_anchor_slot() {
     );
     assert!(
         attempts.load(Ordering::SeqCst) >= 3,
-        "precondition: the worker retried and the third claim succeeded"
+        "precondition: the runner retried and the third claim succeeded"
     );
     assert_eq!(
         anchor_slot(&rec),
@@ -2943,7 +2943,7 @@ fn transient_claim_retry_and_success_keep_the_prompt_anchor_slot() {
 fn backstop_abort_releases_the_abandoned_prompt_anchor_slot() {
     use std::sync::atomic::Ordering;
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _rig = AnchorSlotRig::new();
 
     let rec = record("claude", 34, 340);
@@ -2972,12 +2972,12 @@ fn backstop_abort_releases_the_abandoned_prompt_anchor_slot() {
     });
 
     let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
-    let for_worker = rec.clone();
+    let for_runner = rec.clone();
     paused_rt().block_on(async move {
         let shared = super::super::make_shared_data_for_tests();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared,
-            for_worker,
+            for_runner,
             view,
             claim_succeeds(),
             abort_cleanup,
@@ -3012,10 +3012,10 @@ fn backstop_abort_releases_the_abandoned_prompt_anchor_slot() {
 // this sync scope and never span an await, so no await_holding_lock allow is
 // needed (#3034 ratchet stays frozen at its baseline).
 #[test]
-fn live_worker_with_capped_attempt_count_is_not_abandoned() {
+fn live_runner_with_capped_attempt_count_is_not_abandoned() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -3057,7 +3057,7 @@ fn live_worker_with_capped_attempt_count_is_not_abandoned() {
         rec.attempt_count = PENDING_START_MAX_CLAIM_ATTEMPTS;
         persist(&rec).unwrap();
         let (abort_cleanup, _, _) = recording_abort_cleanup();
-        let handle = tokio::spawn(run_worker(
+        let handle = tokio::spawn(run_runner(
             shared.clone(),
             rec,
             view,
@@ -3069,12 +3069,12 @@ fn live_worker_with_capped_attempt_count_is_not_abandoned() {
         tokio::task::yield_now().await;
         assert!(
             !pending_synthetic_start_abandoned("claude", 13),
-            "a live worker must protect a capped durable record from being \
+            "a live runner must protect a capped durable record from being \
              treated as abandoned during restart re-claim"
         );
         assert!(
             !clear_abandoned_synthetic_start_presence("claude", 13),
-            "presence clear must refuse while a worker is active"
+            "presence clear must refuse while a runner is active"
         );
 
         finalized.store(true, Ordering::SeqCst);
@@ -3083,7 +3083,7 @@ fn live_worker_with_capped_attempt_count_is_not_abandoned() {
         handle.await.unwrap();
         assert!(
             !pending_synthetic_start_present("claude", 13),
-            "the live worker's successful claim clears the presence through the normal delete path"
+            "the live runner's successful claim clears the presence through the normal delete path"
         );
     });
 
@@ -3092,11 +3092,11 @@ fn live_worker_with_capped_attempt_count_is_not_abandoned() {
 
 /// P2-2 (d): durable restore roundtrip. Several same-channel records are
 /// persisted out of order on disk; `load_all` must return them in FIFO order
-/// (observed_at, created_at, anchor tiebreak) so the respawned workers drain
+/// (observed_at, created_at, anchor tiebreak) so the respawned runners drain
 /// in submission order. Drives the REAL durable store under a temp root.
 #[test]
 fn durable_restore_roundtrip_loads_fifo_order() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -3143,7 +3143,7 @@ fn durable_restore_roundtrip_loads_fifo_order() {
         same_channel,
         vec![100, 200, 300],
         "load_all must return same-channel records in FIFO (observed_at) order \
-         so respawned workers drain in submission order — RED if the sort is \
+         so respawned runners drain in submission order — RED if the sort is \
          removed (filesystem order would scramble them)."
     );
 
@@ -3160,9 +3160,9 @@ fn durable_restore_roundtrip_loads_fifo_order() {
 
 // ====================================================================
 // #3303 — DeferredClaim marker hook on the SUCCESSFUL claim path.
-// Each test drives the REAL `run_worker` on a current-thread runtime via
+// Each test drives the REAL `run_runner` on a current-thread runtime via
 // `block_on` on THIS thread (so the marker store's thread-local test root
-// resolves inside the worker, and no lock guard is held across an await
+// resolves inside the runner, and no lock guard is held across an await
 // point — the await_holding_lock ratchet stays frozen), against a REAL
 // on-disk inflight row under a temp AGENTDESK_ROOT_DIR and a REAL
 // in-memory relay lease.
@@ -3170,7 +3170,7 @@ fn durable_restore_roundtrip_loads_fifo_order() {
 
 /// RAII rig: AGENTDESK_ROOT_DIR → tempdir (real inflight store) + the
 /// marker store's thread-local root override. Construct ONLY while
-/// holding `worker_test_lock()` AND the crate env lock (in that order —
+/// holding `runner_test_lock()` AND the crate env lock (in that order —
 /// the `durable_restore_roundtrip_loads_fifo_order` convention).
 struct DeferredClaimMarkerRig {
     _temp: tempfile::TempDir,
@@ -3264,7 +3264,7 @@ fn current_thread_rt() -> tokio::runtime::Runtime {
 fn successful_watcher_owned_claim_records_own_identity_marker() {
     use std::sync::atomic::Ordering;
 
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // The watcher-owned marker decision reads the PROCESS-GLOBAL dedupe lease
     // (`record_lease` → `external_input_relay_lease`); hold `TEST_LOCK` so a
     // concurrent dedupe-state test cannot wipe the lease mid-claim and turn
@@ -3290,7 +3290,7 @@ fn successful_watcher_owned_claim_records_own_identity_marker() {
     persist(&rec).unwrap();
 
     let (cleanup, cleanup_calls, _) = recording_abort_cleanup();
-    current_thread_rt().block_on(run_worker(
+    current_thread_rt().block_on(run_runner(
         shared,
         rec,
         finalized_view(),
@@ -3343,7 +3343,7 @@ fn successful_watcher_owned_claim_records_own_identity_marker() {
 /// RED if the hook records unconditionally.
 #[test]
 fn bridge_owned_claim_records_no_marker() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Holds the dedupe `TEST_LOCK` because this test seeds + reads the
     // process-global relay lease (#3540 cross-lock race guard).
     let _env_lock = crate::config::shared_test_env_lock()
@@ -3368,7 +3368,7 @@ fn bridge_owned_claim_records_no_marker() {
     persist(&rec).unwrap();
 
     let (cleanup, _calls, _) = recording_abort_cleanup();
-    current_thread_rt().block_on(run_worker(
+    current_thread_rt().block_on(run_runner(
         shared,
         rec,
         finalized_view(),
@@ -3391,7 +3391,7 @@ fn bridge_owned_claim_records_no_marker() {
 /// turn is adopted and live — one stem can never hold two markers).
 #[test]
 fn reclaim_overwrites_stale_abort_marker_with_own_identity() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Holds the dedupe `TEST_LOCK` because this test seeds + reads the
     // process-global relay lease (#3540 cross-lock race guard).
     let _env_lock = crate::config::shared_test_env_lock()
@@ -3423,7 +3423,7 @@ fn reclaim_overwrites_stale_abort_marker_with_own_identity() {
     persist(&rec).unwrap();
 
     let (cleanup, _calls, _) = recording_abort_cleanup();
-    current_thread_rt().block_on(run_worker(
+    current_thread_rt().block_on(run_runner(
         shared,
         rec,
         finalized_view(),
@@ -3454,7 +3454,7 @@ fn reclaim_overwrites_stale_abort_marker_with_own_identity() {
 /// it with a TTL ⚠).
 #[test]
 fn generalized_helper_skips_non_watcher_lease() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Holds the dedupe `TEST_LOCK` because this test seeds + reads the
     // process-global relay lease (#3540 cross-lock race guard).
     let _env_lock = crate::config::shared_test_env_lock()
@@ -3483,12 +3483,12 @@ fn generalized_helper_skips_non_watcher_lease() {
 }
 
 /// #3350: the generalized helper with a watcher lease + matching own row
-/// records the SAME own-identity DeferredClaim marker the deferred worker
+/// records the SAME own-identity DeferredClaim marker the deferred runner
 /// records — the inline claim path inherits #3303's guards verbatim (the
-/// existing worker tests stay green through the thin delegation wrapper).
+/// existing runner tests stay green through the thin delegation wrapper).
 #[test]
 fn generalized_helper_records_marker_for_watcher_lease_and_own_row() {
-    let _guard = worker_test_lock();
+    let _guard = runner_test_lock();
     // Holds the dedupe `TEST_LOCK` because this test seeds + reads the
     // process-global relay lease (#3540 cross-lock race guard).
     let _env_lock = crate::config::shared_test_env_lock()
@@ -3561,7 +3561,7 @@ fn inline_claim_marker_wiring_records_only_when_claimed() {
 
 #[test]
 fn anchor_slot_rig_teardown_preserves_present_root() {
-    let _worker = worker_test_lock();
+    let _runner = runner_test_lock();
     crate::config::test_env::teardown_probe::assert_isolated(
         concat!(
             module_path!(),
@@ -3574,7 +3574,7 @@ fn anchor_slot_rig_teardown_preserves_present_root() {
 
 #[test]
 fn anchor_slot_rig_teardown_preserves_absent_root() {
-    let _worker = worker_test_lock();
+    let _runner = runner_test_lock();
     crate::config::test_env::teardown_probe::assert_isolated(
         concat!(
             module_path!(),

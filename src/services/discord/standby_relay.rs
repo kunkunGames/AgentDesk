@@ -1,7 +1,7 @@
 //! Phase 5.3 of intake-node-routing (issue #2011): standalone JSONL → Discord
 //! relay task for cluster-standby nodes.
 //!
-//! On the leader, the tmux watcher (`tmux_watcher.rs`) handles streaming
+//! On the hub, the tmux watcher (`tmux_watcher.rs`) handles streaming
 //! agent output to Discord. The watcher's relay path has many gateway-coupled
 //! assumptions (cached cache, inflight reconciliation, monitor-auto-turn
 //! claims, recent_stop suppression, paused/pause_epoch coordination, etc.)
@@ -17,10 +17,10 @@
 //! extracts the assistant response, and posts it to Discord via REST
 //! (replacing the bridge-allocated placeholder when one is known, otherwise
 //! sending a new channel message). No reliance on cached_serenity_ctx,
-//! inflight reconciliation, or any of the watcher's leader-only state
+//! inflight reconciliation, or any of the watcher's hub-only state
 //! machinery.
 //!
-//! Leader path is unchanged.
+//! Hub path is unchanged.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

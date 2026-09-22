@@ -31,7 +31,7 @@ use self::gateway_lease::{
 };
 use self::gateway_lease_recovery::spawn_standby_gateway_retry;
 use self::gateway_runtime::run_bot_start_gateway_runtime;
-use self::intake::run_bot_maybe_spawn_intake_worker;
+use self::intake::run_bot_maybe_spawn_intake_runner;
 #[allow(unused_imports)]
 pub(in crate::services::discord) use self::queued_placeholders::{
     FilteredQueuedPlaceholders, StalePlaceholderDeleter, collect_live_queue_message_ids,
@@ -45,7 +45,7 @@ use self::shared_data::{
 use self::shutdown::{run_bot_run_gateway_backend, run_bot_spawn_sigterm_handler};
 #[cfg(test)]
 use self::voice::voice_auto_join_provider_map;
-use self::voice::{run_bot_init_voice_workers, run_bot_rehydrate_voice_handoffs};
+use self::voice::{run_bot_init_voice_runners, run_bot_rehydrate_voice_handoffs};
 #[allow(unused_imports)]
 use self::{orphan_recovery::*, restored_state::*, session_gc::*, startup_doctor::*};
 
@@ -158,8 +158,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 
     // Phase 5.1 of intake-node-routing (issue #2007): build SharedData before
     // resolving the gateway lease. Confirmed gateway and standby roles start
-    // the intake worker after the lease result is known; a failed acquisition
-    // must not leave a detached, health-blind worker behind.
+    // the intake runner after the lease result is known; a failed acquisition
+    // must not leave a detached, health-blind runner behind.
     super::internal_api::init(api_port, pg_pool.clone());
 
     // Initialize debug logging from environment variable
@@ -274,23 +274,23 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // `shared.serenity_http_or_token_fallback()` even when
     // `cached_serenity_ctx` stays empty (no gateway runtime).
     //
-    // On the leader the OnceCell is also set later inside the poise
+    // On the hub the OnceCell is also set later inside the poise
     // setup callback — that second `set` is a no-op (`OnceCell::set`
-    // returns Err on already-set), preserving the leader's existing
+    // returns Err on already-set), preserving the hub's existing
     // semantics.
     let _ = shared.http.cached_bot_token.set(token.to_string());
 
     if !modules.gateway {
         health_registry
-            .register_worker(provider.as_str().to_string(), shared.clone())
+            .register_runner(provider.as_str().to_string(), shared.clone())
             .await;
         spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
         #[cfg(unix)]
         spawns::run_bot_spawn_reachability_observation(&shared, &provider);
-        // REST workers persist the same mailbox state as Gateway runtimes.
+        // REST runners persist the same mailbox state as Gateway runtimes.
         // Restore it before polling new intake; never replay Discord history.
-        queued_recovery::restore_worker_queues(&shared, &provider).await;
-        run_bot_maybe_spawn_intake_worker(&shared, &provider);
+        queued_recovery::restore_runner_queues(&shared, &provider).await;
+        run_bot_maybe_spawn_intake_runner(&shared, &provider);
         run_startup_diagnostic_after_reconcile_barrier_for_provider(
             &provider,
             startup_reconcile_remaining,
@@ -300,16 +300,16 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         )
         .await;
         // The existing restart poller owns this provider's shutdown slot.
-        // Dedicated workers never acquire, retry or promote a gateway lease.
+        // Dedicated runners never acquire, retry or promote a gateway lease.
         return;
     }
 
     let voice_receiver =
-        run_bot_init_voice_workers(&voice_config, &voice_barge_in, &shared, &provider);
+        run_bot_init_voice_runners(&voice_config, &voice_barge_in, &shared, &provider);
 
-    // Resolve the gateway role before spawning the intake worker. Both gateway
+    // Resolve the gateway role before spawning the intake runner. Both gateway
     // and confirmed-standby runtimes start it in observe/enforce mode, while an
-    // indeterminate lease failure leaves no health-blind detached worker.
+    // indeterminate lease failure leaves no health-blind detached runner.
     let gateway_outcome = run_bot_acquire_gateway_lease(
         &shared,
         &token_hash,
@@ -321,7 +321,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     )
     .await;
     if !gateway_outcome.starts_provider_runtime() {
-        // Lease ownership is unknown. No intake worker or restart poller has
+        // Lease ownership is unknown. No intake runner or restart poller has
         // been spawned, so this health-blind SharedData cannot outlive run_bot.
         shutdown_remaining.fetch_sub(1, Ordering::AcqRel);
         return;
@@ -336,7 +336,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     let gateway_lease = match gateway_outcome {
         GatewayLeaseOutcome::Proceed(lease) => lease,
         GatewayLeaseOutcome::Standby => {
-            // Standby can execute full turns through the intake worker. Always
+            // Standby can execute full turns through the intake runner. Always
             // register its SharedData so detailed health proves either the real
             // active state or an explicit idle provider entry. This also makes
             // a routing/config race fail closed instead of restoring the old
@@ -347,7 +347,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
             spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
             #[cfg(unix)]
             spawns::run_bot_spawn_reachability_observation(&shared, &provider);
-            run_bot_maybe_spawn_intake_worker(&shared, &provider);
+            run_bot_maybe_spawn_intake_runner(&shared, &provider);
             spawn_standby_gateway_retry(shared.clone(), token_hash.clone(), provider.clone()).await;
             // Keep this provider's shutdown-barrier slot: the marker poller
             // consumes it exactly once after fencing and persisting state.
@@ -358,7 +358,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         }
     };
 
-    // Register and fence the gateway runtime before it can admit intake-worker
+    // Register and fence the gateway runtime before it can admit intake-runner
     // work. The poise setup callback no longer owns marker-poller startup.
     health_registry
         .register(provider.as_str().to_string(), shared.clone())
@@ -366,7 +366,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
     #[cfg(unix)]
     spawns::run_bot_spawn_reachability_observation(&shared, &provider);
-    run_bot_maybe_spawn_intake_worker(&shared, &provider);
+    run_bot_maybe_spawn_intake_runner(&shared, &provider);
 
     run_bot_start_gateway_runtime(
         token,
@@ -403,7 +403,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 /// this path ever reached `mark_reconcile_complete`: the provider stayed
 /// `reconcile_in_progress` for the life of the process and kept blocking deploys
 /// to a standby-only node (#5449). A standby runtime still executes complete
-/// turns through the intake worker, which is the same shape as the utility-bot
+/// turns through the intake runner, which is the same shape as the utility-bot
 /// branch of `recovery_flush` — it marks the reconcile done precisely because it
 /// skipped recovery.
 ///

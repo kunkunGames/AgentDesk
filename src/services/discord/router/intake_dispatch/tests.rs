@@ -60,26 +60,26 @@ fn intake_dispatch_invariant_direct_execution_body_has_no_external_producer_call
 }
 
 #[test]
-fn intake_dispatch_invariant_worker_post_claim_is_the_only_router_bypass() {
-    // The worker boundary spans the intake body module plus its extracted
-    // worker entry seam (intake_turn/worker_entry.rs, split out in #4743).
-    let worker_body = include_str!("../message_handler/intake_turn.rs");
-    let worker_entry = include_str!("../message_handler/intake_turn/worker_entry.rs");
-    for source in [worker_body, worker_entry] {
+fn intake_dispatch_invariant_runner_post_claim_is_the_only_router_bypass() {
+    // The runner boundary spans the intake body module plus its extracted
+    // runner entry seam (intake_turn/runner_entry.rs, split out in #4743).
+    let runner_body = include_str!("../message_handler/intake_turn.rs");
+    let runner_entry = include_str!("../message_handler/intake_turn/runner_entry.rs");
+    for source in [runner_body, runner_entry] {
         assert!(!source.contains("dispatch_text_intake("));
         assert!(!source.contains("admit_text_intake("));
         assert!(!source.contains("try_route_intake("));
         assert!(!source.contains("IntakeSubmission {"));
     }
     assert_eq!(
-        worker_body.matches("handle_text_message(").count(),
+        runner_body.matches("handle_text_message(").count(),
         1,
-        "the worker body module must contain only the body definition"
+        "the runner body module must contain only the body definition"
     );
     assert_eq!(
-        worker_entry.matches("handle_text_message(").count(),
+        runner_entry.matches("handle_text_message(").count(),
         1,
-        "the extracted worker entry must contain only its direct post-claim call"
+        "the extracted runner entry must contain only its direct post-claim call"
     );
     assert_eq!(
         include_str!("../message_handler.rs")
@@ -204,22 +204,22 @@ async fn seed_foreign_owner(pool: &sqlx::PgPool, channel_id: ChannelId, owner_in
     .await
     .expect("seed agent");
     sqlx::query(
-        "INSERT INTO worker_nodes (instance_id, status, role, effective_role,
+        "INSERT INTO cluster_nodes (instance_id, status, role, effective_role,
          labels, capabilities, last_heartbeat_at, started_at, updated_at)
-         VALUES ($1, 'online', 'worker', 'worker', '[]'::jsonb,
-         -- A real foreign worker always advertises \"preserve_on_cancel_v1\" via
-         -- capabilities_with_runtime_state() (intake_worker_capabilities.rs). Without
+         VALUES ($1, 'online', 'runner', 'runner', '[]'::jsonb,
+         -- A real foreign runner always advertises \"preserve_on_cancel_v1\" via
+         -- capabilities_with_runtime_state() (intake_runner_capabilities.rs). Without
          -- it, node_supports_intake_request() treats the node as protocol-incompatible
          -- for preserve_on_cancel=true requests, and resolve_session_owner() classifies
          -- it as LiveForeignIncompatible instead of LiveForeign, blocking the forward
          -- entirely (#4550 multinode preserve tri-state).
-         '{\"intake_worker\":{\"enabled\":true,\"providers\":[\"claude\"],\"features\":[\"preserve_on_cancel_v1\"]}}'::jsonb,
+         '{\"intake_runner\":{\"enabled\":true,\"providers\":[\"claude\"],\"features\":[\"preserve_on_cancel_v1\"]}}'::jsonb,
          NOW(), NOW(), NOW())",
     )
     .bind(owner_instance_id)
     .execute(pool)
     .await
-    .expect("seed worker owner");
+    .expect("seed runner owner");
     sqlx::query(
         "INSERT INTO sessions (session_key, agent_id, provider, channel_id,
          instance_id, status, last_heartbeat)
@@ -497,7 +497,7 @@ async fn live_and_skill_producers_forward_to_foreign_owner_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let channel_id = ChannelId::new(4_350_101);
-    let owner = "worker-owner-4350-live";
+    let owner = "runner-owner-4350-live";
     seed_foreign_owner(&pool, channel_id, owner).await;
 
     let shared =
@@ -584,7 +584,7 @@ async fn untrusted_attachment_urls_block_before_outbox_or_local_state_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let channel_id = ChannelId::new(4_350_151);
-    seed_foreign_owner(&pool, channel_id, "worker-owner-4350-raw-attachment").await;
+    seed_foreign_owner(&pool, channel_id, "runner-owner-4350-raw-attachment").await;
 
     let shared =
         crate::services::discord::make_shared_data_for_tests_with_storage(Some(pool.clone()));
@@ -647,7 +647,7 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let channel_id = ChannelId::new(4_350_201);
-    let owner = "worker-owner-4350-queue";
+    let owner = "runner-owner-4350-queue";
     seed_foreign_owner(&pool, channel_id, owner).await;
 
     let shared =
@@ -710,7 +710,7 @@ async fn queued_foreign_attachment_is_rejected_without_requeue_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let channel_id = ChannelId::new(4_350_301);
-    seed_foreign_owner(&pool, channel_id, "worker-owner-4350-attachment").await;
+    seed_foreign_owner(&pool, channel_id, "runner-owner-4350-attachment").await;
 
     let shared =
         crate::services::discord::make_shared_data_for_tests_with_storage(Some(pool.clone()));
@@ -771,7 +771,7 @@ async fn distinct_open_route_requeues_queued_successor_pg() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let channel_id = ChannelId::new(4_350_401);
-    let owner = "worker-owner-4350-open-route";
+    let owner = "runner-owner-4350-open-route";
     seed_foreign_owner(&pool, channel_id, owner).await;
 
     let shared =
@@ -886,7 +886,7 @@ async fn dispatched_open_route_never_uses_stale_local_recovery_pg() {
             target_instance_id, forwarded_by_instance_id, required_labels,
             channel_id, user_msg_id, request_owner_id, user_text,
             turn_kind, agent_id, provider, status, attempt_no, created_at, dispatched_at
-         ) VALUES ($1, 'leader-1', '[]'::JSONB, $2, 'msg-dispatched', '50',
+         ) VALUES ($1, 'hub-1', '[]'::JSONB, $2, 'msg-dispatched', '50',
             'prior', 'foreground', 'agent-local-dispatched', 'claude',
             'dispatched', 1, NOW() - INTERVAL '60 seconds',
             NOW() - INTERVAL '60 seconds')
@@ -902,7 +902,7 @@ async fn dispatched_open_route_never_uses_stale_local_recovery_pg() {
     let request_owner_id = submission.request.request_owner.get().to_string();
     let ctx = IntakeRouterContext {
         mode: IntakeRoutingMode::Enforce,
-        leader_instance_id: &self_instance,
+        hub_instance_id: &self_instance,
         provider: "claude",
         channel_id: &channel,
         policy_channel_id: &channel,

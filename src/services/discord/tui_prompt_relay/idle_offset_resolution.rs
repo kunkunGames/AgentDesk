@@ -8,10 +8,10 @@ use super::*;
 /// #3154 P1 (timestamp-anchor output loss): single choke point that resolves the
 /// idle-tail start offset.
 ///
-/// When `explicit_start_offset` is `Some` (the deferred-BridgeAdapter worker path),
+/// When `explicit_start_offset` is `Some` (the deferred-BridgeAdapter runner path),
 /// the tail anchors DIRECTLY to that transcript byte offset — the claim's post-drain
 /// EOF `turn_start_offset`, the authoritative byte boundary for this synthetic turn —
-/// and the `observed_at` timestamp scan is BYPASSED. The worker synthesizes
+/// and the `observed_at` timestamp scan is BYPASSED. The runner synthesizes
 /// `observed_at = Utc::now()` only AFTER the deferred-claim wait, so every byte
 /// written to the transcript during that wait predates it; a timestamp scan would
 /// find no boundary line and SKIP those bytes (uncapped output loss). The explicit

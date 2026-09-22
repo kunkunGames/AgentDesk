@@ -20,7 +20,7 @@ guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 
 CURRENT_EXPECTED_CALL_SITES = {
-    "mark_done": {"src/services/cluster/intake_worker.rs": 1},
+    "mark_done": {"src/services/cluster/intake_runner.rs": 1},
     "mark_done_from_delivery_proof": {PROOF_OWNER: 1},
     "settle_intake_done_from_receipt": {SETTLEMENT_OWNER: 1},
 }
@@ -74,9 +74,9 @@ class SourceContractTests(unittest.TestCase):
         )
 
     def test_allowlisted_symbol_is_imported_by_its_owner_function_file(self):
-        worker = (ROOT / "src/services/cluster/intake_worker.rs").read_text(encoding="utf-8")
-        self.assertIn("pub(crate) async fn run_intake_worker_tick(", worker)
-        self.assertIn("mark_done(pool, row.id, claim_owner)", worker)
+        runner = (ROOT / "src/services/cluster/intake_runner.rs").read_text(encoding="utf-8")
+        self.assertIn("pub(crate) async fn run_intake_runner_tick(", runner)
+        self.assertIn("mark_done(pool, row.id, claim_owner)", runner)
 
 
 class DiscriminationTests(unittest.TestCase):
@@ -86,9 +86,9 @@ class DiscriminationTests(unittest.TestCase):
         root = Path(temp.name)
         write(
             root,
-            "src/services/cluster/intake_worker.rs",
+            "src/services/cluster/intake_runner.rs",
             "use crate::db::intake_outbox::{mark_done, mark_spawned};\n"
-            "pub(crate) async fn run_intake_worker_tick(\n"
+            "pub(crate) async fn run_intake_runner_tick(\n"
             "    pool: &PgPool,\n"
             "    http: &Arc<serenity::http::Http>,\n"
             "    shared: &Arc<SharedData>,\n"
@@ -227,7 +227,7 @@ class DiscriminationTests(unittest.TestCase):
         ok, message = self.run_guard(self.fixture(), typo)
         self.assertFalse(ok)
         self.assertIn("call site GONE from src/services/cluster/intake_wroker.rs", message)
-        self.assertIn("UNLISTED call site in src/services/cluster/intake_worker.rs", message)
+        self.assertIn("UNLISTED call site in src/services/cluster/intake_runner.rs", message)
 
     def test_cfg_test_writer_call_is_not_a_production_site(self):
         root = self.fixture()
@@ -378,7 +378,7 @@ class TransportLegacyInventoryTests(unittest.TestCase):
     `adapters.ownership_boundary`); field narrowing is S2b's job.
     """
 
-    WORKER = ROOT / "src/services/cluster/intake_worker.rs"
+    RUNNER = ROOT / "src/services/cluster/intake_runner.rs"
     OWNER = ROOT / "src/services/discord/shared_state.rs"
     BOOTSTRAP = ROOT / "src/services/discord/runtime_bootstrap"
     RAW_STORE = re.compile(r"(shutting_down|restart_pending)\s*\.store\(")
@@ -395,7 +395,7 @@ class TransportLegacyInventoryTests(unittest.TestCase):
     READER_DECL = re.compile(r"struct ShutdownReader\((?P<field>.*)\);")
     RAW_HANDLE = re.compile(r"self\.0(?!\.load\()")
     CHECKPOINT = re.compile(
-        r"admission_action\(\s*cancelled,\s*&shared\.restart\.intake_worker_lifecycle,"
+        r"admission_action\(\s*cancelled,\s*&shared\.restart\.intake_runner_lifecycle,"
         r"\s*AdmissionCheckpoint::(\w+),"
     )
     # "<adapter> <caller basename> <field>=<value>..." in exact store order.
@@ -414,10 +414,10 @@ class TransportLegacyInventoryTests(unittest.TestCase):
         return text[start : text.index("\n}\n", start)]
 
     def test_transport_legacy_lexical_inventory(self):
-        worker = self.WORKER.read_text(encoding="utf-8")
+        runner = self.RUNNER.read_text(encoding="utf-8")
         owner = self.OWNER.read_text(encoding="utf-8")
 
-        tick = self.item(worker, "pub(crate) async fn run_intake_worker_tick(")
+        tick = self.item(runner, "pub(crate) async fn run_intake_runner_tick(")
         self.assertIn("cancelled: &(dyn Fn() -> bool + Sync),", tick)
         self.assertEqual(
             self.CHECKPOINT.findall(tick), ["BeforeClaim", "AfterClaim", "AfterClaim"]
@@ -425,7 +425,7 @@ class TransportLegacyInventoryTests(unittest.TestCase):
         self.assertEqual(tick.count("admission_action("), 3)
         self.assertEqual(tick.count("release_cancelled_claim(pool, &row, claim_owner)"), 2)
 
-        loop_body = self.item(worker, "pub(crate) async fn run_intake_worker_loop(")
+        loop_body = self.item(runner, "pub(crate) async fn run_intake_runner_loop(")
         self.assertNotIn("cancel: Arc<AtomicBool>", loop_body)
         self.assertIn("let reader = shared.restart.shutdown_reader();", loop_body)
         self.assertIn("let cancelled = || reader.load(Ordering::Acquire);", loop_body)

@@ -26,8 +26,8 @@ async fn seed_spawned(pool: &sqlx::PgPool, key: &str) -> i64 {
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
             status, claim_owner, spawned_at
          ) VALUES (
-            'worker', 'leader', $1, $1, 'user', 'hello', 'standard', 'agent',
-            'spawned', 'dispatch-worker', NOW()
+            'runner', 'hub', $1, $1, 'user', 'hello', 'standard', 'agent',
+            'spawned', 'dispatch-runner', NOW()
          ) RETURNING id",
     )
     .bind(key)
@@ -75,9 +75,9 @@ fn assert_path_returns_before_handoff(
     );
 }
 
-async fn assert_worker_closes_spawned(pool: &sqlx::PgPool, key: &str) {
+async fn assert_runner_closes_spawned(pool: &sqlx::PgPool, key: &str) {
     let id = seed_spawned(pool, key).await;
-    assert!(mark_done(pool, id, "dispatch-worker").await.unwrap());
+    assert!(mark_done(pool, id, "dispatch-runner").await.unwrap());
     assert_eq!(status(pool, id).await, IntakeOutboxStatus::Done);
 }
 
@@ -134,31 +134,31 @@ async fn inline_completed_paths_never_reach_dispatched_pg() {
         1,
     );
     // The Discord/session fixtures needed to drive these handler branches do
-    // not carry a worker-owned PostgreSQL intake row. The source assertions
+    // not carry a runner-owned PostgreSQL intake row. The source assertions
     // above therefore pin each marker-to-return segment, while the three
-    // independent rows below verify only the worker's spawned-to-done close.
+    // independent rows below verify only the runner's spawned-to-done close.
     for key in ["inline-no-session", "inline-goal", "inline-stale-dispatch"] {
-        assert_worker_closes_spawned(&pool, key).await;
+        assert_runner_closes_spawned(&pool, key).await;
     }
     pool.close().await;
     database.drop().await;
 }
 
 #[tokio::test]
-async fn race_loss_requeue_leaves_row_in_spawned_and_worker_closes_it_pg() {
+async fn race_loss_requeue_leaves_row_in_spawned_and_runner_closes_it_pg() {
     let database = TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;
     // The production requeue helper requires live Discord mailbox and runtime
     // transition state but has no PostgreSQL intake-row parameter. This test
     // therefore combines a bounded source-order check with an independent
-    // worker mark_done row; it is not an end-to-end requeue invocation.
+    // runner mark_done row; it is not an end-to-end requeue invocation.
     assert_path_returns_before_handoff(
         include_str!("../../intake_turn.rs"),
         "let Some(intake_runtime_transition) = runtime_transition::acquire_after_redirect_or_requeue(",
         "let (mut session_id, mut memento_context_loaded, current_path) =",
         1,
     );
-    assert_worker_closes_spawned(&pool, "race-loss-requeue").await;
+    assert_runner_closes_spawned(&pool, "race-loss-requeue").await;
     pool.close().await;
     database.drop().await;
 }
@@ -169,14 +169,14 @@ async fn hosted_tui_busy_pre_submit_requeue_leaves_row_in_spawned_pg() {
     let pool = database.connect_and_migrate().await;
     // As above, the live TUI/Discord queue path cannot be coupled to the test
     // database row through the repository's current interfaces. The bounded
-    // source check and independent worker close are the declared substitute.
+    // source check and independent runner close are the declared substitute.
     assert_path_returns_before_handoff(
         include_str!("../../intake_turn.rs"),
         "if let Some(diagnostic) = tui_busy_diagnostic {",
         "if recapture_offset_after_busy_wait {",
         1,
     );
-    assert_worker_closes_spawned(&pool, "hosted-tui-busy").await;
+    assert_runner_closes_spawned(&pool, "hosted-tui-busy").await;
     pool.close().await;
     database.drop().await;
 }

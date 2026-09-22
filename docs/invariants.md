@@ -30,7 +30,7 @@ path, and exposed at `GET /api/analytics/invariants`.
 | `recovery_phase_valid` | Recovery phase values are restricted to `pending`, `watcher_reattach`, `inflight_restore`, and `done`; transition helpers must canonicalize persisted values through that enum. | `src/services/discord/recovery_engine.rs:30`, `src/services/discord/recovery_engine.rs:186`, `src/services/discord/recovery_engine.rs:214`, `src/services/discord/recovery_engine.rs:225` | Existing unit tests cover phase parsing and transition helpers. Recovery fires remain observable through `emit_recovery_fired` at `src/services/discord/recovery_engine.rs:2359`. |
 | `recovery_mailbox_reregister_idempotent` | Restart recovery may re-register an active mailbox turn from inflight state, but repeated attempts must not create parallel active turns. | `src/services/discord/recovery_engine.rs:409`, `src/services/discord/recovery_engine.rs:419` | Covered by the mailbox single-token invariant and `reregister_active_turn_from_inflight` tests. |
 | `dispatch_completion_single_authority` | All dispatch completion paths route through `finalize_dispatch` / `complete_dispatch_inner_with_backends` so evidence validation, DB status transition, hooks, and follow-ups share one lifecycle. | `src/dispatch/dispatch_status.rs:1077`, `src/dispatch/dispatch_status.rs:1342`, `src/dispatch/dispatch_status.rs:1345` | Existing dispatch result observability is emitted by the shared status transition path; this change does not rewrite the dispatch state machine. |
-| `dispatch_outbox_single_delivery_worker` | Discord side effects for dispatch outbox rows originate from the outbox worker; other paths enqueue durable outbox rows and return. | `src/server/routes/dispatches/outbox.rs:334`, `src/server/routes/dispatches/outbox.rs:1662`, `src/server/routes/dispatches/outbox.rs:1697` | Existing outbox retry/backoff tests cover the lifecycle. No new runtime panic is introduced here. |
+| `dispatch_outbox_single_delivery_runner` | Discord side effects for dispatch outbox rows originate from the outbox runner; other paths enqueue durable outbox rows and return. | `src/server/routes/dispatches/outbox.rs:334`, `src/server/routes/dispatches/outbox.rs:1662`, `src/server/routes/dispatches/outbox.rs:1697` | Existing outbox retry/backoff tests cover the lifecycle. No new runtime panic is introduced here. |
 
 ## Per-Invariant Notes
 
@@ -59,7 +59,7 @@ pending scan with `retry_count < 0` (schema regression / signed-unsigned
 confusion) or `retry_count > MAX_RETRY_COUNT + 1` (accounting bug that
 bypassed the status transition to `failed`). The transient `+1` slack is
 intentional: `new_count = retry_count + 1` is computed before the comparison
-and before the status flip, so a correctly-behaving worker can read a row at
+and before the status flip, so a correctly-behaving runner can read a row at
 exactly `MAX_RETRY_COUNT + 1` once, and the observation should only fire when
 a row is picked up again at that count.
 

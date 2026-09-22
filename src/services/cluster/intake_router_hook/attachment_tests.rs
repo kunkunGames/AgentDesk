@@ -1,5 +1,5 @@
 use super::pg_tests::{
-    ctx_for_channel, seed_agent_with_preference, seed_worker_node_with_capabilities,
+    ctx_for_channel, seed_agent_with_preference, seed_runner_node_with_capabilities,
 };
 use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
@@ -11,9 +11,9 @@ use serde_json::json;
 async fn attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg() {
     let fixture = TestPostgresDb::create().await;
     let pool = fixture.connect_and_migrate().await;
-    seed_agent_with_preference(&pool, "attachment-agent", "8220", json!(["worker"])).await;
-    let caps = json!({"intake_worker":{"enabled":true,"providers":["claude"],"features":["preserve_on_cancel_v1"]}});
-    seed_worker_node_with_capabilities(&pool, "win", json!(["worker"]), "online", caps.clone())
+    seed_agent_with_preference(&pool, "attachment-agent", "8220", json!(["runner"])).await;
+    let caps = json!({"intake_runner":{"enabled":true,"providers":["claude"],"features":["preserve_on_cancel_v1"]}});
+    seed_runner_node_with_capabilities(&pool, "win", json!(["runner"]), "online", caps.clone())
         .await;
     let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "8220");
     ctx.user_msg_id = "8221";
@@ -44,14 +44,14 @@ async fn attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked { .. }
         ),
-        "a type-only legacy worker must not receive files"
+        "a type-only legacy runner must not receive files"
     );
     let mut caps = caps;
-    caps["intake_worker"]["features"]
+    caps["intake_runner"]["features"]
         .as_array_mut()
         .unwrap()
         .push(json!(CAPABILITY));
-    sqlx::query("UPDATE worker_nodes SET capabilities=$1 WHERE instance_id='win'")
+    sqlx::query("UPDATE cluster_nodes SET capabilities=$1 WHERE instance_id='win'")
         .bind(caps)
         .execute(&pool)
         .await
@@ -66,7 +66,7 @@ async fn attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg
         .unwrap();
     assert_eq!(row.id, id);
     assert_eq!(row.attachment_refs, json!(refs));
-    let uploads = worker_uploads(&pool, &row).await.unwrap();
+    let uploads = runner_uploads(&pool, &row).await.unwrap();
     assert_eq!(
         materialize::prepare(&uploads, Some(&pool))
             .await
@@ -80,7 +80,7 @@ async fn attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg
             .await
             .unwrap()
     );
-    let retry = sweep_failed_pre_accept_once(&pool, "leader-1", 4, 60, None)
+    let retry = sweep_failed_pre_accept_once(&pool, "hub-1", 4, 60, None)
         .await
         .unwrap();
     assert!(matches!(retry, FailedPreAcceptSweepOutcome::Retried { .. }));
@@ -109,7 +109,7 @@ async fn attachment_route_requires_consumer_and_preserves_bytes_through_retry_pg
         .await
         .unwrap();
     assert!(
-        worker_uploads(&pool, &operator_retry).await.is_err(),
+        runner_uploads(&pool, &operator_retry).await.is_err(),
         "expiry never turns an attachment request into text only"
     );
     pool.close().await;

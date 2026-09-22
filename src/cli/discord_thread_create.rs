@@ -1080,7 +1080,7 @@ mod tests {
         let name = name.to_string_lossy();
         // Keep the runtime alive until after the guard drops. This mirrors the
         // one-shot CLI and catches a Windows mutex acquired on a Tokio
-        // blocking worker but incorrectly released from the caller thread.
+        // blocking runner but incorrectly released from the caller thread.
         let runtime = std::env::var_os("ADK_THREAD_LOCK_USE_ASYNC")
             .map(|_| tokio::runtime::Runtime::new().expect("child Tokio runtime"));
         let lock = match runtime.as_ref() {
@@ -1167,7 +1167,7 @@ mod tests {
         .unwrap();
 
         // Keep the runtime (and, in the old broken implementation, its mutex-
-        // owning blocking worker) alive until the parent has observed whether
+        // owning blocking runner) alive until the parent has observed whether
         // cancellation really released the named mutex.
         let exit = PathBuf::from(
             std::env::var_os("ADK_THREAD_LOCK_EXIT").expect("runtime exit marker path"),

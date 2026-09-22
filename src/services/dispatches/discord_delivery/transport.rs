@@ -208,7 +208,7 @@ pub(crate) fn discord_api_url(base_url: &str, path: &str) -> String {
 /// the raw dispatch transport. Discord rate-limits are a normal operating
 /// condition; previously a single 429 fell through to `Other` and became a
 /// terminal PermanentFailure with no backoff. The budget is capped so a long
-/// (or hostile) Retry-After cannot stall a dispatch worker indefinitely.
+/// (or hostile) Retry-After cannot stall a dispatch runner indefinitely.
 const DISCORD_RATE_LIMIT_MAX_RETRIES: u32 = 3;
 const DISCORD_RATE_LIMIT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 const DISCORD_RATE_LIMIT_DEFAULT_BACKOFF: std::time::Duration =
@@ -225,7 +225,7 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(|seconds| {
             // Clamp BEFORE constructing the Duration: `Duration::from_secs_f64`
             // panics on values that overflow Duration's range, so a hostile or
-            // malformed Retry-After (e.g. "1e30") would crash the worker path
+            // malformed Retry-After (e.g. "1e30") would crash the runner path
             // instead of being capped. The caller caps the backoff to
             // DISCORD_RATE_LIMIT_MAX_BACKOFF anyway, so clamping to that ceiling
             // here is both safe and behavior-preserving.

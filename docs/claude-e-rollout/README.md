@@ -1,7 +1,7 @@
 # claude-e Runtime Rollout (Historical)
 
 > Historical directory: #5706 c1 retires the `claude-e` E2E cell, its dedicated
-> E-29 gap row, and the example E2E worker. The production adapter and live
+> E-29 gap row, and the example E2E runner. The production adapter and live
 > opt-in config remain until the later ops/c2 retirement steps. These rollout
 > documents record the original rollout; their config instructions are not
 > current guidance. Use [Source Of Truth](../source-of-truth.md) for canonical

@@ -3658,7 +3658,7 @@ async fn missing_card_replacement_replays_same_nonce_after_post_commit_ambiguity
         .await
         .expect("claim missing-card replacement");
     let store::MissingCardReplacementClaim::Owned(claim) = claim else {
-        panic!("first replacement worker must own the revision")
+        panic!("first replacement runner must own the revision")
     };
     let bot = clients.by_key(&claim.bot_key).expect("pinned card bot");
     let discord_replacement_id = transport
@@ -3672,7 +3672,7 @@ async fn missing_card_replacement_replays_same_nonce_after_post_commit_ambiguity
         .expect("Discord accepts replacement before DB ambiguity");
     store::mark_post_failure(None, &claim, "ambiguous DB response after Discord commit")
         .await
-        .expect("release failed worker while retaining posting nonce");
+        .expect("release failed runner while retaining posting nonce");
 
     let recovered =
         replace_confirmed_missing_card(None, &clients, &transport, &event, first_card.message_id)
@@ -4372,7 +4372,7 @@ async fn old_restart_after_card_post_reconciles_history_without_nonce_replay_pg(
     .await
     .expect("claim before simulated crash");
     let CardClaim::Owned(claimed) = claim else {
-        panic!("first worker must own the post lease");
+        panic!("first runner must own the post lease");
     };
     let boundary = store::begin_card_post(Some(&pool), &claimed)
         .await
@@ -4382,7 +4382,7 @@ async fn old_restart_after_card_post_reconciles_history_without_nonce_replay_pg(
     let original_id = transport
         .post_card(bot, event.scope.channel_id, &seed, &claimed.discord_nonce)
         .await
-        .expect("Discord accepted create before worker crash");
+        .expect("Discord accepted create before runner crash");
     sqlx::query(
         "UPDATE task_notification_card_state
          SET lease_expires_at = NOW() - INTERVAL '1 second',
@@ -4395,7 +4395,7 @@ async fn old_restart_after_card_post_reconciles_history_without_nonce_replay_pg(
     .bind(&event.scope.event_key)
     .execute(&pool)
     .await
-    .expect("expire crashed worker lease");
+    .expect("expire crashed runner lease");
 
     let recovered = ensure_card(
         Some(&pool),
@@ -4441,7 +4441,7 @@ async fn old_card_post_boundary_without_history_fails_closed_without_repost_pg()
     .await
     .expect("claim card before ambiguous boundary");
     let CardClaim::Owned(claimed) = claim else {
-        panic!("first worker must own the post lease");
+        panic!("first runner must own the post lease");
     };
     store::begin_card_post(Some(&pool), &claimed)
         .await

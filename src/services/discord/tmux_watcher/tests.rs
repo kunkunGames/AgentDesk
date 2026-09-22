@@ -1686,7 +1686,7 @@ fn fresh_idle_clear_gate_skips_when_late_reread_is_newer_turn() {
 
     // ── (1) Follow-up preserved ──────────────────────────────────────────
     // Simulate a follow-up turn that saved a DIFFERENT inflight (id 9002,
-    // start 50 >= current_offset) on another worker thread DURING the cleanup
+    // start 50 >= current_offset) on another runner thread DURING the cleanup
     // awaits — i.e. it is what is on disk at clear time, NOT the pinned turn.
     let late_followup = fresh_idle_inflight(provider.clone(), channel_id, session, 9002, 50);
     crate::services::discord::inflight::save_inflight_state(&late_followup)

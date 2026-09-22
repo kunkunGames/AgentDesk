@@ -36,7 +36,7 @@ pub(crate) async fn get(
 }
 
 pub(crate) async fn node_registered(pool: &PgPool, node: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM worker_nodes WHERE instance_id=$1)")
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cluster_nodes WHERE instance_id=$1)")
         .bind(node)
         .fetch_one(pool)
         .await
@@ -100,7 +100,7 @@ mod tests {
         for id in [
             None,
             Some("single-node"),
-            Some("windows-worker-1"),
+            Some("windows-runner-1"),
             Some("studio.arm64"),
         ] {
             assert!(
@@ -121,7 +121,7 @@ mod tests {
             );
         }
         assert!(
-            serde_json::from_value::<AgentExecutionNode>(serde_json::json!({"role":"worker"}))
+            serde_json::from_value::<AgentExecutionNode>(serde_json::json!({"role":"runner"}))
                 .is_err()
         );
     }

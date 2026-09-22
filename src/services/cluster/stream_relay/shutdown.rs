@@ -13,7 +13,7 @@ impl StreamRelayHandle {
         let _ = self.shutdown_with_result().await;
     }
 
-    /// Close producer admission and wait for the worker's best-effort drain.
+    /// Close producer admission and wait for the runner's best-effort drain.
     /// A successful join is not proof of delivery success or detached-work completion.
     /// Panic/cancellation remain JoinError; NoTask does not certify a join.
     pub async fn shutdown_with_result(self) -> Result<ShutdownOutcome, tokio::task::JoinError> {

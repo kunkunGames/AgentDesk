@@ -21,7 +21,7 @@ class PortableDocsExamplesTests(unittest.TestCase):
         self.assertNotIn("itismyfield", text)
         self.assertNotIn("1469870512812462284", text)
         self.assertIn("example-main-node", text)
-        self.assertIn("example-worker-node", text)
+        self.assertIn("example-runner-node", text)
         self.assertIn("intake_routing:", text)
         self.assertIn('mode: "observe"', text)
         self.assertIn("YOUR_GUILD_ID", text)
@@ -36,7 +36,7 @@ class PortableDocsExamplesTests(unittest.TestCase):
         self.assertNotIn("instance_id: mac-mini-release", text)
         self.assertNotIn("mac-book-release", text)
         self.assertIn("instance_id: example-main-node", text)
-        self.assertIn("default_preferred_labels: [example-worker]", text)
+        self.assertIn("default_preferred_labels: [example-runner]", text)
         self.assertIn("operator-init-portable.py --root ~/.adk/release", text)
 
     def test_portable_docs_do_not_embed_operator_user_home(self):

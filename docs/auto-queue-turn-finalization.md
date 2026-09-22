@@ -34,7 +34,7 @@ identity. Required gates should fail when a scenario declares `controlled` or
 ## Current Drift Points
 
 1. Dispatch completion and auto-queue entry completion are separate transitions.
-   `task_dispatches.status = completed` means the worker dispatch ended, while
+   `task_dispatches.status = completed` means the runner dispatch ended, while
    `auto_queue_entries.status` determines whether the run can advance or close.
 2. `on_dispatch_completed` is a side effect of dispatch status transition, but
    several paths intentionally skip or replace the hook. Hook delivery therefore

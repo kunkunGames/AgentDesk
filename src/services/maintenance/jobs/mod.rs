@@ -1,7 +1,7 @@
 //! Storage maintenance job implementations (#1092/#1093). Registration lives in
-//! `crate::server::maintenance::storage_jobs`; driven by the leader-only
-//! `MaintenanceScheduler` worker (skipped entirely without a `PgPool`, so every
-//! job here is leader-only and postgres-gated). Cadence is set per wrapper's
+//! `crate::server::maintenance::storage_jobs`; driven by the hub-only
+//! `MaintenanceScheduler` runner (skipped entirely without a `PgPool`, so every
+//! job here is hub-only and postgres-gated). Cadence is set per wrapper's
 //! `schedule()`.
 //!
 //! Jobs: `storage.target_sweep` (monthly/50GB `target/`);

@@ -2,7 +2,7 @@
 
 ## Summary
 
-- `policy_tick_loop` is already isolated from the main server runtime on this branch. `src/server/worker_registry.rs:365-377` starts a dedicated OS thread and builds a `current_thread` Tokio runtime only for policy ticks.
+- `policy_tick_loop` is already isolated from the main server runtime on this branch. `src/server/runner_registry.rs:365-377` starts a dedicated OS thread and builds a `current_thread` Tokio runtime only for policy ticks.
 - The `#735` code change still matters because `src/server/mod.rs:480-547` now runs each tick hook through `spawn_blocking`, adds a 5s timeout, and skips overlap while a timed-out hook is still finishing.
 - Local baseline profiling on `2026-04-17` with the real repository policy files and an empty test DB measured:
   - `OnTick1min`: `5ms`
@@ -34,7 +34,7 @@ What this proves:
 
 ### 1. Runtime starvation diagnosis was stale
 
-- `src/server/worker_registry.rs:365-377` already isolates the tick loop on its own OS thread.
+- `src/server/runner_registry.rs:365-377` already isolates the tick loop on its own OS thread.
 - `src/engine/mod.rs:82-180` already isolates `PolicyEngineActor` on its own thread.
 
 This means the original "shared Tokio executor blocked for 8-10s" diagnosis does not hold on the current branch.

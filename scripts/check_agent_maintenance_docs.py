@@ -126,10 +126,10 @@ DOC_TOUCH_RULES: tuple[TouchRule, ...] = (
     ),
     TouchRule(
         patterns=(
-            "src/server/worker_registry.rs",
+            "src/server/runner_registry.rs",
             "src/services/cluster/intake_router_hook.rs",
             "src/services/cluster/intake_router_hook/**",
-            "src/services/cluster/intake_worker_capabilities.rs",
+            "src/services/cluster/intake_runner_capabilities.rs",
             "src/services/discord/runtime_bootstrap.rs",
             "migrations/postgres/0093_intake_outbox_preserve_on_cancel.sql",
             "src/server/routes/dispatches/outbox.rs",

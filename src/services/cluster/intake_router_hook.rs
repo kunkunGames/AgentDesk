@@ -1,7 +1,7 @@
-//! Leader-side intake-routing hook. Phase 4 of intake-node-routing
+//! Hub-side intake-routing hook. Phase 4 of intake-node-routing
 //! (docs/design/intake-node-routing.md).
 //!
-//! Sits in the leader's Discord intake gate immediately before
+//! Sits in the hub's Discord intake gate immediately before
 //! `handle_text_message`. For each incoming message, decides:
 //!
 //! In `Enforce`, durable live session ownership wins over `/node` and
@@ -50,7 +50,7 @@ pub(crate) use model::{
 };
 use placement::route_by_preference;
 
-fn worker_heartbeat_lease_secs() -> u64 {
+fn runner_heartbeat_lease_secs() -> u64 {
     crate::config::load_graceful().cluster.lease_ttl_secs.max(1)
 }
 
@@ -77,7 +77,7 @@ async fn check_required_target(
         return None;
     }
     let nodes =
-        match super::node_registry::list_worker_nodes(pool, worker_heartbeat_lease_secs()).await {
+        match super::node_registry::list_cluster_nodes(pool, runner_heartbeat_lease_secs()).await {
             Ok(nodes) => nodes,
             Err(error) => return Some(required_block(error)),
         };
@@ -111,7 +111,7 @@ async fn check_required_target(
     }
 }
 
-/// Run the leader-side placement hook. Enforce mode fails safe whenever a
+/// Run the hub-side placement hook. Enforce mode fails safe whenever a
 /// local execution could split an existing session or duplicate an open route.
 pub(crate) async fn try_route_intake(
     pool: &PgPool,
@@ -174,8 +174,8 @@ pub(crate) async fn try_route_intake(
         pool,
         ctx.provider,
         ctx.channel_id,
-        ctx.leader_instance_id,
-        worker_heartbeat_lease_secs(),
+        ctx.hub_instance_id,
+        runner_heartbeat_lease_secs(),
         ctx.preserve_on_cancel,
     )
     .await
@@ -412,11 +412,11 @@ async fn route_node_override_without_owner(
     if let Some(blocked) = check_required_target(pool, ctx, target, requirements).await {
         return blocked;
     }
-    if target == ctx.leader_instance_id {
+    if target == ctx.hub_instance_id {
         return apply_observe_mode(
             ctx.mode,
             IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::NodeOverrideIsLeader,
+                reason: RanLocalReason::NodeOverrideIsHub,
             },
         );
     }
@@ -432,9 +432,9 @@ async fn route_node_override_without_owner(
         );
     }
 
-    let nodes = match crate::services::cluster::node_registry::list_worker_nodes(
+    let nodes = match crate::services::cluster::node_registry::list_cluster_nodes(
         pool,
-        worker_heartbeat_lease_secs(),
+        runner_heartbeat_lease_secs(),
     )
     .await
     {
@@ -599,7 +599,7 @@ async fn route_to_instance(
     // and sticky owners. A stalled owner stays the owner; it is never replaced
     // by an incompatible local execution because its readiness expired.
     let readiness =
-        match super::node_registry::list_worker_nodes(pool, worker_heartbeat_lease_secs()).await {
+        match super::node_registry::list_cluster_nodes(pool, runner_heartbeat_lease_secs()).await {
             Ok(nodes) => nodes
                 .iter()
                 .find(|node| node["instance_id"].as_str() == Some(target))
@@ -682,7 +682,7 @@ async fn route_to_instance(
     }
 
     // Live ingress is always attempt 1. Retry-family allocation belongs only
-    // to the failed-pre-accept worker recovery path.
+    // to the failed-pre-accept runner recovery path.
     if let Some(blocked) = check_required_target(pool, ctx, target, requirements).await {
         return blocked;
     }
@@ -816,7 +816,7 @@ mod pg_tests {
     ) -> IntakeRouterContext<'a> {
         IntakeRouterContext {
             mode,
-            leader_instance_id: "leader-1",
+            hub_instance_id: "hub-1",
             provider: "claude",
             channel_id: channel,
             policy_channel_id: channel,
@@ -858,19 +858,19 @@ mod pg_tests {
         .expect("seed agent");
     }
 
-    async fn seed_worker_node(
+    async fn seed_runner_node(
         pool: &PgPool,
         instance_id: &str,
         labels: serde_json::Value,
         status: &str,
     ) {
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             pool,
             instance_id,
             labels,
             status,
             serde_json::json!({
-                "intake_worker": {
+                "intake_runner": {
                     "enabled": true,
                     "providers": ["claude"],
                     "features": ["preserve_on_cancel_v1"],
@@ -880,7 +880,7 @@ mod pg_tests {
         .await;
     }
 
-    pub(super) async fn seed_worker_node_with_capabilities(
+    pub(super) async fn seed_runner_node_with_capabilities(
         pool: &PgPool,
         instance_id: &str,
         labels: serde_json::Value,
@@ -888,9 +888,9 @@ mod pg_tests {
         capabilities: serde_json::Value,
     ) {
         sqlx::query(
-            "INSERT INTO worker_nodes (instance_id, status, role, effective_role,
+            "INSERT INTO cluster_nodes (instance_id, status, role, effective_role,
              labels, capabilities, last_heartbeat_at, started_at, updated_at)
-             VALUES ($1, $2, 'worker', 'worker', $3, $4, NOW(), NOW(), NOW())",
+             VALUES ($1, $2, 'runner', 'runner', $3, $4, NOW(), NOW(), NOW())",
         )
         .bind(instance_id)
         .bind(status)
@@ -898,7 +898,7 @@ mod pg_tests {
         .bind(capabilities)
         .execute(pool)
         .await
-        .expect("seed worker_nodes");
+        .expect("seed cluster_nodes");
     }
 
     pub(super) async fn seed_session_owner(
@@ -983,7 +983,7 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn eligible_worker_forwards_portable_text_to_outbox_pg() {
+    async fn eligible_runner_forwards_portable_text_to_outbox_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
 
@@ -994,7 +994,7 @@ mod pg_tests {
             serde_json::json!(["unreal"]),
         )
         .await;
-        seed_worker_node(&pool, "worker-mac", serde_json::json!(["unreal"]), "online").await;
+        seed_runner_node(&pool, "runner-mac", serde_json::json!(["unreal"]), "online").await;
 
         let decision = try_route_intake(
             &pool,
@@ -1006,7 +1006,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 ref target_instance_id,
                 ..
-            } if target_instance_id == "worker-mac"
+            } if target_instance_id == "runner-mac"
         ));
 
         let count: i64 =
@@ -1022,7 +1022,7 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn observe_mode_with_eligible_worker_returns_observed_without_inserting() {
+    async fn observe_mode_with_eligible_runner_returns_observed_without_inserting() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
 
@@ -1033,7 +1033,7 @@ mod pg_tests {
             serde_json::json!(["unreal"]),
         )
         .await;
-        seed_worker_node(&pool, "worker-mac", serde_json::json!(["unreal"]), "online").await;
+        seed_runner_node(&pool, "runner-mac", serde_json::json!(["unreal"]), "online").await;
 
         let decision = try_route_intake(
             &pool,
@@ -1044,7 +1044,7 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
-                    target_instance_id: "worker-mac".to_string()
+                    target_instance_id: "runner-mac".to_string()
                 }
             }
         );
@@ -1068,10 +1068,10 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         seed_session_owner(
             &pool,
-            "claude:leader-1:ch-observe-local",
+            "claude:hub-1:ch-observe-local",
             "claude",
             "ch-observe-local",
-            "leader-1",
+            "hub-1",
             "turn_active",
         )
         .await;
@@ -1103,13 +1103,13 @@ mod pg_tests {
     async fn observe_mode_uses_live_foreign_owner_without_mutation() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(&pool, "worker-owner", serde_json::json!([]), "online").await;
+        seed_runner_node(&pool, "runner-owner", serde_json::json!([]), "online").await;
         seed_session_owner(
             &pool,
-            "claude:worker-owner:ch-observe-foreign",
+            "claude:runner-owner:ch-observe-foreign",
             "claude",
             "ch-observe-foreign",
-            "worker-owner",
+            "runner-owner",
             "turn_active",
         )
         .await;
@@ -1123,7 +1123,7 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldForwardLiveForeignOwner {
-                    target_instance_id: "worker-owner".to_string()
+                    target_instance_id: "runner-owner".to_string()
                 }
             }
         );
@@ -1184,13 +1184,13 @@ mod pg_tests {
     async fn observe_mode_reports_foreign_attachment_block_without_mutation() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(&pool, "worker-owner", serde_json::json!([]), "online").await;
+        seed_runner_node(&pool, "runner-owner", serde_json::json!([]), "online").await;
         seed_session_owner(
             &pool,
-            "claude:worker-owner:ch-observe-upload",
+            "claude:runner-owner:ch-observe-upload",
             "claude",
             "ch-observe-upload",
-            "worker-owner",
+            "runner-owner",
             "turn_active",
         )
         .await;
@@ -1203,7 +1203,7 @@ mod pg_tests {
             IntakeRouterDecision::Observed {
                 outcome: ObservedIntakeOutcome::WouldBlock {
                     reason: IntakeBlockedReason::NonPortableAttachmentForeignOwner {
-                        owner_instance_id: "worker-owner".to_string()
+                        owner_instance_id: "runner-owner".to_string()
                     }
                 }
             }
@@ -1232,9 +1232,9 @@ mod pg_tests {
             serde_json::json!(["unreal"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-enforce",
+            "runner-enforce",
             serde_json::json!(["unreal"]),
             "online",
         )
@@ -1249,7 +1249,7 @@ mod pg_tests {
                 outbox_id,
                 ..
             } => {
-                assert_eq!(target_instance_id, "worker-enforce");
+                assert_eq!(target_instance_id, "runner-enforce");
                 outbox_id
             }
             other => panic!("expected Forwarded, got {other:?}"),
@@ -1264,7 +1264,7 @@ mod pg_tests {
         .fetch_one(&pool)
         .await
         .expect("read inserted row");
-        assert_eq!(row.0, "worker-enforce");
+        assert_eq!(row.0, "runner-enforce");
         assert_eq!(row.1, "ch-enforce");
         assert_eq!(row.2, "9999");
         assert_eq!(row.3, "agent-enforce");
@@ -1277,7 +1277,7 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preserving_request_skips_legacy_preferred_worker_pg() {
+    async fn preserving_request_skips_legacy_preferred_runner_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_agent_with_preference(
@@ -1287,19 +1287,19 @@ mod pg_tests {
             serde_json::json!(["preferred"]),
         )
         .await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-legacy",
+            "runner-legacy",
             serde_json::json!(["preferred"]),
             "online",
             serde_json::json!({
-                "intake_worker": { "enabled": true, "providers": ["claude"] }
+                "intake_runner": { "enabled": true, "providers": ["claude"] }
             }),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-capable",
+            "runner-capable",
             serde_json::json!(["preferred"]),
             "online",
         )
@@ -1313,7 +1313,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-capable"
+            } if target_instance_id == "runner-capable"
         ));
 
         pool.close().await;
@@ -1321,7 +1321,7 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn non_preserving_request_allows_legacy_preferred_worker_pg() {
+    async fn non_preserving_request_allows_legacy_preferred_runner_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_agent_with_preference(
@@ -1331,13 +1331,13 @@ mod pg_tests {
             serde_json::json!(["legacy"]),
         )
         .await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-legacy",
+            "runner-legacy",
             serde_json::json!(["legacy"]),
             "online",
             serde_json::json!({
-                "intake_worker": { "enabled": true, "providers": ["claude"] }
+                "intake_runner": { "enabled": true, "providers": ["claude"] }
             }),
         )
         .await;
@@ -1352,7 +1352,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-legacy"
+            } if target_instance_id == "runner-legacy"
         ));
 
         pool.close().await;
@@ -1371,16 +1371,16 @@ mod pg_tests {
             serde_json::json!(["preferred"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-override",
+            "runner-override",
             serde_json::json!(["preferred"]),
             "online",
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-owner",
+            "runner-owner",
             serde_json::json!(["owner"]),
             "online",
         )
@@ -1390,13 +1390,13 @@ mod pg_tests {
             "claude:owner-first",
             "claude",
             "ch-owner-first",
-            "worker-owner",
+            "runner-owner",
             "turn_active",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-owner-first");
-        ctx.node_override_instance_id = Some("worker-override");
+        ctx.node_override_instance_id = Some("runner-override");
         let decision = try_route_intake(&pool, &ctx).await;
         let outbox_id = match decision {
             IntakeRouterDecision::Forwarded {
@@ -1404,7 +1404,7 @@ mod pg_tests {
                 outbox_id,
                 ..
             } => {
-                assert_eq!(target_instance_id, "worker-owner");
+                assert_eq!(target_instance_id, "runner-owner");
                 outbox_id
             }
             other => panic!("live owner must beat /node and labels, got {other:?}"),
@@ -1433,14 +1433,14 @@ mod pg_tests {
             serde_json::json!(["gateway-b"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-owner-a",
+            "runner-owner-a",
             serde_json::json!(["owner-a"]),
             "online",
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
             "gateway-b",
             serde_json::json!(["gateway-b"]),
@@ -1452,20 +1452,20 @@ mod pg_tests {
             "claude:gateway-move",
             "claude",
             "ch-gateway-move",
-            "worker-owner-a",
+            "runner-owner-a",
             "idle",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-gateway-move");
-        ctx.leader_instance_id = "gateway-b";
+        ctx.hub_instance_id = "gateway-b";
         let decision = try_route_intake(&pool, &ctx).await;
         assert!(matches!(
             decision,
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-owner-a"
+            } if target_instance_id == "runner-owner-a"
         ));
 
         pool.close().await;
@@ -1481,7 +1481,7 @@ mod pg_tests {
             "claude:local-owner",
             "claude",
             "ch-local-owner",
-            "leader-1",
+            "hub-1",
             "idle",
         )
         .await;
@@ -1520,14 +1520,14 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node(&pool, "worker-one", serde_json::json!([]), "online").await;
+        seed_runner_node(&pool, "runner-one", serde_json::json!([]), "online").await;
         for session_key in ["legacy:owner-dupe", "namespaced:owner-dupe"] {
             seed_session_owner(
                 &pool,
                 session_key,
                 "claude",
                 "ch-owner-dupe",
-                "worker-one",
+                "runner-one",
                 "turn_active",
             )
             .await;
@@ -1542,7 +1542,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-one"
+            } if target_instance_id == "runner-one"
         ));
 
         pool.close().await;
@@ -1553,13 +1553,13 @@ mod pg_tests {
     async fn preserving_request_blocks_legacy_live_owner_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-legacy-owner",
+            "runner-legacy-owner",
             serde_json::json!([]),
             "online",
             serde_json::json!({
-                "intake_worker": { "enabled": true, "providers": ["claude"] }
+                "intake_runner": { "enabled": true, "providers": ["claude"] }
             }),
         )
         .await;
@@ -1568,7 +1568,7 @@ mod pg_tests {
             "claude:legacy-owner",
             "claude",
             "ch-legacy-owner",
-            "worker-legacy-owner",
+            "runner-legacy-owner",
             "turn_active",
         )
         .await;
@@ -1579,7 +1579,7 @@ mod pg_tests {
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::OwnerProtocolIncompatible {
-                    instance_id: "worker-legacy-owner".to_string(),
+                    instance_id: "runner-legacy-owner".to_string(),
                 }
             }
         );
@@ -1592,9 +1592,9 @@ mod pg_tests {
     async fn preserving_request_forwards_to_capable_live_owner_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-capable-owner",
+            "runner-capable-owner",
             serde_json::json!([]),
             "online",
         )
@@ -1604,7 +1604,7 @@ mod pg_tests {
             "claude:capable-owner",
             "claude",
             "ch-capable-owner",
-            "worker-capable-owner",
+            "runner-capable-owner",
             "turn_active",
         )
         .await;
@@ -1616,7 +1616,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-capable-owner"
+            } if target_instance_id == "runner-capable-owner"
         ));
 
         pool.close().await;
@@ -1634,9 +1634,9 @@ mod pg_tests {
             serde_json::json!(["preferred"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-preferred",
+            "runner-preferred",
             serde_json::json!(["preferred"]),
             "online",
         )
@@ -1646,7 +1646,7 @@ mod pg_tests {
             "claude:stale-owner",
             "claude",
             "ch-stale-owner",
-            "worker-missing",
+            "runner-missing",
             "turn_active",
         )
         .await;
@@ -1660,7 +1660,7 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::StaleSessionOwners {
-                    instance_ids: vec!["worker-missing".to_string()]
+                    instance_ids: vec!["runner-missing".to_string()]
                 }
             }
         );
@@ -1681,18 +1681,18 @@ mod pg_tests {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
 
-        seed_worker_node(&pool, "worker-expired", serde_json::json!([]), "online").await;
+        seed_runner_node(&pool, "runner-expired", serde_json::json!([]), "online").await;
         sqlx::query(
-            "UPDATE worker_nodes
+            "UPDATE cluster_nodes
                 SET last_heartbeat_at = NOW() - INTERVAL '1 day'
-              WHERE instance_id = 'worker-expired'",
+              WHERE instance_id = 'runner-expired'",
         )
         .execute(&pool)
         .await
-        .expect("expire worker");
-        seed_worker_node_with_capabilities(
+        .expect("expire runner");
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-no-provider",
+            "runner-no-provider",
             serde_json::json!([]),
             "online",
             serde_json::json!({}),
@@ -1700,8 +1700,8 @@ mod pg_tests {
         .await;
 
         for (channel_id, owner) in [
-            ("ch-owner-expired", "worker-expired"),
-            ("ch-owner-no-provider", "worker-no-provider"),
+            ("ch-owner-expired", "runner-expired"),
+            ("ch-owner-no-provider", "runner-no-provider"),
         ] {
             seed_session_owner(
                 &pool,
@@ -1732,16 +1732,16 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stale_owner_recovers_when_worker_is_fresh_again_pg() {
+    async fn stale_owner_recovers_when_runner_is_fresh_again_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(&pool, "worker-recovering", serde_json::json!([]), "offline").await;
+        seed_runner_node(&pool, "runner-recovering", serde_json::json!([]), "offline").await;
         seed_session_owner(
             &pool,
             "claude:recovering-owner",
             "claude",
             "ch-recovering-owner",
-            "worker-recovering",
+            "runner-recovering",
             "turn_active",
         )
         .await;
@@ -1754,19 +1754,19 @@ mod pg_tests {
         ));
 
         sqlx::query(
-            "UPDATE worker_nodes
+            "UPDATE cluster_nodes
                 SET status = 'online', last_heartbeat_at = NOW()
-              WHERE instance_id = 'worker-recovering'",
+              WHERE instance_id = 'runner-recovering'",
         )
         .execute(&pool)
         .await
-        .expect("recover worker");
+        .expect("recover runner");
         assert!(matches!(
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-recovering"
+            } if target_instance_id == "runner-recovering"
         ));
 
         pool.close().await;
@@ -1777,8 +1777,8 @@ mod pg_tests {
     async fn conflicting_live_owners_block_arbitrary_placement_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        for owner in ["worker-a", "worker-b"] {
-            seed_worker_node(&pool, owner, serde_json::json!([]), "online").await;
+        for owner in ["runner-a", "runner-b"] {
+            seed_runner_node(&pool, owner, serde_json::json!([]), "online").await;
             seed_session_owner(
                 &pool,
                 &format!("claude:{owner}"),
@@ -1799,7 +1799,7 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::ConflictingLiveSessionOwners {
-                    instance_ids: vec!["worker-a".to_string(), "worker-b".to_string()]
+                    instance_ids: vec!["runner-a".to_string(), "runner-b".to_string()]
                 }
             }
         );
@@ -1819,10 +1819,10 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node(&pool, "worker-live", serde_json::json!([]), "online").await;
+        seed_runner_node(&pool, "runner-live", serde_json::json!([]), "online").await;
         for (key, owner) in [
-            ("claude:live-owner", "worker-live"),
-            ("claude:stale-dupe", "worker-stale"),
+            ("claude:live-owner", "runner-live"),
+            ("claude:stale-dupe", "runner-stale"),
         ] {
             seed_session_owner(&pool, key, "claude", "ch-live-stale", owner, "turn_active").await;
         }
@@ -1836,7 +1836,7 @@ mod pg_tests {
             IntakeRouterDecision::Forwarded {
                 target_instance_id,
                 ..
-            } if target_instance_id == "worker-live"
+            } if target_instance_id == "runner-live"
         ));
 
         pool.close().await;
@@ -1859,7 +1859,7 @@ mod pg_tests {
             "claude:paired",
             "claude",
             "ch-paired-provider",
-            "worker-claude",
+            "runner-claude",
             "turn_active",
         )
         .await;
@@ -1868,17 +1868,17 @@ mod pg_tests {
             "codex:paired",
             "codex",
             "ch-paired-provider",
-            "worker-codex",
+            "runner-codex",
             "turn_active",
         )
         .await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-codex",
+            "runner-codex",
             serde_json::json!([]),
             "online",
             serde_json::json!({
-                "intake_worker": { "enabled": true, "providers": ["codex"] }
+                "intake_runner": { "enabled": true, "providers": ["codex"] }
             }),
         )
         .await;
@@ -1891,7 +1891,7 @@ mod pg_tests {
                 outbox_id,
                 ..
             } => {
-                assert_eq!(target_instance_id, "worker-codex");
+                assert_eq!(target_instance_id, "runner-codex");
                 outbox_id
             }
             other => panic!("expected codex owner, got {other:?}"),
@@ -1912,9 +1912,9 @@ mod pg_tests {
     async fn foreign_owner_attachment_is_blocked_without_outbox_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-upload-owner",
+            "runner-upload-owner",
             serde_json::json!([]),
             "online",
         )
@@ -1924,7 +1924,7 @@ mod pg_tests {
             "claude:upload-owner",
             "claude",
             "ch-upload-owner",
-            "worker-upload-owner",
+            "runner-upload-owner",
             "turn_active",
         )
         .await;
@@ -1935,7 +1935,7 @@ mod pg_tests {
             decision,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::NonPortableAttachmentForeignOwner {
-                    owner_instance_id: "worker-upload-owner".to_string()
+                    owner_instance_id: "runner-upload-owner".to_string()
                 }
             }
         );
@@ -1953,7 +1953,7 @@ mod pg_tests {
                 channel_id, user_msg_id, request_owner_id, user_text,
                 turn_kind, agent_id, status, attempt_no
              ) VALUES (
-                'worker-upload-owner', 'leader-1', '[]'::JSONB,
+                'runner-upload-owner', 'hub-1', '[]'::JSONB,
                 'ch-upload-owner', 'prior-upload-message', '50', 'prior',
                 'foreground', '', 'pending', 1
              )",
@@ -1965,7 +1965,7 @@ mod pg_tests {
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::NonPortableAttachmentForeignOwner {
-                    owner_instance_id: "worker-upload-owner".to_string()
+                    owner_instance_id: "runner-upload-owner".to_string()
                 }
             },
             "a prior open route must not hide a live ingress attachment block"
@@ -1993,9 +1993,9 @@ mod pg_tests {
             serde_json::json!(["mac-mini"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-mac-mini",
+            "runner-mac-mini",
             serde_json::json!(["mac-mini"]),
             "online",
         )
@@ -2006,7 +2006,7 @@ mod pg_tests {
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
-                    target_instance_id: "worker-mac-mini".to_string()
+                    target_instance_id: "runner-mac-mini".to_string()
                 }
             }
         );
@@ -2091,29 +2091,29 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_owner_worker_lookup_error_has_observe_enforce_parity_without_mutation_pg() {
+    async fn no_owner_runner_lookup_error_has_observe_enforce_parity_without_mutation_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_agent_with_preference(
             &pool,
-            "agent-worker-lookup-error",
-            "ch-worker-lookup-error",
+            "agent-runner-lookup-error",
+            "ch-runner-lookup-error",
             serde_json::json!(["mini"]),
         )
         .await;
-        sqlx::query("DROP TABLE worker_nodes CASCADE")
+        sqlx::query("DROP TABLE cluster_nodes CASCADE")
             .execute(&pool)
             .await
-            .expect("drop worker_nodes for preference routing error");
+            .expect("drop cluster_nodes for preference routing error");
 
         let enforce = try_route_intake(
             &pool,
-            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-worker-lookup-error"),
+            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-runner-lookup-error"),
         )
         .await;
         let observe = try_route_intake(
             &pool,
-            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-worker-lookup-error"),
+            &ctx_for_channel(IntakeRoutingMode::Observe, "ch-runner-lookup-error"),
         )
         .await;
         let IntakeRouterDecision::RanLocal { reason } = enforce else {
@@ -2131,7 +2131,7 @@ mod pg_tests {
         );
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
-                .bind("ch-worker-lookup-error")
+                .bind("ch-runner-lookup-error")
                 .fetch_one(&pool)
                 .await
                 .expect("count");
@@ -2153,15 +2153,15 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-selected",
+            "runner-selected",
             serde_json::json!(["mac-mini"]),
             "online",
         )
         .await;
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Disabled, "ch-node-override");
-        ctx.node_override_instance_id = Some("worker-selected");
+        ctx.node_override_instance_id = Some("runner-selected");
         let decision = try_route_intake(&pool, &ctx).await;
         assert_eq!(
             decision,
@@ -2186,22 +2186,22 @@ mod pg_tests {
     async fn node_override_attachment_is_blocked_before_outbox_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-selected",
+            "runner-selected",
             serde_json::json!(["mac-mini"]),
             "online",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-node-upload");
-        ctx.node_override_instance_id = Some("worker-selected");
+        ctx.node_override_instance_id = Some("runner-selected");
         ctx.has_nonportable_uploads = true;
         assert_eq!(
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::NonPortableAttachmentRoutedTarget {
-                    target_instance_id: "worker-selected".to_string()
+                    target_instance_id: "runner-selected".to_string()
                 }
             }
         );
@@ -2232,23 +2232,23 @@ mod pg_tests {
             serde_json::json!(["preferred"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-preferred-but-not-selected",
+            "runner-preferred-but-not-selected",
             serde_json::json!(["preferred"]),
             "online",
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-selected",
+            "runner-selected",
             serde_json::json!(["mac-mini"]),
             "online",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-node-override");
-        ctx.node_override_instance_id = Some("worker-selected");
+        ctx.node_override_instance_id = Some("runner-selected");
         let decision = try_route_intake(&pool, &ctx).await;
         let outbox_id = match decision {
             IntakeRouterDecision::Forwarded {
@@ -2256,7 +2256,7 @@ mod pg_tests {
                 outbox_id,
                 ..
             } => {
-                assert_eq!(target_instance_id, "worker-selected");
+                assert_eq!(target_instance_id, "runner-selected");
                 outbox_id
             }
             other => panic!("expected explicit node override to forward, got {other:?}"),
@@ -2270,7 +2270,7 @@ mod pg_tests {
         .fetch_one(&pool)
         .await
         .expect("read node override row");
-        assert_eq!(row.0, "worker-selected");
+        assert_eq!(row.0, "runner-selected");
         assert_eq!(row.1, serde_json::json!([]));
         assert_eq!(row.2, "agent-node-override");
 
@@ -2279,28 +2279,28 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preserving_node_override_rejects_legacy_worker_pg() {
+    async fn preserving_node_override_rejects_legacy_runner_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-legacy-selected",
+            "runner-legacy-selected",
             serde_json::json!([]),
             "online",
             serde_json::json!({
-                "intake_worker": { "enabled": true, "providers": ["claude"] }
+                "intake_runner": { "enabled": true, "providers": ["claude"] }
             }),
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-legacy-override");
-        ctx.node_override_instance_id = Some("worker-legacy-selected");
+        ctx.node_override_instance_id = Some("runner-legacy-selected");
         ctx.preserve_on_cancel = true;
         assert_eq!(
             try_route_intake(&pool, &ctx).await,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::OverrideUnavailable {
-                    target_instance_id: "worker-legacy-selected".to_string(),
+                    target_instance_id: "runner-legacy-selected".to_string(),
                 }
             }
         );
@@ -2321,16 +2321,16 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-selected-dup",
+            "runner-selected-dup",
             serde_json::json!(["mac-mini"]),
             "online",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-node-override-dup");
-        ctx.node_override_instance_id = Some("worker-selected-dup");
+        ctx.node_override_instance_id = Some("runner-selected-dup");
 
         // First call should forward.
         let first = try_route_intake(&pool, &ctx).await;
@@ -2375,22 +2375,22 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-offline",
+            "runner-offline",
             serde_json::json!(["mac-mini"]),
             "offline",
         )
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-node-offline");
-        ctx.node_override_instance_id = Some("worker-offline");
+        ctx.node_override_instance_id = Some("runner-offline");
         let decision = try_route_intake(&pool, &ctx).await;
         assert_eq!(
             decision,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::OverrideUnavailable {
-                    target_instance_id: "worker-offline".to_string()
+                    target_instance_id: "runner-offline".to_string()
                 }
             }
         );
@@ -2419,9 +2419,9 @@ mod pg_tests {
             serde_json::json!([]),
         )
         .await;
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
-            "worker-online-no-consumer",
+            "runner-online-no-consumer",
             serde_json::json!(["mac-mini"]),
             "online",
             serde_json::json!({}),
@@ -2429,13 +2429,13 @@ mod pg_tests {
         .await;
 
         let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "ch-node-no-consumer");
-        ctx.node_override_instance_id = Some("worker-online-no-consumer");
+        ctx.node_override_instance_id = Some("runner-online-no-consumer");
         let decision = try_route_intake(&pool, &ctx).await;
         assert_eq!(
             decision,
             IntakeRouterDecision::Blocked {
                 reason: IntakeBlockedReason::OverrideUnavailable {
-                    target_instance_id: "worker-online-no-consumer".to_string()
+                    target_instance_id: "runner-online-no-consumer".to_string()
                 }
             }
         );
@@ -2464,9 +2464,9 @@ mod pg_tests {
             serde_json::json!(["unreal"]),
         )
         .await;
-        seed_worker_node(
+        seed_runner_node(
             &pool,
-            "worker-conflict",
+            "runner-conflict",
             serde_json::json!(["unreal"]),
             "online",
         )
@@ -2480,7 +2480,7 @@ mod pg_tests {
                 channel_id, user_msg_id, request_owner_id, user_text,
                 turn_kind, agent_id, status, attempt_no
              ) VALUES (
-                'worker-conflict', 'leader-1', '[\"unreal\"]'::JSONB,
+                'runner-conflict', 'hub-1', '[\"unreal\"]'::JSONB,
                 'ch-conflict', 'msg-prior', '50', 'prior',
                 'foreground', 'agent-conflict', 'pending', 1
              )",
@@ -2506,7 +2506,7 @@ mod pg_tests {
                 open_route_age_secs,
                 resolved_owner,
             } => {
-                assert_eq!(target_instance_id, "worker-conflict");
+                assert_eq!(target_instance_id, "runner-conflict");
                 assert_eq!(open_route_status, Some(IntakeOutboxStatus::Pending));
                 assert_eq!(resolved_owner, ResolvedSessionOwner::NoOwner);
                 assert!(
@@ -2531,7 +2531,7 @@ mod pg_tests {
                 target_instance_id, forwarded_by_instance_id, required_labels,
                 channel_id, user_msg_id, request_owner_id, user_text,
                 turn_kind, agent_id, status, attempt_no
-             ) VALUES ($1, 'leader-1', '[]'::JSONB, $2, 'msg-prior', '50',
+             ) VALUES ($1, 'hub-1', '[]'::JSONB, $2, 'msg-prior', '50',
                 'prior', 'foreground', 'agent-owner-telemetry', 'pending', 1)",
         )
         .bind(target_instance_id)
@@ -2548,10 +2548,10 @@ mod pg_tests {
     ) {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
-        seed_open_route(&pool, channel_id, "worker-open-route").await;
+        seed_open_route(&pool, channel_id, "runner-open-route").await;
         if let Some(instance_id) = owner_instance_id {
-            if instance_id != "leader-1" {
-                seed_worker_node(&pool, instance_id, serde_json::json!([]), "online").await;
+            if instance_id != "hub-1" {
+                seed_runner_node(&pool, instance_id, serde_json::json!([]), "online").await;
             }
             seed_session_owner(
                 &pool,
@@ -2602,7 +2602,7 @@ mod pg_tests {
     async fn open_route_telemetry_preserves_local_owner_pg() {
         open_route_owner_telemetry_case(
             "ch-open-route-local-owner",
-            Some("leader-1"),
+            Some("hub-1"),
             ResolvedSessionOwner::LiveLocal,
         )
         .await;
@@ -2612,7 +2612,7 @@ mod pg_tests {
     async fn open_route_telemetry_preserves_foreign_owner_pg() {
         open_route_owner_telemetry_case(
             "ch-open-route-foreign-owner",
-            Some("worker-live-owner"),
+            Some("runner-live-owner"),
             ResolvedSessionOwner::LiveForeign,
         )
         .await;
@@ -2629,39 +2629,39 @@ mod pg_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn enforce_mode_with_no_eligible_worker_falls_back_to_local() {
+    async fn enforce_mode_with_no_eligible_runner_falls_back_to_local() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
 
         seed_agent_with_preference(
             &pool,
-            "agent-noworker",
-            "ch-noworker",
+            "agent-norunner",
+            "ch-norunner",
             serde_json::json!(["unreal"]),
         )
         .await;
-        // Worker exists but with WRONG labels.
-        seed_worker_node(&pool, "worker-x", serde_json::json!(["api"]), "online").await;
+        // Runner exists but with WRONG labels.
+        seed_runner_node(&pool, "runner-x", serde_json::json!(["api"]), "online").await;
 
         let decision = try_route_intake(
             &pool,
-            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-noworker"),
+            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-norunner"),
         )
         .await;
         assert_eq!(
             decision,
             IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::NoEligibleWorker
+                reason: RanLocalReason::NoEligibleRunner
             }
         );
 
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM intake_outbox WHERE channel_id = $1")
-                .bind("ch-noworker")
+                .bind("ch-norunner")
                 .fetch_one(&pool)
                 .await
                 .expect("count");
-        assert_eq!(count, 0, "no-eligible-worker must not insert");
+        assert_eq!(count, 0, "no-eligible-runner must not insert");
 
         pool.close().await;
         pg_db.drop().await;
@@ -2679,7 +2679,7 @@ mod pg_tests {
 
         seed_agent_with_preference(&pool, "agent-dup", "ch-dup", serde_json::json!(["unreal"]))
             .await;
-        seed_worker_node(&pool, "worker-dup", serde_json::json!(["unreal"]), "online").await;
+        seed_runner_node(&pool, "runner-dup", serde_json::json!(["unreal"]), "online").await;
 
         // First call should forward.
         let first = try_route_intake(

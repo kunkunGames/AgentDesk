@@ -14,8 +14,8 @@ fn compact_command_name_first_stub() -> &'static str {
 // The relay of a turn's output must come from EXACTLY ONE owner. The
 // deferred path has two participants:
 //   * the OBSERVER's BridgeAdapter idle-response tail, and
-//   * the deferred worker's claimed (watcher) owner.
-// If the observer skips but the worker never adopts the watcher owner, the
+//   * the deferred runner's claimed (watcher) owner.
+// If the observer skips but the runner never adopts the watcher owner, the
 // output is dropped (a GAP). If both run, it relays twice (a DUPLICATE).
 // These tests pin BOTH production decisions against the REAL lease store.
 // ====================================================================
@@ -29,7 +29,7 @@ fn deferred_observer_skips_bridge_tail() {
     assert!(
         !observer_should_spawn_bridge_tail(true, ExternalInputRelayOwner::BridgeAdapter),
         "deferred path: the observer must NOT spawn its own bridge tail \
-             (the worker owns the relay handoff) — else DUPLICATE relay"
+             (the runner owns the relay handoff) — else DUPLICATE relay"
     );
     // Non-deferred + BridgeAdapter owner ⇒ observer relays (the normal path).
     assert!(observer_should_spawn_bridge_tail(
@@ -44,7 +44,7 @@ fn deferred_observer_skips_bridge_tail() {
 }
 
 /// The no-GAP invariant end-to-end against the REAL lease store. When the
-/// synthetic start is deferred and the worker's claim resolves to the tmux
+/// synthetic start is deferred and the runner's claim resolves to the tmux
 /// WATCHER, the adoption re-records the lease as watcher-owned. We then prove
 /// EXACTLY ONE relayer remains:
 ///   (1) the observer stands down (deferred), AND
@@ -57,7 +57,7 @@ fn deferred_claim_adopts_watcher_owner_exactly_one_relayer_no_gap() {
     let tmux = "tmux-3154-p2-2-c";
     let channel_id: u64 = 770_000_000_000_001;
 
-    // Worker rehydrates the lease as BridgeAdapter (the persisted pre-claim
+    // Runner rehydrates the lease as BridgeAdapter (the persisted pre-claim
     // owner), records it, then the claim resolves to the WATCHER.
     let mut lease = ExternalInputRelayLease::unassigned(Some(channel_id));
     lease.relay_owner = ExternalInputRelayOwner::BridgeAdapter;
@@ -76,7 +76,7 @@ fn deferred_claim_adopts_watcher_owner_exactly_one_relayer_no_gap() {
              observer/bridge tail would relay a SECOND copy"
     );
 
-    // Perform the adoption exactly as the deferred worker does: re-record the
+    // Perform the adoption exactly as the deferred runner does: re-record the
     // lease with the claimed owner into the REAL store.
     let mut adopted = lease.clone();
     adopted.relay_owner = claimed_owner;
@@ -114,24 +114,24 @@ fn deferred_claim_adopts_watcher_owner_exactly_one_relayer_no_gap() {
 /// #3154 P1 (BridgeAdapter-GAP) — the PARALLEL no-GAP invariant for the OTHER
 /// resolved owner. When the deferred claim resolves to the BridgeAdapter (NO
 /// watcher will relay this turn), there must STILL be exactly one relayer: the
-/// worker spawns the bridge tail. We count relayers explicitly:
+/// runner spawns the bridge tail. We count relayers explicitly:
 ///   * observer(0) — stood down on the deferred path, AND
 ///   * watcher(0) — the resolved owner is the BridgeAdapter, not the watcher, SO
-///   * worker bridge tail(1) — `deferred_claim_requires_bridge_tail_relayer` fires.
+///   * runner bridge tail(1) — `deferred_claim_requires_bridge_tail_relayer` fires.
 ///
-/// RED before this fix: the worker never spawned a bridge tail for the
-/// BridgeAdapter owner, so observer(0) + watcher(0) + worker(0) == 0 == GAP.
-/// Neutralizing the new branch the OTHER direction (forcing the worker to spawn
+/// RED before this fix: the runner never spawned a bridge tail for the
+/// BridgeAdapter owner, so observer(0) + watcher(0) + runner(0) == 0 == GAP.
+/// Neutralizing the new branch the OTHER direction (forcing the runner to spawn
 /// for the WATCHER owner) is covered by the watcher test below staying at 1.
 #[test]
 fn deferred_claim_resolves_bridge_owner_exactly_one_relayer_no_gap() {
     // Deferred ⇒ the observer stands down regardless of owner (it cannot know
-    // the resolved owner pre-claim and hands the decision to the worker).
+    // the resolved owner pre-claim and hands the decision to the runner).
     let observer_relays =
         observer_should_spawn_bridge_tail(true, ExternalInputRelayOwner::BridgeAdapter);
     assert!(
         !observer_relays,
-        "deferred path: the observer always stands down (the worker owns the \
+        "deferred path: the observer always stands down (the runner owns the \
              post-claim bridge-tail decision)"
     );
 
@@ -140,52 +140,52 @@ fn deferred_claim_resolves_bridge_owner_exactly_one_relayer_no_gap() {
     let watcher_relays = matches!(resolved_owner, ExternalInputRelayOwner::TmuxWatcher);
     assert!(!watcher_relays, "BridgeAdapter owner ⇒ no watcher relayer");
 
-    // PRODUCTION decision: the worker MUST spawn its bridge tail for the
+    // PRODUCTION decision: the runner MUST spawn its bridge tail for the
     // BridgeAdapter owner — this is the GAP fix.
-    let worker_bridge_tail = deferred_claim_requires_bridge_tail_relayer(resolved_owner);
+    let runner_bridge_tail = deferred_claim_requires_bridge_tail_relayer(resolved_owner);
     assert!(
-        worker_bridge_tail,
-        "BridgeAdapter-owned deferred claim MUST get a worker bridge tail — \
-             RED before this fix (worker spawned nothing ⇒ relayer_count == 0 == GAP)"
+        runner_bridge_tail,
+        "BridgeAdapter-owned deferred claim MUST get a runner bridge tail — \
+             RED before this fix (runner spawned nothing ⇒ relayer_count == 0 == GAP)"
     );
 
     let relayer_count =
-        u8::from(observer_relays) + u8::from(watcher_relays) + u8::from(worker_bridge_tail);
+        u8::from(observer_relays) + u8::from(watcher_relays) + u8::from(runner_bridge_tail);
     assert_eq!(
         relayer_count, 1,
         "EXACTLY ONE relayer on the deferred BridgeAdapter path: not zero (no \
-             GAP) and not two (no duplicate). RED if the worker bridge tail is \
+             GAP) and not two (no duplicate). RED if the runner bridge tail is \
              dropped (count == 0, GAP) or if the observer also relays (count == 2)."
     );
 }
 
 /// #3154 P1 (BridgeAdapter-GAP) — the symmetric guard: when the deferred claim
-/// resolves to the WATCHER, the worker must NOT spawn a bridge tail (the watcher
+/// resolves to the WATCHER, the runner must NOT spawn a bridge tail (the watcher
 /// is the sole relayer). This pins the owner-kind-awareness in the OTHER
-/// direction: neutralizing the branch so the worker spawns unconditionally would
+/// direction: neutralizing the branch so the runner spawns unconditionally would
 /// push the watcher path to relayer_count == 2 (DUPLICATE) and turn this RED.
 #[test]
-fn deferred_claim_resolves_watcher_owner_worker_bridge_tail_stands_down() {
+fn deferred_claim_resolves_watcher_owner_runner_bridge_tail_stands_down() {
     let resolved_owner = ExternalInputRelayOwner::TmuxWatcher;
     let observer_relays = observer_should_spawn_bridge_tail(true, resolved_owner);
     let watcher_relays = matches!(resolved_owner, ExternalInputRelayOwner::TmuxWatcher);
-    let worker_bridge_tail = deferred_claim_requires_bridge_tail_relayer(resolved_owner);
+    let runner_bridge_tail = deferred_claim_requires_bridge_tail_relayer(resolved_owner);
     assert!(
-        !worker_bridge_tail,
-        "watcher-owned deferred claim MUST NOT get a worker bridge tail — else \
+        !runner_bridge_tail,
+        "watcher-owned deferred claim MUST NOT get a runner bridge tail — else \
              DUPLICATE relay (the watcher already relays)"
     );
     let relayer_count =
-        u8::from(observer_relays) + u8::from(watcher_relays) + u8::from(worker_bridge_tail);
+        u8::from(observer_relays) + u8::from(watcher_relays) + u8::from(runner_bridge_tail);
     assert_eq!(
         relayer_count, 1,
         "EXACTLY ONE relayer on the deferred watcher path (the watcher); RED if \
-             the worker also spawns a bridge tail (count == 2, DUPLICATE)."
+             the runner also spawns a bridge tail (count == 2, DUPLICATE)."
     );
 }
 
 /// Adoption must NOT fire when the claim FAILED — a false claim leaves the
-/// owner untouched (the worker retries; nothing relays yet, by design).
+/// owner untouched (the runner retries; nothing relays yet, by design).
 #[test]
 fn failed_claim_does_not_adopt_owner() {
     assert!(
@@ -210,7 +210,7 @@ fn failed_claim_does_not_adopt_owner() {
 /// swapped `⏳ → ⚠` here, branding answered messages as failures. RED on
 /// the pre-#3296 code: no marker module/store exists and a `⚠` is added.
 /// codex r2 reverses the r1 tail: with the foreign row gone at the record
-/// instant the marker must pin the worker's LAST-VIEW identity and stay
+/// instant the marker must pin the runner's LAST-VIEW identity and stay
 /// UNCOVERED unless a commit tombstone proves the deletion was a commit —
 /// RED on the r1 code (row-absence alone pre-covered the marker, false-✅
 /// ing force-cleared unanswered anchors).
@@ -221,7 +221,7 @@ fn abort_cleanup_records_marker_and_keeps_hourglass() {
     // Durable BASE-root injection via the marker module's THREAD-LOCAL
     // test seam (never the process-global `AGENTDESK_ROOT_DIR` env —
     // mutating it races env-reading tests that hold no lock, e.g. the
-    // pending-start worker tests' `persist()`). The current-thread
+    // pending-start runner tests' `persist()`). The current-thread
     // `block_on` below keeps the cleanup future on this thread so the
     // override resolves inside it.
     struct RootReset;
@@ -258,7 +258,7 @@ fn abort_cleanup_records_marker_and_keeps_hourglass() {
         .build()
         .unwrap();
     // No inflight row exists for this channel in the test env (the row
-    // vanished post-final-view); the worker's last-view identity is what
+    // vanished post-final-view); the runner's last-view identity is what
     // the marker must pin (codex r2).
     let last_view = Some((888_777_u64, "2026-06-10 12:00:00".to_string()));
     rt.block_on(cleanup(&shared, &record, last_view.clone()));
@@ -946,13 +946,13 @@ fn classify_injected_prompt_subagent_notification_event() {
         "wrapped subagent_notification must pass after peeling the direct-injection wrapper"
     );
 
-    let newline_attr = "<subagent_notification\nkind=\"worker\">{\"status\":{\"completed\":\"done\"}}</subagent_notification>";
+    let newline_attr = "<subagent_notification\nkind=\"runner\">{\"status\":{\"completed\":\"done\"}}</subagent_notification>";
     assert_eq!(
         classify_injected_prompt(newline_attr),
         InjectedPromptClass::SubagentNotificationEvent,
         "subagent_notification detection must accept newline attribute boundaries",
     );
-    let tab_attr = "<subagent_notification\tkind=\"worker\">{\"status\":{\"completed\":\"done\"}}</subagent_notification>";
+    let tab_attr = "<subagent_notification\tkind=\"runner\">{\"status\":{\"completed\":\"done\"}}</subagent_notification>";
     assert_eq!(
         classify_injected_prompt(tab_attr),
         InjectedPromptClass::SubagentNotificationEvent,
@@ -5388,13 +5388,13 @@ fn claude_idle_response_start_offset_resets_stale_fallback_after_shrink() {
     assert_eq!(offset, 0);
 }
 
-// #3154 P1 (timestamp-anchor output loss): the worker-spawned BridgeAdapter
+// #3154 P1 (timestamp-anchor output loss): the runner-spawned BridgeAdapter
 // tail must anchor to the claim's post-drain EOF `turn_start_offset`, NOT a
 // `Utc::now()` timestamp scan. This proves the divergence on a transcript that
 // models the deferred-claim wait window: prior-turn bytes occupy `[0, X)`;
 // X is the post-drain EOF (the claim's `turn_start_offset`); THIS synthetic
 // turn then writes its response bytes at `[X, EOF)` DURING the wait, all with
-// timestamps that predate the worker's `Utc::now()` spawn (the worker spawns
+// timestamps that predate the runner's `Utc::now()` spawn (the runner spawns
 // the tail only AFTER the deferred claim resolves).
 //
 // RED (old `Utc::now()` timestamp anchoring): the scan looks for the first
@@ -5409,7 +5409,7 @@ fn claude_idle_response_start_offset_resets_stale_fallback_after_shrink() {
 // re-reads `[0, X)` (no prior-turn re-relay). The EOF offset is the boundary.
 #[cfg(unix)]
 #[test]
-fn worker_bridge_tail_anchors_to_turn_start_offset_not_utc_now_timestamp_scan() {
+fn runner_bridge_tail_anchors_to_turn_start_offset_not_utc_now_timestamp_scan() {
     let dir = tempfile::tempdir().expect("temp dir");
     let transcript = dir.path().join("transcript.jsonl");
 
@@ -5420,19 +5420,19 @@ fn worker_bridge_tail_anchors_to_turn_start_offset_not_utc_now_timestamp_scan() 
     let turn_start_offset = prior.len() as u64; // post-drain EOF == X (claim's turn_start_offset)
 
     // THIS synthetic turn's response bytes, written at `[X, EOF)` DURING the
-    // deferred-claim wait. Their timestamps predate the worker's spawn instant.
+    // deferred-claim wait. Their timestamps predate the runner's spawn instant.
     let turn_a = r#"{"timestamp":"2026-05-28T00:00:05Z","type":"assistant","text":"part-1"}"#;
     let turn_b = r#"{"timestamp":"2026-05-28T00:00:06Z","type":"assistant","text":"part-2"}"#;
     let turn = format!("{turn_a}\n{turn_b}\n");
     std::fs::write(&transcript, format!("{prior}{turn}")).expect("write transcript");
     let eof = (prior.len() + turn.len()) as u64;
 
-    // The worker synthesizes `observed_at = Utc::now()` only AFTER the claim
+    // The runner synthesizes `observed_at = Utc::now()` only AFTER the claim
     // wait — strictly after every byte above was written.
-    let worker_spawn_now = chrono::DateTime::parse_from_rfc3339("2026-05-28T00:01:00Z")
+    let runner_spawn_now = chrono::DateTime::parse_from_rfc3339("2026-05-28T00:01:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
-    // The worker's fallback is the STALE binding cursor — a real pre-reseed
+    // The runner's fallback is the STALE binding cursor — a real pre-reseed
     // value that points PAST this turn (here: EOF). The explicit-anchor path
     // MUST override it; if the explicit offset were ignored and the timestamp
     // scan ran with this fallback, the turn's bytes would be skipped. Using a
@@ -5440,17 +5440,17 @@ fn worker_bridge_tail_anchors_to_turn_start_offset_not_utc_now_timestamp_scan() 
     // the fix is reverted (explicit anchor ignored) — i.e. a true RED→GREEN.
     let fallback_offset = eof;
 
-    // RED — the old `Utc::now()` timestamp anchoring (what the worker did
+    // RED — the old `Utc::now()` timestamp anchoring (what the runner did
     // before this fix): `resolve_idle_tail_start_offset(.., explicit=None, ..)`
-    // runs the timestamp scan. Every byte of this turn predates `worker_spawn_now`,
+    // runs the timestamp scan. Every byte of this turn predates `runner_spawn_now`,
     // so the scan finds no boundary line and returns the fallback. The relay
     // window then starts at the fallback. Demonstrate the skip directly: when
     // the fallback is the stale-high prior cursor (a real pre-reseed value),
     // the timestamp path lands PAST this turn and skips ALL of its bytes.
     let red_offset = resolve_idle_tail_start_offset(
         &transcript,
-        None, // old worker behaviour: no explicit anchor → Utc::now() scan
-        worker_spawn_now,
+        None, // old runner behaviour: no explicit anchor → Utc::now() scan
+        runner_spawn_now,
         eof, // stale-high fallback (== EOF) the scan falls back to
     );
     assert_eq!(
@@ -5465,12 +5465,12 @@ fn worker_bridge_tail_anchors_to_turn_start_offset_not_utc_now_timestamp_scan() 
     );
 
     // GREEN — explicit anchoring on the claim's post-drain EOF `turn_start_offset`
-    // (what the fixed worker passes: `explicit_start_offset = Some(turn_start_offset)`).
+    // (what the fixed runner passes: `explicit_start_offset = Some(turn_start_offset)`).
     // `observed_at`/`fallback` are IGNORED on this path.
     let green_offset = resolve_idle_tail_start_offset(
         &transcript,
         Some(turn_start_offset),
-        worker_spawn_now, // must be ignored
+        runner_spawn_now, // must be ignored
         fallback_offset,  // must be ignored
     );
     assert_eq!(

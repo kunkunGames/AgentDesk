@@ -89,7 +89,7 @@ async fn gateway_preference() -> Option<GatewayPreference> {
 
 /// May we hand the gateway over to the preferred node?
 ///
-/// Being `online` in `worker_nodes` is **not** sufficient. A node whose dcserver
+/// Being `online` in `cluster_nodes` is **not** sufficient. A node whose dcserver
 /// is up and heartbeating may have no token for this provider, may have failed
 /// before gateway startup, or may simply not be contending for the lease. Yielding
 /// to such a node hands the gateway to nobody: we release, self-fence, restart,
@@ -125,11 +125,11 @@ async fn preferred_gateway_is_waiting(
     provider: &ProviderKind,
 ) -> bool {
     let lease_ttl_secs = crate::config::load_graceful().cluster.lease_ttl_secs.max(1);
-    match crate::services::cluster::node_registry::list_worker_nodes(pool, lease_ttl_secs).await {
+    match crate::services::cluster::node_registry::list_cluster_nodes(pool, lease_ttl_secs).await {
         Ok(nodes) => should_yield_to_preferred(&nodes, preferred_instance_id, provider.as_str()),
         Err(error) => {
             tracing::warn!(
-                "GATEWAY-LEASE: could not read worker_nodes to check preferred gateway: {error}"
+                "GATEWAY-LEASE: could not read cluster_nodes to check preferred gateway: {error}"
             );
             false
         }
@@ -208,7 +208,7 @@ async fn acquire_as_preferred_gateway(
     // Publish the intent immediately rather than waiting for the next heartbeat,
     // so a peer holding the lease can start yielding right away.
     if let Err(error) =
-        crate::services::cluster::node_registry::refresh_worker_node_runtime_capabilities(
+        crate::services::cluster::node_registry::refresh_runner_node_runtime_capabilities(
             pool,
             &crate::services::cluster::node_registry::resolve_self_instance_id_without_config(),
         )
@@ -514,7 +514,7 @@ async fn self_fence_gateway(
 /// the Discord relay down for ~2h until a manual restart).
 ///
 /// So instead of fencing on the first error, it re-acquires the lock on a fresh
-/// connection — mirroring the cluster-leader lease
+/// connection — mirroring the cluster-hub lease
 /// (`node_registry::spawn_heartbeat_loop`), which auto-recovered from the same
 /// blip while this loop did not:
 ///   * re-acquired (`Ok(Some)`)  → the gateway never went down; keep serving.

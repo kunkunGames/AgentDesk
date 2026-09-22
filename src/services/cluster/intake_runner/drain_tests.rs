@@ -1,4 +1,4 @@
-use super::IntakeWorkerLifecycle;
+use super::IntakeRunnerLifecycle;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -9,7 +9,7 @@ fn poll_drain(future: Pin<&mut impl Future<Output = ()>>) -> Poll<()> {
 
 #[test]
 fn last_tick_completes_both_pending_waiters() {
-    let lifecycle = IntakeWorkerLifecycle::default();
+    let lifecycle = IntakeRunnerLifecycle::default();
     let tick = lifecycle.try_begin_tick().unwrap();
     lifecycle.fence_admission();
     let mut first = Box::pin(lifecycle.wait_until_drained());
@@ -23,7 +23,7 @@ fn last_tick_completes_both_pending_waiters() {
 
 #[test]
 fn cancelled_waiter_does_not_block_survivor() {
-    let lifecycle = IntakeWorkerLifecycle::default();
+    let lifecycle = IntakeRunnerLifecycle::default();
     let tick = lifecycle.try_begin_tick().unwrap();
     lifecycle.fence_admission();
     let mut cancelled = Box::pin(lifecycle.wait_until_drained());
@@ -37,7 +37,7 @@ fn cancelled_waiter_does_not_block_survivor() {
 
 #[test]
 fn late_waiter_completes_without_another_notification() {
-    let lifecycle = IntakeWorkerLifecycle::default();
+    let lifecycle = IntakeRunnerLifecycle::default();
     let tick = lifecycle.try_begin_tick().unwrap();
     lifecycle.fence_admission();
     drop(tick);
@@ -47,7 +47,7 @@ fn late_waiter_completes_without_another_notification() {
 
 #[test]
 fn nonfinal_tick_does_not_complete_drain() {
-    let lifecycle = IntakeWorkerLifecycle::default();
+    let lifecycle = IntakeRunnerLifecycle::default();
     let first_tick = lifecycle.try_begin_tick().unwrap();
     let last_tick = lifecycle.try_begin_tick().unwrap();
     lifecycle.fence_admission();
@@ -62,12 +62,12 @@ fn nonfinal_tick_does_not_complete_drain() {
 #[test]
 fn drain_registers_before_checking_active_ticks() {
     // Lexical order tripwire, not a runtime interleaving proof or Rust parser.
-    let source = include_str!("../intake_worker.rs");
+    let source = include_str!("../intake_runner.rs");
     let start = source
         .find("pub(crate) async fn wait_until_drained(")
         .unwrap();
     let end = source[start..]
-        .find("\npub(crate) struct IntakeWorkerTickGuard")
+        .find("\npub(crate) struct IntakeRunnerTickGuard")
         .unwrap();
     let body = &source[start..start + end];
     let register = body

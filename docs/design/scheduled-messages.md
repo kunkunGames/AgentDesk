@@ -27,7 +27,7 @@ outbox를 거치지 않고 기존 headless turn relay로 Discord에 게시된다
 | headless agent turn (`services/discord/health`) | agent 모드에서 턴 ID를 먼저 예약하고 `start_reserved_headless_agent_turn_with_owner_channel`로 대상 채널에 relay. 완료는 routines와 같은 transcript/quality-event 증거 모델로 판정 |
 | `routines` / `routine_runs` (0035) | 스키마 패턴 차용: 정의 row + 실행 이력 row 분리, `next_due_at` partial index due-scan, lease 기반 중복 실행 방지 |
 | `services/scheduling.rs` | routines와 scheduled messages가 함께 사용하는 `@every`/5-field cron 파싱 및 slot-anchor 다음 시각 계산 |
-| `worker_registry` + `message_outbox_loop` 패턴 | `scheduled_message_loop` 워커를 기존 등록 패턴으로 추가. adaptive backoff(500ms–5s) 폴링 패턴 동일 적용 |
+| `runner_registry` + `message_outbox_loop` 패턴 | `scheduled_message_loop` 워커를 기존 등록 패턴으로 추가. adaptive backoff(500ms–5s) 폴링 패턴 동일 적용 |
 | agent channel bindings | agent 모드는 명시적 `target_channel_id` 유무와 무관하게 primary Discord 채널을 필수로 한다. primary는 turn owner/session 컨텍스트이고, target 미지정 시 delivery 채널로도 사용 |
 | `outbound/source_registry.rs` | push/강등 outbox enqueue 소스 `scheduled_message`를 `LoopbackInternal`로만 허용 |
 
@@ -238,7 +238,7 @@ firing    ──(DELETE)──▶ canceled   (진행 중 delivery는 interrupted
 
 ## 스케줄러 워커 — `scheduled_message_loop`
 
-`worker_registry`에 기존 `message_outbox_loop`와 동일 패턴으로 등록
+`runner_registry`에 기존 `message_outbox_loop`와 동일 패턴으로 등록
 (adaptive backoff 500ms–5s — 예약 메시지는 분 단위 정밀도면 충분하므로
 idle 시 5s 상한까지 늘어나는 기존 백오프 로직을 그대로 사용).
 
@@ -273,8 +273,8 @@ idle 시 5s 상한까지 늘어나는 기존 백오프 로직을 그대로 사�
 
 3. 완료 감시 (agent 모드 running delivery만 해당):
    - `message_outbox_loop`와 같은 process-wide 계약으로 Discord runtime이 있는
-     프로세스만 poll한다. runtime 없는 leader는 durable turn을 그대로 두고,
-     runtime 복구 후 다른 leader가 adopt한다.
+     프로세스만 poll한다. runtime 없는 hub는 durable turn을 그대로 두고,
+     runtime 복구 후 다른 hub가 adopt한다.
    - turn ID의 non-empty assistant transcript → sent.
    - NO_REPLY, empty_response → 확정 terminal evidence를 parent→delivery lock 아래
      재검증하고, push_raw outbox INSERT + delivery/parent 종료를 한 transaction으로
@@ -284,7 +284,7 @@ idle 시 5s 상한까지 늘어나는 기존 백오프 로직을 그대로 사�
    - 확정 실패 뒤 push_raw 강등도 active parent+delivery lock, outbox INSERT,
      delivery/parent 종료를 한 transaction으로 commit한다.
    - poll owner는 자기 active lease 또는 만료/unowned row만 가져간다. 다른
-     leader의 active lease는 건너뛰며, takeover 시 claim_token을 교체해 stale
+     hub의 active lease는 건너뛰며, takeover 시 claim_token을 교체해 stale
      poller를 fencing한다. lease 만료가 가까운 순서로 batch를 순환한다.
 
 4. 재시도/부모 갱신:
@@ -308,14 +308,14 @@ idle 시 5s 상한까지 늘어나는 기존 백오프 로직을 그대로 사�
 확인한다. turn ID가 없거나 0086 writer의 `turn_intent_at IS NOT NULL`이면서 아직
 `launch_committed_at IS NULL`인 확실한 pre-call row만 re-arm한다. launch commit이
 있거나 rolling deploy 중 구버전 writer가 남긴 marker 없는 turn ID는 새 turn을
-만들지 않고 다음 leader의 poller가 같은 durable turn을 adopt한다. runtime ack가
+만들지 않고 다음 hub의 poller가 같은 durable turn을 adopt한다. runtime ack가
 없어도 timeout까지 fail-closed하며, 이는 claim token으로 막을 수 없는 기존 turn의
 늦은 Discord relay와 replacement turn의 중복 발화를 방지한다.
 pre-call rewind는 모든 turn phase marker를 같은 transaction에서 clear한다. 따라서
-이후 구버전 leader가 같은 slot을 re-arm해도 stale 0086 intent가 남지 않는다.
+이후 구버전 hub가 같은 slot을 re-arm해도 stale 0086 intent가 남지 않는다.
 Discord runtime 자체가 없는 프로세스도 카카오 전용 push는 claim할 수 있다.
-Discord target이 있거나 agent 모드인 정의는 runtime-capable leader를 기다린다.
-외부 outbox는 provider I/O 직전에 `dispatch_started_at`을 기록한다. 그 이후 worker
+Discord target이 있거나 agent 모드인 정의는 runtime-capable hub를 기다린다.
+외부 outbox는 provider I/O 직전에 `dispatch_started_at`을 기록한다. 그 이후 runner
 lease가 사라지면 결과를 `unknown`으로 닫고 payload를 제거하며 자동 재전송하지
 않는다. dispatch 전 설정/OAuth 실패만 최대 5회 bounded backoff로 재시도한다.
 runtime이 booting/cached-context/token-unavailable 상태인 direct agent fire도 retry
@@ -465,7 +465,7 @@ API 응답에 반환하지 않고 count-only summary만 반환한다. 반복 정
 1. **provider별 outbox + 감시 책임 단일화**: Discord push와 `push_raw`는
    slot 단위 persistent dedupe로 `message_outbox`에 handoff한 뒤 즉시 손을 떼고,
    카카오는 같은 transaction에서 generic external outbox로 handoff한다.
-   각 provider worker가 재시도/최종 전송을 소유한다. agent 정상 전달은 outbox가 아닌
+   각 provider runner가 재시도/최종 전송을 소유한다. agent 정상 전달은 outbox가 아닌
    headless turn relay와 transcript 증거를 사용한다.
 2. **정의/이력 분리 + fenced lease claim**: `uq_smdel_fire_slot` +
    `FOR UPDATE SKIP LOCKED`로 slot을 하나로 유지하고, 중단 slot은 같은 row에
@@ -493,8 +493,8 @@ API 응답에 반환하지 않고 count-only summary만 반환한다. 반복 정
 | `src/server/routes/scheduled_messages.rs` | 위 7개 핸들러 |
 | `src/server/routes/mod.rs`, `domains/ops.rs` | 라우트 등록 (protected ops 도메인) |
 | `src/server/routes/docs/inventory/endpoints/part_09.rs` | API docs 인벤토리 항목 (coverage 가드 필수) |
-| `src/services/scheduled_messages.rs`, `src/services/scheduled_messages/{evidence,timing,push_handoff,provider_targets,external_delivery}.rs` | scheduler + 원자적 fan-out + provider payload/worker + 완료 evidence/timing |
-| `src/server/worker_registry.rs` | 워커 등록 항목 추가 (`ScheduledMessages`, leader-only) |
+| `src/services/scheduled_messages.rs`, `src/services/scheduled_messages/{evidence,timing,push_handoff,provider_targets,external_delivery}.rs` | scheduler + 원자적 fan-out + provider payload/runner + 완료 evidence/timing |
+| `src/server/runner_registry.rs` | 워커 등록 항목 추가 (`ScheduledMessages`, hub-only) |
 | `src/server/outbox_gc.rs`, `src/services/maintenance/jobs/db_retention.rs` | 영구 slot dedupe sentinel을 GC/retention에서 보존 |
 | `src/services/scheduling.rs` | routines와 scheduled messages 양쪽이 의존하는 공용 스케줄 문법 + slot-anchor 계산 |
 | `src/services/discord/outbound/source_registry.rs` | `scheduled_message`를 LoopbackInternal source로 등록 |

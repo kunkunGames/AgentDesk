@@ -44,9 +44,9 @@ pub(in crate::services::discord) fn resolve_is_dm_channel(
 
 /// Resolve the channel name and parent category name for a Discord channel.
 ///
-/// `cache` is an optional optimization: when present (leader-side), category
+/// `cache` is an optional optimization: when present (hub-side), category
 /// names are looked up via the in-memory guild cache and avoid an extra REST
-/// hop. Worker-side callers without a live shard pass `None` and pay the
+/// hop. Runner-side callers without a live shard pass `None` and pay the
 /// REST fallback at line ~978 instead. Correctness is identical either way.
 pub(in crate::services::discord) async fn resolve_channel_category(
     http: &Arc<serenity::http::Http>,
@@ -119,7 +119,7 @@ pub(in crate::services::discord) async fn validate_live_channel_routing_with_dm_
 }
 
 /// Queue execution needs current channel policy, not a Gateway shard. Keep
-/// the same thread inheritance, DM and bot allowlist checks on REST workers.
+/// the same thread inheritance, DM and bot allowlist checks on REST runners.
 pub(in crate::services::discord) async fn validate_rest_channel_routing(
     http: &Arc<serenity::Http>,
     cache: Option<&Arc<serenity::cache::Cache>>,

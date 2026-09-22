@@ -901,7 +901,7 @@ mod simple_cancel_watcher_tests {
     #[test]
     fn linux_proc_stat_parser_handles_comm_with_spaces_and_parens() {
         let stat =
-            "123 (worker ) with spaces) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+            "123 (runner ) with spaces) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
 
         assert_eq!(
             super::parse_linux_proc_stat_after_comm(stat),

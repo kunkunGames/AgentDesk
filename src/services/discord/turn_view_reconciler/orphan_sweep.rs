@@ -77,7 +77,7 @@ pub(in crate::services::discord) async fn sweep_orphan_tui_anchor_reactions(
     // removal candidates). Any of the three holds landing after the verdict
     // aborts the removal: a live inflight row, an abort/deferred-claim marker
     // covering the exact anchor, or a durable pending-start pinned to the
-    // exact anchor (its deferring worker owns this ⏳'s lifecycle).
+    // exact anchor (its deferring runner owns this ⏳'s lifecycle).
     let holds_before_removal = |channel_id: u64, anchor_message_id: u64| {
         inflight::load_inflight_state_read_only(provider, channel_id).is_some()
             || tui_direct_abort_marker::load_for_channel(provider.as_str(), channel_id)

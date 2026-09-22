@@ -123,7 +123,7 @@ pub(super) async fn reap_orphaned_gateway_lease_for_instance_with_min_age(
               a.application_name,
               '^agentdesk:gateway:([0-9a-f]{16}):([0-9]+):([^:]+)$'
           ) parsed ON TRUE
-          LEFT JOIN worker_nodes n
+          LEFT JOIN cluster_nodes n
             ON n.instance_id = $5
            AND n.process_id = parsed[2]::INTEGER
            AND parsed[1] = $6
@@ -205,7 +205,7 @@ fn runtime_is_idle(shared: &SharedData) -> bool {
 
 fn unfence_runtimes(runtimes: &[Arc<SharedData>]) {
     for runtime in runtimes {
-        runtime.restart.intake_worker_lifecycle.unfence_admission();
+        runtime.restart.intake_runner_lifecycle.unfence_admission();
         runtime.restart.legacy_promotion_unfence();
     }
 }
@@ -470,13 +470,13 @@ pub(super) async fn attempt_clean_standby_promotion(
         .expect("registered standby keeps the process health registry alive")
         .await;
     for runtime in &runtimes {
-        runtime.restart.intake_worker_lifecycle.fence_admission();
+        runtime.restart.intake_runner_lifecycle.fence_admission();
         runtime.restart.legacy_promotion_fence();
     }
     for runtime in &runtimes {
         runtime
             .restart
-            .intake_worker_lifecycle
+            .intake_runner_lifecycle
             .wait_until_drained()
             .await;
     }
@@ -565,7 +565,7 @@ pub(super) async fn attempt_clean_standby_promotion(
 }
 
 /// Retry a confirmed standby lease until it becomes available. The provider's
-/// `SharedData` and intake workers are already live, so promotion uses the
+/// `SharedData` and intake runners are already live, so promotion uses the
 /// existing fenced deferred-restart path rather than constructing a second
 /// gateway in place.
 pub(super) async fn spawn_standby_gateway_retry(

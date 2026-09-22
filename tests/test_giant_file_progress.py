@@ -20,8 +20,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 PROGRESS = importlib.import_module("giant_file_progress")
 ROOT_FILE = "src/services/discord/turn_finalizer.rs"
 CHILD_FILE = "src/services/discord/turn_finalizer/terminal_handler.rs"
-SURVIVOR = "src/server/worker_registry.rs"
-SURVIVOR_CHILD = "src/server/worker_registry/slice.rs"
+SURVIVOR = "src/server/runner_registry.rs"
+SURVIVOR_CHILD = "src/server/runner_registry/slice.rs"
 PIN_FILE = "tests/test_delivery_journal_raw_writer.py"
 META_ROOT = ("shrink", "discord-finalizer", "2026-08-31", "#4712", "")
 META_SURVIVOR = ("shrink", "server-runtime", "2026-08-31", "#4710", "")
@@ -717,7 +717,7 @@ class GiantFileLedgerRepairTest(unittest.TestCase):
 
     def test_r2_03_measured_5744_retired_paths_allow_transition_cleanup(self):
         # Re-measured at base 5a3d16ef765b / head 769f7f0dd700: no source diff.
-        retired = {"src/server/worker_registry.rs": 483,
+        retired = {"src/server/runner_registry.rs": 483,
                    "src/services/discord/outbound/turn_output_controller.rs": 996,
                    "src/services/discord/tui_direct_pending_start.rs": 933,
                    "src/services/discord/turn_finalizer.rs": 860}

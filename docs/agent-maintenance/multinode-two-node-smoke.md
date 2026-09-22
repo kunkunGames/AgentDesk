@@ -13,13 +13,13 @@ Job: `multinode_regression`
 
 Coverage:
 
-- `single leader`: two PG pools contend for
-  `CLUSTER_LEADER_ADVISORY_LOCK_ID`; only one holder is accepted, then standby
+- `single hub`: two PG pools contend for
+  `CLUSTER_HUB_ADVISORY_LOCK_ID`; only one holder is accepted, then standby
   acquires after release.
-- `exactly-once claim`: two workers concurrently claim the same
+- `exactly-once claim`: two runners concurrently claim the same
   `task_dispatches` row; only one claim succeeds.
-- `lease reclaim`: an expired dispatch claim is reclaimed by a second worker.
-- `resource lock exclusive`: two workers contend for the same
+- `lease reclaim`: an expired dispatch claim is reclaimed by a second runner.
+- `resource lock exclusive`: two runners contend for the same
   `unreal:project:<repo>` lock; only one holder is accepted.
 - `tested head merge gate`: merge automation blocks when a required phase is
   missing for the current PR head SHA.
@@ -36,21 +36,21 @@ node --test policies/__tests__/merge-automation.test.js
 Run this only against a release runtime against the shared PostgreSQL instance.
 Do not stop `AgentDesk-*` tmux work sessions unless the operator explicitly asks.
 
-1. Start Mac mini as the configured leader:
+1. Start Mac mini as the configured hub:
 
 ```bash
 AGENTDESK_CLUSTER_ENABLED=true \
 AGENTDESK_CLUSTER_INSTANCE_ID=mac-mini-release \
-AGENTDESK_CLUSTER_ROLE=leader \
+AGENTDESK_CLUSTER_ROLE=hub \
 scripts/deploy-release.sh
 ```
 
-2. Start MacBook as worker:
+2. Start MacBook as runner:
 
 ```bash
 AGENTDESK_CLUSTER_ENABLED=true \
 AGENTDESK_CLUSTER_INSTANCE_ID=mac-book-release \
-AGENTDESK_CLUSTER_ROLE=worker \
+AGENTDESK_CLUSTER_ROLE=runner \
 scripts/deploy-release.sh
 ```
 
@@ -62,10 +62,10 @@ curl http://localhost:8787/api/cluster/nodes
 
 Expected:
 
-- two distinct `worker_nodes` rows
-- exactly one `effective_role=leader`
-- exactly one configured `cluster.role=leader`; all-`auto` clusters can elect a
-  runtime leader but skip destructive config-to-DB agent roster sync, so
+- two distinct `cluster_nodes` rows
+- exactly one `effective_role=hub`
+- exactly one configured `cluster.role=hub`; all-`auto` clusters can elect a
+  runtime hub but skip destructive config-to-DB agent roster sync, so
   `agentdesk.yaml` roster edits can remain frozen
 - MacBook/Mac mini capability surfaces differ where expected
 

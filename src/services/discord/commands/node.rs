@@ -173,7 +173,7 @@ async fn list_online_node_choices(
     };
     let lease_ttl_secs = crate::config::load_graceful().cluster.lease_ttl_secs.max(1);
     let mut nodes =
-        crate::services::cluster::node_registry::list_worker_nodes(pool, lease_ttl_secs).await?;
+        crate::services::cluster::node_registry::list_cluster_nodes(pool, lease_ttl_secs).await?;
     nodes.sort_by(|left, right| {
         let left_id = left
             .get("instance_id")
@@ -306,7 +306,7 @@ pub(in crate::services::discord) async fn cmd_node(ctx: Context<'_>) -> Result<(
         }
     };
     if nodes.is_empty() {
-        ctx.say("현재 provider의 intake worker를 광고하는 온라인 cluster node가 없습니다.")
+        ctx.say("현재 provider의 intake runner를 광고하는 온라인 cluster node가 없습니다.")
             .await?;
         return Ok(());
     }
@@ -411,7 +411,7 @@ pub(in crate::services::discord) async fn handle_node_picker_interaction(
             return ephemeral_reply(
                 ctx,
                 component,
-                "선택한 노드가 현재 provider의 intake worker를 광고하지 않습니다. `/node`를 다시 실행하세요.",
+                "선택한 노드가 현재 provider의 intake runner를 광고하지 않습니다. `/node`를 다시 실행하세요.",
             )
             .await;
         }

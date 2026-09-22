@@ -15,7 +15,7 @@ pub fn tmux_session_exists(tmux_session_name: &str) -> bool {
 /// Async-safe exact session-existence probe for request/reaper paths.
 ///
 /// `tmux_session_exists` invokes the tmux CLI and is therefore blocking. Keep
-/// it off Tokio workers and bound the join so a wedged tmux server cannot
+/// it off Tokio runners and bound the join so a wedged tmux server cannot
 /// wedge Discord intake. A timeout or join failure is treated conservatively
 /// as "present": stale-busy recovery must never release a turn unless absence
 /// was positively observed.
@@ -132,7 +132,7 @@ fn pane_liveness_override_for_tests(
 }
 
 /// Async adapter for the pre-existing #4489 pane probe. #4794 adopts the
-/// three-state answer off the Tokio worker and maps a blocking-task JoinError to
+/// three-state answer off the Tokio runner and maps a blocking-task JoinError to
 /// `ProbeError`; it does not introduce the liveness states or two-second bound.
 pub async fn probe_tmux_session_pane_liveness(
     tmux_session_name: &str,

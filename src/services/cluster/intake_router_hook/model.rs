@@ -4,7 +4,7 @@ use crate::db::intake_outbox::InsertPendingPayload;
 use crate::db::intake_outbox_status::IntakeOutboxStatus;
 
 /// What the hook decided. The intake gate uses this to choose between
-/// "skip local execution; the worker has the row" and "fall through
+/// "skip local execution; the runner has the row" and "fall through
 /// to `handle_text_message` as today".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntakeRoutingBasis {
@@ -30,7 +30,7 @@ pub(crate) enum IntakeRouterDecision {
     /// Observe mode evaluated the same owner-aware placement path as Enforce,
     /// but did not mutate the outbox. The caller MUST still run locally.
     Observed { outcome: ObservedIntakeOutcome },
-    /// The hook inserted a row for the worker. The caller MUST NOT
+    /// The hook inserted a row for the runner. The caller MUST NOT
     /// run the turn locally — that would double-emit the Discord turn.
     /// `outbox_id` is the row's PK for log correlation.
     Forwarded {
@@ -107,13 +107,13 @@ pub(crate) enum RanLocalReason {
     HookDisabled,
     /// Agent opted out (`preferred_intake_node_labels` empty).
     AgentHasNoPreference,
-    /// Agent opted in but no worker matches (offline, missing labels).
-    NoEligibleWorker,
-    /// Agent opted in and a worker matched, but the only eligible
-    /// candidate IS the leader.
-    LeaderIsOnlyEligible,
-    /// The ready leader is the agent's preferred execution device.
-    AgentDefaultIsLeader,
+    /// Agent opted in but no runner matches (offline, missing labels).
+    NoEligibleRunner,
+    /// Agent opted in and a runner matched, but the only eligible
+    /// candidate IS the hub.
+    HubIsOnlyEligible,
+    /// The ready hub is the agent's preferred execution device.
+    AgentDefaultIsHub,
     /// Some DB or schema error during the routing decision. Reported
     /// so operators see WHY a forward turned into a local fallback.
     DbErrorFellBackToLocal { detail: String },
@@ -125,10 +125,10 @@ pub(crate) enum RanLocalReason {
     /// Agent for this channel could not be looked up (channel not
     /// mapped to an agent). Treated as no-preference.
     NoAgentForChannel,
-    /// Channel has an explicit `/node` override to this leader, so the
-    /// leader should keep the turn local.
-    NodeOverrideIsLeader,
-    /// Channel has an explicit `/node` override, but the intake worker is only
+    /// Channel has an explicit `/node` override to this hub, so the
+    /// hub should keep the turn local.
+    NodeOverrideIsHub,
+    /// Channel has an explicit `/node` override, but the intake runner is only
     /// spawned in `Enforce` mode. Running locally avoids pending-row loss.
     NodeOverrideRoutingDisabled,
     /// This instance is the durable live owner for the session.
@@ -140,8 +140,8 @@ pub(crate) enum RanLocalReason {
 #[derive(Clone, Debug)]
 pub(crate) struct IntakeRouterContext<'a> {
     pub mode: IntakeRoutingMode,
-    pub leader_instance_id: &'a str,
-    /// Provider of the bot handling this intake (#4349). Worker claim is
+    pub hub_instance_id: &'a str,
+    /// Provider of the bot handling this intake (#4349). Runner claim is
     /// scoped on this, so it must be the forwarding bot's provider — never
     /// `agents.provider`, which is a single column shared by an agent's
     /// cc and cdx channels.
@@ -178,7 +178,7 @@ pub(super) fn build_payload_for_insert(
         execution_requirements: serde_json::json!({}),
         attachment_refs: serde_json::json!(ctx.attachment_refs),
         target_instance_id: target.to_string(),
-        forwarded_by_instance_id: ctx.leader_instance_id.to_string(),
+        forwarded_by_instance_id: ctx.hub_instance_id.to_string(),
         provider: ctx.provider.to_string(),
         required_labels: serde_json::Value::Array(
             preferred_labels
@@ -194,8 +194,8 @@ pub(super) fn build_payload_for_insert(
         reply_context: ctx.reply_context.map(str::to_string),
         has_reply_boundary: ctx.has_reply_boundary,
         dm_hint: ctx.dm_hint,
-        // Phase 4 codex follow-up: leader emits canonical "foreground"
-        // for `TurnKind::Foreground`; the worker's `parse_turn_kind`
+        // Phase 4 codex follow-up: hub emits canonical "foreground"
+        // for `TurnKind::Foreground`; the runner's `parse_turn_kind`
         // accepts both "foreground" and "standard" for backwards
         // compatibility with rows already in the queue.
         turn_kind: ctx.turn_kind.to_string(),

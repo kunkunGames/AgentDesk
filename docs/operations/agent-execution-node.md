@@ -18,7 +18,7 @@ GET /api/agents/{id}/execution-node
 PUT /api/agents/{id}/execution-node
 Content-Type: application/json
 
-{"default_node_id":"windows-worker-1"}
+{"default_node_id":"windows-pc"}
 ```
 
 `{"default_node_id":null}`은 기본값을 해제하고 기존 배정 정책을 사용한다. 필수

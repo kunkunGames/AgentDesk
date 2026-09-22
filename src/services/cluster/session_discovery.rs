@@ -1,4 +1,4 @@
-//! `SessionDiscovery` — worker-local loop that periodically enumerates live
+//! `SessionDiscovery` — runner-local loop that periodically enumerates live
 //! tmux sessions, runs them through [`super::session_matcher::match_session`],
 //! and reconciles its node's slice of the process-wide [`SessionRegistry`].
 //!
@@ -7,12 +7,12 @@
 //! broadcasts. This module deliberately does **not** spawn or stop any
 //! watchers — its only job is to keep the registry honest.
 //!
-//! ## Why worker-local (not leader-only)
+//! ## Why runner-local (not hub-only)
 //!
 //! tmux is host-scoped: every node in the cluster sees only the sessions on
-//! its own machine. A leader-only discovery loop on machine A literally
-//! cannot enumerate sessions on machine B, so leader takeover would silently
-//! lose observability of the previous leader's host. Discovery therefore runs
+//! its own machine. A hub-only discovery loop on machine A literally
+//! cannot enumerate sessions on machine B, so hub takeover would silently
+//! lose observability of the previous hub's host. Discovery therefore runs
 //! on **every** node, and `reconcile_for_node` scopes mutations to the
 //! current `instance_id` — peer nodes' entries are never touched. The
 //! registry's keying (session name → entry) plus the `instance_id` field
@@ -20,7 +20,7 @@
 //!
 //! ## Boot reconcile
 //!
-//! The first poll cycle runs **immediately** when the worker starts. This
+//! The first poll cycle runs **immediately** when the runner starts. This
 //! re-attaches the registry to any session that survived a dcserver restart
 //! within a single poll cycle — Acceptance criterion B in the epic.
 //!
@@ -63,7 +63,7 @@ use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tm
 
 /// Knobs for the discovery loop. Production callers use [`Self::default`].
 /// Kept as a struct (rather than a bare `Duration`) so future tuning (jitter,
-/// backoff, leader-acquisition delay) can land without churning every call
+/// backoff, hub-acquisition delay) can land without churning every call
 /// site.
 #[derive(Clone, Debug)]
 pub struct DiscoveryConfig {
@@ -642,10 +642,10 @@ fn trace_rejection(session: &EnumeratedSession, reason: &MatchRejection) {
     }
 }
 
-/// The discovery loop — runs on every cluster node (worker-local), each
+/// The discovery loop — runs on every cluster node (runner-local), each
 /// scoped to its own `instance_id` slice of the shared in-memory registry.
-/// tmux is host-local, so cross-node leader takeover cannot relocate
-/// observability; therefore discovery cannot be leader-only.
+/// tmux is host-local, so cross-node hub takeover cannot relocate
+/// observability; therefore discovery cannot be hub-only.
 ///
 /// Returns when `shutdown` flips true.
 pub async fn run_discovery_loop(

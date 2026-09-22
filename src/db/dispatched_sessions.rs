@@ -3010,7 +3010,7 @@ pub(crate) async fn update_session_pg(
     // callers cannot leave a zombie `active_dispatch_id` linked to a session
     // they just transitioned to `disconnected`/`aborted`, and so the PATCH
     // bumps `last_heartbeat` the same way the hook does. Without these two,
-    // PATCH self-reports from a worker would leave dashboard rows displaying
+    // PATCH self-reports from a runner would leave dashboard rows displaying
     // stale active dispatches and the SessionActivityResolver would treat the
     // session as inactive even when the caller has just provided a fresh
     // state report.

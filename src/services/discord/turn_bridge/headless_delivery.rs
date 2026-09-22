@@ -322,7 +322,7 @@ pub(super) async fn enqueue_headless_delivery(
                     let thread_channel_id = channel_id.get().to_string();
                     // #2838/#2950: once enqueue returned Ok(Some(outbox_id))
                     // the outbox row exists, but visible completion must still
-                    // wait for the notify-bot worker to mark that row sent.
+                    // wait for the notify-bot runner to mark that row sent.
                     // The delivery marker below is best-effort dedup bookkeeping;
                     // propagating a marker failure as a delivery Err makes the
                     // caller preserve inflight, which then re-delivers via
@@ -471,7 +471,7 @@ pub(super) async fn enqueue_headless_delivery(
         };
 
         // Phase 5.2 of intake-node-routing (issue #2009): use gateway-or-token
-        // fallback so the standby worker path can still deliver headless
+        // fallback so the standby runner path can still deliver headless
         // messages even when `cached_serenity_ctx` is None.
         let http = notify_http
             .or_else(|| shared.serenity_http_or_token_fallback())

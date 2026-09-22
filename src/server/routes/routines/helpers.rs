@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn run_now_guard_rejects_invalid_runtime_worker_config() {
+    fn run_now_guard_rejects_invalid_runtime_runner_config() {
         let mut config = RoutinesConfig {
             enabled: true,
             ..RoutinesConfig::default()
@@ -284,7 +284,7 @@ mod tests {
         config.max_agent_polls_per_tick = 0;
 
         let err = ensure_routine_runtime_runnable(&config)
-            .expect_err("worker-invalid routines config must reject run-now");
+            .expect_err("runner-invalid routines config must reject run-now");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code(), ErrorCode::Config);
         assert!(

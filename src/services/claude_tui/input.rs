@@ -1490,13 +1490,13 @@ where
 {
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            // Safe to park the worker thread because the multi-thread runtime
-            // has other workers to keep driving tasks during the block.
+            // Safe to park the runner thread because the multi-thread runtime
+            // has other runners to keep driving tasks during the block.
             tokio::task::block_in_place(|| handle.block_on(fut))
         }
         _ => {
             // Either no ambient runtime, or a current-thread runtime where
-            // `block_in_place` would panic and parking the only worker would
+            // `block_in_place` would panic and parking the only runner would
             // deadlock the runtime. Run the wait on a dedicated thread with
             // its own minimal current-thread runtime so we never block the
             // caller's runtime.
@@ -1534,7 +1534,7 @@ where
         }) {
         Ok(handle) => handle.join().unwrap_or_else(|panic| {
             tracing::warn!(
-                "prompt readiness fast-path worker panicked: {:?}; falling back to polling",
+                "prompt readiness fast-path runner panicked: {:?}; falling back to polling",
                 panic
             );
             T::fallback()
@@ -1542,7 +1542,7 @@ where
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                "failed to spawn prompt readiness fast-path worker; falling back to polling"
+                "failed to spawn prompt readiness fast-path runner; falling back to polling"
             );
             T::fallback()
         }
@@ -3521,7 +3521,7 @@ line 37";
     #[tokio::test(flavor = "current_thread")]
     async fn fast_path_does_not_panic_on_current_thread_runtime() {
         // Regression: `tokio::task::block_in_place` panics on current-thread
-        // runtimes. Many AgentDesk worker entry points (cluster watchers,
+        // runtimes. Many AgentDesk runner entry points (cluster watchers,
         // turn-bridge, doctor, etc.) build current-thread runtimes, so the
         // hook fast-path must never assume multi-thread. Budget is short so
         // the test stays fast.
@@ -3532,7 +3532,7 @@ line 37";
 
     #[tokio::test(flavor = "current_thread")]
     async fn fast_path_returns_ready_on_current_thread_runtime_when_notify_fires() {
-        // Even on a current-thread runtime the dedicated worker thread we
+        // Even on a current-thread runtime the dedicated runner thread we
         // spawn for the wait must observe a `notify_waiters` signal that
         // fires after the waiter registers.
         let notify = Arc::new(Notify::new());
@@ -3602,8 +3602,8 @@ line 37";
         let notify = Arc::new(Notify::new());
         let trigger = notify.clone();
 
-        // Race the trigger against the spawn_blocking worker. With `enable()`
-        // wired into the future body the worker registers BEFORE awaiting,
+        // Race the trigger against the spawn_blocking runner. With `enable()`
+        // wired into the future body the runner registers BEFORE awaiting,
         // so even if the notify_waiters call lands very close to the select
         // we still observe it. Generous budget so the test is robust even
         // on slow CI runners.

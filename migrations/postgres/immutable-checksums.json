@@ -650,6 +650,11 @@
       "path": "migrations/postgres/0127_agent_execution_node.sql",
       "version": 127,
       "sha256": "30ffd17ef546b3a0d2552563b2b9966eebc8b98b825d830f6c9ef8d3aa88e040"
+    },
+    {
+      "path": "migrations/postgres/0129_hub_runner_names.sql",
+      "version": 129,
+      "sha256": "eff36cd91664cec811193d2665cdc95cc9904bb9af782f212716d384c52e1cf7"
     }
   ],
   "version": 1

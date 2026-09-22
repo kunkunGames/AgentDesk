@@ -8,25 +8,25 @@ use super::{
 pub(super) struct IdleQueueRetentionGuard {
     queue_dir: PathBuf,
     lock_files_existed: bool,
-    _worker_lock: RelayQueueFileLock,
+    _runner_lock: RelayQueueFileLock,
 }
 
 impl IdleQueueRetentionGuard {
     pub(super) fn acquire(queue_dir: &Path) -> Option<Self> {
-        let worker_lock_path = queue_dir.join("worker.lock");
+        let runner_lock_path = queue_dir.join("runner.lock");
         let producer_lock_path = queue_dir.join("producer.lock");
-        let worker_lock_existed = worker_lock_path.exists();
+        let runner_lock_existed = runner_lock_path.exists();
         let producer_lock_existed = producer_lock_path.exists();
-        let lock_files_existed = worker_lock_existed && producer_lock_existed;
-        let worker_lock = lock_relay_queue_file(&worker_lock_path, true).ok()??;
-        if worker_lock_existed && !producer_lock_existed {
+        let lock_files_existed = runner_lock_existed && producer_lock_existed;
+        let runner_lock = lock_relay_queue_file(&runner_lock_path, true).ok()??;
+        if runner_lock_existed && !producer_lock_existed {
             let _producer_lock =
                 lock_relay_queue_file_with_mode(&producer_lock_path, true, true).ok()??;
         }
         Some(Self {
             queue_dir: queue_dir.to_path_buf(),
             lock_files_existed,
-            _worker_lock: worker_lock,
+            _runner_lock: runner_lock,
         })
     }
 
@@ -155,7 +155,7 @@ fn queue_contains_only_idle_state(queue_dir: &Path) -> bool {
             }
         } else if !matches!(
             name,
-            "worker.lock" | "producer.lock" | "next-sequence" | "completed-high-water"
+            "runner.lock" | "producer.lock" | "next-sequence" | "completed-high-water"
         ) {
             return false;
         }
@@ -178,6 +178,6 @@ fn remove_idle_queue_dir(queue_dir: &Path) {
     ] {
         let _ = std::fs::remove_dir(path);
     }
-    let _ = std::fs::remove_file(queue_dir.join("worker.lock"));
+    let _ = std::fs::remove_file(queue_dir.join("runner.lock"));
     let _ = std::fs::remove_dir(queue_dir);
 }

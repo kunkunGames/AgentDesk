@@ -8,7 +8,7 @@ pub(crate) async fn calendar_loop(pool: Arc<PgPool>) {
     loop {
         if let Err(_error) = tick(&pool).await {
             // SQL errors can include row content. Keep calendar diagnostics content-free.
-            tracing::warn!("calendar worker storage operation failed");
+            tracing::warn!("calendar runner storage operation failed");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }

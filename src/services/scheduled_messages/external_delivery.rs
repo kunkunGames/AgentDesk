@@ -1,7 +1,7 @@
 //! Durable scheduled delivery to non-Discord providers.
 //!
 //! A row becomes `dispatch_started` immediately before provider I/O. Losing a
-//! worker after that fence produces `unknown`, never an automatic replay that
+//! runner after that fence produces `unknown`, never an automatic replay that
 //! could duplicate a user-visible message.
 
 use std::sync::Arc;

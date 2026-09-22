@@ -408,7 +408,7 @@ struct HealthSnapshot {
 fn fetch_health_snapshot(options: &DoctorOptions) -> HealthSnapshot {
     let cfg = config::load_graceful();
     // Startup diagnostics describe this process, even when the user's CLI
-    // target is a remote leader. Manual doctor keeps its remote opt-in gate.
+    // target is a remote hub. Manual doctor keeps its remote opt-in gate.
     let base = if options.run_context == RunContext::StartupOnce {
         cfg.server.local_base_url()
     } else {
@@ -1170,7 +1170,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Dispatch Outbox",
             detail.clone(),
-            "Pending/retrying outbox items remain. If oldest age increases, check the delivery worker.",
+            "Pending/retrying outbox items remain. If oldest age increases, check the delivery runner.",
         )
         .with_subsystem("health")
         .with_path(health_detail_endpoint(&snapshot.base))

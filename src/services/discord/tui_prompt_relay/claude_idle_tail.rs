@@ -10,7 +10,7 @@ pub(super) async fn maybe_spawn_claude_idle_response_tail(
     // start to THIS explicit transcript byte offset (the deferred claim's
     // post-drain EOF `turn_start_offset`) and SKIP the `observed_at` timestamp
     // scan. The timestamp scan picks the first transcript line at/after
-    // `prompt.observed_at`; for the worker-spawned deferred-BridgeAdapter path
+    // `prompt.observed_at`; for the runner-spawned deferred-BridgeAdapter path
     // that timestamp is a `Utc::now()` synthesized AFTER the claim wait, so the
     // scan skips every byte written during the wait window — those bytes belong
     // to this synthetic turn and would be lost. The post-drain EOF offset is the

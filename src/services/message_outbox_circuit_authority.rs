@@ -1,6 +1,6 @@
 //! PostgreSQL authority for channel-scoped circuit alert activation (#4615 S3a).
 //!
-//! S3a is dormant: live producer wiring is forbidden until S3b adds the worker
+//! S3a is dormant: live producer wiring is forbidden until S3b adds the runner
 //! delivery fence. Vouch cancellation only covers `held`/`pending` rows.
 
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -270,7 +270,7 @@ async fn authority_is_current(
     .await
 }
 
-/// Stage an exact worker-invisible row. Dedupe collisions are idempotent only
+/// Stage an exact runner-invisible row. Dedupe collisions are idempotent only
 /// when payload identity and every circuit stamp match; all others fail closed.
 pub(crate) async fn stage_held(
     pool: &PgPool,
@@ -617,7 +617,7 @@ pub(crate) async fn revoke_on_fresh_vouch(
     Ok(FreshVouchRevoke::Revoked)
 }
 
-/// Cancellation reason stamped on a row fenced off by the worker delivery fence.
+/// Cancellation reason stamped on a row fenced off by the runner delivery fence.
 pub(crate) const DELIVERY_FENCE_CANCEL_REASON: &str = "circuit_authority_superseded_at_delivery";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -632,17 +632,17 @@ pub(crate) enum DeliveryFenceOutcome {
     /// must NOT deliver.
     Fenced,
     /// The lease (`claim_owner`/`claimed_at`) no longer matches or the row left
-    /// `processing`: a stale worker performed no mutation and must NOT deliver.
+    /// `processing`: a stale runner performed no mutation and must NOT deliver.
     LeaseLost,
 }
 
 /// Re-validate a claimed `processing` outbox row's circuit authority in the
-/// instant before the worker performs the Discord HTTP send (#4615 S3b — the
-/// worker delivery fence that activates S3a's dormant authority columns).
+/// instant before the runner performs the Discord HTTP send (#4615 S3b — the
+/// runner delivery fence that activates S3a's dormant authority columns).
 ///
 /// The fence is lease-guarded exactly like `mark_message_outbox_sent_pg` /
 /// `mark_message_outbox_failed_pg`: every mutation requires the row to still be
-/// `processing` under the caller's `claim_owner` + `claimed_at`, so a worker
+/// `processing` under the caller's `claim_owner` + `claimed_at`, so a runner
 /// whose lease was stolen (stale-claim reclaimed by another owner) neither
 /// fences nor stamps the row.
 ///

@@ -4,7 +4,7 @@
 > `docs/generated/giant-file-registry.md` are now untracked, checkout-local
 > views (#4724). This removes their production-line churn from git merges
 > entirely. The `regen-inventory` driver remains only for the two generated
-> inventories that are still committed: route and worker. It is a best-effort
+> inventories that are still committed: route and runner. It is a best-effort
 > ergonomic auto-resolver; source-of-truth invariants and tracked-doc drift are
 > enforced after generation in `scripts/ci-script-checks.sh`.
 
@@ -31,7 +31,7 @@ git config --local --get merge.regen-inventory.driver
 files that remain tracked:
 
 - `docs/generated/route-inventory.md`
-- `docs/generated/worker-inventory.md`
+- `docs/generated/runner-inventory.md`
 
 The generator also emits `module-inventory.md` and `giant-file-registry.md`, but
 `.gitignore` keeps those checkout-local. CI generates them before maintenance
@@ -103,7 +103,7 @@ partially-generated content.
   scripts/generate_inventory_docs.py`. Generation hard-fails source-of-truth
   violations such as an unregistered giant or invalid registry metadata. CI
   then runs `git diff --exit-code` for `ARCHITECTURE.md`, route inventory, and
-  worker inventory, the three generated outputs that remain tracked.
+  runner inventory, the three generated outputs that remain tracked.
   `check_agent_maintenance_docs.py` consumes the freshly generated, untracked
   module inventory and keeps frozen-surface membership/threshold checks active.
 - **Local convenience — the pre-push hook.** `.githooks/pre-push` regenerates

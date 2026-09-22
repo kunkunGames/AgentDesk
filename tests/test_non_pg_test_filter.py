@@ -15,7 +15,7 @@ MEMBERSHIP = ROOT / "scripts/check_pg_test_lane_membership.py"
 EXPECTED_FALSE_POSITIVES = (
     "db::dispatched_session_canonical_identity::pg_tests::"
     "canonical_identity_conflict_is_http_409_ready",
-    "db::postgres::tests::agent_roster_sync_gated_to_leader_or_single_node",
+    "db::postgres::tests::agent_roster_sync_gated_to_hub_or_single_node",
     "db::postgres::tests::background_backpressure_disabled_when_reserve_zero",
     "db::postgres::tests::background_backpressure_saturating_boundaries",
     "db::postgres::tests::background_backpressure_yields_only_at_or_past_budget",
@@ -24,6 +24,7 @@ EXPECTED_FALSE_POSITIVES = (
     "db::postgres::tests::"
     "checksum_resolution_filters_down_migrations_to_avoid_false_positive",
     "db::postgres::tests::clamp_foreground_reserve_always_leaves_a_background_slot",
+    "db::postgres::tests::env_lock_after_lifecycle_lock_trips_the_order_tripwire",
     "db::postgres::tests::runtime_pool_settings_enable_dead_peer_detection",
     "db::postgres::tests::startup_pool_settings_raise_pool_size_and_acquire_timeout",
     "reconcile::dispatch_delivery_reconcile_tests::"

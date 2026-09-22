@@ -556,7 +556,7 @@ pub(super) async fn poll_watcher_output_or_continue(
         }
     }
     // #3154: a deferred synthetic turn-start pending for this channel means
-    // the per-channel worker has not yet saved the matching inflight; keep
+    // the per-channel runner has not yet saved the matching inflight; keep
     // the bytes buffered (do NOT suppress / advance confirmed offset) so the
     // wakeup turn's response batch survives the wait window.
     let pending_synthetic_start_present = post_terminal_inflight_missing

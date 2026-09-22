@@ -13,7 +13,7 @@ agent의 필수 조건은 PostgreSQL `agents.execution_requirements`가 소유�
 {
   "os": ["windows"],
   "arch": ["x86_64"],
-  "nodes": ["windows-worker"],
+  "nodes": ["windows-runner"],
   "tools": ["git"],
   "repositories": ["kunkunGames/AgentDesk"],
   "backends": ["process"]

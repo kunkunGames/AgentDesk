@@ -1,4 +1,4 @@
-//! Worker-side intake polling loop. Phase 3 of intake-node-routing
+//! Runner-side intake polling loop. Phase 3 of intake-node-routing
 //! (docs/design/intake-node-routing.md).
 //!
 //! Polls `intake_outbox` for rows where `target_instance_id == self`,
@@ -8,12 +8,12 @@
 //! `services::discord::execute_intake_turn_core` to actually run the
 //! Discord turn.
 //!
-//! Phase 4 wires `start_intake_worker` into the worker-node bootstrap
+//! Phase 4 wires `start_intake_runner` into the runner-node bootstrap
 //! flow. Until then the loop is callable but never started in production.
 //!
 //! Critical invariants enforced here:
-//!   - Workers MUST abort the turn before spawning when
-//!     `mark_accepted` returns `Ok(false)` — that means the leader's
+//!   - Runners MUST abort the turn before spawning when
+//!     `mark_accepted` returns `Ok(false)` — that means the hub's
 //!     stale-claim sweep already reset the row, and double-execution
 //!     is the only way to double-emit a Discord turn.
 //!   - Once a row reaches `accepted`, auto-retry is forbidden
@@ -55,11 +55,11 @@ async fn classify_mark_done_miss(pool: &PgPool, row_id: i64, channel_id: &str, u
                 .stamp_handoff_observed
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
-                counter = "worker_stamp_handoff_observed",
+                counter = "runner_stamp_handoff_observed",
                 row_id,
                 channel_id,
                 user_msg_id,
-                "[intake_worker] mark_done CAS observed dispatched bridge handoff"
+                "[intake_runner] mark_done CAS observed dispatched bridge handoff"
             );
         }
         Ok(Some(IntakeOutboxStatus::Done)) => {
@@ -67,11 +67,11 @@ async fn classify_mark_done_miss(pool: &PgPool, row_id: i64, channel_id: &str, u
                 .lost_to_settlement
                 .fetch_add(1, Ordering::Relaxed);
             tracing::info!(
-                counter = "worker_mark_done_lost_to_settlement",
+                counter = "runner_mark_done_lost_to_settlement",
                 row_id,
                 channel_id,
                 user_msg_id,
-                "[intake_worker] mark_done CAS lost a normal settlement race"
+                "[intake_runner] mark_done CAS lost a normal settlement race"
             );
         }
         Ok(observed) => {
@@ -79,12 +79,12 @@ async fn classify_mark_done_miss(pool: &PgPool, row_id: i64, channel_id: &str, u
                 .divergence
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                counter = "worker_mark_done_divergence",
+                counter = "runner_mark_done_divergence",
                 row_id,
                 channel_id,
                 user_msg_id,
                 observed_status = ?observed,
-                "[intake_worker] mark_done CAS miss diverged from bridge handoff or settlement"
+                "[intake_runner] mark_done CAS miss diverged from bridge handoff or settlement"
             );
         }
         Err(error) => {
@@ -92,27 +92,27 @@ async fn classify_mark_done_miss(pool: &PgPool, row_id: i64, channel_id: &str, u
                 .divergence
                 .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                counter = "worker_mark_done_divergence",
+                counter = "runner_mark_done_divergence",
                 row_id,
                 channel_id,
                 user_msg_id,
                 %error,
-                "[intake_worker] mark_done CAS miss status read failed"
+                "[intake_runner] mark_done CAS miss status read failed"
             );
         }
     }
 }
 
-/// Provider-local worker activity used by the restart marker poller. The
+/// Provider-local runner activity used by the restart marker poller. The
 /// process-global shutdown counters remain separate; each provider waits only
 /// for its own accepted intake tick before consuming its barrier slot.
-pub(crate) struct IntakeWorkerLifecycle {
+pub(crate) struct IntakeRunnerLifecycle {
     admission_fenced: AtomicBool,
     active_ticks: std::sync::atomic::AtomicUsize,
     drained: tokio::sync::Notify,
 }
 
-impl Default for IntakeWorkerLifecycle {
+impl Default for IntakeRunnerLifecycle {
     fn default() -> Self {
         Self {
             admission_fenced: AtomicBool::new(false),
@@ -122,24 +122,24 @@ impl Default for IntakeWorkerLifecycle {
     }
 }
 
-impl IntakeWorkerLifecycle {
-    /// Acquire admission for one complete worker tick. The post-increment fence
+impl IntakeRunnerLifecycle {
+    /// Acquire admission for one complete runner tick. The post-increment fence
     /// check closes the load-before-fence race: either the tick is counted before
     /// the poller drains, or it relinquishes admission without touching the DB.
-    pub(crate) fn try_begin_tick(&self) -> Option<IntakeWorkerTickGuard<'_>> {
+    pub(crate) fn try_begin_tick(&self) -> Option<IntakeRunnerTickGuard<'_>> {
         if self.admission_fenced.load(Ordering::SeqCst) {
             return None;
         }
         self.finish_admission_after_open_check()
     }
 
-    fn finish_admission_after_open_check(&self) -> Option<IntakeWorkerTickGuard<'_>> {
+    fn finish_admission_after_open_check(&self) -> Option<IntakeRunnerTickGuard<'_>> {
         self.active_ticks.fetch_add(1, Ordering::SeqCst);
         if self.admission_fenced.load(Ordering::SeqCst) {
             self.finish_tick();
             return None;
         }
-        Some(IntakeWorkerTickGuard { lifecycle: self })
+        Some(IntakeRunnerTickGuard { lifecycle: self })
     }
 
     pub(crate) fn fence_admission(&self) {
@@ -174,11 +174,11 @@ impl IntakeWorkerLifecycle {
     }
 }
 
-pub(crate) struct IntakeWorkerTickGuard<'a> {
-    lifecycle: &'a IntakeWorkerLifecycle,
+pub(crate) struct IntakeRunnerTickGuard<'a> {
+    lifecycle: &'a IntakeRunnerLifecycle,
 }
 
-impl Drop for IntakeWorkerTickGuard<'_> {
+impl Drop for IntakeRunnerTickGuard<'_> {
     fn drop(&mut self) {
         self.lifecycle.finish_tick();
     }
@@ -199,7 +199,7 @@ enum AdmissionAction {
 
 fn admission_action(
     cancelled: &(dyn Fn() -> bool + Sync),
-    lifecycle: &IntakeWorkerLifecycle,
+    lifecycle: &IntakeRunnerLifecycle,
     checkpoint: AdmissionCheckpoint,
 ) -> AdmissionAction {
     if !cancelled() && !lifecycle.admission_is_fenced() {
@@ -214,16 +214,16 @@ fn admission_action(
 /// Poll-loop tunables. Defaults reflect the design doc's adaptive
 /// polling: tight cadence right after a successful claim so a burst
 /// of forwarded intakes drains fast, slower idle cadence so the
-/// worker does not pin its DB pool.
+/// runner does not pin its DB pool.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct IntakeWorkerConfig {
+pub(crate) struct IntakeRunnerConfig {
     /// Sleep between poll attempts when the queue had no rows to claim.
     pub idle_poll_interval: Duration,
     /// Sleep between poll attempts when the previous tick claimed a row.
     pub busy_poll_interval: Duration,
 }
 
-impl Default for IntakeWorkerConfig {
+impl Default for IntakeRunnerConfig {
     fn default() -> Self {
         Self {
             idle_poll_interval: Duration::from_secs(2),
@@ -241,7 +241,7 @@ pub(crate) enum TickOutcome {
     /// Loop claimed a row and the executor ran (whether it succeeded
     /// or failed terminally). Loop should sleep shorter to drain.
     Processed,
-    /// Loop claimed a row but lost the claim before accept. The leader's
+    /// Loop claimed a row but lost the claim before accept. The hub's
     /// stale-claim sweep got there first; this is operationally
     /// distinguishable from a normal Processed for metrics.
     LostClaimBeforeAccept,
@@ -255,7 +255,7 @@ pub(crate) enum TickOutcome {
 ///
 /// This is the unit a poll loop schedules — extracted so tests can
 /// drive single-tick scenarios without spawning a long-running task.
-pub(crate) async fn run_intake_worker_tick(
+pub(crate) async fn run_intake_runner_tick(
     pool: &PgPool,
     shared: &Arc<SharedData>,
     target_instance_id: &str,
@@ -263,7 +263,7 @@ pub(crate) async fn run_intake_worker_tick(
     claim_owner: &str,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<TickOutcome, sqlx::Error> {
-    let Some(_active_tick) = shared.restart.intake_worker_lifecycle.try_begin_tick() else {
+    let Some(_active_tick) = shared.restart.intake_runner_lifecycle.try_begin_tick() else {
         return Ok(TickOutcome::Cancelled);
     };
 
@@ -271,7 +271,7 @@ pub(crate) async fn run_intake_worker_tick(
     // retained as a belt-and-suspenders fence for signal-driven shutdown.
     if admission_action(
         cancelled,
-        &shared.restart.intake_worker_lifecycle,
+        &shared.restart.intake_runner_lifecycle,
         AdmissionCheckpoint::BeforeClaim,
     ) == AdmissionAction::StopBeforeClaim
     {
@@ -285,10 +285,10 @@ pub(crate) async fn run_intake_worker_tick(
     };
 
     // A marker can land while the claim transaction is in flight. Return only
-    // this worker's row to pending and stop before payload work or spawning.
+    // this runner's row to pending and stop before payload work or spawning.
     if admission_action(
         cancelled,
-        &shared.restart.intake_worker_lifecycle,
+        &shared.restart.intake_runner_lifecycle,
         AdmissionCheckpoint::AfterClaim,
     ) == AdmissionAction::ReleaseClaim
     {
@@ -306,14 +306,14 @@ pub(crate) async fn run_intake_worker_tick(
                 row_id = row.id,
                 channel_id = row.channel_id,
                 user_msg_id = row.user_msg_id,
-                "[intake_worker] pre-accept payload conversion failed: {msg}"
+                "[intake_runner] pre-accept payload conversion failed: {msg}"
             );
             let _ = mark_failed_pre_accept(pool, row.id, claim_owner, &msg).await?;
             return Ok(TickOutcome::Processed);
         }
     };
 
-    let runtime = match crate::services::discord::health::resolve_intake_worker_runtime(
+    let runtime = match crate::services::discord::health::resolve_intake_runner_runtime(
         shared,
         request.channel_id,
     )
@@ -335,7 +335,7 @@ pub(crate) async fn run_intake_worker_tick(
     let Some(_owner_tick) = runtime
         .shared
         .restart
-        .intake_worker_lifecycle
+        .intake_runner_lifecycle
         .try_begin_tick()
     else {
         release_cancelled_claim(pool, &row, claim_owner).await?;
@@ -344,11 +344,11 @@ pub(crate) async fn run_intake_worker_tick(
     let owner_shutdown = runtime.shared.restart.shutdown_reader();
     let owner_cancelled = || {
         cancelled()
-            || shared.restart.intake_worker_lifecycle.admission_is_fenced()
+            || shared.restart.intake_runner_lifecycle.admission_is_fenced()
             || owner_shutdown.load(Ordering::Acquire)
     };
 
-    if let Err(reason) = super::execution_requirements::validate_worker(&row) {
+    if let Err(reason) = super::execution_requirements::validate_runner(&row) {
         mark_failed_pre_accept(
             pool,
             row.id,
@@ -359,7 +359,7 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Processed);
     }
 
-    let uploads = match super::attachment_transfer::worker_uploads(pool, &row).await {
+    let uploads = match super::attachment_transfer::runner_uploads(pool, &row).await {
         Ok(uploads) => uploads,
         Err(reason) => {
             mark_failed_pre_accept(pool, row.id, claim_owner, &format!("attachments: {reason}"))
@@ -373,7 +373,7 @@ pub(crate) async fn run_intake_worker_tick(
     // acknowledgement wait for execute/final DB transition to drain.
     if admission_action(
         &owner_cancelled,
-        &runtime.shared.restart.intake_worker_lifecycle,
+        &runtime.shared.restart.intake_runner_lifecycle,
         AdmissionCheckpoint::AfterClaim,
     ) == AdmissionAction::ReleaseClaim
     {
@@ -389,7 +389,7 @@ pub(crate) async fn run_intake_worker_tick(
             row_id = row.id,
             channel_id = row.channel_id,
             user_msg_id = row.user_msg_id,
-            "[intake_worker] lost claim before accept (stale-claim sweep won the race) — aborting before spawn"
+            "[intake_runner] lost claim before accept (stale-claim sweep won the race) — aborting before spawn"
         );
         return Ok(TickOutcome::LostClaimBeforeAccept);
     }
@@ -403,7 +403,7 @@ pub(crate) async fn run_intake_worker_tick(
         // and bail without invoking the executor.
         tracing::warn!(
             row_id = row.id,
-            "[intake_worker] failed to advance accepted → spawned (operator force-fail?) — aborting"
+            "[intake_runner] failed to advance accepted → spawned (operator force-fail?) — aborting"
         );
         return Ok(TickOutcome::Processed);
     }
@@ -437,7 +437,7 @@ pub(crate) async fn run_intake_worker_tick(
                 row_id = row.id,
                 channel_id = row.channel_id,
                 user_msg_id = row.user_msg_id,
-                "[intake_worker] post-accept turn failed: {msg}"
+                "[intake_runner] post-accept turn failed: {msg}"
             );
             let advanced = mark_failed_post_accept(pool, row.id, claim_owner, &msg).await?;
             if !advanced {
@@ -445,7 +445,7 @@ pub(crate) async fn run_intake_worker_tick(
                     row_id = row.id,
                     channel_id = row.channel_id,
                     user_msg_id = row.user_msg_id,
-                    "[intake_worker] mark_failed_post_accept = false (row no longer in 'accepted'/'spawned'; operator force-fail or DB divergence)"
+                    "[intake_runner] mark_failed_post_accept = false (row no longer in 'accepted'/'spawned'; operator force-fail or DB divergence)"
                 );
             }
             Ok(TickOutcome::Processed)
@@ -464,7 +464,7 @@ async fn release_cancelled_claim(
             row_id = row.id,
             channel_id = row.channel_id,
             user_msg_id = row.user_msg_id,
-            "[intake_worker] restart fence could not release claim (ownership/state changed) — aborting before accept"
+            "[intake_runner] restart fence could not release claim (ownership/state changed) — aborting before accept"
         );
     }
     Ok(())
@@ -492,13 +492,13 @@ async fn release_cancelled_claim(
 /// set it before restart acknowledgement, fencing new poll ticks while an
 /// active tick drains to completion.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_intake_worker_loop(
+pub(crate) async fn run_intake_runner_loop(
     pool: PgPool,
     shared: Arc<SharedData>,
     target_instance_id: String,
     provider: String,
     claim_owner: String,
-    config: IntakeWorkerConfig,
+    config: IntakeRunnerConfig,
 ) {
     // Own the reader for the lifetime of the loop; `cancelled` is the single
     // live probe handed to every checkpoint, so the loop and the tick can never
@@ -511,15 +511,15 @@ pub(crate) async fn run_intake_worker_loop(
         claim_owner,
         idle_ms = config.idle_poll_interval.as_millis() as u64,
         busy_ms = config.busy_poll_interval.as_millis() as u64,
-        "[intake_worker] poll loop started"
+        "[intake_runner] poll loop started"
     );
     loop {
         if cancelled() {
-            tracing::info!(target_instance_id, "[intake_worker] cancelled — exiting");
+            tracing::info!(target_instance_id, "[intake_runner] cancelled — exiting");
             return;
         }
 
-        let tick = run_intake_worker_tick(
+        let tick = run_intake_runner_tick(
             &pool,
             &shared,
             &target_instance_id,
@@ -535,11 +535,11 @@ pub(crate) async fn run_intake_worker_loop(
                 config.busy_poll_interval
             }
             Ok(TickOutcome::Cancelled) => {
-                tracing::info!(target_instance_id, "[intake_worker] cancelled — exiting");
+                tracing::info!(target_instance_id, "[intake_runner] cancelled — exiting");
                 return;
             }
             Err(error) => {
-                tracing::warn!("[intake_worker] tick error (pool/sqlx): {error} — backing off");
+                tracing::warn!("[intake_runner] tick error (pool/sqlx): {error} — backing off");
                 config.idle_poll_interval
             }
         };
@@ -611,7 +611,7 @@ fn intake_request_from_row(row: &IntakeOutboxRow) -> Result<IntakeRequest, Strin
         // NULL is the pre-0093/older-producer shape: the durable row has no
         // author-classification proof, so fail safe to the historical
         // drop-on-cancel behavior instead of guessing human intent. New
-        // leaders always persist Some(true/false).
+        // hubs always persist Some(true/false).
         preserve_on_cancel: row.preserve_on_cancel.unwrap_or(false),
     })
 }
@@ -638,8 +638,8 @@ mod tests {
             execution_requirements: serde_json::json!({}),
             attachment_refs: serde_json::json!([]),
             id: 42,
-            target_instance_id: "worker-1".to_string(),
-            forwarded_by_instance_id: "leader-1".to_string(),
+            target_instance_id: "runner-1".to_string(),
+            forwarded_by_instance_id: "hub-1".to_string(),
             provider: "claude".to_string(),
             required_labels: serde_json::json!(["unreal"]),
             channel_id: "1234567890".to_string(),
@@ -658,7 +658,7 @@ mod tests {
             preserve_on_cancel: None,
             agent_id: "agent-x".to_string(),
             status: IntakeOutboxStatus::Claimed,
-            claim_owner: Some("worker-1.local".to_string()),
+            claim_owner: Some("runner-1.local".to_string()),
             attempt_no: 1,
             parent_outbox_id: None,
             retry_count: 0,
@@ -692,52 +692,52 @@ mod tests {
     }
 
     #[test]
-    fn worker_executor_forwards_restored_preservation_instead_of_literal_false() {
+    fn runner_executor_forwards_restored_preservation_instead_of_literal_false() {
         let executor_source =
-            include_str!("../discord/router/message_handler/intake_turn/worker_entry.rs");
+            include_str!("../discord/router/message_handler/intake_turn/runner_entry.rs");
         let start = executor_source
             .find("pub(crate) async fn execute_intake_turn_core(")
-            .expect("worker executor exists");
+            .expect("runner executor exists");
         let executor = &executor_source[start..];
         let call_start = executor
             .find("super::handle_text_message(")
-            .expect("worker delegates to the intake body");
+            .expect("runner delegates to the intake body");
         let call_end = executor[call_start..]
             .find("\n    .await")
             .map(|offset| call_start + offset)
-            .expect("worker awaits the intake body");
+            .expect("runner awaits the intake body");
         let forwarding_call = &executor[call_start..call_end];
 
         assert!(
             forwarding_call.contains("request.preserve_on_cancel,\n        request,"),
-            "worker executor must pass the preservation bit restored from the durable row"
+            "runner executor must pass the preservation bit restored from the durable row"
         );
         assert!(
             !forwarding_call.contains("\n        false,\n        request,"),
-            "worker executor must not restore the historical hardcoded false"
+            "runner executor must not restore the historical hardcoded false"
         );
     }
 
     #[test]
-    fn worker_ok_branch_textually_contains_done_writer_once_and_err_branch_contains_none() {
-        // This is a source contract because exercising `run_intake_worker_tick`
+    fn runner_ok_branch_textually_contains_done_writer_once_and_err_branch_contains_none() {
+        // This is a source contract because exercising `run_intake_runner_tick`
         // requires a production-shaped SharedData + Discord executor harness,
         // while this module's lane intentionally remains PG-free and synchronous.
         // It pins the current T2 precondition: the executor's `Ok(())` branch
         // textually contains the intake lifecycle's `mark_done` call.
         // This test does not strip comments or strings; the Python call-site
         // gate owns that filtering layer.
-        let worker_source = include_str!("intake_worker.rs");
-        let tick_start = worker_source
-            .find("pub(crate) async fn run_intake_worker_tick(")
-            .expect("worker tick exists");
-        let tick_end = worker_source
+        let runner_source = include_str!("intake_runner.rs");
+        let tick_start = runner_source
+            .find("pub(crate) async fn run_intake_runner_tick(")
+            .expect("runner tick exists");
+        let tick_end = runner_source
             .find("\nasync fn release_cancelled_claim(")
-            .expect("worker tick has its next symbol boundary");
-        let tick = &worker_source[tick_start..tick_end];
+            .expect("runner tick has its next symbol boundary");
+        let tick = &runner_source[tick_start..tick_end];
         let result_start = tick
             .find("let result = execute_intake_turn_core(")
-            .expect("worker invokes the executor");
+            .expect("runner invokes the executor");
         let result = &tick[result_start..];
         let ok_start = result
             .find("Ok(()) => {")
@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn marker_between_loop_check_and_claim_stops_before_claim() {
-        let lifecycle = IntakeWorkerLifecycle::default();
+        let lifecycle = IntakeRunnerLifecycle::default();
         assert!(
             !lifecycle.admission_is_fenced(),
             "the loop-level check observed an open fence"
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn restart_fence_rejects_all_future_tick_admissions_after_active_tick_drains() {
-        let lifecycle = IntakeWorkerLifecycle::default();
+        let lifecycle = IntakeRunnerLifecycle::default();
         let active = lifecycle
             .try_begin_tick()
             .expect("tick admitted before restart fence");
@@ -831,13 +831,13 @@ mod tests {
 
     #[test]
     fn fence_between_open_check_and_active_registration_rejects_late_tick() {
-        let lifecycle = IntakeWorkerLifecycle::default();
+        let lifecycle = IntakeRunnerLifecycle::default();
         assert!(!lifecycle.admission_is_fenced());
 
         lifecycle.fence_admission();
         assert!(
             lifecycle.finish_admission_after_open_check().is_none(),
-            "a worker paused after its open check must not register after the fence"
+            "a runner paused after its open check must not register after the fence"
         );
         assert_eq!(lifecycle.active_ticks.load(Ordering::SeqCst), 0);
     }
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn marker_between_claim_and_accept_requires_release_without_spawn() {
         let cancelled = || false;
-        let lifecycle = IntakeWorkerLifecycle::default();
+        let lifecycle = IntakeRunnerLifecycle::default();
         assert_eq!(
             admission_action(&cancelled, &lifecycle, AdmissionCheckpoint::BeforeClaim),
             AdmissionAction::Proceed
@@ -877,7 +877,7 @@ mod tests {
     fn live_probe_flip_after_claim_releases_before_accept() {
         let flag = AtomicBool::new(false);
         let cancelled = || flag.load(Ordering::Acquire);
-        let lifecycle = IntakeWorkerLifecycle::default();
+        let lifecycle = IntakeRunnerLifecycle::default();
 
         assert_eq!(
             admission_action(&cancelled, &lifecycle, AdmissionCheckpoint::BeforeClaim),
@@ -905,15 +905,15 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "intake_worker/dispatch_stamp_tests.rs"]
+#[path = "intake_runner/dispatch_stamp_tests.rs"]
 mod dispatch_stamp_tests;
 
 #[cfg(test)]
-#[path = "intake_worker/drain_tests.rs"]
+#[path = "intake_runner/drain_tests.rs"]
 mod drain_tests;
 
 // PG-backed tick coverage is intentionally NOT in this file:
-// `run_intake_worker_tick` calls `execute_intake_turn_core` →
+// `run_intake_runner_tick` calls `execute_intake_turn_core` →
 // `handle_text_message`, which requires a fully-populated
 // `Arc<SharedData>` + Discord runtime. Constructing that from outside
 // `services::discord` is not supported today (the prod-shape test
@@ -927,5 +927,5 @@ mod drain_tests;
 //     `db::intake_outbox::postgres_tests::mark_accepted_returns_false_when_sweep_already_reset_the_claim`
 //   - 23505 classification, claim ordering, sweep correctness:
 //     same module's other 13 tests.
-// Phase 4 (leader hook integration) will re-add tick-level integration
+// Phase 4 (hub hook integration) will re-add tick-level integration
 // tests once it has access to the harness.

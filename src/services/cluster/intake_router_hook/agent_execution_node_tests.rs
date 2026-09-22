@@ -1,6 +1,6 @@
 use super::pg_tests::{
-    ctx_for_channel, seed_agent_with_preference, seed_session_owner,
-    seed_worker_node_with_capabilities,
+    ctx_for_channel, seed_agent_with_preference, seed_runner_node_with_capabilities,
+    seed_session_owner,
 };
 use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
@@ -10,7 +10,7 @@ use serde_json::json;
 async fn seed_ready(pool: &PgPool, id: &str, os: &str, status: &str) {
     let mut caps = ready_node(id, os)["capabilities"].clone();
     caps["execution_capacity"] = json!({"version":1,"slots":1});
-    seed_worker_node_with_capabilities(pool, id, json!([]), status, caps).await;
+    seed_runner_node_with_capabilities(pool, id, json!([]), status, caps).await;
 }
 
 async fn set_primary(pool: &PgPool, primary: &str) {
@@ -30,11 +30,7 @@ async fn agent_primary_inherits_into_thread_with_bounded_fallback_without_moving
         .execute(&pool)
         .await
         .unwrap();
-    for (id, os) in [
-        ("leader-1", "macos"),
-        ("win", "windows"),
-        ("linux", "linux"),
-    ] {
+    for (id, os) in [("hub-1", "macos"), ("win", "windows"), ("linux", "linux")] {
         seed_ready(&pool, id, os, "online").await;
     }
     let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "8332");
@@ -73,7 +69,7 @@ async fn agent_primary_inherits_into_thread_with_bounded_fallback_without_moving
     assert!(matches!(
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::LeaderIsOnlyEligible
+            reason: RanLocalReason::HubIsOnlyEligible
         }
     ));
 
@@ -83,7 +79,7 @@ async fn agent_primary_inherits_into_thread_with_bounded_fallback_without_moving
         "claude:default-owner",
         "claude",
         "8333",
-        "leader-1",
+        "hub-1",
         "turn_active",
     )
     .await;
@@ -102,11 +98,11 @@ async fn agent_primary_inherits_into_thread_with_bounded_fallback_without_moving
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::Blocked { .. }
     ));
-    ctx.node_override_instance_id = Some("leader-1");
+    ctx.node_override_instance_id = Some("hub-1");
     assert!(matches!(
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::NodeOverrideIsLeader
+            reason: RanLocalReason::NodeOverrideIsHub
         }
     ));
     pool.close().await;
@@ -121,16 +117,16 @@ async fn unavailable_primary_uses_only_ready_compatible_candidates_and_never_mov
     seed_agent_with_preference(&pool, "default-agent", "8441", json!([])).await;
     set_primary(&pool, "win").await;
     seed_ready(&pool, "win", "windows", "offline").await;
-    seed_ready(&pool, "leader-1", "macos", "online").await;
+    seed_ready(&pool, "hub-1", "macos", "online").await;
     let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "8441");
     assert!(matches!(
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::LeaderIsOnlyEligible
+            reason: RanLocalReason::HubIsOnlyEligible
         }
     ));
 
-    // A stale owner is not no owner, even if the leader is healthy.
+    // A stale owner is not no owner, even if the hub is healthy.
     seed_session_owner(
         &pool,
         "claude:offline-owner",
@@ -164,7 +160,7 @@ async fn unavailable_primary_uses_only_ready_compatible_candidates_and_never_mov
         .unwrap();
 
     // Heartbeat alone cannot prove a fallback can execute a turn.
-    sqlx::query("UPDATE worker_nodes SET capabilities=capabilities-'execution_readiness' WHERE instance_id='leader-1'")
+    sqlx::query("UPDATE cluster_nodes SET capabilities=capabilities-'execution_readiness' WHERE instance_id='hub-1'")
         .execute(&pool).await.unwrap();
     for mode in [
         IntakeRoutingMode::Enforce,
@@ -187,11 +183,11 @@ async fn unavailable_primary_uses_only_ready_compatible_candidates_and_never_mov
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn preferred_leader_wins_but_unconfigured_agent_keeps_legacy_placement_pg() {
+async fn preferred_hub_wins_but_unconfigured_agent_keeps_legacy_placement_pg() {
     let fixture = TestPostgresDb::create().await;
     let pool = fixture.connect_and_migrate().await;
     seed_agent_with_preference(&pool, "default-agent", "8551", json!([])).await;
-    for (id, os) in [("leader-1", "macos"), ("win", "windows")] {
+    for (id, os) in [("hub-1", "macos"), ("win", "windows")] {
         seed_ready(&pool, id, os, "online").await;
     }
     let mut ctx = ctx_for_channel(IntakeRoutingMode::Disabled, "8551");
@@ -209,15 +205,15 @@ async fn preferred_leader_wins_but_unconfigured_agent_keeps_legacy_placement_pg(
             reason: RanLocalReason::AgentHasNoPreference
         }
     ));
-    set_primary(&pool, "leader-1").await;
+    set_primary(&pool, "hub-1").await;
     assert!(matches!(
         try_route_intake(&pool, &ctx).await,
         IntakeRouterDecision::RanLocal {
-            reason: RanLocalReason::AgentDefaultIsLeader
+            reason: RanLocalReason::AgentDefaultIsHub
         }
     ));
 
-    // A hard requirement wins over a preferred leader.
+    // A hard requirement wins over a preferred hub.
     sqlx::query("UPDATE agents SET execution_requirements=$1 WHERE id='default-agent'")
         .bind(json!({"os":["windows"]}))
         .execute(&pool)

@@ -89,7 +89,7 @@ pub(crate) fn spawn(config: crate::config::Config, pool: sqlx::PgPool, local: St
             cluster_instance_id: Some(local.clone()),
         };
         loop {
-            if let Ok(nodes) = crate::services::cluster::node_registry::list_worker_nodes(
+            if let Ok(nodes) = crate::services::cluster::node_registry::list_cluster_nodes(
                 &pool,
                 context.config.cluster.lease_ttl_secs.max(1),
             )
@@ -133,7 +133,7 @@ async fn probe(context: &ForwardCallerContext, node: &Value) -> Value {
             .ok_or("node_identity_missing")?;
         let origin = node["api_base_url"]
             .as_str()
-            .ok_or("worker_api_base_url_missing")?;
+            .ok_or("runner_api_base_url_missing")?;
         let target = build_trusted_target(
             &context.config.cluster,
             id,

@@ -1424,10 +1424,10 @@ async fn voice_turn_done_plays_distinct_done_chime() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let harness = VoicePcmHarness::new(&[]).await;
-    // #5485 S2a: the worker now takes a read-only `ShutdownReader` over the
+    // #5485 S2a: the runner now takes a read-only `ShutdownReader` over the
     // harness's own lifecycle flag, so the test no longer owns a writable
     // `Arc<AtomicBool>` of its own.
-    harness.runtime.spawn_progress_worker(
+    harness.runtime.spawn_progress_runner(
         harness.shared.clone(),
         harness.shared.restart.shutdown_reader(),
     );
@@ -1453,7 +1453,7 @@ async fn voice_turn_done_plays_distinct_done_chime() {
     // Both observations above are already awaited, so the semantic stop below
     // can never race them. Stopping through owner state keeps this call stable
     // across the S2b writer cutover.
-    crate::services::discord::shared_state::restart_lifecycle_tests::stop_pcm_worker_for_test(
+    crate::services::discord::shared_state::restart_lifecycle_tests::stop_pcm_runner_for_test(
         &harness.shared.restart,
     );
 }

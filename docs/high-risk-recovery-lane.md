@@ -1,6 +1,6 @@
 # High-Risk Recovery Lane
 
-고위험 회귀는 개별 함수 단위보다 상태 전이, 재시작, outbox 전달 경계, 지연된 worker 복구에서 더 자주 발생한다. 이 문서는 해당 영역을 `unit / state-transition integration / failure-recovery` 3계층으로 고정하고, 항상 실행되는 recovery lane과 남은 테스트 공백을 기록한다.
+고위험 회귀는 개별 함수 단위보다 상태 전이, 재시작, outbox 전달 경계, 지연된 runner 복구에서 더 자주 발생한다. 이 문서는 해당 영역을 `unit / state-transition integration / failure-recovery` 3계층으로 고정하고, 항상 실행되는 recovery lane과 남은 테스트 공백을 기록한다.
 
 > **#3035 Phase 1 메모:** 레거시 SQLite 기반 `src/integration_tests.rs` 및 `src/integration_tests/tests/high_risk_recovery.rs` 하네스(legacy-sqlite-tests 게이트, 기본 빌드 미컴파일)는 제거되었다. PG-only 회귀 보호는 `src/high_risk_recovery.rs` 로 이전되며, 아래 `scenario_*` 시나리오 표는 제거된 레거시 하네스 기준 기록(historical)이다. PG 스위트로의 시나리오 재매핑은 후속 Phase 에서 진행한다.
 
@@ -10,14 +10,14 @@
 | --- | --- | --- | --- |
 | `unit` | 파일 단위 직렬화/저장 규약, mailbox state, handoff roundtrip | `src/services/discord/inflight.rs`, `src/services/discord/handoff.rs`, `src/services/discord/channel_mailbox.rs` | 모듈별 `cargo test --bin agentdesk <filter>` |
 | `state-transition integration` | DB + policy engine + dispatch 상태 전이 | `src/integration_tests.rs` | 기본 gate: `cargo test --all-targets` |
-| `failure-recovery` | restart / reconcile / outbox delivery / delayed-worker recovery 경계 | `src/integration_tests/tests/high_risk_recovery.rs` | `cargo test --bin agentdesk high_risk_recovery::` |
+| `failure-recovery` | restart / reconcile / outbox delivery / delayed-runner recovery 경계 | `src/integration_tests/tests/high_risk_recovery.rs` | `cargo test --bin agentdesk high_risk_recovery::` |
 
 ## Recovery Lane Commands
 
 - 전체 recovery gate: `cargo test --bin agentdesk high_risk_recovery::`
 - restart / boot reconcile: `cargo test --bin agentdesk high_risk_recovery::failure_recovery::`
 - outbox delivery boundary: `cargo test --bin agentdesk high_risk_recovery::outbox_boundary::`
-- delayed worker / watchdog: `cargo test --bin agentdesk high_risk_recovery::delayed_worker::`
+- delayed runner / watchdog: `cargo test --bin agentdesk high_risk_recovery::delayed_runner::`
 
 ## Curated Scenarios
 
@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | `high_risk_recovery::failure_recovery::` | `scenario_3_restart_recovery_reconciles_broken_state`, `scenario_251_boot_reconcile_backfills_missing_notify_outbox`, `scenario_251_boot_reconcile_refires_missing_review_dispatch` | 부팅 직후 reconcile이 깨진 review pointer, 누락 outbox, 누락 review dispatch를 복구하는지 확인 |
 | `high_risk_recovery::outbox_boundary::` | `scenario_160_1_outbox_batch_delivers_exactly_once`, `scenario_160_2_recovery_fallback_completes_dispatch`, `scenario_160_4_outbox_processes_all_entries_including_duplicates` | notify exactly-once, fallback completion, duplicate delivery 경계를 고정 |
-| `high_risk_recovery::delayed_worker::` | `scenario_421_deadlock_recent_output_extends_watchdog`, `scenario_421_deadlock_stale_output_only_marks_suspected_deadlock`, `scenario_421_long_turn_alerts_start_at_30_minutes` | worker 지연과 최근 출력 유무에 따라 watchdog 연장/의심/알림 단계가 올바르게 분기되는지 확인 |
+| `high_risk_recovery::delayed_runner::` | `scenario_421_deadlock_recent_output_extends_watchdog`, `scenario_421_deadlock_stale_output_only_marks_suspected_deadlock`, `scenario_421_long_turn_alerts_start_at_30_minutes` | runner 지연과 최근 출력 유무에 따라 watchdog 연장/의심/알림 단계가 올바르게 분기되는지 확인 |
 
 ## P0 Coverage Inventory
 
@@ -43,7 +43,7 @@
 | Axis | Module filter | Anchored scenarios |
 | --- | --- | --- |
 | Live turn 보존 | `high_risk_recovery::failure_recovery::` | `scenario_3_restart_recovery_reconciles_broken_state`, `scenario_667_restart_recovery_reconciles_duplicate_review_dispatches` |
-| Watcher reattach | `high_risk_recovery::delayed_worker::` | `scenario_421_deadlock_recent_output_extends_watchdog`, `scenario_421_deadlock_stale_output_only_marks_suspected_deadlock`, `scenario_421_long_turn_alerts_start_at_30_minutes` |
+| Watcher reattach | `high_risk_recovery::delayed_runner::` | `scenario_421_deadlock_recent_output_extends_watchdog`, `scenario_421_deadlock_stale_output_only_marks_suspected_deadlock`, `scenario_421_long_turn_alerts_start_at_30_minutes` |
 | Dispatch/outbox idempotency | `high_risk_recovery::outbox_boundary::` | `scenario_160_1_outbox_batch_delivers_exactly_once`, `scenario_160_2_recovery_fallback_completes_dispatch`, `scenario_160_4_outbox_processes_all_entries_including_duplicates`, `scenario_160_6_notify_success_keeps_completed_dispatch_terminal` |
 | Queue loss 방지 | `high_risk_recovery::failure_recovery::` + `idle_session_cleanup::` | `scenario_251_boot_reconcile_backfills_missing_notify_outbox`, `scenario_251_boot_reconcile_refires_missing_review_dispatch`, `scenario_251_boot_reconcile_resets_broken_auto_queue_entries`, `scenario_492_idle_session_with_active_dispatch_uses_180_minute_safety_ttl` |
 

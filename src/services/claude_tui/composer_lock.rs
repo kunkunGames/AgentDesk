@@ -71,9 +71,9 @@ mod claude_tui_composer_lock_tests {
         let turn_lock = session_turn_lock(&session);
         let _turn_guard = turn_lock.lock().unwrap();
         let (sent, received) = mpsc::channel();
-        let worker_session = session.clone();
+        let runner_session = session.clone();
         std::thread::spawn(move || {
-            with_composer_mutation_lock(&worker_session, || {
+            with_composer_mutation_lock(&runner_session, || {
                 sent.send(()).unwrap();
             });
         });

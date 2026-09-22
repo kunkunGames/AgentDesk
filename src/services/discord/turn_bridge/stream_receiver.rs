@@ -30,12 +30,12 @@ pub(in crate::services::discord) fn spawn_stream_message_receiver_adapter(
 ) -> StreamMessageReceiverAdapter {
     let (tx, async_rx) = tokio::sync::mpsc::unbounded_channel();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_worker = stop.clone();
+    let stop_runner = stop.clone();
     tokio::task::spawn_blocking(move || {
-        while !stop_worker.load(std::sync::atomic::Ordering::Acquire) {
+        while !stop_runner.load(std::sync::atomic::Ordering::Acquire) {
             match rx.recv_timeout(std::time::Duration::from_millis(10)) {
                 Ok(message) => {
-                    if stop_worker.load(std::sync::atomic::Ordering::Acquire)
+                    if stop_runner.load(std::sync::atomic::Ordering::Acquire)
                         || tx.send(message).is_err()
                     {
                         break;

@@ -21,9 +21,9 @@
 | `GET` | `/api/agents/{id}/dispatched-sessions` | `agents::agent_dispatched_sessions` | `src/server/routes/agents.rs:690` | `src/server/routes/domains/runtime.rs:128` |
 | `POST` | `/api/agents/{id}/duplicate` | `agents_crud::duplicate_agent` | `src/server/routes/agents_crud.rs:768` | `src/server/routes/domains/agents.rs:41` |
 | `GET` | `/api/agents/{id}/execution-node` | `execution_requirements::get_node` | `src/server/routes/execution_requirements.rs:12` | `src/server/routes/domains/agents.rs:37` |
-| `PUT` | `/api/agents/{id}/execution-node` | `execution_requirements::put_node` | `src/server/routes/execution_requirements.rs:31` | `src/server/routes/domains/agents.rs:37` |
-| `GET` | `/api/agents/{id}/execution-requirements` | `execution_requirements::get` | `src/server/routes/execution_requirements.rs:71` | `src/server/routes/domains/agents.rs:33` |
-| `PUT` | `/api/agents/{id}/execution-requirements` | `execution_requirements::put` | `src/server/routes/execution_requirements.rs:89` | `src/server/routes/domains/agents.rs:33` |
+| `PUT` | `/api/agents/{id}/execution-node` | `execution_requirements::put_node` | `src/server/routes/execution_requirements.rs:29` | `src/server/routes/domains/agents.rs:37` |
+| `GET` | `/api/agents/{id}/execution-requirements` | `execution_requirements::get` | `src/server/routes/execution_requirements.rs:62` | `src/server/routes/domains/agents.rs:33` |
+| `PUT` | `/api/agents/{id}/execution-requirements` | `execution_requirements::put` | `src/server/routes/execution_requirements.rs:77` | `src/server/routes/domains/agents.rs:33` |
 | `POST` | `/api/agents/{id}/handoff` | `agents::agent_handoff` | `src/server/routes/agents.rs:1251` | `src/server/routes/domains/agents.rs:45` |
 | `POST` | `/api/agents/{id}/message` | `agents::agent_message` | `src/server/routes/agents.rs:1203` | `src/server/routes/domains/agents.rs:44` |
 | `GET` | `/api/agents/{id}/offices` | `agents::agent_offices` | `src/server/routes/agents.rs:635` | `src/server/routes/domains/agents.rs:42` |
@@ -334,4 +334,4 @@
 | `GET` | `/api/v1/tokens` | `tokens` | `src/server/routes/v1.rs:205` | `src/server/routes/v1.rs:122` |
 | `GET` | `/api/voice/config` | `voice_config::get_voice_config` | `src/server/routes/voice_config.rs:110` | `src/server/routes/domains/admin.rs:72` |
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:120` | `src/server/routes/domains/admin.rs:72` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/mod.rs:412` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/mod.rs:408` |

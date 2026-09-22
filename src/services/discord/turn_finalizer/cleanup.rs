@@ -424,7 +424,7 @@ pub(in crate::services::discord) async fn rearm_queue_backstop_after_mailbox_rel
         return false;
     }
     // The channel-scoped scheduler coalesces duplicate release/late-cleanup arms,
-    // and its worker rechecks the mailbox before every dispatch attempt.
+    // and its runner rechecks the mailbox before every dispatch attempt.
     crate::services::discord::arm_slow_idle_queue_backstop_if_queue_nonempty(
         shared, provider, channel_id, reason,
     )

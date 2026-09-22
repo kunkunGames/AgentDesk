@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    FAILURE_MARKER_WORKER_ENV, HookRelayFailureMarker, HookRelayFailureMarkerWriteRequest,
-    NON_WAIT_RELAY_WORKER_ENV, failure_marker_dir, marker_component,
+    FAILURE_MARKER_RUNNER_ENV, HookRelayFailureMarker, HookRelayFailureMarkerWriteRequest,
+    NON_WAIT_RELAY_RUNNER_ENV, failure_marker_dir, marker_component,
     relay_hook_event_response_with_request_timeout, relay_hook_event_with_request,
     write_hook_relay_failure_marker,
 };
@@ -67,7 +67,7 @@ struct OrderedHookRelayResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct OrderedHookRelayWorkerRequest {
+struct OrderedHookRelayRunnerRequest {
     queue_dir: PathBuf,
 }
 
@@ -470,36 +470,36 @@ pub(super) fn enqueue_ordered_hook_relay_request(
     Ok((queue_dir, response_path))
 }
 
-pub(super) fn start_ordered_hook_relay_worker(queue_dir: &Path) -> Result<(), String> {
-    let Some(worker_probe) = lock_relay_queue_file(&queue_dir.join("worker.lock"), true)? else {
+pub(super) fn start_ordered_hook_relay_runner(queue_dir: &Path) -> Result<(), String> {
+    let Some(runner_probe) = lock_relay_queue_file(&queue_dir.join("runner.lock"), true)? else {
         // The active helper normally observes this request; the endpoint recovery
         // owner and synchronous response reprobe cover its narrow idle-exit race.
         return Ok(());
     };
-    drop(worker_probe);
-    let request = OrderedHookRelayWorkerRequest {
+    drop(runner_probe);
+    let request = OrderedHookRelayRunnerRequest {
         queue_dir: queue_dir.to_path_buf(),
     };
     let encoded = serde_json::to_string(&request)
-        .map_err(|err| format!("serialize non-wait hook relay worker handoff: {err}"))?;
+        .map_err(|err| format!("serialize non-wait hook relay runner handoff: {err}"))?;
     let executable = std::env::current_exe()
-        .map_err(|err| format!("resolve non-wait hook relay worker: {err}"))?;
+        .map_err(|err| format!("resolve non-wait hook relay runner: {err}"))?;
     let mut command = Command::new(executable);
     #[cfg(test)]
     command.args([
         "--ignored",
         "--exact",
-        "services::claude_tui::hook_relay::tests::non_wait_relay_worker_subprocess_entry",
+        "services::claude_tui::hook_relay::tests::non_wait_relay_runner_subprocess_entry",
     ]);
     let child = command
-        .env(NON_WAIT_RELAY_WORKER_ENV, encoded)
-        .env_remove(FAILURE_MARKER_WORKER_ENV)
+        .env(NON_WAIT_RELAY_RUNNER_ENV, encoded)
+        .env_remove(FAILURE_MARKER_RUNNER_ENV)
         .env_remove("AGENTDESK_ROOT_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| format!("start non-wait hook relay worker: {err}"))?;
+        .map_err(|err| format!("start non-wait hook relay runner: {err}"))?;
     drop(child);
     Ok(())
 }
@@ -513,7 +513,7 @@ pub(super) fn handoff_non_wait_hook_event(
 ) -> Result<(), String> {
     let (queue_dir, _) =
         enqueue_ordered_hook_relay_request(endpoint, provider, event, session_id, payload, None)?;
-    start_ordered_hook_relay_worker(&queue_dir)
+    start_ordered_hook_relay_runner(&queue_dir)
 }
 
 pub(super) fn handoff_ordered_hook_event_response_with_timeout(
@@ -535,7 +535,7 @@ pub(super) fn handoff_ordered_hook_event_response_with_timeout(
     )?;
     let response_path = response_path
         .ok_or_else(|| "ordered hook relay response path was not allocated".to_string())?;
-    start_ordered_hook_relay_worker(&queue_dir)?;
+    start_ordered_hook_relay_runner(&queue_dir)?;
     let mut recovery_reprobed = false;
     loop {
         match std::fs::read(&response_path) {
@@ -562,29 +562,29 @@ pub(super) fn handoff_ordered_hook_event_response_with_timeout(
         }
         if !recovery_reprobed && started.elapsed() >= RELAY_RECOVERY_REPROBE {
             recovery_reprobed = true;
-            let _ = start_ordered_hook_relay_worker(&queue_dir);
+            let _ = start_ordered_hook_relay_runner(&queue_dir);
         }
         std::thread::sleep(RELAY_RESPONSE_POLL_INTERVAL);
     }
 }
 
-pub(super) fn run_ordered_hook_relay_worker_from_env(encoded: OsString) -> Result<(), String> {
+pub(super) fn run_ordered_hook_relay_runner_from_env(encoded: OsString) -> Result<(), String> {
     encoded
         .into_string()
         .map_err(|_| "non-wait hook relay handoff is not UTF-8".to_string())
         .and_then(|encoded| {
-            serde_json::from_str::<OrderedHookRelayWorkerRequest>(&encoded)
+            serde_json::from_str::<OrderedHookRelayRunnerRequest>(&encoded)
                 .map_err(|err| format!("parse non-wait hook relay handoff: {err}"))
         })
-        .and_then(run_ordered_hook_relay_worker)
+        .and_then(run_ordered_hook_relay_runner)
 }
 
-fn run_ordered_hook_relay_worker(request: OrderedHookRelayWorkerRequest) -> Result<(), String> {
+fn run_ordered_hook_relay_runner(request: OrderedHookRelayRunnerRequest) -> Result<(), String> {
     let queue_dir = request.queue_dir;
-    let Some(worker_lock) = lock_relay_queue_file(&queue_dir.join("worker.lock"), true)? else {
+    let Some(runner_lock) = lock_relay_queue_file(&queue_dir.join("runner.lock"), true)? else {
         return Ok(());
     };
-    let mut worker_lock = Some(worker_lock);
+    let mut runner_lock = Some(runner_lock);
     loop {
         promote_ordered_hook_relay_ingress(&queue_dir)?;
         let request_paths = queue_request_paths(&queue_dir)?;
@@ -592,7 +592,7 @@ fn run_ordered_hook_relay_worker(request: OrderedHookRelayWorkerRequest) -> Resu
             std::thread::sleep(RELAY_QUEUE_IDLE_GRACE);
             promote_ordered_hook_relay_ingress(&queue_dir)?;
             if queue_request_paths(&queue_dir)?.is_empty() {
-                drop(worker_lock.take());
+                drop(runner_lock.take());
                 return Ok(());
             }
             continue;
@@ -888,11 +888,11 @@ fn scan_ordered_hook_relay_queues_once(
             if has_work {
                 stats.active_queue_count += 1;
             }
-            if has_work && let Err(error) = start_ordered_hook_relay_worker(&queue_dir) {
+            if has_work && let Err(error) = start_ordered_hook_relay_runner(&queue_dir) {
                 tracing::warn!(
                     queue_dir = %queue_dir.display(),
                     error,
-                    "failed to restart stranded ordered hook relay worker"
+                    "failed to restart stranded ordered hook relay runner"
                 );
             }
         }
@@ -1027,11 +1027,11 @@ mod tests {
     fn atomic_queue_evidence_and_high_water_survive_publication_error() {
         let dir = tempfile::tempdir().unwrap();
         let queue = dir.path();
-        let _worker = lock_relay_queue_file(&queue.join("worker.lock"), false)
+        let _runner = lock_relay_queue_file(&queue.join("runner.lock"), false)
             .unwrap()
             .unwrap();
         assert!(
-            lock_relay_queue_file(&queue.join("worker.lock"), true)
+            lock_relay_queue_file(&queue.join("runner.lock"), true)
                 .unwrap()
                 .is_none()
         );
@@ -1256,25 +1256,25 @@ mod tests {
         false
     }
 
-    fn spawn_worker_process(queue_dir: &Path) -> Child {
-        let encoded = serde_json::to_string(&OrderedHookRelayWorkerRequest {
+    fn spawn_runner_process(queue_dir: &Path) -> Child {
+        let encoded = serde_json::to_string(&OrderedHookRelayRunnerRequest {
             queue_dir: queue_dir.to_path_buf(),
         })
-        .expect("serialize worker request");
+        .expect("serialize runner request");
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--ignored",
                 "--exact",
-                "services::claude_tui::hook_relay::tests::non_wait_relay_worker_subprocess_entry",
+                "services::claude_tui::hook_relay::tests::non_wait_relay_runner_subprocess_entry",
             ])
-            .env(NON_WAIT_RELAY_WORKER_ENV, encoded)
-            .env_remove(FAILURE_MARKER_WORKER_ENV)
+            .env(NON_WAIT_RELAY_RUNNER_ENV, encoded)
+            .env_remove(FAILURE_MARKER_RUNNER_ENV)
             .env_remove("AGENTDESK_ROOT_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn ordered relay worker process")
+            .expect("spawn ordered relay runner process")
     }
 
     fn age_path(path: &Path, age: Duration) {
@@ -1304,7 +1304,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let queue_dir = temp_dir.path().join("active");
         std::fs::create_dir_all(queue_dir.join("ingress")).unwrap();
-        std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+        std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("producer.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("ingress/pending.ingress.json"), b"{}").unwrap();
         age_queue_tree(&queue_dir, LEDGER_RETENTION + Duration::from_secs(1));
@@ -1320,7 +1320,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let queue_dir = temp_dir.path().join("stale");
         std::fs::create_dir_all(queue_dir.join("ingress")).unwrap();
-        std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+        std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("producer.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("next-sequence"), b"3").unwrap();
         std::fs::write(queue_dir.join("completed-high-water"), b"3").unwrap();
@@ -1336,7 +1336,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let queue_dir = temp_dir.path().join("legacy-idle");
         std::fs::create_dir_all(queue_dir.join("ingress")).unwrap();
-        std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+        std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("completed-high-water"), b"1").unwrap();
         age_queue_tree(&queue_dir, LEDGER_RETENTION + Duration::from_secs(1));
 
@@ -1365,7 +1365,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let queue_dir = temp_dir.path().join("recent");
         std::fs::create_dir_all(queue_dir.join("ingress")).unwrap();
-        std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+        std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("producer.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("completed-high-water"), b"1").unwrap();
 
@@ -1380,7 +1380,7 @@ mod tests {
         let queue_dir = temp_dir.path().join("pruning");
         let quarantine_dir = queue_dir.join("quarantine");
         std::fs::create_dir_all(&quarantine_dir).unwrap();
-        std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+        std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         std::fs::write(queue_dir.join("producer.lock"), b"").unwrap();
         for index in 0..2_000 {
             std::fs::write(
@@ -1433,7 +1433,7 @@ mod tests {
             None,
         )
         .unwrap();
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         assert_eq!(
             requests
                 .recv_timeout(Duration::from_secs(2))
@@ -1446,13 +1446,13 @@ mod tests {
         );
         assert_eq!(receiver.join().unwrap(), 1);
 
-        // The worker started above is a real subprocess that keeps promoting
+        // The runner started above is a real subprocess that keeps promoting
         // through its idle grace, so it can still be the queue's promoter when
         // the first request is gone. Every manual counter write, enqueue,
-        // quarantine and promote below therefore takes the same `worker.lock`
+        // quarantine and promote below therefore takes the same `runner.lock`
         // production uses to keep one promoter per queue; blocking here waits
-        // out the worker's idle exit before this test becomes that promoter.
-        let _worker_lock = lock_relay_queue_file(&queue_dir.join("worker.lock"), false)
+        // out the runner's idle exit before this test becomes that promoter.
+        let _runner_lock = lock_relay_queue_file(&queue_dir.join("runner.lock"), false)
             .unwrap()
             .unwrap();
 
@@ -1574,7 +1574,7 @@ mod tests {
             .to_string();
         std::fs::write(&pending[0], b"{corrupt-json").unwrap();
 
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         assert_eq!(
             requests
                 .recv_timeout(Duration::from_secs(3))
@@ -1602,7 +1602,7 @@ mod tests {
             .collect::<Vec<_>>();
         for queue_dir in &queue_dirs {
             std::fs::create_dir(queue_dir).unwrap();
-            std::fs::write(queue_dir.join("worker.lock"), b"").unwrap();
+            std::fs::write(queue_dir.join("runner.lock"), b"").unwrap();
         }
 
         let started = Instant::now();
@@ -1731,7 +1731,7 @@ mod tests {
             "the event must remain durable after lock handoff"
         );
 
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         let delivered = requests.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(receiver.join().unwrap(), 1);
         assert_eq!(delivered["ordinal"].as_u64(), Some(1));
@@ -1774,7 +1774,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(expected.len(), 8);
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         let observed = (0..8)
             .map(|_| {
                 requests.recv_timeout(Duration::from_secs(3)).unwrap()["ordinal"]
@@ -1808,7 +1808,7 @@ mod tests {
         request.published_at = Utc::now() - chrono::Duration::hours(2);
         request.delivery_deadline = Utc::now() - chrono::Duration::hours(1);
         std::fs::write(&ingress, serde_json::to_vec(&request).unwrap()).unwrap();
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         wait_until(
             || {
                 queue_ingress_paths(&queue_dir).is_ok_and(|paths| paths.is_empty())
@@ -1891,7 +1891,7 @@ mod tests {
         second.request_id = first.request_id;
         std::fs::write(&ingress[1], serde_json::to_vec(&second).unwrap()).unwrap();
 
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         let observed = (0..3)
             .map(|_| {
                 requests.recv_timeout(Duration::from_secs(3)).unwrap()["ordinal"]
@@ -1927,7 +1927,7 @@ mod tests {
         )
         .unwrap();
 
-        start_ordered_hook_relay_worker(&queue_dir).unwrap();
+        start_ordered_hook_relay_runner(&queue_dir).unwrap();
         let observed = (0..2)
             .map(|_| {
                 requests.recv_timeout(Duration::from_secs(3)).unwrap()["ordinal"]
@@ -1967,7 +1967,7 @@ mod tests {
         let mut buffer = [0u8; 4096];
         loop {
             let read = socket.read(&mut buffer).await.expect("read proxy request");
-            assert!(read > 0, "worker closed before proxy request body");
+            assert!(read > 0, "runner closed before proxy request body");
             encoded.extend_from_slice(&buffer[..read]);
             if let Some((body_start, body_len)) = http_body_bounds(&encoded)
                 && encoded.len() >= body_start + body_len
@@ -2004,13 +2004,13 @@ mod tests {
     ) {
         let mut first_release = Some(first_release);
         for index in 0..2 {
-            let (mut socket, _) = listener.accept().await.expect("accept worker relay");
+            let (mut socket, _) = listener.accept().await.expect("accept runner relay");
             let encoded = read_async_http_request(&mut socket).await;
             let path = request_path(&encoded);
             let body_start = http_body_bounds(&encoded).unwrap().0;
             let app = router.read().await.clone();
             let request_id = request_header(&encoded, RELAY_REQUEST_ID_HEADER)
-                .expect("worker relay request id header");
+                .expect("runner relay request id header");
             let mut request = Request::builder()
                 .method(Method::POST)
                 .uri(&path)
@@ -2051,15 +2051,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn worker_crash_after_actual_stop_acceptance_replays_cached_receipt_once() {
-        check_worker_acceptance_replay(false).await;
-        check_worker_acceptance_replay(true).await;
+    async fn runner_crash_after_actual_stop_acceptance_replays_cached_receipt_once() {
+        check_runner_acceptance_replay(false).await;
+        check_runner_acceptance_replay(true).await;
     }
 
-    async fn check_worker_acceptance_replay(sync_failure: bool) {
+    async fn check_runner_acceptance_replay(sync_failure: bool) {
         let temp_dir = tempfile::tempdir().unwrap();
         let _root = crate::config::set_agentdesk_root_for_test(temp_dir.path());
-        let session_id = "worker-crash-after-stop-acceptance";
+        let session_id = "runner-crash-after-stop-acceptance";
         let state = crate::services::claude_tui::hook_server::HookServerState::new();
         let app = crate::services::claude_tui::hook_server::hook_receiver_router_with_state(state);
         let search = app
@@ -2126,12 +2126,12 @@ mod tests {
             .expect("ordered request must persist a stable receiver idempotency key")
             .to_string();
 
-        let mut first_worker = (!sync_failure).then(|| spawn_worker_process(&queue_dir));
-        let failed_worker = sync_failure.then(|| {
+        let mut first_runner = (!sync_failure).then(|| spawn_runner_process(&queue_dir));
+        let failed_runner = sync_failure.then(|| {
             let queue_dir = queue_dir.clone();
             tokio::task::spawn_blocking(move || {
                 with_sync_fault("ordered hook relay response", "parent", || {
-                    run_ordered_hook_relay_worker(OrderedHookRelayWorkerRequest { queue_dir })
+                    run_ordered_hook_relay_runner(OrderedHookRelayRunnerRequest { queue_dir })
                 })
             })
         });
@@ -2141,15 +2141,15 @@ mod tests {
                 .expect("first receiver acceptance timeout")
                 .expect("first receiver acceptance");
         assert_eq!(first_path, request_id);
-        if let Some(worker) = first_worker.as_mut() {
-            worker
+        if let Some(runner) = first_runner.as_mut() {
+            runner
                 .kill()
-                .expect("kill worker after receiver acceptance");
-            worker.wait().expect("reap killed worker");
+                .expect("kill runner after receiver acceptance");
+            runner.wait().expect("reap killed runner");
         }
         let _ = release_tx.send(());
-        if let Some(worker) = failed_worker {
-            assert!(worker.await.unwrap().unwrap_err().contains("injected sync"));
+        if let Some(runner) = failed_runner {
+            assert!(runner.await.unwrap().unwrap_err().contains("injected sync"));
             assert!(response_path.as_ref().unwrap().exists());
         }
         let request_path = queue_request_paths(&queue_dir).unwrap().remove(0);
@@ -2157,14 +2157,14 @@ mod tests {
             request_path.exists(),
             "crash point must precede request removal"
         );
-        let mut recovery_worker = spawn_worker_process(&queue_dir);
+        let mut recovery_runner = spawn_runner_process(&queue_dir);
         let (second_path, second_body) =
             tokio::time::timeout(Duration::from_secs(3), accepted_rx.recv())
                 .await
                 .expect("recovery receiver acceptance timeout")
                 .expect("recovery receiver acceptance");
         assert_eq!(second_path, request_id);
-        let recovery_status = tokio::task::spawn_blocking(move || recovery_worker.wait())
+        let recovery_status = tokio::task::spawn_blocking(move || recovery_runner.wait())
             .await
             .unwrap()
             .unwrap();
@@ -2175,7 +2175,7 @@ mod tests {
         assert!(second_body.get("memento_tool_feedback_flush").is_some());
         assert!(
             !request_path.exists(),
-            "recovery worker removes the request only after cached acceptance"
+            "recovery runner removes the request only after cached acceptance"
         );
         let response_path = response_path.unwrap();
         let response: OrderedHookRelayResponse =
@@ -2185,7 +2185,7 @@ mod tests {
                 .result
                 .as_ref()
                 .is_ok_and(|body| body.get("memento_tool_feedback_flush").is_some()),
-            "durable worker response must retain the accepted Stop flush"
+            "durable runner response must retain the accepted Stop flush"
         );
 
         let followup = routers
@@ -2208,7 +2208,7 @@ mod tests {
                 .unwrap();
         assert!(
             followup_body.get("memento_tool_feedback_flush").is_some(),
-            "worker-crash replay must leave the sole Stop retry available to the next fresh boundary"
+            "runner-crash replay must leave the sole Stop retry available to the next fresh boundary"
         );
     }
 }

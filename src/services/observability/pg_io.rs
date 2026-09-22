@@ -1,6 +1,6 @@
 //! #2049: Postgres I/O primitives (event inserts, snapshot inserts, query
 //! helpers, and the daily-rollup queries) split out of `mod.rs`. These are
-//! `pub(super)` so the worker, retention sweep, and query façade can share
+//! `pub(super)` so the runner, retention sweep, and query façade can share
 //! them without touching the global runtime.
 
 use std::collections::BTreeMap;

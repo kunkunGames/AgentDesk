@@ -12,7 +12,7 @@
 //! tmux pane path OR an active-dispatch cwd. A flat-root dir is DISCARDED only
 //! when, on top of having no owner, its NAME matches the runtime naming
 //! whitelist (`wt/<provider>-…` branch / `claude-adk-cc…` / `codex-adk-cdx…`
-//! dir). Manual dev worktrees (`worker-*`, `integration-*`, `codex-*`,
+//! dir). Manual dev worktrees (`runner-*`, `integration-*`, `codex-*`,
 //! `release-*`, `fix-*`, `e2e-*`, …) are NOT runtime-created and are NEVER
 //! discard candidates (#3231 key safety fix).
 //!
@@ -282,8 +282,8 @@ pub async fn run_inner(config: &Config, pg_pool: Option<PgPool>) -> Result<Sweep
     };
 
     // Directory enumeration and metadata probes are blocking filesystem calls.
-    // Keep them off Tokio's runtime worker so a large worktree population cannot
-    // consume a runtime worker while readdir waits on the filesystem.
+    // Keep them off Tokio's runtime runner so a large worktree population cannot
+    // consume a runtime runner while readdir waits on the filesystem.
     let directories = collect_child_directories_off_runtime(config.worktrees_root.clone()).await?;
 
     for dir_path in directories {
@@ -311,7 +311,7 @@ pub async fn run_inner(config: &Config, pg_pool: Option<PgPool>) -> Result<Sweep
 
         // #3231 (A): naming whitelist — only runtime-named per-channel worktrees
         // (`wt/<provider>-…` branch / `claude-adk-cc…` / `codex-adk-cdx…` dir)
-        // are ever discard candidates. Manual dev worktrees (worker-*,
+        // are ever discard candidates. Manual dev worktrees (runner-*,
         // integration-*, codex-*, release-*, fix-*, e2e-*, …) are NOT
         // runtime-created and must NEVER be swept, even with no owning row.
         if !is_runtime_named_worktree(&dir_path) {
@@ -684,7 +684,7 @@ pub(crate) fn is_protected_infra_worktree(dir: &Path) -> bool {
 /// #3231 (A): true when the worktree dir name matches the runtime per-channel
 /// naming the AgentDesk runtime actually creates — `{provider}-…` flat-root dirs
 /// (`create_git_worktree`: `claude-…` / `codex-…`, branch `wt/<provider>-…`).
-/// Returning `false` PROTECTS manual dev worktrees (`worker-*`, `integration-*`,
+/// Returning `false` PROTECTS manual dev worktrees (`runner-*`, `integration-*`,
 /// `codex-*`-without-`-adk-cdx`, `release-*`, `fix-*`, `e2e-*`, …) that a human
 /// dropped into the flat root — they are never runtime-created and must NEVER be
 /// discard candidates. This is the key #3231 safety fix.
@@ -1056,7 +1056,7 @@ mod naming_whitelist_tests {
     fn manual_dev_worktrees_are_never_discard_candidates() {
         // None of these are runtime-created — they must be protected forever.
         for manual in [
-            "worker-1",
+            "runner-1",
             "integration-main",
             "codex-scratch", // plain `codex-*` (NOT the `codex-adk-cdx` runtime form)
             "release-2026",
@@ -1966,10 +1966,10 @@ mod managed_root_recursion_tests {
 
     #[test]
     fn manual_worktree_in_flat_root_is_protected_by_naming() {
-        // A `worker-*` style manual worktree dropped in the flat root: even with
+        // A `runner-*` style manual worktree dropped in the flat root: even with
         // no owning row it is NOT a discard candidate (naming whitelist).
         let _keep: HashSet<String> = HashSet::new();
-        let manual = Path::new("/home/u/.adk/release/worktrees/worker-1");
+        let manual = Path::new("/home/u/.adk/release/worktrees/runner-1");
         assert!(!is_runtime_named_worktree(manual));
     }
 }

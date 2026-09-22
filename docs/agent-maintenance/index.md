@@ -44,7 +44,7 @@
   (#4724). Includes the one-time `scripts/setup-merge-drivers.sh` step every
   developer must run.
 - [`multinode-transition.md`](multinode-transition.md) — transition map for
-  moving AgentDesk from one dcserver node to leader/worker execution, including
+  moving AgentDesk from one dcserver node to hub/runner execution, including
   single-node assumptions, side-effect ownership, invariants, and #876-#884
   test gates.
 - [`opencode-usability-spec.md`](opencode-usability-spec.md) — implementation
@@ -66,8 +66,8 @@
   the giant-file list in `change-surfaces.md`.
 - [`docs/generated/route-inventory.md`](../generated/route-inventory.md) — HTTP
   routes and the file/line where each is registered.
-- [`docs/generated/worker-inventory.md`](../generated/worker-inventory.md) —
-  background workers spawned at startup.
+- [`docs/generated/runner-inventory.md`](../generated/runner-inventory.md) —
+  background runners spawned at startup.
 
 Regenerate the docs above with:
 

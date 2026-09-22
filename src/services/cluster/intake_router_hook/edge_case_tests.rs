@@ -1,7 +1,7 @@
 //! Cross-boundary regressions for per-agent placement; every fixture is an isolated DB.
 use super::pg_tests::{
-    ctx_for_channel, seed_agent_with_preference, seed_session_owner,
-    seed_worker_node_with_capabilities,
+    ctx_for_channel, seed_agent_with_preference, seed_runner_node_with_capabilities,
+    seed_session_owner,
 };
 use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
@@ -24,11 +24,11 @@ async fn fixture(channel: &str) -> (TestPostgresDb, PgPool) {
         .bind(json!({"os":["windows"],"backends":["process"]}))
         .execute(&pool).await.unwrap();
     for (id, os) in [
-        ("leader-1", "macos"),
+        ("hub-1", "macos"),
         ("win-primary", "windows"),
         ("win-backup", "windows"),
     ] {
-        seed_worker_node_with_capabilities(&pool, id, json!([]), "online", capabilities(id, os))
+        seed_runner_node_with_capabilities(&pool, id, json!([]), "online", capabilities(id, os))
             .await;
     }
     (fixture, pool)
@@ -80,7 +80,7 @@ async fn primary_readiness_loss_and_removed_registration_only_use_compatible_fal
     {
         let mut caps = capabilities("win-primary", "windows");
         *caps.pointer_mut(pointer).unwrap() = value;
-        sqlx::query("UPDATE worker_nodes SET capabilities=$1 WHERE instance_id='win-primary'")
+        sqlx::query("UPDATE cluster_nodes SET capabilities=$1 WHERE instance_id='win-primary'")
             .bind(caps)
             .execute(&pool)
             .await
@@ -103,7 +103,7 @@ async fn primary_readiness_loss_and_removed_registration_only_use_compatible_fal
         complete(&pool, id).await;
     }
     // Previously selected registrations can disappear; the saved preference is soft.
-    sqlx::query("DELETE FROM worker_nodes WHERE instance_id='win-primary'")
+    sqlx::query("DELETE FROM cluster_nodes WHERE instance_id='win-primary'")
         .execute(&pool)
         .await
         .unwrap();
@@ -168,7 +168,7 @@ async fn per_agent_primary_race_reserves_two_slots_and_reuses_a_released_slot_pg
                 );
             }
             IntakeRouterDecision::Blocked { .. } => blocked += 1,
-            other => panic!("must not run on incompatible leader: {other:?}"),
+            other => panic!("must not run on incompatible hub: {other:?}"),
         }
     }
     assert_eq!(
@@ -254,7 +254,7 @@ async fn idle_owner_overrides_new_primary_and_offline_or_conflicting_owners_bloc
         "idle",
     )
     .await;
-    // Idle session heartbeats are not leases; a fresh worker still owns the conversation.
+    // Idle session heartbeats are not leases; a fresh runner still owns the conversation.
     sqlx::query("UPDATE sessions SET last_heartbeat=now()-interval '7 days'")
         .execute(&pool)
         .await
@@ -270,7 +270,7 @@ async fn idle_owner_overrides_new_primary_and_offline_or_conflicting_owners_bloc
     ));
     let id = forwarded(decision, "win-backup");
     complete(&pool, id).await;
-    sqlx::query("UPDATE worker_nodes SET status='offline' WHERE instance_id='win-backup'")
+    sqlx::query("UPDATE cluster_nodes SET status='offline' WHERE instance_id='win-backup'")
         .execute(&pool)
         .await
         .unwrap();
@@ -282,7 +282,7 @@ async fn idle_owner_overrides_new_primary_and_offline_or_conflicting_owners_bloc
             reason: IntakeBlockedReason::StaleSessionOwners { .. }
         }
     ));
-    sqlx::query("UPDATE worker_nodes SET status='online' WHERE instance_id='win-backup'")
+    sqlx::query("UPDATE cluster_nodes SET status='online' WHERE instance_id='win-backup'")
         .execute(&pool)
         .await
         .unwrap();
@@ -314,7 +314,7 @@ async fn idle_owner_overrides_new_primary_and_offline_or_conflicting_owners_bloc
 async fn explicit_override_cannot_bypass_requirements_or_silently_use_primary_pg() {
     let (fixture, pool) = fixture("9600").await;
     let mut ctx = ctx_for_channel(IntakeRoutingMode::Enforce, "9600");
-    for explicit in ["leader-1", "  leader-1  ", "missing-node"] {
+    for explicit in ["hub-1", "  hub-1  ", "missing-node"] {
         ctx.node_override_instance_id = Some(explicit);
         assert!(
             matches!(

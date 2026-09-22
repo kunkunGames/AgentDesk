@@ -313,7 +313,7 @@ export default {
 
 - Rewrites the generated `src/` tree snapshot in `ARCHITECTURE.md`.
 - Rewrites the generated top-level module map in `ARCHITECTURE.md`; adding a new top-level `src/` entry without a description makes `--check` fail.
-- Regenerates module, route, and worker inventories under `docs/generated/`.
+- Regenerates module, route, and runner inventories under `docs/generated/`.
 - CI runs `python3 scripts/generate_inventory_docs.py --check` to block architecture and inventory drift before merge.
 
 ---

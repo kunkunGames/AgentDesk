@@ -98,7 +98,7 @@ episode change, failed pin commit) reads the marker and records **nothing**.
   an operator API call. **This site does not fire on its own.**
 - `tui_direct_stale_foreign_cancel` fires from the
   `WaitOutcome::BackstopForeignInflightLive` arm of the
-  `tui_direct_pending_start` worker, after `destructive_cancel_gate::evaluate`
+  `tui_direct_pending_start` runner, after `destructive_cancel_gate::evaluate`
   allows it and the #4020 positive-stale age gate
   (`STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS`) has passed.
 

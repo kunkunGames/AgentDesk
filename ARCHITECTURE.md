@@ -9,7 +9,7 @@ High-signal navigation guide for contributors. The generated inventories under `
 - `dashboard/` — React/Vite UI for the web dashboard.
 - `docs/generated/module-inventory.md` — generated Rust module inventory.
 - `docs/generated/route-inventory.md` — generated HTTP/WebSocket route inventory.
-- `docs/generated/worker-inventory.md` — generated supervised worker inventory.
+- `docs/generated/runner-inventory.md` — generated supervised runner inventory.
 
 Install `sccache` with `brew install sccache` for local build caching. AgentDesk build helpers default to `SCCACHE_CACHE_SIZE=40G` and `SCCACHE_IDLE_TIMEOUT=0` while preserving nonempty overrides; see the [sccache setup guide](docs/ci/sccache-setup.md#22-shell-env-release-deploy-and-installer-source-builds) for activation rules, manual-wrapper behavior, and existing-daemon limits.
 
@@ -73,6 +73,7 @@ src/
 │   ├── test_env/
 │   │   └── teardown_probe.rs
 │   ├── agent_channels.rs
+│   ├── cluster_role.rs
 │   ├── runtime_profile.rs
 │   └── test_env.rs
 ├── db/
@@ -130,6 +131,7 @@ src/
 │   ├── postgres/
 │   │   ├── tests/
 │   │   │   └── migration_compat_tests.rs
+│   │   ├── hub_runner_names_tests.rs
 │   │   ├── migration_compat.rs
 │   │   └── shared_config.rs
 │   ├── prompt_manifests/
@@ -398,9 +400,10 @@ src/
 │   │   ├── turn_lease.rs
 │   │   ├── v1.rs
 │   │   └── voice_config.rs
-│   ├── worker_registry/
+│   ├── runner_registry/
 │   │   ├── registry.rs
 │   │   └── status.rs
+│   ├── worker_registry/
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
@@ -412,17 +415,17 @@ src/
 │   ├── multinode_regression.rs
 │   ├── outbox_actionable_delivery.rs
 │   ├── outbox_delivery_alert.rs
-│   ├── outbox_worker.rs
+│   ├── outbox_runner.rs
 │   ├── rate_limit_profiles.rs
 │   ├── rate_limit_sync.rs
 │   ├── resource_locks.rs
 │   ├── routine_script_audit.rs
+│   ├── runner_recovery.rs
+│   ├── runner_registry.rs
 │   ├── startup_preflight.rs
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
 │   ├── test_phase_runs.rs
-│   ├── worker_recovery.rs
-│   ├── worker_registry.rs
 │   └── ws.rs
 ├── services/
 │   ├── agent_quality/
@@ -502,7 +505,7 @@ src/
 │   ├── calendar_sync/
 │   │   ├── model.rs
 │   │   ├── recovery.rs
-│   │   └── worker.rs
+│   │   └── runner.rs
 │   ├── claude/
 │   │   ├── active_usage.rs
 │   │   ├── backend_routing.rs
@@ -560,14 +563,16 @@ src/
 │   │   │   ├── agent_execution_node_tests.rs
 │   │   │   ├── attachment_tests.rs
 │   │   │   ├── capacity_tests.rs
+│   │   │   ├── edge_case_tests.rs
 │   │   │   ├── execution_requirement_tests.rs
 │   │   │   ├── model.rs
 │   │   │   ├── owner_record.rs
 │   │   │   ├── placement.rs
 │   │   │   └── session_owner.rs
-│   │   ├── intake_worker/
+│   │   ├── intake_runner/
 │   │   │   ├── dispatch_stamp_tests.rs
 │   │   │   └── drain_tests.rs
+│   │   ├── intake_worker/
 │   │   ├── readiness/
 │   │   │   └── tests.rs
 │   │   ├── stream_relay/
@@ -587,8 +592,8 @@ src/
 │   │   ├── intake_routing.rs
 │   │   ├── intake_routing_config.rs
 │   │   ├── intake_routing_telemetry.rs
-│   │   ├── intake_worker.rs
-│   │   ├── intake_worker_capabilities.rs
+│   │   ├── intake_runner.rs
+│   │   ├── intake_runner_capabilities.rs
 │   │   ├── mod.rs
 │   │   ├── node_registry.rs
 │   │   ├── readiness.rs
@@ -682,6 +687,7 @@ src/
 │   │   │   ├── streaming_status.rs
 │   │   │   └── tool_markdown.rs
 │   │   ├── gateway/
+│   │   │   ├── merged_placeholders.rs
 │   │   │   └── outbound_messages.rs
 │   │   ├── health/
 │   │   │   ├── reachability/
@@ -863,7 +869,12 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── section_dedupe.rs
 │   │   │   └── session_anchors.rs
+│   │   ├── queue_dispatch/
+│   │   │   └── kickoff.rs
 │   │   ├── queue_io/
+│   │   │   ├── transport/
+│   │   │   │   └── tests.rs
+│   │   │   ├── transport.rs
 │   │   │   └── turn_admission.rs
 │   │   ├── recovery_engine/
 │   │   │   ├── manual_rebind/
@@ -971,10 +982,10 @@ src/
 │   │   │   │   │   ├── intake_dispatch.rs
 │   │   │   │   │   ├── placeholder_handoff.rs
 │   │   │   │   │   ├── race_loss.rs
+│   │   │   │   │   ├── runner_entry.rs
 │   │   │   │   │   ├── runtime_transition.rs
 │   │   │   │   │   ├── stale_dispatch_guard.rs
-│   │   │   │   │   ├── voice_intake.rs
-│   │   │   │   │   └── worker_entry.rs
+│   │   │   │   │   └── voice_intake.rs
 │   │   │   │   ├── attachments.rs
 │   │   │   │   ├── busy_retry.rs
 │   │   │   │   ├── control.rs
@@ -1026,6 +1037,7 @@ src/
 │   │   │   ├── intake_delivery_sweep.rs
 │   │   │   ├── orphan_recovery.rs
 │   │   │   ├── queued_placeholders.rs
+│   │   │   ├── queued_recovery.rs
 │   │   │   ├── recovery_flush.rs
 │   │   │   ├── relay_dlq_redelivery.rs
 │   │   │   ├── restored_state.rs
@@ -1287,6 +1299,7 @@ src/
 │   │   │   │   │   ├── rowless_receipt_tests/
 │   │   │   │   │   │   ├── pg_tests.rs
 │   │   │   │   │   │   └── preloop_cleanup_tests.rs
+│   │   │   │   │   ├── rest_delivery_tests.rs
 │   │   │   │   │   └── rowless_receipt_tests.rs
 │   │   │   │   ├── empty_response_recovery/
 │   │   │   │   │   ├── guidance.rs
@@ -1633,11 +1646,11 @@ src/
 │   │   ├── recovery_audit.rs
 │   │   ├── relay_signal_alert.rs
 │   │   ├── retention.rs
+│   │   ├── runner.rs
 │   │   ├── session_inventory.rs
 │   │   ├── test_support.rs
 │   │   ├── turn_lifecycle.rs
-│   │   ├── watcher_latency.rs
-│   │   └── worker.rs
+│   │   └── watcher_latency.rs
 │   ├── onboarding/
 │   │   ├── channel.rs
 │   │   ├── mod.rs
@@ -1981,7 +1994,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/github/` | GitHub sync, issue triage, and Definition-of-Done mirroring. |
 | `src/kanban/` | High-level kanban orchestration, state machine facade, and shared test support. |
 | `src/runtime_layout/` | Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment. |
-| `src/server/` | Axum server boot, routes, workers, background loops, and WebSocket broadcast. |
+| `src/server/` | Axum server boot, routes, runners, background loops, and WebSocket broadcast. |
 | `src/services/` | Core runtime services: provider runners, Discord bot, queueing, memory, and platform helpers. |
 | `src/supervisor/` | Runtime supervisor signals and recovery decisions for orphaned or stalled work. |
 | `src/ui/` | Compatibility shims for persisted UI/session types used by the Discord runtime. |
@@ -2045,13 +2058,13 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/server/routes/dispatches/` | Dispatch CRUD, Discord delivery, outbox, thread reuse. |
 | `src/server/routes/review_verdict/` | Review verdict and decision routes plus review-state storage helpers. |
 | `src/server/ws.rs` | Top-level WebSocket endpoint and broadcast plumbing. |
-| `src/server/worker_registry.rs` | Supervised worker specs; mirrored to `docs/generated/worker-inventory.md`. |
+| `src/server/runner_registry.rs` | Supervised runner specs; mirrored to `docs/generated/runner-inventory.md`. |
 
 ## Generated Inventories
 
 - `docs/generated/module-inventory.md` is the fastest way to answer “which module owns this code?”
 - `docs/generated/route-inventory.md` is the authoritative endpoint-to-handler map. Prefer it over manually maintained tables.
-- `docs/generated/worker-inventory.md` shows every supervised worker, its start stage, restart policy, and owner.
+- `docs/generated/runner-inventory.md` shows every supervised runner, its start stage, restart policy, and owner.
 - `python3 scripts/generate_inventory_docs.py --check` is the CI drift gate for these inventories, the generated `src/` snapshot above, and the top-level module coverage table.
 
 ## Troubleshooting: Where to Look

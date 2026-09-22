@@ -68,7 +68,7 @@ mod session_banner;
 #[cfg(unix)]
 mod session_relay_sink;
 mod sidecar_interaction;
-// #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (leader uses tmux_watcher's relay path).
+// #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (hub uses tmux_watcher's relay path).
 #[cfg(unix)]
 mod standby_relay;
 // #1074: landing zone for the future recovery-engine module split (restart / runtime / manual_rebind; see `docs/recovery-paths.md`). Named `recovery_paths` to avoid shadowing the `recovery_engine as recovery` alias until the split lands.
@@ -884,9 +884,9 @@ impl UserRecord {
 /// Shared state for the Discord bot — split into independently-lockable groups.
 ///
 /// Phase 2-pre.3 of intake-node-routing: widened from `pub(super)` to
-/// `pub(crate)` so the public worker entry point `execute_intake_turn_core`
+/// `pub(crate)` so the public runner entry point `execute_intake_turn_core`
 /// can accept `&Arc<SharedData>` from a non-`services::discord` caller
-/// (Phase 3 worker polling loop).
+/// (Phase 3 runner polling loop).
 pub(crate) struct SharedData {
     /// Core state (sessions + request lifecycle) — requires atomic access
     pub(super) core: Mutex<CoreState>,
@@ -1260,7 +1260,7 @@ fn make_shared_data_for_tests_with_storage_and_intake_capabilities(
         restart: RestartLifecycle {
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            intake_worker_lifecycle: Default::default(),
+            intake_runner_lifecycle: Default::default(),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_generation: 0,
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1535,7 +1535,7 @@ fn idle_queue_snapshot_has_kickable_backlog(
         && idle_queue_snapshot_has_pending_or_marker_backlog(shared, provider, channel_id, snapshot)
         && !cleanup_retry_inflight_blocks_idle_kickoff(shared, provider, channel_id)
         // #3154: while a deferred synthetic turn-start is pending for this
-        // channel, the per-channel worker is waiting for the prior turn to
+        // channel, the per-channel runner is waiting for the prior turn to
         // finalize before claiming. Do NOT kick normal queued work in the
         // meantime — that would re-introduce the very turn-interleave this fix
         // serializes away.
@@ -1949,7 +1949,7 @@ async fn apply_queue_exit_feedback(
     );
 
     // Phase 5.2 of intake-node-routing (issue #2009): use gateway-or-token
-    // fallback so cluster-standby workers can still rewrite queue-exit
+    // fallback so cluster-standby runners can still rewrite queue-exit
     // placeholder cards via REST. Falling back to the deferred-cleanup
     // path is still correct for genuinely-no-token startup races.
     let Some(http) = shared.serenity_http_or_token_fallback() else {
@@ -2017,7 +2017,7 @@ pub(in crate::services::discord) async fn drain_pending_queue_exit_placeholder_c
 ) {
     // Phase 5.2 of intake-node-routing (issue #2009): use gateway-or-token
     // fallback so the deferred drain that fires on `bot_connected` /
-    // `runtime_bootstrap` can still run on standby workers.
+    // `runtime_bootstrap` can still run on standby runners.
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         return;
     };
@@ -2180,7 +2180,7 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
     }
 
     // Phase 5.2 of intake-node-routing (issue #2009): catch-up retry runs
-    // on whatever node hosts the channel; on standby workers it falls back
+    // on whatever node hosts the channel; on standby runners it falls back
     // to a token-built REST `Arc<Http>` so retries still fire even
     // without a gateway runtime.
     let Some(http) = shared.serenity_http_or_token_fallback() else {

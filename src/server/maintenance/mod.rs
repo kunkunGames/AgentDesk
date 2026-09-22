@@ -135,13 +135,13 @@ impl MaintenanceJobRegistry {
             Arc::new(VoiceTurnLinkGcJob),
             Arc::new(VoiceTranscriptAnnouncementMetaGcJob),
             Arc::new(VoiceBackgroundHandoffMetaGcJob),
-            // #3909 — leader-only voice TTS cache/temp sweep.
+            // #3909 — hub-only voice TTS cache/temp sweep.
             Arc::new(ProgressTtsCacheSweepJob {
                 config: voice_cache_sweep,
             }),
             // #3231 — disk-GC / memory maintenance jobs. Their implementations
             // live in `services::maintenance::jobs::*`; these wrappers register
-            // them on the live leader-only scheduler.
+            // them on the live hub-only scheduler.
             Arc::new(StorageTargetSweepJob),
             Arc::new(StorageWorktreeOrphanSweepJob),
             Arc::new(StorageTmpPipelineSweepJob),
@@ -411,7 +411,7 @@ impl MaintenanceJob for PromptManifestRetentionJob {
     }
 }
 
-/// #2209 — leader-only GC for durable voice transcript announcement metadata.
+/// #2209 — hub-only GC for durable voice transcript announcement metadata.
 /// Rows are short-lived during normal operation, but a send failure or process
 /// crash can leave pending rows behind.
 struct VoiceTranscriptAnnouncementMetaGcJob;
@@ -451,7 +451,7 @@ impl MaintenanceJob for VoiceTranscriptAnnouncementMetaGcJob {
     }
 }
 
-/// #2274 — leader-only GC for `voice_background_handoff_meta`. Cleans
+/// #2274 — hub-only GC for `voice_background_handoff_meta`. Cleans
 /// rows whose `created_at` is older than the durable handoff TTL (~1
 /// hour). Consumed rows are also removed by the same age-based filter
 /// since terminal-delivery rows are consumed within minutes; anything
@@ -924,7 +924,7 @@ mod registry_membership_tests {
         assert!(
             names.contains(&"voice.turn_link_gc"),
             "voice.turn_link_gc must be registered on the production \
-             MaintenanceJobRegistry so the leader scheduler sweeps \
+             MaintenanceJobRegistry so the hub scheduler sweeps \
              terminal voice_turn_link rows (#2362). present jobs: {names:?}"
         );
     }
@@ -943,7 +943,7 @@ mod registry_membership_tests {
 
     /// #3231 — the disk-GC / memory maintenance implementations live in
     /// `services::maintenance::jobs::*`; the wrapper structs below keep them
-    /// registered on the live leader-only scheduler.
+    /// registered on the live hub-only scheduler.
     #[test]
     fn static_registry_includes_disk_gc_jobs() {
         let registry = MaintenanceJobRegistry::static_registry();
@@ -960,14 +960,14 @@ mod registry_membership_tests {
                 names.contains(&expected),
                 "{expected} must be registered on the production \
                  MaintenanceJobRegistry so the disk-GC maintenance jobs from \
-                 #3231 actually run on the leader scheduler. present jobs: {names:?}"
+                 #3231 actually run on the hub scheduler. present jobs: {names:?}"
             );
         }
     }
 
     #[test]
     fn static_registry_includes_progress_tts_cache_sweep() {
-        // #3909 — the leader-only voice cache/temp sweeper must be wired into
+        // #3909 — the hub-only voice cache/temp sweeper must be wired into
         // the production registry so the unbounded-growth leaks are bounded.
         let registry = MaintenanceJobRegistry::static_registry();
         assert!(
@@ -976,7 +976,7 @@ mod registry_membership_tests {
                 .iter()
                 .any(|job| job.name() == "voice.progress_tts_cache_sweep"),
             "voice.progress_tts_cache_sweep must be registered on the production \
-             leader-only maintenance scheduler (#3909)"
+             hub-only maintenance scheduler (#3909)"
         );
     }
 
@@ -989,7 +989,7 @@ mod registry_membership_tests {
     }
 
     /// #3561 — the relay-loss operator monitor must be registered so the
-    /// leader scheduler actually evaluates the relay signal thresholds hourly;
+    /// hub scheduler actually evaluates the relay signal thresholds hourly;
     /// otherwise the alert pipeline silently never runs.
     #[test]
     fn static_registry_includes_relay_signal_alerter() {
@@ -997,7 +997,7 @@ mod registry_membership_tests {
         let names: Vec<&'static str> = registry.jobs().iter().map(|job| job.name()).collect();
         assert!(
             names.contains(&"relay_signal_alerter"),
-            "relay_signal_alerter must be registered so the leader scheduler \
+            "relay_signal_alerter must be registered so the hub scheduler \
              evaluates relay-loss signal thresholds hourly (#3561). \
              present jobs: {names:?}"
         );

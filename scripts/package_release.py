@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package one native build in the shared leader/worker layout (Python >= 3.11).
+"""Package one native build in the shared hub/runner layout (Python >= 3.11).
 
 Inputs are the binary, built dashboard and explicitly selected tracked assets.
 Operator configuration, credentials and workspaces are never packaged.
@@ -25,7 +25,8 @@ RUNTIME_ASSETS = (
     "policies", "routines", "skills", "scripts/launchd-migrated",
     "scripts/_defaults.sh", "scripts/queue-stability-batch.sh",
     "scripts/install-windows-runtime-task.ps1", "scripts/agentdesk-dcserver.service",
-    "scripts/install-windows-worker-firewall.ps1",
+    "scripts/install-windows-runner-firewall.ps1",
+    "scripts/migrate-windows-hub-runner-firewall.ps1",
     "defaults.json", "agentdesk.example.yaml", "LICENSE",
 )
 TARGETS = {

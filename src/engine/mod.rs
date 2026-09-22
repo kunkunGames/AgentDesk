@@ -38,8 +38,8 @@ struct PolicyEngineInner {
     //   1. `policies`     — Persistent JS values; must be cleared before the
     //                        runtime is dropped (also done explicitly in
     //                        `Drop::drop` to cope with poisoned mutexes).
-    //   2. `_hot_reload`  — Watcher + worker thread guard. Its `Drop`
-    //                        joins the worker thread, which owns a clone of
+    //   2. `_hot_reload`  — Watcher + runner thread guard. Its `Drop`
+    //                        joins the runner thread, which owns a clone of
     //                        the QuickJS `Context`. Joining here makes that
     //                        clone drop *before* we touch `context` or
     //                        `_runtime` below, preventing a stale `Context`
@@ -63,9 +63,9 @@ impl Drop for PolicyEngineInner {
         if let Ok(mut guard) = self.policies.lock() {
             guard.clear();
         }
-        // Proactively tear down the hot-reload worker so its `Context` clone
+        // Proactively tear down the hot-reload runner so its `Context` clone
         // is dropped before this function returns and the remaining fields
-        // (context, runtime) get dropped. Without this the worker would only
+        // (context, runtime) get dropped. Without this the runner would only
         // be torn down when `_hot_reload` is dropped via the normal field
         // drop order, which is safe in isolation but fragile under panics
         // and mutex poisoning. Explicit shutdown here is the belt to the
@@ -428,7 +428,7 @@ impl PolicyEngine {
 
     /// Approximate number of commands waiting in the actor queue (#747).
     /// Zero when idle. Reported for observability when a tick hook times out
-    /// so operators can tell whether the stuck worker is also holding up
+    /// so operators can tell whether the stuck runner is also holding up
     /// queued callers.
     pub fn actor_queue_depth(&self) -> usize {
         self.actor

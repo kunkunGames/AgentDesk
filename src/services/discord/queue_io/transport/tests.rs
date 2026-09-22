@@ -2,19 +2,19 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
-async fn rest_worker_queue_transport_requires_credentials_but_not_gateway() {
+async fn rest_runner_queue_transport_requires_credentials_but_not_gateway() {
     let shared = make_shared_data_for_tests();
     assert!(QueueTransport::from_runtime(&shared).is_none());
     shared
         .http
         .cached_bot_token
-        .set("worker-queue-test-token".into())
+        .set("runner-queue-test-token".into())
         .unwrap();
-    let transport = QueueTransport::from_runtime(&shared).expect("REST worker transport");
+    let transport = QueueTransport::from_runtime(&shared).expect("REST runner transport");
     let deps = transport.intake_deps(&shared);
     assert!(deps.cache.is_none());
     assert!(deps.ctx_for_chained_dispatch.is_none());
-    assert_eq!(deps.token, "worker-queue-test-token");
+    assert_eq!(deps.token, "runner-queue-test-token");
     assert!(Arc::ptr_eq(deps.shared, &shared));
 }
 
@@ -46,7 +46,7 @@ async fn mock_discord() -> (
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http = Arc::new(
-        serenity::HttpBuilder::new("worker-queue-test-token")
+        serenity::HttpBuilder::new("runner-queue-test-token")
             .proxy(format!("http://{}", listener.local_addr().unwrap()))
             .ratelimiter_disabled(true)
             .build(),
@@ -111,7 +111,7 @@ async fn rest_queue_rejected_by_changed_policy_keeps_durable_head_and_lease_free
     shared
         .http
         .cached_bot_token
-        .set("worker-queue-test-token".into())
+        .set("runner-queue-test-token".into())
         .unwrap();
     let (http, count, server) = mock_discord().await;
     let mut transport = QueueTransport::from_runtime(&shared).unwrap();

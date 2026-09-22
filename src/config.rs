@@ -373,9 +373,9 @@ pub struct AgentDef {
     #[serde(default)]
     pub avatar_emoji: Option<String>,
     /// Cluster intake node-affinity labels (#3667). When set and non-empty,
-    /// intake for this agent's channels is routed to an online worker node whose
+    /// intake for this agent's channels is routed to an online runner node whose
     /// labels satisfy this list; `Some([])` means no preference (intake stays on
-    /// the leader). `None` (key absent from yaml) leaves any existing DB value
+    /// the hub). `None` (key absent from yaml) leaves any existing DB value
     /// untouched on sync, so an out-of-band label is never wiped. Maps to the
     /// `agents.preferred_intake_node_labels` JSONB column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1301,11 +1301,11 @@ dispatch_routing:
         assert!(config.nodes["mac-mini-release"].allow_private_forwarding);
         assert!(config.nodes["mac-mini-release"].allow_insecure_http_forwarding);
         let defaults: ClusterConfig = serde_yaml::from_str(
-            "nodes:\n  worker-default:\n    trusted_forward_origin: https://worker.example:8791\n",
+            "nodes:\n  runner-default:\n    trusted_forward_origin: https://runner.example:8791\n",
         )
         .expect("new forwarding flags preserve config compatibility");
-        assert!(!defaults.nodes["worker-default"].allow_private_forwarding);
-        assert!(!defaults.nodes["worker-default"].allow_insecure_http_forwarding);
+        assert!(!defaults.nodes["runner-default"].allow_private_forwarding);
+        assert!(!defaults.nodes["runner-default"].allow_insecure_http_forwarding);
         assert_eq!(
             config.blackout_windows["mac-mini-release"][0]
                 .reason

@@ -164,7 +164,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("dispatch outbox oldest pending age is {age}s"),
-            next_step: "inspect dispatch outbox retry worker and delivery failures".to_string(),
+            next_step: "inspect dispatch outbox retry runner and delivery failures".to_string(),
         },
         ["pipeline_override_warnings", count] => ClassifiedReason {
             raw: raw.to_string(),
@@ -245,43 +245,43 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: "database is unavailable".to_string(),
             next_step: "check Postgres availability and server logs".to_string(),
         },
-        // #4515 PR2: worker-local recovery circuit reasons.
-        ["worker_local_restart_budget_exhausted", worker] => ClassifiedReason {
+        // #4515 PR2: runner-local recovery circuit reasons.
+        ["runner_local_restart_budget_exhausted", runner] => ClassifiedReason {
             raw: raw.to_string(),
-            subsystem: "worker_recovery",
+            subsystem: "runner_recovery",
             severity: Severity::Error,
             fix_safety: FixSafety::ExplicitRestartRequired,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!(
-                "worker-local worker {worker} exhausted its restart budget and is permanently stopped"
+                "runner-local runner {runner} exhausted its restart budget and is permanently stopped"
             ),
             next_step: format!(
-                "inspect dcserver logs for {worker} crash cause; the process exits for launchd KeepAlive restart unless the cross-process crash-loop guard held it"
+                "inspect dcserver logs for {runner} crash cause; the process exits for launchd KeepAlive restart unless the cross-process crash-loop guard held it"
             ),
         },
-        ["worker_local_loop_owned_terminated", worker] => ClassifiedReason {
+        ["runner_local_loop_owned_terminated", runner] => ClassifiedReason {
             raw: raw.to_string(),
-            subsystem: "worker_recovery",
+            subsystem: "runner_recovery",
             severity: Severity::Warning,
             fix_safety: FixSafety::ExplicitRestartRequired,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!(
-                "un-migrated LoopOwned worker {worker} terminated unexpectedly and is not auto-restarted"
+                "un-migrated LoopOwned runner {runner} terminated unexpectedly and is not auto-restarted"
             ),
             next_step: format!(
-                "inspect dcserver logs for {worker}; a dcserver restart is required to recover it"
+                "inspect dcserver logs for {runner}; a dcserver restart is required to recover it"
             ),
         },
-        ["worker_local_restart_flapping", worker, count] => ClassifiedReason {
+        ["runner_local_restart_flapping", runner, count] => ClassifiedReason {
             raw: raw.to_string(),
-            subsystem: "worker_recovery",
+            subsystem: "runner_recovery",
             severity: Severity::Warning,
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!(
-                "worker-local worker {worker} restarted {count} time(s) within the budget window"
+                "runner-local runner {runner} restarted {count} time(s) within the budget window"
             ),
-            next_step: format!("inspect dcserver logs for repeated {worker} exits"),
+            next_step: format!("inspect dcserver logs for repeated {runner} exits"),
         },
         _ => ClassifiedReason {
             raw: raw.to_string(),
@@ -403,20 +403,20 @@ mod health_classification_tests {
     }
 
     #[test]
-    fn worker_recovery_reason_codes_classify() {
+    fn runner_recovery_reason_codes_classify() {
         // #4515 PR2: budget exhaustion is a fatal, restart-required error.
         let exhausted =
-            classify_degraded_reason("worker_local_restart_budget_exhausted:dispatch_outbox");
-        assert_eq!(exhausted.subsystem, "worker_recovery");
+            classify_degraded_reason("runner_local_restart_budget_exhausted:dispatch_outbox");
+        assert_eq!(exhausted.subsystem, "runner_recovery");
         assert_eq!(exhausted.severity, Severity::Error);
         assert_eq!(exhausted.fix_safety, FixSafety::ExplicitRestartRequired);
         assert!(exhausted.summary.contains("dispatch_outbox"));
         assert_ne!(exhausted.summary, exhausted.raw);
 
-        // An un-migrated LoopOwned worker death is a warning needing a restart.
+        // An un-migrated LoopOwned runner death is a warning needing a restart.
         let terminated =
-            classify_degraded_reason("worker_local_loop_owned_terminated:watcher_supervisor");
-        assert_eq!(terminated.subsystem, "worker_recovery");
+            classify_degraded_reason("runner_local_loop_owned_terminated:watcher_supervisor");
+        assert_eq!(terminated.subsystem, "runner_recovery");
         assert_eq!(terminated.severity, Severity::Warning);
         assert_eq!(terminated.fix_safety, FixSafety::ExplicitRestartRequired);
         assert!(terminated.summary.contains("watcher_supervisor"));
@@ -424,8 +424,8 @@ mod health_classification_tests {
 
         // Flapping is read-only informational.
         let flapping =
-            classify_degraded_reason("worker_local_restart_flapping:session_discovery:3");
-        assert_eq!(flapping.subsystem, "worker_recovery");
+            classify_degraded_reason("runner_local_restart_flapping:session_discovery:3");
+        assert_eq!(flapping.subsystem, "runner_recovery");
         assert_eq!(flapping.severity, Severity::Warning);
         assert_eq!(flapping.fix_safety, FixSafety::ReadOnly);
         assert!(flapping.summary.contains("session_discovery"));

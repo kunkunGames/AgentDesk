@@ -69,7 +69,7 @@ if [[ "$ENV" != "preview" ]]; then
   # Every provider role participates in the same marker handshake. Health is
   # drain evidence only after restart_pending has fenced new admissions; an
   # idle snapshot by itself cannot authorize bootout because a standby intake
-  # worker may claim a full turn immediately after that snapshot.
+  # runner may claim a full turn immediately after that snapshot.
   if ! request_restart_drain_mode_or_fail "$ENV" "$LABEL" "$PORT" "$RUNTIME_ROOT" "agentdesk-restart-skill"; then
     exit 1
   fi

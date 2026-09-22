@@ -14,11 +14,11 @@ pub(crate) enum IntakeRoutingReasonCode {
     DisabledButPreferenceSet,
     NoAgentForChannel,
     AgentHasNoPreference,
-    NoEligibleWorker,
-    LeaderIsOnlyEligible,
-    AgentDefaultIsLeader,
+    NoEligibleRunner,
+    HubIsOnlyEligible,
+    AgentDefaultIsHub,
     DependencyFallback,
-    NodeOverrideIsLeader,
+    NodeOverrideIsHub,
     NodeOverrideRoutingDisabled,
     LiveOwnerLocal,
     LiveOwnerForeign,
@@ -43,11 +43,11 @@ impl IntakeRoutingReasonCode {
             Self::DisabledButPreferenceSet => "disabled_but_preference_set",
             Self::NoAgentForChannel => "no_agent_for_channel",
             Self::AgentHasNoPreference => "agent_has_no_preference",
-            Self::NoEligibleWorker => "no_eligible_worker",
-            Self::LeaderIsOnlyEligible => "leader_is_only_eligible",
-            Self::AgentDefaultIsLeader => "agent_default_is_leader",
+            Self::NoEligibleRunner => "no_eligible_runner",
+            Self::HubIsOnlyEligible => "hub_is_only_eligible",
+            Self::AgentDefaultIsHub => "agent_default_is_hub",
             Self::DependencyFallback => "dependency_fallback",
-            Self::NodeOverrideIsLeader => "node_override_is_leader",
+            Self::NodeOverrideIsHub => "node_override_is_hub",
             Self::NodeOverrideRoutingDisabled => "node_override_routing_disabled",
             Self::LiveOwnerLocal => "live_owner_local",
             Self::LiveOwnerForeign => "live_owner_foreign",
@@ -98,9 +98,9 @@ impl OwnerResolutionCode {
 pub(crate) enum PreferredLabelMatchCode {
     NotEvaluated,
     NoPreference,
-    MatchedWorker,
-    LeaderOnly,
-    NoEligibleWorker,
+    MatchedRunner,
+    HubOnly,
+    NoEligibleRunner,
     LookupFailed,
 }
 
@@ -109,9 +109,9 @@ impl PreferredLabelMatchCode {
         match self {
             Self::NotEvaluated => "not_evaluated",
             Self::NoPreference => "no_preference",
-            Self::MatchedWorker => "matched_worker",
-            Self::LeaderOnly => "leader_only",
-            Self::NoEligibleWorker => "no_eligible_worker",
+            Self::MatchedRunner => "matched_runner",
+            Self::HubOnly => "hub_only",
+            Self::NoEligibleRunner => "no_eligible_runner",
             Self::LookupFailed => "lookup_failed",
         }
     }
@@ -185,18 +185,18 @@ fn ran_local_telemetry(reason: &RanLocalReason) -> IntakeRoutingTelemetry<'stati
             OwnerResolutionCode::NoOwner,
             PreferredLabelMatchCode::NoPreference,
         ),
-        RanLocalReason::NoEligibleWorker => (
-            IntakeRoutingReasonCode::NoEligibleWorker,
+        RanLocalReason::NoEligibleRunner => (
+            IntakeRoutingReasonCode::NoEligibleRunner,
             OwnerResolutionCode::NoOwner,
-            PreferredLabelMatchCode::NoEligibleWorker,
+            PreferredLabelMatchCode::NoEligibleRunner,
         ),
-        RanLocalReason::LeaderIsOnlyEligible => (
-            IntakeRoutingReasonCode::LeaderIsOnlyEligible,
+        RanLocalReason::HubIsOnlyEligible => (
+            IntakeRoutingReasonCode::HubIsOnlyEligible,
             OwnerResolutionCode::NoOwner,
-            PreferredLabelMatchCode::LeaderOnly,
+            PreferredLabelMatchCode::HubOnly,
         ),
-        RanLocalReason::AgentDefaultIsLeader => (
-            IntakeRoutingReasonCode::AgentDefaultIsLeader,
+        RanLocalReason::AgentDefaultIsHub => (
+            IntakeRoutingReasonCode::AgentDefaultIsHub,
             OwnerResolutionCode::NoOwner,
             PreferredLabelMatchCode::NotEvaluated,
         ),
@@ -205,8 +205,8 @@ fn ran_local_telemetry(reason: &RanLocalReason) -> IntakeRoutingTelemetry<'stati
             OwnerResolutionCode::NoOwner,
             PreferredLabelMatchCode::LookupFailed,
         ),
-        RanLocalReason::NodeOverrideIsLeader => (
-            IntakeRoutingReasonCode::NodeOverrideIsLeader,
+        RanLocalReason::NodeOverrideIsHub => (
+            IntakeRoutingReasonCode::NodeOverrideIsHub,
             OwnerResolutionCode::NoOwner,
             PreferredLabelMatchCode::NotEvaluated,
         ),
@@ -254,7 +254,7 @@ pub(crate) fn telemetry_for_decision(
                     reason_code: IntakeRoutingReasonCode::NoOwnerTargetSelected,
                     would_assign_target: Some(target_instance_id),
                     owner_resolution: OwnerResolutionCode::NoOwner,
-                    preferred_label_match: PreferredLabelMatchCode::MatchedWorker,
+                    preferred_label_match: PreferredLabelMatchCode::MatchedRunner,
                 }
             }
             ObservedIntakeOutcome::WouldKeepNoOwnerLocal { reason } => ran_local_telemetry(reason),
@@ -300,7 +300,7 @@ pub(crate) fn telemetry_for_decision(
                 reason_code: IntakeRoutingReasonCode::NoOwnerTargetSelected,
                 would_assign_target: Some(target_instance_id),
                 owner_resolution: OwnerResolutionCode::NoOwner,
-                preferred_label_match: PreferredLabelMatchCode::MatchedWorker,
+                preferred_label_match: PreferredLabelMatchCode::MatchedRunner,
             },
         },
         IntakeRouterDecision::SkippedDuplicate { resolved_owner } => IntakeRoutingTelemetry {
@@ -419,7 +419,7 @@ mod tests {
     fn observe_planner_telemetry_is_stable_and_complete() {
         let decision = IntakeRouterDecision::Observed {
             outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
-                target_instance_id: "worker-mac".to_string(),
+                target_instance_id: "runner-mac".to_string(),
             },
         };
         let telemetry = telemetry_for_decision(&decision);
@@ -427,9 +427,9 @@ mod tests {
             telemetry,
             IntakeRoutingTelemetry {
                 reason_code: IntakeRoutingReasonCode::NoOwnerTargetSelected,
-                would_assign_target: Some("worker-mac"),
+                would_assign_target: Some("runner-mac"),
                 owner_resolution: OwnerResolutionCode::NoOwner,
-                preferred_label_match: PreferredLabelMatchCode::MatchedWorker,
+                preferred_label_match: PreferredLabelMatchCode::MatchedRunner,
             }
         );
         assert_eq!(telemetry.reason_code.as_str(), "no_owner_target_selected");
@@ -446,7 +446,7 @@ mod tests {
             .finish();
         let decision = IntakeRouterDecision::Observed {
             outcome: ObservedIntakeOutcome::WouldAssignNoOwnerToTarget {
-                target_instance_id: "worker-mac".to_string(),
+                target_instance_id: "runner-mac".to_string(),
             },
         };
 
@@ -466,9 +466,9 @@ mod tests {
             "mode=\"observe\"",
             "authority_channel_opt_in=\"opted_in\"",
             "authority_scope=\"telemetry_and_admission\"",
-            "would_assign_target=\"worker-mac\"",
+            "would_assign_target=\"runner-mac\"",
             "owner_resolution=\"no_owner\"",
-            "preferred_label_match=\"matched_worker\"",
+            "preferred_label_match=\"matched_runner\"",
             "reason_code=\"no_owner_target_selected\"",
         ] {
             assert!(logs.contains(field), "missing {field} in logs={logs}");
@@ -480,7 +480,7 @@ mod tests {
         let decision = IntakeRouterDecision::Observed {
             outcome: ObservedIntakeOutcome::WouldBlock {
                 reason: IntakeBlockedReason::ConflictingLiveSessionOwners {
-                    instance_ids: vec!["worker-a".into(), "worker-b".into()],
+                    instance_ids: vec!["runner-a".into(), "runner-b".into()],
                 },
             },
         };

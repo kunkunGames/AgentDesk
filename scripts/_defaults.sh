@@ -723,7 +723,7 @@ _health_json_unhealthy_only_no_provider_runtimes() {
   # #4348 DEPLOY/RESTART readiness rescue — NOT a runtime /health change.
   # Returns 0 when the node is provably SERVING the new binary (server_up + db +
   # dashboard all true) and its ONLY deploy-BLOCKING condition is that no
-  # provider runtimes are registered (leader-only / no-agent-session topology):
+  # provider runtimes are registered (hub-only / no-agent-session topology):
   # providers.is_empty() emits `no_providers_registered`, the startup doctor is
   # skipped with skipped_reason=no_provider_runtimes_registered, and status is
   # pinned to `unhealthy` forever even though the server is fully up.
@@ -854,7 +854,7 @@ health_json_is_ready() {
   if _health_json_field_exists "$health_json" "server_up"; then
     _health_json_field_is_true "$health_json" "server_up" || return 1
     if [ "$status" = "unhealthy" ]; then
-      # #4348: rescue a serving leader-only / no-session node whose only
+      # #4348: rescue a serving hub-only / no-session node whose only
       # deploy-BLOCKING cause is no_provider_runtimes_registered (co-existing
       # degraded/non-blocking axes are allowed — same as a provider-present
       # degraded node that passes the gate). server_up is already confirmed true
