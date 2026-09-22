@@ -1,6 +1,7 @@
 //! Placement inputs and outcomes; transport and ownership remain in the routing hook.
 use super::IntakeRoutingMode;
 use crate::db::intake_outbox::InsertPendingPayload;
+use crate::db::intake_outbox_status::IntakeOutboxStatus;
 
 /// What the hook decided. The intake gate uses this to choose between
 /// "skip local execution; the worker has the row" and "fall through

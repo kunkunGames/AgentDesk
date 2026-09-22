@@ -975,6 +975,25 @@ async function mockMeetingsHubApis(page: Page) {
 }
 
 async function mockAgentsHubApis(page: Page) {
+  await page.route(/\/api\/agents\/[^/]+\/execution-node$/, async (route) => {
+    await route.fulfill({ json: { default_node_id: null, routing_enforced: true } });
+  });
+  await page.route(/\/api\/cluster\/nodes$/, async (route) => {
+    await route.fulfill({ json: {
+      cluster: { enabled: true, local_instance_id: "mac-mini" },
+      nodes: [
+        { instance_id: "mac-mini", hostname: "Mac mini", effective_role: "leader", status: "online", os: "macos" },
+        { instance_id: "windows-1", hostname: "Windows PC", effective_role: "worker", status: "online", os: "windows" },
+        { instance_id: "linux-2", hostname: "Linux PC", effective_role: "worker", status: "offline", os: "linux" },
+      ].map(({ os, ...node }) => ({ ...node,
+        capabilities: { execution_readiness: {
+          os, arch: "x86_64", runtime_profile: "full", observed_at_ms: Date.now(),
+          expires_at_ms: Date.now() + 60_000, backends: ["process"],
+        } },
+        execution_readiness: { providers: { codex: { eligible: true, reasons: [] } } },
+      })),
+    } });
+  });
   await page.route(/\/api\/agents\/[^/]+\/cron$/, async (route) => {
     await route.fulfill({
       status: 200,
@@ -2276,6 +2295,46 @@ test.describe("Dashboard smoke tests", () => {
     await expect(
       page.getByText(/모바일에서 warning disclosure는 별도 버튼으로 분리합니다/),
     ).toBeVisible();
+  });
+
+  test("agents: default execution device requires save and survives reopening", async ({ page }) => {
+    await mockAgentsHubApis(page);
+    let saved: string | null = null;
+    const writes: unknown[] = [];
+    await page.route(/\/api\/agents\/agent-ada\/execution-node$/, async (route) => {
+      if (route.request().method() === "PUT") {
+        const body = route.request().postDataJSON() as { default_node_id: string | null };
+        writes.push(body);
+        saved = body.default_node_id;
+      }
+      await route.fulfill({ json: { default_node_id: saved, routing_enforced: true } });
+    });
+    await page.goto("/agents");
+    await page.getByTestId("agents-card-agent-ada").click();
+    const dialog = page.getByRole("dialog", { name: /직원 상세|Agent Details/ });
+    const device = dialog.getByLabel(/실행 장비|Execution device/);
+    const save = dialog.getByRole("button", { name: /^(저장|Save)$/ });
+    await expect(device).toBeEnabled();
+    await expect(device).toHaveValue("");
+    await expect(device.locator('option[value="mac-mini"]')).toContainText("leader · macos");
+    await expect(device.locator('option[value="windows-1"]')).toContainText("worker · windows");
+    await device.selectOption("windows-1");
+    expect(writes).toEqual([]);
+    await save.click();
+    await expect(dialog.getByRole("status")).toContainText(/새 세션부터|new sessions/);
+    expect(writes).toEqual([{ default_node_id: "windows-1" }]);
+    await page.getByRole("button", { name: /닫기|Close/ }).click();
+    await page.getByTestId("agents-card-agent-ada").click();
+    await expect(device).toHaveValue("windows-1");
+    await expect(save).toBeDisabled();
+    await device.selectOption("linux-2");
+    await expect(dialog.getByText(/선택한 장비의 실행 준비|The selected device is not ready/)).toBeVisible();
+    expect(writes).toHaveLength(1);
+    await device.selectOption("");
+    await save.click();
+    await expect(dialog.getByRole("status")).toContainText(/새 세션부터|new sessions/);
+    expect(writes).toEqual([{ default_node_id: "windows-1" }, { default_node_id: null }]);
+    await expectNoHorizontalOverflow(page);
   });
 
   test("agents: desktop hub preserves 3-tab drill-ins", async ({ page }, testInfo) => {
