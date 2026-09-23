@@ -4,8 +4,8 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks, kakao_calendar,
-    meetings, pr_summary, protected_api_domain, provider_auth_profiles,
+    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks,
+    kakao_calendar, meetings, pr_summary, protected_api_domain, provider_auth_profiles,
 };
 
 // Category: integrations
