@@ -68,8 +68,6 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/cluster/execution_capacity/tests.rs",
         "src/services/cluster/execution_requirements/tests.rs",
         "src/services/cluster/intake_router_hook/attachment_tests.rs",
-        "src/services/cluster/intake_router_hook/agent_execution_node_tests.rs",
-        "src/services/cluster/intake_router_hook/edge_case_tests.rs",
         "src/services/cluster/intake_router_hook/capacity_tests.rs",
         "src/services/cluster/intake_router_hook/execution_requirement_tests.rs",
         "src/services/cluster/readiness/tests.rs",

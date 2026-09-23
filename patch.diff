@@ -1,0 +1,24 @@
+--- scripts/test_only_module_skip_pin.py
++++ scripts/test_only_module_skip_pin.py
+@@ -35,6 +35,8 @@
+         "src/services/cluster/execution_capacity/tests.rs",
+         "src/services/cluster/execution_requirements/tests.rs",
+         "src/services/cluster/intake_router_hook/attachment_tests.rs",
++        "src/services/cluster/intake_router_hook/agent_execution_node_tests.rs",
++        "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+         "src/services/cluster/intake_router_hook/capacity_tests.rs",
+         "src/services/cluster/intake_router_hook/execution_requirement_tests.rs",
+         "src/services/cluster/readiness/tests.rs",
+@@ -95,6 +97,7 @@
+         "src/services/discord/queue_dispatch/kickoff.rs",
+         "src/services/discord/queue_io/transport.rs",
+         "src/services/discord/queue_io/transport/tests.rs",
+         "src/services/discord/queue_io/turn_admission.rs",
+         "src/services/discord/recovery_engine/manual_rebind.rs",
+         "src/services/discord/recovery_engine/manual_rebind/tests.rs",
+@@ -102,6 +105,7 @@
+         "src/services/discord/turn_bridge/terminal_outcome_delivery/cancel_prompt_replace.rs",
+         "src/services/discord/turn_bridge/terminal_outcome_delivery/cancel_prompt_replace/cancel_prompt_replace_tests.rs",
+         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rest_delivery_tests.rs",
+         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests.rs",
+         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/pg_tests.rs",
