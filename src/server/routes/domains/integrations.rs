@@ -4,7 +4,7 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, kakao_calendar,
+    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks, kakao_calendar,
     meetings, pr_summary, protected_api_domain, provider_auth_profiles,
 };
 
@@ -89,6 +89,12 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 patch(github_dashboard::close_issue),
             )
             .route("/github-closed-today", get(github_dashboard::closed_today))
+            .route("/hook/reset-status", post(hooks::reset_status))
+            .route("/hook/skill-usage", post(hooks::skill_usage))
+            .route(
+                "/hook/session/{sessionKey}",
+                delete(hooks::disconnect_session),
+            )
             .route("/discord/bindings", get(discord::list_bindings))
             .route(
                 "/discord/channels/{id}/messages",
