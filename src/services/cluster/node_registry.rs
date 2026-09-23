@@ -178,6 +178,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     );
     let base_capabilities = cluster_capabilities_with_runner_api(&config.cluster);
     super::readiness::spawn_probe(config.clone());
+    super::machine_resources::spawn(config.cluster.heartbeat_interval_secs);
     super::attachment_transfer::temporary::spawn_cleanup();
     crate::services::session_forwarding::probe::spawn(
         config.clone(),

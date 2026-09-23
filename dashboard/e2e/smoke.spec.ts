@@ -2736,21 +2736,30 @@ test.describe("Dashboard smoke tests", () => {
     let fail = false;
     let enabled = true;
     let offline = false;
+    let cpuUsage = 37.5;
+    let includeRunner = true;
     await page.route(/\/api\/cluster\/nodes$/, route => {
       if (fail) return route.fulfill({ status: 503, json: { error: "fixture unavailable" } });
       const now = Date.now();
       return route.fulfill({ json: {
         cluster: { enabled, local_instance_id: "hub-example", lease_ttl_secs: 30, heartbeat_interval_secs: 5 },
-        nodes: ["hub-example", "runner-example"].map((id, index) => ({
+        nodes: (includeRunner ? ["hub-example", "runner-example"] : ["hub-example"]).map((id, index) => ({
           instance_id: id, hostname: index ? "Build runner" : "Control hub",
           status: index && offline ? "offline" : "online", role: index ? "runner" : "hub",
           effective_role: index ? "worker" : "leader", process_id: 100 + index,
           last_heartbeat_at: new Date(now).toISOString(), started_at: new Date(now - 60_000).toISOString(),
           api_base_url: `https://${id}.example.invalid`, labels: [index ? "build" : "control"],
           execution_active: 1, execution_occupied: 1, active_session_count: 1, active_dispatch_count: 0,
-          capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
+          capabilities: { machine_resources: {
+            schema: 1, observed_at_ms: now, expires_at_ms: now + 30_000, sample_interval_ms: 5_000,
+            cpu: { model: "Example CPU", physical_cores: 8, logical_cores: 16, usage_percent: cpuUsage },
+            memory: { total_bytes: 32 * 1024 ** 3, used_bytes: 16 * 1024 ** 3, available_bytes: 16 * 1024 ** 3 },
+            disks: [{ name: "Data", mount_point: index ? "C:\\" : "/", kind: "SSD", total_bytes: 1024 ** 4, used_bytes: 512 * 1024 ** 3, available_bytes: 512 * 1024 ** 3 }],
+            gpus: [{ name: "Example GPU", usage_percent: 25, memory_used_bytes: 4 * 1024 ** 3, memory_total_bytes: 16 * 1024 ** 3, shared_memory: false }],
+          }, execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
             os: index ? "windows" : "linux", arch: "x86_64", runtime_profile: index ? "runner" : "full",
             observed_at_ms: now, expires_at_ms: now + 60_000, backends: ["process"],
+            providers: { codex: { cli_installed: true, cli_usable: true }, antigravity: { cli_installed: false, cli_usable: false } },
           } },
           execution_readiness: { providers: { codex: { eligible: true, reasons: [] } } },
           forwarding_diagnostics: { advertised: true, configured: true, trust_validated: true,
@@ -2762,13 +2771,22 @@ test.describe("Dashboard smoke tests", () => {
     const panel = page.getByTestId("settings-machine-panel");
     await expect(panel).toBeVisible();
     await expect(page.locator("#settings-tab-machine")).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#settings-tab-machine").getByText("2", { exact: true })).toBeVisible();
     const order = await page.getByRole("tablist", { name: /설정 패널|Settings panels/ }).getByRole("tab").evaluateAll(tabs => tabs.map(tab => tab.id));
     expect(order[order.indexOf("settings-tab-general") + 1]).toBe("settings-tab-machine");
     const runner = page.getByTestId("machine-node-runner-example");
     await expect(runner.getByText("Runner", { exact: true }).first()).toBeVisible();
-    await expect(runner.getByText("Windows / x86_64", { exact: true })).toBeVisible();
+    await expect(runner.getByText(/Windows \/ x86_64/)).toBeVisible();
     await expect(runner.getByText(/연결 확인됨|Connection verified/, { exact: true })).toBeVisible();
     await expect(runner.getByText(/신규 실행 가능|Ready for new work/, { exact: true })).toBeVisible();
+    await expect(runner.getByText("Example CPU", { exact: true })).toBeVisible();
+    await expect(runner.getByText("Example GPU", { exact: true })).toBeVisible();
+    await expect(runner.getByRole("meter", { name: /CPU 사용률|CPU utilization/ })).toHaveAttribute("aria-valuenow", "37.5");
+    await expect(runner.getByText("antigravity", { exact: true })).toHaveCount(0);
+    await expect(runner.getByText(/설정된 역할|Configured role/, { exact: true })).toHaveCount(0);
+    cpuUsage = 62.5;
+    await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
+    await expect(runner.getByRole("meter", { name: /CPU 사용률|CPU utilization/ })).toHaveAttribute("aria-valuenow", "62.5");
     await expectNoHorizontalOverflow(page);
     await page.screenshot({ path: testInfo.outputPath("machine-settings.png"), fullPage: true });
     await page.locator("#settings-tab-general").click();
@@ -2782,10 +2800,14 @@ test.describe("Dashboard smoke tests", () => {
     await expect(panel.getByRole("alert")).toContainText(/마지막 조회|last snapshot/);
     await expect(runner.getByText(/연결 확인됨|Connection verified/, { exact: true })).toHaveCount(0);
     await expect(runner.getByText(/신규 실행 가능|Ready for new work/, { exact: true })).toHaveCount(0);
+    await expect(runner.getByRole("meter", { name: /CPU 사용률|CPU utilization/ })).toHaveCount(0);
     fail = false;
     offline = true;
     await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
     await expect(runner.getByText(/오프라인|Offline/, { exact: true })).toBeVisible();
+    includeRunner = false;
+    await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
+    await expect(page.locator("#settings-tab-machine").getByText("1", { exact: true })).toBeVisible();
     enabled = false;
     await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
     await expect(panel.getByText(/단독 운영 중|runs standalone/)).toBeVisible();
