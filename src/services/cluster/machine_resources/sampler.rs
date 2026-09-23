@@ -41,8 +41,7 @@ impl Sampler {
             logical_cores: self.system.cpus().len(),
             // A CPU percentage requires two distinct samples. Do not present
             // the first refresh's placeholder value as a measured idle host.
-            usage_percent: self
-                .primed
+            usage_percent: (self.primed && !self.system.cpus().is_empty())
                 .then(|| self.system.global_cpu_usage())
                 .and_then(super::valid_percent),
         };

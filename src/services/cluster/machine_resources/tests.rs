@@ -20,6 +20,7 @@ fn first_cpu_sample_is_unknown_and_memory_and_disk_accounting_are_bounded() {
 fn non_finite_usage_is_not_a_healthy_zero() {
     assert_eq!(valid_percent(f32::NAN), None);
     assert_eq!(valid_percent(f32::INFINITY), None);
+    assert_eq!(valid_percent(-1.0), None);
     assert_eq!(valid_percent(102.0), Some(100.0));
 }
 

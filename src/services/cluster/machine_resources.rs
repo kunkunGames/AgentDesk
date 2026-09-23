@@ -108,5 +108,5 @@ pub(crate) fn spawn(heartbeat_interval_secs: u64) {
 }
 
 fn valid_percent(value: f32) -> Option<f32> {
-    value.is_finite().then(|| value.clamp(0.0, 100.0))
+    (value.is_finite() && value >= 0.0).then(|| value.min(100.0))
 }
