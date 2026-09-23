@@ -43,7 +43,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_CODEX_REASONING_EFFORT` | `src/services/codex.rs:203` |  |
 | `AGENTDESK_CODEX_REMOTE_TMUX` | `src/services/codex.rs:1244` |  |
 | `AGENTDESK_CODEX_TUI_WARM_FOLLOWUP` | `src/services/codex_tui/warm_followup.rs:14` (+1 more) |  |
-| `AGENTDESK_CONFIG` | `src/config.rs:3340` (+5 more) | The on-disk config path the running server loaded from, resolved with the same precedence as [`load`] (`$AGENTDESK_CONFIG` → runtime root → cwd → home). |
+| `AGENTDESK_CONFIG` | `src/config.rs:3347` (+5 more) | The on-disk config path the running server loaded from, resolved with the same precedence as [`load`] (`$AGENTDESK_CONFIG` → runtime root → cwd → home). |
 | `AGENTDESK_CSWAP_PATH` | `src/services/cswap.rs:22` (+1 more) |  |
 | `AGENTDESK_DCSERVER_LABEL` | `src/cli/dcserver.rs:18` (+2 more) |  |
 | `AGENTDESK_DCSERVER_LOG_MAX_BYTES` | `src/logging.rs:225` |  |
@@ -67,7 +67,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_HOOK_RELAY_TEST_ENDPOINT` | `src/services/claude_tui/hook_relay.rs:46` |  |
 | `AGENTDESK_HOOK_RELAY_TEST_MUTATION` | `src/services/claude_tui/hook_relay/ordered_queue.rs:41` (+1 more) |  |
 | `AGENTDESK_HOOK_RELAY_TEST_STDOUT_PATH` | `src/services/claude_tui/hook_relay.rs:50` |  |
-| `AGENTDESK_INSTANCE_ID` | `src/services/cluster/node_registry.rs:686` (+1 more) | Resolve the self instance_id, preferring the value the cluster bootstrap registered (config-driven if present), falling back to the env-var/hostname pair only… |
+| `AGENTDESK_INSTANCE_ID` | `src/services/cluster/node_registry.rs:659` (+1 more) | Resolve the self instance_id, preferring the value the cluster bootstrap registered (config-driven if present), falling back to the env-var/hostname pair only… |
 | `AGENTDESK_KAKAO_ACCOUNTS` | `src/services/kakao.rs:35` (+1 more) |  |
 | `AGENTDESK_KAKAO_CALENDAR_ACCOUNTS` | `src/services/kakao/account.rs:21` | Separate allowlist: enabling calendar never implicitly grants all message accounts. |
 | `AGENTDESK_KAKAO_CALENDAR_ENABLED` | `src/services/kakao/account.rs:10` |  |
@@ -84,7 +84,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_POLICY_HARDENING` | `src/engine/loader.rs:67` (+1 more) |  |
 | `AGENTDESK_POLICY_TRUST_ENFORCE` | `src/engine/loader.rs:61` |  |
 | `AGENTDESK_POLICY_TRUST_OVERRIDE` | `src/engine/loader.rs:55` |  |
-| `AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES` | `src/config.rs:615` | `AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES` accepts `5` or `60`; anything else (including the variable being unset) returns `None`. |
+| `AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES` | `src/config.rs:617` | `AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES` accepts `5` or `60`; anything else (including the variable being unset) returns `None`. |
 | `AGENTDESK_PRUNE_GLOBAL_SLASH_COMMANDS` | `src/services/discord/runtime_bootstrap/framework_setup.rs:284` |  |
 | `AGENTDESK_PYTHON3_PATH` | `src/engine/ops/runtime_ops.rs:18` |  |
 | `AGENTDESK_QUEUE_EXIT_CLEAR_RETRY_SECS` | `src/services/discord/runtime_bootstrap/spawns.rs:492` |  |
@@ -120,7 +120,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `DATABASE_URL` | `src/db/postgres.rs:1006` |  |
 | `GEMINI_CLIENT_ID` | `src/server/mod.rs:1487` | env vars GEMINI_CLIENT_ID / GEMINI_CLIENT_SECRET 2. |
 | `GEMINI_CLIENT_SECRET` | `src/server/mod.rs:1488` | env vars GEMINI_CLIENT_ID / GEMINI_CLIENT_SECRET 2. |
-| `GEMINI_CLI_HOME` | `src/services/mcp_config.rs:665` |  |
+| `GEMINI_CLI_HOME` | `src/services/mcp_config.rs:708` |  |
 | `HOME` | `src/cli/doctor/orchestrator.rs:509` (+9 more) | #2655: handler for the `install-memento-session-hook` CLI surface. |
 | `HOSTNAME` | `src/server/outbox_worker.rs:24` (+5 more) | Opens this turn's buffer and evicts whatever predecessor was left on this channel by a bridge exit that never reached post-loop finalize. |
 | `LOCALAPPDATA` | `src/services/platform/binary_resolver.rs:1130` (+2 more) |  |

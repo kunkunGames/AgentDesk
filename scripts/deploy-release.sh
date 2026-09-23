@@ -1244,13 +1244,14 @@ _resolve_deploy_peers() {
 _deploy_peer_env_prelude() {
     printf 'AGENTDESK_DEPLOY_PEER_INVOCATION=1'
     local name value
+    # AGENTDESK_DEPLOY_BINARY is deliberately absent: it names a host-local path, so
+    # each peer builds from its own verified source with the provenance gates enabled.
     for name in \
         AGENTDESK_CODESIGN_IDENTITY \
         AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN \
         AGENTDESK_CODESIGN_KEYCHAIN_PW_FILE \
         AGENTDESK_CODESIGN_KEYCHAIN_NAME \
         AGENTDESK_DEPLOY_ALL_NODES \
-        AGENTDESK_DEPLOY_BINARY \
         AGENTDESK_DEPLOY_DELAY_SECS \
         AGENTDESK_DEPLOY_FAST \
         AGENTDESK_DEPLOY_HEALTH_DELAY_SECS \
@@ -2623,8 +2624,10 @@ if [ "${AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED:-0}" != "1" ]; then
             "release" "$ADK_REL" "$RESTART_REQUEST_NONCE" 30; then
             exit 1
         fi
+    elif _restart_persistence_proof_exists "$ADK_REL" "$RESTART_REQUEST_NONCE"; then
+        echo "▸ [gate] release persisted this request's frontier and exited; nothing left to wait for"
     else
-        echo "▸ [gate] release is not serving on :${REL_PORT:-} — no in-flight delivery frontier to persist; proceeding"
+        echo "▸ [gate] release is not serving on :${REL_PORT:-} and left no persistence proof — proceeding; a mid-stream turn may truncate (durable relay reattaches turns)"
     fi
 else
     echo "⚠ [gate] release restart durability gate=${AGENTDESK_RESTART_DRAIN_VERDICT}"
