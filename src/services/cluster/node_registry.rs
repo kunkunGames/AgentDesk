@@ -178,7 +178,10 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     );
     let base_capabilities = cluster_capabilities_with_runner_api(&config.cluster);
     super::readiness::spawn_probe(config.clone());
-    super::machine_resources::spawn(config.cluster.heartbeat_interval_secs);
+    super::machine_resources::spawn(
+        config.cluster.heartbeat_interval_secs,
+        config.cluster.api_base_url.as_deref(),
+    );
     super::attachment_transfer::temporary::spawn_cleanup();
     crate::services::session_forwarding::probe::spawn(
         config.clone(),
@@ -308,6 +311,11 @@ fn spawn_heartbeat_loop(
     let stale_threshold_secs = lease_ttl_secs.max(interval_secs * 3);
     let hub_eligible =
         hub_eligible && matches!(configured_role, ClusterRole::Hub | ClusterRole::Auto);
+    let resource_recorder = super::machine_resources::store::spawn_recorder(
+        pool.clone(),
+        instance_id.clone(),
+        hub_active.clone(),
+    );
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await;
@@ -367,6 +375,12 @@ fn spawn_heartbeat_loop(
             .await
             {
                 tracing::warn!("[cluster] heartbeat failed: {error}");
+            } else if let Some(sample) = capabilities
+                .get("machine_resources")
+                .filter(|value| value.is_object())
+                && resource_recorder.try_send(sample.clone()).is_err()
+            {
+                tracing::debug!("[cluster] machine sample skipped while persistence queue is full");
             }
             if let Err(error) = upsert_node_mcp_endpoints(&pool, &instance_id, &capabilities).await
             {

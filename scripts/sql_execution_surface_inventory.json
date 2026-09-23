@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "a5ae0e51150f1cba1f1f2b5b7fd2d7617a6e28d1",
+  "measured_at_sha": "4f0b81f407febc72a23c9362ef30e288d92d793c",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1192,6 +1192,24 @@
     },
     {
       "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0130_relay_dead_letter_redelivery_attempts.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:54f5e68a0543f83002069f76a1cbe3280110642ea1609a4e11991619065de346"
+    },
+    {
+      "root": "migrations/postgres",
+      "kind": "MIGRATION",
+      "path": "migrations/postgres/0131_machine_resource_samples.sql",
+      "api": "migration.file",
+      "symbol": "file",
+      "classification": "STATIC_FILE",
+      "fingerprint": "sha256:cbd3ffe8b7daa1979bbc83a6500ebaf4cf4b7f07a5d4cc147d2cbe91db127eea"
+    },
+    {
+      "root": "migrations/postgres",
       "kind": "MIGRATION_METADATA",
       "path": "migrations/postgres/checksum-repair-allowlist.json",
       "api": "migration.non_sql_tracked",
@@ -1206,7 +1224,7 @@
       "api": "migration.non_sql_tracked",
       "symbol": "non_sql_tracked",
       "classification": "NON_SQL_TRACKED",
-      "fingerprint": "sha256:4022056504e5fb78231afc583a5b325c3bc0515b241641234e429ec5ad607f4b"
+      "fingerprint": "sha256:2b1fdf3cb58dfb01fca4ed652a592ff53a7180426610519dfd3a857e8ebbce07"
     },
     {
       "root": "policies",
@@ -25156,6 +25174,33 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:9a7d97371bd4bba9f51ead34c01f5ee98d90104def82c7efc438cccf2fbd3974"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/machine_resources/store.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:19f0ead6db952a13e5afec5978d36373c115785ab535b1e05908a29bbd70edc4"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/machine_resources/store.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:7c4b5610c63ed9a80a7f67ff6fda2ca58bd79eb7f697826f227f66e675cb5d26"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/machine_resources/store.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:f968986b50c30b0ae767181419c1148498a29504e7d24d606d7af6904d2ccb30"
     },
     {
       "root": "src",
