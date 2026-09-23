@@ -420,10 +420,10 @@ class TransportLegacyInventoryTests(unittest.TestCase):
         tick = self.item(worker, "pub(crate) async fn run_intake_worker_tick(")
         self.assertIn("cancelled: &(dyn Fn() -> bool + Sync),", tick)
         self.assertEqual(
-            self.CHECKPOINT.findall(tick), ["BeforeClaim", "AfterClaim"]
+            self.CHECKPOINT.findall(tick), ["BeforeClaim", "AfterClaim", "AfterClaim"]
         )
         self.assertEqual(tick.count("admission_action("), 3)
-        self.assertEqual(tick.count("release_cancelled_claim(pool, &row, claim_owner)"), 3)
+        self.assertEqual(tick.count("release_cancelled_claim(pool, &row, claim_owner)"), 2)
 
         loop_body = self.item(worker, "pub(crate) async fn run_intake_worker_loop(")
         self.assertNotIn("cancel: Arc<AtomicBool>", loop_body)
