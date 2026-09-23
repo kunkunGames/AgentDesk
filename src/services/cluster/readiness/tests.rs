@@ -7,6 +7,7 @@ fn node() -> Value {
             schema:2, boot_id:"boot-a".into(), observed_at_ms:1_000_000, expires_at_ms:1_120_000,
             os:"windows".into(), arch:"x86_64".into(), runtime_profile:crate::config::RuntimeProfile::Runner,
             release:json!({}), providers:BTreeMap::from([("codex".into(),ProviderEvidence {
+                cli_installed:true,
                 cli_usable:true,version:Some("1.0".into()),failure:None,
                 credential_profiles:BTreeMap::from([("default".into(),true)]),
                 authentication_verified:false,quota_verified:false,

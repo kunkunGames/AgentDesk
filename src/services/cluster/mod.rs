@@ -20,6 +20,7 @@ pub(crate) mod intake_routing_config;
 pub(crate) mod intake_routing_telemetry;
 pub(crate) mod intake_runner;
 pub(crate) mod intake_runner_capabilities;
+pub(crate) mod machine_resources;
 /// Runner-node registry + capability routing infrastructure. Relocated from
 /// `server::cluster` (#3037 bucket 3): it is pure cluster coordination
 /// (config + db + serde) with no route/axum dependency, so it belongs beside

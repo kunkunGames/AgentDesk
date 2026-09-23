@@ -19,6 +19,8 @@ static BOOT_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_stri
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ProviderEvidence {
+    #[serde(default)]
+    pub cli_installed: bool,
     pub cli_usable: bool,
     pub version: Option<String>,
     pub failure: Option<String>,
@@ -245,7 +247,8 @@ fn collect(config: &Config) -> ExecutionProbe {
     let observed_at_ms = chrono::Utc::now().timestamp_millis();
     let catalog = crate::services::discord::org_schema::provider_auth_catalog();
     let mut providers = BTreeMap::new();
-    for id in super::intake_runner_capabilities::active_intake_runner_providers() {
+    for entry in crate::services::provider::provider_registry() {
+        let id = entry.id.to_owned();
         let Some(kind) = ProviderKind::from_str(&id) else {
             continue;
         };
@@ -275,6 +278,7 @@ fn collect(config: &Config) -> ExecutionProbe {
         providers.insert(
             id,
             ProviderEvidence {
+                cli_installed: probe.resolution.resolved_path.is_some(),
                 cli_usable: probe.version.is_some() && probe.probe_failure_kind.is_none(),
                 version: probe.version.map(|v| v.chars().take(256).collect()),
                 failure: probe.probe_failure_kind,
