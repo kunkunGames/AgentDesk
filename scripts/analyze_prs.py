@@ -101,6 +101,17 @@ def has_duplicate_guard_ack(body):
         ],
     )
 
+def has_no_change_avoidance_guard_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*no-change avoidance:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "no-change avoidance",
+            "no change avoidance",
+        ],
+    )
+
 def has_no_change_verification_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*no[- ]change verification:\*\*", body):
         return True
@@ -309,6 +320,8 @@ def main():
             print("  [!] MISSING NON-OVERLAPPING REASON: PR body lacks the required 'Why this is non-overlapping' field.")
         if not has_duplicate_guard_ack(body):
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
+        if not has_no_change_avoidance_guard_ack(body):
+            print("  [!] MISSING NO-CHANGE AVOIDANCE GUARD: PR body lacks a completed no-change avoidance guard acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_pr_size_ack(body):

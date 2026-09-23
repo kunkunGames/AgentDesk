@@ -1,0 +1,9 @@
+Steward: Add no-change avoidance guard to PR hygiene checks
+
+What changed:
+- Added `has_no_change_avoidance_guard_ack` to `scripts/analyze_prs.py` to ensure PR bodies contain a checked `No-change avoidance` template field.
+- Updated the main evaluation loop in `scripts/analyze_prs.py` to enforce the new `No-change avoidance` check.
+- Added comprehensive unit tests in `tests/test_analyze_prs.py` for both positive and negative cases of the new check.
+
+Why:
+- To improve PR queue hygiene and avoid opening empty/no-change PRs unless they explicitly touch durable queue hygiene artifacts, as mandated by repository operating rules.
