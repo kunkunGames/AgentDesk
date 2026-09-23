@@ -225,17 +225,17 @@ class PrAnalyzerPrSizeGuardTests(unittest.TestCase):
 
 class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
     def test_unchecked_template_scratch_file_guard_is_not_acknowledgement(self):
-        body = "- [ ] **Scratch file cleanup:** I have run `git status`..."
+        body = "- [ ] **Unrelated change & scratch file audit:** I have run `git status`..."
 
         self.assertFalse(has_scratch_file_cleanup_ack(body))
 
     def test_checked_template_scratch_file_guard_is_acknowledgement(self):
-        body = "- [X] **Scratch file cleanup:** I have run `git status`..."
+        body = "- [X] **Unrelated change & scratch file audit:** I have run `git status`..."
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
 
     def test_filled_scratch_file_field_is_acknowledgement(self):
-        body = "- scratch file cleanup: ran git diff --check and git status."
+        body = "- unrelated change & scratch file audit: ran git diff --check and git status."
 
         self.assertTrue(has_scratch_file_cleanup_ack(body))
 

@@ -135,13 +135,15 @@ def has_pr_size_ack(body):
     )
 
 def has_scratch_file_cleanup_ack(body):
-    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*scratch file cleanup:\*\*", body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*(?:unrelated change (?:&|and) )?scratch file (?:cleanup|audit):\*\*", body):
         return True
     return has_non_empty_body_field(
         body,
         [
             "scratch file cleanup",
             "scratch-file cleanup",
+            "unrelated change & scratch file audit",
+            "unrelated change and scratch file audit",
         ],
     )
 
