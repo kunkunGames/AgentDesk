@@ -883,9 +883,3 @@ file = "src/services/discord/catch_up.rs"
 owner = "discord-relay"
 deadline = "2026-10-31"
 decompose_issue = "#4712"
-
-[[entry]]
-file = "src/services/discord/gateway.rs"
-decision = "keep"
-owner = "discord-relay"
-keep_reason = "Recently crossed the 1000-line threshold; keep registered until decomposition can be planned."

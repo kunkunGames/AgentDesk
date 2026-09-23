@@ -1,9 +1,0 @@
---- scripts/test_only_module_skip_pin.py
-+++ scripts/test_only_module_skip_pin.py
-@@ -93,6 +93,7 @@
-         "src/services/discord/placeholder_live_events/probe_fixtures_tests.rs",
-         "src/services/discord/placeholder_live_events/tests.rs",
-         "src/services/discord/prompt_builder/dispatch_contract_tests.rs",
-+        "src/services/discord/queue_io/transport/tests.rs",
-         "src/services/discord/recovery_engine/manual_rebind/coordinate_adoption_tests.rs",
-         "src/services/discord/recovery_engine/manual_rebind/post_adoption_guard_tests.rs",

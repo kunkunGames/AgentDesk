@@ -1,9 +1,0 @@
---- scripts/test_only_module_skip_pin.py
-+++ scripts/test_only_module_skip_pin.py
-@@ -102,6 +102,7 @@
-         "src/services/discord/queue_dispatch/kickoff.rs",
-         "src/services/discord/queue_io/transport.rs",
-         "src/services/discord/queue_io/turn_admission.rs",
-+        "src/services/discord/queue_io/transport/tests.rs",
-         "src/services/discord/recovery_engine/manual_rebind.rs",
-         "src/services/discord/recovery_engine/manual_rebind/tests.rs",

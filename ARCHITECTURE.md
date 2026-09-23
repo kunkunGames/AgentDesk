@@ -73,7 +73,6 @@ src/
 │   ├── test_env/
 │   │   └── teardown_probe.rs
 │   ├── agent_channels.rs
-│   ├── cluster_role.rs
 │   ├── runtime_profile.rs
 │   └── test_env.rs
 ├── db/
@@ -561,7 +560,6 @@ src/
 │   │   │   ├── agent_execution_node_tests.rs
 │   │   │   ├── attachment_tests.rs
 │   │   │   ├── capacity_tests.rs
-│   │   │   ├── edge_case_tests.rs
 │   │   │   ├── execution_requirement_tests.rs
 │   │   │   ├── model.rs
 │   │   │   ├── owner_record.rs
@@ -865,12 +863,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── section_dedupe.rs
 │   │   │   └── session_anchors.rs
-│   │   ├── queue_dispatch/
-│   │   │   └── kickoff.rs
 │   │   ├── queue_io/
-│   │   │   ├── transport/
-│   │   │   │   └── tests.rs
-│   │   │   ├── transport.rs
 │   │   │   └── turn_admission.rs
 │   │   ├── recovery_engine/
 │   │   │   ├── manual_rebind/
@@ -1033,7 +1026,6 @@ src/
 │   │   │   ├── intake_delivery_sweep.rs
 │   │   │   ├── orphan_recovery.rs
 │   │   │   ├── queued_placeholders.rs
-│   │   │   ├── queued_recovery.rs
 │   │   │   ├── recovery_flush.rs
 │   │   │   ├── relay_dlq_redelivery.rs
 │   │   │   ├── restored_state.rs
@@ -1295,7 +1287,6 @@ src/
 │   │   │   │   │   ├── rowless_receipt_tests/
 │   │   │   │   │   │   ├── pg_tests.rs
 │   │   │   │   │   │   └── preloop_cleanup_tests.rs
-│   │   │   │   │   ├── rest_delivery_tests.rs
 │   │   │   │   │   └── rowless_receipt_tests.rs
 │   │   │   │   ├── empty_response_recovery/
 │   │   │   │   │   ├── guidance.rs
