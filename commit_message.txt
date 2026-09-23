@@ -1,0 +1,36 @@
+Bolt: optimize agentBusy SQL query with EXISTS pattern
+
+What changed:
+Modified the `agentBusy` calculation in `policies/lib/auto-queue-lifecycle.js` to use `SELECT 1 ... LIMIT 1` instead of `SELECT COUNT(*)`.
+
+Why:
+The previous query performed a full table or index scan to count all matching rows. By changing it to an existence check (`SELECT 1 ... LIMIT 1`), the database can short-circuit and return as soon as the first matching row is found, converting an O(N) operation to O(1) in the best and average cases.
+
+WorkFingerprint:
+- Agent Name: Bolt
+- Category Boundary: policies/lib/auto-queue-lifecycle.js
+- Primary Files: policies/lib/auto-queue-lifecycle.js
+- Invariant Protected: auto-queue policy behavior and lifecycle state checks remain identical.
+- Public API Impact: None.
+- Docs Impact: None.
+- Verification Plan: Run `npm run test:policies` to ensure behavior consistency, and `git diff --check` to ensure style consistency.
+- Related PRs/Issues: None.
+
+Duplicate/overlap check:
+Checked open PRs (using `git branch -r`). No open PR overlaps with this change.
+
+Verifications:
+- `npm run test:policies` ran successfully (154 tests passed).
+- `git diff --check` ran successfully.
+
+Skipped checks:
+- Rust tests (`cargo check`, `cargo test`) skipped because no Rust files were modified.
+- Dashboard tests skipped because no dashboard code was modified.
+- Script verification (`shellcheck`) skipped because no bash scripts were modified.
+- Docs generation skipped because no docs or generated inventories were modified.
+
+Risk:
+Low. The boolean logic is identical (`active.length > 0` vs `active.length > 0 && active[0].cnt > 0`), and the behavior of the auto queue policy remains unchanged while performing less work on the database side.
+
+Rollback notes:
+Revert the single modified query block in `policies/lib/auto-queue-lifecycle.js`.
