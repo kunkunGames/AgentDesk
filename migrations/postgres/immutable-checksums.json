@@ -657,9 +657,9 @@
       "version": 128
     },
     {
-      "path": "migrations/postgres/0129_relay_dead_letter_redelivery_attempts.sql",
+      "path": "migrations/postgres/0130_relay_dead_letter_redelivery_attempts.sql",
       "sha256": "de5a5c2cf7ff88fa38dc638e3472e21b478572eef77cecfe8182df9736be9e9e",
-      "version": 129
+      "version": 130
     }
   ],
   "version": 1
