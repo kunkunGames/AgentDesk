@@ -67,6 +67,7 @@ describe("EmojiPicker", () => {
     const dialog = target.querySelector('div[role="dialog"]');
     expect(dialog).not.toBeNull();
     expect(dialog?.getAttribute("aria-label")).toBe("Choose an emoji");
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
   });
 
   it("returns focus to the trigger when dismissed by an outside click", async () => {
